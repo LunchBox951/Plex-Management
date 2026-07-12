@@ -40,6 +40,7 @@ from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.services.log_capture_service import DECISION_TELEMETRY_LOGGER_NAME
 
 if TYPE_CHECKING:
+    from plex_manager.domain.decision_engine import BlocklistCheck
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.domain.release import CandidateRelease, ParsedRelease
     from plex_manager.domain.season_pack import MultiSeasonRequestIntent
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import BlocklistRepository
 
-__all__ = ["preview"]
+__all__ = ["preview", "preview_episode_fallback"]
 
 # The constant equals this module's dotted path (i.e. ``__name__``); constructing
 # the logger FROM it (retention-telemetry precedent) guarantees the emitter can
@@ -66,6 +67,37 @@ _logger = logging.getLogger(DECISION_TELEMETRY_LOGGER_NAME)
 #: ``NOT_SEASON_PACK``) -- enough to spot-check which releases are showing up
 #: without per-release log spam.
 _MULTI_SEASON_PACK_SAMPLE_TITLES = 3
+
+
+async def _blocklist_hook(
+    blocklist_repo: BlocklistRepository, *, tmdb_id: int, media_type: str | None
+) -> BlocklistCheck:
+    """Fetch this media's blocklist entries once and close a pure check over them.
+
+    Shared by :func:`preview` and :func:`preview_episode_fallback` so the two
+    previews can never disagree about what "blocklisted" means -- the engine's
+    ``is_blocklisted`` hook is synchronous, so the DB fetch happens here, once per
+    preview call.
+    """
+    records = await blocklist_repo.list_for_media(tmdb_id, media_type=media_type)
+    entries = [
+        BlocklistedRelease(
+            source_title=record.source_title,
+            info_hash=record.torrent_hash,
+            indexer=record.indexer,
+        )
+        for record in records
+    ]
+
+    def _blocklisted(candidate: CandidateRelease, _parsed: ParsedRelease) -> bool:
+        return _is_blocklisted(
+            info_hash=candidate.info_hash,
+            source_title=candidate.title,
+            indexer=candidate.indexer_name,
+            entries=entries,
+        )
+
+    return _blocklisted
 
 
 async def preview(
@@ -123,23 +155,9 @@ async def preview(
     # numeric tmdb_id, so a tmdb-id-only lookup would let one media type's blocklist
     # reject the other's candidates. ``"search"`` (untyped) imposes no scope.
     blocklist_media_type = media_type if media_type in ("movie", "tv") else None
-    records = await blocklist_repo.list_for_media(tmdb_id, media_type=blocklist_media_type)
-    entries = [
-        BlocklistedRelease(
-            source_title=record.source_title,
-            info_hash=record.torrent_hash,
-            indexer=record.indexer,
-        )
-        for record in records
-    ]
-
-    def _blocklisted(candidate: CandidateRelease, _parsed: ParsedRelease) -> bool:
-        return _is_blocklisted(
-            info_hash=candidate.info_hash,
-            source_title=candidate.title,
-            indexer=candidate.indexer_name,
-            entries=entries,
-        )
+    _blocklisted = await _blocklist_hook(
+        blocklist_repo, tmdb_id=tmdb_id, media_type=blocklist_media_type
+    )
 
     # ``year`` is the wanted media's reference year. For a movie that is the
     # release year and the matcher should enforce it. For TV it is the show's
@@ -198,6 +216,97 @@ async def preview(
     _log_multi_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
     _log_not_season_pack_rejections(result, tmdb_id=tmdb_id, media_type=media_type, season=season)
     return result
+
+
+async def preview_episode_fallback(
+    prowlarr: IndexerPort,
+    parser: ParserPort,
+    profile: QualityProfile,
+    blocklist_repo: BlocklistRepository,
+    *,
+    tmdb_id: int,
+    title: str,
+    season: int,
+    missing_episodes: frozenset[int],
+) -> DecisionResult:
+    """Pass-2 episode-level fallback search (ADR-0020, issue #178).
+
+    Only called by the auto-grab worker when Pass 1 (:func:`preview` with the
+    derived ``prefer_season_pack=True``) found ZERO acceptable season packs THIS
+    cycle -- the issue #167 hard gate stays intact as Pass 1; this is a same-cycle
+    fallback, never a relaxed retry of the same search. Runs the SAME season-scoped
+    indexer search as a whole-season preview (``episode=None`` -- a multi-value
+    missing set has no single-value slot for the indexer query), but decides with
+    ``prefer_season_pack=False`` and the engine's ``episode_subset`` gate set to
+    ``missing_episodes`` instead: a candidate must cover a non-empty subset of the
+    still-missing episodes (single episodes and partial multi-episode releases are
+    both fine; anything overlapping an already-imported/downloading episode is
+    rejected -- no redundant grabs).
+
+    ``episodes`` is deliberately NOT passed to the media-identity hook (that
+    coverage gate is for the explicit-episode request path, :func:`preview`'s
+    ``episodes`` parameter) -- the engine's ``episode_subset`` gate is what
+    enforces coverage here. No ``year`` gate either (mirrors :func:`preview`'s TV
+    branch: a per-episode release name legitimately omits the show's first-air
+    year).
+    """
+    request = IndexerSearchRequest(
+        media_type="tv",
+        query=title,
+        tmdb_id=tmdb_id or None,
+        year=None,
+        season=season,
+        episode=None,
+    )
+    candidates = await prowlarr.search(request)
+
+    _blocklisted = await _blocklist_hook(blocklist_repo, tmdb_id=tmdb_id, media_type="tv")
+
+    def _media_match(candidate: CandidateRelease, parsed: ParsedRelease) -> bool:
+        return matches_media(
+            parsed,
+            expected_title=title,
+            expected_year=None,
+            candidate_tmdb_id=candidate.tmdb_id,
+            expected_tmdb_id=tmdb_id,
+            expected_season=season,
+        )
+
+    result = decide(
+        candidates,
+        parser,
+        profile,
+        _media_match,
+        _blocklisted,
+        prefer_season_pack=False,
+        episode_subset=missing_episodes,
+    )
+    _log_episode_not_needed_rejections(result, tmdb_id=tmdb_id, season=season)
+    return result
+
+
+def _log_episode_not_needed_rejections(
+    result: DecisionResult,
+    *,
+    tmdb_id: int,
+    season: int | None,
+) -> None:
+    """Beta-week telemetry (issue #178): one aggregated INFO per fallback preview
+    when any release was rejected ``EPISODE_NOT_NEEDED`` (a pack/whole-season
+    release reaching Pass 2, a wrong episode, or a redundant already-covered
+    one) -- never per-release spam. Same aggregation mechanics as
+    :func:`_log_multi_season_pack_rejections` / :func:`_log_not_season_pack_rejections`.
+    """
+    _log_season_scope_rejections(
+        result,
+        reason=RejectionReason.EPISODE_NOT_NEEDED,
+        label="episode-not-needed",
+        count_key="episode_not_needed_rejections",
+        sample_limit=_MULTI_SEASON_PACK_SAMPLE_TITLES,
+        tmdb_id=tmdb_id,
+        media_type="tv",
+        season=season,
+    )
 
 
 def _log_multi_season_pack_rejections(

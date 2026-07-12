@@ -2153,6 +2153,17 @@
       "SeasonStatus": {
         "description": "One tracked season's status, embedded in a tv ``RequestResponse``.",
         "properties": {
+          "imported_episode_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Imported Episode Count"
+          },
           "installed_profile_index": {
             "anyOf": [
               {
@@ -2182,6 +2193,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "target_episode_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Episode Count"
           }
         },
         "required": [

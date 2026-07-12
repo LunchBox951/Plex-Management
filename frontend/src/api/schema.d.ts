@@ -2130,6 +2130,8 @@ export interface components {
          * @description One tracked season's status, embedded in a tv ``RequestResponse``.
          */
         SeasonStatus: {
+            /** Imported Episode Count */
+            imported_episode_count?: number | null;
             /** Installed Profile Index */
             installed_profile_index?: number | null;
             /** Installed Quality Id */
@@ -2138,6 +2140,8 @@ export interface components {
             season_number: number;
             /** Status */
             status: string;
+            /** Target Episode Count */
+            target_episode_count?: number | null;
         };
         /**
          * ServiceValidateResponse

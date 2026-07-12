@@ -112,6 +112,71 @@ describe('Requests — per-season status list', () => {
   })
 })
 
+describe('Requests — episode-fallback "N/M" badge (ADR-0020, issue #178)', () => {
+  it('renders "S1 2/3" when a season is partially imported', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          tvRequest({
+            seasons: [
+              {
+                season_number: 1,
+                status: 'downloading',
+                imported_episode_count: 2,
+                target_episode_count: 3,
+              },
+            ],
+          }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText(/S1 2\/3/)).toBeInTheDocument()
+  })
+
+  it('renders plain "S1" when the counts are absent (unseeded season)', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          tvRequest({
+            seasons: [{ season_number: 1, status: 'downloading' }],
+          }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText(/S1$/)).toBeInTheDocument()
+    expect(screen.queryByText(/S1 \d+\/\d+/)).not.toBeInTheDocument()
+  })
+
+  it('renders plain "S1" once imported reaches target (nothing left to distinguish)', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          tvRequest({
+            seasons: [
+              {
+                season_number: 1,
+                status: 'completed',
+                imported_episode_count: 3,
+                target_episode_count: 3,
+              },
+            ],
+          }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByText(/S1$/)).toBeInTheDocument()
+  })
+})
+
 describe('Requests — poster rendering (issue #26)', () => {
   // Decorative posters carry alt="" (implicit role "presentation", not "img"),
   // so query the DOM node directly rather than by accessible role.

@@ -57,6 +57,7 @@ from plex_manager.domain.release import CandidateRelease, ParsedRelease, ScoredR
 from plex_manager.domain.season_pack import (
     MultiSeasonRequestIntent,
     classify_release_scope,
+    episode_numbers,
     plan_multi_season_pack,
 )
 from plex_manager.domain.source_mapping import resolve_quality
@@ -119,6 +120,7 @@ def decide(
     *,
     prefer_season_pack: bool = False,
     multi_season_intent: MultiSeasonRequestIntent | None = None,
+    episode_subset: frozenset[int] | None = None,
 ) -> DecisionResult:
     """Run the parse -> match -> gate -> filter -> rank pipeline over ``candidates``.
 
@@ -132,6 +134,17 @@ def decide(
     multi-season gates that run before it -- a release that fails one of those is
     still rejected for that gate's reason -- and a season pack still must clear
     the quality gate after it to be accepted.
+
+    ``episode_subset`` (default ``None``) is the whole-season episode-fallback gate
+    (Pass 2 of the auto-grab cycle, issue #178/#167, ADR-0020): when set, a
+    candidate's parsed episode set must be a *non-empty* subset of
+    ``episode_subset`` (the season's still-missing aired episodes) or it is a
+    *permanent* rejection, never scored. This rejects both whole-season/pack
+    releases (empty parsed episode set) and any release that overlaps an
+    already-imported/downloading episode (no redundant grabs). Callers set this
+    ONLY with ``prefer_season_pack=False`` -- the two gates are independent and
+    mutually exclusive: Pass 1 (pack-only) sets ``prefer_season_pack``, Pass 2
+    (episode fallback) sets ``episode_subset``, never both.
     """
     accepted: list[ScoredRelease] = []
     rejected: list[tuple[CandidateRelease, RejectionReason]] = []
@@ -162,6 +175,19 @@ def decide(
         if prefer_season_pack and scope not in _PACK_SCOPES and not multi_season_with_intent:
             rejected.append((candidate, RejectionReason.NOT_SEASON_PACK))
             continue
+
+        # Episode-fallback gate (Pass 2, issue #178/#167, ADR-0020): a release
+        # must cover only still-missing episodes -- a non-empty subset of
+        # ``episode_subset`` -- or it is a *permanent* rejection, never scored.
+        # This rejects whole-season/pack releases (empty parsed episode set) AND
+        # any release overlapping an already-imported/downloading episode (no
+        # redundant grabs), mirroring how ``covers_requested_episodes`` gates the
+        # explicit-episode path.
+        if episode_subset is not None:
+            eps = episode_numbers(parsed.episode)
+            if not eps or not (set(eps) <= episode_subset):
+                rejected.append((candidate, RejectionReason.EPISODE_NOT_NEEDED))
+                continue
 
         quality = resolve_quality(parsed.source, parsed.resolution, parsed.modifier)
 

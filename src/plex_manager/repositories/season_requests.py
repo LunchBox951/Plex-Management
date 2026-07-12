@@ -284,6 +284,43 @@ class SqlSeasonRequestRepository:
             records.append(_to_record(row, tmdb_ids[row.media_request_id]))
         return records
 
+    async def list_for_airing_refresh(
+        self, statuses: frozenset[str], limit: int
+    ) -> list[SeasonRequestRecord]:
+        # NULLs (never checked) sort first via an EXPLICIT ``nulls_first()`` -- same
+        # backend-portability reasoning as ``list_due_for_search`` above -- then
+        # oldest-checked first, tie-broken by ``id`` for determinism. This is what
+        # makes the window ROTATE rather than always returning the same id-lowest
+        # slice (P2 finding): every row this call actually returns gets stamped by
+        # the caller (:meth:`mark_airing_refresh_checked`), which moves it to the
+        # back of this ordering for the NEXT call.
+        stmt = (
+            select(SeasonRequest)
+            .where(SeasonRequest.status.in_([RequestStatus(s) for s in statuses]))
+            .order_by(
+                SeasonRequest.airing_refresh_checked_at.asc().nulls_first(),
+                SeasonRequest.id,
+            )
+            .limit(limit)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        tmdb_ids: dict[int, int] = {}
+        records: list[SeasonRequestRecord] = []
+        for row in rows:
+            if row.media_request_id not in tmdb_ids:
+                tmdb_ids[row.media_request_id] = await self._tmdb_id_for(row.media_request_id)
+            records.append(_to_record(row, tmdb_ids[row.media_request_id]))
+        return records
+
+    async def mark_airing_refresh_checked(
+        self, season_request_id: int, checked_at: datetime
+    ) -> None:
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.airing_refresh_checked_at = checked_at
+        await self._session.flush()
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[SeasonRequestRecord]:

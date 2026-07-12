@@ -25,9 +25,10 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0017](0017-plex-video-download-validation.md) | Positive Plex-video validation before library import | Accepted |
 | [0018](0018-origin-confined-service-urls.md) | Origin-confined service URLs and explicit changed-destination credential consent | Accepted |
 | [0019](0019-realtime-sse-invalidations-over-polling-floor.md) | Realtime admin SSE invalidations over a permanent polling floor | Accepted |
+| [0020](0020-episode-level-fallback-whole-season.md) | Episode-level fallback for whole-season TV requests | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
-first frontend-alpha session; 0010–0019 across the subsequent beta feature
+first frontend-alpha session; 0010–0020 across the subsequent beta feature
 sessions (each ADR's own header carries its date). Full context:
 [`docs/design/overview.md`](../design/overview.md).

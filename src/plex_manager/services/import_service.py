@@ -63,6 +63,7 @@ from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int
 from plex_manager.models import (
+    BlocklistReason,
     Download,
     DownloadHistory,
     DownloadHistoryEvent,
@@ -70,10 +71,18 @@ from plex_manager.models import (
     RequestStatus,
 )
 from plex_manager.ports.media_probe import MediaProbeError, MediaProbeUnavailableError
+from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import path_visibility, purge_service, season_request_service
+from plex_manager.services import (
+    blocklist_service,
+    path_visibility,
+    purge_service,
+    season_episode_service,
+    season_request_service,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -772,6 +781,59 @@ async def _set_download_scope_status(
     if completed:
         values["completed_at"] = datetime.now(UTC)
     await session.execute(stmt.values(**values))
+
+
+async def _blocklist_incomplete_pack(
+    session: AsyncSession,
+    *,
+    tmdb_id: int,
+    torrent_hash: str,
+    request_id: int,
+    season: int,
+    target: frozenset[int],
+    covered: set[int],
+) -> None:
+    """Blocklist a season pack whose import did not cover the whole seeded target
+    (P1, issue #178 review round 2) -- the recycle terminator.
+
+    Without this the re-arm below hands the season straight back to Pass 1, which
+    can re-accept the SAME pack next cycle (the decision engine's pack gate has no
+    per-episode overlap check -- that is Pass 2's ``episode_subset`` gate), and
+    because ``pass1_found_pack`` is then true the episode fallback never runs: the
+    worker re-grabs/re-imports the identical incomplete pack forever and the
+    missing episodes are never searched for. Blocklisting THIS release's identity
+    (hash, with title+indexer fallback -- the same two-tier identity every other
+    blocklist writer uses) makes Pass 1 reject it next cycle, so Pass 1 accepts
+    nothing and Pass 2 searches exactly the missing set. Honest by construction:
+    this exact copy is already imported -- re-grabbing bit-identical content can
+    never add an episode it does not contain, so the entry can never cost us a
+    usable release. Only ever called for a PACK-scoped grab (``episodes is None``);
+    an episode-scoped release that delivered what it named is never blocklisted
+    (Pass 2's overlap gate already prevents its re-grab).
+    """
+    source_title = await blocklist_service.source_title_for(session, torrent_hash) or torrent_hash
+    indexer = await blocklist_service.indexer_for(session, torrent_hash)
+    await SqlBlocklistRepository(session).create(
+        source_title=source_title,
+        reason=BlocklistReason.failed.value,
+        tmdb_id=tmdb_id,
+        torrent_hash=torrent_hash,
+        indexer=indexer,
+        media_type="tv",
+    )
+    _logger.warning(
+        "import: season pack covered only %d of %d target episode(s) for season %s; "
+        "blocklisted the release so the next auto-grab cycle searches the missing "
+        "episodes instead of re-grabbing the same incomplete pack",
+        len(covered & target),
+        len(target),
+        safe_int(season),
+        extra={
+            "request_id": safe_int(request_id),
+            "tmdb_id": safe_int(tmdb_id),
+            "season": safe_int(season),
+        },
+    )
 
 
 async def _block(
@@ -1668,6 +1730,7 @@ async def _import_tv_targets_locked(
         await session.commit()
 
         successful_dirs: list[Path] = []
+        pack_blocklisted = False
         for plan in plans:
             placed_paths: list[Path] = []
             imported: list[tuple[str, PurePosixPath]] = []
@@ -1730,11 +1793,70 @@ async def _import_tv_targets_locked(
                     quality_id=installed_quality.id,
                     profile_index=installed_profile_index,
                 )
-                await season_request_service.mark_completed(
+                # Episode-level completeness for THIS season of the multi-target
+                # plan (P2, issue #178 review round 2) -- the multi-season mirror
+                # of ``_import_tv_locked``'s conditional completion. Without it,
+                # target rows a prior fallback cycle seeded stay ``pending`` after
+                # the pack imports, and the next airing refresh sees
+                # ``target > imported`` and re-arms an already-imported season for
+                # duplicate grabs. Same degradation rule: an unseeded season
+                # (empty target) completes on import exactly as before.
+                plan_season_row = await SqlSeasonRequestRepository(session).ensure(
+                    plan.target.request.id,
+                    plan.target.season,
+                    status=RequestStatus.pending.value,
+                )
+                plan_state_repo = SqlSeasonEpisodeStateRepository(session)
+                # Exclude stale grabbed rows from the completion target (P2,
+                # round 3) -- see the single-season path's comment for the full
+                # rationale; identical semantics here.
+                plan_target = frozenset(
+                    state.episode_number
+                    for state in await plan_state_repo.list_for_season(plan_season_row.id)
+                ) - await plan_state_repo.stale_grabbed_episodes(plan_season_row.id)
+                plan_episodes = {ep for result in plan.accepted for ep in result.episodes}
+                plan_complete = await season_episode_service.apply_import(
                     session,
                     media_request_id=plan.target.request.id,
                     season_number=plan.target.season,
+                    imported_episodes=plan_episodes,
+                    download_id=download_id,
+                    target=plan_target,
                 )
+                if plan_complete:
+                    await season_request_service.mark_completed(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                    )
+                else:
+                    # Same recycle terminator as the single-season path: a
+                    # multi-season pack is a PACK for every season it carries, so
+                    # an incompletely-covered season must block this release's
+                    # identity before re-arming (P1 x P2 composition: the re-arm
+                    # alone would let Pass 1 re-accept the same pack). One entry
+                    # per download is enough -- the identity is per-release, not
+                    # per-season.
+                    if not pack_blocklisted:
+                        pack_blocklisted = True
+                        await _blocklist_incomplete_pack(
+                            session,
+                            tmdb_id=plan.target.request.tmdb_id,
+                            torrent_hash=torrent_hash,
+                            request_id=plan.target.request.id,
+                            season=plan.target.season,
+                            target=plan_target,
+                            covered=plan_episodes,
+                        )
+                    await season_request_service.set_status(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                        status=RequestStatus.searching.value,
+                    )
+                    await SqlSeasonRequestRepository(session).schedule_search(
+                        plan_season_row.id, search_attempts=0, next_search_at=None
+                    )
                 await _set_download_scope_status(
                     session,
                     download_id=download_id,
@@ -2187,9 +2309,79 @@ async def _import_tv_locked(
             quality_id=installed_quality.id,
             profile_index=installed_profile_index,
         )
-        await season_request_service.mark_completed(
-            session, media_request_id=request.id, season_number=season
+
+        # Episode-level completeness (ADR-0020, issue #178): the target is read
+        # from ``season_episode_states`` WITHOUT calling TMDB -- import may run
+        # while TMDB is down, and the target is whatever auto-grab's fallback
+        # already seeded. An empty/unseeded target (this download's season was
+        # never touched by the fallback -- a plain whole-season-pack request, the
+        # common case) means "target unknown", and ``apply_import`` degrades to
+        # the LEGACY behavior: any TV import completes the season, unchanged from
+        # before this feature existed.
+        season_row = await SqlSeasonRequestRepository(session).ensure(
+            request.id, season, status=RequestStatus.pending.value
         )
+        episode_state_repo = SqlSeasonEpisodeStateRepository(session)
+        # The completion target excludes STALE ``grabbed`` rows -- ones whose
+        # download is gone or terminally dead (P2, issue #178 review round 3):
+        # a failed fallback grab for an episode TMDB later retracted leaves a
+        # ``grabbed`` row that ``upsert_target``'s retraction (pending-only)
+        # never retires; counting it here would hold the season incomplete
+        # forever even when every currently-aired episode is imported. Safe by
+        # the airing-refresh safety net: if the excluded episode IS genuinely
+        # aired-and-missing, the refresh re-arms the completed season the moment
+        # TMDB's target exceeds what is imported -- nothing lost, only un-wedged.
+        target = frozenset(
+            state.episode_number
+            for state in await episode_state_repo.list_for_season(season_row.id)
+        ) - await episode_state_repo.stale_grabbed_episodes(season_row.id)
+        accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
+        complete = await season_episode_service.apply_import(
+            session,
+            media_request_id=request.id,
+            season_number=season,
+            imported_episodes=accepted_episodes,
+            download_id=download_id,
+            target=target,
+        )
+        if complete:
+            await season_request_service.mark_completed(
+                session, media_request_id=request.id, season_number=season
+            )
+        else:
+            # Target known and still incomplete (a partial fallback assembly,
+            # e.g. a pack with a hole, or a single-episode grab): re-arm the
+            # season to keep collecting rather than falsely completing it. Do
+            # NOT clear ``library_path`` (the episodes just placed are real) or
+            # ``installed_quality`` (already set above). Reset the search
+            # backoff so the next missing episode is searched promptly, not
+            # throttled by a stale ladder from before this partial import.
+            if episodes is None:
+                # A whole-season PACK that could not complete the season: block
+                # its release identity BEFORE the re-arm (same transaction) so
+                # Pass 1 cannot re-accept it next cycle and starve the episode
+                # fallback forever (P1, issue #178 review round 2). An
+                # episode-scoped grab (``episodes`` named) delivered what it
+                # promised and is left alone -- Pass 2's overlap gate already
+                # rejects re-grabbing it.
+                await _blocklist_incomplete_pack(
+                    session,
+                    tmdb_id=request.tmdb_id,
+                    torrent_hash=torrent_hash,
+                    request_id=request.id,
+                    season=season,
+                    target=target,
+                    covered=accepted_episodes,
+                )
+            await season_request_service.set_status(
+                session,
+                media_request_id=request.id,
+                season_number=season,
+                status=RequestStatus.searching.value,
+            )
+            await SqlSeasonRequestRepository(session).schedule_search(
+                season_row.id, search_attempts=0, next_search_at=None
+            )
         await session.commit()
         return await download_repo.get_by_hash(torrent_hash)
     finally:

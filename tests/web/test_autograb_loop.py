@@ -8,6 +8,7 @@ monkeypatched on the app module -- mirroring ``tests/web/test_reconcile_loop.py`
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 import httpx
 import pytest
@@ -15,14 +16,16 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.prowlarr import IndexerError
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus
+from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
+from plex_manager.ports.metadata import EpisodeInfo, MetadataPort
 from plex_manager.services.health_service import AutograbStatus
 from plex_manager.web import app as app_module
 from tests.web.fakes import (
     FakeProwlarr,
     FakeQbittorrent,
+    FakeTmdb,
     candidate,
     good_and_cam_candidates,
 )
@@ -201,3 +204,96 @@ async def test_autograb_records_grab_error_on_health(
     # The scope entered a grab-pipeline cooldown, surfaced on the health record so the
     # operator SEES the pipeline failing (ADR-0013 round-3 #2), not just a stuck request.
     assert status.cooled_down_scopes == 1
+
+
+async def _seed_pending_tv_season(sessionmaker_: SessionMaker, tmdb_id: int) -> tuple[int, int]:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.pending,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(media_request_id=request.id, season_number=1, status="pending")
+        session.add(season)
+        await session.commit()
+        return request.id, season.id
+
+
+async def test_autograb_wires_tmdb_into_the_episode_fallback(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_autograb_once`` resolves TMDB best-effort and threads it into
+    ``run_grab_cycle`` (ADR-0020, issue #178): with TMDB configured and no season
+    pack available, a whole-season TV scope reaches the Pass-2 episode-level
+    fallback and grabs the missing episode."""
+    tmdb_id = 611
+    request_id, season_id = await _seed_pending_tv_season(sessionmaker_, tmdb_id)
+    # No season pack in the results -- Pass 1 rejects it NOT_SEASON_PACK, leaving
+    # Pass 2 to run.
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S01E01.1080p.WEB-DL.x264-GROUP", info_hash="ab" * 20)]
+    )
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+
+    tmdb: MetadataPort = FakeTmdb(
+        season_episodes={(tmdb_id, 1): [EpisodeInfo(episode_number=1, air_date=date(2020, 1, 1))]}
+    )
+
+    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+        return tmdb
+
+    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.downloading
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.downloading
+    status = app.state.autograb_status
+    assert status.last_ok_at is not None
+    assert status.last_error_type is None
+
+
+async def test_autograb_unconfigured_tmdb_disables_fallback_cleanly(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``tmdb_api_key`` setting -> ``get_tmdb`` raises ``ServiceNotConfiguredError``
+    -> ``_autograb_once`` catches it and passes ``metadata=None``: Pass 1 alone,
+    an honest park on nothing acceptable, no crash."""
+    tmdb_id = 612
+    request_id, season_id = await _seed_pending_tv_season(sessionmaker_, tmdb_id)
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S01E01.1080p.WEB-DL.x264-GROUP", info_hash="cd" * 20)]
+    )
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=FakeQbittorrent(), enabled=True)
+    # get_tmdb is NOT monkeypatched: the real deps.py function runs against a DB
+    # with no tmdb_api_key setting and raises ServiceNotConfiguredError.
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.no_acceptable_release
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.no_acceptable_release
+    status = app.state.autograb_status
+    assert status.last_ok_at is not None
+    assert status.last_error_type is None

@@ -7,11 +7,13 @@ TMDB's JSON into them. All methods are async (``httpx.AsyncClient``).
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "EpisodeInfo",
     "MediaPage",
     "MediaSearchResult",
     "MetadataPort",
@@ -84,6 +86,20 @@ class TvMetadata(BaseModel):
     is_anime: bool = False
 
 
+class EpisodeInfo(BaseModel):
+    """One episode of a TV season: its number and (if known) air date.
+
+    Used by the episode-level fallback (ADR-0020, issue #178) to compute the
+    aired-episode target set. ``air_date`` is ``None`` when TMDB hasn't dated the
+    episode yet -- treated by the domain as "not yet aired", never guessed.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    episode_number: int
+    air_date: date | None = None
+
+
 @runtime_checkable
 class MetadataPort(Protocol):
     """Search for media and resolve movie / TV details by tmdb id."""
@@ -119,5 +135,14 @@ class MetadataPort(Protocol):
 
         No TV equivalent of ``upcoming_movies`` -- TMDB has no "upcoming" TV
         endpoint comparable to its movie release-date listing.
+        """
+        raise NotImplementedError
+
+    async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
+        """Episodes of one TV season (episode number + air date).
+
+        Raises on a TMDB outage/error (never returns a silently-empty list to mean
+        "unreachable") -- the caller treats a raise as "target unknown this
+        cycle" and retries later; it must never guess an empty target (ADR-0020).
         """
         raise NotImplementedError

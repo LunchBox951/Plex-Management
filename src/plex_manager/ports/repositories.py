@@ -15,7 +15,7 @@ and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -34,6 +34,8 @@ __all__ = [
     "QueueRecord",
     "RequestRecord",
     "RequestRepository",
+    "SeasonEpisodeStateRecord",
+    "SeasonEpisodeStateRepository",
     "SeasonRequestRecord",
     "SeasonRequestRepository",
 ]
@@ -205,6 +207,26 @@ class SeasonRequestRecord(BaseModel):
     # ``evicted`` -- the season-level eviction guard's own re-grab. See
     # ``SeasonRequest.eviction_regrab``'s docstring.
     eviction_regrab: bool = False
+
+
+class SeasonEpisodeStateRecord(BaseModel):
+    """One aired episode's collection state for a whole-season fallback (ADR-0020).
+
+    One row per aired episode of a :class:`SeasonRequestRecord`, tracking
+    ``pending -> grabbed -> imported`` progress for the episode-level fallback
+    (issue #178). ``air_date`` is ``None`` only for a row seeded before this
+    breadcrumb existed (pre-fallback back-compat), never a live "unknown" state --
+    a genuinely-unaired episode never gets a row in the first place.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    season_request_id: int
+    episode_number: int
+    status: str
+    air_date: date | None = None
+    grabbed_download_id: int | None = None
 
 
 class BlocklistRecord(BaseModel):
@@ -626,6 +648,33 @@ class SeasonRequestRepository(Protocol):
         """List season requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def list_for_airing_refresh(
+        self, statuses: frozenset[str], limit: int
+    ) -> list[SeasonRequestRecord]:
+        """List up to ``limit`` seasons in ``statuses`` due for an airing-target
+        refresh (ADR-0020 §6, ``season_episode_service.reconcile_airing``), oldest
+        ``airing_refresh_checked_at`` first (``NULL`` -- never checked -- sorts
+        first), tie-broken by ``id``.
+
+        This is a ROTATING window, not a stable top-N: :meth:`mark_airing_refresh_
+        checked` advances a row to the back of the queue, so a bounded per-cycle
+        ``limit`` still eventually revisits every row instead of permanently
+        starving whichever ones do not fit in the first ``limit``-sized slice.
+        """
+        raise NotImplementedError
+
+    async def mark_airing_refresh_checked(
+        self, season_request_id: int, checked_at: datetime
+    ) -> None:
+        """Stamp the airing-refresh rotation cursor (see :meth:`list_for_airing_
+        refresh`) after ``reconcile_airing`` has actually looked at this season this
+        cycle -- rearmed or not, even after a TMDB error -- so the row moves to the
+        back of the rotation instead of being re-selected every cycle. A full
+        timestamp (not a date) so same-day cycles keep rotating (P2, issue #178
+        review round 2).
+        """
+        raise NotImplementedError
+
     async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
         """Season numbers whose NEWEST row (across this ``tmdb_id``'s ``tv``
         requests) is ``evicted`` (ADR-0012).
@@ -737,6 +786,98 @@ class SeasonRequestRepository(Protocol):
         self, season_request_id: int, *, quality_id: int, profile_index: int | None
     ) -> None:
         """Store the imported quality breadcrumb for this season."""
+        raise NotImplementedError
+
+
+@runtime_checkable
+class SeasonEpisodeStateRepository(Protocol):
+    """Persistence for per-episode fallback-collection state (ADR-0020, #178).
+
+    Bridges the aired-episode target set (from ``MetadataPort.season_episodes``)
+    to what has actually been grabbed/imported, so the episode-level fallback can
+    compute a season's "missing" set without re-deriving it from free-text
+    history.
+    """
+
+    async def list_for_season(self, season_request_id: int) -> list[SeasonEpisodeStateRecord]:
+        """List every tracked episode row for ``season_request_id``."""
+        raise NotImplementedError
+
+    async def upsert_target(self, season_request_id: int, aired: Mapping[int, date | None]) -> None:
+        """Idempotently seed/refresh the aired-episode target.
+
+        For each episode in ``aired``: inserts a ``pending`` row if absent, and
+        refreshes ``air_date`` on an existing row -- but NEVER downgrades an
+        existing ``grabbed``/``imported`` row back to ``pending``. Lets a newly
+        aired episode join the target (airing growth, ADR-0020) without
+        disturbing progress already made on episodes already tracked.
+
+        Also RETIRES (deletes) ``pending`` rows absent from ``aired`` -- TMDB
+        delaying/removing a previously-aired episode must not leave a stale
+        pending row that keeps the season searching forever. ``grabbed``/
+        ``imported`` rows are never retired.
+        """
+        raise NotImplementedError
+
+    async def mark_grabbed(
+        self, season_request_id: int, episode_numbers: Sequence[int], download_id: int
+    ) -> None:
+        """Mark ``episode_numbers`` ``grabbed`` (+ their ``grabbed_download_id``).
+
+        Creates a row as ``grabbed`` for an episode with no existing target row
+        (defensive; observability/crash-visibility only -- NOT read by
+        ``compute_missing``, which treats the live active download as
+        authoritative).
+        """
+        raise NotImplementedError
+
+    async def mark_imported(
+        self, season_request_id: int, episode_numbers: Sequence[int], download_id: int
+    ) -> None:
+        """Upsert ``episode_numbers`` to ``imported`` (+ ``grabbed_download_id``).
+
+        Creates rows for episodes not previously in the target (e.g. a season
+        pack placed episodes beyond the seeded aired set) -- they still count as
+        imported.
+
+        On an insert race (a concurrent target refresh inserts the same episode
+        first) the winning row is re-read and promoted to ``imported`` so an
+        import can never leave a just-placed episode ``pending`` for the airing
+        refresh to re-arm.
+        """
+        raise NotImplementedError
+
+    async def adopt_baseline(
+        self, season_request_id: int, *, episodes: Sequence[int] | None = None
+    ) -> None:
+        """Promote PENDING rows for this season to ``imported`` with no backing
+        download -- baseline adoption for an already-watchable season whose
+        content predates per-episode import tracking (ADR-0020 §6). ``episodes``
+        restricts adoption to those episode numbers (the partial-baseline case,
+        round 3); ``None`` adopts every pending row. Never touches ``grabbed``
+        rows -- they are evidence of our own attempt to fetch the episode, i.e.
+        evidence it was NOT already owned.
+        """
+        raise NotImplementedError
+
+    async def stale_grabbed_episodes(self, season_request_id: int) -> frozenset[int]:
+        """Episode numbers whose ``grabbed`` row's backing download is gone or
+        terminally dead (``failed``/``no_acceptable_release``) -- stale grab
+        breadcrumbs import completeness excludes from its completion target so a
+        failed grab of a later-retracted episode cannot wedge the season
+        incomplete forever (P2, issue #178 review round 3).
+        """
+        raise NotImplementedError
+
+    async def counts_for_seasons(
+        self, season_request_ids: Sequence[int]
+    ) -> dict[int, tuple[int, int]]:
+        """Batch ``{season_request_id: (imported_count, target_count)}``.
+
+        One grouped query for however many seasons are asked about -- the
+        requests-list "N/M episodes" badge's batched read, avoiding an N+1 over
+        the season rows on a page.
+        """
         raise NotImplementedError
 
 

@@ -14,6 +14,7 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import RequestRecord
+from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, request_service
 from plex_manager.services.correction_service import (
@@ -117,6 +118,7 @@ async def _to_response(
     session: AsyncSession,
     record: RequestRecord,
     seasons_by_request: dict[int, list[SeasonRequestRecord]] | None = None,
+    episode_counts_by_season_id: dict[int, tuple[int, int]] | None = None,
 ) -> RequestResponse:
     """Map a request record to the wire DTO, embedding its per-season rollup for tv.
 
@@ -129,6 +131,14 @@ async def _to_response(
     /requests/{id}`` path, where batching buys nothing), a tv record fetches its
     OWN season rows directly. A movie record's ``seasons`` is always ``None`` --
     movies have no ``SeasonRequest`` rows.
+
+    ``episode_counts_by_season_id`` (ADR-0020, issue #178) is likewise an optional
+    pre-fetched ``{season_request_id: (imported_count, target_count)}`` map for the
+    "N/M episodes" badge; when omitted, this function does its OWN small batched
+    read (one query for however many seasons this single record has). A season
+    absent from the map (no tracked ``season_episode_states`` rows -- the common
+    clean-single-pack-import case) renders both counts ``None``, never a fabricated
+    ``0/0``.
     """
     seasons: list[SeasonRequestRecord] | None = None
     if record.media_type == "tv":
@@ -136,6 +146,11 @@ async def _to_response(
             seasons = seasons_by_request.get(record.id, [])
         else:
             seasons = await SqlSeasonRequestRepository(session).list_for_request(record.id)
+    episode_counts = episode_counts_by_season_id
+    if episode_counts is None and seasons:
+        episode_counts = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
+            [s.id for s in seasons]
+        )
     return RequestResponse(
         id=record.id,
         tmdb_id=record.tmdb_id,
@@ -160,6 +175,8 @@ async def _to_response(
                     status=s.status,
                     installed_quality_id=s.installed_quality_id,
                     installed_profile_index=s.installed_profile_index,
+                    imported_episode_count=((episode_counts or {}).get(s.id, (None, None))[0]),
+                    target_episode_count=((episode_counts or {}).get(s.id, (None, None))[1]),
                 )
                 for s in seasons
             ]
@@ -264,8 +281,18 @@ async def list_requests_endpoint(
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]
     seasons_by_request = await SqlSeasonRequestRepository(session).list_for_requests(tv_ids)
+    # Likewise batch the episode-fallback "N/M" counts across EVERY season row on
+    # the page in ONE query (ADR-0020, issue #178) -- avoids an N+1 that calling
+    # ``_to_response`` per-row without this would otherwise cause.
+    all_season_ids = [s.id for seasons in seasons_by_request.values() for s in seasons]
+    episode_counts_by_season_id = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
+        all_season_ids
+    )
     return RequestListResponse(
-        requests=[await _to_response(session, r, seasons_by_request) for r in records]
+        requests=[
+            await _to_response(session, r, seasons_by_request, episode_counts_by_season_id)
+            for r in records
+        ]
     )
 
 
