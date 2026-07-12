@@ -7,7 +7,7 @@ interface PosterCardProps {
   posterUrl?: string | null
   /** Seed for the deterministic placeholder gradient (e.g. tmdb_id). */
   seed?: number
-  onClick?: () => void
+  onClick?: (trigger: HTMLButtonElement) => void
   /** Overlay slot, top-left (e.g. a StatusBadge). */
   badge?: ReactNode
   /** Overlay slot, top-right (e.g. a request button or library check). */
@@ -60,7 +60,7 @@ export function PosterCard({
           type="button"
           data-poster-card-trigger
           aria-label={year ? `View details for ${title} (${year})` : `View details for ${title}`}
-          onClick={onClick}
+          onClick={(event) => onClick(event.currentTarget)}
           className="absolute inset-0 z-10 cursor-pointer rounded-[7px] border-0 bg-transparent p-0 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-gold/60"
         />
       ) : null}
