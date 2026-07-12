@@ -1,4 +1,4 @@
-"""Pure arithmetic tests for episode-level season completeness (ADR-0018)."""
+"""Pure arithmetic tests for episode-level season completeness (ADR-0020)."""
 
 from __future__ import annotations
 

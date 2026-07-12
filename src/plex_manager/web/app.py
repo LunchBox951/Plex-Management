@@ -315,7 +315,7 @@ async def _autograb_once(app: FastAPI) -> None:
         except ServiceNotConfiguredError:
             status.mark_ok()
             return
-        # TMDB is OPTIONAL here (ADR-0018, issue #178): it only powers the
+        # TMDB is OPTIONAL here (ADR-0020, issue #178): it only powers the
         # episode-level fallback for whole-season TV scopes (the airing pre-pass +
         # Pass-2 search). An unconfigured TMDB cleanly disables both -- Pass 1
         # behaves exactly as before this feature existed -- rather than blocking

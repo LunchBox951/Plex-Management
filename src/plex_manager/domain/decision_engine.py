@@ -136,7 +136,7 @@ def decide(
     the quality gate after it to be accepted.
 
     ``episode_subset`` (default ``None``) is the whole-season episode-fallback gate
-    (Pass 2 of the auto-grab cycle, issue #178/#167, ADR-0018): when set, a
+    (Pass 2 of the auto-grab cycle, issue #178/#167, ADR-0020): when set, a
     candidate's parsed episode set must be a *non-empty* subset of
     ``episode_subset`` (the season's still-missing aired episodes) or it is a
     *permanent* rejection, never scored. This rejects both whole-season/pack
@@ -176,7 +176,7 @@ def decide(
             rejected.append((candidate, RejectionReason.NOT_SEASON_PACK))
             continue
 
-        # Episode-fallback gate (Pass 2, issue #178/#167, ADR-0018): a release
+        # Episode-fallback gate (Pass 2, issue #178/#167, ADR-0020): a release
         # must cover only still-missing episodes -- a non-empty subset of
         # ``episode_subset`` -- or it is a *permanent* rejection, never scored.
         # This rejects whole-season/pack releases (empty parsed episode set) AND

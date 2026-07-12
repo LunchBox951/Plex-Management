@@ -2179,7 +2179,7 @@ async def _import_tv_locked(
             profile_index=installed_profile_index,
         )
 
-        # Episode-level completeness (ADR-0018, issue #178): the target is read
+        # Episode-level completeness (ADR-0020, issue #178): the target is read
         # from ``season_episode_states`` WITHOUT calling TMDB -- import may run
         # while TMDB is down, and the target is whatever auto-grab's fallback
         # already seeded. An empty/unseeded target (this download's season was

@@ -204,7 +204,7 @@ class SeasonRequestRecord(BaseModel):
 
 
 class SeasonEpisodeStateRecord(BaseModel):
-    """One aired episode's collection state for a whole-season fallback (ADR-0018).
+    """One aired episode's collection state for a whole-season fallback (ADR-0020).
 
     One row per aired episode of a :class:`SeasonRequestRecord`, tracking
     ``pending -> grabbed -> imported`` progress for the episode-level fallback
@@ -758,7 +758,7 @@ class SeasonRequestRepository(Protocol):
 
 @runtime_checkable
 class SeasonEpisodeStateRepository(Protocol):
-    """Persistence for per-episode fallback-collection state (ADR-0018, #178).
+    """Persistence for per-episode fallback-collection state (ADR-0020, #178).
 
     Bridges the aired-episode target set (from ``MetadataPort.season_episodes``)
     to what has actually been grabbed/imported, so the episode-level fallback can
@@ -776,7 +776,7 @@ class SeasonEpisodeStateRepository(Protocol):
         For each episode in ``aired``: inserts a ``pending`` row if absent, and
         refreshes ``air_date`` on an existing row -- but NEVER downgrades an
         existing ``grabbed``/``imported`` row back to ``pending``. Lets a newly
-        aired episode join the target (airing growth, ADR-0018) without
+        aired episode join the target (airing growth, ADR-0020) without
         disturbing progress already made on episodes already tracked.
         """
         raise NotImplementedError

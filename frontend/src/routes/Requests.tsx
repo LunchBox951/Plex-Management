@@ -107,7 +107,7 @@ function RequestRow({ request, onOpen }: { request: RequestResponse; onOpen: () 
           {request.media_type === 'tv' && request.seasons && request.seasons.length > 0 ? (
             <ul className="flex flex-wrap justify-end gap-1">
               {request.seasons.map((season) => {
-                // Episode-level fallback progress (ADR-0018, issue #178): "N/M"
+                // Episode-level fallback progress (ADR-0020, issue #178): "N/M"
                 // while a whole-season request is partially assembled from a mix
                 // of pack/episode grabs. Both counts are null for a season the
                 // fallback has never touched (the common clean-pack-import case)

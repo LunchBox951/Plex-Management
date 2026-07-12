@@ -189,7 +189,7 @@ class FakeTmdb:
         self._popular_tv = (
             list(popular_tv_results) if popular_tv_results is not None else list(self.results)
         )
-        # ADR-0018 (issue #178): keyed (tmdb_id, season_number). ``season_episodes_error``
+        # ADR-0020 (issue #178): keyed (tmdb_id, season_number). ``season_episodes_error``
         # (when set) is raised on every call -- the "TMDB outage / target unknown"
         # test double.
         self._season_episodes = season_episodes or {}

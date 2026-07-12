@@ -183,7 +183,7 @@ AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 MAX_GRAB_ATTEMPTS_PER_SCOPE: int = 3
 
 # At most this many ``available``/``completed`` TV seasons get their aired target
-# refreshed from TMDB per cycle by the airing pre-pass (ADR-0018 §6,
+# refreshed from TMDB per cycle by the airing pre-pass (ADR-0020 §6,
 # :func:`plex_manager.services.season_episode_service.reconcile_airing`) -- a
 # module constant mirroring :data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`, protecting
 # the single TMDB budget from a large install with many finished shows.
@@ -297,7 +297,7 @@ class AutograbCycleResult:
     failing (honesty over silence), rather than wondering why eager scopes never
     reach ``downloading``.
 
-    ``season_episode_fallback_grabs`` (ADR-0018, issue #178) counts scopes settled
+    ``season_episode_fallback_grabs`` (ADR-0020, issue #178) counts scopes settled
     by the Pass-2 episode-level fallback rather than a Pass-1 season-pack grab --
     included in ``grabbed`` too, broken out here for observability into how often
     the fallback path (vs. a clean pack grab) is what actually completes a season.
@@ -444,7 +444,7 @@ async def _attempt_episode_fallback(
     cooldowns: CooldownRegistry,
     clock: Callable[[], datetime],
 ) -> _EpisodeFallbackOutcome:
-    """Pass-2 of the whole-season scope's cycle (ADR-0018, issue #178): only called
+    """Pass-2 of the whole-season scope's cycle (ADR-0020, issue #178): only called
     when Pass 1 (the season-pack-only search) accepted nothing this cycle.
 
     1. Refresh the aired-episode target from TMDB. A raise (``TmdbApiError``/
@@ -792,7 +792,7 @@ async def run_grab_cycle(
     ``""`` (the default) leaves qBittorrent's own default in charge, unchanged
     prior behaviour.
 
-    ``metadata`` (ADR-0018, issue #178) is the optional :class:`MetadataPort` (TMDB)
+    ``metadata`` (ADR-0020, issue #178) is the optional :class:`MetadataPort` (TMDB)
     that powers the episode-level fallback for whole-season TV scopes: an airing
     pre-pass (bounded, :data:`AIRING_REFRESH_MAX_PER_CYCLE`) re-arms any
     ``available``/``completed`` season whose aired target has grown, THEN, for each
@@ -815,7 +815,7 @@ async def run_grab_cycle(
     season_repo = SqlSeasonRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
 
-    # Airing pre-pass (ADR-0018 §6): re-arm any available/completed season whose
+    # Airing pre-pass (ADR-0020 §6): re-arm any available/completed season whose
     # aired target has grown BEFORE due-scope collection, so a newly-aired episode
     # re-enters ``DUE_SEARCH_STATUSES`` in time to be collected THIS cycle. Bounded
     # and best-effort per season (a TMDB error for one season is logged and
@@ -1155,7 +1155,7 @@ async def run_grab_cycle(
                     extra={"request_id": scope.request_id},
                 )
 
-        # Pass 2 (ADR-0018, issue #178): ONLY when Pass 1 found zero acceptable
+        # Pass 2 (ADR-0020, issue #178): ONLY when Pass 1 found zero acceptable
         # season packs this cycle (``park_scope`` still True), the scope is a
         # WHOLE-season TV scope (no specific episodes named), and TMDB is
         # configured. The issue #167 hard gate (Pass 1, above) cannot be bypassed

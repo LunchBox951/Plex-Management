@@ -1,5 +1,5 @@
 """decision_service.preview_episode_fallback — Pass-2 episode-level fallback
-search (ADR-0018, issue #178)."""
+search (ADR-0020, issue #178)."""
 
 from __future__ import annotations
 

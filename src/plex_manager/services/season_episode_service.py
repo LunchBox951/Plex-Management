@@ -1,4 +1,4 @@
-"""Episode-level fallback orchestration for whole-season TV requests (ADR-0018).
+"""Episode-level fallback orchestration for whole-season TV requests (ADR-0020).
 
 Bridges TMDB (via :class:`~plex_manager.ports.metadata.MetadataPort`), the
 ``season_episode_states`` repository, and the pure
@@ -155,7 +155,7 @@ async def reconcile_airing(
 ) -> int:
     """Re-arm a bounded number of ``available``/``completed`` seasons whose aired
     target has grown past what is imported (a new episode aired) back to
-    ``searching`` so auto-grab collects the newcomer (ADR-0018 §6).
+    ``searching`` so auto-grab collects the newcomer (ADR-0020 §6).
 
     Bounded by ``max_refresh`` to protect the single TMDB budget from a large
     install. Best-effort per season: a TMDB error for one season is logged and

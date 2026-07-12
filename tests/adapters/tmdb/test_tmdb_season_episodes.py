@@ -1,4 +1,4 @@
-"""TmdbMetadata.season_episodes tests (ADR-0018, issue #178).
+"""TmdbMetadata.season_episodes tests (ADR-0020, issue #178).
 
 Mirrors ``test_tmdb_adapter.py``'s ``httpx.MockTransport`` pattern. No real
 network in the default run.
@@ -102,7 +102,7 @@ async def test_season_episodes_500_raises_tmdb_api_error() -> None:
 async def test_season_episodes_404_raises_tmdb_api_error() -> None:
     """A 404 on the season-detail route means the route/tmdb id/season is wrong,
     NOT "no episodes" -- surfaced, never silently mapped to an empty list
-    (issue #89 pattern, ADR-0018's "never guess a target")."""
+    (issue #89 pattern, ADR-0020's "never guess a target")."""
     with pytest.raises(TmdbApiError) as exc_info:
         await _adapter().season_episodes(99999, 1)
     assert API_KEY not in str(exc_info.value)

@@ -1,4 +1,4 @@
-"""``season_episode_states`` migration (ADR-0018, issue #178): table + backfill.
+"""``season_episode_states`` migration (ADR-0020, issue #178): table + backfill.
 
 Mirrors ``test_migrations.py``'s subprocess/command-based upgrade/downgrade
 pattern.

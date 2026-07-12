@@ -131,7 +131,7 @@ async def _to_response(
     OWN season rows directly. A movie record's ``seasons`` is always ``None`` --
     movies have no ``SeasonRequest`` rows.
 
-    ``episode_counts_by_season_id`` (ADR-0018, issue #178) is likewise an optional
+    ``episode_counts_by_season_id`` (ADR-0020, issue #178) is likewise an optional
     pre-fetched ``{season_request_id: (imported_count, target_count)}`` map for the
     "N/M episodes" badge; when omitted, this function does its OWN small batched
     read (one query for however many seasons this single record has). A season
@@ -268,7 +268,7 @@ async def list_requests_endpoint(
     tv_ids = [r.id for r in records if r.media_type == "tv"]
     seasons_by_request = await SqlSeasonRequestRepository(session).list_for_requests(tv_ids)
     # Likewise batch the episode-fallback "N/M" counts across EVERY season row on
-    # the page in ONE query (ADR-0018, issue #178) -- avoids an N+1 that calling
+    # the page in ONE query (ADR-0020, issue #178) -- avoids an N+1 that calling
     # ``_to_response`` per-row without this would otherwise cause.
     all_season_ids = [s.id for seasons in seasons_by_request.values() for s in seasons]
     episode_counts_by_season_id = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(

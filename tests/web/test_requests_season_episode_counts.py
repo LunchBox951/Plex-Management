@@ -1,4 +1,4 @@
-"""``RequestResponse.seasons[i]``'s "N/M episodes" fallback progress (ADR-0018,
+"""``RequestResponse.seasons[i]``'s "N/M episodes" fallback progress (ADR-0020,
 issue #178): populated when ``season_episode_states`` rows exist, ``None`` for a
 season the fallback has never touched (movies included)."""
 

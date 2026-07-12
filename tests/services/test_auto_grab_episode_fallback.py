@@ -1,4 +1,4 @@
-"""auto_grab_service — Pass-2 episode-level fallback wiring (ADR-0018, issue #178).
+"""auto_grab_service — Pass-2 episode-level fallback wiring (ADR-0020, issue #178).
 
 Covers the honest behaviours the fallback depends on: pack-first precedence (Pass 2
 never runs while Pass 1 can still grab a pack), the TMDB target-unknown fall-through

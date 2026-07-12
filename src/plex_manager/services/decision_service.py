@@ -229,7 +229,7 @@ async def preview_episode_fallback(
     season: int,
     missing_episodes: frozenset[int],
 ) -> DecisionResult:
-    """Pass-2 episode-level fallback search (ADR-0018, issue #178).
+    """Pass-2 episode-level fallback search (ADR-0020, issue #178).
 
     Only called by the auto-grab worker when Pass 1 (:func:`preview` with the
     derived ``prefer_season_pack=True``) found ZERO acceptable season packs THIS

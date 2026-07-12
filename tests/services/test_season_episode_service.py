@@ -1,5 +1,5 @@
 """``season_episode_service`` -- refresh_target / compute_missing / apply_import /
-reconcile_airing (ADR-0018, issue #178).
+reconcile_airing (ADR-0020, issue #178).
 
 Mirrors ``test_season_request_service.py``'s ``sessionmaker_`` fixture pattern.
 """

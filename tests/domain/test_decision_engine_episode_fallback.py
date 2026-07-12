@@ -1,4 +1,4 @@
-"""Decision-engine tests for the Pass-2 episode-fallback gate (issue #178, ADR-0018).
+"""Decision-engine tests for the Pass-2 episode-fallback gate (issue #178, ADR-0020).
 
 Mirrors ``test_decision_engine.py``'s fake-parser pattern (no guessit) and
 exercises ``decide(..., episode_subset=...)`` in isolation from the

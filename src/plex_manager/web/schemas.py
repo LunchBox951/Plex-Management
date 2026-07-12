@@ -844,7 +844,7 @@ class SeasonStatus(BaseModel):
     status: str
     installed_quality_id: int | None = None
     installed_profile_index: int | None = None
-    # Episode-level fallback progress (ADR-0018, issue #178): "N/M episodes"
+    # Episode-level fallback progress (ADR-0020, issue #178): "N/M episodes"
     # while a whole-season request is being assembled from a mix of
     # pack/episode grabs. Both ``None`` for a season with no tracked
     # ``season_episode_states`` rows (a movie's season -- never happens -- or a

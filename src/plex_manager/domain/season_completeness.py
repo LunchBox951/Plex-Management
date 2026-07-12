@@ -1,4 +1,4 @@
-"""Episode-level completeness for a whole-season TV request (ADR-0018).
+"""Episode-level completeness for a whole-season TV request (ADR-0020).
 
 The season-pack-only gate (``decision_engine.decide``'s ``prefer_season_pack``,
 issue #167) permanently rejects any non-pack release for a whole-season request —

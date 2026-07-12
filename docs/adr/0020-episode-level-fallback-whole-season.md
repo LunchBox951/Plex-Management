@@ -1,4 +1,4 @@
-# ADR-0018: Episode-level fallback for whole-season TV requests
+# ADR-0020: Episode-level fallback for whole-season TV requests
 
 - **Status:** Accepted
 - **Date:** 2026-07-11

@@ -160,7 +160,7 @@ class DownloadHistoryEvent(StrEnum):
 
 
 class EpisodeState(StrEnum):
-    """One episode's collection state within a whole-season fallback (ADR-0018).
+    """One episode's collection state within a whole-season fallback (ADR-0020).
 
     ``pending`` -> ``grabbed`` (a fallback release covering it was grabbed) ->
     ``imported`` (the episode file was placed). A row is only ever created for an
@@ -498,7 +498,7 @@ class SeasonRequest(Base):
 
 
 class SeasonEpisodeState(Base):
-    """One aired episode's collection state for the episode-level fallback (ADR-0018).
+    """One aired episode's collection state for the episode-level fallback (ADR-0020).
 
     One row per *aired* episode of a whole-season request (issue #178): the
     episode-fallback (Pass 2 of the auto-grab cycle) reads/writes this table to

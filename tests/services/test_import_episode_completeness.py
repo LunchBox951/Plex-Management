@@ -1,4 +1,4 @@
-"""``_import_tv_locked``'s conditional completeness (ADR-0018, issue #178).
+"""``_import_tv_locked``'s conditional completeness (ADR-0020, issue #178).
 
 Covers the episode-level fallback's import-side half: a season whose target is
 known (``season_episode_states`` was seeded, e.g. by auto-grab's Pass-2 fallback)

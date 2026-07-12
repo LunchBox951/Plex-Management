@@ -89,7 +89,7 @@ class TvMetadata(BaseModel):
 class EpisodeInfo(BaseModel):
     """One episode of a TV season: its number and (if known) air date.
 
-    Used by the episode-level fallback (ADR-0018, issue #178) to compute the
+    Used by the episode-level fallback (ADR-0020, issue #178) to compute the
     aired-episode target set. ``air_date`` is ``None`` when TMDB hasn't dated the
     episode yet -- treated by the domain as "not yet aired", never guessed.
     """
@@ -143,6 +143,6 @@ class MetadataPort(Protocol):
 
         Raises on a TMDB outage/error (never returns a silently-empty list to mean
         "unreachable") -- the caller treats a raise as "target unknown this
-        cycle" and retries later; it must never guess an empty target (ADR-0018).
+        cycle" and retries later; it must never guess an empty target (ADR-0020).
         """
         raise NotImplementedError

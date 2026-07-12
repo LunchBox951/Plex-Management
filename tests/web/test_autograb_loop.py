@@ -224,7 +224,7 @@ async def test_autograb_wires_tmdb_into_the_episode_fallback(
     sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_autograb_once`` resolves TMDB best-effort and threads it into
-    ``run_grab_cycle`` (ADR-0018, issue #178): with TMDB configured and no season
+    ``run_grab_cycle`` (ADR-0020, issue #178): with TMDB configured and no season
     pack available, a whole-season TV scope reaches the Pass-2 episode-level
     fallback and grabs the missing episode."""
     tmdb_id = 611

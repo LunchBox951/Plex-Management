@@ -112,7 +112,7 @@ describe('Requests — per-season status list', () => {
   })
 })
 
-describe('Requests — episode-fallback "N/M" badge (ADR-0018, issue #178)', () => {
+describe('Requests — episode-fallback "N/M" badge (ADR-0020, issue #178)', () => {
   it('renders "S1 2/3" when a season is partially imported', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: {

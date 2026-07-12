@@ -426,7 +426,7 @@ class TmdbMetadata:
         A 404 here means the season/route is wrong (bad tmdb id, season that
         doesn't exist for this show, or an API mismatch) -- NOT "no episodes" --
         so it is surfaced as ``TmdbApiError`` (issue #89 pattern), never silently
-        mapped to an empty list. Callers (ADR-0018) treat any raise as "target
+        mapped to an empty list. Callers (ADR-0020) treat any raise as "target
         unknown this cycle" and retry later.
         """
         cache_key = f"{tmdb_id}:{season_number}"
