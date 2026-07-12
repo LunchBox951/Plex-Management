@@ -1,29 +1,61 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AuthMeResponse } from '../api/types'
-import { useAuthMe, useLogout } from '../api/hooks'
+import { useAuthMe, useLogout, useRequests } from '../api/hooks'
+import type { AuthMeResponse, RequestListResponse, RequestResponse } from '../api/types'
 import { Layout } from './Layout'
 
 type MockAuth = { data: AuthMeResponse }
+type MockRequests = { data: RequestListResponse | undefined; isError?: boolean }
 
 const h = vi.hoisted(
-  (): { logout: ReturnType<typeof vi.fn>; auth: MockAuth } => ({
+  (): {
+    logout: ReturnType<typeof vi.fn>
+    auth: MockAuth
+    requests: MockRequests
+  } => ({
     logout: vi.fn(),
     auth: {
       data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
     },
+    requests: { data: { requests: [] } },
   }),
 )
 
 vi.mock('../api/hooks', () => ({
   useLogout: vi.fn(() => ({ mutateAsync: h.logout, isPending: false })),
   useAuthMe: vi.fn(() => h.auth),
+  useRequests: vi.fn(() => h.requests),
 }))
 
 vi.mock('./HealthDot', () => ({
   HealthDot: () => <div>Health</div>,
 }))
+
+function requestRow(id: number, status: string): RequestResponse {
+  return {
+    id,
+    tmdb_id: id,
+    media_type: 'movie',
+    title: `Request ${id}`,
+    status,
+    is_anime: false,
+    keep_forever: false,
+  }
+}
+
+function setRequests(data: RequestListResponse | undefined, isError = false) {
+  h.requests = { data, isError }
+  vi.mocked(useRequests).mockReturnValue(h.requests as never)
+}
+
+function renderAt(path = '/') {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <Layout />
+    </MemoryRouter>,
+  )
+}
 
 describe('Layout', () => {
   beforeEach(() => {
@@ -34,17 +66,40 @@ describe('Layout', () => {
       data: { authenticated: true, auth_method: 'plex_session', is_admin: true, user: null },
     }
     vi.mocked(useAuthMe).mockReturnValue(h.auth as never)
+    setRequests({ requests: [] })
+    vi.mocked(useRequests).mockClear()
   })
 
-  it('revokes the current session from the header', () => {
-    render(<Layout />, { wrapper: MemoryRouter })
+  it('renders labelled user and administration navigation zones for admins', () => {
+    renderAt()
 
-    fireEvent.click(screen.getByRole('button', { name: /sign out/i }))
+    const userNav = screen.getByRole('navigation', { name: 'User' })
+    expect(within(userNav).getByRole('link', { name: 'Discover' })).toBeInTheDocument()
+    expect(within(userNav).getByRole('link', { name: 'Requests' })).toBeInTheDocument()
 
-    expect(h.logout).toHaveBeenCalledTimes(1)
+    const adminNav = screen.getByRole('navigation', { name: 'Administration' })
+    for (const label of ['Queue', 'Status', 'Logs', 'Settings', 'Blocklist']) {
+      expect(within(adminNav).getByRole('link', { name: label })).toBeInTheDocument()
+    }
+    expect(screen.getAllByRole('separator')).toHaveLength(1)
   })
 
-  it('hides admin navigation for shared Plex users', () => {
+  it('uses separate active treatments for user and administration links', () => {
+    const view = renderAt('/requests')
+
+    const requestsLink = screen.getByRole('link', { name: 'Requests' })
+    expect(requestsLink).toHaveClass('bg-white/8', 'text-ink')
+    expect(requestsLink).toHaveAttribute('aria-current', 'page')
+
+    view.unmount()
+    renderAt('/status')
+
+    const statusLink = screen.getByRole('link', { name: 'Status' })
+    expect(statusLink).toHaveClass('bg-gold/12', 'text-gold')
+    expect(statusLink).toHaveAttribute('aria-current', 'page')
+  })
+
+  it('shows only the user zone and a non-interactive health indicator to shared Plex users', () => {
     h.auth = {
       data: {
         authenticated: true,
@@ -55,14 +110,80 @@ describe('Layout', () => {
     }
     vi.mocked(useAuthMe).mockReturnValue(h.auth as never)
 
-    render(<Layout />, { wrapper: MemoryRouter })
+    renderAt()
 
-    expect(screen.getByRole('link', { name: 'Discover' })).toBeInTheDocument()
+    const userNav = screen.getByRole('navigation', { name: 'User' })
+    expect(within(userNav).getByRole('link', { name: 'Discover' })).toBeInTheDocument()
+    expect(within(userNav).getByRole('link', { name: 'Requests' })).toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Administration' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('separator')).not.toBeInTheDocument()
+    for (const label of ['Queue', 'Status', 'Logs', 'Settings', 'Blocklist']) {
+      expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument()
+    }
+    expect(screen.getByText('Health').closest('a')).toBeNull()
+  })
+
+  it('counts only request statuses that need attention and keeps stale data visible on error', () => {
+    setRequests(
+      {
+        requests: [
+          requestRow(1, 'searching'),
+          requestRow(2, 'downloading'),
+          requestRow(3, 'no_acceptable_release'),
+          requestRow(4, 'pending'),
+          requestRow(5, 'waiting_for_air_date'),
+          requestRow(6, 'completed'),
+          requestRow(7, 'import_blocked'),
+          requestRow(8, 'available'),
+          requestRow(9, 'partially_available'),
+          requestRow(10, 'failed'),
+          requestRow(11, 'cancelled'),
+          requestRow(12, 'evicted'),
+        ],
+      },
+      true,
+    )
+
+    renderAt('/requests')
+
+    const requestsLink = screen.getByRole('link', {
+      name: 'Requests, 3 active requests',
+    })
+    expect(within(requestsLink).getByText('3').parentElement).toHaveClass(
+      'bg-gold',
+      'text-gold-ink',
+    )
+    expect(useRequests).toHaveBeenCalledWith({ poll: true })
+  })
+
+  it('hides the request badge while unresolved and when the resolved count is zero', () => {
+    setRequests(undefined)
+    const view = renderAt('/requests')
+
+    expect(screen.queryByText(/active requests?/)).not.toBeInTheDocument()
+
+    view.unmount()
+    setRequests({ requests: [requestRow(1, 'pending')] })
+    renderAt('/requests')
+
+    expect(screen.queryByText(/active requests?/)).not.toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Requests' })).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Queue' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Status' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Logs' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Blocklist' })).not.toBeInTheDocument()
+  })
+
+  it('links the health indicator to Status for admins', () => {
+    renderAt()
+
+    const healthLink = screen.getByRole('link', { name: 'Open system status: Health' })
+    expect(healthLink).toHaveAttribute('href', '/status')
+    expect(healthLink).toHaveAttribute('title', 'Open system status')
+    expect(healthLink).toHaveClass('min-h-6', 'focus-visible:ring-2')
+  })
+
+  it('revokes the current session from the header', () => {
+    renderAt()
+
+    fireEvent.click(screen.getByRole('button', { name: /sign out/i }))
+
+    expect(h.logout).toHaveBeenCalledTimes(1)
   })
 })
