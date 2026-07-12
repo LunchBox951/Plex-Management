@@ -66,6 +66,7 @@ from plex_manager.web.deps import (
     get_eviction_proactive_enabled,
     get_filesystem,
     get_library_optional,
+    get_log_max_rows,
     get_log_retention_days,
     get_media_probe,
     get_movies_root_optional,
@@ -431,7 +432,8 @@ async def _autograb_loop(app: FastAPI) -> None:
 
 async def _log_drain_loop(app: FastAPI) -> None:
     """Sibling background task (own interval) draining the log-capture queue into
-    ``log_events``, and periodically pruning past ``log_retention_days``.
+    ``log_events``, and periodically pruning past ``log_retention_days`` AND
+    beyond the ``log_max_rows`` row-count cap (issue #152).
 
     Reads ``app.state.log_handler`` (set by :func:`lifespan`) for the queue the
     synchronous :class:`~plex_manager.services.log_capture_service.
@@ -474,14 +476,18 @@ async def _log_drain_loop(app: FastAPI) -> None:
                     >= log_capture_service.LOG_PRUNE_INTERVAL_SECONDS
                 ):
                     retention_days = await get_log_retention_days(session)
-                    pruned = await log_capture_service.prune_once(repo, retention_days)
+                    max_rows = await get_log_max_rows(session)
+                    pruned = await log_capture_service.prune_once(
+                        repo, retention_days, max_rows=max_rows
+                    )
                     await session.commit()
                     last_pruned_at = time.monotonic()
                     if pruned:
                         _logger.info(
-                            "pruned %d log_events row(s) older than %d day(s)",
+                            "pruned %d log_events row(s) older than %d day(s) or beyond %d row(s)",
                             pruned,
                             retention_days,
+                            max_rows,
                         )
         except Exception:
             _logger.exception("log drain/prune tick failed; continuing")

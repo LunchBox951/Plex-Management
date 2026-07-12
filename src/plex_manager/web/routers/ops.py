@@ -19,7 +19,9 @@ Every endpoint here is read-only or an idempotent operator action; none of them
 ever return a secret (subsystem ``detail`` strings and log messages carry
 whatever a call site already chose to log — see ``log_capture_service``'s
 module docstring on why that discipline lives upstream of this router, not in
-it).
+it). ``GET /logs/export`` additionally re-applies ``logsafe.redact_secrets``
+to every message as a second, independent redaction pass (issue #153) — see
+that endpoint's own docstring.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.logsafe import redact_secrets
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service
@@ -317,6 +320,14 @@ async def export_logs_endpoint(
     ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
     straight to this URL downloads a file; a caller reading the body via
     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+
+    Every message is passed through :func:`~plex_manager.logsafe.
+    redact_secrets` again here (issue #153) as a SECOND, independent line of
+    defense on top of the capture-time pass (``log_capture_service._capture``)
+    -- this is the boundary the blueprint explicitly calls out ("the log store
+    never records a secret"), and a row written before this redaction pass
+    existed, or by any future path that bypasses the capture pipeline, must
+    still never leave this endpoint carrying one.
     """
     repo = SqlLogEventRepository(session)
     if correlation_id is not None:
@@ -344,7 +355,7 @@ async def export_logs_endpoint(
                     created_at=e.created_at,
                     level=e.level,
                     logger=e.logger,
-                    message=e.message,
+                    message=redact_secrets(e.message),
                     context=e.context,
                 )
                 for e in events
@@ -352,7 +363,10 @@ async def export_logs_endpoint(
         )
         return JSONResponse(content=body.model_dump(mode="json"), headers=headers)
 
-    lines = [f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {e.message}" for e in events]
+    lines = [
+        f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {redact_secrets(e.message)}"
+        for e in events
+    ]
     if truncated:
         dropped = page.total - len(page.results)
         lines.append(

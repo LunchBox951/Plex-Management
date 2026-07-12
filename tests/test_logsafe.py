@@ -17,7 +17,7 @@ import re
 
 import pytest
 
-from plex_manager.logsafe import safe_guid, safe_int, safe_text
+from plex_manager.logsafe import redact_secrets, safe_guid, safe_int, safe_text
 
 
 def _sha12(value: str) -> str:
@@ -280,3 +280,158 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
     become a throw or a verbatim-passthrough bypass."""
     raw = "https://tracker.example.org/x?passkey=S\ud800ECRET"
     assert safe_guid(raw) == f"tracker.example.org#{_sha12(raw)}"
+
+
+# --------------------------------------------------------------------------- #
+# redact_secrets (issue #153): defense-in-depth redaction over a fully-rendered
+# log line, applied at capture time and again at the export boundary. Every
+# fixture secret below is an obviously-fake literal (never a real credential),
+# so asserting ``secret not in result`` -- which pytest's assertion rewriting
+# would otherwise echo on a failure -- never actually risks logging a real
+# secret in a test's own failure output (mirrors the existing ``safe_guid``
+# tests' identical convention above).
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("raw", "secret", "expected"),
+    [
+        # TMDB-shaped: api_key as a URL query parameter -- the httpx INFO log
+        # line shape this whole issue exists to catch.
+        (
+            "GET https://api.themoviedb.org/3/movie/603?api_key=FAKEAPIKEY123456&language=en-US",
+            "FAKEAPIKEY123456",
+            "GET https://api.themoviedb.org/3/movie/603?api_key=<redacted>&language=en-US",
+        ),
+        # Prowlarr-shaped: X-Api-Key as a plain header line (no quotes). The
+        # hyphenated prefix ``X-Api-`` is untouched text; only the "Key" word
+        # the alternation matches plus its value are replaced.
+        (
+            "X-Api-Key: FAKEPROWLARRKEY99",
+            "FAKEPROWLARRKEY99",
+            "X-Api-Key: <redacted>",
+        ),
+        # Prowlarr-shaped: X-Api-Key inside a dict-repr headers dump.
+        (
+            "sending request headers={'Accept': 'json', 'X-Api-Key': 'FAKEPROWLARRKEY99'}",
+            "FAKEPROWLARRKEY99",
+            "sending request headers={'Accept': 'json', 'X-Api-Key': '<redacted>'}",
+        ),
+        # Plex-shaped: X-Plex-Token as a header.
+        (
+            "X-Plex-Token: FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "X-Plex-Token: <redacted>",
+        ),
+        # Plex-shaped: X-Plex-Token riding a URL query parameter (some Plex
+        # media/transcode urls carry the token this way instead of a header).
+        (
+            "GET https://plex.example.com/library/sections?X-Plex-Token=FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "GET https://plex.example.com/library/sections?X-Plex-Token=<redacted>",
+        ),
+        # qBittorrent-shaped: password in a form/dict login payload -- the
+        # username stays visible (debuggability), only the password is masked.
+        (
+            "POST /api/v2/auth/login data={'username': 'admin', 'password': 'FAKEQBTPASSWORD1'}",
+            "FAKEQBTPASSWORD1",
+            "POST /api/v2/auth/login data={'username': 'admin', 'password': '<redacted>'}",
+        ),
+        # A generic bearer-style access token query param.
+        (
+            "refreshing session: access_token=FAKEACCESSTOKEN123456&expires_in=3600",
+            "FAKEACCESSTOKEN123456",
+            "refreshing session: access_token=<redacted>&expires_in=3600",
+        ),
+        # A generic "secret" key.
+        (
+            "loaded webhook secret=FAKEWEBHOOKSECRET99",
+            "FAKEWEBHOOKSECRET99",
+            "loaded webhook secret=<redacted>",
+        ),
+    ],
+)
+def test_redact_secrets_masks_key_value_shaped_secrets(
+    raw: str, secret: str, expected: str
+) -> None:
+    result = redact_secrets(raw)
+    assert result == expected
+    assert secret not in result
+
+
+def test_redact_secrets_masks_basic_auth_url_password() -> None:
+    raw = "connecting to https://tracker_user:FAKEURLPASSWORD1@tracker.example.com/announce"
+    result = redact_secrets(raw)
+    assert result == "connecting to https://tracker_user:<redacted>@tracker.example.com/announce"
+    assert "FAKEURLPASSWORD1" not in result
+    assert "tracker_user" in result  # the account name stays diagnosable
+    assert "tracker.example.com" in result  # the host stays diagnosable
+
+
+@pytest.mark.parametrize(
+    ("scheme_word", "token"),
+    [
+        ("Bearer", "FAKEBEARERTOKEN.abc.def"),
+        ("Basic", "ZmFrZTpjcmVkZW50aWFs"),
+    ],
+)
+def test_redact_secrets_masks_the_whole_authorization_value(scheme_word: str, token: str) -> None:
+    """Authorization values carry an internal SPACE (scheme + token) that the
+    generic single-token value capture would only partially mask -- this must
+    redact the ENTIRE value, not just leave the scheme word exposed and the
+    token behind it untouched."""
+    raw = f"Authorization: {scheme_word} {token}"
+    result = redact_secrets(raw)
+    assert result == "Authorization: <redacted>"
+    assert token not in result
+    assert scheme_word not in result
+
+
+def test_redact_secrets_masks_a_fernet_key_shaped_blob_regardless_of_context() -> None:
+    """The Fernet key has no "key name" attached in a log line at all (it is
+    loaded from a file) -- it must still be caught, on SHAPE alone."""
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    raw = f"generated a new encryption key at startup: {key}"
+    result = redact_secrets(raw)
+    assert key not in result
+    assert "<redacted-fernet-key>" in result
+    assert "generated a new encryption key at startup" in result
+
+
+def test_redact_secrets_does_not_mangle_an_unrelated_44_char_token() -> None:
+    """A 44-char run that is NOT base64-shaped (contains a character outside the
+    urlsafe-base64 alphabet, or has no trailing ``=``) must survive untouched --
+    the Fernet pattern is deliberately shape-EXACT, not "roughly 44 chars"."""
+    not_fernet_shaped = "x" * 44  # no trailing '=' pad
+    assert redact_secrets(f"id={not_fernet_shaped}") == f"id={not_fernet_shaped}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "reconcile tick completed in 1.23s",
+        "auto-grab cycle summary: attempted=3 granted=2 source_failures=1",
+        "grab failed for request 42: HTTP 503 Service Unavailable",
+        "pruned 12 log_events row(s) older than 7 day(s) or beyond 100000 row(s)",
+        "TMDB request failed: GET /movie/603 (HTTP 429)",
+        # An already-safe_guid-redacted value must pass through unchanged --
+        # no accidental re-match of its hash-suffix shape.
+        "release guid: tracker.example.org#a1b2c3d4e5f6",
+        # A benign field whose name merely CONTAINS one of the secret roots as
+        # a substring, not a whole word, must not be treated as a secret key.
+        "tokenizer initialized with vocab_size=32000",
+    ],
+)
+def test_redact_secrets_leaves_known_good_lines_unmangled(line: str) -> None:
+    assert redact_secrets(line) == line
+
+
+def test_redact_secrets_is_a_noop_on_empty_string() -> None:
+    assert redact_secrets("") == ""
+
+
+def test_redact_secrets_never_raises_on_malformed_input() -> None:
+    # Odd-but-plausible malformed inputs: an unterminated quote, a lone '=' at
+    # the end of the string right after a secret-shaped key name.
+    for raw in ("password='unterminated", "token=", "api_key", "://:@"):
+        redact_secrets(raw)  # must not raise

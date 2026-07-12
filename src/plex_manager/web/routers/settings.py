@@ -43,6 +43,7 @@ from plex_manager.web.deps import (
     EVICTION_GRACE_DAYS_DEFAULT,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     EVICTION_PROACTIVE_ENABLED_DEFAULT,
+    LOG_MAX_ROWS_DEFAULT,
     LOG_RETENTION_DAYS_DEFAULT,
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
@@ -63,6 +64,7 @@ from plex_manager.web.deps import (
     resolve_disk_pressure_percents,
     resolve_eviction_grace_days,
     resolve_eviction_interval_minutes,
+    resolve_log_max_rows,
     resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
@@ -286,6 +288,11 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
     retention, retention_honored = resolve_log_retention_days(raw.get("log_retention_days"))
     out["log_retention_days"] = _present_effective(
         raw.get("log_retention_days"), retention, LOG_RETENTION_DAYS_DEFAULT, retention_honored
+    )
+
+    max_rows, max_rows_honored = resolve_log_max_rows(raw.get("log_max_rows"))
+    out["log_max_rows"] = _present_effective(
+        raw.get("log_max_rows"), max_rows, LOG_MAX_ROWS_DEFAULT, max_rows_honored
     )
 
     for key, default in _BOOL_SETTING_DEFAULTS.items():

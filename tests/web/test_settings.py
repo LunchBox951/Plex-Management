@@ -31,6 +31,8 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MAX_MINUTES,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     KNOWN_SETTING_KEYS,
+    LOG_MAX_ROWS_DEFAULT,
+    LOG_MAX_ROWS_MAX,
     LOG_RETENTION_DAYS_DEFAULT,
     LOG_RETENTION_DAYS_MAX,
     PLEX_MACHINE_ID_SETTING,
@@ -47,6 +49,7 @@ from plex_manager.web.deps import (
     get_eviction_grace_days,
     get_eviction_interval_minutes,
     get_eviction_proactive_enabled,
+    get_log_max_rows,
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
@@ -70,7 +73,11 @@ _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "disk_pressure_target_percent",
     "eviction_interval_minutes",
 )
-_INT_TYPED_SETTING_KEYS: tuple[str, ...] = ("eviction_grace_days", "log_retention_days")
+_INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
+    "eviction_grace_days",
+    "log_retention_days",
+    "log_max_rows",
+)
 _BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -1412,6 +1419,7 @@ async def test_put_round_trips_operability_settings(
         "eviction_proactive_enabled": True,
         "eviction_interval_minutes": 45,
         "log_retention_days": 3,
+        "log_max_rows": 50_000,
     }
     put = await client.put("/api/v1/settings", json=update, headers=headers)
     assert put.status_code == 200
@@ -1423,6 +1431,7 @@ async def test_put_round_trips_operability_settings(
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
     assert body["log_retention_days"] == 3
+    assert body["log_max_rows"] == 50_000
 
     # GET reflects the identical stored values.
     got = (await client.get("/api/v1/settings", headers=headers)).json()
@@ -1439,6 +1448,7 @@ async def test_put_round_trips_operability_settings(
         assert await get_eviction_proactive_enabled(session) is True
         assert await get_eviction_interval_minutes(session) == 45.0
         assert await get_log_retention_days(session) == 3
+        assert await get_log_max_rows(session) == 50_000
 
 
 async def test_put_rejects_out_of_range_operability_settings(
@@ -1467,6 +1477,13 @@ async def test_put_rejects_out_of_range_operability_settings(
         headers=headers,
     )
     assert negative_days.status_code == 422
+
+    negative_max_rows = await client.put(
+        "/api/v1/settings",
+        json={"log_max_rows": -1},
+        headers=headers,
+    )
+    assert negative_max_rows.status_code == 422
 
 
 async def test_put_single_field_threshold_below_stored_target_rejects_and_does_not_persist(
@@ -1560,6 +1577,7 @@ def test_settings_update_rejects_non_finite_interval() -> None:
         ("disk_pressure_threshold_percent", float("nan")),
         ("eviction_grace_days", EVICTION_GRACE_DAYS_MAX + 1),
         ("log_retention_days", LOG_RETENTION_DAYS_MAX + 1),
+        ("log_max_rows", LOG_MAX_ROWS_MAX + 1),
     ],
 )
 async def test_put_rejects_non_finite_and_overflow_operability_settings(
@@ -1631,6 +1649,7 @@ async def test_put_accepts_upper_bound_operability_settings(
         "eviction_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
         "eviction_grace_days": EVICTION_GRACE_DAYS_MAX,
         "log_retention_days": LOG_RETENTION_DAYS_MAX,
+        "log_max_rows": LOG_MAX_ROWS_MAX,
     }
 
     put = await client.put("/api/v1/settings", json=update, headers=headers)
@@ -1639,6 +1658,7 @@ async def test_put_accepts_upper_bound_operability_settings(
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+    assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
 
     got = (await client.get("/api/v1/settings", headers=headers)).json()
     assert got == body
@@ -1647,6 +1667,7 @@ async def test_put_accepts_upper_bound_operability_settings(
         assert await get_eviction_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
         assert await get_eviction_grace_days(session) == EVICTION_GRACE_DAYS_MAX
         assert await get_log_retention_days(session) == LOG_RETENTION_DAYS_MAX
+        assert await get_log_max_rows(session) == LOG_MAX_ROWS_MAX
 
 
 @pytest.mark.parametrize("stored", ["inf", "nan", "-inf"])
@@ -1760,6 +1781,39 @@ async def test_get_log_retention_days_degrades_negative_or_overflow(
         assert "log_retention_days" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected", "degraded"),
+    [
+        # Negative -> default (0 rows kept is the destructive end of the
+        # scale -- never what a corrupt value should silently mean).
+        ("-1", LOG_MAX_ROWS_DEFAULT, True),
+        # Above the cap: CLAMPED (mirrors the day-count settings) -- a
+        # pre-bounds huge value meant "keep effectively everything".
+        (str(LOG_MAX_ROWS_MAX + 1), LOG_MAX_ROWS_MAX, True),
+        ("5000", 5000, False),
+        ("abc", LOG_MAX_ROWS_DEFAULT, True),
+    ],
+)
+async def test_get_log_max_rows_degrades_negative_or_overflow(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+    degraded: bool,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("log_max_rows", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_log_max_rows(session)
+
+    assert value == expected
+    if degraded:
+        assert "log_max_rows" in caplog.text
+
+
 async def test_get_settings_does_not_500_on_non_finite_stored_interval(
     client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
@@ -1781,6 +1835,7 @@ async def test_get_settings_does_not_500_on_non_finite_stored_interval(
         ("disk_pressure_threshold_percent", "not-a-number"),
         ("eviction_grace_days", "1.5"),
         ("log_retention_days", "abc"),
+        ("log_max_rows", "abc"),
         ("eviction_enabled", "maybe"),
         ("eviction_interval_minutes", "inf"),
     ],
@@ -1821,6 +1876,7 @@ async def test_get_settings_preserves_valid_typed_values(
         "eviction_proactive_enabled": "true",
         "eviction_interval_minutes": "45.0",
         "log_retention_days": "3",
+        "log_max_rows": "50000",
     }
     async with sessionmaker_() as session:
         store = SettingsStore(session)
@@ -1838,6 +1894,7 @@ async def test_get_settings_preserves_valid_typed_values(
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
     assert body["log_retention_days"] == 3
+    assert body["log_max_rows"] == 50000
 
 
 @pytest.mark.parametrize(
@@ -1861,6 +1918,7 @@ async def test_get_settings_preserves_valid_typed_values(
         ("disk_pressure_target_percent", "-1", None),  # default 80 (<= default threshold 90)
         ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX),
         ("log_retention_days", str(LOG_RETENTION_DAYS_MAX + 1), LOG_RETENTION_DAYS_MAX),
+        ("log_max_rows", str(LOG_MAX_ROWS_MAX + 1), LOG_MAX_ROWS_MAX),
     ],
 )
 async def test_get_settings_presents_finite_out_of_range_typed_values_as_effective(
@@ -1904,6 +1962,7 @@ async def test_get_settings_preserves_boundary_typed_values(
         "eviction_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),  # le, inclusive
         "eviction_grace_days": str(EVICTION_GRACE_DAYS_MAX),
         "log_retention_days": str(LOG_RETENTION_DAYS_MAX),
+        "log_max_rows": str(LOG_MAX_ROWS_MAX),
     }
     async with sessionmaker_() as session:
         store = SettingsStore(session)
@@ -1919,6 +1978,7 @@ async def test_get_settings_preserves_boundary_typed_values(
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
+    assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
 
 
 # --------------------------------------------------------------------------- #

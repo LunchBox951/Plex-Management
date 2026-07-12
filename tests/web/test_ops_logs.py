@@ -288,3 +288,52 @@ async def test_export_json_truncation_reports_total_and_keeps_oldest(
     body = response.json()
     assert body["total"] == 3
     assert [e["message"] for e in body["events"]] == ["root", "middle"]
+
+
+# --------------------------------------------------------------------------- #
+# GET /logs/export secret redaction (issue #153) — a SECOND, independent
+# redaction pass on top of capture-time redaction. ``_insert_event`` writes
+# straight to the ``log_events`` table via the ORM, bypassing the capture
+# pipeline entirely, so these prove the export endpoint's OWN pass catches a
+# secret-shaped message regardless of how it got into the store (a row
+# written before this redaction existed, or any future path that bypasses
+# ``log_capture_service._capture``). Every fixture secret is an obviously-fake
+# literal (never a real credential).
+# --------------------------------------------------------------------------- #
+async def test_export_text_redacts_a_secret_shaped_stored_message(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message="X-Api-Key: FAKEEXPORTKEY123",
+        created_at=_NOW,
+    )
+
+    response = await client.get("/api/v1/ops/logs/export", headers=_HEADERS)
+    assert response.status_code == 200
+    assert "FAKEEXPORTKEY123" not in response.text
+    assert "X-Api-Key: <redacted>" in response.text
+
+
+async def test_export_json_redacts_a_secret_shaped_stored_message(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message="qbittorrent login data={'username': 'admin', 'password': 'FAKEEXPORTPW1'}",
+        created_at=_NOW,
+    )
+
+    response = await client.get(
+        "/api/v1/ops/logs/export", params={"format": "json"}, headers=_HEADERS
+    )
+    assert response.status_code == 200
+    body = response.json()
+    message = body["events"][0]["message"]
+    assert "FAKEEXPORTPW1" not in message
+    assert "'password': '<redacted>'" in message
+    assert response.text.count("FAKEEXPORTPW1") == 0  # never in the raw response body either

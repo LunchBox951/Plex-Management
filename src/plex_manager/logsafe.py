@@ -124,3 +124,153 @@ def safe_guid(value: str) -> str:
     if not _SAFE_GUID_LABEL_RE.fullmatch(label):
         label = ""  # a label is emitted validated or not at all (see contract)
     return f"{label}#{digest}"
+
+
+# --------------------------------------------------------------------------- #
+# redact_secrets (issue #153): a defense-in-depth, post-hoc redaction pass over
+# a FULLY-RENDERED log line, applied at capture time (``log_capture_service.
+# _capture``) and again at the ``/ops/logs/export`` boundary. The helpers above
+# are call-site barriers -- they only protect a value a call site remembers to
+# route through them. ``redact_secrets`` is the backstop for the case that
+# discipline misses: a message string assembled elsewhere (a third-party
+# library's own log line, a forgotten call site, a future adapter) that
+# happens to carry one of THIS app's real secret shapes -- the credentials
+# ``config.py`` documents plus the ones the setup wizard stores encrypted (Plex
+# token, Prowlarr/TMDB api keys, qBittorrent password), and the Fernet
+# encryption key protecting them at rest.
+#
+# Deliberately regex-based and KEY-NAME-driven, never a denylist of specific
+# services: every adapter in this codebase sends its secret as one of a small
+# set of shapes --
+#   * a query-string parameter (TMDB's ``api_key``, an X-Plex-Token carried on
+#     a URL rather than a header),
+#   * an HTTP header value (Prowlarr's ``X-Api-Key``, Plex's ``X-Plex-Token``,
+#     a bearer/basic ``Authorization``),
+#   * HTTP basic-auth userinfo (``scheme://user:pass@host``),
+#   * a bare form/dict field (qBittorrent's login ``password``),
+#   * or -- for the Fernet key specifically -- a standalone base64 blob with no
+#     key name attached at all.
+# Matching by KEY NAME (whatever separates it from its value: ``:``/``=``,
+# optionally quoted) generalizes across all four services and any future one
+# without a per-adapter rule, and is CONSERVATIVE the way the task requires:
+# the key name always survives (debuggability), only the value is masked.
+#
+# Three independent passes, applied in sequence (each is a total no-op on text
+# it finds nothing to redact in, so the order between the first two never
+# matters -- they match disjoint key vocabularies):
+#
+# 1. Basic-auth URL userinfo (``scheme://user:pass@host``): the PASSWORD half
+#    of ``user:pass@`` is masked; the username and the rest of the url survive
+#    (diagnosable: which url, which account -- never a byte of the password).
+# 2. ``Authorization`` header values specifically: unlike every other secret
+#    key below, an Authorization value routinely carries an internal SPACE
+#    (``Basic <base64>``, ``Bearer <token>``) -- a plain single-token value
+#    capture would only swallow the scheme word and leave the credential
+#    itself exposed. This pass captures the whole ``<scheme> <token>`` (or a
+#    bare token with no scheme) and masks it entirely.
+# 3. Every other secret-key-shaped ``key<sep>value`` pair -- ``api_key``/
+#    ``apikey``, ``access_token``, ``auth_token``, a bare ``token`` (also
+#    matches ``X-Plex-Token``/``X-Api-Key``: the hyphen before the final word
+#    is a non-word boundary, so the alternation matches the LAST word of a
+#    hyphenated header name and the untouched ``X-Plex-``/``X-Api-`` prefix is
+#    simply copied through by ``re.sub`` unmodified), ``password``/``passwd``/
+#    ``pwd``, ``passkey`` (the private-tracker-URL shape ``safe_guid`` already
+#    covers at the call site; this is the same shape's defense-in-depth
+#    backstop), ``secret``. The value capture excludes whitespace/quote/``&``/
+#    ``,``/closing-bracket delimiters, so it never swallows past ONE token --
+#    correct for a query-string ``key=value``, a header ``Key: value``, or a
+#    JSON/dict ``"key": "value"`` entry, all in one pattern.
+#
+# A final, UNCONDITIONAL pass (no key name involved at all) catches a
+# Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
+# ``Fernet.generate_key()`` is always exactly 44 urlsafe-base64 characters
+# ending in one ``=`` pad -- distinctive enough to redact on shape alone, which
+# matters because the key is loaded from a file (``<data_dir>/secret.key``),
+# never assigned a "key name" of its own in a log line to key off of.
+# A regex alternation of secret-bearing KEY NAMES (not a credential itself).
+_SECRET_KEY_PATTERN: Final = (
+    r"api[-_]?key|access[-_]?token|auth[-_]?token|token|"  # noqa: S105
+    r"password|passwd|pwd|passkey|secret"
+)
+
+# ``sep``: an optional quote (closing the key's own quoting in a dict/JSON
+# literal), then MANDATORY ``:``/``=`` (never matches a bare word with no
+# separator at all -- "issued a new token for the user" has no `:`/`=`
+# immediately following "token" and is correctly left untouched), then an
+# optional opening quote for the value.
+_SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*['\"]?"
+# The value itself: any run of characters that is not whitespace, a literal
+# delimiter (`&`, `,`), a quote, or a closing bracket -- i.e. exactly one
+# token, correct for a query-string/header/dict-style single-value secret.
+_VALUE_CHARS: Final = r"[^\s&,'\"}\)\]]+"
+
+_SECRET_KV_RE: Final = re.compile(
+    r"(?i)\b(?:" + _SECRET_KEY_PATTERN + r")\b" + _SEP_PATTERN + r"(?P<value>" + _VALUE_CHARS + r")"
+)
+
+# ``Authorization`` gets its own pattern (see rationale above): the value may
+# be a scheme word plus a token (``Basic``/``Bearer``/``Digest``/``Negotiate``)
+# separated by a SPACE the generic value-capture above would stop at, or a
+# bare scheme-less token.
+_AUTHORIZATION_RE: Final = re.compile(
+    r"(?i)\bauthorization\b"
+    + _SEP_PATTERN
+    + r"(?P<value>(?:Basic|Bearer|Digest|Negotiate)\s+"
+    + _VALUE_CHARS
+    + r"|"
+    + _VALUE_CHARS
+    + r")"
+)
+
+# ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
+# Group 1 captures ``scheme://user`` (stopping the username at the first
+# ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
+# into the output, only its span is consumed so it can be dropped.
+_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]+):[^\s@'\"]+@")
+
+# A standalone Fernet-key-shaped blob: 43 urlsafe-base64 characters plus the
+# one trailing ``=`` pad ``Fernet.generate_key()`` always produces (32 raw
+# bytes base64-encoded), bounded on both sides so it cannot match as a
+# substring of a longer base64/id-shaped run.
+_FERNET_KEY_RE: Final = re.compile(r"(?<![A-Za-z0-9_=+/-])[A-Za-z0-9_-]{43}=(?![A-Za-z0-9_=+/-])")
+
+_REDACTED: Final = "<redacted>"
+
+
+def _mask_value(match: re.Match[str]) -> str:
+    """Replace a ``_SECRET_KV_RE``/``_AUTHORIZATION_RE`` match's ``value`` group
+    with :data:`_REDACTED`, keeping everything else the match consumed (the key
+    name, separator, and any quote) verbatim -- "mask the value, keep the key
+    name for debuggability"."""
+    whole = match.group(0)
+    value_offset = match.start("value") - match.start(0)
+    return whole[:value_offset] + _REDACTED
+
+
+def _mask_basic_auth(match: re.Match[str]) -> str:
+    """Replace a ``_BASIC_AUTH_URL_RE`` match's password with :data:`_REDACTED`,
+    keeping ``scheme://user:`` and the trailing ``@`` -- the account is
+    diagnosable, the credential never is."""
+    return f"{match.group(1)}:{_REDACTED}@"
+
+
+def redact_secrets(text: str) -> str:
+    """Defense-in-depth: mask this app's known secret shapes in *text* before it
+    is ever persisted or exported (issue #153).
+
+    A conservative, total (never raises) regex pass -- see the module-level
+    comment above for the exact shapes covered and why key-name matching
+    generalizes across every adapter (Plex/Prowlarr/TMDB/qBittorrent) without a
+    per-service rule. A line carrying none of these shapes is returned
+    byte-identical; this is a SECOND line of defense behind the call-site
+    barriers above (:func:`safe_guid` etc.), not a replacement for them --
+    call-site discipline still applies, this only catches what discipline
+    misses.
+    """
+    if not text:
+        return text
+    redacted = _BASIC_AUTH_URL_RE.sub(_mask_basic_auth, text)
+    redacted = _AUTHORIZATION_RE.sub(_mask_value, redacted)
+    redacted = _SECRET_KV_RE.sub(_mask_value, redacted)
+    redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
+    return redacted
