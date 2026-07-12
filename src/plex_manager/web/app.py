@@ -71,9 +71,9 @@ from plex_manager.web.deps import (
     get_movies_root_optional,
     get_parser,
     get_prowlarr,
-    get_qbittorrent,
     get_quality_profile,
     get_tv_root_optional,
+    resolve_qbittorrent,
 )
 from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
@@ -216,7 +216,7 @@ async def _reconcile_once(app: FastAPI) -> None:
         # Download-client reconcile + import drain — needs qBittorrent. Skipped
         # when qBittorrent isn't configured.
         try:
-            qbt = await get_qbittorrent(session, client)
+            qbt = await resolve_qbittorrent(app.state, session, client)
         except ServiceNotConfiguredError:
             qbt = None
         if qbt is not None:
@@ -349,7 +349,7 @@ async def _autograb_once(app: FastAPI) -> None:
         # not an error -- exactly the reconcile loop's posture for a missing qBt).
         try:
             prowlarr = await get_prowlarr(session, client)
-            qbt = await get_qbittorrent(session, client)
+            qbt = await resolve_qbittorrent(app.state, session, client)
         except ServiceNotConfiguredError:
             status.mark_ok()
             return

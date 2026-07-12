@@ -125,6 +125,12 @@ class DownloadRecord(BaseModel):
     # original grab time, letting the very next reconcile tick immediately
     # misjudge the brand-new grab as stalled.
     added_at: datetime | None = None
+    # The honest download-phase stall deadline (``downloads.timeout_at``):
+    # ``added_at`` + the phase window for the live raw_state, recomputed each
+    # reconcile cycle. Observability only — ``detect_stalls`` stays anchored on
+    # ``added_at`` and never reads this. Exposed on the read-model so the queue
+    # reconcile can skip a redundant write when the deadline has not moved.
+    timeout_at: datetime | None = None
     download_path: str | None = None
     # The release ("download") title the grab decision picked -- the same value
     # already written to ``DownloadHistory.source_title`` at grab time and used

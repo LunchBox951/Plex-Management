@@ -91,7 +91,9 @@ async def test_reconcile_runs_availability_when_qbittorrent_is_down(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
     )
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return _OutageQbittorrent(outage)
 
     async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
@@ -100,7 +102,7 @@ async def test_reconcile_runs_availability_when_qbittorrent_is_down(
     async def _movies_root(_session: AsyncSession) -> str | None:
         return None  # the import drain is irrelevant; the status poll fails first
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _library)
     monkeypatch.setattr(app_module, "get_movies_root_optional", _movies_root)
 
@@ -171,13 +173,15 @@ async def test_reconcile_imports_when_only_movies_root_unset(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
     )
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return qbt
 
     async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
         return library
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _library)
     # movies_root / tv_root are left to the REAL (optional) dependency, reading
     # from a settings store where neither was ever configured -- both resolve to
@@ -235,13 +239,15 @@ async def test_reconcile_once_heals_db_only_strand_when_qbt_unconfigured(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
     )
 
-    async def _no_qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _no_qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         raise ServiceNotConfiguredError("qbittorrent")
 
     async def _no_library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
         return None
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _no_qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _no_qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _no_library)
 
     try:
@@ -296,13 +302,15 @@ async def test_reconcile_outage_tick_still_heals_db_only_strand(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
     )
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return _OutageQbittorrent(QbittorrentError("qBittorrent request failed"))
 
     async def _no_library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
         return None
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _no_library)
 
     try:
@@ -335,7 +343,9 @@ async def test_reconcile_idle_cycle_does_not_publish_realtime_event(
     phases: list[str] = []
     published: list[tuple[tuple[str, ...], str]] = []
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return qbt
 
     async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
@@ -365,7 +375,7 @@ async def test_reconcile_idle_cycle_does_not_publish_realtime_event(
     def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
         published.append((topics, reason))
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _library)
     monkeypatch.setattr(app_module, "get_movies_root_optional", _root)
     monkeypatch.setattr(app_module, "get_tv_root_optional", _root)
@@ -399,7 +409,9 @@ async def test_reconcile_coalesces_all_reported_changes_into_one_realtime_event(
     library = FakeLibrary()
     published: list[tuple[tuple[str, ...], str]] = []
 
-    async def _qbt(_session: AsyncSession, _client: httpx.AsyncClient) -> DownloadClientPort:
+    async def _qbt(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> DownloadClientPort:
         return qbt
 
     async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
@@ -429,7 +441,7 @@ async def test_reconcile_coalesces_all_reported_changes_into_one_realtime_event(
     def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
         published.append((topics, reason))
 
-    monkeypatch.setattr(app_module, "get_qbittorrent", _qbt)
+    monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_library_optional", _library)
     monkeypatch.setattr(app_module, "get_movies_root_optional", _root)
     monkeypatch.setattr(app_module, "get_tv_root_optional", _root)
