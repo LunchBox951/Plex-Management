@@ -39,6 +39,7 @@ from typing import Final, cast
 
 import httpx
 
+from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
 from plex_manager.headersafe import header_value_error
 
@@ -203,7 +204,11 @@ class ProwlarrIndexer:
         search_timeout: float = _DEFAULT_SEARCH_TIMEOUT,
     ) -> None:
         self._client = client
-        self._base_url = base_url.rstrip("/")
+        try:
+            self._service_url = ServiceUrl.parse(base_url)
+        except InvalidServiceUrl as exc:
+            raise IndexerError("Prowlarr service URL is invalid") from exc
+        self._base_url = self._service_url.base
         self._api_key = api_key
         self._search_timeout = search_timeout
         # indexerId -> priority, resolved from /api/v1/indexer and cached with a
@@ -269,10 +274,11 @@ class ProwlarrIndexer:
         headers = self._auth_headers()
         try:
             response = await self._client.get(
-                f"{self._base_url}{_SEARCH_PATH}",
+                self._service_url.endpoint(_SEARCH_PATH),
                 params=self._build_params(request),
                 headers=headers,
                 timeout=self._search_timeout,
+                follow_redirects=False,
             )
         except httpx.InvalidURL as exc:
             # A malformed stored base URL (issue #88): httpx.InvalidURL is NOT a
@@ -341,8 +347,9 @@ class ProwlarrIndexer:
         headers = self._auth_headers()
         try:
             response = await self._client.get(
-                f"{self._base_url}{_INDEXER_PATH}",
+                self._service_url.endpoint(_INDEXER_PATH),
                 headers=headers,
+                follow_redirects=False,
             )
         except httpx.InvalidURL as exc:
             # A malformed stored base URL (issue #88): unlike a transient network

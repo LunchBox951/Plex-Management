@@ -192,6 +192,12 @@ _BAD_SERVICE_URLS = [
     "http://x/\x01",  # control char in path
     "http://plex local",  # whitespace in the authority -- urlsplit still yields a host
     "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
+    "http://user:password@x/base",  # URL userinfo can redirect credentials to another host
+    "http://good\\@evil/base",  # browser-style backslash/userinfo authority ambiguity
+    "http://x/a/../admin",  # raw dot-segment escapes the configured proxy prefix
+    "http://x/a/%2e%2e/admin",  # encoded traversal may be decoded by an intermediary
+    "http://x/%2fadmin",  # encoded slash changes path segmentation downstream
+    "http://x/a//admin",  # empty segment is normalized inconsistently by proxies
     "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
     "http://x#frag",  # fragment -- likewise swallows the appended API path
     "http://x?",  # BARE query delimiter -- urlsplit yields an EMPTY query, raw '?' remains

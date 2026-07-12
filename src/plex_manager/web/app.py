@@ -12,6 +12,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Literal, cast
 
 import httpx
@@ -89,6 +90,16 @@ from plex_manager.web.routers import setup as setup_router
 from plex_manager.web.spa import mount_spa
 
 router = APIRouter()
+
+
+class _RejectAllResponseCookies(DefaultCookiePolicy):
+    """Keep the process-wide upstream client stateless across service origins."""
+
+    def set_ok(self, cookie: Any, request: Any) -> bool:
+        """Reject every response cookie; qBittorrent manages its SID explicitly."""
+        del cookie, request
+        return False
+
 
 _logger = logging.getLogger(__name__)
 
@@ -873,8 +884,17 @@ def create_app() -> FastAPI:
 
 
 def create_upstream_http_client() -> httpx.AsyncClient:
-    """Create the shared service-to-service client for configured integrations."""
-    return httpx.AsyncClient(timeout=30.0, trust_env=False)
+    """Create the stateless shared client for configured integrations.
+
+    A normal cookie jar matches by domain/path but not port. Keeping an upstream
+    cookie on this process-wide client could therefore forward one service's
+    credential to another service on the same hostname. qBittorrent captures and
+    sends its session cookie explicitly; all automatic response-cookie persistence
+    is denied.
+    """
+    client = httpx.AsyncClient(timeout=30.0, trust_env=False)
+    client.cookies.jar.set_policy(_RejectAllResponseCookies())
+    return client
 
 
 app = create_app()
