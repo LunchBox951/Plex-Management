@@ -294,6 +294,7 @@ class _LibraryMissingTriggerScan(LibraryPort):
         media_type: Literal["movie", "tv"],
         *,
         season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         return WatchState(watched=False)
 

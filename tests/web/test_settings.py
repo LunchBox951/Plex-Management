@@ -2367,6 +2367,28 @@ async def test_reveal_app_key_requires_authentication(
     assert response.status_code == 401
 
 
+async def test_reveal_app_key_response_is_never_cached(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Issue #208: a caching intermediary must never persist the plaintext key."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
+
+
+async def test_normal_settings_response_is_unaffected_by_no_store_headers(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Negative case: the no-store treatment is specific to the plaintext key routes."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.get("/api/v1/settings", headers=_HEALTH_HEADERS)
+    assert response.status_code == 200
+    assert "cache-control" not in response.headers
+    assert "pragma" not in response.headers
+
+
 async def test_rotate_app_key_mints_a_new_key_and_invalidates_the_old_one(
     client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
@@ -2387,6 +2409,17 @@ async def test_rotate_app_key_mints_a_new_key_and_invalidates_the_old_one(
     # The NEW key works.
     new_key_check = await client.get("/api/v1/settings", headers={"X-Api-Key": new_key})
     assert new_key_check.status_code == 200
+
+
+async def test_rotate_app_key_response_is_never_cached(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Issue #208: the rotate response carries the freshly minted plaintext key too."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    response = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
 
 
 async def test_rotate_app_key_requires_authentication(

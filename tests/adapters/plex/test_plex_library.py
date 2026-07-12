@@ -1851,3 +1851,245 @@ async def test_watch_state_adapter_conforms_to_library_port() -> None:
     from plex_manager.ports.library import LibraryPort
 
     assert isinstance(_adapter(_tv_watch_handler), LibraryPort)
+
+
+# --------------------------------------------------------------------------- #
+# watch_state — path-correlated reads (issue #207)
+#
+# A legitimate duplicate: the SAME tmdb id sits in two sections with DISTINCT
+# copies on disk (e.g. a title imported into both a regular and a "4K"/anime
+# section). Section keys 1/2 collide with the base SECTIONS fixtures above by
+# design (proves ordinary single-copy tests are untouched); 10/20 are the
+# second copy of each. The 4K/second movie section deliberately does NOT sit
+# under the base SECTIONS fixture's sibling ``/mnt/movies2`` location, so a
+# duplicate-test path can never accidentally cross-correlate into it.
+# --------------------------------------------------------------------------- #
+SECTIONS_DUP: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/data/movies"}],
+            },
+            {
+                "key": "10",
+                "title": "Movies 2",
+                "type": "movie",
+                "Location": [{"path": "/data/movies2"}],
+            },
+            {"key": "2", "title": "TV", "type": "show", "Location": [{"path": "/data/tv"}]},
+            {"key": "20", "title": "Anime", "type": "show", "Location": [{"path": "/data/anime"}]},
+        ]
+    }
+}
+
+MOVIES_DUP_SECTION_1: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                "viewCount": 3,
+                "lastViewedAt": _WATCHED_EPOCH,
+                "Media": [{"Part": [{"file": "/data/movies/Watched/wd.mkv"}]}],
+            },
+        ],
+    }
+}
+
+MOVIES_DUP_SECTION_10: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                # Never viewed -- Plex omits viewCount/lastViewedAt entirely.
+                "Media": [{"Part": [{"file": "/data/movies2/Unwatched/ud.mkv"}]}],
+            },
+        ],
+    }
+}
+
+EMPTY_METADATA: dict[str, Any] = {"MediaContainer": {"size": 0, "Metadata": []}}
+
+
+def _movie_dup_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_DUP)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_DUP_SECTION_1)
+    if path == "/library/sections/10/all":
+        return httpx.Response(200, json=MOVIES_DUP_SECTION_10)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_correlates_to_the_path_backing_the_target() -> None:
+    # Both duplicates share tmdb 42; the path -- not section iteration order --
+    # decides which copy's watch state is authoritative for a given candidate.
+    adapter = _adapter(_movie_dup_handler, base_url="http://watch-dup-movie:32400")
+    unwatched = await adapter.watch_state(
+        42, "movie", library_path="/data/movies2/Unwatched/ud.mkv"
+    )
+    assert unwatched == WatchState(watched=False, last_viewed_at=None)
+    watched = await adapter.watch_state(42, "movie", library_path="/data/movies/Watched/wd.mkv")
+    assert watched == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+async def test_watch_state_movie_fails_closed_when_path_matches_no_item() -> None:
+    adapter = _adapter(_movie_dup_handler, base_url="http://watch-dup-movie-miss:32400")
+    state = await adapter.watch_state(42, "movie", library_path="/data/movies/NoSuchTitle/x.mkv")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+async def test_watch_state_movie_fails_closed_when_path_under_no_section() -> None:
+    adapter = _adapter(_movie_dup_handler, base_url="http://watch-dup-movie-nosection:32400")
+    state = await adapter.watch_state(42, "movie", library_path="/elsewhere/X/y.mkv")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+MOVIES_DUP_AMBIGUOUS_SECTION_1: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 2,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                "viewCount": 1,
+                "lastViewedAt": _WATCHED_EPOCH,
+                "Media": [{"Part": [{"file": "/data/movies/Ambiguous/a1.mkv"}]}],
+            },
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                "Media": [{"Part": [{"file": "/data/movies/Ambiguous/a2.mkv"}]}],
+            },
+        ],
+    }
+}
+
+
+def _movie_dup_ambiguous_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_DUP)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_DUP_AMBIGUOUS_SECTION_1)
+    if path == "/library/sections/10/all":
+        return httpx.Response(200, json=EMPTY_METADATA)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_fails_closed_when_two_items_correlate() -> None:
+    # Two same-tmdb items whose files both sit under the target directory --
+    # correlation must never guess between them; a watched duplicate must never
+    # authorize deleting an unwatched one.
+    adapter = _adapter(
+        _movie_dup_ambiguous_handler, base_url="http://watch-dup-movie-ambiguous:32400"
+    )
+    state = await adapter.watch_state(42, "movie", library_path="/data/movies/Ambiguous")
+    assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+SHOWS_DUP_SECTION_2: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"ratingKey": "100", "Guid": [{"id": "tmdb://1399"}]}],
+    }
+}
+
+SHOWS_DUP_SECTION_20: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"ratingKey": "200", "Guid": [{"id": "tmdb://1399"}]}],
+    }
+}
+
+SEASONS_DUP_FOR_100: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "index": 1,
+                "ratingKey": "101",
+                "leafCount": 10,
+                "viewedLeafCount": 10,
+                "lastViewedAt": _WATCHED_EPOCH,
+            },
+        ],
+    }
+}
+
+SEASONS_DUP_FOR_200: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "index": 1,
+                "ratingKey": "201",
+                "leafCount": 10,
+                "viewedLeafCount": 4,
+                "lastViewedAt": _PARTIAL_EPOCH,
+            },
+        ],
+    }
+}
+
+EPISODES_DUP_FOR_101: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"Media": [{"Part": [{"file": "/data/tv/Show/Season 01/e01.mkv"}]}]}],
+    }
+}
+
+EPISODES_DUP_FOR_201: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"Media": [{"Part": [{"file": "/data/anime/Show/Season 01/e01.mkv"}]}]}],
+    }
+}
+
+
+def _tv_dup_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_DUP)
+    if path == "/library/sections/2/all":
+        return httpx.Response(200, json=SHOWS_DUP_SECTION_2)
+    if path == "/library/sections/20/all":
+        return httpx.Response(200, json=SHOWS_DUP_SECTION_20)
+    if path == "/library/metadata/100/children":
+        return httpx.Response(200, json=SEASONS_DUP_FOR_100)
+    if path == "/library/metadata/200/children":
+        return httpx.Response(200, json=SEASONS_DUP_FOR_200)
+    if path == "/library/metadata/101/children":
+        return httpx.Response(200, json=EPISODES_DUP_FOR_101)
+    if path == "/library/metadata/201/children":
+        return httpx.Response(200, json=EPISODES_DUP_FOR_201)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_tv_correlates_season_to_the_path_backing_the_target() -> None:
+    # Same show/season/tmdb in two sections (a regular TV copy and an anime
+    # copy) with divergent per-section watch state; the season DIRECTORY path
+    # -- not section order -- decides which copy's state is authoritative.
+    adapter = _adapter(_tv_dup_handler, base_url="http://watch-dup-tv:32400")
+    anime_state = await adapter.watch_state(
+        1399, "tv", season=1, library_path="/data/anime/Show/Season 01"
+    )
+    assert anime_state == WatchState(watched=False, last_viewed_at=_PARTIAL_AT)
+    tv_state = await adapter.watch_state(
+        1399, "tv", season=1, library_path="/data/tv/Show/Season 01"
+    )
+    assert tv_state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+async def test_watch_state_tv_fails_closed_when_no_episode_under_the_path() -> None:
+    # The season exists (index 1 resolves on both shows) but no episode file
+    # in EITHER duplicate sits under this season-2-shaped path.
+    adapter = _adapter(_tv_dup_handler, base_url="http://watch-dup-tv-miss:32400")
+    state = await adapter.watch_state(1399, "tv", season=1, library_path="/data/tv/Show/Season 02")
+    assert state == WatchState(watched=False, last_viewed_at=None)
