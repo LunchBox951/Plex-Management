@@ -25,8 +25,12 @@ from plex_manager.models import SystemSettings
 from plex_manager.web.app import create_app
 
 
-def test_default_host_is_loopback() -> None:
-    assert Settings().host == "127.0.0.1"
+def test_default_host_is_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC: the code default binds loopback regardless of a real .env / process
+    override. Deletes any PLEX_MANAGER_HOST and disables dotenv loading so the
+    assertion turns only on the field default (issue #217)."""
+    monkeypatch.delenv("PLEX_MANAGER_HOST", raising=False)
+    assert Settings(_env_file=None).host == "127.0.0.1"  # pyright: ignore[reportCallIssue]
 
 
 @pytest.fixture

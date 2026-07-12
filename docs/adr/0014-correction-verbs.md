@@ -2,6 +2,9 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-01
+- **Superseded in part by:** [ADR-0022](0022-claim-before-purge-correction-order.md)
+  — report-issue's step ordering only (claim the active slot before the
+  irreversible torrent/file purge, not after). Everything else below stands.
 - **Context builds on:** [ADR-0001](0001-integrated-app-borrowed-brains.md)
   (borrowed brains: Radarr-style blocklist + quality model),
   [ADR-0005](0005-zero-terminal-web-operability.md) (100% web-operable, no
