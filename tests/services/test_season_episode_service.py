@@ -34,6 +34,27 @@ async def _make_show(sm: SessionMaker, tmdb_id: int = 800) -> int:
         return show.id
 
 
+async def _make_show_with_intent(
+    sm: SessionMaker,
+    *,
+    tmdb_id: int,
+    tv_request_mode: str,
+    requested_episodes_json: dict[str, list[int]] | None = None,
+) -> int:
+    async with sm() as session:
+        show = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title="Show",
+            status=RequestStatus.pending,
+            tv_request_mode=tv_request_mode,
+            requested_episodes_json=requested_episodes_json,
+        )
+        session.add(show)
+        await session.commit()
+        return show.id
+
+
 async def _make_season(
     sm: SessionMaker, media_request_id: int, season_number: int, status: RequestStatus
 ) -> int:
@@ -367,6 +388,151 @@ async def test_reconcile_airing_skips_a_season_on_tmdb_error_without_aborting(
         await session.commit()
 
     assert rearmed == 0
+
+
+async def test_reconcile_airing_skips_episode_scoped_request(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 fix (issue #178 review): an explicit episode-scoped request is TERMINAL
+    for the episode it named. The airing refresh must NOT widen it to the whole
+    aired season -- doing so would seed the whole season, see only the requested
+    episode imported, and re-arm the completed request -> duplicate grabs. The
+    season is left available and TMDB is never even consulted for it.
+    """
+    show_id = await _make_show_with_intent(
+        sessionmaker_,
+        tmdb_id=811,
+        tv_request_mode="explicit_episodes",
+        requested_episodes_json={"1": [5]},
+    )
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    async with sessionmaker_() as session:
+        download = Download(torrent_hash="ep-scoped-hash", status="imported")
+        session.add(download)
+        await session.commit()
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        await episode_repo.upsert_target(season_request_id, {5: date(2026, 1, 29)})
+        await episode_repo.mark_imported(season_request_id, [5], download_id=download.id)
+        await session.commit()
+
+    # TMDB would report the whole aired season -- if the refresh ran it would seed
+    # {1..10} and re-arm. It must never be called for an episode-scoped season.
+    tmdb = FakeTmdb(
+        season_episodes={
+            (811, 1): [
+                EpisodeInfo(episode_number=n, air_date=date(2026, 1, 1)) for n in range(1, 11)
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, today=_TODAY, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 0
+    assert tmdb.season_episodes_calls == []  # never widened to the whole season
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.available  # stays terminal
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    # Only the originally-requested episode's row -- the season was NOT seeded.
+    assert {r.episode_number for r in rows} == {5}
+    assert rows[0].status == "imported"
+
+
+async def test_reconcile_airing_adopts_baseline_for_done_season_with_no_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 fix (issue #178 review): an already-watchable season with NO episode-
+    state rows (Plex already owned it, or a whole-season-pack import the migration
+    seeded nothing for) is fully OWNED. The refresh must NOT re-arm it (that would
+    re-download owned content); it adopts the aired target as the imported
+    baseline instead.
+    """
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=812, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (812, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+                EpisodeInfo(episode_number=3, air_date=date(2026, 1, 15)),
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, today=_TODAY, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 0  # adopted as baseline, never re-armed
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.available  # stays watchable
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    assert set(by_episode) == {1, 2, 3}
+    assert all(r.status == "imported" for r in by_episode.values())
+    assert all(r.grabbed_download_id is None for r in by_episode.values())
+
+
+async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Baseline adoption must not break FUTURE airing growth: once a no-baseline
+    done season has adopted its aired target as imported, a genuinely newly-aired
+    episode on a LATER cycle must still re-arm the season.
+    """
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=813, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    # Cycle 1: aired {1, 2} with no baseline -> adopted, not re-armed.
+    tmdb = FakeTmdb(
+        season_episodes={
+            (813, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+            ]
+        }
+    )
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, today=_TODAY, max_refresh=5
+        )
+        await session.commit()
+    assert rearmed == 0
+
+    # Cycle 2: episode 3 newly aired -> not in the adopted baseline -> re-arm.
+    tmdb_grown = FakeTmdb(
+        season_episodes={
+            (813, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+                EpisodeInfo(episode_number=3, air_date=date(2026, 1, 15)),
+            ]
+        }
+    )
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb_grown, today=_TODAY, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 1
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
 
 
 async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(

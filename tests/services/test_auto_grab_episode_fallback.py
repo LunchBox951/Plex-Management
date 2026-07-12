@@ -418,6 +418,61 @@ async def test_airing_prepass_rearms_and_processes_within_the_same_cycle(
         assert parent.status != RequestStatus.available
 
 
+async def test_fallback_target_baseline_survives_a_per_release_rollback(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 regression (issue #178 review): a per-release rollback in the fallback
+    candidate loop must NOT discard the aired-target baseline.
+
+    Aired target is episodes {1, 2, 3}, none imported. The highest-ranked accepted
+    fallback release (E01 1080p) is source-unresolvable and rolls back; a
+    lower-ranked accepted release (E01 720p) then grabs. Pre-fix, the first
+    candidate's rollback discarded the still-uncommitted target rows for the WHOLE
+    season, and the successful candidate's ``mark_grabbed`` recreated a row for ONLY
+    episode 1 -- so import would later see the target as just {1} and mark the
+    whole season complete after one episode. The baseline is now committed before
+    the loop, so rows for the un-grabbed aired episodes 2 and 3 must still exist.
+    """
+    _request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2011)
+    bad_title = "Some.Show.S01E01.1080p.WEB-DL.x264-GROUP"
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{bad_title}"})
+    prowlarr = _PerTmdbProwlarr(
+        {
+            2011: [
+                # Higher-ranked (1080p) but source-unresolvable -> rolls back.
+                candidate(bad_title, magnet=False),
+                # Lower-ranked (720p) but grabbable -> succeeds on the next attempt.
+                candidate("Some.Show.S01E01.720p.WEB-DL.x264-GROUP", info_hash="ab" * 20),
+            ]
+        }
+    )
+    metadata = FakeTmdb(
+        season_episodes={
+            (2011, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+                EpisodeInfo(episode_number=3, air_date=date(2026, 1, 15)),
+            ]
+        }
+    )
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.grabbed == 1
+    assert result.season_episode_fallback_grabs == 1
+    async with sessionmaker_() as session:
+        repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await repo.list_for_season(season_id)
+    by_episode = {r.episode_number: r for r in rows}
+    # The WHOLE aired target survived the per-release rollback: rows exist for 1, 2
+    # AND 3 -- episode 1 grabbed, the still-missing 2 and 3 still pending. Without
+    # the pre-loop baseline commit only episode 1's row would exist here.
+    assert set(by_episode) == {1, 2, 3}
+    assert by_episode[1].status == "grabbed"
+    assert by_episode[2].status == "pending"
+    assert by_episode[3].status == "pending"
+
+
 async def test_no_metadata_disables_fallback_cleanly(sessionmaker_: SessionMaker) -> None:
     """``metadata=None`` (unconfigured TMDB) must behave exactly like before this
     feature existed: Pass 1 only, honest park on nothing acceptable."""

@@ -521,6 +521,22 @@ async def _attempt_episode_fallback(
         )
         return _EpisodeFallbackOutcome(settled=False)
 
+    # Commit the aired-target baseline BEFORE entering the candidate loop below.
+    # ``refresh_target`` above upserts a ``pending`` row for EVERY aired episode --
+    # the WHOLE-season tracking baseline. The loop's per-release failure handlers
+    # (``QbittorrentSourceError`` / ``NoGrabSourceError`` / ``TorrentAlreadyTracked
+    # Error``) each ``session.rollback()`` and fall through to the next candidate;
+    # left uncommitted, those rollbacks would DISCARD this baseline, and a later
+    # lower-ranked candidate's ``mark_grabbed`` (+ its commit) would then recreate
+    # rows for ONLY its covered episodes -- letting import see the target as just
+    # those episodes and mark the whole season complete after a single episode.
+    # Committing the baseline here makes it durable across every per-release
+    # rollback. INVARIANT: at ``mark_grabbed`` time the full aired-target rows
+    # already exist. (Safe: on entry to Pass 2 the session carries no uncommitted
+    # writes -- Pass 1 either committed its grab and skipped Pass 2, or rolled back
+    # every failed attempt -- so this commits the target rows and nothing else.)
+    await session.commit()
+
     missing = await season_episode_service.compute_missing(
         session,
         download_repo,

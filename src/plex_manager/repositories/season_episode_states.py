@@ -62,6 +62,18 @@ class SqlSeasonEpisodeStateRepository:
             return None
         return row
 
+    async def _reread_one(
+        self, season_request_id: int, episode_number: int
+    ) -> SeasonEpisodeState | None:
+        """Re-read a single row by its unique key -- a FRESH query (not the stale
+        bulk ``_existing_by_episode`` snapshot) used to reconcile with the winner
+        of an insert race after ``_insert_or_reread`` reports one."""
+        stmt = select(SeasonEpisodeState).where(
+            SeasonEpisodeState.season_request_id == season_request_id,
+            SeasonEpisodeState.episode_number == episode_number,
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
     async def list_for_season(self, season_request_id: int) -> list[SeasonEpisodeStateRecord]:
         stmt = (
             select(SeasonEpisodeState)
@@ -129,7 +141,34 @@ class SqlSeasonEpisodeStateRepository:
                 status=EpisodeState.imported,
                 grabbed_download_id=download_id,
             )
-            await self._insert_or_reread(new_row)
+            if await self._insert_or_reread(new_row) is None:
+                # A concurrent ``refresh_target``/``upsert_target`` won the insert
+                # race after our ``_existing_by_episode`` snapshot. Import and the
+                # airing refresh run in separate background tasks, so this is a real
+                # race: leaving the winner ``pending`` would let ``apply_import``
+                # re-arm/search an episode that was JUST placed. Re-read the winner
+                # and promote it to ``imported`` (CAS-style) so import always wins.
+                winner = await self._reread_one(season_request_id, episode_number)
+                if winner is not None:
+                    winner.status = EpisodeState.imported
+                    winner.grabbed_download_id = download_id
+        await self._session.flush()
+
+    async def adopt_baseline(self, season_request_id: int) -> None:
+        """Promote every not-yet-``imported`` row for this season to ``imported``
+        with NO backing download (``grabbed_download_id`` stays ``NULL``).
+
+        Baseline adoption (ADR-0020 §6) for an already-watchable season whose
+        target rows were just seeded by ``refresh_target`` but which has no real
+        imported baseline -- see ``season_episode_service.reconcile_airing`` for
+        the full invariant. Idempotent; only the caller (which has just confirmed
+        the season had NO rows before the seed) invokes this, so every row it
+        touches is a freshly-seeded ``pending`` target row.
+        """
+        existing = await self._existing_by_episode(season_request_id)
+        for row in existing.values():
+            if row.status != EpisodeState.imported:
+                row.status = EpisodeState.imported
         await self._session.flush()
 
     async def counts_for_seasons(

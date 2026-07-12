@@ -23,6 +23,7 @@ from plex_manager.domain.season_completeness import (
     compute_missing as _compute_missing,
 )
 from plex_manager.logsafe import safe_int
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.metadata import MetadataPort
-    from plex_manager.ports.repositories import DownloadRepository
+    from plex_manager.ports.repositories import DownloadRepository, RequestRecord
 
 __all__ = [
     "apply_import",
@@ -175,13 +176,47 @@ async def reconcile_airing(
     """
     season_repo = SqlSeasonRequestRepository(session)
     episode_repo = SqlSeasonEpisodeStateRepository(session)
+    request_repo = SqlRequestRepository(session)
 
     candidates = await season_repo.list_for_airing_refresh(
         _REARMABLE_DONE_STATUSES, limit=max_refresh
     )
 
     rearmed = 0
+    parents: dict[int, RequestRecord | None] = {}
     for season in candidates:
+        # (P1 fix, issue #178 review) Episode-scoped requests are TERMINAL for the
+        # episodes they named -- the airing refresh must never widen them to the
+        # whole aired season. Doing so would seed the whole season, see only the
+        # requested episode imported, and re-arm the season to ``searching``, so
+        # auto-grab would re-search the already-satisfied episode (or park the done
+        # request as no-acceptable) -- a duplicate grab / regression of a request
+        # that should stay done. Whole-season / whole-show seasons ONLY. This is
+        # the SAME per-season gate auto-grab's Pass-2 fallback uses (``not
+        # scope_episodes``): a season is episode-scoped iff its parent named
+        # specific episodes FOR THAT SEASON. ``tv_request_mode`` alone is NOT a
+        # correct discriminator -- an ``explicit_episodes`` request can still hold
+        # whole-season siblings (``request_service._merge_tv_request_intent``).
+        if season.media_request_id not in parents:
+            parents[season.media_request_id] = await request_repo.get(season.media_request_id)
+        parent = parents[season.media_request_id]
+        scoped_episodes = (
+            parent.requested_episodes.get(season.season_number)
+            if parent is not None and parent.requested_episodes
+            else None
+        )
+        if scoped_episodes:
+            # Leave the terminal episode-scoped season entirely alone; just rotate
+            # it out of the bounded candidate window so it never starves a
+            # whole-season sibling that legitimately needs re-arming.
+            await season_repo.mark_airing_refresh_checked(season.id, today)
+            continue
+
+        # (P1 fix, issue #178 review) Capture whether a real per-episode baseline
+        # exists BEFORE ``refresh_target`` seeds pending rows -- it always inserts,
+        # so this must be read first.
+        had_baseline = bool(await episode_repo.list_for_season(season.id))
+
         try:
             target = await refresh_target(
                 session,
@@ -203,6 +238,23 @@ async def reconcile_airing(
             # Stamped even on failure: a persistently-erroring show must not
             # monopolise the bounded rotation window forever (it will simply be
             # re-tried once the rotation comes back around to it).
+            await season_repo.mark_airing_refresh_checked(season.id, today)
+            continue
+
+        if not had_baseline and target:
+            # Baseline adoption. INVARIANT: an already-watchable
+            # (``available``/``completed``) season with NO episode-state rows
+            # became watchable BEFORE per-episode tracking existed -- Plex already
+            # owned it, or a whole-season-pack import the migration deliberately
+            # seeded nothing for (0004ea..._add_season_episode_states_table). Its
+            # content is fully OWNED, so its aired target must count as already
+            # imported and must NEVER be re-downloaded. Adopt the just-seeded
+            # target as the imported baseline (no backing download) rather than
+            # re-arming. Future airing GROWTH still works: a NEWLY-aired episode
+            # added to the target on a later cycle will NOT be in this baseline, so
+            # ``target > imported`` re-arms the season then -- exactly as a normally
+            # tracked season does.
+            await episode_repo.adopt_baseline(season.id)
             await season_repo.mark_airing_refresh_checked(season.id, today)
             continue
 

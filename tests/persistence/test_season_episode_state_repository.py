@@ -9,9 +9,16 @@ from __future__ import annotations
 import itertools
 from datetime import date
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plex_manager.models import Download, MediaRequest, SeasonRequest
+from plex_manager.models import (
+    Download,
+    EpisodeState,
+    MediaRequest,
+    SeasonEpisodeState,
+    SeasonRequest,
+)
 from plex_manager.repositories import SqlSeasonEpisodeStateRepository
 
 _hash_counter = itertools.count()
@@ -169,6 +176,67 @@ async def test_mark_imported_upserts_episodes_beyond_the_seeded_target(
     assert {r.episode_number for r in rows} == {1, 2, 3}
     assert all(r.status == "imported" for r in rows)
     assert all(r.grabbed_download_id == download_id for r in rows)
+
+
+async def test_mark_imported_updates_winner_after_insert_race(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2 fix (issue #178 review): if a concurrent ``refresh_target`` inserts the
+    same episode between ``mark_imported``'s existing-row snapshot and its own
+    insert, the insert loses the unique-index race and ``_insert_or_reread``
+    returns ``None``. The winner must then be RE-READ and promoted to ``imported``
+    -- never left ``pending``, which would let ``apply_import`` re-arm/search an
+    episode that was just placed.
+    """
+    season_request_id = await _make_season(session)
+    download_id = await _make_download(session)
+
+    # The race winner: a PENDING row a concurrent target refresh already committed.
+    session.add(
+        SeasonEpisodeState(
+            season_request_id=season_request_id,
+            episode_number=1,
+            status=EpisodeState.pending,
+            air_date=date(2026, 1, 1),
+        )
+    )
+    await session.flush()
+
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    # Force the race: ``mark_imported``'s bulk pre-read misses the winner (as if the
+    # concurrent insert committed AFTER this read but BEFORE our own insert), so it
+    # takes the insert path, hits the unique index, and must fall back to the CAS
+    # re-read. ``_reread_one`` is a SEPARATE fresh query, so it still sees the row.
+    async def _blind(_self: SqlSeasonEpisodeStateRepository, _sr_id: int) -> dict[int, object]:
+        return {}
+
+    monkeypatch.setattr(SqlSeasonEpisodeStateRepository, "_existing_by_episode", _blind)
+
+    await repo.mark_imported(season_request_id, [1], download_id=download_id)
+
+    monkeypatch.undo()
+    rows = await repo.list_for_season(season_request_id)
+    assert len(rows) == 1
+    assert rows[0].episode_number == 1
+    assert rows[0].status == "imported"
+    assert rows[0].grabbed_download_id == download_id
+
+
+async def test_adopt_baseline_promotes_pending_rows_to_imported(session: AsyncSession) -> None:
+    """Baseline adoption marks every not-yet-imported row ``imported`` with no
+    backing download -- an already-watchable season whose target was just seeded
+    but which predates per-episode tracking (ADR-0020 §6)."""
+    season_request_id = await _make_season(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8)})
+    await repo.adopt_baseline(season_request_id)
+
+    rows = await repo.list_for_season(season_request_id)
+    assert {r.episode_number for r in rows} == {1, 2}
+    assert all(r.status == "imported" for r in rows)
+    assert all(r.grabbed_download_id is None for r in rows)
 
 
 async def test_list_for_season_orders_by_episode_number(session: AsyncSession) -> None:

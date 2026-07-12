@@ -824,6 +824,18 @@ class SeasonEpisodeStateRepository(Protocol):
         Creates rows for episodes not previously in the target (e.g. a season
         pack placed episodes beyond the seeded aired set) -- they still count as
         imported.
+
+        On an insert race (a concurrent target refresh inserts the same episode
+        first) the winning row is re-read and promoted to ``imported`` so an
+        import can never leave a just-placed episode ``pending`` for the airing
+        refresh to re-arm.
+        """
+        raise NotImplementedError
+
+    async def adopt_baseline(self, season_request_id: int) -> None:
+        """Promote every not-yet-``imported`` row for this season to ``imported``
+        with no backing download -- baseline adoption for an already-watchable
+        season that predates per-episode import tracking (ADR-0020 §6).
         """
         raise NotImplementedError
 
