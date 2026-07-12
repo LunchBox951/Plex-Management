@@ -20,6 +20,7 @@ from typing import Final, cast
 
 import httpx
 
+from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import is_header_safe
 
 __all__ = [
@@ -260,8 +261,15 @@ class PlexTvClient:
         return self.parse_resources(payload)
 
     async def fetch_server_identity(self, base_url: str, service_token: str) -> str:
-        url = f"{base_url.rstrip('/')}/identity"
-        _require_header_safe_token(service_token, httpx.URL(url).host)
+        try:
+            service_url = ServiceUrl.parse(base_url)
+            url = service_url.endpoint("/identity")
+        except InvalidServiceUrl as exc:
+            raise PlexVerifyError(
+                _CODE_SERVER_UNREACHABLE,
+                "Plex server URL is invalid",
+            ) from exc
+        _require_header_safe_token(service_token, service_url.host)
         payload = await self._request_json(
             "GET",
             url,
@@ -274,14 +282,14 @@ class PlexTvClient:
             raise PlexVerifyError(
                 _CODE_IDENTITY_FAILED,
                 "Plex server identity response did not include machineIdentifier",
-                diagnostics={"host": httpx.URL(url).host},
+                diagnostics={"host": service_url.host},
             )
         return identity
 
     async def _request_json(
         self,
         method: str,
-        url: str,
+        url: str | httpx.URL,
         *,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str],
@@ -291,7 +299,13 @@ class PlexTvClient:
     ) -> Mapping[str, object]:
         host = httpx.URL(url).host
         try:
-            response = await self._client.request(method, url, params=params, headers=headers)
+            response = await self._client.request(
+                method,
+                url,
+                params=params,
+                headers=headers,
+                follow_redirects=False,
+            )
         except httpx.RequestError as exc:
             raise PlexVerifyError(
                 unreachable_code,
@@ -377,5 +391,5 @@ class PlexTvClient:
         return resources
 
 
-def _safe_path(url: str) -> str:
+def _safe_path(url: str | httpx.URL) -> str:
     return httpx.URL(url).path

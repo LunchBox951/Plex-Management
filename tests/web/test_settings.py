@@ -9,6 +9,7 @@ import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pytest
@@ -53,6 +54,7 @@ from plex_manager.web.deps import (
     load_system_settings,
     require_api_key,
 )
+from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers.settings import (
     _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -381,9 +383,9 @@ async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
     """Repointing plex_url probes the NEW server's /identity BEFORE committing and
     caches the DERIVED id (better than the earlier clear-and-reprobe-per-sign-in:
     the id was just derived, so sign-in keeps its no-re-probe fast path). The FE
-    round-trips the token as the '***' mask, so BOTH verification calls (the
-    /identity derive and the authenticated /library/sections check) must resolve
-    the EFFECTIVE token — the STORED real one — never the mask literal. An
+    must explicitly re-enter the token before a different origin may receive it,
+    so BOTH verification calls (the /identity derive and the authenticated
+    /library/sections check) use that explicitly authorized value. An
     api-key caller has no Plex account, so plex.tv ownership is never consulted
     (``resources=None`` fails loudly if it were)."""
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -393,18 +395,296 @@ async def test_put_changed_plex_url_stores_the_freshly_derived_machine_id(
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://new:32400", "plex_token": "***"},
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
         headers={"X-Api-Key": _API_KEY},
     )
 
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # derived, not cleared
-    # Both probes hit the SUBMITTED url with the STORED real token, not the mask.
+    # Both probes hit the SUBMITTED url with the explicitly re-entered token.
     assert [str(p.url) for p in probes] == [
         "http://new:32400/identity",
         "http://new:32400/library/sections",
     ]
     assert all(p.headers.get("X-Plex-Token") == _SEED_PLEX_TOKEN for p in probes)
+
+
+@pytest.mark.parametrize("new_url", ["http://new:32400", "http://old:32400/capture"])
+async def test_put_changed_plex_destination_refuses_stored_token_reuse(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    new_url: str,
+) -> None:
+    """A URL-only repoint never discloses the encrypted stored token.
+
+    This includes another reverse-proxy path on the same origin: it may route to
+    a completely different backend just as surely as another host can.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": new_url, "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "credential_reentry_required"
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("plex_url") == "http://old:32400"
+        assert await store.get("plex_token") == _SEED_PLEX_TOKEN
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"
+
+
+@pytest.mark.parametrize(
+    ("url_field", "secret_field"),
+    [
+        ("prowlarr_url", "prowlarr_api_key"),
+        ("qbittorrent_url", "qbittorrent_password"),
+    ],
+)
+@pytest.mark.parametrize("new_url", ["http://new-service:8080", "http://old-service:8080/capture"])
+async def test_put_changed_service_destination_refuses_stored_secret_reuse(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    url_field: str,
+    secret_field: str,
+    new_url: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(url_field, "http://old-service:8080")
+        await store.set(secret_field, "stored-secret")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={url_field: new_url},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "credential_reentry_required"
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get(url_field) == "http://old-service:8080"
+        assert await store.get(secret_field) == "stored-secret"
+
+
+async def test_put_changed_qbittorrent_destination_refuses_stored_empty_password_reuse(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A configured empty password still requires explicit destination consent."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://old-service:8080")
+        await store.set("qbittorrent_password", "")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"qbittorrent_url": "http://new-service:8080"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 422
+    assert put.json()["detail"] == "credential_reentry_required"
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("qbittorrent_url") == "http://old-service:8080"
+        assert await store.get("qbittorrent_password") == ""
+
+
+async def test_put_changed_prowlarr_destination_allows_unconfigured_empty_api_key(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An empty Prowlarr key is unconfigured, so no credential can cross origins."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://old-service:8080")
+        await store.set("prowlarr_api_key", "")
+        await session.commit()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"prowlarr_url": "http://new-service:8080"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("prowlarr_url") == "http://new-service:8080"
+        assert await store.get("prowlarr_api_key") == ""
+
+
+@pytest.mark.parametrize(
+    ("url_field", "secret_field"),
+    [
+        ("prowlarr_url", "prowlarr_api_key"),
+        ("qbittorrent_url", "qbittorrent_password"),
+    ],
+)
+async def test_put_cross_origin_service_url_accepts_explicit_secret_reentry(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    url_field: str,
+    secret_field: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set(url_field, "http://old-service:8080")
+        await store.set(secret_field, "stored-secret")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={url_field: "http://new-service:8080", secret_field: "replacement-secret"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get(url_field) == "http://new-service:8080"
+        assert await store.get(secret_field) == "replacement-secret"
+
+
+async def test_put_changed_qbittorrent_base_accepts_explicit_empty_password(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """An empty qBittorrent password is valid and cannot reuse the old secret."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("qbittorrent_url", "http://old-service:8080")
+        await store.set("qbittorrent_password", "stored-secret")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"qbittorrent_url": "http://new-service:8080", "qbittorrent_password": ""},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("qbittorrent_url") == "http://new-service:8080"
+        assert await store.get("qbittorrent_password") == ""
+
+
+async def test_put_serializes_destination_and_secret_updates(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A secret rotation cannot be paired with a concurrently repointed URL.
+
+    Hold a secret-only PUT immediately before its write, then start a URL+dummy
+    secret PUT. Without the endpoint-wide lock, the repoint commits while the
+    rotation is paused and the rotation subsequently overwrites only its secret,
+    leaving ``capture + fresh-secret``. The lock makes the repoint wait, re-read
+    the pair committed by the rotation, and atomically leave ``capture + dummy``.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://old-service:9696")
+        await store.set("prowlarr_api_key", "old-secret")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    from plex_manager.web.routers import settings as settings_router
+
+    class ObservedSettingsLock(asyncio.Lock):
+        """Signal when the second PUT has reached the contended lock."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquire_attempts = 0
+            self.second_waiting = asyncio.Event()
+
+        async def acquire(self) -> Literal[True]:
+            self.acquire_attempts += 1
+            if self.acquire_attempts == 2:
+                self.second_waiting.set()
+            return await super().acquire()
+
+    # A contended asyncio.Lock binds to this test's event loop. Install a fresh
+    # one so this regression stays independent of tests running in other loops.
+    observed_lock = ObservedSettingsLock()
+    monkeypatch.setattr(settings_router, "_settings_update_lock", observed_lock)
+
+    real_set = SettingsStore.set
+    rotation_ready = asyncio.Event()
+    release_rotation = asyncio.Event()
+
+    async def gated_set(store: SettingsStore, key: str, value: str) -> None:
+        if key == "prowlarr_api_key" and value == "fresh-secret":
+            rotation_ready.set()
+            await asyncio.wait_for(release_rotation.wait(), timeout=5.0)
+        await real_set(store, key, value)
+
+    monkeypatch.setattr(SettingsStore, "set", gated_set)
+
+    rotation = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={"prowlarr_api_key": "fresh-secret"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await asyncio.wait_for(rotation_ready.wait(), timeout=5.0)
+
+    repoint = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={
+                "prowlarr_url": "http://capture:9696",
+                "prowlarr_api_key": "dummy-secret",
+            },
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await asyncio.wait_for(observed_lock.second_waiting.wait(), timeout=5.0)
+    assert not repoint.done()
+
+    release_rotation.set()
+    rotation_response, repoint_response = await asyncio.wait_for(
+        asyncio.gather(rotation, repoint), timeout=10.0
+    )
+
+    assert rotation_response.status_code == 200
+    assert repoint_response.status_code == 200
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        assert await store.get("prowlarr_url") == "http://capture:9696"
+        assert await store.get("prowlarr_api_key") == "dummy-secret"
 
 
 async def test_put_changed_plex_token_probes_with_the_new_token(
@@ -447,7 +727,7 @@ async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://typo-wrong-host:32400"},
+        json={"plex_url": "http://typo-wrong-host:32400", "plex_token": _SEED_PLEX_TOKEN},
         cookies=cookies,
         headers=csrf,
     )
@@ -535,6 +815,12 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9201, tag="repoint-adm")
     other_cookies, _ = await _admin_session_cookies(app, plex_id=9202, tag="repoint-other")
     assert await _active_session_count(sessionmaker_) == 2
+    hub = get_event_hub(app)
+    admin_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=1)
+    other_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=2)
+    api_key_stream = hub.subscribe(auth_method=AuthMethod.api_key.value)
+    for subscription in (admin_stream, other_stream, api_key_stream):
+        _ = await subscription.get()  # initial sync
     probes: list[httpx.Request] = []
     await _use_transport(
         app,
@@ -545,7 +831,7 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://new:32400"},
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
         cookies=admin_cookies,
         headers=admin_csrf,
     )
@@ -554,6 +840,10 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the verified anchor
     assert await _active_session_count(sessionmaker_) == 0  # everyone, caller included
+    assert admin_stream.closed
+    assert other_stream.closed
+    assert not api_key_stream.closed  # recovery-key authority survives a Plex repoint
+    api_key_stream.close()
     # The ownership check presented the CALLER's own account OAuth token to plex.tv.
     ownership = [p for p in probes if p.url.host == "plex.tv"]
     assert ownership and ownership[0].headers.get("X-Plex-Token") == _SEED_OAUTH_TOKEN
@@ -582,7 +872,7 @@ async def test_put_reachable_but_unauthorized_token_is_422_and_commits_nothing(
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://new:32400"},
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
         cookies=cookies,
         headers=csrf,
     )
@@ -615,7 +905,7 @@ async def test_put_session_admin_repoint_to_non_owned_server_is_403(
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://new:32400"},
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
         cookies=cookies,
         headers=csrf,
     )
@@ -645,7 +935,7 @@ async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
 
     put = await client.put(
         "/api/v1/settings",
-        json={"plex_url": "http://new:32400"},
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
         headers={"X-Api-Key": _API_KEY},
     )
 
@@ -880,6 +1170,12 @@ _BAD_SERVICE_URLS = [
     "http://x/\x01",  # control char in path
     "http://plex local",  # whitespace in the authority -- urlsplit still yields a host
     "http://x/base path",  # whitespace anywhere (here in the path) is rejected too
+    "http://user:password@x/base",  # URL userinfo can redirect credentials to another host
+    "http://good\\@evil/base",  # browser-style backslash/userinfo authority ambiguity
+    "http://x/a/../admin",  # raw dot-segment escapes the configured proxy prefix
+    "http://x/a/%2e%2e/admin",  # encoded traversal may be decoded by an intermediary
+    "http://x/%2fadmin",  # encoded slash changes path segmentation downstream
+    "http://x/a//admin",  # empty segment is normalized inconsistently by proxies
     "http://x?y=1",  # query -- adapters append API paths, so a query is swallowed
     "http://x#frag",  # fragment -- likewise swallows the appended API path
     "http://x?",  # BARE query delimiter -- urlsplit yields an EMPTY query, raw '?' remains

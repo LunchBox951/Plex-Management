@@ -20,10 +20,10 @@ import { useToast } from '../components/ui/toast'
 
 /**
  * The wizard is a three-step, derived state machine: sign in with Plex → pick the
- * server your account owns → configure the remaining services. There is no token
- * or key entry — the signed-in Plex session IS the credential, and setup mints
- * nothing to disclose (ADR-0016). Plex's URL/token/machine-identifier all come
- * from the verified server, never a typed card.
+ * server your account owns → configure the remaining services. A plex.tv-listed
+ * server reuses the signed-in session credential; a custom URL requires an
+ * explicit Plex token in the picker. Setup mints nothing to disclose (ADR-0016),
+ * and the URL/token/machine-identifier all come from the verified server.
  */
 type WizardStep = 'signin' | 'server' | 'services'
 
@@ -306,10 +306,10 @@ export function SetupWizard() {
       const body: SetupCompleteRequest = {
         plex_url: server.url,
         plex_machine_identifier: server.machine_identifier,
-        // A custom override, or `null` for the happy path — the backend reads a
-        // null/absent token as "use the signed-in admin's stored OAuth token"
-        // (setup.py: `if plex_token is None: … _admin_plex_token`), so no Plex
-        // token is ever typed or shown on the owned-server path (ADR-0016).
+        // A required explicit token for a custom URL, or `null` for a connection
+        // advertised by plex.tv. Only that advertised-server path may reuse the
+        // signed-in admin's stored OAuth token, so it never needs to show or
+        // re-type the token (ADR-0016).
         plex_token: server.token ?? null,
         prowlarr_url: form.prowlarr_url,
         prowlarr_api_key: form.prowlarr_api_key,

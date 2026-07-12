@@ -37,6 +37,7 @@ RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
 # ---- runtime: slim image with just the venv + migration assets ----
 FROM python:3.14-slim AS runtime
+ARG PLEX_MANAGER_BUILD_ID=0.0.0
 # The app's config default is loopback (safe for bare-metal first runs); inside
 # the container the ONLY way in is the published port, so bind all interfaces
 # here or `docker run -p` would map to a dead socket (the healthcheck, probing
@@ -45,6 +46,7 @@ FROM python:3.14-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
+    PLEX_MANAGER_BUILD_ID=${PLEX_MANAGER_BUILD_ID} \
     PLEX_MANAGER_HOST=0.0.0.0
 WORKDIR /app
 

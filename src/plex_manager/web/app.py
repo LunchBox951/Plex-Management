@@ -12,6 +12,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Literal, cast
 
 import httpx
@@ -76,10 +77,18 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
 )
 from plex_manager.web.errors import install_error_handlers
+from plex_manager.web.events import (
+    EventHub,
+    current_build_id,
+    get_event_hub,
+    publish_realtime,
+    warn_if_multiworker,
+)
 from plex_manager.web.middleware import SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
+from plex_manager.web.routers import events as events_router
 from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.routers import quality_profile as quality_profile_router
 from plex_manager.web.routers import queue as queue_router
@@ -90,6 +99,16 @@ from plex_manager.web.routers import setup as setup_router
 from plex_manager.web.spa import mount_spa
 
 router = APIRouter()
+
+
+class _RejectAllResponseCookies(DefaultCookiePolicy):
+    """Keep the process-wide upstream client stateless across service origins."""
+
+    def set_ok(self, cookie: Any, request: Any) -> bool:
+        """Reject every response cookie; qBittorrent manages its SID explicitly."""
+        del cookie, request
+        return False
+
 
 _logger = logging.getLogger(__name__)
 
@@ -190,6 +209,8 @@ async def _reconcile_once(app: FastAPI) -> None:
     reconcile_status.mark_run_started()
     sessionmaker = app.state.sessionmaker
     client = app.state.http_client
+    changes = queue_service.ReconcileChanges()
+    realtime_topics: set[str] = set()
     async with sessionmaker() as session:
         library = await get_library_optional(session, client)
 
@@ -211,13 +232,13 @@ async def _reconcile_once(app: FastAPI) -> None:
             # availability commit, then fall through — no request stuck in "Finalizing"
             # while qBittorrent is down.
             try:
-                await queue_service.reconcile_and_list(qbt, session)
+                await queue_service.reconcile_and_list(qbt, session, changes=changes)
                 if library is not None:
                     movies_root = await get_movies_root_optional(session)
                     tv_root = await get_tv_root_optional(session)
                     anime_movie_root = await get_anime_movie_root_optional(session)
                     anime_tv_root = await get_anime_tv_root_optional(session)
-                    await import_service.run_import_cycle(
+                    imported = await import_service.run_import_cycle(
                         fs=get_filesystem(),
                         media_probe=get_media_probe(),
                         library=library,
@@ -230,6 +251,8 @@ async def _reconcile_once(app: FastAPI) -> None:
                         anime_movie_root=anime_movie_root,
                         anime_tv_root=anime_tv_root,
                     )
+                    if imported:
+                        realtime_topics.update(("queue", "requests", "discover"))
             except QbittorrentError as exc:
                 await session.rollback()
                 _logger.warning(
@@ -243,7 +266,7 @@ async def _reconcile_once(app: FastAPI) -> None:
                 # narrow DB-only heal on the rolled-back session; rows that need a
                 # removal keep waiting for the client to recover (counted + logged
                 # inside the heal, never silently dropped).
-                await queue_service.heal_failed_pending_without_client(session)
+                await queue_service.heal_failed_pending_without_client(session, changes=changes)
         else:
             # DB-only strand heal (queue_service module docstring, "Operator
             # provenance"): with qBittorrent UNCONFIGURED the reconcile cycle above
@@ -252,13 +275,29 @@ async def _reconcile_once(app: FastAPI) -> None:
             # client I/O) would otherwise sit at failed_pending forever on exactly
             # the installs that path exists for. Rows needing a removal still wait
             # for the client (logged inside the heal, never silently dropped).
-            await queue_service.heal_failed_pending_without_client(session)
+            await queue_service.heal_failed_pending_without_client(session, changes=changes)
 
         # Availability promotion (completed -> available) needs ONLY Plex, so it runs
         # even when qBittorrent is down or the Movies root was cleared after an
         # import already triggered a scan — no request stuck in "Finalizing".
         if library is not None:
-            await import_service.run_availability_cycle(library=library, session=session)
+            promoted = await import_service.run_availability_cycle(library=library, session=session)
+            if promoted:
+                realtime_topics.update(("requests", "discover"))
+
+    if changes.queue:
+        realtime_topics.add("queue")
+    if changes.requests:
+        realtime_topics.update(("requests", "discover"))
+    if changes.blocklist:
+        realtime_topics.add("blocklist")
+    if realtime_topics:
+        ordered_topics = tuple(
+            topic
+            for topic in ("queue", "requests", "blocklist", "discover")
+            if topic in realtime_topics
+        )
+        publish_realtime(app, ordered_topics, reason="reconcile_cycle")
 
     reconcile_status.mark_ok()
 
@@ -340,6 +379,12 @@ async def _autograb_once(app: FastAPI) -> None:
     # eager scopes that keep hitting ``GrabError`` are being cooled so they don't
     # starve the search budget, rather than silently never reaching ``downloading``.
     status.cooled_down_scopes = result.cooled_down
+    if result.grabbed or result.no_acceptable:
+        publish_realtime(
+            app,
+            ("requests", "queue", "discover"),
+            reason="autograb",
+        )
     # An operational GRAB failure (``GrabError`` -- qBittorrent accepted the torrent
     # but no info-hash could be derived, leaving a live untracked torrent) does NOT
     # propagate the way a raised search does: ``run_grab_cycle`` catches it, leaves
@@ -605,6 +650,11 @@ async def _eviction_tick(app: FastAPI) -> float:
                         media_type,
                         root,
                     )
+                    publish_realtime(
+                        app,
+                        ("requests", "discover", "ops:disk", "ops:health"),
+                        reason="eviction",
+                    )
             if proactive_enabled:
                 # A SEPARATE pass, never gated on the pressure sweep above having
                 # fired: opting in means "also clear past-grace watched content
@@ -649,6 +699,11 @@ async def _eviction_tick(app: FastAPI) -> float:
                             len(proactive_evicted),
                             media_type,
                             root,
+                        )
+                        publish_realtime(
+                            app,
+                            ("requests", "discover", "ops:disk", "ops:health"),
+                            reason="eviction",
                         )
     return interval_minutes * 60.0
 
@@ -779,6 +834,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
+        get_event_hub(app).close_all(reason="shutdown")
         for task in background_tasks:
             task.cancel()
         # Await every cancelled task so its cleanup runs; return_exceptions=True
@@ -858,6 +914,11 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="Plex Manager", version=__version__, lifespan=lifespan)
+    # In-process realtime hub. The hub is single-worker only (see events.py);
+    # warn loudly if the environment hints at a multi-worker deployment that
+    # would silently drop cross-worker events.
+    warn_if_multiworker()
+    app.state.realtime_hub = EventHub(app_version=current_build_id())
     app.add_middleware(SetupGuardMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
@@ -870,6 +931,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
+    app.include_router(events_router.router)
     app.include_router(requests_router.router)
     app.include_router(search_preview_router.router)
     app.include_router(queue_router.router)
@@ -884,8 +946,17 @@ def create_app() -> FastAPI:
 
 
 def create_upstream_http_client() -> httpx.AsyncClient:
-    """Create the shared service-to-service client for configured integrations."""
-    return httpx.AsyncClient(timeout=30.0, trust_env=False)
+    """Create the stateless shared client for configured integrations.
+
+    A normal cookie jar matches by domain/path but not port. Keeping an upstream
+    cookie on this process-wide client could therefore forward one service's
+    credential to another service on the same hostname. qBittorrent captures and
+    sends its session cookie explicitly; all automatic response-cookie persistence
+    is denied.
+    """
+    client = httpx.AsyncClient(timeout=30.0, trust_env=False)
+    client.cookies.jar.set_policy(_RejectAllResponseCookies())
+    return client
 
 
 app = create_app()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
@@ -53,6 +53,7 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
     require_admin,
 )
+from plex_manager.web.events import publish_realtime
 from plex_manager.web.routers.search_preview import run_preview, stored_episodes_for_request
 from plex_manager.web.schemas import (
     ErrorDetail,
@@ -171,6 +172,7 @@ async def get_queue(
 @router.post("/grab", status_code=status.HTTP_201_CREATED, responses=_GRAB_ERROR_RESPONSES)
 async def grab_endpoint(
     body: GrabRequest,
+    http_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     prowlarr: Annotated[IndexerPort, Depends(get_prowlarr)],
@@ -271,6 +273,11 @@ async def grab_endpoint(
                 parked = await request_service.mark_no_acceptable_release(session, request.id)
             if parked:
                 await session.commit()
+                publish_realtime(
+                    http_request.app,
+                    ("requests", "discover"),
+                    reason="no_acceptable_release",
+                )
             else:
                 await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="no_acceptable_release")
@@ -325,12 +332,19 @@ async def grab_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="grab_hash_unresolved"
         ) from exc
-    return _to_item(record)
+    item = _to_item(record)
+    publish_realtime(
+        http_request.app,
+        ("queue", "requests", "discover"),
+        reason="grab",
+    )
+    return item
 
 
 @router.post("/{download_id}/import", responses=_QUEUE_ERROR_RESPONSES)
 async def import_endpoint(
     download_id: int,
+    http_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     library: Annotated[LibraryPort, Depends(get_library)],
@@ -369,12 +383,19 @@ async def import_endpoint(
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="download_not_found")
-    return _to_item(record)
+    item = _to_item(record)
+    publish_realtime(
+        http_request.app,
+        ("queue", "requests", "discover"),
+        reason="import",
+    )
+    return item
 
 
 @router.post("/{download_id}/mark-failed", responses=_QUEUE_ERROR_RESPONSES)
 async def mark_failed_endpoint(
     download_id: int,
+    http_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
     blocklist: Annotated[bool, Query()] = False,
@@ -418,12 +439,19 @@ async def mark_failed_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
         ) from exc
-    return _to_item(record)
+    item = _to_item(record)
+    publish_realtime(
+        http_request.app,
+        ("queue", "requests", "blocklist", "discover"),
+        reason="mark_failed",
+    )
+    return item
 
 
 @router.post("/{download_id}/relocate", responses=_QUEUE_ERROR_RESPONSES)
 async def relocate_endpoint(
     download_id: int,
+    http_request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     downloads_host_root: Annotated[str, Depends(get_downloads_host_root)],
@@ -467,4 +495,10 @@ async def relocate_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="relocation_superseded"
         ) from exc
-    return _to_item(record)
+    item = _to_item(record)
+    publish_realtime(
+        http_request.app,
+        ("queue",),
+        reason="relocate",
+    )
+    return item

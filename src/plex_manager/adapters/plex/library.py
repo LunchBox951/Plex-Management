@@ -34,6 +34,7 @@ from typing import Final, Literal, cast
 
 import httpx
 
+from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import header_value_error
 from plex_manager.logsafe import safe_int
 from plex_manager.ports.library import LibrarySection, WatchState
@@ -351,7 +352,11 @@ class PlexLibrary:
 
     def __init__(self, client: httpx.AsyncClient, base_url: str, token: str) -> None:
         self._client = client
-        self._base_url = base_url.rstrip("/")
+        try:
+            self._service_url = ServiceUrl.parse(base_url)
+        except InvalidServiceUrl as exc:
+            raise PlexLibraryError("Plex service URL is invalid") from exc
+        self._base_url = self._service_url.base
         self._token = token
         # Cache key = server + a hash of the token, so a different credential for the
         # same URL never reads back another token's cached sections (the raw token is
@@ -396,9 +401,15 @@ class PlexLibrary:
         if headers is not None:
             request_headers.update(headers)
         try:
+            url = self._service_url.endpoint(path)
             response = await self._client.get(
-                f"{self._base_url}{path}", params=params, headers=request_headers
+                url,
+                params=params,
+                headers=request_headers,
+                follow_redirects=False,
             )
+        except InvalidServiceUrl as exc:
+            raise PlexLibraryError("plex request path is invalid") from exc
         except httpx.RequestError as exc:
             # Plex unreachable (DNS / connection refused / timeout): httpx raises
             # before any status check, so without this it would propagate as an

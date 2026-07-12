@@ -2,19 +2,29 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useEvict,
   useMarkFailed,
+  useQueue,
   useRelocateDownload,
+  useRequests,
   useRequestsInvalidated,
   useRevokeAppKey,
   useRotateAppKey,
   useUpdateSettings,
 } from './hooks'
 import { client } from './client'
-import { queryKeys } from '../lib/queryClient'
+import {
+  POLL_INTERVAL_MS,
+  QUEUE_REALTIME_FLOOR_MS,
+  REQUESTS_POLL_INTERVAL_MS,
+  REQUESTS_REALTIME_FLOOR_MS,
+  queryKeys,
+} from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
+import * as apiKeyRotationLib from '../lib/apiKeyRotation'
+import { setRealtimeConnected } from '../lib/realtimeState'
 import type {
   AppApiKeyResponse,
   EvictResponse,
@@ -35,9 +45,18 @@ function createWrapper(qc: QueryClient) {
 }
 
 beforeEach(() => {
+  vi.mocked(client.GET).mockReset()
   vi.mocked(client.POST).mockReset()
   vi.mocked(client.PUT).mockReset()
   vi.mocked(client.DELETE).mockReset()
+  apiKeyLib.clearApiKey()
+  setRealtimeConnected(false)
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  apiKeyLib.clearApiKey()
 })
 
 describe('useUpdateSettings', () => {
@@ -231,6 +250,13 @@ describe('useRotateAppKey', () => {
       data: rotated,
       response: { status: 200 },
     })
+    const finishRotation = vi.fn(() => {
+      // The replacement must already be visible when the old-key barrier opens.
+      expect(apiKeyLib.getApiKey()).toBe('brand-new-key')
+    })
+    const beginRotationSpy = vi
+      .spyOn(apiKeyRotationLib, 'beginApiKeyRotation')
+      .mockReturnValue(finishRotation)
     const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
@@ -239,11 +265,13 @@ describe('useRotateAppKey', () => {
     const outcome = await result.current.mutateAsync()
 
     expect(outcome.app_api_key).toBe('brand-new-key')
+    expect(beginRotationSpy).toHaveBeenCalledTimes(1)
     // Fails before the fix: a rotated key never written into THIS browser's
     // own store would 401 the very next request from the device that just
     // rotated it -- every other device is correctly locked out, but this one
     // must not be.
     expect(setApiKeySpy).toHaveBeenCalledWith('brand-new-key')
+    expect(finishRotation).toHaveBeenCalledTimes(1)
     // Minting flips the Access card from Generate to Rotate/Revoke: the status
     // query must be invalidated so the card reflects that a key now exists.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
@@ -269,5 +297,117 @@ describe('useRevokeAppKey', () => {
     // Revoke clears the SHARED server-side key; it must never write a value into
     // this browser's own key store.
     expect(setApiKeySpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('realtime polling fallback', () => {
+  it('keeps an explicitly disabled queue query completely idle', async () => {
+    vi.useFakeTimers()
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { queue: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useQueue({ enabled: false, poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(QUEUE_REALTIME_FLOOR_MS + POLL_INTERVAL_MS)
+    })
+    expect(client.GET).not.toHaveBeenCalled()
+    unmount()
+    qc.clear()
+  })
+
+  it('drops queue polling to its slow floor while realtime is connected', async () => {
+    vi.useFakeTimers()
+    setRealtimeConnected(true)
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { queue: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useQueue({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(QUEUE_REALTIME_FLOOR_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
+    unmount()
+    qc.clear()
+  })
+
+  it('keeps request polling while realtime is disconnected', async () => {
+    vi.useFakeTimers()
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { requests: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useRequests({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
+    unmount()
+    qc.clear()
+  })
+
+  it('drops to a slow polling floor (never off) while realtime is connected', async () => {
+    vi.useFakeTimers()
+    setRealtimeConnected(true)
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { requests: [] },
+      response: { status: 200 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useRequests({ poll: true }), {
+      wrapper: createWrapper(qc),
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    // Fast cadence is suppressed while connected...
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_POLL_INTERVAL_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(1)
+
+    // ...but the slow floor still fires — a zombie stream self-heals within one
+    // slow tick regardless of the watchdog.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REQUESTS_REALTIME_FLOOR_MS)
+    })
+    expect(client.GET).toHaveBeenCalledTimes(2)
+    unmount()
+    qc.clear()
   })
 })

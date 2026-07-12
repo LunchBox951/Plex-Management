@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import Blocklist, BlocklistReason, MediaType
+from plex_manager.web.events import get_event_hub
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -67,13 +68,22 @@ async def test_list_can_scope_by_tmdb_id_and_media_type(
 
 
 async def test_delete_removes_entry_then_404(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     entry_id = await _insert(sessionmaker_, source_title="A", tmdb_id=1)
+    subscription = get_event_hub(app).subscribe()
+    await subscription.get()  # connect-time sync
 
     deleted = await client.delete(f"/api/v1/blocklist/{entry_id}", headers=_HEADERS)
     assert deleted.status_code == 204
+    event = await subscription.get()
+    assert event.topics == ("blocklist",)
+    assert event.reason == "blocklist_deleted"
+    subscription.close()
 
     missing = await client.delete(f"/api/v1/blocklist/{entry_id}", headers=_HEADERS)
     assert missing.status_code == 404

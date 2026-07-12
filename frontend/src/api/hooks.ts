@@ -8,6 +8,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
 import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
+import { beginApiKeyRotation } from '../lib/apiKeyRotation'
 import type {
   AppApiKeyResponse,
   AppApiKeyStatusResponse,
@@ -42,9 +43,12 @@ import {
   LOG_TAIL_POLL_INTERVAL_MS,
   OPS_POLL_INTERVAL_MS,
   POLL_INTERVAL_MS,
+  QUEUE_REALTIME_FLOOR_MS,
   REQUESTS_POLL_INTERVAL_MS,
+  REQUESTS_REALTIME_FLOOR_MS,
   queryKeys,
 } from '../lib/queryClient'
+import { useRealtimeConnected } from '../lib/realtimeState'
 
 /* ------------------------------------------------------------------- auth -- */
 
@@ -126,10 +130,10 @@ export function useSetupPlexServers(enabled: boolean, setupToken = '') {
 
 /**
  * Test a candidate Plex server AND assert the signed-in admin owns it
- * (`POST /setup/validate/plex`). `token` is OPTIONAL: omitted, the backend probes
- * with the admin's stored Plex OAuth token (the wizard's happy path — a picked
- * owned server never re-types a token); a supplied `token` is the explicit
- * custom-credential override. On success the response carries the server's
+ * (`POST /setup/validate/plex`). `token` may be omitted only for a plex.tv-
+ * advertised connection, which the backend probes with the admin's stored Plex
+ * OAuth token. A custom URL requires an explicit `token`. On success the response
+ * carries the server's
  * `machine_identifier` (for `plex_machine_identifier` on complete) and its
  * `libraries` (to drive the library-root pickers).
  */
@@ -144,7 +148,7 @@ export function useValidatePlex() {
 }
 
 // Plex is NOT here: its connection is verified on the wizard's server step via
-// `useValidatePlex` (owned-server ownership + optional token), never as a typed
+// `useValidatePlex` (owned-server ownership + conditional token), never as a typed
 // service card. These are the three card-driven services only.
 export type SetupService = 'prowlarr' | 'qbittorrent' | 'tmdb'
 
@@ -257,9 +261,16 @@ export function useRotateAppKey() {
   return useMutation({
     mutationFn: async (): Promise<AppApiKeyResponse> =>
       unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
+    onMutate: () => beginApiKeyRotation(),
     onSuccess: (data) => {
+      // Store the replacement BEFORE onSettled releases the old-key barrier.
+      // Any SSE or REST 401 that raced the server-side stream close can then see
+      // that its credential is stale instead of disabling the rotation winner.
       setApiKey(data.app_api_key)
       void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
+    },
+    onSettled: (_data, _error, _variables, finishRotation) => {
+      finishRotation?.()
     },
   })
 }
@@ -318,10 +329,17 @@ export function useDiscoverSearch(query: string, year?: number) {
 /* --------------------------------------------------------------- requests -- */
 
 export function useRequests(options?: { poll?: boolean }) {
+  const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.requests,
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
-    refetchInterval: options?.poll ? REQUESTS_POLL_INTERVAL_MS : false,
+    // Two-tier: fast cadence when the stream is down, a slow floor (never off)
+    // when it is up — the permanent safety net against a zombie stream.
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
   })
 }
 
@@ -470,11 +488,18 @@ export function useSearchPreview() {
  * admin-only (`require_admin`) and a shared session would just collect 403s.
  */
 export function useQueue(options?: { poll?: boolean; enabled?: boolean }) {
+  const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.queue,
     enabled: options?.enabled ?? true,
     queryFn: async (): Promise<QueueResponse> => unwrap(await client.GET('/api/v1/queue')),
-    refetchInterval: options?.poll ? POLL_INTERVAL_MS : false,
+    // Two-tier: fast cadence when the stream is down, a slow floor (never off)
+    // when it is up — the permanent safety net against a zombie stream.
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? QUEUE_REALTIME_FLOOR_MS
+        : POLL_INTERVAL_MS
+      : false,
   })
 }
 

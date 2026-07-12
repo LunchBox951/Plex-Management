@@ -139,6 +139,48 @@ function isValidNumberInput(value: string): boolean {
   return value.trim() !== '' && Number.isFinite(Number(value))
 }
 
+/** Canonical configured-service base for the frontend's credential-consent UI.
+ *
+ * The backend's security boundary ignores host/scheme case, explicit default
+ * ports, and a trailing slash when deciding whether a stored credential stays on
+ * the same configured base. WHATWG URL performs the first three normalizations;
+ * trimming the path's trailing slash completes the comparison. Invalid inputs
+ * return null and are conservatively treated as changed until backend validation
+ * reports the URL error.
+ */
+function canonicalServiceBase(value: string): string | null {
+  try {
+    const parsed = new URL(value)
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      parsed.username !== '' ||
+      parsed.password !== '' ||
+      parsed.search !== '' ||
+      parsed.hash !== ''
+    ) {
+      return null
+    }
+    const path = parsed.pathname.replace(/\/+$/, '')
+    return `${parsed.protocol}//${parsed.host}${path}`
+  } catch {
+    return null
+  }
+}
+
+function serviceBaseChanged(current: string, stored: string): boolean {
+  // An explicit blank disables the integration; it does not authorize a new
+  // credential destination. Keep the stored secret untouched so re-enabling at
+  // any non-blank base still requires fresh consent.
+  if (current === '' || current === stored) return false
+  const currentBase = canonicalServiceBase(current)
+  const storedBase = canonicalServiceBase(stored)
+  return currentBase === null || storedBase === null || currentBase !== storedBase
+}
+
+function credentialReentryMessage(credential: string): string {
+  return `Re-enter the ${credential} because the service address changed.`
+}
+
 const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
 
 /** The exact one-time reveal caption (ADR-0016). Kept verbatim so it never
@@ -324,6 +366,18 @@ export function Settings() {
   useEffect(() => {
     if (data && form === null) setForm(initialForm(data))
   }, [data, form])
+  const plexBaseChanged =
+    data !== undefined &&
+    form !== null &&
+    serviceBaseChanged(form.plex_url, data.plex_url ?? '')
+  const prowlarrBaseChanged =
+    data !== undefined &&
+    form !== null &&
+    serviceBaseChanged(form.prowlarr_url, data.prowlarr_url ?? '')
+  const qbittorrentBaseChanged =
+    data !== undefined &&
+    form !== null &&
+    serviceBaseChanged(form.qbittorrent_url, data.qbittorrent_url ?? '')
   const plexConnectionChanged =
     data !== undefined &&
     form !== null &&
@@ -363,6 +417,12 @@ export function Settings() {
   const setBoolField = (key: BoolKey, value: boolean) =>
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev))
 
+  const plexTokenRequired = plexBaseChanged && data.plex_token === SECRET_SET
+  const prowlarrApiKeyRequired =
+    prowlarrBaseChanged && data.prowlarr_api_key === SECRET_SET
+  const qbittorrentPasswordReentry =
+    qbittorrentBaseChanged && data.qbittorrent_password === SECRET_SET
+
   const textField = (key: TextKey, label: string, placeholder: string) => (
     <Field
       label={label}
@@ -372,17 +432,39 @@ export function Settings() {
     />
   )
 
-  const secretField = (key: SecretKey, label: string, isSet: boolean) => (
-    <Field
-      label={label}
-      type="password"
-      autoComplete="off"
-      value={form[key]}
-      onChange={(e) => setField(key, e.target.value)}
-      placeholder={isSet ? '•••• set' : 'Not set'}
-      hint={isSet ? '•••• set (leave blank to keep)' : undefined}
-    />
-  )
+  const secretField = (
+    key: SecretKey,
+    label: string,
+    isSet: boolean,
+    options?: {
+      credential: string
+      destinationChanged: boolean
+      emptyAllowed?: boolean
+    },
+  ) => {
+    const reentryNeeded = isSet && options?.destinationChanged === true
+    const required = reentryNeeded && options?.emptyAllowed !== true
+    const credential = options?.credential ?? label
+    const hint = reentryNeeded
+      ? options?.emptyAllowed
+        ? `The service address changed. Re-enter the ${credential}, or leave it blank only if the new service uses an empty password.`
+        : credentialReentryMessage(credential)
+      : isSet
+        ? '•••• set (leave blank to keep)'
+        : undefined
+    return (
+      <Field
+        label={label}
+        type="password"
+        autoComplete="off"
+        required={required}
+        value={form[key]}
+        onChange={(e) => setField(key, e.target.value)}
+        placeholder={isSet ? '•••• set' : 'Not set'}
+        hint={hint}
+      />
+    )
+  }
 
   const numberField = (
     key: NumberKey,
@@ -416,6 +498,23 @@ export function Settings() {
   )
 
   const handleSave = async () => {
+    // A stored credential may be reused only on the exact canonical service
+    // base. Fail locally with the same correction the backend would return,
+    // instead of inviting an avoidable rejected save after the URL changed.
+    for (const [required, value, credential] of [
+      [plexTokenRequired, form.plex_token, 'Plex token'],
+      [prowlarrApiKeyRequired, form.prowlarr_api_key, 'Prowlarr API key'],
+    ] as const) {
+      if (required && value.trim() === '') {
+        toast({
+          title: 'Save failed',
+          description: credentialReentryMessage(credential),
+          intent: 'error',
+        })
+        return
+      }
+    }
+
     // Every numeric operability knob must be a non-empty, finite number BEFORE
     // any save is attempted. An emptied input (or stray non-numeric text) must
     // never silently coerce to 0 via `Number('')` — that would flip a real
@@ -486,7 +585,13 @@ export function Settings() {
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
-    if (form.qbittorrent_password) body.qbittorrent_password = form.qbittorrent_password
+    // An empty qBittorrent password is valid. When its destination changes,
+    // include the blank field explicitly so it authorizes an empty-password
+    // replacement instead of ambiguously asking the backend to reuse the stored
+    // password at a new base.
+    if (form.qbittorrent_password || qbittorrentPasswordReentry) {
+      body.qbittorrent_password = form.qbittorrent_password
+    }
     if (form.tmdb_api_key) body.tmdb_api_key = form.tmdb_api_key
 
     try {
@@ -531,7 +636,10 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">Plex</h2>
           <div className="mt-4 flex flex-col gap-4">
             {textField('plex_url', 'URL', 'http://localhost:32400')}
-            {secretField('plex_token', 'Token', data.plex_token === SECRET_SET)}
+            {secretField('plex_token', 'Token', data.plex_token === SECRET_SET, {
+              credential: 'Plex token',
+              destinationChanged: plexBaseChanged,
+            })}
           </div>
         </section>
 
@@ -539,7 +647,10 @@ export function Settings() {
           <h2 className="font-display text-sm font-semibold text-ink">Prowlarr</h2>
           <div className="mt-4 flex flex-col gap-4">
             {textField('prowlarr_url', 'URL', 'http://localhost:9696')}
-            {secretField('prowlarr_api_key', 'API key', data.prowlarr_api_key === SECRET_SET)}
+            {secretField('prowlarr_api_key', 'API key', data.prowlarr_api_key === SECRET_SET, {
+              credential: 'Prowlarr API key',
+              destinationChanged: prowlarrBaseChanged,
+            })}
           </div>
         </section>
 
@@ -548,7 +659,16 @@ export function Settings() {
           <div className="mt-4 flex flex-col gap-4">
             {textField('qbittorrent_url', 'URL', 'http://localhost:8080')}
             {textField('qbittorrent_username', 'Username', 'admin')}
-            {secretField('qbittorrent_password', 'Password', data.qbittorrent_password === SECRET_SET)}
+            {secretField(
+              'qbittorrent_password',
+              'Password',
+              data.qbittorrent_password === SECRET_SET,
+              {
+                credential: 'qBittorrent password',
+                destinationChanged: qbittorrentBaseChanged,
+                emptyAllowed: true,
+              },
+            )}
           </div>
         </section>
 

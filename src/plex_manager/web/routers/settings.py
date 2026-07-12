@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
 
 from plex_manager.adapters.plex.oauth import PlexTvClient
+from plex_manager.adapters.service_url import same_service_base
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, User
@@ -65,6 +66,7 @@ from plex_manager.web.deps import (
     resolve_log_retention_days,
 )
 from plex_manager.web.errors import AppError
+from plex_manager.web.events import close_realtime_streams, publish_realtime
 from plex_manager.web.schemas import (
     AppApiKeyResponse,
     AppApiKeyStatusResponse,
@@ -110,19 +112,20 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorEnvelope,
         "description": "The signed-in admin has no Plex account on file to verify ownership",
     },
-    # This status code has THREE distinct producers, so all three shapes are
+    # This status code has THREE distinct response shapes, so all three are
     # documented (mirroring queue.py's ``_GRAB_ERROR_RESPONSES`` /
     # search_preview.py's anyOf, which document the same body-validation-vs-app-error
     # collision): FastAPI's own request-body validation (``HTTPValidationError``),
     # ``_validate_disk_pressure_pair``'s plain ``HTTPException`` (``ErrorDetail``),
-    # and the repoint verification ladder's ``plex_token_invalid`` ``AppError``
-    # (``ErrorEnvelope``). Declaring only ``ErrorEnvelope`` here would silently
-    # overwrite FastAPI's auto-generated validation-error entry instead of adding
-    # to it.
+    # and application-validation ``AppError`` values (``plex_token_invalid`` or
+    # ``credential_reentry_required``, both ``ErrorEnvelope``). Declaring only
+    # ``ErrorEnvelope`` here would silently overwrite FastAPI's auto-generated
+    # validation-error entry instead of adding to it.
     422: {
         "description": (
             "Request validation failed, the disk-pressure pair would invert, "
-            "or the replacement Plex server rejected the effective Plex token"
+            "a changed service destination requires credential re-entry, or the "
+            "replacement Plex server rejected the effective Plex token"
         ),
         "content": {
             "application/json": {
@@ -159,6 +162,23 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 # non-deterministic, so a ``WHERE app_api_key = <ciphertext>`` predicate can never
 # match).
 _rotate_lock = asyncio.Lock()
+
+# A settings update validates an EFFECTIVE destination/credential pair and then
+# writes its individual rows in one transaction.  Without serializing that whole
+# read-check-write sequence, two otherwise-valid partial PUTs can interleave: a
+# secret-only rotation can finish its checks against the old URL, a second request
+# can commit a new URL plus a dummy secret, and the first can then overwrite only
+# the secret -- silently pairing the fresh credential with the new destination.
+# Keep validation, live Plex probes, persistence, cache invalidation, and the
+# redacted response under one lock so every request reasons about the pair left by
+# its predecessor.
+#
+# Like ``_rotate_lock`` above, this is deliberately a SINGLE-PROCESS guard. The
+# supported uvicorn deployment runs one worker and the in-app background loops
+# already rely on that model. A future multi-worker deployment must replace this
+# with a database-level version/CAS or advisory lock spanning the same critical
+# section; an in-process lock alone would not coordinate separate workers.
+_settings_update_lock = asyncio.Lock()
 
 
 # The default each boolean key degrades to on an unrecognized stored value --
@@ -526,6 +546,12 @@ async def rotate_app_key_endpoint(
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
         await session.commit()
+    close_realtime_streams(
+        request.app,
+        reason="app_key_rotated",
+        auth_method=AuthMethod.api_key.value,
+    )
+    publish_realtime(request.app, ("access",), reason="app_key_rotated")
     return AppApiKeyResponse(app_api_key=new_key)
 
 
@@ -574,6 +600,12 @@ async def revoke_app_key_endpoint(
                 raise HTTPException(status_code=409, detail="app_key_changed")
         system.app_api_key = None
         await session.commit()
+    close_realtime_streams(
+        request.app,
+        reason="app_key_revoked",
+        auth_method=AuthMethod.api_key.value,
+    )
+    publish_realtime(request.app, ("access",), reason="app_key_revoked")
 
 
 async def _verify_plex_repoint(
@@ -594,8 +626,9 @@ async def _verify_plex_repoint(
     * ``(True, machine_id)`` — the identity changes, the EFFECTIVE (post-PUT)
       url+token pair is complete, and the full verification ladder passed. The
       effective value of each half is this PUT's submitted value when it
-      carries one, else the currently-stored value — so a masked/omitted token
-      still probes with the STORED real token when only ``plex_url`` changed.
+      carries one, else the currently-stored value.  A masked/omitted token may
+      reuse the stored value only when the submitted URL normalizes to the exact
+      same configured base; any destination change requires explicit re-entry.
     * ``(True, None)`` — the identity changes but the effective pair is
       INCOMPLETE (a half-configured install, or an explicit clear-to-``""``).
       There is nothing to probe; the caller keeps the settings write but treats
@@ -654,6 +687,26 @@ async def _verify_plex_repoint(
     effective_token = submitted_token if submitted_token is not None else stored_token
     if not effective_url or not effective_token:
         return True, None
+    # Never forward the STORED token to a newly submitted origin.  A URL-only
+    # repoint used to send the encrypted-at-rest credential to that host during
+    # /identity and /library/sections verification *before* ownership was known.
+    # Even a path-prefix change on the same origin can route to another backend,
+    # so anything other than the exact canonical base requires the operator to
+    # explicitly re-enter the token they are authorizing us to send.
+    if (
+        submitted_url is not None
+        and submitted_token is None
+        and stored_token
+        and (not stored_url or not same_service_base(submitted_url, stored_url))
+    ):
+        raise AppError(
+            status_code=422,
+            code="credential_reentry_required",
+            message="Changing the Plex server address requires the Plex token again.",
+            hint=(
+                "Re-enter the Plex token so a stored credential is never sent to a new destination."
+            ),
+        )
     plex_tv = PlexTvClient(
         client,
         client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
@@ -678,9 +731,60 @@ async def _verify_plex_repoint(
     return True, machine_identifier
 
 
+async def _reject_changed_base_stored_credential_reuse(
+    body: SettingsUpdate, store: SettingsStore
+) -> None:
+    """Require explicit secret re-entry when a configured service base changes.
+
+    Prowlarr and qBittorrent are not probed during a settings write, so a URL-only
+    change would otherwise be committed and the next health/search/reconcile call
+    would silently send their encrypted stored credential to the new destination.  A
+    different reverse-proxy prefix on the same origin can route to another
+    backend, so only the exact canonical base may reuse a stored credential.
+    """
+    protected: tuple[tuple[str, str, str, bool], ...] = (
+        ("prowlarr_url", "prowlarr_api_key", "Prowlarr API key", False),
+        ("qbittorrent_url", "qbittorrent_password", "qBittorrent password", True),
+    )
+    for url_field, secret_field, secret_label, empty_secret_is_configured in protected:
+        submitted_url = (
+            getattr(body, url_field)
+            if url_field in body.model_fields_set and getattr(body, url_field) is not None
+            else None
+        )
+        if not isinstance(submitted_url, str) or not submitted_url:
+            continue
+        stored_url = await store.get(url_field)
+        if stored_url and same_service_base(submitted_url, stored_url):
+            continue
+        submitted_secret = (
+            getattr(body, secret_field)
+            if secret_field in body.model_fields_set
+            and getattr(body, secret_field) not in (None, SECRET_MASK)
+            else None
+        )
+        stored_secret = await store.get(secret_field)
+        # qBittorrent accepts an intentionally empty password; Prowlarr treats
+        # an empty API key as unconfigured and therefore sends no credential.
+        stored_credential_exists = (
+            stored_secret is not None if empty_secret_is_configured else bool(stored_secret)
+        )
+        if stored_credential_exists and submitted_secret is None:
+            raise AppError(
+                status_code=422,
+                code="credential_reentry_required",
+                message=f"Changing the service address requires the {secret_label} again.",
+                hint=(
+                    f"Re-enter the {secret_label} so a stored credential is never sent "
+                    "to a new destination."
+                ),
+            )
+
+
 @router.put("", responses=_PUT_SETTINGS_RESPONSES)
 async def put_settings_endpoint(
     body: SettingsUpdate,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     context: Annotated[AuthContext, Depends(require_admin)],
@@ -712,10 +816,12 @@ async def put_settings_endpoint(
     effective token (``/identity`` is unauthenticated, so reachability alone
     would bless a wrong/revoked token), then — for Plex-SESSION callers — the
     wizard's ownership assertion. The same code paths ``/setup/complete`` and
-    ``/setup/validate/plex`` use, resolving a masked/omitted token to the stored
-    real one. Only a server that passes gets committed: the settings are
-    written, the freshly DERIVED id replaces the cached one (better than
-    clearing it — it was just derived, so sign-in never needs a per-request
+    ``/setup/validate/plex`` use. A masked/omitted token is resolved to the
+    stored real one only when the configured base is unchanged after
+    normalization; a new path, scheme, host, or port requires explicit token
+    re-entry before any probe. Only a server that passes gets committed: the
+    settings are written, the freshly DERIVED id replaces the cached one (better
+    than clearing it — it was just derived, so sign-in never needs a per-request
     re-probe), and every active browser session is revoked. Any verification
     failure is its honest envelope (502 unreachable, 422 ``plex_token_invalid``,
     403 ``server_not_owned``) with NOTHING committed and every session intact —
@@ -785,50 +891,78 @@ async def put_settings_endpoint(
     field, so the very next ``GET /health`` re-probes the NEW server instead of
     serving a stale pre-repoint ``ok``/``down`` card.
     """
-    await _validate_disk_pressure_pair(body, session)
+    # Security-critical read/check/write boundary: see ``_settings_update_lock``.
+    # The redacted response stays inside too, so a waiting PUT cannot change rows
+    # between this request's commit and the values it returns to the operator.
+    async with _settings_update_lock:
+        # Authentication dependencies use this same AsyncSession before the
+        # endpoint acquires the lock. End that read transaction now so a request
+        # that waited behind another PUT cannot retain a pre-lock database
+        # snapshot while validating its effective destination/credential pair.
+        # The dependencies leave only primitive AuthContext data and make no
+        # writes, so rolling their read transaction back is safe.
+        await session.rollback()
+        await _validate_disk_pressure_pair(body, session)
 
-    store = SettingsStore(session)
-    # Verify BEFORE any write: a failed verification must leave nothing behind.
-    plex_identity_changed, machine_identifier = await _verify_plex_repoint(
-        body, session, store, client, context
-    )
-    # Likewise verify every submitted library root is visible to THIS container
-    # (issue #132) before anything is written.
-    resolved_roots = await _resolve_root_writes(body)
+        store = SettingsStore(session)
+        await _reject_changed_base_stored_credential_reuse(body, store)
+        # Verify BEFORE any write: a failed verification must leave nothing behind.
+        plex_identity_changed, machine_identifier = await _verify_plex_repoint(
+            body, session, store, client, context
+        )
+        # Likewise verify every submitted library root is visible to THIS container
+        # (issue #132) before anything is written.
+        resolved_roots = await _resolve_root_writes(body)
 
-    written_fields: set[str] = set()
-    for field in body.model_fields_set:
-        value = getattr(body, field)
-        if value is None:
-            continue
-        if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
-            continue
-        if field in resolved_roots:
-            value = resolved_roots[field]
-        await store.set(field, _to_stored_string(value))
-        written_fields.add(field)
-    if plex_identity_changed:
-        if machine_identifier is None:
-            # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
-            await store.delete(PLEX_MACHINE_ID_SETTING)
-        else:
-            # Verified repoint, all in this SAME transaction: cache the id just
-            # derived from the NEW server and revoke every ACTIVE session so
-            # nobody's old-server authority outlives the repoint (the caller's
-            # own session included, deliberately — see the docstring).
-            await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
-            await session.execute(
-                update(AuthSession)
-                .where(AuthSession.revoked_at.is_(None))
-                .values(revoked_at=datetime.now(UTC))
+        written_fields: set[str] = set()
+        for field in body.model_fields_set:
+            value = getattr(body, field)
+            if value is None:
+                continue
+            if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
+                continue
+            if field in resolved_roots:
+                value = resolved_roots[field]
+            await store.set(field, _to_stored_string(value))
+            written_fields.add(field)
+        if plex_identity_changed:
+            if machine_identifier is None:
+                # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
+                await store.delete(PLEX_MACHINE_ID_SETTING)
+            else:
+                # Verified repoint, all in this SAME transaction: cache the id just
+                # derived from the NEW server and revoke every ACTIVE session so
+                # nobody's old-server authority outlives the repoint (the caller's
+                # own session included, deliberately — see the docstring).
+                await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
+                await session.execute(
+                    update(AuthSession)
+                    .where(AuthSession.revoked_at.is_(None))
+                    .values(revoked_at=datetime.now(UTC))
+                )
+        await session.commit()
+
+        # Clear backend probe caches before publishing: a listening tab can refetch
+        # immediately on the SSE event, so publishing first could race it into the
+        # stale pre-update health snapshot.
+        for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+            if written_fields.intersection(fields):
+                health_cache.invalidate(subsystem)
+
+        if plex_identity_changed and machine_identifier is not None:
+            close_realtime_streams(
+                request.app,
+                reason="plex_server_repointed",
+                auth_method=AuthMethod.plex_session.value,
             )
-    await session.commit()
+        if written_fields or plex_identity_changed:
+            publish_realtime(
+                request.app,
+                ("settings", "ops:health"),
+                reason="settings_updated",
+            )
 
-    for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
-        if written_fields.intersection(fields):
-            health_cache.invalidate(subsystem)
-
-    return await _redacted(store)
+        return await _redacted(store)
 
 
 async def _validate_disk_pressure_pair(body: SettingsUpdate, session: AsyncSession) -> None:

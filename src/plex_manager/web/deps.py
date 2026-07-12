@@ -42,7 +42,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.media_probe.ffprobe import FfprobeMediaProbe
@@ -52,7 +52,7 @@ from plex_manager.adapters.prowlarr.adapter import ProwlarrIndexer
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentClient
 from plex_manager.adapters.tmdb.adapter import TmdbMetadata
 from plex_manager.config import get_settings
-from plex_manager.db import get_session
+from plex_manager.db import get_session, get_sessionmaker
 from plex_manager.domain.quality_profile import QualityProfile, default_profile
 from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.ports.download_client import DownloadClientPort
@@ -146,7 +146,9 @@ __all__ = [
     "is_setup_token_required",
     "load_system_settings",
     "require_admin",
+    "require_admin_short_session",
     "require_api_key",
+    "require_api_key_short_session",
     "require_setup_admin",
     "resolve_bool_setting",
     "resolve_disk_pressure_percents",
@@ -201,6 +203,7 @@ class AuthContext:
     email: str | None = None
     avatar_url: str | None = None
     is_admin: bool = False
+    session_expires_at: datetime | None = None
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -750,7 +753,8 @@ async def _session_auth_context(
     if row is None:
         return None
     auth_session, user = row
-    if _normalize_dt(auth_session.expires_at) <= now:
+    expires_at = _normalize_dt(auth_session.expires_at)
+    if expires_at <= now:
         return None
     if enforce_csrf:
         _require_csrf_for_session(request)
@@ -762,6 +766,7 @@ async def _session_auth_context(
         email=user.email,
         avatar_url=user.avatar_url,
         is_admin=user.permissions > 0,
+        session_expires_at=expires_at,
     )
 
 
@@ -807,6 +812,45 @@ async def require_api_key(
     return context
 
 
+async def require_api_key_short_session(
+    request: Request,
+    provided: Annotated[str | None, Depends(_api_key_header)],
+) -> AuthContext:
+    """Auth for long-lived streaming endpoints that must hold no DB session.
+
+    :func:`require_api_key` validates against a session sourced from
+    :func:`get_session` — a *yield* dependency that stays checked out for the
+    whole request lifetime. For an ordinary request that is momentary, but for an
+    SSE stream the "request" lives as long as the browser tab, so the session (and
+    its connection) would be pinned for hours. With the small aiosqlite pool
+    (~5 slots) shared with the reconcile/autograb/eviction workers, a handful of
+    long-lived tabs would exhaust it.
+
+    This accepts the same API-key-or-Plex-session contract as
+    :func:`require_api_key`, but validates it against a session that is opened and
+    **closed up front**, before the endpoint begins streaming. The stream itself
+    therefore holds no connection. The header source remains
+    :class:`APIKeyHeader`, so the OpenAPI security scheme is unchanged and the app
+    factory can still advertise cookie auth as the alternative browser path.
+    """
+    maker_obj = getattr(request.app.state, "sessionmaker", None)
+    maker: async_sessionmaker[AsyncSession]
+    if isinstance(maker_obj, async_sessionmaker):
+        maker = cast("async_sessionmaker[AsyncSession]", maker_obj)
+    else:
+        maker = get_sessionmaker()
+    async with maker() as session:
+        context = await authenticate_request(
+            request,
+            session,
+            provided_api_key=provided,
+            enforce_csrf=False,
+        )
+    if context is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    return context
+
+
 async def require_admin(
     context: Annotated[AuthContext, Depends(require_api_key)],
 ) -> AuthContext:
@@ -814,6 +858,20 @@ async def require_admin(
 
     API-key and dev-bypass auth are administrator contexts. Plex session auth is
     administrator-only when the signed-in Plex account owns the configured server.
+    """
+    if not context.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return context
+
+
+async def require_admin_short_session(
+    context: Annotated[AuthContext, Depends(require_api_key_short_session)],
+) -> AuthContext:
+    """Require an administrator without retaining a DB session.
+
+    Long-lived streams use this companion to :func:`require_admin`: credential
+    validation completes against a short-lived session before the response
+    starts, and shared Plex users stay on the privacy-safe polling path.
     """
     if not context.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
