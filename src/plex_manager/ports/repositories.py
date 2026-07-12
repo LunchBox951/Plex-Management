@@ -770,9 +770,7 @@ class SeasonEpisodeStateRepository(Protocol):
         """List every tracked episode row for ``season_request_id``."""
         raise NotImplementedError
 
-    async def upsert_target(
-        self, season_request_id: int, aired: Mapping[int, date | None]
-    ) -> None:
+    async def upsert_target(self, season_request_id: int, aired: Mapping[int, date | None]) -> None:
         """Idempotently seed/refresh the aired-episode target.
 
         For each episode in ``aired``: inserts a ``pending`` row if absent, and

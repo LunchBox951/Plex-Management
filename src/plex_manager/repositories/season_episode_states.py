@@ -42,9 +42,7 @@ class SqlSeasonEpisodeStateRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def _existing_by_episode(
-        self, season_request_id: int
-    ) -> dict[int, SeasonEpisodeState]:
+    async def _existing_by_episode(self, season_request_id: int) -> dict[int, SeasonEpisodeState]:
         stmt = select(SeasonEpisodeState).where(
             SeasonEpisodeState.season_request_id == season_request_id
         )
@@ -73,9 +71,7 @@ class SqlSeasonEpisodeStateRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
-    async def upsert_target(
-        self, season_request_id: int, aired: Mapping[int, date | None]
-    ) -> None:
+    async def upsert_target(self, season_request_id: int, aired: Mapping[int, date | None]) -> None:
         existing = await self._existing_by_episode(season_request_id)
         for episode_number, air_date in aired.items():
             row = existing.get(episode_number)
