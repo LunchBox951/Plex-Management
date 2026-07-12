@@ -222,6 +222,43 @@ def test_snapshot_naive_copy_would_miss_uncheckpointed_wal_rows(tmp_path: Path) 
         conn.close()
 
 
+def test_snapshot_and_revision_read_handle_uri_reserved_chars_in_path(tmp_path: Path) -> None:
+    """Finding: SQLite ``file:`` URIs must percent-escape the filesystem path.
+
+    A bare ``f"file:{path}?mode=ro"`` breaks when the path contains
+    URI-reserved characters: a ``?`` in a directory name starts the query
+    string early and a ``#`` truncates the path at the fragment, so SQLite
+    opens the WRONG file (or creates one) instead of the intended database.
+    Both read-only openers (``_current_revision`` and ``_snapshot_sqlite``'s
+    source connection) must go through the escaping helper. The decoy file at
+    the truncated path proves a regression opens the wrong database rather
+    than merely erroring.
+    """
+    weird_dir = tmp_path / "a?b#c"
+    weird_dir.mkdir()
+    db_path = weird_dir / "plex_manager.db"
+    _stamp_db(db_path, "escaped-uri-revision")
+
+    # An unescaped URI would truncate at '?': "file:<tmp>/a". Plant a decoy
+    # THERE so a regression reads a different database instead of failing
+    # loudly -- the assertions below then catch the wrong content, not just
+    # an exception.
+    decoy = tmp_path / "a"
+    _stamp_db(decoy, "DECOY-wrong-file")
+
+    assert db_backup._current_revision(db_path) == "escaped-uri-revision"  # pyright: ignore[reportPrivateUsage]
+
+    snapshot = tmp_path / "snapshot.db"
+    db_backup._snapshot_sqlite(db_path, snapshot)  # pyright: ignore[reportPrivateUsage]
+    conn = sqlite3.connect(snapshot)
+    try:
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "escaped-uri-revision"
+
+
 def test_missing_key_backs_up_db_only_nonfatal(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

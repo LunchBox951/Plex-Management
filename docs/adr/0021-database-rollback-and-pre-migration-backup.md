@@ -73,10 +73,16 @@ database.
   `sqlite3.Connection.backup()` — not a bare file copy, which would silently
   miss rows still sitting in the `-wal` file and produce a corrupt or
   stale-looking snapshot — into
-  `<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/`, alongside a copy of
-  the Fernet key (mode 0600 preserved) and a `MANIFEST.txt` restore runbook.
-  The database and the key are backed up **as one unit**, addressing the
-  recovery-unit gap directly (#221).
+  `<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/`, alongside a
+  `MANIFEST.txt` restore runbook and — **in the key-file (default) disposition
+  only** — a copy of the Fernet key (mode 0600 preserved), so the database and
+  the key are backed up **as one unit**, addressing the recovery-unit gap
+  directly (#221). A SQLite deployment using `PLEX_MANAGER_FERNET_KEY` instead
+  gets a **database-only** backup directory: the env value is the key half of
+  the recovery unit and is never embedded (any on-disk `secret.key` is absent
+  or stale and is deliberately not copied — same reasoning as §6 below), and
+  the `MANIFEST.txt` records which disposition applied. The backup directory
+  is therefore self-contained only in the key-file disposition.
 - Prunes to the 5 most recent backup directories (sorted by modification time,
   not by directory name — the name embeds an arbitrary revision hash before
   the timestamp, which is not chronologically sortable).
@@ -97,7 +103,7 @@ reason and is not a silent swallow — it always emits the ERROR first.
 honest notice instead of silently doing nothing: the operator must snapshot
 the database (e.g. `pg_dump`) AND separately preserve the key half of the
 recovery unit themselves. Which key half depends on the deployment, exactly as
-the SQLite path's `KeyDisposition` (§4) already distinguishes -- an
+the SQLite path's `KeyDisposition` (§4) already distinguishes — an
 unconditional "preserve `secret.key`" instruction is wrong for half of these
 deployments:
 
@@ -106,7 +112,7 @@ deployments:
   keep the two together.
 - **`PLEX_MANAGER_FERNET_KEY` deployments:** the active key is the environment
   value, not a file. Any on-disk `secret.key` in this case is absent, or a
-  stale leftover that no longer matches the active key -- it must **not** be
+  stale leftover that no longer matches the active key — it must **not** be
   saved as the key half; doing so pairs the dump with the wrong key and
   produces an undecryptable restore. Preserve the `PLEX_MANAGER_FERNET_KEY`
   value from the environment/secret store instead.
@@ -142,8 +148,10 @@ credential-scoped feature and is deliberately deferred. See the README
   what actually happens, closing the gap the independent reproduction found.
 - A real recovery path exists for cross-migration rollback, not just same-schema.
 - The database and its encryption key can no longer be backed up as two
-  independently-drifting things by accident — the automatic path always takes
-  both, and the manual runbook (README) says so explicitly for Postgres.
+  independently-drifting things by accident — the automatic path takes both
+  whenever the key is a file (and records honestly, in `MANIFEST.txt`, when
+  the key half instead lives in `PLEX_MANAGER_FERNET_KEY`), and the manual
+  runbook (README) says so explicitly for Postgres.
 - WAL-consistent snapshots mean the automatic backup reflects genuinely
   committed data, not a torn mid-write file.
 

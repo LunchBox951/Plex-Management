@@ -34,6 +34,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+from urllib.parse import quote
 
 from sqlalchemy.engine import make_url
 
@@ -74,6 +75,22 @@ def _sqlite_file_path(settings: Settings) -> Path | None:
     return Path(url.database)
 
 
+def _sqlite_ro_uri(path: Path) -> str:
+    """Build a read-only SQLite ``file:`` URI for ``path``, percent-escaping it.
+
+    A bare ``f"file:{path}?mode=ro"`` breaks when the filesystem path contains
+    URI-reserved characters: a ``?`` in the path starts the query string early
+    (so ``mode=ro`` is silently dropped and part of the filename becomes a bogus
+    parameter) and a ``#`` truncates the path at the fragment -- SQLite then
+    opens the WRONG file, or creates one. Python's ``sqlite3`` docs recommend
+    percent-encoding the path portion of a file URI for exactly this reason;
+    ``urllib.parse.quote`` keeps ``/`` intact (its default ``safe``) while
+    escaping the reserved characters, and SQLite percent-decodes the path
+    before opening it.
+    """
+    return f"file:{quote(str(path))}?mode=ro"
+
+
 def _current_revision(db_path: Path) -> str | None:
     """Read the ``alembic_version`` row from an existing SQLite file, read-only.
 
@@ -81,7 +98,7 @@ def _current_revision(db_path: Path) -> str | None:
     predates Alembic, or a partially-initialized one) -- callers treat that the
     same as "base" (nothing applied).
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
     try:
         cursor = conn.execute("SELECT version_num FROM alembic_version LIMIT 1")
         row = cursor.fetchone()
@@ -146,7 +163,7 @@ def _snapshot_sqlite(src: Path, dst: Path) -> None:
     uncommitted WAL frames, so a snapshot taken while the app is running does
     not silently drop recently-committed rows still sitting in ``-wal``.
     """
-    src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    src_conn = sqlite3.connect(_sqlite_ro_uri(src), uri=True)
     try:
         dst_conn = sqlite3.connect(dst)
         try:

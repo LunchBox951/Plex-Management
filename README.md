@@ -165,9 +165,14 @@ startup — not a replacement for your own backup strategy. Know its limits:
 
 **SQLite (the default, named-volume) deployment:**
 ```bash
-# Stop the container, then copy both files out of the volume together:
-cp /path/to/volume/plex_manager.db /path/to/volume/secret.key ./backup/
+# Stop the container, then snapshot the database via the SQLite backup API --
+# a bare `cp` of plex_manager.db can miss committed rows still sitting in the
+# -wal sidecar (e.g. after a crash/kill; this is why the automatic backup
+# uses the same API):
+sqlite3 /path/to/volume/plex_manager.db ".backup './backup/plex_manager.db'"
+# The key is the other half of the recovery unit; keep it with the snapshot.
 # secret.key must keep mode 0600 on restore:
+cp /path/to/volume/secret.key ./backup/
 chmod 600 ./backup/secret.key
 ```
 
