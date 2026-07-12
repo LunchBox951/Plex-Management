@@ -642,6 +642,29 @@ class SeasonRequestRepository(Protocol):
         """List season requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def list_for_airing_refresh(
+        self, statuses: frozenset[str], limit: int
+    ) -> list[SeasonRequestRecord]:
+        """List up to ``limit`` seasons in ``statuses`` due for an airing-target
+        refresh (ADR-0020 §6, ``season_episode_service.reconcile_airing``), oldest
+        ``airing_refresh_checked_at`` first (``NULL`` -- never checked -- sorts
+        first), tie-broken by ``id``.
+
+        This is a ROTATING window, not a stable top-N: :meth:`mark_airing_refresh_
+        checked` advances a row to the back of the queue, so a bounded per-cycle
+        ``limit`` still eventually revisits every row instead of permanently
+        starving whichever ones do not fit in the first ``limit``-sized slice.
+        """
+        raise NotImplementedError
+
+    async def mark_airing_refresh_checked(self, season_request_id: int, checked_at: date) -> None:
+        """Stamp the airing-refresh rotation cursor (see :meth:`list_for_airing_
+        refresh`) after ``reconcile_airing`` has actually looked at this season this
+        cycle -- rearmed or not, even after a TMDB error -- so the row moves to the
+        back of the rotation instead of being re-selected every cycle.
+        """
+        raise NotImplementedError
+
     async def evicted_seasons(self, tmdb_id: int) -> frozenset[int]:
         """Season numbers whose NEWEST row (across this ``tmdb_id``'s ``tv``
         requests) is ``evicted`` (ADR-0012).

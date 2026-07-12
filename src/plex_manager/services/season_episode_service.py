@@ -163,15 +163,22 @@ async def reconcile_airing(
     callers), never aborting the whole pass -- mirrors
     ``season_request_service._present_seasons``'s best-effort posture. Returns the
     count of seasons actually re-armed.
+
+    The candidate window ROTATES (P2 fix): :meth:`SeasonRequestRepository.
+    list_for_airing_refresh` returns the ``max_refresh`` LEAST-recently-checked
+    rows (never-checked first), and every candidate this call actually looks at --
+    rearmed, unchanged, OR a TMDB failure -- is stamped via :meth:`SeasonRequest
+    Repository.mark_airing_refresh_checked` so it moves to the back of the queue.
+    Without this an install with more than ``max_refresh`` airing/completed
+    seasons would only ever re-check the same id-lowest slice, permanently
+    starving every other season's re-arm.
     """
     season_repo = SqlSeasonRequestRepository(session)
     episode_repo = SqlSeasonEpisodeStateRepository(session)
 
-    candidates = [
-        season
-        for status in ("available", "completed")
-        for season in await season_repo.list_by_status(status)
-    ][:max_refresh]
+    candidates = await season_repo.list_for_airing_refresh(
+        _REARMABLE_DONE_STATUSES, limit=max_refresh
+    )
 
     rearmed = 0
     for season in candidates:
@@ -193,11 +200,16 @@ async def reconcile_airing(
                     "tmdb_id": safe_int(season.tmdb_id),
                 },
             )
+            # Stamped even on failure: a persistently-erroring show must not
+            # monopolise the bounded rotation window forever (it will simply be
+            # re-tried once the rotation comes back around to it).
+            await season_repo.mark_airing_refresh_checked(season.id, today)
             continue
 
         states = await episode_repo.list_for_season(season.id)
         imported = {state.episode_number for state in states if state.status == "imported"}
         if target <= imported:
+            await season_repo.mark_airing_refresh_checked(season.id, today)
             continue  # nothing new aired -- still fully covered
 
         changed = await season_request_service.set_status_if_in(
@@ -210,5 +222,6 @@ async def reconcile_airing(
         if changed:
             await season_repo.schedule_search(season.id, search_attempts=0, next_search_at=None)
             rearmed += 1
+        await season_repo.mark_airing_refresh_checked(season.id, today)
 
     return rearmed

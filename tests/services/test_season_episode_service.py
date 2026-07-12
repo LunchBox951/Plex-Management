@@ -367,3 +367,61 @@ async def test_reconcile_airing_skips_a_season_on_tmdb_error_without_aborting(
         await session.commit()
 
     assert rearmed == 0
+
+
+async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 fix (issue #178 review): with MORE airing/completed seasons than
+    ``max_refresh``, the candidate window must ROTATE across cycles, not always
+    return the same id-lowest slice. Pre-fix, seasons past the first
+    ``max_refresh`` (by id) would NEVER be re-checked, so a legitimately-aired
+    new episode on one of them could never re-arm the season.
+
+    Seven shows, each with a season whose TMDB target already equals what is
+    imported (no rearm -- isolates the rotation itself from the rearm decision).
+    ``max_refresh=3`` over two cycles must touch SIX DISTINCT shows, not the
+    SAME three twice.
+    """
+    tmdb_ids = list(range(900, 907))  # 7 shows
+
+    for tmdb_id in tmdb_ids:
+        show_id = await _make_show(sessionmaker_, tmdb_id=tmdb_id)
+        season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+        async with sessionmaker_() as session:
+            download = Download(torrent_hash=f"rotation-hash-{tmdb_id}", status="imported")
+            session.add(download)
+            await session.commit()
+            episode_repo = SqlSeasonEpisodeStateRepository(session)
+            await episode_repo.upsert_target(season_request_id, {1: date(2026, 1, 1)})
+            await episode_repo.mark_imported(season_request_id, [1], download_id=download.id)
+            await session.commit()
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (tmdb_id, 1): [EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1))]
+            for tmdb_id in tmdb_ids
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, today=_TODAY, max_refresh=3
+        )
+        await session.commit()
+    assert rearmed == 0
+    first_cycle = set(tmdb.season_episodes_calls)
+    assert len(first_cycle) == 3
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, today=_TODAY, max_refresh=3
+        )
+        await session.commit()
+    assert rearmed == 0
+    second_cycle = set(tmdb.season_episodes_calls) - first_cycle
+    assert len(second_cycle) == 3
+
+    # The SAME three shows must not have been picked again -- proves the window
+    # rotated instead of collapsing back to the id-lowest slice.
+    assert first_cycle.isdisjoint(second_cycle)

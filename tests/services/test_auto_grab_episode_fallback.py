@@ -144,6 +144,46 @@ async def test_fallback_grabs_a_missing_episode_when_no_pack_is_acceptable(
         assert download["episodes_json"] == [1]
 
 
+async def test_episode_fallback_search_shares_the_per_cycle_search_budget(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 fix (issue #178 review): Pass 2's own Prowlarr search
+    (``decision_service.preview_episode_fallback``) must be counted against the
+    SAME ``max_searches`` per-cycle budget Pass 1 spends from, not an extra
+    uncounted search. With ``max_searches=1``, Pass 1's single search for this
+    scope already exhausts the budget, so Pass 2 must skip its OWN search
+    entirely -- the scope falls through to the normal park, un-searched, and is
+    retried next cycle.
+    """
+    request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2009)
+    qbt = FakeQbittorrent()
+    # No season pack -- Pass 1 rejects it NOT_SEASON_PACK, leaving Pass 2 eligible
+    # to run (pass1_found_pack is False) -- but the budget must still gate it.
+    prowlarr = _PerTmdbProwlarr(
+        {2009: [candidate("Some.Show.S01E01.1080p.WEB-DL.x264-GROUP", info_hash="ab" * 20)]}
+    )
+    metadata = FakeTmdb(
+        season_episodes={(2009, 1): [EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1))]}
+    )
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata, max_searches=1)
+
+    assert result.searched == 1  # Pass 1's search only -- Pass 2's was skipped
+    assert result.grabbed == 0
+    assert result.season_episode_fallback_grabs == 0
+    assert result.no_acceptable == 1
+    # Exactly one Prowlarr search reached the indexer this cycle -- Pass 2 never
+    # issued its own ``preview_episode_fallback`` search.
+    assert len(prowlarr.searched) == 1
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.no_acceptable_release
+        parent = await session.get(MediaRequest, request_id)
+        assert parent is not None
+        assert parent.status == RequestStatus.no_acceptable_release
+
+
 async def test_pack_first_wins_metadata_never_consulted(sessionmaker_: SessionMaker) -> None:
     request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2002)
     qbt = FakeQbittorrent()
@@ -165,6 +205,41 @@ async def test_pack_first_wins_metadata_never_consulted(sessionmaker_: SessionMa
         assert parent.status == RequestStatus.downloading
     # MetadataPort was never touched -- Pass 1 alone settled the scope.
     assert metadata.season_episodes_calls == []
+
+
+async def test_accepted_but_ungrabbable_pack_never_triggers_episode_fallback(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 regression (issue #178 review): Pass 1 finds an ACCEPTABLE season pack,
+    but its only candidate raises ``QbittorrentSourceError`` (source healthy,
+    release unusable). ``park_scope`` survives the grab loop (nothing grabbed),
+    but Pass 2 must NOT fire -- a pack existed this cycle, it just could not be
+    grabbed; the scope must park/cool and be retried next cycle, never fall
+    through to single-episode collection (the #167 pattern this whole feature
+    exists to keep from recurring).
+    """
+    request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=2010)
+    title = "Some.Show.S01.1080p.WEB-DL.x264-BAD"
+    qbt = FakeQbittorrent(source_errors={f"http://idx.local/{title}"})
+    prowlarr = _PerTmdbProwlarr({2010: [candidate(title, magnet=False)]})
+    metadata = FakeTmdb()
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.grabbed == 0
+    assert result.season_episode_fallback_grabs == 0
+    assert result.no_acceptable == 1
+    # MetadataPort was never touched -- Pass 2 never ran, so the target was
+    # never even looked up.
+    assert metadata.season_episodes_calls == []
+    assert qbt.added == []  # the raise precedes the add POST -- nothing handed over
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.no_acceptable_release
+        parent = await session.get(MediaRequest, request_id)
+        assert parent is not None
+        assert parent.status == RequestStatus.no_acceptable_release
 
 
 async def test_tmdb_target_unknown_parks_honestly_and_other_scopes_still_process(
@@ -329,7 +404,10 @@ async def test_airing_prepass_rearms_and_processes_within_the_same_cycle(
     # The airing pre-pass re-armed the season to searching BEFORE due-scope
     # collection, so it was searched (and, finding nothing, parked) in THIS cycle
     # -- proving the pre-pass wiring, not just the underlying service function.
-    assert result.searched == 1
+    # Two searches: Pass 1 (season-pack-only, nothing accepted) THEN Pass 2's own
+    # episode-fallback search (missing episode 3, also nothing accepted) -- both
+    # count against the SAME per-cycle budget (P2 fix, issue #178 review).
+    assert result.searched == 2
     assert result.no_acceptable == 1
     async with sessionmaker_() as session:
         season = await session.get(SeasonRequest, season_id)

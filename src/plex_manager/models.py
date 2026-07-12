@@ -495,6 +495,20 @@ class SeasonRequest(Base):
     # for the same
     # backward-compat reason as the movie mirror.
     eviction_regrab: Mapped[bool | None] = mapped_column(sa.Boolean(), nullable=True)
+    # Rotation cursor for the airing-refresh pre-pass (ADR-0020 §6, ``season_episode_
+    # service.reconcile_airing``). ``NULL`` (never checked) sorts first; every
+    # candidate reconcile_airing actually looks at this cycle -- rearmed or not, even
+    # on a TMDB error -- gets stamped with that cycle's ``today``, so a bounded
+    # ``max_refresh`` per-cycle budget still eventually revisits EVERY airing/completed
+    # season instead of permanently starving every row past the lowest ``max_refresh``
+    # ids (P2 finding: an install with more airing/completed seasons than the per-cycle
+    # budget would otherwise never re-check the higher-id ones, so a legitimately
+    # newly-aired episode could never re-arm the season). Date-granularity (not a full
+    # timestamp) is enough: at ``_AUTOGRAB_INTERVAL_SECONDS`` cadence a full rotation
+    # completes many times over before the calendar day rolls, and once every row has
+    # been stamped ``today`` the remaining same-day cycles simply keep revisiting an
+    # already-fully-covered set, which is correct, not a starvation regression.
+    airing_refresh_checked_at: Mapped[date | None] = mapped_column(sa.Date())
 
 
 class SeasonEpisodeState(Base):
