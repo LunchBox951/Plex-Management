@@ -841,10 +841,25 @@ class SeasonEpisodeStateRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def adopt_baseline(self, season_request_id: int) -> None:
-        """Promote every not-yet-``imported`` row for this season to ``imported``
-        with no backing download -- baseline adoption for an already-watchable
-        season that predates per-episode import tracking (ADR-0020 §6).
+    async def adopt_baseline(
+        self, season_request_id: int, *, episodes: Sequence[int] | None = None
+    ) -> None:
+        """Promote PENDING rows for this season to ``imported`` with no backing
+        download -- baseline adoption for an already-watchable season whose
+        content predates per-episode import tracking (ADR-0020 §6). ``episodes``
+        restricts adoption to those episode numbers (the partial-baseline case,
+        round 3); ``None`` adopts every pending row. Never touches ``grabbed``
+        rows -- they are evidence of our own attempt to fetch the episode, i.e.
+        evidence it was NOT already owned.
+        """
+        raise NotImplementedError
+
+    async def stale_grabbed_episodes(self, season_request_id: int) -> frozenset[int]:
+        """Episode numbers whose ``grabbed`` row's backing download is gone or
+        terminally dead (``failed``/``no_acceptable_release``) -- stale grab
+        breadcrumbs import completeness excludes from its completion target so a
+        failed grab of a later-retracted episode cannot wedge the season
+        incomplete forever (P2, issue #178 review round 3).
         """
         raise NotImplementedError
 

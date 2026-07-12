@@ -271,9 +271,9 @@ async def test_mark_imported_updates_winner_after_insert_race(
 
 
 async def test_adopt_baseline_promotes_pending_rows_to_imported(session: AsyncSession) -> None:
-    """Baseline adoption marks every not-yet-imported row ``imported`` with no
-    backing download -- an already-watchable season whose target was just seeded
-    but which predates per-episode tracking (ADR-0020 §6)."""
+    """Baseline adoption marks every pending row ``imported`` with no backing
+    download -- an already-watchable season whose target was just seeded but
+    which predates per-episode tracking (ADR-0020 §6)."""
     season_request_id = await _make_season(session)
     repo = SqlSeasonEpisodeStateRepository(session)
 
@@ -284,6 +284,57 @@ async def test_adopt_baseline_promotes_pending_rows_to_imported(session: AsyncSe
     assert {r.episode_number for r in rows} == {1, 2}
     assert all(r.status == "imported" for r in rows)
     assert all(r.grabbed_download_id is None for r in rows)
+
+
+async def test_adopt_baseline_subset_adopts_only_named_pending_rows(
+    session: AsyncSession,
+) -> None:
+    """The partial-baseline shape (round 3): only the named episodes are adopted,
+    and a ``grabbed`` row is NEVER adopted even when named -- it is evidence of
+    our own attempt to fetch, i.e. evidence the episode was NOT already owned."""
+    season_request_id = await _make_season(session)
+    download_id = await _make_download(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(
+        season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+    )
+    await repo.mark_grabbed(season_request_id, [2], download_id=download_id)
+
+    await repo.adopt_baseline(season_request_id, episodes=[1, 2])
+
+    rows = await repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    assert by_episode[1].status == "imported"  # named + pending -> adopted
+    assert by_episode[2].status == "grabbed"  # named but grabbed -> untouched
+    assert by_episode[3].status == "pending"  # not named -> untouched
+
+
+async def test_stale_grabbed_episodes_flags_dead_or_missing_downloads_only(
+    session: AsyncSession,
+) -> None:
+    """P2 (round 3): a ``grabbed`` row is stale iff its download is gone or
+    terminally dead -- a live (or imported) download still represents real
+    work/content and must keep counting toward the completion target."""
+    season_request_id = await _make_season(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    failed = Download(torrent_hash="stale-failed-hash", status="failed")
+    live = Download(torrent_hash="stale-live-hash", status="downloading")
+    done = Download(torrent_hash="stale-imported-hash", status="imported")
+    orphan = Download(torrent_hash="stale-orphan-hash", status="failed")
+    session.add_all([failed, live, done, orphan])
+    await session.flush()
+
+    await repo.mark_grabbed(season_request_id, [1], download_id=failed.id)
+    await repo.mark_grabbed(season_request_id, [2], download_id=live.id)
+    await repo.mark_grabbed(season_request_id, [3], download_id=done.id)
+    # Episode 4: grab breadcrumb whose download row is later deleted (FK SET NULL).
+    await repo.mark_grabbed(season_request_id, [4], download_id=orphan.id)
+    await session.delete(orphan)
+    await session.flush()
+
+    assert await repo.stale_grabbed_episodes(season_request_id) == frozenset({1, 4})
 
 
 async def test_list_for_season_orders_by_episode_number(session: AsyncSession) -> None:

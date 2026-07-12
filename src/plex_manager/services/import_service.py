@@ -1791,12 +1791,14 @@ async def _import_tv_targets_locked(
                     plan.target.season,
                     status=RequestStatus.pending.value,
                 )
+                plan_state_repo = SqlSeasonEpisodeStateRepository(session)
+                # Exclude stale grabbed rows from the completion target (P2,
+                # round 3) -- see the single-season path's comment for the full
+                # rationale; identical semantics here.
                 plan_target = frozenset(
                     state.episode_number
-                    for state in await SqlSeasonEpisodeStateRepository(session).list_for_season(
-                        plan_season_row.id
-                    )
-                )
+                    for state in await plan_state_repo.list_for_season(plan_season_row.id)
+                ) - await plan_state_repo.stale_grabbed_episodes(plan_season_row.id)
                 plan_episodes = {ep for result in plan.accepted for ep in result.episodes}
                 plan_complete = await season_episode_service.apply_import(
                     session,
@@ -2304,12 +2306,20 @@ async def _import_tv_locked(
         season_row = await SqlSeasonRequestRepository(session).ensure(
             request.id, season, status=RequestStatus.pending.value
         )
+        episode_state_repo = SqlSeasonEpisodeStateRepository(session)
+        # The completion target excludes STALE ``grabbed`` rows -- ones whose
+        # download is gone or terminally dead (P2, issue #178 review round 3):
+        # a failed fallback grab for an episode TMDB later retracted leaves a
+        # ``grabbed`` row that ``upsert_target``'s retraction (pending-only)
+        # never retires; counting it here would hold the season incomplete
+        # forever even when every currently-aired episode is imported. Safe by
+        # the airing-refresh safety net: if the excluded episode IS genuinely
+        # aired-and-missing, the refresh re-arms the completed season the moment
+        # TMDB's target exceeds what is imported -- nothing lost, only un-wedged.
         target = frozenset(
             state.episode_number
-            for state in await SqlSeasonEpisodeStateRepository(session).list_for_season(
-                season_row.id
-            )
-        )
+            for state in await episode_state_repo.list_for_season(season_row.id)
+        ) - await episode_state_repo.stale_grabbed_episodes(season_row.id)
         accepted_episodes = {ep for result in validation.accepted for ep in result.episodes}
         complete = await season_episode_service.apply_import(
             session,

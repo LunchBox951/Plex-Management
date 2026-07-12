@@ -536,6 +536,258 @@ async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
         assert season.status == RequestStatus.searching
 
 
+async def _seed_imported_episode_row(
+    sessionmaker_: SessionMaker,
+    season_request_id: int,
+    episode_number: int,
+    *,
+    media_request_id: int | None = None,
+    season_number: int | None = None,
+) -> None:
+    """An ``imported`` episode-state row backed by an episode-scoped download --
+    the shape the season_episode_states migration backfills for old
+    episode-scoped downloads."""
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash=f"ep-scoped-{season_request_id}-{episode_number}",
+            status="imported",
+            media_request_id=media_request_id,
+            season=season_number,
+            episodes_json=[episode_number],
+        )
+        session.add(download)
+        await session.commit()
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.mark_imported(season_request_id, [episode_number], download_id=download.id)
+        await session.commit()
+
+
+async def test_reconcile_airing_adopts_partial_baseline_with_imported_pack_history(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 fix (issue #178 review round 3): a done season with a PARTIAL row set
+    (the migration backfills imported rows for old episode-scoped downloads even
+    when the season became watchable via a whole-season pack the migration seeded
+    nothing for) must be adopted as complete WHEN download history proves an
+    imported whole-season pack for it -- never re-armed to re-download owned
+    content. Only episodes that aired strictly before the pack was grabbed are
+    adopted (a pack cannot contain an episode that had not yet aired)."""
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=814, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    # The partial baseline: one old episode-scoped download's backfilled row.
+    await _seed_imported_episode_row(
+        sessionmaker_, season_request_id, 7, media_request_id=show_id, season_number=1
+    )
+    # The pack proof: an IMPORTED whole-season pack (episodes_json NULL) grabbed
+    # 2026-06-01, well after every episode below aired.
+    async with sessionmaker_() as session:
+        pack = Download(
+            torrent_hash="owned-pack-hash-814",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            episodes_json=None,
+            added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+        )
+        session.add(pack)
+        await session.commit()
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (814, 1): [
+                EpisodeInfo(episode_number=n, air_date=date(2026, 1, n)) for n in range(1, 11)
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 0  # adopted via pack proof, never re-armed
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.available  # stays watchable
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    assert set(by_episode) == set(range(1, 11))
+    assert all(r.status == "imported" for r in by_episode.values())
+    # Adopted rows carry no backing download; the backfilled row keeps its own.
+    assert by_episode[1].grabbed_download_id is None
+    assert by_episode[7].grabbed_download_id is not None
+
+
+async def test_reconcile_airing_partial_rows_without_pack_history_still_rearm(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The other half of the round-3 discriminator (the live TLMOE S4 shape): a
+    season available via the presence probe with only one episode ever imported
+    and NO pack in download history is genuinely incomplete -- the re-arm is
+    CORRECT and must stay. Blanket-adopting partial baselines would silently
+    strand the missing episodes forever."""
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=815, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+    await _seed_imported_episode_row(
+        sessionmaker_, season_request_id, 7, media_request_id=show_id, season_number=1
+    )
+    # NO whole-season pack download exists for this season.
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (815, 1): [
+                EpisodeInfo(episode_number=n, air_date=date(2026, 1, n)) for n in range(1, 11)
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 1
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r.status for r in rows}
+    assert by_episode[7] == "imported"
+    assert all(status == "pending" for ep, status in by_episode.items() if ep != 7)
+
+
+async def test_reconcile_airing_pack_adoption_never_swallows_episodes_aired_after_the_pack(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Airing growth survives pack-proof adoption: an episode that aired AFTER
+    the pack was grabbed cannot have been inside it, so it is never adopted and
+    the season still re-arms to collect it."""
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=818, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+    await _seed_imported_episode_row(
+        sessionmaker_, season_request_id, 1, media_request_id=show_id, season_number=1
+    )
+    async with sessionmaker_() as session:
+        pack = Download(
+            torrent_hash="owned-pack-hash-818",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            episodes_json=None,
+            added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+        )
+        session.add(pack)
+        await session.commit()
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (818, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),  # pre-pack: adopt
+                EpisodeInfo(episode_number=3, air_date=date(2026, 7, 10)),  # post-pack: collect
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 1  # the post-pack newcomer keeps the re-arm alive
+    async with sessionmaker_() as session:
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
+    by_episode = {r.episode_number: r.status for r in rows}
+    assert by_episode == {1: "imported", 2: "imported", 3: "pending"}
+
+
+async def test_reconcile_airing_skips_rearm_when_newer_active_request_owns_the_show(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P2 fix (issue #178 review round 3): an old ``available`` request sits
+    outside ``uq_media_requests_active``, so a NEWER active request for the same
+    (tmdb_id, media_type) can coexist. Re-arming the old season would fold its
+    parent back into an active rollup and collide with the newer row's slot --
+    pre-fix that ``IntegrityError`` escaped ``reconcile_airing`` and aborted the
+    whole auto-grab cycle. The collision must degrade to a logged skip (the
+    newer request owns the intent; the WHOLE re-arm rolls back, not just the
+    rollup) and the cycle must continue to later candidates."""
+    old_show_id = await _make_show_with_intent(
+        sessionmaker_, tmdb_id=816, tv_request_mode="whole_show"
+    )
+    old_season_id = await _make_season(sessionmaker_, old_show_id, 1, RequestStatus.available)
+    async with sessionmaker_() as session:
+        old_show = await session.get(MediaRequest, old_show_id)
+        assert old_show is not None
+        old_show.status = RequestStatus.available  # settled -- outside the active index
+        # The newer active request now owns the show's active-dedup slot.
+        newer = MediaRequest(
+            tmdb_id=816, media_type=MediaType.tv, title="Show", status=RequestStatus.searching
+        )
+        session.add(newer)
+        await session.commit()
+        newer_id = newer.id
+    await _seed_imported_episode_row(
+        sessionmaker_, old_season_id, 1, media_request_id=old_show_id, season_number=1
+    )
+
+    # A second, unconflicted candidate PROVES the cycle continues past the skip.
+    other_show_id = await _make_show_with_intent(
+        sessionmaker_, tmdb_id=817, tv_request_mode="whole_show"
+    )
+    other_season_id = await _make_season(sessionmaker_, other_show_id, 1, RequestStatus.available)
+    await _seed_imported_episode_row(
+        sessionmaker_, other_season_id, 1, media_request_id=other_show_id, season_number=1
+    )
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (816, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 7, 10)),  # wants a re-arm
+            ],
+            (817, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 7, 10)),  # wants a re-arm
+            ],
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    # No escaped IntegrityError; the conflicted show skipped, the other re-armed.
+    assert rearmed == 1
+    async with sessionmaker_() as session:
+        old_season = await session.get(SeasonRequest, old_season_id)
+        assert old_season is not None
+        assert old_season.status == RequestStatus.available  # WHOLE re-arm rolled back
+        old_show = await session.get(MediaRequest, old_show_id)
+        assert old_show is not None
+        assert old_show.status == RequestStatus.available
+        newer_row = await session.get(MediaRequest, newer_id)
+        assert newer_row is not None
+        assert newer_row.status == RequestStatus.searching  # untouched owner
+        other_season = await session.get(SeasonRequest, other_season_id)
+        assert other_season is not None
+        assert other_season.status == RequestStatus.searching  # cycle continued
+
+
 async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
     sessionmaker_: SessionMaker,
 ) -> None:

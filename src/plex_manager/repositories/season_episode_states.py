@@ -11,10 +11,10 @@ from __future__ import annotations
 from datetime import date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.models import EpisodeState, SeasonEpisodeState
+from plex_manager.models import Download, EpisodeState, SeasonEpisodeState
 from plex_manager.ports.repositories import SeasonEpisodeStateRecord
 
 if TYPE_CHECKING:
@@ -167,22 +167,65 @@ class SqlSeasonEpisodeStateRepository:
                     winner.grabbed_download_id = download_id
         await self._session.flush()
 
-    async def adopt_baseline(self, season_request_id: int) -> None:
-        """Promote every not-yet-``imported`` row for this season to ``imported``
-        with NO backing download (``grabbed_download_id`` stays ``NULL``).
+    async def adopt_baseline(
+        self, season_request_id: int, *, episodes: Sequence[int] | None = None
+    ) -> None:
+        """Promote PENDING rows for this season to ``imported`` with NO backing
+        download (``grabbed_download_id`` stays ``NULL``).
 
         Baseline adoption (ADR-0020 §6) for an already-watchable season whose
-        target rows were just seeded by ``refresh_target`` but which has no real
-        imported baseline -- see ``season_episode_service.reconcile_airing`` for
-        the full invariant. Idempotent; only the caller (which has just confirmed
-        the season had NO rows before the seed) invokes this, so every row it
-        touches is a freshly-seeded ``pending`` target row.
+        content predates per-episode tracking -- see ``season_episode_service.
+        reconcile_airing`` for the full invariant. ``episodes=None`` adopts every
+        pending row (the zero-row-season case, where every row is a just-seeded
+        pending target row); a sequence restricts adoption to those episode
+        numbers (the partial-baseline case, round 3: only episodes provably
+        covered by an imported pack). PENDING only, deliberately: a ``grabbed``
+        row is evidence of OUR OWN in-flight/failed attempt to fetch the episode
+        -- i.e. evidence the library did NOT already own it -- so adopting it
+        would silently drop a legitimately wanted episode. Idempotent.
         """
+        wanted = None if episodes is None else set(episodes)
         existing = await self._existing_by_episode(season_request_id)
         for row in existing.values():
-            if row.status != EpisodeState.imported:
-                row.status = EpisodeState.imported
+            if row.status != EpisodeState.pending:
+                continue
+            if wanted is not None and row.episode_number not in wanted:
+                continue
+            row.status = EpisodeState.imported
         await self._session.flush()
+
+    async def stale_grabbed_episodes(self, season_request_id: int) -> frozenset[int]:
+        """Episode numbers whose row is ``grabbed`` but whose backing download is
+        gone (``grabbed_download_id`` NULL -- the FK's ``SET NULL``) or terminally
+        DEAD (``failed``/``no_acceptable_release``) -- i.e. the grab breadcrumb no
+        longer represents in-flight work.
+
+        Import completeness (P2, issue #178 review round 3) subtracts these from
+        its completion target: a fallback grab that failed, for an episode TMDB
+        then retracted, would otherwise wedge the season incomplete forever (the
+        retraction in :meth:`upsert_target` retires only ``pending`` rows). A
+        ``grabbed`` row whose download is LIVE (or ``imported`` -- content
+        arrived somewhere even if this episode's file was filtered) still counts:
+        excluding real in-flight/delivered work could complete a season whose
+        aired episode is genuinely still missing. If the excluded episode IS
+        genuinely aired, nothing is lost: the airing refresh sees the TMDB target
+        exceed what is imported and re-arms the season to collect it.
+        """
+        stmt = select(SeasonEpisodeState.episode_number).where(
+            SeasonEpisodeState.season_request_id == season_request_id,
+            SeasonEpisodeState.status == EpisodeState.grabbed,
+            or_(
+                SeasonEpisodeState.grabbed_download_id.is_(None),
+                select(Download.id)
+                .where(
+                    Download.id == SeasonEpisodeState.grabbed_download_id,
+                    Download.status.in_(["failed", "no_acceptable_release"]),
+                )
+                .exists(),
+            ),
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return frozenset(rows)
 
     async def counts_for_seasons(
         self, season_request_ids: Sequence[int]

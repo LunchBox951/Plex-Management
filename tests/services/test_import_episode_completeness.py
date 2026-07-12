@@ -402,6 +402,106 @@ async def test_incomplete_pack_cannot_recycle_next_cycle_falls_back_to_missing_e
         assert season.status == RequestStatus.downloading
 
 
+async def _seed_grabbed_row(
+    sessionmaker_: SessionMaker,
+    season_request_id: int,
+    episode_number: int,
+    *,
+    download_status: str,
+    torrent_hash: str,
+) -> None:
+    """A ``grabbed`` episode-state row backed by a download in ``download_status``."""
+    async with sessionmaker_() as session:
+        download = Download(torrent_hash=torrent_hash, status=download_status)
+        session.add(download)
+        await session.commit()
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.mark_grabbed(season_request_id, [episode_number], download_id=download.id)
+        await session.commit()
+
+
+async def test_stale_grabbed_row_with_dead_download_does_not_wedge_completion(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """P2 regression (issue #178 review round 3): the grabbed-then-retracted
+    shape. A fallback grab for episode 3 FAILED (download terminal-failed) and
+    TMDB then retracted the episode -- ``upsert_target``'s retraction retires
+    only ``pending`` rows, so the stale ``grabbed`` row survives. Import
+    completeness must EXCLUDE it from the completion target: a pack covering the
+    currently-aired {1, 2} completes the season instead of wedging it in an
+    endless re-arm/search/park loop.
+    """
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S05.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S05E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S05E02.1080p.WEB-DL.x264-GRP.mkv")
+
+    download_id, request_id, season_request_id = await _seed_tv_download(
+        sessionmaker_, torrent_hash="unwedge-pack-hash", season=5
+    )
+    await _seed_target(sessionmaker_, season_request_id, [1, 2])
+    # The stale breadcrumb: grabbed episode 3, download dead, episode retracted
+    # (deliberately NOT in the seeded pending target above).
+    await _seed_grabbed_row(
+        sessionmaker_,
+        season_request_id,
+        3,
+        download_status="failed",
+        torrent_hash="dead-fallback-grab-hash",
+    )
+
+    await _import_tv(sessionmaker_, download_id, tv_root, _qbt("unwedge-pack-hash", release_dir))
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.completed  # NOT re-armed
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.completed
+        blocked = (
+            (await session.execute(select(Blocklist).where(Blocklist.tmdb_id == _TMDB_ID)))
+            .scalars()
+            .all()
+        )
+    assert blocked == []  # the pack completed the season -- nothing to blocklist
+
+
+async def test_grabbed_row_with_live_download_still_counts_toward_completion_target(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """The guard rail on the round-3 exclusion: a ``grabbed`` row whose download
+    is LIVE is real in-flight work, not a stale breadcrumb -- a pack import that
+    does not cover it must still leave the season collecting (re-armed)."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S06.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S06E01.1080p.WEB-DL.x264-GRP.mkv")
+    _make_video(release_dir / "Some.Show.S06E02.1080p.WEB-DL.x264-GRP.mkv")
+
+    download_id, _request_id, season_request_id = await _seed_tv_download(
+        sessionmaker_, torrent_hash="live-sibling-pack-hash", season=6
+    )
+    await _seed_target(sessionmaker_, season_request_id, [1, 2])
+    await _seed_grabbed_row(
+        sessionmaker_,
+        season_request_id,
+        3,
+        download_status="downloading",
+        torrent_hash="live-fallback-grab-hash",
+    )
+
+    await _import_tv(
+        sessionmaker_, download_id, tv_root, _qbt("live-sibling-pack-hash", release_dir)
+    )
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching  # episode 3 still owed
+
+
 async def _seed_multi_season_download(
     sessionmaker_: SessionMaker, *, torrent_hash: str
 ) -> tuple[int, int, int, int]:

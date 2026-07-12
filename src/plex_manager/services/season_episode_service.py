@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Final
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.domain.season_completeness import (
     aired_target,
@@ -23,6 +25,7 @@ from plex_manager.domain.season_completeness import (
     compute_missing as _compute_missing,
 )
 from plex_manager.logsafe import safe_int
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -183,6 +186,7 @@ async def reconcile_airing(
     season_repo = SqlSeasonRequestRepository(session)
     episode_repo = SqlSeasonEpisodeStateRepository(session)
     request_repo = SqlRequestRepository(session)
+    download_repo = SqlDownloadRepository(session)
 
     candidates = await season_repo.list_for_airing_refresh(
         _REARMABLE_DONE_STATUSES, limit=max_refresh
@@ -270,15 +274,86 @@ async def reconcile_airing(
             await season_repo.mark_airing_refresh_checked(season.id, now)
             continue  # nothing new aired -- still fully covered
 
-        changed = await season_request_service.set_status_if_in(
-            session,
-            media_request_id=season.media_request_id,
-            season_request_id=season.id,
-            status="searching",
-            allowed_from=_REARMABLE_DONE_STATUSES,
-        )
+        if had_baseline:
+            # Partial-baseline adoption (P2, issue #178 review round 3). The
+            # migration backfills ``imported`` rows for OLD episode-scoped
+            # downloads even when the season became watchable via a whole-season
+            # pack it deliberately seeded nothing for -- so a done season can
+            # carry a PARTIAL row set that under-states what is owned, and the
+            # plain ``target > imported`` re-arm above would re-download owned
+            # content. DISCRIMINATOR (the invariant): adopt only with PROOF of
+            # pack ownership -- an IMPORTED whole-season(-or-multi-season-scope)
+            # pack in download history for THIS season -- and only for PENDING
+            # episodes that aired STRICTLY BEFORE that pack was grabbed (a pack
+            # cannot contain an episode that had not yet aired when it was
+            # made; the strict inequality errs toward a recoverable duplicate
+            # single-episode grab over unrecoverably marking missing content
+            # owned). Without pack proof (e.g. a season available via the
+            # presence probe with only one episode ever imported -- the live
+            # TLMOE S4 shape) the re-arm below is CORRECT and proceeds. The
+            # cutoff also keeps airing GROWTH working: an episode airing after
+            # the pack grab is never adopted, so a genuinely new episode still
+            # re-arms the season no matter how old the pack evidence is.
+            pack_added_at = await download_repo.latest_imported_pack_added_at(
+                season.media_request_id, season.season_number
+            )
+            if pack_added_at is not None:
+                cutoff = pack_added_at.date()
+                adoptable = [
+                    state.episode_number
+                    for state in states
+                    if state.status == "pending"
+                    and state.episode_number in target
+                    and state.air_date is not None
+                    and state.air_date < cutoff
+                ]
+                if adoptable:
+                    await episode_repo.adopt_baseline(season.id, episodes=adoptable)
+                    imported.update(adoptable)
+                if target <= imported:
+                    await season_repo.mark_airing_refresh_checked(season.id, now)
+                    continue  # fully covered once pack-owned episodes are adopted
+
+        # Re-arm under a SAVEPOINT (P2, issue #178 review round 3): an OLD
+        # ``available`` request sits OUTSIDE ``uq_media_requests_active``, so a
+        # NEWER active request for the same (tmdb_id, media_type) can coexist;
+        # folding the old parent's rollup back to an active status would collide
+        # with the newer row's slot in that partial unique index. Unlike
+        # eviction (which tolerates just the rollup write and keeps its season
+        # CAS -- the "file is gone" record MUST survive), this best-effort
+        # re-arm has nothing that must survive: the NEWER request owns the
+        # collection intent for this show, and re-arming the old season anyway
+        # would let two requests download the same season concurrently (each
+        # holds its own ``uq_downloads_active_request`` slot). So the WHOLE
+        # re-arm (season CAS + rollup + backoff reset) is rolled back to a
+        # logged no-op and the cycle continues -- never an escaped
+        # IntegrityError aborting every auto-grab cycle.
+        changed = False
+        try:
+            async with session.begin_nested():
+                changed = await season_request_service.set_status_if_in(
+                    session,
+                    media_request_id=season.media_request_id,
+                    season_request_id=season.id,
+                    status="searching",
+                    allowed_from=_REARMABLE_DONE_STATUSES,
+                )
+                if changed:
+                    await season_repo.schedule_search(
+                        season.id, search_attempts=0, next_search_at=None
+                    )
+        except IntegrityError:
+            changed = False
+            _logger.warning(
+                "auto-grab: airing-refresh re-arm skipped -- a newer active request "
+                "already owns this show's active-dedup slot; leaving the old season "
+                "as-is",
+                extra={
+                    "request_id": safe_int(season.media_request_id),
+                    "tmdb_id": safe_int(season.tmdb_id),
+                },
+            )
         if changed:
-            await season_repo.schedule_search(season.id, search_attempts=0, next_search_at=None)
             rearmed += 1
         await season_repo.mark_airing_refresh_checked(season.id, now)
 
