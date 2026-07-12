@@ -9,7 +9,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from plex_manager.models import AuthSession, User
+from plex_manager.models import AuthSession, MediaRequest, MediaType, RequestStatus, User
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -450,3 +450,114 @@ async def test_list_requests_batches_season_rows_not_one_query_per_tv_row(
 
     assert batch_calls["n"] == 1
     assert per_row_calls["n"] == 0
+
+
+# --- Change 1: fold duplicate rows in the requests list ------------------------
+# (request-dedup healing, spec-request-dedup-healing.md)
+
+
+async def _insert_request(
+    app: FastAPI,
+    *,
+    tmdb_id: int,
+    status: RequestStatus,
+    media_type: MediaType = MediaType.movie,
+    user_id: int | None = None,
+    library_path: str | None = None,
+) -> int:
+    async with app.state.sessionmaker() as session:
+        row = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            title=f"Movie {tmdb_id}",
+            status=status,
+            user_id=user_id,
+            library_path=library_path,
+        )
+        session.add(row)
+        await session.commit()
+        return row.id
+
+
+async def _insert_user(app: FastAPI, *, username: str) -> int:
+    async with app.state.sessionmaker() as session:
+        user = User(username=username, permissions=0)
+        session.add(user)
+        await session.commit()
+        return user.id
+
+
+async def test_list_folds_duplicate_movie_rows_prefers_active(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Two rows for the same (tmdb, movie), same (ownerless) owner -- one
+    'available', one 'pending' -- fold to ONE row: the non-settled 'pending'."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    available_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.available)
+    pending_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.pending)
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.status_code == 200
+    items = listed.json()["requests"]
+    assert [item["id"] for item in items] == [pending_id]
+    assert items[0]["status"] == "pending"
+    assert available_id != pending_id  # sanity: two distinct rows really exist
+
+
+async def test_list_folds_prefers_newest_when_all_settled(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Two SETTLED rows for the same media (available + failed) -- fold to the
+    newest (highest id) row."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _insert_request(app, tmdb_id=603, status=RequestStatus.available)
+    newest_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.failed)
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.status_code == 200
+    items = listed.json()["requests"]
+    assert [item["id"] for item in items] == [newest_id]
+    assert items[0]["status"] == "failed"
+
+
+async def test_list_does_not_fold_distinct_users(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Two rows for the same media, owned by DIFFERENT users -- the admin
+    (unfiltered) view must show BOTH; folding across owners would silently hide
+    one user's request from the admin (an honesty regression)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    user_a = await _insert_user(app, username="user-a")
+    user_b = await _insert_user(app, username="user-b")
+    # 'available' (SETTLED) rows are excluded from the active-dedup partial
+    # unique index, so two rows for the SAME (tmdb_id, media_type) can coexist
+    # here regardless of owner -- exactly the legitimate remove-then-reacquire /
+    # per-owner shape this test targets.
+    id_a = await _insert_request(app, tmdb_id=603, status=RequestStatus.available, user_id=user_a)
+    id_b = await _insert_request(app, tmdb_id=603, status=RequestStatus.available, user_id=user_b)
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.status_code == 200
+    assert {item["id"] for item in listed.json()["requests"]} == {id_a, id_b}
+
+
+async def test_list_leaves_underlying_rows_untouched(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """The fold is display-only: after listing, each underlying row is still
+    individually GET-able (never deleted or mutated by the fold)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    available_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.available)
+    pending_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.pending)
+
+    listed = await client.get("/api/v1/requests", headers=_HEADERS)
+    assert listed.status_code == 200
+    assert len(listed.json()["requests"]) == 1  # folded for display
+
+    for request_id, expected_status in (
+        (available_id, "available"),
+        (pending_id, "pending"),
+    ):
+        got = await client.get(f"/api/v1/requests/{request_id}", headers=_HEADERS)
+        assert got.status_code == 200
+        assert got.json()["status"] == expected_status

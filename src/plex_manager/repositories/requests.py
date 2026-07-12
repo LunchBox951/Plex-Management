@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, case, func, insert, or_, select, update
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import aliased
@@ -462,6 +463,183 @@ class SqlRequestRepository:
             chosen = active if active is not None else group[-1]
             result[key] = chosen.status.value
         return result
+
+    async def list_false_available_movies(self, *, limit: int) -> list[RequestRecord]:
+        """Movie rows ``status='available' AND library_path IS NULL AND
+        available_heal_verified_at IS NULL``, id-ascending.
+
+        The EXACT false-claim signature the already-in-library short-circuit mints
+        (``request_service.create_request_result``): ``mark_available`` never sets
+        ``library_path``, so a movie promoted straight from the short-circuit
+        carries no breadcrumb, while a normally-imported movie always has one
+        (``set_library_path`` runs before promotion). A TV parent's ``available``
+        + ``library_path IS NULL`` is a DIFFERENT, legitimate shape (the column
+        lives on ``SeasonRequest`` for tv) -- scoped to ``movie`` only so a TV
+        rollup row is never mistaken for a false claim. ``id``-ascending + capped
+        at ``limit`` bounds the healing pass so a reconcile tick stays cheap.
+
+        ``available_heal_verified_at IS NULL`` is the CONVERGENCE guard: once the
+        heal pass (``import_service._heal_false_available_movies``) live-
+        reconfirms a row genuinely present, it stamps that column (see
+        :meth:`mark_heal_verified_present`) and the row permanently exits this
+        scan population. Without it, a genuinely-present row (which never gets a
+        ``library_path`` -- there was never a file for THIS app to place) would
+        keep the exact same signature forever: re-fetched, re-verified, and
+        re-occupying the bounded per-tick ``limit`` window on EVERY reconcile
+        tick, which could starve out a later, higher-id GENUINE false claim from
+        ever being scanned at all.
+        """
+        stmt = (
+            select(MediaRequest)
+            .where(
+                MediaRequest.media_type == MediaType.movie,
+                MediaRequest.status == RequestStatus.available,
+                MediaRequest.library_path.is_(None),
+                MediaRequest.available_heal_verified_at.is_(None),
+            )
+            .order_by(MediaRequest.id)
+            .limit(limit)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def mark_heal_verified_present(self, request_id: int) -> bool:
+        """CAS-stamp ``available_heal_verified_at`` for a false-available-heal
+        candidate the pass just live-reconfirmed genuinely present in Plex.
+
+        A single ``UPDATE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL AND available_heal_verified_at IS NULL`` -- the
+        DATABASE, not a prior read, decides whether the exact false-claim
+        signature still holds (mirrors :meth:`rearm_false_available_to_pending`'s
+        CAS discipline). The ``available_heal_verified_at IS NULL`` arm makes
+        convergence a ONE-WAY door: once stamped, a repeat call (e.g. a stale
+        in-memory candidate list from a concurrent/overlapping cycle) is an
+        honest no-op rather than pointlessly re-writing the same stamp. Also
+        re-stamps ``library_verified_at`` (the row's presence WAS just
+        reconfirmed). This is what makes the heal pass CONVERGE: the row
+        permanently exits :meth:`list_false_available_movies`'s scan population
+        afterward, instead of keeping the exact same signature and being
+        re-verified (and re-occupying the bounded per-tick scan window) every
+        reconcile tick forever. Returns whether a row was actually updated --
+        ``False`` means a concurrent writer already moved the row off this exact
+        signature (e.g. collapsed it onto a sibling, re-armed it, or already
+        stamped it) and this call must not clobber that outcome.
+        """
+        now = datetime.now(UTC)
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.status == RequestStatus.available,
+                    MediaRequest.library_path.is_(None),
+                    MediaRequest.available_heal_verified_at.is_(None),
+                )
+                .values(available_heal_verified_at=now, library_verified_at=now)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def rearm_false_available_to_pending(self, request_id: int) -> bool:
+        """Re-arm a healed false-available row to ``pending`` (honest re-search).
+
+        A single ``UPDATE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL`` -- the DATABASE, not a prior read, decides whether
+        the exact false-claim signature still holds (mirrors :meth:`set_status_if_in`'s
+        CAS discipline). Clears ``library_verified_at``/``completed_at`` so the row
+        stops asserting in-library (honesty over silence) and resets the auto-grab
+        backoff (``search_attempts``/``next_search_at``) so ``list_due_for_search``
+        picks the re-armed row up on the very next tick rather than waiting out a
+        stale schedule. ``library_path`` is left untouched (already ``NULL``).
+        Returns whether a row was actually updated -- ``False`` means a concurrent
+        writer already moved the row off this exact signature, and the caller must
+        not assume its own stale read still applies.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.status == RequestStatus.available,
+                    MediaRequest.library_path.is_(None),
+                )
+                .values(
+                    status=RequestStatus.pending,
+                    library_verified_at=None,
+                    completed_at=None,
+                    search_attempts=0,
+                    next_search_at=None,
+                )
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def delete_false_available_sibling_collapse(
+        self, request_id: int, *, expected_user_id: int | None
+    ) -> bool:
+        """CAS-delete a false-available heal candidate collapsing onto a sibling
+        (branch 1 of ``_heal_false_available_movies``'s sibling collapse).
+
+        A single ``DELETE ... WHERE id = ? AND status = 'available' AND
+        library_path IS NULL AND user_id IS <expected_user_id>`` -- the DATABASE,
+        not the caller's earlier read, decides whether the row's ownership is
+        STILL exactly what the caller's ownership-guard decision (mirroring
+        ``request_service._owned_by_another_user``) was computed against.
+
+        Why this matters (issue #58 class): the heal pass reads its candidates'
+        owners once, at the very top of ``run_availability_cycle``, then does a
+        ``present_ids`` Plex crawl and (for cross-owner siblings) a
+        ``confirm_paths`` crawl before this delete ever fires -- a multi-second
+        window. An OWNERLESS candidate (``expected_user_id`` ``None``) ranks
+        ABOVE a foreign-owned real-path sibling in ``find_in_library``, so a
+        concurrent user create can adopt (claim) that exact row in the window
+        and return it as THEIR just-succeeded request. A plain ``delete(id)``
+        would then silently vanish that user's request. This CAS ties the
+        delete to the SAME ownership snapshot the caller's safe-sibling
+        decision used: if a concurrent claim (or any other write) has moved the
+        row off that exact ``(status, library_path, user_id)`` signature,
+        ``rowcount`` is 0 and nothing is deleted -- the caller must leave the
+        row for the next cycle to re-evaluate from scratch, never blindly retry
+        the delete against the new owner.
+        """
+        stmt = sa_delete(MediaRequest).where(
+            MediaRequest.id == request_id,
+            MediaRequest.status == RequestStatus.available,
+            MediaRequest.library_path.is_(None),
+        )
+        if expected_user_id is None:
+            stmt = stmt.where(MediaRequest.user_id.is_(None))
+        else:
+            stmt = stmt.where(MediaRequest.user_id == expected_user_id)
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
+
+    async def latest_library_path(self, tmdb_id: int, media_type: str) -> str | None:
+        """The ``library_path`` breadcrumb of the NEWEST row (id DESC) for this
+        media that carries one, across ANY status, or ``None``.
+
+        The only handle to a file THIS app previously placed for
+        ``(tmdb_id, media_type)`` -- backs the dedup-time breadcrumb corroboration
+        gate (``request_service.create_request_result``'s in-library short-circuit):
+        a prior terminal row's real path is the one grounded signal available at
+        create time to corroborate a GUID-present-but-possibly-mistagged movie
+        before minting a fresh terminal ``available`` row.
+        """
+        stmt = (
+            select(MediaRequest.library_path)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType(media_type),
+                MediaRequest.library_path.is_not(None),
+            )
+            .order_by(MediaRequest.id.desc())
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).scalars().first()
 
     async def find_earliest_available(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
         """Return the OLDEST ``available`` request for this media (lowest id), or None.

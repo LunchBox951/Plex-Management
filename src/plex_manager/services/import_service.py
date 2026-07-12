@@ -37,12 +37,13 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
@@ -149,6 +150,20 @@ _FINALIZING_WARN_AFTER_MINUTES: Final = 30.0
 # tick -- derived PURELY from elapsed-time bucketing (see
 # ``_check_bounded_finalizing``), no new column or timer needed.
 _FINALIZING_WARN_DUTY_CYCLE_MINUTES: Final = 60.0
+
+# False-available healing (request-dedup bug): the movie already-in-library
+# short-circuit (``request_service.create_request_result``) can mint a terminal
+# ``available`` row off a transient/mis-tagged Plex GUID; ``mark_available``
+# never sets ``library_path``, so ``available`` + ``library_path IS NULL`` is
+# that short-circuit's unique false-claim signature -- nothing else produces
+# it for a MOVIE (a TV parent's ``available`` + NULL path is the normal,
+# legitimate rollup shape; the breadcrumb lives per-season there). Bounded so
+# a reconcile tick stays cheap; the false-claim population is normally zero.
+_HEAL_FALSE_AVAILABLE_LIMIT: Final = 25
+# Statuses that mean "genuinely in the library" for a sibling row backing the
+# heal's collapse branch -- mirrors ``SqlRequestRepository.find_in_library``'s
+# own available/completed pairing.
+_IN_LIBRARY_STATUSES: Final = frozenset({"available", "completed"})
 
 # In-memory (never persisted -- no schema change) bookkeeping for the bounded-
 # Finalizing warning's duty cycle, keyed by a caller-chosen row identity (see
@@ -2250,6 +2265,417 @@ async def run_import_cycle(
     return changed
 
 
+async def _heal_false_available_movies(
+    *,
+    library: LibraryPort,
+    session: AsyncSession,
+    candidates: Sequence[RequestRecord],
+    present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]],
+    present_ids_succeeded: bool,
+) -> None:
+    """Self-heal MOVIE rows falsely minted ``available`` by the in-library
+    short-circuit (request-dedup bug: a transient/mis-tagged Plex GUID at
+    create time, ``request_service.create_request_result``).
+
+    ``candidates`` are ``status='available' AND library_path IS NULL AND
+    available_heal_verified_at IS NULL`` rows -- the exact false-claim
+    signature (see :data:`_HEAL_FALSE_AVAILABLE_LIMIT`'s docstring comment),
+    fetched by the CALLER (:func:`run_availability_cycle`) capped at that
+    limit per tick, id-ascending, BEFORE this tick's movie promotion loop runs
+    -- so a row that loop promotes this same tick was still ``completed`` (a
+    disjoint status) when ``candidates`` was read and can never double up here.
+    ``present_movie_keys``/``present_ids_succeeded`` are the SAME batched
+    ``LibraryPort.present_ids`` answer the promotion loop uses -- the caller
+    folds every candidate's ``tmdb_id`` into that ONE call before running
+    either loop (never a second Plex call, and never the old per-row
+    ``is_available(use_cache=False)``, which cost one full movie-library page
+    PER ROW and could starve a whole tick's healing budget on already-known
+    presence checks alone). Per row, in priority order:
+
+    1. **Sibling collapse**: another row for the SAME ``(tmdb_id, 'movie')`` is
+       ``available``/``completed`` and carries a REAL ``library_path`` -- the
+       path-grounded signal that the content is genuinely present under a
+       DIFFERENT row (the faithful reading of the spec's "path-based
+       confirmation fallback": that sibling was already confirmed at its own
+       import/short-circuit time). Delete the NULL-path row and keep the
+       sibling (mirrors ``request_service._collapse_available_race``'s
+       delete-the-loser). Ownership-guarded (issue #58): a PLAIN collapse only
+       when the delete strands no one's per-user list view — same owner, or the
+       NULL-path candidate is itself ownerless. An OWNED candidate whose only
+       real-path sibling is OWNERLESS is NOT a plain collapse (deleting the
+       owned row would drop it from that user's list, and the ownerless sibling
+       carries no owner to inherit the visibility): instead the ownerless
+       sibling is first ADOPTED for the candidate's owner
+       (:meth:`SqlRequestRepository.claim_if_unowned`) and only THEN collapsed
+       onto — atomically, so a lost adoption race (another user claimed the
+       sibling first) degrades to a logged skip rather than a strand. A
+       genuinely differing owner on every sibling is left for the branches
+       below. Needs no Plex answer at all, so it runs regardless of
+       ``present_ids_succeeded``. The delete itself is a SECOND, independent
+       CAS (:meth:`SqlRequestRepository.delete_false_available_sibling_collapse`)
+       keyed on the row's ownership at the moment it read as of THIS pass's
+       top-of-cycle candidate fetch: the batched ``present_ids``/
+       ``confirm_paths`` crawls between that read and this delete are a
+       multi-second window in which an ownerless candidate can be adopted by a
+       concurrent user create (``find_in_library`` ranks an ownerless row
+       above a foreign-owned real-path sibling). If the CAS finds the row's
+       ownership no longer matches, it deletes nothing -- the row is left
+       untouched for the next cycle to re-decide from a fresh read, never
+       deleted out from under its new (or since-changed) owner.
+    2. **Genuinely present for THIS owner**: the batched GUID check confirms
+       Plex has it after all AND no cross-owner real-path sibling casts doubt on
+       whose copy that is (the candidate has NO real-path sibling at all -- any
+       same-owner/ownerless one would already have collapsed in branch 1) --
+       stamp ``available_heal_verified_at`` (a CAS write; see
+       :meth:`SqlRequestRepository.mark_heal_verified_present`) so the row
+       CONVERGES: it exits ``list_false_available_movies``'s scan population
+       for good, instead of keeping the exact same ``available`` +
+       ``library_path IS NULL`` signature (and being re-verified, and
+       re-occupying the bounded per-tick scan window) forever. A GUID hit whose
+       ONLY corroboration is a DIFFERENT owner's real-path sibling is NOT owner-
+       corroborated: it must never one-way-converge THIS owner's row onto
+       someone else's file, so it falls through to the cross-owner re-arm
+       (branch 3) exactly like a GUID MISS with a cross-owner sibling does.
+
+       **Active-slot collision guard** (before every re-arm below): a re-request
+       for the same media may already hold this media's
+       ``uq_media_requests_active`` slot (any non-settled row -- ``pending`` /
+       ``downloading`` / ``completed`` / ...). Re-arming this NULL-path row to
+       ``pending`` would then violate that partial unique index, and the
+       resulting ``IntegrityError`` -- uncaught -- would abort the whole
+       availability cycle and repeat forever. So before any re-arm, look for
+       that active sibling: it already carries the user's live intent to fetch
+       the content, so COLLAPSE the false ``available`` row onto it (same
+       ownership-guarded CAS delete / adopt-then-collapse as branch 1) rather
+       than re-arming a duplicate. A genuinely cross-owner active sibling (which
+       the normal create paths make near-unreachable -- a foreign in-library row
+       is rejected 409, never grown into a second active row) can be neither
+       safely deleted nor re-armed over, so it degrades to a logged skip. Every
+       re-arm is additionally wrapped so a sibling appearing in the check->re-arm
+       gap is a rolled-back, logged skip -- never an aborted cycle.
+    3. **Cross-owner sibling, path-corroborated**: a real-``library_path``
+       sibling exists (same ``tmdb_id``/``'movie'``) but belongs to a
+       DIFFERENT owner, so branch 1's ownership guard left it alone -- and the
+       GUID batch in branch 2 also missed this row. Corroborate the sibling's
+       ``library_path`` with the SAME GUID-independent path fallback the
+       promotion loop above uses
+       (:meth:`~plex_manager.ports.library.LibraryPort.confirm_paths`, issue
+       #158) -- one extra BATCHED call for the whole heal pass (every
+       cross-owner candidate's sibling path(s) folded into it), never one call
+       per row -- but even a CONFIRMED cross-owner path still re-arms to
+       ``pending`` (folds into branch 4) rather than stamping
+       ``available_heal_verified_at``. THIS row's own owner never had their
+       own copy: a one-way convergence stamp keyed on a DIFFERENT owner's file
+       would strand this row permanently ``available`` with no re-heal path if
+       that sibling is later evicted (ADR-0012 deletes files this app placed)
+       -- the corroboration only avoids logging a false "nothing to
+       corroborate" and still lets a same-tick transport failure on the
+       ``confirm_paths`` call leave the row untouched instead of wrongly
+       re-arming it.
+    4. **Absent, no usable/confirmable sibling**: re-arm to ``pending`` -- the
+       original request was never actually fulfilled, so it re-enters the
+       normal search/grab pipeline (``list_due_for_search`` picks up a
+       re-armed ``pending`` row immediately; the CAS resets the auto-grab
+       backoff).
+
+    Branches 2-4 all require a CONCLUSIVE answer: when ``present_ids_succeeded``
+    is ``False`` (the shared batch call itself raised -- Plex unreachable, auth
+    failure, etc.), every row that didn't collapse onto a sibling is left
+    completely untouched for the next tick's retry -- a same-tick transport
+    failure must never be misread as "genuinely absent" and wrongly re-armed.
+    Likewise, when a row reaches branch 3/4 with an unconfirmable cross-owner
+    sibling and the batched ``confirm_paths`` call itself raises, that row is
+    ALSO left untouched rather than wrongly re-armed on an "unknown" answer.
+
+    Every branch is its own transaction (commit/rollback per row) so one bad
+    row never aborts the rest of the pass, mirroring the promotion loops
+    above. Every outcome -- collapse, re-verify, re-arm, a lost sibling-collapse
+    CAS race, or a transport failure that leaves the row untouched -- logs,
+    honoring "honesty over silence": a duplicate/false row is never silently
+    deleted or left unexplained.
+    """
+    repo = SqlRequestRepository(session)
+
+    async def _commit_collapse(row: RequestRecord, winner: RequestRecord, *, reason: str) -> None:
+        """CAS-delete the false-available ``row`` collapsing it onto ``winner``.
+
+        The delete is keyed on ``row``'s ownership snapshot (issue #58): if a
+        concurrent create claimed the row in the window since candidates were
+        read, the CAS finds nothing and the row is left for next cycle rather
+        than deleted out from under its new owner.
+        """
+        if await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=row.user_id):
+            await session.commit()
+            _logger.info(
+                "healed duplicate false-available movie row: %s",
+                reason,
+                extra={
+                    "tmdb_id": safe_int(row.tmdb_id),
+                    "request_id": safe_int(row.id),
+                    "winner_request_id": safe_int(winner.id),
+                },
+            )
+        else:
+            await session.rollback()
+            _logger.warning(
+                "heal: false-available movie row's ownership changed before the "
+                "collapse could commit (likely claimed by a concurrent create in "
+                "the window since candidates were read); leaving it for next cycle "
+                "instead of deleting a row that may now be someone's just-succeeded "
+                "request",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+
+    async def _adopt_then_collapse(
+        row: RequestRecord, winner: RequestRecord, *, reason: str
+    ) -> None:
+        """Adopt an OWNERLESS ``winner`` for ``row``'s owner FIRST, then collapse
+        (finding 2 / issue #58): deleting an OWNED candidate onto an ownerless
+        sibling would drop the row from that user's per-user list with no owner to
+        inherit its visibility. Claim the sibling for the owner (atomic with the
+        collapse) so the owner keeps the row; a lost adoption race (another user
+        claimed the sibling first) degrades to a rolled-back logged skip.
+        """
+        owner = row.user_id
+        if owner is None or not await repo.claim_if_unowned(winner.id, owner):
+            await session.rollback()
+            _logger.warning(
+                "heal: could not adopt the ownerless sibling for the false-available "
+                "movie row's owner before collapsing (likely claimed by a concurrent "
+                "create in the window since candidates were read); leaving it for next "
+                "cycle rather than stranding the owner's per-user list view",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            return
+        await _commit_collapse(row, winner, reason=reason)
+
+    async def _rearm(row: RequestRecord) -> bool:
+        """Re-arm the false-available ``row`` to ``pending``, guarded against the
+        ``uq_media_requests_active`` collision (finding 1): a concurrent active
+        re-request appearing in the check->re-arm gap makes the CAS UPDATE raise
+        ``IntegrityError``; catch it, roll back, and degrade to a logged skip so
+        the availability cycle NEVER aborts. Returns whether the row was re-armed.
+        """
+        try:
+            rearmed = await repo.rearm_false_available_to_pending(row.id)
+        except IntegrityError:
+            await session.rollback()
+            _logger.warning(
+                "heal: re-arm of false-available movie row collided with a concurrent "
+                "active re-request that now owns this media's uq_media_requests_active "
+                "slot; leaving it for next cycle (the active row carries the intent)",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            return False
+        if rearmed:
+            await session.commit()
+            return True
+        await session.rollback()
+        return False
+
+    # Phase 1: resolve every candidate's siblings + the ownership-guarded
+    # "safe" one up front (DB-only, cheap) so phase 2 below can fold every
+    # cross-owner candidate's sibling path(s) into ONE batched confirm_paths
+    # call for the WHOLE pass, instead of one call per row.
+    #
+    # ``safe_sibling`` is a PLAIN collapse target: same owner, or the NULL-path
+    # candidate is itself ownerless (deleting it strands no per-user list). An
+    # OWNED candidate whose only real-path sibling is OWNERLESS is instead an
+    # ``adoptable_sibling`` (finding 2): the sibling must be claimed for the
+    # owner BEFORE collapsing so the owner keeps the row, never a plain delete.
+    row_siblings: dict[int, list[RequestRecord]] = {}
+    row_safe_sibling: dict[int, RequestRecord | None] = {}
+    row_adoptable_sibling: dict[int, RequestRecord | None] = {}
+    for row in candidates:
+        siblings = [
+            sibling
+            for sibling in await repo.list_for_media(row.tmdb_id, "movie", _IN_LIBRARY_STATUSES)
+            if sibling.id != row.id and sibling.library_path is not None
+        ]
+        row_siblings[row.id] = siblings
+        row_safe_sibling[row.id] = next(
+            (
+                sibling
+                for sibling in siblings
+                if sibling.user_id == row.user_id or row.user_id is None
+            ),
+            None,
+        )
+        row_adoptable_sibling[row.id] = (
+            None
+            if row_safe_sibling[row.id] is not None or row.user_id is None
+            else next((sibling for sibling in siblings if sibling.user_id is None), None)
+        )
+
+    # Phase 2: cross-owner sibling path corroboration (branch 3 above). Only
+    # candidates that will NOT collapse (no safe/adoptable sibling) and were NOT
+    # already confirmed by the GUID batch need a path answer at all.
+    cross_owner_paths: set[str] = set()
+    for row in candidates:
+        if row_safe_sibling[row.id] is not None or row_adoptable_sibling[row.id] is not None:
+            continue
+        if present_ids_succeeded and (row.tmdb_id, "movie") in present_movie_keys:
+            continue
+        for sibling in row_siblings[row.id]:
+            if sibling.library_path:
+                cross_owner_paths.add(sibling.library_path)
+    confirmed_cross_owner_paths: frozenset[str] = frozenset()
+    # Vacuously "succeeded" when nothing needed checking -- no row will ever
+    # consult this flag unless it actually has a cross-owner path pending.
+    cross_owner_check_succeeded = not cross_owner_paths
+    if cross_owner_paths:
+        try:
+            confirmed_cross_owner_paths = await library.confirm_paths("movie", cross_owner_paths)
+            cross_owner_check_succeeded = True
+        except (PlexLibraryError, PlexAuthError, NotImplementedError):
+            _logger.warning(
+                "cross-owner sibling path corroboration failed for %d false-available "
+                "movie row(s); will retry next cycle",
+                len(cross_owner_paths),
+            )
+
+    for row in candidates:
+        siblings = row_siblings[row.id]
+        safe_sibling = row_safe_sibling[row.id]
+        adoptable_sibling = row_adoptable_sibling[row.id]
+        # Branch 1: plain collapse onto a same-owner / candidate-ownerless
+        # real-path sibling. Needs no Plex answer.
+        if safe_sibling is not None:
+            await _commit_collapse(
+                row, safe_sibling, reason="collapsed onto a sibling with a real library_path"
+            )
+            continue
+        # Branch 1b (finding 2): owned candidate + ownerless real-path sibling
+        # -> adopt the sibling for the owner, THEN collapse (never a plain delete
+        # that would strand the owner's per-user list view).
+        if adoptable_sibling is not None:
+            await _adopt_then_collapse(
+                row,
+                adoptable_sibling,
+                reason=(
+                    "adopted an ownerless sibling with a real library_path for this "
+                    "row's owner, then collapsed onto it"
+                ),
+            )
+            continue
+        if not present_ids_succeeded:
+            await session.rollback()
+            _logger.warning(
+                "heal: batch availability check failed for false-available movie "
+                "row; leaving it for next cycle",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            continue
+        guid_present = (row.tmdb_id, "movie") in present_movie_keys
+        # Branch 2 (finding 4): genuinely present for THIS owner -- a GUID hit
+        # AND no cross-owner real-path sibling casting doubt on whose copy it is
+        # (any same-owner/ownerless one would already have collapsed above).
+        # Only then is convergence (a one-way stamp) honest.
+        if guid_present and not siblings:
+            if await repo.mark_heal_verified_present(row.id):
+                await session.commit()
+                _logger.info(
+                    "healed false-available movie row: Plex confirms present, "
+                    "re-verified and stamped so it stops being re-scanned",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+            else:
+                await session.rollback()
+            continue
+        # Active-slot collision guard (finding 1): a re-request already holding
+        # this media's uq_media_requests_active slot (any non-settled row) would
+        # make the re-arm below raise IntegrityError and abort the whole cycle.
+        # It already carries the user's live intent, so collapse the false row
+        # onto it instead of re-arming a duplicate.
+        active_sibling = await repo.find_active(row.tmdb_id, "movie")
+        if active_sibling is not None:
+            if active_sibling.user_id == row.user_id or row.user_id is None:
+                await _commit_collapse(
+                    row,
+                    active_sibling,
+                    reason="collapsed onto an active re-request that already carries the intent",
+                )
+            elif active_sibling.user_id is None:
+                await _adopt_then_collapse(
+                    row,
+                    active_sibling,
+                    reason=(
+                        "adopted the ownerless active re-request for this row's owner, "
+                        "then collapsed onto it"
+                    ),
+                )
+            else:
+                await session.rollback()
+                _logger.warning(
+                    "heal: false-available movie row has an active re-request owned by "
+                    "a DIFFERENT user holding this media's dedup slot; can neither "
+                    "re-arm (would collide) nor collapse (would strand this owner) -- "
+                    "leaving it for next cycle",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+            continue
+        # Branch 3 (finding 4): GUID present but corroborated ONLY by a cross-
+        # owner real-path sibling -> the content exists under a DIFFERENT owner's
+        # copy, not this owner's. Conclusive that it exists, so re-arm THIS owner
+        # for their own fresh copy rather than one-way-converging on another
+        # owner's file (which would strand this row if that sibling is later
+        # evicted, ADR-0012). No path check needed: the GUID hit is conclusive.
+        if guid_present:
+            if await _rearm(row):
+                _logger.info(
+                    "healed false-available movie row: Plex confirms the content "
+                    "present but only under a DIFFERENT owner's copy; re-armed to "
+                    "pending for this owner's own fresh search instead of converging "
+                    "on another owner's file",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+            continue
+        # Branches 4 & 5 (GUID miss). A cross-owner sibling whose path could not
+        # be corroborated leaves the row untouched (never re-armed on an unknown).
+        cross_owner_sibling = next(
+            (
+                sibling
+                for sibling in siblings
+                if sibling.library_path in confirmed_cross_owner_paths
+            ),
+            None,
+        )
+        if siblings and not cross_owner_check_succeeded:
+            await session.rollback()
+            _logger.warning(
+                "heal: cross-owner sibling path corroboration failed for "
+                "false-available movie row; leaving it for next cycle",
+                extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+            )
+            continue
+        if await _rearm(row):
+            if cross_owner_sibling is not None:
+                # Corroborated: the content genuinely exists under a DIFFERENT
+                # owner's row. Still re-arm rather than stamping
+                # ``available_heal_verified_at`` -- THIS row's own owner never
+                # had their own copy, and converging on another owner's file
+                # would strand this row permanently ``available`` with no
+                # re-heal path if that sibling is later evicted (ADR-0012).
+                _logger.info(
+                    "healed false-available movie row: cross-owner sibling's "
+                    "library_path corroborated via the path fallback, but it "
+                    "is a different owner's copy; re-armed to pending for "
+                    "this owner's own fresh search instead of converging on "
+                    "another owner's file",
+                    extra={
+                        "tmdb_id": safe_int(row.tmdb_id),
+                        "request_id": safe_int(row.id),
+                        "sibling_request_id": safe_int(cross_owner_sibling.id),
+                    },
+                )
+            else:
+                _logger.info(
+                    "healed false-available movie row: not in Plex and no "
+                    "confirmable sibling copy; re-armed to pending for a fresh search",
+                    extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
+                )
+
+
 async def run_availability_cycle(
     *, library: LibraryPort, session: AsyncSession, now: datetime | None = None
 ) -> int:
@@ -2308,6 +2734,35 @@ async def run_availability_cycle(
     tick's retry instead. A same-tick transport failure must never be
     misattributed to a library/GUID mismatch; the "batch availability check
     failed" warning already logged above names the real cause.
+
+    SELF-HEAL FALSE 'AVAILABLE' CLAIMS (request-dedup bug): a bounded pass
+    (:func:`_heal_false_available_movies`, run after the movie promotion loop
+    below) scans for MOVIE rows already ``available`` with ``library_path IS
+    NULL`` -- the unique signature the already-in-library short-circuit
+    (``request_service.create_request_result``) mints when a transient/
+    mis-tagged Plex GUID makes it believe a movie is present that never
+    actually was. Each false claim is either collapsed onto a genuine
+    same-owner-or-ownerless sibling row (via a second, ownership-CAS'd delete
+    guarding against a concurrent adoption race), re-verified by the GUID
+    batch and stamped ``available_heal_verified_at`` (which converges it out
+    of future scans -- a genuinely-present row is never re-verified or
+    re-paged again), or re-armed to ``pending`` for a fresh, honest search --
+    including a row whose ONLY corroboration is a different owner's sibling
+    ``library_path`` (issue #158's path fallback): that content was never
+    THIS owner's own copy, so it re-arms rather than one-way-converging on
+    another owner's file, which could otherwise strand it permanently
+    ``available`` if that sibling is later evicted -- north stars "correction
+    without a terminal" and
+    "honesty over silence": a wrongly-terminal row self-corrects on the next
+    reconcile tick instead of silently shadowing a real re-request (or
+    perpetually consuming the bounded per-tick heal budget and starving a
+    later, higher-id false claim) forever. These candidate rows are fetched
+    HERE, before the promotion loop, so their ``tmdb_id``s can be folded into
+    the SAME single batched ``present_ids`` call the promotion loop already
+    needs -- the heal pass's GUID check never issues its own (formerly
+    per-ROW, full-library-page) Plex call; its cross-owner path fallback
+    issues AT MOST one additional batched ``confirm_paths`` call for the
+    whole pass, never one per row.
     """
     effective_now = now if now is not None else datetime.now(UTC)
     promoted = 0
@@ -2317,24 +2772,45 @@ async def run_availability_cycle(
         for request in await request_repo.list_by_status(RequestStatus.completed.value)
         if request.media_type == "movie"
     ]
+    # False-available heal candidates (see the docstring section above and
+    # ``_heal_false_available_movies``) -- read NOW, before the promotion loop
+    # below runs, so a row that loop promotes this very tick was still
+    # ``completed`` (a status disjoint from ``available``) at THIS read and can
+    # never also show up here; no separate exclude-set is needed.
+    heal_candidates = await request_repo.list_false_available_movies(
+        limit=_HEAL_FALSE_AVAILABLE_LIMIT
+    )
     present_movie_keys: frozenset[tuple[int, Literal["movie", "tv"]]] = frozenset()
     # Whether the GUID batch actually returned an answer this tick, as opposed
     # to defaulting to "nothing confirmed" because the call itself raised
     # (round-5 finding: a transport failure must never be mistaken for a
     # genuine "Plex doesn't have this" -- the "batch availability check
-    # failed" warning above already surfaces the real cause).
+    # failed" warning above already surfaces the real cause). Shared by both
+    # the promotion loop below and the heal pass after it.
     present_ids_succeeded = False
-    if completed_movies:
+    # ``present_ids`` costs AT MOST one movie-library crawl for the WHOLE
+    # call no matter how many keys it's asked about, so folding the heal
+    # candidates in here is free -- one call answers both the promotion loop
+    # AND the heal pass, instead of two (or, before this fix, N per-row) calls.
+    _completed_keys: list[tuple[int, Literal["movie", "tv"]]] = [
+        (request.tmdb_id, "movie") for request in completed_movies
+    ]
+    _heal_keys: list[tuple[int, Literal["movie", "tv"]]] = [
+        (row.tmdb_id, "movie") for row in heal_candidates
+    ]
+    combined_movie_keys = list(dict.fromkeys(_completed_keys + _heal_keys))
+    if combined_movie_keys:
         try:
             present_movie_keys = await library.present_ids(
-                [(request.tmdb_id, "movie") for request in completed_movies],
+                combined_movie_keys,
                 refresh_absent=True,
             )
             present_ids_succeeded = True
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             _logger.warning(
-                "batch availability check failed for %d completed movie(s); will retry next cycle",
-                len(completed_movies),
+                "batch availability check failed for %d completed/false-available "
+                "movie(s); will retry next cycle",
+                len(combined_movie_keys),
             )
 
     # Path-based fallback candidates (issue #158): every GUID-miss movie that
@@ -2402,6 +2878,20 @@ async def run_availability_cycle(
                 "availability promotion failed; will retry next cycle",
                 extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
             )
+
+    # Self-heal false 'available' movie claims (request-dedup bug, see
+    # ``_heal_false_available_movies``'s docstring) -- a bounded pass, run once
+    # per tick after the movie promotion loop above, over ``heal_candidates``
+    # (fetched up top, before this tick's promotion could touch anything) using
+    # the SAME batched ``present_movie_keys``/``present_ids_succeeded`` answer
+    # the promotion loop just used.
+    await _heal_false_available_movies(
+        library=library,
+        session=session,
+        candidates=heal_candidates,
+        present_movie_keys=present_movie_keys,
+        present_ids_succeeded=present_ids_succeeded,
+    )
 
     # TV: per-SEASON confirmation, mirroring the movie loop above but scoped to
     # SeasonRequest rows -- a show's OTHER seasons may still be mid-flight while

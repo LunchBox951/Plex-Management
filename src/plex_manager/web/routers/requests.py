@@ -254,6 +254,12 @@ async def list_requests_endpoint(
     records = await request_service.list_requests(session)
     if not auth.is_admin:
         records = [record for record in records if record.user_id == auth.user_id]
+    # Fold duplicate rows for the same media (e.g. a healed-but-not-yet-collapsed
+    # false-``available`` row alongside a genuine re-grab) down to ONE visible
+    # row per the requester's own preference order -- AFTER the per-user filter
+    # above, so a non-admin's own visible row is never folded onto a row they
+    # cannot see. Underlying rows are untouched (see the helper's docstring).
+    records = request_service.fold_requests_for_display(records)
     # Batch every tv row's season rows in ONE query (avoids an N+1 query per tv
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]

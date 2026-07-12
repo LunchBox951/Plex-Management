@@ -349,6 +349,22 @@ class MediaRequest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Convergence discriminator for the false-available MOVIE heal pass
+    # (``import_service._heal_false_available_movies``, request-dedup bug). Stamped
+    # ONLY by that pass's "genuinely present" branch -- a LIVE re-check found the
+    # movie really is in Plex despite no stored ``library_path`` (an already-owned
+    # title this app never placed a file for). NEVER stamped at request-create time
+    # (that would hide a false claim from the heal pass it exists to catch) nor by
+    # the normal import-promotion path (which always has a real ``library_path`` by
+    # then, so it never matches the heal predicate in the first place). Once set,
+    # ``SqlRequestRepository.list_false_available_movies`` excludes the row from
+    # its scan population -- without this, a genuinely-present row re-verified via
+    # ``mark_available`` (which never sets ``library_path``) would keep the exact
+    # same ``available`` + ``library_path IS NULL`` signature FOREVER and be
+    # re-scanned every reconcile tick, and (id-ascending, bounded) could starve out
+    # a real false claim at a higher id. ``None`` for every row the heal pass
+    # hasn't (yet) confirmed genuinely present.
+    available_heal_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The final placed path the importer wrote this movie into (ADR-0012),
     # captured at import/availability time and STORED — never reconstructed from
     # naming at eviction time, which would be fragile. The disk-pressure eviction
