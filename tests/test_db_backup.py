@@ -439,6 +439,73 @@ def test_skips_and_does_not_prune_for_unknown_newer_revision(
     assert any("migration graph" in record.message for record in caplog.records)
 
 
+def test_unknown_head_backup_does_not_prune_existing_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding: a defensive unknown-head backup must never evict existing backups.
+
+    Under ``restart: unless-stopped``, a broken image that keeps failing
+    ``alembic upgrade head`` restarts forever, producing one defensive backup
+    per restart (the head is undeterminable each time). If each of those
+    triggered the normal keep-5 prune, enough restarts would evict the genuine
+    pre-migration backup that guards the last successful migration -- exactly
+    the recovery unit ADR-0021 depends on. So an unknown-head backup must add
+    itself without pruning anything, even when the total now exceeds
+    ``_KEEP_COUNT``.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_head())
+    _write_key(data_dir)
+
+    backups_root = data_dir / "backups"
+    backups_root.mkdir(parents=True)
+    extra = db_backup._KEEP_COUNT + 3  # pyright: ignore[reportPrivateUsage]
+    existing: list[str] = []
+    for i in range(extra):
+        stale = backups_root / f"pre-migrate-fake-rev-2020010{i}T000000Z"
+        stale.mkdir()
+        os.utime(stale, (1_000_000 + i, 1_000_000 + i))
+        existing.append(stale.name)
+
+    monkeypatch.setattr(db_backup, "_head_revision", lambda: db_backup._UNKNOWN_HEAD)  # pyright: ignore[reportPrivateUsage]
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
+    remaining = sorted(p.name for p in backups_root.iterdir() if p.is_dir())
+    # Every pre-existing backup survives AND the new defensive one is added --
+    # nothing pruned even though the count now exceeds _KEEP_COUNT. A normal
+    # (non-defensive) backup path would have pruned this down to _KEEP_COUNT.
+    assert set(existing).issubset(set(remaining))
+    assert result.name in remaining
+    assert len(remaining) == extra + 1
+
+
+def test_manifest_instructs_removing_stale_wal_shm_sidecars(tmp_path: Path) -> None:
+    """Finding: the restore runbook must tell the operator to drop stale WAL/SHM.
+
+    The snapshot is a STANDALONE file taken via the SQLite backup API. If the
+    operator restores it next to leftover ``<db>-wal`` / ``<db>-shm`` sidecars
+    from whatever database was running most recently (typically a newer one),
+    SQLite replays those frames on open -- silently reintroducing the newer
+    schema/data the restore was meant to roll back away from.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
+    manifest = (result / "MANIFEST.txt").read_text(encoding="utf-8")
+    assert "-wal" in manifest
+    assert "-shm" in manifest
+
+
 def test_partial_backup_is_not_published_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

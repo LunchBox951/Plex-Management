@@ -95,9 +95,25 @@ reason and is not a silent swallow — it always emits the ERROR first.
 **6. Non-SQLite (PostgreSQL) is out of scope for the automatic snapshot.**
 `create_pre_migration_backup` detects a non-SQLite `database_url` and logs an
 honest notice instead of silently doing nothing: the operator must snapshot
-the database (e.g. `pg_dump`) AND separately preserve the still-local
-`secret.key` themselves. Automating a Postgres snapshot from inside the app
-container is a larger, credential-scoped feature and is deliberately deferred.
+the database (e.g. `pg_dump`) AND separately preserve the key half of the
+recovery unit themselves. Which key half depends on the deployment, exactly as
+the SQLite path's `KeyDisposition` (§4) already distinguishes -- an
+unconditional "preserve `secret.key`" instruction is wrong for half of these
+deployments:
+
+- **Key file (the default):** the active key is `<data_dir>/secret.key` in the
+  app container's data directory. Copy it alongside the `pg_dump` output and
+  keep the two together.
+- **`PLEX_MANAGER_FERNET_KEY` deployments:** the active key is the environment
+  value, not a file. Any on-disk `secret.key` in this case is absent, or a
+  stale leftover that no longer matches the active key -- it must **not** be
+  saved as the key half; doing so pairs the dump with the wrong key and
+  produces an undecryptable restore. Preserve the `PLEX_MANAGER_FERNET_KEY`
+  value from the environment/secret store instead.
+
+Automating a Postgres snapshot from inside the app container is a larger,
+credential-scoped feature and is deliberately deferred. See the README
+"Backup & recovery" section for the exact commands for both cases.
 
 ## Alternatives considered
 

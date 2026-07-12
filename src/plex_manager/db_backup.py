@@ -7,7 +7,14 @@ snapshots the SQLite database (WAL-consistent, via :func:`sqlite3.Connection.bac
 the Fernet encryption key as **one recovery unit** into
 ``<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/``, alongside a
 human-readable ``MANIFEST.txt`` restore runbook. Backups are pruned to the
-most recent :data:`_KEEP_COUNT`.
+most recent :data:`_KEEP_COUNT` -- EXCEPT a defensive backup taken when the
+migration head could not be determined (see :data:`_UNKNOWN_HEAD`), which is
+written but never triggers a prune. Under ``restart: unless-stopped``, a
+broken image that fails ``alembic upgrade head`` restarts forever, producing
+one such defensive backup per restart; if that path pruned too, enough
+restarts would evict the genuine pre-migration backup guarding the last
+successful migration -- exactly the recovery unit this module exists to
+protect. See :func:`create_pre_migration_backup`.
 
 This is advisory, not a replacement for an operator's own backup strategy
 (Postgres deployments are explicitly out of scope -- see :func:`_sqlite_file_path`)
@@ -238,7 +245,7 @@ def _write_manifest(dest_dir: Path, from_rev: str | None, key_disposition: KeyDi
         key_source = "<data_dir>/secret.key (key file, included in this backup)"
         key_line = f"  - {_KEY_COPY_NAME} (mode 0600)"
         key_restore = f"""\
-  3. Copy {_KEY_COPY_NAME} from this backup back into the data directory as
+  4. Copy {_KEY_COPY_NAME} from this backup back into the data directory as
      secret.key, preserving mode 0600 (`chmod 600 secret.key`)."""
     elif key_disposition is KeyDisposition.ENV_OVERRIDE:
         key_source = "PLEX_MANAGER_FERNET_KEY (env override -- NOT embedded in this backup)"
@@ -248,7 +255,7 @@ def _write_manifest(dest_dir: Path, from_rev: str | None, key_disposition: KeyDi
             "    embedded in this backup; preserve that value separately)"
         )
         key_restore = """\
-  3. Ensure the SAME PLEX_MANAGER_FERNET_KEY value that was active at backup
+  4. Ensure the SAME PLEX_MANAGER_FERNET_KEY value that was active at backup
      time is configured on the deployment (this backup contains no key file;
      the env secret IS the key half of this recovery unit)."""
     else:  # KeyDisposition.MISSING
@@ -259,7 +266,7 @@ def _write_manifest(dest_dir: Path, from_rev: str | None, key_disposition: KeyDi
             "    DATABASE-ONLY backup -- it is NOT a complete recovery unit."
         )
         key_restore = """\
-  3. WARNING: this backup contains NO key and none was configured when it was
+  4. WARNING: this backup contains NO key and none was configured when it was
      taken. Encrypted columns in the restored database can only be decrypted
      with the ORIGINAL key -- recover it separately (a prior backup, your
      secret store, an old volume). Do NOT mint a new key and expect existing
@@ -287,11 +294,19 @@ Restore steps:
   1. Stop the container.
   2. Copy {_DB_COPY_NAME} back into the data directory, replacing the current
      database file (match the filename your PLEX_MANAGER_DATABASE_URL expects).
+  3. Remove any <db>-wal and <db>-shm sidecar files sitting next to the
+     database file you just restored (e.g. plex_manager.db-wal,
+     plex_manager.db-shm), if present. {_DB_COPY_NAME} is a STANDALONE
+     snapshot taken via the SQLite backup API -- it is already complete on its
+     own. Leftover WAL frames from whatever database was running most
+     recently belong to a DIFFERENT (newer) database file than the one you
+     just restored; SQLite replays them on open, which can silently
+     reintroduce the newer schema/data you are trying to roll back away from.
 {key_restore}
-  4. Re-point the deployment at the older image tag that matches this
+  5. Re-point the deployment at the older image tag that matches this
      database revision (same-schema rollback: just re-point; cross-migration
      rollback: this backup unit IS the recovery path -- see ADR-0021).
-  5. Start the container and verify: sign in, and confirm a stored credential
+  6. Start the container and verify: sign in, and confirm a stored credential
      (e.g. a configured service) still decrypts correctly.
 
 See docs/adr/0021-database-rollback-and-pre-migration-backup.md and the
@@ -360,6 +375,7 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
 
     current = _current_revision(db_path)
     head = _head_revision()
+    is_defensive_unknown_head = head == _UNKNOWN_HEAD
     if current == head:
         logger.info(
             "Database already at head revision %s; no migration pending, "
@@ -419,7 +435,25 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
         key_disposition.name,
     )
 
-    _prune(dest.parent)
+    if is_defensive_unknown_head:
+        # Do NOT prune here. This backup was forced because the migration head
+        # itself is undeterminable, not because a confirmed pending migration
+        # was found -- under restart: unless-stopped, a broken image that keeps
+        # failing `alembic upgrade head` produces one of these per restart, and
+        # pruning on that cadence could evict the genuine pre-migration backup
+        # that guards the last successful migration. Skipping the prune trades
+        # unbounded disk growth in that (already-broken, operator-visible)
+        # scenario for never silently losing the real recovery unit.
+        logger.warning(
+            "Migration head could not be determined; skipping the post-backup "
+            "prune so this defensive backup cannot evict an existing genuine "
+            "pre-migration backup. Backups under %s may accumulate until the "
+            "head can be determined again -- investigate and prune manually "
+            "if disk usage becomes a concern.",
+            dest.parent,
+        )
+    else:
+        _prune(dest.parent)
     return dest
 
 

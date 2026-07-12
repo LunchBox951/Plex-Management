@@ -171,6 +171,14 @@ cp /path/to/volume/plex_manager.db /path/to/volume/secret.key ./backup/
 chmod 600 ./backup/secret.key
 ```
 
+**Restoring** a SQLite backup: after copying `plex_manager.db` (and `secret.key`,
+per the key-half rules above) back into the volume, remove any stale
+`plex_manager.db-wal` / `plex_manager.db-shm` sidecar files left next to it
+*before* starting the older image. The backup is a standalone snapshot;
+leftover WAL frames belong to whatever database was running most recently
+(likely a newer one) and SQLite replays them on open, which can silently
+reintroduce the very data/schema you are trying to roll back away from.
+
 **PostgreSQL deployment:** `pg_dump` backs up the database only — the Fernet
 key is never in Postgres. Where the key half lives depends on your deployment:
 
