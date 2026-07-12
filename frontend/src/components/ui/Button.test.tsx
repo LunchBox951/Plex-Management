@@ -18,4 +18,12 @@ describe('Button', () => {
     render(<Button>Go</Button>)
     expect(screen.getByRole('button')).toBeEnabled()
   })
+
+  // The primary hover uses the explicit brighter gold token, not an opacity
+  // step: `bg-gold/90` blends toward the dark background (darker), the opposite
+  // of the intended brighten-on-hover.
+  it('brightens the primary action on hover via the gold-hover token', () => {
+    render(<Button variant="primary">Save</Button>)
+    expect(screen.getByRole('button')).toHaveClass('hover:bg-gold-hover')
+  })
 })
