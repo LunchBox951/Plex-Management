@@ -42,9 +42,12 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord
 
 __all__ = [
+    "METADATA_STALL_WINDOW",
+    "STALLED_PROGRESS_WINDOW",
     "StallDetection",
     "StateTransition",
     "detect_stalls",
+    "download_deadline",
     "failed_download_events",
     "reconcile",
     "unmapped_client_states",
@@ -328,6 +331,25 @@ _STALLED_PROGRESS_RAW_STATES: Final[frozenset[str]] = frozenset(
     {"downloading", "forcedDL", "stalledDL"}
 )
 
+# Raw states qBittorrent reports as DELIBERATELY not-downloading. The
+# never-had-activity catch-all (below) must never self-heal these — an operator
+# paused it (pausedDL/stoppedDL), it is queued behind others by design
+# (queuedDL), it is verifying pieces after a restart (checkingDL/
+# checkingResumeData), or it is relocating settled bytes (moving). Removing +
+# blocklisting any of these would destroy a healthy torrent (north star:
+# correction, never destruction). ``metaDL``/``forcedMetaDL`` are already
+# consumed by the earlier metadata-stall branch (via ``continue``), so they
+# never reach the catch-all — no need to list them here too.
+_DELIBERATELY_IDLE_RAW_STATES: Final[frozenset[str]] = frozenset(
+    {"pausedDL", "stoppedDL", "queuedDL", "checkingDL", "checkingResumeData", "moving"}
+)
+
+# Public windows — the single definition ``download_deadline`` and
+# ``detect_stalls``'s own defaults both bind to, so there is exactly ONE place
+# that knows how long each phase's deadline is.
+METADATA_STALL_WINDOW: Final[timedelta] = timedelta(minutes=_METADATA_STALL_MINUTES)
+STALLED_PROGRESS_WINDOW: Final[timedelta] = timedelta(hours=_STALLED_PROGRESS_HOURS)
+
 # Persisted-status gate (issue #165 hardening finding): the rows this detector is
 # handed come from ``download_repo.list_active()``, whose OWN docstring scopes it
 # to "active (non-terminal)" -- a broader set than the two live shapes this
@@ -373,8 +395,8 @@ def detect_stalls(
     client: Sequence[DownloadStatus],
     *,
     now: datetime,
-    metadata_stall: timedelta = timedelta(minutes=_METADATA_STALL_MINUTES),
-    stalled_progress: timedelta = timedelta(hours=_STALLED_PROGRESS_HOURS),
+    metadata_stall: timedelta = METADATA_STALL_WINDOW,
+    stalled_progress: timedelta = STALLED_PROGRESS_WINDOW,
 ) -> list[StallDetection]:
     """Detect rows stuck in metadata-fetching or with a dead/frozen download,
     pure and read-only (no I/O, no side effects — the service layer decides what
@@ -419,6 +441,20 @@ def detect_stalls(
       ``last_activity``; ``moving`` — actively relocating settled bytes) and any
       unmapped future state. Self-healing one of those would remove and
       blocklist a healthy torrent (north star: correction, never destruction).
+    * **Never-had-activity catch-all**: a zero-seed magnet (or an unmapped raw
+      state falling back to ``DownloadState.Downloading`` via
+      ``_UNKNOWN_FALLBACK``) can report ``last_activity_unix == 0`` forever — it
+      never had ANY activity to report, so the stalled-progress branch above
+      (which requires ``last_activity_unix > 0``) can never trip for it, and the
+      row sits ``downloading`` indefinitely. Any raw state NOT in
+      :data:`_DELIBERATELY_IDLE_RAW_STATES` (the metadata-fetching raw states are
+      already consumed by the branch above) with ``last_activity_unix <= 0`` AND
+      ``progress <= 0.0`` for at least ``metadata_stall`` is healed on the SAME
+      ``metadata_stall`` path — it never made it past fetching metadata in any
+      way that produced observable activity. The ``progress <= 0.0`` guard keeps
+      a partially-downloaded torrent whose activity was merely reset by a
+      restart (real bytes on disk) untouched — only the genuine zero-progress
+      dead case is healed.
 
     Deliberately keyed off the LIVE raw state (not the row's persisted
     ``status``) so a row this SAME cycle's :func:`reconcile` is already moving
@@ -440,6 +476,14 @@ def detect_stalls(
             if elapsed >= metadata_stall:
                 detections.append(StallDetection(row.id, row.torrent_hash, "metadata_stall"))
             continue
+        if (
+            status.raw_state not in _DELIBERATELY_IDLE_RAW_STATES
+            and status.last_activity_unix <= 0
+            and status.progress <= 0.0
+            and elapsed >= metadata_stall
+        ):
+            detections.append(StallDetection(row.id, row.torrent_hash, "metadata_stall"))
+            continue
         if elapsed < stalled_progress:
             continue
         if status.raw_state in _STALLED_PROGRESS_RAW_STATES and status.last_activity_unix > 0:
@@ -447,3 +491,60 @@ def detect_stalls(
             if now - last_activity > stalled_progress:
                 detections.append(StallDetection(row.id, row.torrent_hash, "stalled_progress"))
     return detections
+
+
+def download_deadline(status: DownloadStatus, added_at: datetime) -> datetime | None:
+    """The honest stall deadline for a live download row, or ``None`` when the
+    state has no meaningful download deadline (completed/seeding/failed).
+
+    ``metaDL``/``forcedMetaDL`` -> ``added_at + METADATA_STALL_WINDOW`` (still
+    fetching metadata); a never-had-activity row (``status.raw_state`` not in
+    :data:`_DELIBERATELY_IDLE_RAW_STATES`, ``last_activity_unix <= 0``, and
+    ``progress <= 0.0``) -> ALSO ``added_at + METADATA_STALL_WINDOW`` — this
+    MUST mirror :func:`detect_stalls`'s own never-had-activity predicate
+    exactly (Codex P2 round 1: the two used to disagree, so a zero-seed
+    magnet's ``timeout_at`` showed the 3h ``STALLED_PROGRESS_WINDOW`` deadline
+    while the self-heal actually fired 2h15m earlier, at the 45m metadata
+    window); any OTHER raw_state mapping to ``DownloadState.Downloading``
+    (including the unknown-state fallback) with REPORTED activity
+    (``last_activity_unix > 0``) -> ``max(added_at, last_activity) +
+    STALLED_PROGRESS_WINDOW`` — the stalled-progress heal requires BOTH ``now -
+    added_at >= window`` AND ``now - last_activity > window``, so the honest
+    deadline is the LATER of the two anchors plus the window (Codex P2 round 2:
+    anchoring on ``added_at`` alone showed a deadline the heal could not
+    possibly fire at while ``last_activity`` was newer than ``added_at``, e.g.
+    added 12:00 / active 13:30 reported 15:00 when the heal cannot fire before
+    16:30); the residual Downloading-side shapes with no reported activity (a
+    deliberately-idle state, or activity reset by a restart with real bytes on
+    disk) -> ``added_at + STALLED_PROGRESS_WINDOW``; an ``ImportPending``/
+    ``FailedPending`` state -> ``None`` (no download in flight).
+
+    Observability only — :func:`detect_stalls` remains anchored on the same
+    signals but stays the sole control path; this column is never read for
+    control.
+    """
+    if status.raw_state in ("metaDL", "forcedMetaDL"):
+        return added_at + METADATA_STALL_WINDOW
+    if _RAW_STATE_MAP.get(status.raw_state, _UNKNOWN_FALLBACK) is not DownloadState.Downloading:
+        # ImportPending (uploading/stalledUP/...) or FailedPending (error/
+        # missingFiles): no download-phase deadline. Checked BEFORE the
+        # never-had-activity predicate below so an ImportPending raw_state can
+        # never be misread as "never had activity" just because ``progress``/
+        # ``last_activity_unix`` happen to be unset on the snapshot.
+        return None
+    if (
+        status.raw_state not in _DELIBERATELY_IDLE_RAW_STATES
+        and status.last_activity_unix <= 0
+        and status.progress <= 0.0
+    ):
+        return added_at + METADATA_STALL_WINDOW
+    if status.last_activity_unix > 0:
+        # Mirrors the stalled-progress branch of detect_stalls: the heal fires
+        # only once the row is >= window old AND the client's last activity is
+        # > window stale, so the binding constraint — the honest deadline — is
+        # whichever anchor is later. A resurrected row (added_at re-stamped
+        # NEWER than the torrent's old last_activity) is correctly anchored on
+        # added_at by the max().
+        last_activity = datetime.fromtimestamp(status.last_activity_unix, tz=UTC)
+        return max(added_at, last_activity) + STALLED_PROGRESS_WINDOW
+    return added_at + STALLED_PROGRESS_WINDOW

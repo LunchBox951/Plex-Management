@@ -39,6 +39,7 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
     SeasonRequest,
+    User,
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
 from plex_manager.ports.library import WatchState
@@ -49,6 +50,7 @@ from plex_manager.ports.media_probe import (
 )
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
     eviction_service,
     import_service,
@@ -3131,12 +3133,14 @@ async def _seed_movie_request(
     status: RequestStatus = RequestStatus.completed,
     library_path: str | None = None,
     completed_at: datetime | None = None,
+    user_id: int | None = None,
 ) -> int:
     """Insert a bare movie request row (no download) -- the availability cycle
     reads only ``MediaRequest``, so a batching test needs nothing else.
     ``library_path``/``completed_at`` (issue #158) let a path-confirmation-fallback
     or bounded-Finalizing test control the exact breadcrumb / elapsed-time anchor
-    without needing a full import run."""
+    without needing a full import run. ``user_id`` (request-dedup healing) lets an
+    ownership-guard test control the row's owner."""
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=tmdb_id,
@@ -3146,6 +3150,7 @@ async def _seed_movie_request(
             status=status,
             library_path=library_path,
             completed_at=completed_at,
+            user_id=user_id,
         )
         session.add(request)
         await session.commit()
@@ -4093,3 +4098,751 @@ async def test_begin_placement_refuses_while_a_purge_holds_the_path(
         )
     assert purge_service.begin_placement(str(season_dir)) is True
     purge_service.end_placement(str(season_dir))
+
+
+# --- Change 2: self-heal false 'available' movie claims -----------------------
+# (request-dedup healing, spec-request-dedup-healing.md)
+
+
+async def test_heal_collapses_null_path_available_onto_real_path_sibling(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Mario repro: row A is 'available' with library_path=None (the false
+    short-circuit claim); row B, same tmdb + same owner (both ownerless here), is
+    'available' with a REAL library_path. The heal collapses row A onto row B."""
+    tmdb_id = 1226863
+    row_a = await _seed_movie_request(
+        sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+    )
+    row_b = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/mario",
+    )
+    library = FakeLibrary()
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+        b = await session.get(MediaRequest, row_b)
+    assert a is None  # collapsed (deleted)
+    assert (
+        b is not None and b.status == RequestStatus.available and b.library_path == "/movies/mario"
+    )
+    assert any(
+        "healed duplicate false-available movie row" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_sibling_collapse_cas_skips_when_ownership_changed_since_read(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``delete_false_available_sibling_collapse`` must not delete a row whose
+    ownership no longer matches the caller's snapshot -- the CAS guarding
+    the exact race a concurrent user create's adoption
+    (``request_service._claim_dedup_winner_if_unowned``) can win in the
+    multi-second window between the heal pass's top-of-cycle candidate read
+    and this delete: an ownerless false-available row is claimed by user X's
+    concurrent create (``find_in_library`` ranks it above a foreign-owned
+    real-path sibling) before the heal ever reaches its delete call. A plain
+    unconditional delete would silently vanish X's just-succeeded request."""
+    tmdb_id = 9001
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+    )
+    async with sessionmaker_() as session:
+        owner_x = User(username="owner-x", permissions=0)
+        session.add(owner_x)
+        await session.commit()
+        owner_x_id = owner_x.id
+        # Simulate a concurrent create claiming the ownerless candidate in the
+        # window between the heal pass's candidate read and its delete.
+        row = await session.get(MediaRequest, row_id)
+        assert row is not None
+        row.user_id = owner_x_id
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        repo = SqlRequestRepository(session)
+        deleted = await repo.delete_false_available_sibling_collapse(row_id, expected_user_id=None)
+        await session.commit()
+    assert deleted is False  # ownership moved off the read snapshot -- CAS refuses
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None  # NOT deleted -- X's now-claimed row survives
+    assert row.user_id == owner_x_id
+    assert row.status == RequestStatus.available
+
+
+async def test_heal_restamps_when_genuinely_present(sessionmaker_: SessionMaker) -> None:
+    """No sibling, but a live GUID check confirms Plex genuinely has it after all
+    -- re-stamp ``library_verified_at``, leave the row 'available'/NULL-path, and
+    CONVERGE (P1 regression): a second reconcile tick must not re-probe Plex for
+    this row at all -- it has permanently exited the heal scan population."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=777, status=RequestStatus.available, library_path=None
+    )
+    async with sessionmaker_() as session:
+        before = await session.get(MediaRequest, row_id)
+        assert before is not None
+        assert before.library_verified_at is None
+
+    library = FakeLibrary(available={777})
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        after = await session.get(MediaRequest, row_id)
+    assert after is not None
+    assert after.status == RequestStatus.available
+    assert after.library_path is None
+    assert after.library_verified_at is not None  # re-stamped
+    assert after.available_heal_verified_at is not None  # converged: exits future scans
+    assert library.present_ids_calls == 1
+
+    # Second tick: nothing else pending/completed/false-available exists, so a
+    # genuinely-converged row must not trigger ANY further Plex call -- the old
+    # per-row ``is_available(use_cache=False)`` would have paged the whole movie
+    # library again here, every 15s, forever.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        after_second_tick = await session.get(MediaRequest, row_id)
+    assert after_second_tick is not None
+    assert after_second_tick.status == RequestStatus.available
+    assert after_second_tick.library_path is None
+    assert library.present_ids_calls == 1  # unchanged: the row was never re-probed
+    assert library.is_available_calls == 0
+
+
+async def test_heal_rearms_to_pending_when_absent_and_no_sibling(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No sibling and Plex genuinely does not have it -- re-arm to 'pending' for a
+    fresh, honest search rather than leaving a false claim standing."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=778, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(available=set())
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.pending
+    assert row.library_verified_at is None
+    assert row.completed_at is None
+    assert row.library_path is None
+    assert any("re-armed to pending" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_ignores_available_rows_with_a_library_path(sessionmaker_: SessionMaker) -> None:
+    """A normally-imported 'available' row (a real library_path) is never a false
+    claim -- the heal must never touch it (no-false-positive)."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=779, status=RequestStatus.available, library_path="/movies/x"
+    )
+    library = FakeLibrary()  # would answer False for is_available -- must never be asked
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.available
+    assert row.library_path == "/movies/x"
+    assert library.is_available_calls == 0
+
+
+async def test_heal_leaves_tv_available_parent_untouched(sessionmaker_: SessionMaker) -> None:
+    """A TV parent MediaRequest 'available' with library_path=None is the NORMAL,
+    legitimate rollup shape (the breadcrumb lives per-season) -- the heal is
+    movie-only and must never select or mutate it."""
+    show_id = await _seed_show_request(sessionmaker_, tmdb_id=1001, status=RequestStatus.available)
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+    assert show is not None
+    assert show.status == RequestStatus.available
+    assert show.library_path is None
+    assert library.is_available_calls == 0
+
+
+async def test_heal_differing_owner_sibling_guid_hit_rearms_not_stamps(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A real-path sibling owned by a DIFFERENT user must NOT collapse the
+    NULL-path row (issue #58: a background heal has no user context and must
+    never strand one owner's per-user list view). Finding 4 (GUID-batch-hit
+    shape): even though the GUID batch reports the tmdb present -- because the
+    cross-owner sibling's copy IS in Plex -- the candidate's OWN owner still
+    never had their own copy, so it must RE-ARM (not one-way-converge/stamp on
+    another owner's file, which would strand it permanently 'available' with no
+    re-heal path if that sibling is later evicted)."""
+    tmdb_id = 780
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a", permissions=0)
+        owner_b = User(username="owner-b", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/other-owner",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available={tmdb_id})  # GUID present -> but only a cross-owner copy
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None  # NOT deleted
+    assert a.status == RequestStatus.pending  # re-armed, NOT stamped/converged
+    assert a.library_path is None
+    assert a.available_heal_verified_at is None  # never one-way-stamped on another owner's file
+    # The GUID hit was conclusive on its own -- no per-row path check was needed.
+    assert library.confirm_paths_calls == []
+    assert any("only under a DIFFERENT owner's copy" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_cross_owner_sibling_corroborated_by_path_still_rearms(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cross-owner sibling's ``library_path`` is left uncollapsed by the
+    ownership guard (issue #58) AND the GUID batch misses this row -- the path
+    fallback (issue #158) corroborates the sibling's directory is genuinely
+    indexed in Plex, but that is a DIFFERENT owner's copy, not this row's own.
+    The row must still re-arm to pending (never a one-way convergence stamp
+    keyed on another owner's file, which would strand it permanently
+    'available' with no re-heal path if that sibling is later evicted)."""
+    tmdb_id = 782
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a2", permissions=0)
+        owner_b = User(username="owner-b2", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/cross-owner",
+        user_id=owner_b_id,
+    )
+    # GUID misses this tmdb id entirely (available=set()), but the sibling's
+    # directory IS indexed under Plex's known movie file paths.
+    library = FakeLibrary(available=set(), movie_file_paths=["/movies/cross-owner/movie.mkv"])
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None  # NOT deleted
+    assert a.status == RequestStatus.pending  # re-armed, not converged
+    assert a.library_path is None
+    assert a.available_heal_verified_at is None  # never one-way-stamped on another owner's file
+    assert library.confirm_paths_calls == [("movie", frozenset({"/movies/cross-owner"}))]
+    assert any(
+        "cross-owner sibling's library_path corroborated" in r.getMessage() for r in caplog.records
+    )
+    assert any("re-armed to pending" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_cross_owner_sibling_unconfirmed_by_path_still_rearms(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The cross-owner sibling's path fallback is consulted but does NOT
+    corroborate (Plex genuinely has neither the GUID nor that directory) --
+    the row still honestly re-arms rather than being stuck 'available'."""
+    tmdb_id = 783
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a3", permissions=0)
+        owner_b = User(username="owner-b3", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/nonexistent",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available=set())  # no movie_file_paths -> confirm_paths finds nothing
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None
+    assert a.status == RequestStatus.pending
+    assert library.confirm_paths_calls == [("movie", frozenset({"/movies/nonexistent"}))]
+
+
+async def test_heal_cross_owner_sibling_path_check_error_leaves_row_untouched(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The batched ``confirm_paths`` corroboration call itself fails (Plex
+    unreachable) -- honesty over silence: the row is left completely
+    unchanged rather than misread as 'absent' and wrongly re-armed."""
+    tmdb_id = 784
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-a4", permissions=0)
+        owner_b = User(username="owner-b4", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    row_a = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=tmdb_id,
+        status=RequestStatus.available,
+        library_path="/movies/unreachable",
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available=set(), confirm_paths_raises=PlexLibraryError("unreachable"))
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        a = await session.get(MediaRequest, row_a)
+    assert a is not None
+    assert a.status == RequestStatus.available
+    assert a.library_path is None
+    assert a.available_heal_verified_at is None
+    assert any(
+        "cross-owner sibling path corroboration failed" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_collapses_false_row_onto_active_resubmit(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 1: a false-'available' row coexisting with an active (``pending``)
+    re-request for the SAME media must NOT re-arm -- re-arming to 'pending' would
+    violate ``uq_media_requests_active`` (whose predicate already includes
+    'pending') and the uncaught ``IntegrityError`` would abort the whole
+    availability cycle and repeat forever. Instead the false row COLLAPSES onto
+    the active re-request (which already carries the user's intent), and the
+    cycle continues to heal the next candidate."""
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-active", permissions=0)
+        session.add(owner_a)
+        await session.commit()
+        owner_a_id = owner_a.id
+    # The false claim + the active re-request that already owns the dedup slot.
+    false_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=785,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    active_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=785,
+        status=RequestStatus.pending,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    # A SECOND, independent false claim (different media) that must STILL heal
+    # after the first -- proving the cycle did not abort on the collision case.
+    other_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=786,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    library = FakeLibrary(available=set())  # neither media present in Plex
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        active_row = await session.get(MediaRequest, active_id)
+        other_row = await session.get(MediaRequest, other_id)
+    assert false_row is None  # collapsed (deleted), never a colliding re-arm
+    assert active_row is not None and active_row.status == RequestStatus.pending  # intent kept
+    assert other_row is not None and other_row.status == RequestStatus.pending  # cycle continued
+    assert any("collapsed onto an active re-request" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_cross_owner_active_resubmit_leaves_row_untouched(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 1, cross-owner sub-case: the active re-request holding the dedup
+    slot belongs to a DIFFERENT user. Re-arming would collide; collapsing would
+    strand this owner's per-user list view -- so the row is left for next cycle
+    with an honest log rather than either unsafe outcome."""
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-xa", permissions=0)
+        owner_b = User(username="owner-xb", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    false_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=787,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    active_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=787,
+        status=RequestStatus.downloading,
+        library_path=None,
+        user_id=owner_b_id,
+    )
+    library = FakeLibrary(available=set())
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        active_row = await session.get(MediaRequest, active_id)
+    assert false_row is not None  # NOT deleted (would strand owner A)
+    assert false_row.status == RequestStatus.available and false_row.library_path is None
+    assert active_row is not None and active_row.status == RequestStatus.downloading
+    assert any(
+        "active re-request owned by a DIFFERENT user" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_rearm_collision_degrades_to_logged_skip_not_aborted_cycle(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1, belt-and-suspenders: an active re-request appearing in the
+    check->re-arm gap (here the ``find_active`` guard is forced to miss it) makes
+    the re-arm's CAS UPDATE collide on ``uq_media_requests_active`` at the DB
+    level. The resulting ``IntegrityError`` must be caught and degrade to a rolled-
+    back, logged skip -- never propagate and abort the whole availability cycle.
+    A second, independent false claim must still heal afterward."""
+
+    async def blind_find_active(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        return None  # simulate the guard missing a concurrent active re-request
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", blind_find_active)
+
+    false_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=791, status=RequestStatus.available, library_path=None
+    )
+    # A REAL active row owns the uq_media_requests_active slot for tmdb 791, so the
+    # re-arm-to-pending below genuinely collides at the DB even though the guard missed it.
+    active_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=791, status=RequestStatus.pending, library_path=None
+    )
+    other_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=792, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(available=set())  # both absent -> both would re-arm
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            # Must NOT raise IntegrityError -- the cycle completes.
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        active_row = await session.get(MediaRequest, active_id)
+        other_row = await session.get(MediaRequest, other_id)
+    assert false_row is not None  # left untouched: the colliding re-arm was rolled back
+    assert false_row.status == RequestStatus.available and false_row.library_path is None
+    assert active_row is not None and active_row.status == RequestStatus.pending
+    assert other_row is not None and other_row.status == RequestStatus.pending  # cycle continued
+    assert any(
+        "collided with a concurrent active re-request" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_heal_active_sibling_takes_precedence_over_cross_owner_realpath(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Self-review (a): a candidate with BOTH an active same-owner re-request AND
+    a cross-owner real-path sibling must collapse onto the ACTIVE re-request (the
+    row that holds the dedup slot), never re-arm -- re-arming would collide with
+    that active row, and stamping/converging on the cross-owner file is wrong.
+    The active-slot guard runs before the cross-owner re-arm branch."""
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-both-a", permissions=0)
+        owner_b = User(username="owner-both-b", permissions=0)
+        session.add_all([owner_a, owner_b])
+        await session.commit()
+        owner_a_id, owner_b_id = owner_a.id, owner_b.id
+    false_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=790,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=790,
+        status=RequestStatus.available,
+        library_path="/movies/cross",  # cross-owner real-path sibling
+        user_id=owner_b_id,
+    )
+    active_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=790,
+        status=RequestStatus.pending,  # same-owner active re-request holding the slot
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    library = FakeLibrary(available=set(), movie_file_paths=["/movies/cross/movie.mkv"])
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        active_row = await session.get(MediaRequest, active_id)
+    assert false_row is None  # collapsed onto the active re-request, never re-armed
+    assert active_row is not None and active_row.status == RequestStatus.pending
+    assert any("collapsed onto an active re-request" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_owned_candidate_adopts_ownerless_sibling_then_collapses(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 2: an OWNED candidate whose only real-path sibling is OWNERLESS
+    must not be plain-collapsed (deleting the owned row drops it from that user's
+    per-user list, and the ownerless sibling carries no owner to inherit the
+    visibility). The heal ADOPTS the ownerless sibling for the candidate's owner
+    FIRST, then collapses onto it -- so the owner keeps the (now real-path) row."""
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-adopt", permissions=0)
+        session.add(owner_a)
+        await session.commit()
+        owner_a_id = owner_a.id
+    false_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=788,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    sibling_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=788,
+        status=RequestStatus.available,
+        library_path="/movies/ownerless",
+        user_id=None,  # ownerless real-path sibling
+    )
+    library = FakeLibrary()  # collapse needs no Plex answer
+
+    with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        sibling_row = await session.get(MediaRequest, sibling_id)
+    assert false_row is None  # collapsed
+    assert sibling_row is not None
+    assert sibling_row.user_id == owner_a_id  # adopted FIRST so the owner keeps visibility
+    assert sibling_row.library_path == "/movies/ownerless"
+    assert any("adopted an ownerless sibling" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_owned_candidate_ownerless_sibling_lost_adoption_race_skips(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2, adoption-race sub-case: another user claims the ownerless
+    sibling in the window before the heal's own ``claim_if_unowned`` fires (here
+    forced to return ``False``). The heal must NOT then collapse the owned
+    candidate onto a sibling it no longer safely owns -- it rolls back and logs a
+    skip, leaving the candidate for next cycle rather than stranding the owner."""
+    async with sessionmaker_() as session:
+        owner_a = User(username="owner-race", permissions=0)
+        session.add(owner_a)
+        await session.commit()
+        owner_a_id = owner_a.id
+    false_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=789,
+        status=RequestStatus.available,
+        library_path=None,
+        user_id=owner_a_id,
+    )
+    sibling_id = await _seed_movie_request(
+        sessionmaker_,
+        tmdb_id=789,
+        status=RequestStatus.available,
+        library_path="/movies/raced",
+        user_id=None,
+    )
+
+    async def losing_claim(self: SqlRequestRepository, request_id: int, user_id: int) -> bool:
+        return False  # simulate the sibling being claimed by another user first
+
+    monkeypatch.setattr(SqlRequestRepository, "claim_if_unowned", losing_claim)
+    library = FakeLibrary()
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        false_row = await session.get(MediaRequest, false_id)
+        sibling_row = await session.get(MediaRequest, sibling_id)
+    assert false_row is not None  # NOT deleted -- adoption failed, so no collapse
+    assert false_row.status == RequestStatus.available and false_row.library_path is None
+    assert sibling_row is not None  # untouched
+    assert any("could not adopt the ownerless sibling" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_leaves_row_when_live_check_errors(
+    sessionmaker_: SessionMaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The shared batched Plex check itself fails (Plex unreachable) -- honesty
+    over silence: the row is left completely unchanged (unknown != absent), and
+    a warning is logged rather than the row being wrongly re-armed."""
+    row_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=781, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(raises=PlexLibraryError("plex unreachable"))
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, row_id)
+    assert row is not None
+    assert row.status == RequestStatus.available
+    assert row.library_path is None
+    assert row.available_heal_verified_at is None
+    assert any("batch availability check failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_heal_convergence_frees_budget_for_higher_id_false_claim(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 regression: enough already-genuinely-present low-id rows to fill the
+    whole per-tick heal budget must not permanently starve a later, higher-id
+    GENUINE false claim out of ever being scanned. Each genuinely-present row
+    converges (stamps ``available_heal_verified_at`` and exits the scan
+    population) after being checked once, so the SECOND tick's budget is freed
+    up to finally reach the false claim."""
+    limit = import_service._HEAL_FALSE_AVAILABLE_LIMIT  # pyright: ignore[reportPrivateUsage]
+    genuine_tmdb_ids = list(range(3000, 3000 + limit + 2))
+    for tmdb_id in genuine_tmdb_ids:
+        await _seed_movie_request(
+            sessionmaker_, tmdb_id=tmdb_id, status=RequestStatus.available, library_path=None
+        )
+    # Created LAST, so its row id is the highest -- id-ascending + the bounded
+    # limit is exactly what starved it before this fix.
+    false_claim_id = await _seed_movie_request(
+        sessionmaker_, tmdb_id=3999, status=RequestStatus.available, library_path=None
+    )
+    library = FakeLibrary(available=set(genuine_tmdb_ids))  # false claim absent, no sibling
+
+    # Tick 1: the low-id genuine rows fill the whole budget; the false claim
+    # (highest id) is outside this tick's window and stays untouched.
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+    async with sessionmaker_() as session:
+        after_tick_1 = await session.get(MediaRequest, false_claim_id)
+    assert after_tick_1 is not None
+    assert after_tick_1.status == RequestStatus.available
+
+    # Tick 2: every genuine row converged on tick 1 (stamped, excluded from the
+    # scan query), freeing the budget -- the false claim is now reachable and
+    # heals (re-armed to 'pending' for a fresh, honest search).
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+    async with sessionmaker_() as session:
+        after_tick_2 = await session.get(MediaRequest, false_claim_id)
+    assert after_tick_2 is not None
+    assert after_tick_2.status == RequestStatus.pending
+
+
+async def test_heal_is_bounded_per_cycle(sessionmaker_: SessionMaker) -> None:
+    """More false-available rows exist than the per-cycle cap -- at most the cap
+    is processed in one tick, keeping the reconcile pass cheap."""
+    limit = import_service._HEAL_FALSE_AVAILABLE_LIMIT  # pyright: ignore[reportPrivateUsage]
+    extra = 5
+    ids = [
+        await _seed_movie_request(
+            sessionmaker_,
+            tmdb_id=2000 + i,
+            status=RequestStatus.available,
+            library_path=None,
+        )
+        for i in range(limit + extra)
+    ]
+    library = FakeLibrary(available=set())  # every row would re-arm to pending if processed
+
+    async with sessionmaker_() as session:
+        await run_availability_cycle(library=library, session=session)
+
+    async with sessionmaker_() as session:
+        statuses = []
+        for row_id in ids:
+            row = await session.get(MediaRequest, row_id)
+            assert row is not None
+            statuses.append(row.status)
+    processed = sum(1 for s in statuses if s == RequestStatus.pending)
+    assert processed == limit
+    assert statuses.count(RequestStatus.available) == extra

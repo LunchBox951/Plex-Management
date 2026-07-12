@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
+from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
 from plex_manager.models import (
     Blocklist,
@@ -2306,3 +2307,42 @@ async def test_reuse_same_hash_active_episodes_empty_both_sides_non_conflicting(
             episodes=[],
         )
     assert again.id == first.id
+
+
+async def test_grab_stamps_metadata_timeout(sessionmaker_: SessionMaker) -> None:
+    """A fresh grab stamps ``timeout_at`` = ``added_at`` + the metadata-fetch
+    window (observability only -- detect_stalls stays anchored on added_at)."""
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        await session.commit()
+
+    h = "c" * 40
+    before = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(h),
+            request_id=request_id,
+            tmdb_id=300,
+        )
+    after = datetime.now(UTC)
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, record.id)
+        assert row is not None
+        assert row.added_at is not None
+        assert row.timeout_at is not None
+        # SQLite round-trips a ``DateTime(timezone=True)`` value as naive (UTC
+        # wall-clock, tzinfo dropped) -- reattach UTC before comparing against
+        # the tz-aware wall-clock window captured around the call. ``added_at``
+        # is a DB server default (second resolution) while ``timeout_at`` is
+        # stamped in Python (microsecond) -- the tiny clock skew between the two
+        # is irrelevant for an observability column (blueprint note).
+        timeout_at = row.timeout_at.replace(tzinfo=UTC)
+        assert before + METADATA_STALL_WINDOW <= timeout_at <= after + METADATA_STALL_WINDOW
