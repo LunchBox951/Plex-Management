@@ -18,6 +18,11 @@ Ship Plex Manager as a **Docker image published to the GitHub Container Registry
 (GHCR)**. Install with `docker compose up -d`. Configuration and the database
 live in a **mounted volume** so updates and rollbacks never touch user data.
 
+> **Qualified by [ADR-0021](0021-database-rollback-and-pre-migration-backup.md):**
+> "rollback = re-point a tag" holds only for a same-schema rollback (no
+> migration ran between the two versions). Cross-migration recovery requires
+> restoring the pre-migration database + encryption-key backup unit first.
+
 This makes the runtime language a free choice (the image bundles the interpreter
 and all dependencies), which is what lets [ADR-0002](0002-python-typed-stack.md)
 keep Python without paying Python's packaging tax. It also mirrors how the *arr

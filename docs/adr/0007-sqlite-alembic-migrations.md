@@ -27,6 +27,11 @@ before it can reach a stable host.
 
 **Positive**
 - Safe, reviewable, reversible schema evolution across releases.
+  > **Qualified by [ADR-0021](0021-database-rollback-and-pre-migration-backup.md):**
+  > "reversible" describes the forward migration chain being reviewable and
+  > incremental, not that Alembic's `downgrade` scripts are a general,
+  > non-destructive path back on **production data** — several refuse or
+  > coerce persisted rows. Tag-based rollback never invokes `downgrade` at all.
 - The promotion gate guarantees migrations are exercised on the canary first.
 - Postgres is available later without a data-layer rewrite.
 
