@@ -228,6 +228,8 @@ async def _reuse_terminal_row(
     episodes: list[int] | None,
     media_type: str | None,
     release_title: str | None,
+    qbt: DownloadClientPort,
+    actually_added: bool,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -281,12 +283,25 @@ async def _reuse_terminal_row(
     reset stall-detection anchor (observability only — never read for control).
     """
     # #206: refuse to resurrect a terminal row whose torrent is being removed right
-    # now (a concurrent cancel's post-commit delete, or a reconcile-driven removal).
-    # Re-owning it would hand this request a torrent whose data is mid-deletion.
-    # Checked here so BOTH reuse call sites (the get_by_hash precheck branch and the
-    # post-add UNIQUE-conflict branch) are covered in one place; a synchronous read of
-    # the in-process registry, no await between it and the CAS below.
+    # now (a concurrent cancel's post-commit delete, a reconcile-driven removal, or an
+    # operator mark-failed's in-flight delete). Re-owning it would hand this request a
+    # torrent whose data is mid-deletion. Checked here so BOTH reuse call sites (the
+    # post-add ``existing`` branch and the post-add UNIQUE-conflict branch) are covered
+    # in one place; a synchronous read of the in-process registry, no await between it
+    # and the CAS below. Both call sites reach here AFTER ``qbt.add`` (the known-hash
+    # precheck refuses before adding), so a torrent THIS grab genuinely created for a
+    # hash qBittorrent had dropped mid-removal (``actually_added``) would be left
+    # seeding untracked once we refuse — remove it (WITH data, since it is ours and
+    # orphaned) before raising. A pre-existing torrent (``actually_added=False``) is
+    # left in place by ``_remove_torrent_if_added``: it predates this grab.
     if queue_service.removal_in_flight(download_id):
+        await _remove_torrent_if_added(
+            qbt,
+            torrent_hash,
+            actually_added=actually_added,
+            request_id=request_id,
+            reason="the terminal row's torrent is being removed",
+        )
         raise TorrentRemovalInFlightError(torrent_hash, download_id)
     now = datetime.now(UTC)
     claimed = await download_repo.update_status_if_in(
@@ -642,6 +657,19 @@ async def grab(
     known_hash = candidate.info_hash.lower() if candidate.info_hash else None
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
+        # #206 (pre-add): the indexer gave us the hash up front, so if it maps to a
+        # TERMINAL row whose torrent is being removed right now (a racing cancel /
+        # reconcile / operator delete), refuse BEFORE ``qbt.add`` ever runs. Deferring
+        # to the post-add reuse guard would first re-create a fresh torrent for a hash
+        # qBittorrent has already dropped (``add_result.created=True``) and then refuse
+        # it, orphaning that torrent to seed untracked while the old data finishes
+        # deleting. Caught here, nothing is added; by retry the removal has settled.
+        if (
+            pre is not None
+            and pre.status in _TERMINAL_STATUS_VALUES
+            and queue_service.removal_in_flight(pre.id)
+        ):
+            raise TorrentRemovalInFlightError(known_hash, pre.id)
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
             if request_id is not None and pre.media_request_id != request_id:
                 raise TorrentAlreadyTrackedError(known_hash, pre.media_request_id)
@@ -763,6 +791,8 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
                 release_title=candidate.title,
+                qbt=qbt,
+                actually_added=actually_added,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:
@@ -895,6 +925,8 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
                 release_title=candidate.title,
+                qbt=qbt,
+                actually_added=actually_added,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:

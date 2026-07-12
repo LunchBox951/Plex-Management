@@ -531,8 +531,25 @@ def release_removal_in_flight(download_id: int) -> None:
 
 
 def removal_in_flight(download_id: int) -> bool:
-    """Whether a torrent removal is physically in flight for ``download_id``."""
-    return download_id in _removals_in_flight
+    """Whether a torrent removal is physically in flight for ``download_id``.
+
+    The SINGLE source of truth ``grab_service``'s terminal-row reuse consults, and
+    it must see EVERY actor that physically removes a torrent — not just the shared
+    ``_removals_in_flight`` registry (reconcile's Phase-B, cancel), but also an
+    OPERATOR :func:`mark_failed` whose own delete is in flight. An operator
+    ``mark_failed(remove_torrent=True)`` never publishes to ``_removals_in_flight``;
+    it records its irreversible delete solely on its ``_OperatorClaim`` (the
+    ``removal_in_flight`` flag, set by :func:`_mark_removal_in_flight` immediately
+    before the delete await and held until the claim releases). Without consulting
+    that flag here, a cancel racing an operator's Phase-B delete could commit the row
+    terminal and release ITS shared guard while the operator's delete is still
+    awaiting, letting a same-hash grab reuse a row whose data the operator is mid-
+    deletion. Reading BOTH keeps one query as the source of truth while each registry
+    stays the sole owner of its actors' state (no duplicated bookkeeping)."""
+    if download_id in _removals_in_flight:
+        return True
+    claim = _operator_fail_claims.get(download_id)
+    return claim is not None and claim.removal_in_flight
 
 
 # The persisted provenance-AND-ownership marker (module docstring): the EXACT

@@ -214,7 +214,12 @@ _GRAB_OPERATIONAL_ERRORS: Final = (grab_service.GrabError,)
 # ``grab_service``). Unlike the per-release failures, these apply to the whole SCOPE,
 # not this one release, so trying a lower-ranked candidate cannot help: the scope now
 # has an active download (``AlreadyDownloadingError``), or is terminal / mis-shaped
-# (``RequestNotActiveError`` / ``SeasonRequiredError``). Mirrors auto-grab's
+# (``RequestNotActiveError`` / ``SeasonRequiredError``), or the replacement resolved
+# to a hash whose terminal row is being removed RIGHT NOW by a racing cancel /
+# reconcile / operator delete (``TorrentRemovalInFlightError``, #206). The last is
+# transient -- by the auto-grab worker's next tick the removal has settled -- so like
+# the others it must LEAVE the scope at the ``searching`` committed at (b) for retry,
+# not surface an unhandled 500 out of the requests router. Mirrors auto-grab's
 # settle-and-leave: discard the partial write and LEAVE the scope's committed
 # ``searching`` as-is -- never a ``no_acceptable_release`` park (that would LIE:
 # releases exist; the grab was refused for a scope reason, not exhaustion).
@@ -222,6 +227,7 @@ _GRAB_SCOPE_REFUSALS: Final = (
     grab_service.AlreadyDownloadingError,
     grab_service.RequestNotActiveError,
     grab_service.SeasonRequiredError,
+    grab_service.TorrentRemovalInFlightError,
 )
 
 # The indexer failures the inline RE-SEARCH (``decision_service.preview`` ->

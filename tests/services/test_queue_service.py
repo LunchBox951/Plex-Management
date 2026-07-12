@@ -3320,6 +3320,32 @@ def test_removal_in_flight_register_release_roundtrip() -> None:
     assert not queue_service.removal_in_flight(download_id)
 
 
+def test_removal_in_flight_consults_operator_claim_flag() -> None:
+    """Finding 3 (#206): ``removal_in_flight`` -- the SINGLE source of truth the
+    grab-reuse guard consults -- must see an operator ``mark_failed`` whose delete
+    is in flight, even though that delete is recorded ONLY on the ``_OperatorClaim``
+    (via ``_mark_removal_in_flight``) and is NEVER published to the shared
+    ``_removals_in_flight`` registry. Without this, a cancel racing the operator's
+    Phase-B delete could commit the row terminal + release its OWN shared guard while
+    the operator delete is still awaiting, and a same-hash grab would reuse a row
+    whose data the operator is mid-deletion."""
+    download_id = 999_004
+    flags = _OperatorFailFlags(blocklist=True, remove_torrent=True)
+    token = _register_operator_claim(download_id, flags)
+    # A live claim NOT yet removal-in-flight does not report in-flight: the delete
+    # hasn't started, the row is still failed_pending (un-reusable) anyway.
+    assert not queue_service.removal_in_flight(download_id)
+
+    _mark_removal_in_flight(download_id, token)
+    # The operator's delete is now physically in flight. The shared registry is
+    # still empty, yet the guard reports in-flight via the operator claim flag.
+    assert download_id not in queue_service._removals_in_flight  # pyright: ignore[reportPrivateUsage]
+    assert queue_service.removal_in_flight(download_id)
+
+    _release_operator_claim(download_id, token)
+    assert not queue_service.removal_in_flight(download_id)
+
+
 def test_register_operator_claim_refused_while_removal_in_flight() -> None:
     """#206: registering a removal-in-flight claim through the PUBLIC helper (the
     same one ``cancel_request`` now calls) bars a racing operator mark_failed via

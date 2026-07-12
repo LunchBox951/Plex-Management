@@ -340,6 +340,86 @@ async def test_report_issue_source_error_exhaustion_parks_honestly(
     assert {d.torrent_hash for d in downloads if d.status != "imported"} == set()
 
 
+async def test_report_issue_regrab_removal_in_flight_leaves_scope_at_searching(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Finding 2 (#206): the inline report-issue re-grab's replacement resolves to a
+    hash whose terminal row is being removed RIGHT NOW by a racing cancel/reconcile/
+    operator delete, so ``grab`` raises ``TorrentRemovalInFlightError``. That outcome
+    must be treated like the other transient scope refusals -- the already-committed
+    report flow LEAVES the scope at ``searching`` for the auto-grab worker to retry --
+    NOT bubble an unhandled 500 out of the requests router. Pre-fix the exception was
+    in none of the caught families and escaped."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 4096)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    # An UNRELATED terminal (failed) download already owns the replacement's hash and
+    # is mid-removal (a cancel that committed terminal + registered its guard). The
+    # re-grab's only accepted replacement resolves to exactly that hash.
+    async with sessionmaker_() as session:
+        other = MediaRequest(
+            tmdb_id=700, media_type=MediaType.movie, title="Other", status=RequestStatus.cancelled
+        )
+        session.add(other)
+        await session.flush()
+        alt_download = Download(
+            torrent_hash=_ALT,
+            status="failed",
+            media_request_id=other.id,
+            tmdb_id=700,
+            failed_reason="cancelled by operator",
+        )
+        session.add(alt_download)
+        await session.commit()
+        alt_download_id = alt_download.id
+        other_id = other.id
+
+    qbt = FakeQbittorrent()
+    prowlarr = FakeProwlarr(
+        [
+            candidate("Some.Movie.2020.1080p.BluRay.x264-GROUP", info_hash=_CULPRIT),
+            candidate("Some.Movie.2020.1080p.WEB-DL.x264-OTHER", info_hash=_ALT),
+        ]
+    )
+
+    queue_service.register_removal_in_flight(alt_download_id)
+    try:
+        async with sessionmaker_() as session:
+            updated = await correction_service.report_issue(
+                session,
+                qbt,
+                LocalFileSystem(library_roots=[str(root)]),
+                FakeLibrary(),
+                prowlarr,
+                GuessitParser(),
+                default_profile(),
+                request_id=request_id,
+                reason="bad_quality",
+                season=None,
+                roots=LibraryRoots(movies=str(root)),
+            )
+    finally:
+        queue_service.release_removal_in_flight(alt_download_id)
+
+    # No 500 escaped: the report committed, and the scope is LEFT at 'searching' for
+    # the auto-grab worker to retry once the removal settles -- never parked
+    # 'no_acceptable_release' (releases exist), never a silent success.
+    assert updated.status == RequestStatus.searching.value
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        alt_row = await session.get(Download, alt_download_id)
+    # The guard fired BEFORE any add: nothing was handed to the client for _ALT, and
+    # the guarded terminal row is untouched (still failed, still owned by the other).
+    assert qbt.added == []
+    assert {d.torrent_hash for d in downloads if d.status != "imported"} == {_ALT}
+    assert alt_row is not None
+    assert alt_row.status == "failed"
+    assert alt_row.media_request_id == other_id
+
+
 async def test_report_issue_movie_reset_clears_library_path(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
@@ -2831,7 +2911,7 @@ class _GrabDuringRemovalQbt(FakeQbittorrent):
         self._sessionmaker = sessionmaker_
         self._torrent_hash = torrent_hash
         self._tmdb_id = tmdb_id
-        self.concurrent_grab_error: BaseException | None = None
+        self.concurrent_grab_error: Exception | None = None
         self.concurrent_grab_ran = False
         self.new_request_id: int | None = None
         self.new_request_had_no_active_download = False
@@ -2856,7 +2936,7 @@ class _GrabDuringRemovalQbt(FakeQbittorrent):
                     request_id=new_request.id,
                     tmdb_id=self._tmdb_id,
                 )
-            except BaseException as exc:  # captured for the test's own assertion, not swallowed
+            except Exception as exc:  # captured for the test's own assertion, not swallowed
                 self.concurrent_grab_error = exc
             active = (
                 (
