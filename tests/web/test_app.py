@@ -137,35 +137,62 @@ class TestSetupReadyUrl:
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url[fragment_index:]
 
     def test_uses_the_published_host_bind_over_the_in_process_listen_address(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Issue #294, finding 4: a Compose install deliberately published
         under a LAN IP must get that IP in the printed link, not an
         unconditional ``localhost`` that never resolves off the container
-        host."""
+        host. ``host_port`` is deliberately distinct from ``port`` here so
+        this only passes via the compose branch honoring both published
+        values -- not by coincidence with the bare-metal fallback (which
+        would print ``port``, not ``host_port``)."""
+        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
         settings = Settings(
             host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
+            host_bind="192.168.1.50",
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://192.168.1.50:9443/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
+
+    def test_substitutes_localhost_when_the_published_host_bind_is_also_undialable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
+            host_bind="0.0.0.0",  # noqa: S104
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:9443/setup")
+
+    def test_falls_back_to_settings_host_when_host_bind_is_unset(self) -> None:
+        settings = Settings(host="127.0.0.1", port=8000, host_port=8000, host_bind=None)
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:8000/setup")
+
+    def test_ignores_a_compose_only_host_bind_default_on_bare_metal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare-metal install that copies ``.env.example`` verbatim inherits
+        its compose-only ``PLEX_MANAGER_HOST_BIND=127.0.0.1`` default -- and an
+        operator who then widens it for what they believe is a Compose LAN
+        publish would otherwise get that value trusted unconditionally even
+        though the bare-metal process actually listens on ``settings.host``.
+        Without the compose-topology gate this prints an undialable link
+        exactly like the ungated ``host_port`` bug finding 3 already closes;
+        with it, ``host_bind`` is ignored and the in-process host is used."""
+        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
+        settings = Settings(
+            host="127.0.0.1",
             port=8000,
             host_port=8000,
             host_bind="192.168.1.50",
         )
-        url = _setup_ready_url(settings)
-        assert url.startswith("http://192.168.1.50:8000/setup")
-
-    def test_substitutes_localhost_when_the_published_host_bind_is_also_undialable(
-        self,
-    ) -> None:
-        settings = Settings(
-            host="0.0.0.0",  # noqa: S104
-            port=8000,
-            host_port=8000,
-            host_bind="0.0.0.0",  # noqa: S104
-        )
-        url = _setup_ready_url(settings)
-        assert url.startswith("http://localhost:8000/setup")
-
-    def test_falls_back_to_settings_host_when_host_bind_is_unset(self) -> None:
-        settings = Settings(host="127.0.0.1", port=8000, host_port=8000, host_bind=None)
         url = _setup_ready_url(settings)
         assert url.startswith("http://127.0.0.1:8000/setup")
 

@@ -1057,7 +1057,17 @@ def _setup_ready_url(settings: Settings) -> str:
     ``0.0.0.0``), substituting ``localhost`` for either when it is itself one
     of :data:`_UNDIALABLE_BIND_HOSTS` (an operator who deliberately widens the
     published bind to a real LAN IP gets a link that actually resolves off the
-    container host, instead of always asserting ``localhost``).
+    container host, instead of always asserting ``localhost``) -- but ONLY
+    when :func:`_running_under_documented_compose` confirms this process is
+    actually running under that compose file, the same gate applied to
+    ``host_port`` below. ``.env.example`` ships ``PLEX_MANAGER_HOST_BIND=
+    127.0.0.1`` UNCOMMENTED (right beside ``PLEX_MANAGER_HOST_PORT``), so a
+    bare-metal install that copies it verbatim and later widens that value to
+    a LAN IP would otherwise get it trusted unconditionally even though the
+    bare-metal process actually listens on ``settings.host`` -- the identical
+    "compose-only .env default leaks onto bare metal" bug finding 3 already
+    closes for the port. Ungated, the loopback default is harmless, but a
+    widened one would silently print an undialable link.
 
     The PORT prefers ``settings.host_port`` (the container's PUBLISHED host
     port, see that field's docstring) over ``settings.port`` (the in-container
@@ -1084,7 +1094,10 @@ def _setup_ready_url(settings: Settings) -> str:
     browser. This is a discoverability aid only (ADR-0005's install-time
     exception).
     """
-    host = settings.host_bind or settings.host
+    if settings.host_bind is not None and _running_under_documented_compose():
+        host = settings.host_bind
+    else:
+        host = settings.host
     if host in _UNDIALABLE_BIND_HOSTS:
         host = "localhost"
     if settings.host_port is not None and _running_under_documented_compose():

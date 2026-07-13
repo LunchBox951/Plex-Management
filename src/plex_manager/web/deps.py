@@ -578,8 +578,10 @@ class SettingsStore:
         a log line -- e.g. echoed back in an error message, or pasted into a
         support request -- would sail past this redaction pass entirely. A
         second query (rather than folding it into the query above) is
-        unavoidable: it is a different table with no ``key`` column to join on,
-        and this is still only two round trips total, not N.
+        unavoidable: it is a different table with no ``key`` column to join on.
+        (Issue #292 items 5-6 below add a THIRD query, over ``User``, for the
+        same reason -- see there; this is now three round trips total, still
+        not one per credential.)
 
         Also folds in (issue #292, items 5-6) two further credential sources
         this method previously missed entirely:
