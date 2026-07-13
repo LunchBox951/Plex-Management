@@ -1179,6 +1179,94 @@ async def test_grab_terminal_request_with_empty_preview_stays_terminal(
     assert request.status.value == "available"
 
 
+async def test_grab_terminal_tv_untracked_season_empty_preview_is_rejected_not_parked(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #287 (second call site): the TV analogue of the movie empty-preview
+    guard, at the ENDPOINT's parking path rather than grab_service's qbt.add gate.
+
+    An old, wholly-terminal TV request (every tracked season ``evicted``, so the
+    parent rollup is ``evicted``) is grabbed for a season that is not yet tracked,
+    and the fresh preview finds nothing acceptable. Before the fix the up-front
+    terminal check was skipped for EVERY tv request, so this reached the
+    empty-preview parking path, where ``mark_no_acceptable_release`` ``ensure``d
+    the untracked season as ``pending`` and recomputed the parent to the
+    non-terminal, dedup-blocking ``no_acceptable_release`` -- resurrecting the
+    finished request as a ghost. The season-scoped TV terminal gate must now
+    reject it up front (409 ``request_not_active``): nothing handed to the client,
+    the untracked season NEVER materialized, and the parent stays terminal."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={901: TvMetadata(tmdb_id=901, title="Old Show", year=2019, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 901, "media_type": "tv", "seasons": [1]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    # Drive the ONLY tracked season (1) terminal, so the parent rollup folds to a
+    # genuinely terminal ``evicted`` -- nothing due anywhere. Season 2 is left
+    # untracked (never requested), the resurrection vector.
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {s.season_number for s in seasons} == {1}  # season 2 is untracked
+        for s in seasons:
+            s.status = RequestStatus.evicted
+        request.status = RequestStatus.evicted
+        await session.commit()
+
+    # Only CAM/TS available -> empty preview: the path that, before the fix,
+    # parked the untracked season and recomputed the parent. (The guard now fires
+    # BEFORE run_preview, so prowlarr is never even consulted.)
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=FakeProwlarr(prerelease_only_candidates()), qbt=qbt)
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = (await session.execute(select(Download))).scalars().all()
+    by_season = {s.season_number: s.status for s in seasons}
+    # The untracked season was never ``ensure``d into existence, so no dead-end
+    # marker could recompute the parent: it stays terminal, not resurrected.
+    assert 2 not in by_season
+    assert by_season[1] is RequestStatus.evicted
+    assert request.status is RequestStatus.evicted
+    assert rows == []
+
+
 async def test_grab_loser_orphaned_torrent_is_removed_from_client(
     app: FastAPI,
     client: httpx.AsyncClient,

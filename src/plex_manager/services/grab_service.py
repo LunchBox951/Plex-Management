@@ -55,6 +55,7 @@ __all__ = [
     "TorrentAlreadyTrackedError",
     "TorrentRemovalInFlightError",
     "grab",
+    "tv_grab_blocked_by_terminal_parent",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -125,6 +126,36 @@ _SETTLED_TV_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.evicted.value,
     }
 )
+
+
+def tv_grab_blocked_by_terminal_parent(*, parent_status: str, observed_season_status: str) -> bool:
+    """Whether a TV grab must be refused up front because the parent is terminal.
+
+    A TV ``MediaRequest.status`` is ``season_rollup``'s COMPUTED fold over every
+    tracked season, not a real state of its own. ``completed`` is structurally the
+    ONLY ``TERMINAL_REQUEST_STATUS_VALUES`` member the fold can ever produce while
+    a genuinely due season is still present behind a finalizing sibling (issue
+    #265 precedence -- every other terminal fold branch is only reached once EVERY
+    tracked season already settled that way; see ``domain/season_rollup.py``). So
+    the carve-out is EXACTLY: a ``completed`` parent whose THIS season is not
+    itself settled (``_SETTLED_TV_SEASON_STATUS_VALUES``) stays grabbable; every
+    other terminal parent value, and a settled season under a ``completed`` parent,
+    is blocked -- restoring the original 409-and-adds-nothing / no-resurrection
+    guarantee for a genuinely settled/terminal TV row.
+
+    Shared by :func:`grab` (its pre-``qbt.add`` gate) and the ``/queue/grab``
+    endpoint's empty-preview parking path (issue #287): both must agree on which
+    terminal TV rows are un-grabbable, so a settled TV season reaches neither the
+    download client nor ``season_request_service.mark_no_acceptable_release``
+    (which would ``ensure`` an untracked season as ``pending`` and recompute the
+    parent rollup to a non-terminal dead-end ghost).
+    """
+    if parent_status not in TERMINAL_REQUEST_STATUS_VALUES:
+        return False
+    return not (
+        parent_status == RequestStatus.completed.value
+        and observed_season_status not in _SETTLED_TV_SEASON_STATUS_VALUES
+    )
 
 
 class NoGrabSourceError(Exception):
@@ -697,9 +728,9 @@ async def grab(
                     # would download a duplicate of on-disk content the caller
                     # never decided to re-fetch.
                     raise RequestNotActiveError(request_id)
-                if request.status in TERMINAL_REQUEST_STATUS_VALUES and not (
-                    request.status == RequestStatus.completed.value
-                    and observed_season_status not in _SETTLED_TV_SEASON_STATUS_VALUES
+                if tv_grab_blocked_by_terminal_parent(
+                    parent_status=request.status,
+                    observed_season_status=observed_season_status,
                 ):
                     # The parent rollup is terminal and this is NOT the one
                     # precedence carve-out (a due sibling hidden behind a
@@ -708,6 +739,8 @@ async def grab(
                     # exact season is itself settled (available/completed/
                     # evicted) even though a sibling is finalizing. Nothing here
                     # is due; refuse up front exactly like the movie gate below.
+                    # The same gate runs in the /queue/grab endpoint's
+                    # empty-preview parking path so both agree (issue #287).
                     raise RequestNotActiveError(request_id)
             else:
                 if request.status in TERMINAL_REQUEST_STATUS_VALUES:
