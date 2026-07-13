@@ -1270,34 +1270,45 @@ async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
     assert calls == 1
 
 
-async def test_safe_fetch_backend_allows_private_answer_for_trusted_host_only(
+async def test_safe_fetch_backend_allows_private_answer_only_when_hop_marked_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The connection-time backend mirrors the per-hop URL allowance: the
-    operator-configured Prowlarr host+port may resolve to a private address
-    (compose alias / LAN name), while the SAME private answer for any other
-    host stays a refused connect."""
+    """``connect_tcp`` only ever sees a bare host+port -- it cannot itself tell
+    a genuinely trusted hop from an off-prefix sibling that happens to share
+    the same host+port (see ``SafeFetchNetworkBackend``'s docstring and issue
+    #38's follow-up: a same-host, off-prefix redirect must NOT inherit the
+    private-address allowance). Trust is instead reported per hop by the
+    caller via ``note_hop_trust`` immediately before the connect it applies
+    to, and is consumed (reset to closed) by that one ``connect_tcp`` call --
+    a private DNS answer connects only for a call explicitly marked trusted;
+    the identical answer for an unmarked call, on the very same host+port,
+    stays a refused connect."""
 
     def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", 9696))]
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
-    trusted = SafeFetchNetworkBackend(_AcceptingBackend(), ("prowlarr.local", 9696))
-    stream = await trusted.connect_tcp("prowlarr.local", 9696)
+    trusted_backend = SafeFetchNetworkBackend(_AcceptingBackend())
+    trusted_backend.note_hop_trust(True)
+    stream = await trusted_backend.connect_tcp("prowlarr.local", 9696)
     assert isinstance(stream, _DummyNetworkStream)
 
-    # Same private DNS answer, untrusted host: refused before any connect.
+    # Same private DNS answer, same host+port, but this connect was never
+    # marked trusted: refused before any delegate connect.
     delegate = _RecordingBackend()
-    untrusted = SafeFetchNetworkBackend(delegate, ("prowlarr.local", 9696))
+    untrusted_backend = SafeFetchNetworkBackend(delegate)
     with pytest.raises(httpcore.ConnectError):
-        await untrusted.connect_tcp("indexer.example", 9696)
+        await untrusted_backend.connect_tcp("prowlarr.local", 9696)
     assert delegate.hosts == []
 
-    # Trusted host on a DIFFERENT port is a different endpoint: refused too.
+    # The trust flag is consumed: a second connect on the SAME backend and
+    # SAME host+port, without a fresh note_hop_trust(True), fails closed too
+    # -- exactly what stops an off-prefix hop from riding a prior hop's trust.
+    trusted_backend.note_hop_trust(True)
+    await trusted_backend.connect_tcp("prowlarr.local", 9696)
     with pytest.raises(httpcore.ConnectError):
-        await untrusted.connect_tcp("prowlarr.local", 9999)
-    assert delegate.hosts == []
+        await trusted_backend.connect_tcp("prowlarr.local", 9696)
 
 
 class _AcceptingBackend(httpcore.AsyncNetworkBackend):
@@ -1578,6 +1589,88 @@ async def test_redirect_hop_single_resolution_still_vetoes_unsafe_answer(
 
     assert calls == 1
     assert backend.hosts == []
+
+
+class _RedirectThenServeBackend(httpcore.AsyncNetworkBackend):
+    """First connect serves a 302 redirect; every connect after that serves a
+    canned response -- lets a test tell whether a SECOND hop's connection was
+    ever actually allowed to happen."""
+
+    def __init__(self, redirect_response: bytes, served_response: bytes) -> None:
+        self.hosts: list[str] = []
+        self._redirect_response = redirect_response
+        self._served_response = served_response
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        response = self._redirect_response if len(self.hosts) == 1 else self._served_response
+        return _ScriptedResponseStream(response)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_redirect_off_prefix_same_host_port_over_real_network_path_is_vetoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for a P1 review finding on PR #303: on the REAL network path,
+    ``SafeFetchNetworkBackend.connect_tcp`` only ever sees a bare host+port. If
+    trust were still keyed off host+port alone (the pre-fix design), a redirect
+    that stays on the trusted Prowlarr host+port but steps OUTSIDE its
+    configured ``/prowlarr`` reverse-proxy prefix would wrongly inherit the
+    private-address allowance meant only for the prefix-bounded endpoint --
+    even though ``_is_trusted_source_url`` (and its ``source_client``-seam
+    mirror, ``test_redirect_off_prefix_same_origin_is_vetoed``) already say
+    that hop is untrusted. The fix threads the per-hop
+    ``_is_trusted_source_url`` decision down to the connect-time backend via
+    ``note_hop_trust`` instead of re-deriving it from host+port, so this
+    same-host, off-prefix hop must still be vetoed before it ever connects."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9696))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    redirect_response = (
+        b"HTTP/1.1 302 Found\r\n"
+        b"Location: http://127.0.0.1:9696/admin/x\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    served_response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nd3:foo3:bar"
+    backend = _RedirectThenServeBackend(redirect_response, served_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin=PROWLARR_PREFIXED_ORIGIN,
+    )
+
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted (in-prefix) hop connected; the off-prefix redirect target --
+    # on the SAME host+port -- must never have been allowed to connect at all.
+    assert backend.hosts == ["127.0.0.1"]
 
 
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:

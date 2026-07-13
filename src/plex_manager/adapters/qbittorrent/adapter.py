@@ -765,26 +765,41 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
     rejects any non-global answer, then asks the real backend to connect to the
     vetted IP while httpcore keeps the original origin for Host and TLS SNI.
 
-    ``trusted_host_port`` is the single OPERATOR-CONFIGURED trusted source
-    endpoint (the Prowlarr host + effective port, derived from the same
-    configured base URL the app already calls for every Prowlarr API request):
-    a connection to exactly that host+port may resolve to a private address
-    (``http://prowlarr:9696`` on a compose network, ``127.0.0.1``, RFC1918 —
-    the normal self-hosted layout). Every other host keeps the full veto, so a
-    redirect OFF the configured endpoint re-enters the normal SSRF guard.
+    ``connect_tcp`` itself only ever sees a bare host+port -- it has no idea
+    which URL, and therefore which PATH, is being fetched. The operator-
+    configured trusted source origin (the Prowlarr host + effective port the
+    app already calls for every API request) may carry a reverse-proxy path
+    PREFIX that is itself a service/credential boundary (ADR-0018): a redirect
+    that stays on that exact host+port but steps outside the trusted prefix
+    must NOT inherit the private-address allowance, even though its connection
+    identity (host+port) is indistinguishable from a genuinely trusted hop.
+    Host+port alone can therefore never be the trust signal here -- the only
+    place with the full URL is the caller
+    (``QbittorrentClient._resolve_http_source_with_client``, via
+    ``_is_trusted_source_url``), which reports its per-hop decision through
+    :meth:`note_hop_trust` immediately before the request that will trigger
+    the connection for that hop. Trust defaults to, and is reset to, CLOSED
+    after every ``connect_tcp`` call, so a hop the caller forgot to mark --
+    or an extra connection this backend didn't anticipate -- fails safe.
     """
 
     def __init__(
         self,
         delegate: httpcore.AsyncNetworkBackend | None = None,
-        trusted_host_port: tuple[str, int] | None = None,
+        trusted: bool = False,
     ) -> None:
         self._delegate: httpcore.AsyncNetworkBackend = (
             delegate
             if delegate is not None
             else cast(httpcore.AsyncNetworkBackend, httpcore.AnyIOBackend())
         )
-        self._trusted_host_port = trusted_host_port
+        self._hop_trusted = trusted
+
+    def note_hop_trust(self, trusted: bool) -> None:
+        """Record whether the request about to trigger the NEXT ``connect_tcp``
+        call is for a hop ``_is_trusted_source_url`` allows. See the class
+        docstring for why host+port can't make this decision on its own."""
+        self._hop_trusted = trusted
 
     async def connect_tcp(
         self,
@@ -794,9 +809,10 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        trusted = self._trusted_host_port is not None and (
-            (host.casefold(), port) == self._trusted_host_port
-        )
+        trusted = self._hop_trusted
+        # Consume the flag: fail closed by default for any call the caller
+        # didn't explicitly mark trusted immediately beforehand.
+        self._hop_trusted = False
         try:
             addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
         except QbittorrentError as exc:
@@ -856,14 +872,21 @@ class _SafeFetchResponseStream(httpx.AsyncByteStream):
 class _SafeFetchTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport for untrusted indexer/Prowlarr torrent URLs."""
 
-    def __init__(self, trusted_host_port: tuple[str, int] | None = None) -> None:
+    def __init__(self) -> None:
+        self._network_backend = SafeFetchNetworkBackend()
         self._pool = httpcore.AsyncConnectionPool(
-            network_backend=SafeFetchNetworkBackend(trusted_host_port=trusted_host_port),
+            network_backend=self._network_backend,
             http1=True,
             http2=False,
             retries=0,
             max_keepalive_connections=0,
         )
+
+    def note_hop_trust(self, trusted: bool) -> None:
+        """Forward the caller's per-hop trust decision to the connect-time
+        backend for the request about to be sent. See
+        :meth:`SafeFetchNetworkBackend.note_hop_trust`."""
+        self._network_backend.note_hop_trust(trusted)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if not isinstance(request.stream, httpx.AsyncByteStream):
@@ -1174,7 +1197,12 @@ class QbittorrentClient:
 
     # ---- add ------------------------------------------------------------ #
     async def _resolve_http_source_with_client(
-        self, client: httpx.AsyncClient, url: str, *, precheck_resolves_dns: bool
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        precheck_resolves_dns: bool,
+        transport: _SafeFetchTransport | None = None,
     ) -> tuple[str | None, bytes | None]:
         """Walk an HTTP(S) source to a magnet URI or ``.torrent`` body.
 
@@ -1190,16 +1218,29 @@ class QbittorrentClient:
         its own) passes ``True`` so this pre-check remains the one place that
         resolves + vets DNS for it. See :func:`_assert_safe_fetch_url_shape` and
         :func:`_assert_safe_fetch_url`.
+
+        ``transport`` is the real network path's ``_SafeFetchTransport`` (``None``
+        for the ``source_client`` seam, which has no connect-time backend of its
+        own). It must be told this hop's trust decision -- via
+        ``_is_trusted_source_url``, the only place with the full URL including
+        its path -- immediately before every request: ``connect_tcp`` only ever
+        sees a bare host+port, so it cannot re-derive whether THIS hop sits
+        beneath the trusted origin's prefix on its own (see
+        :class:`SafeFetchNetworkBackend`).
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
-            # Per-hop trust check, by URL ORIGIN only (never DNS results): a hop on
-            # exactly the operator-configured Prowlarr origin skips the private-
-            # address veto (Prowlarr serves .torrent downloadUrls pointing at itself,
-            # typically a private/compose address); any redirect OFF that origin --
-            # including to another private host -- re-enters the full SSRF veto on
-            # its own next iteration.
-            if not self._is_trusted_source_url(current):
+            # Per-hop trust check, by URL ORIGIN + PATH PREFIX (never DNS
+            # results): a hop beneath the operator-configured Prowlarr origin's
+            # prefix skips the private-address veto (Prowlarr serves .torrent
+            # downloadUrls pointing at itself, typically a private/compose
+            # address); any redirect OFF that origin or prefix -- including to
+            # another private host, or a sibling path on the SAME host+port --
+            # re-enters the full SSRF veto on its own next iteration.
+            is_trusted = self._is_trusted_source_url(current)
+            if transport is not None:
+                transport.note_hop_trust(is_trusted)
+            if not is_trusted:
                 if precheck_resolves_dns:
                     await _assert_safe_fetch_url(current)
                 else:
@@ -1299,17 +1340,16 @@ class QbittorrentClient:
             return await self._resolve_http_source_with_client(
                 self._source_client, url, precheck_resolves_dns=True
             )
-        # The connection-time backend needs the same single allowance the per-hop
-        # URL check grants: the trusted origin's host may legitimately resolve to a
-        # private address. (scheme is enforced at the URL level; host+port is the
-        # connection's identity.)
-        trusted_host_port = (
-            (self._trusted_source_origin[1], self._trusted_source_origin[2])
-            if self._trusted_source_origin is not None
-            else None
-        )
+        # The connection-time backend needs the same per-hop allowance the URL
+        # check grants (the trusted origin's host, beneath its configured
+        # prefix, may legitimately resolve to a private address) -- reported
+        # fresh for every hop via ``note_hop_trust``, never derived from a
+        # host+port comparison at connect time (that can't see the path, so it
+        # can't tell a trusted hop from an off-prefix sibling on the same
+        # host+port; see ``SafeFetchNetworkBackend``).
+        transport = _SafeFetchTransport()
         async with httpx.AsyncClient(
-            transport=_SafeFetchTransport(trusted_host_port=trusted_host_port),
+            transport=transport,
             timeout=30.0,
             trust_env=False,
         ) as client:
@@ -1317,7 +1357,7 @@ class QbittorrentClient:
             # ``SafeFetchNetworkBackend.connect_tcp``, which is also the
             # connection's authority -- the pre-check here is shape-only.
             return await self._resolve_http_source_with_client(
-                client, url, precheck_resolves_dns=False
+                client, url, precheck_resolves_dns=False, transport=transport
             )
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
