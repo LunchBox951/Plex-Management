@@ -2324,6 +2324,84 @@
             ],
             "title": "Auto Grab Enabled"
           },
+          "automatic_update_idle_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Idle Only"
+          },
+          "automatic_update_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Timezone"
+          },
+          "automatic_update_weekdays": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Weekdays"
+          },
+          "automatic_update_window_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Window End"
+          },
+          "automatic_update_window_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Window Start"
+          },
+          "automatic_updates_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Updates Enabled"
+          },
           "disk_pressure_target_percent": {
             "anyOf": [
               {
@@ -2561,6 +2639,85 @@
               }
             ],
             "title": "Auto Grab Enabled"
+          },
+          "automatic_update_idle_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Idle Only"
+          },
+          "automatic_update_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Timezone"
+          },
+          "automatic_update_weekdays": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday"
+                  ],
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Weekdays"
+          },
+          "automatic_update_window_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Window End"
+          },
+          "automatic_update_window_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Update Window Start"
+          },
+          "automatic_updates_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Automatic Updates Enabled"
           },
           "disk_pressure_target_percent": {
             "anyOf": [
@@ -3017,6 +3174,479 @@
         "title": "TmdbValidateRequest",
         "type": "object"
       },
+      "UpdateActionRequest": {
+        "additionalProperties": false,
+        "description": "Bodyless public/internal action guard; arbitrary target fields are forbidden.",
+        "properties": {},
+        "title": "UpdateActionRequest",
+        "type": "object"
+      },
+      "UpdateClaimResponse": {
+        "description": "A newly-created drain claim, or a fail-closed busy response.",
+        "properties": {
+          "blocker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocker"
+          },
+          "lease_seconds": {
+            "title": "Lease Seconds",
+            "type": "integer"
+          },
+          "lease_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Token"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ready",
+          "lease_seconds"
+        ],
+        "title": "UpdateClaimResponse",
+        "type": "object"
+      },
+      "UpdateEligibilityResponse": {
+        "description": "Policy/action snapshot returned to the authenticated sidecar heartbeat.",
+        "properties": {
+          "action": {
+            "enum": [
+              "none",
+              "check",
+              "install"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "automatic_enabled": {
+            "title": "Automatic Enabled",
+            "type": "boolean"
+          },
+          "blocker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocker"
+          },
+          "idle_only": {
+            "title": "Idle Only",
+            "type": "boolean"
+          },
+          "poll_after_seconds": {
+            "default": 15,
+            "title": "Poll After Seconds",
+            "type": "integer"
+          },
+          "window_open": {
+            "title": "Window Open",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "automatic_enabled",
+          "window_open",
+          "idle_only"
+        ],
+        "title": "UpdateEligibilityResponse",
+        "type": "object"
+      },
+      "UpdateLeaseRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "lease_token": {
+            "maxLength": 256,
+            "minLength": 32,
+            "title": "Lease Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_token"
+        ],
+        "title": "UpdateLeaseRequest",
+        "type": "object"
+      },
+      "UpdateLeaseResponse": {
+        "properties": {
+          "blocker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocker"
+          },
+          "lease_seconds": {
+            "title": "Lease Seconds",
+            "type": "integer"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ready",
+          "lease_seconds"
+        ],
+        "title": "UpdateLeaseResponse",
+        "type": "object"
+      },
+      "UpdateOutcomeRequest": {
+        "additionalProperties": false,
+        "description": "Sidecar acknowledgement. Targets/configuration are intentionally absent.",
+        "properties": {
+          "available_build": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Build"
+          },
+          "available_digest": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Digest"
+          },
+          "current_build": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Build"
+          },
+          "current_digest": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Digest"
+          },
+          "detail_code": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z0-9_]{1,64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "from_build": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Build"
+          },
+          "lease_token": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Token"
+          },
+          "operation": {
+            "enum": [
+              "check",
+              "install"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "no_update",
+              "update_available",
+              "succeeded",
+              "failed",
+              "rolled_back"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "to_build": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Build"
+          }
+        },
+        "required": [
+          "operation",
+          "outcome"
+        ],
+        "title": "UpdateOutcomeRequest",
+        "type": "object"
+      },
+      "UpdateResultItem": {
+        "description": "The last completed updater operation, with only bounded safe detail.",
+        "properties": {
+          "detail_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "finished_at": {
+            "format": "date-time",
+            "title": "Finished At",
+            "type": "string"
+          },
+          "from_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Build"
+          },
+          "operation": {
+            "enum": [
+              "check",
+              "install"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "no_update",
+              "update_available",
+              "succeeded",
+              "failed",
+              "rolled_back"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "to_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Build"
+          }
+        },
+        "required": [
+          "operation",
+          "outcome",
+          "finished_at"
+        ],
+        "title": "UpdateResultItem",
+        "type": "object"
+      },
+      "UpdateStatusResponse": {
+        "description": "Honest public status for the admin update controls.",
+        "properties": {
+          "available_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Build"
+          },
+          "available_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Digest"
+          },
+          "blocker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocker"
+          },
+          "channel": {
+            "title": "Channel",
+            "type": "string"
+          },
+          "current_build": {
+            "title": "Current Build",
+            "type": "string"
+          },
+          "current_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Digest"
+          },
+          "last_checked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Checked At"
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpdateResultItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_window_end": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Window End"
+          },
+          "next_window_start": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Window Start"
+          },
+          "state": {
+            "enum": [
+              "disabled",
+              "unavailable",
+              "idle",
+              "checking",
+              "update_available",
+              "waiting_for_window",
+              "waiting_for_idle",
+              "draining",
+              "installing",
+              "rollback",
+              "succeeded",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updater_available": {
+            "title": "Updater Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "state",
+          "updater_available",
+          "current_build",
+          "channel"
+        ],
+        "title": "UpdateStatusResponse",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -3073,6 +3703,10 @@
         "in": "header",
         "name": "X-CSRF-Token",
         "type": "apiKey"
+      },
+      "UpdaterBearer": {
+        "scheme": "bearer",
+        "type": "http"
       }
     }
   },
@@ -3509,6 +4143,250 @@
         "summary": "Events Endpoint",
         "tags": [
           "events"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/claim": {
+      "post": {
+        "operationId": "claim_endpoint_api_v1_internal_updates_claim_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateClaimResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Claim Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/eligibility": {
+      "post": {
+        "operationId": "eligibility_endpoint_api_v1_internal_updates_eligibility_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateEligibilityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Eligibility Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/outcome": {
+      "post": {
+        "operationId": "outcome_endpoint_api_v1_internal_updates_outcome_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Outcome Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/release": {
+      "post": {
+        "operationId": "release_endpoint_api_v1_internal_updates_release_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLeaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Release Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/renew": {
+      "post": {
+        "operationId": "renew_endpoint_api_v1_internal_updates_renew_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLeaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Renew Endpoint",
+        "tags": [
+          "internal-updates"
         ]
       }
     },
@@ -5390,6 +6268,149 @@
         "summary": "Validate Tmdb Endpoint",
         "tags": [
           "setup"
+        ]
+      }
+    },
+    "/api/v1/updates/check-now": {
+      "post": {
+        "operationId": "check_now_endpoint_api_v1_updates_check_now_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Check Now Endpoint",
+        "tags": [
+          "updates"
+        ]
+      }
+    },
+    "/api/v1/updates/status": {
+      "get": {
+        "operationId": "update_status_endpoint_api_v1_updates_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "Update Status Endpoint",
+        "tags": [
+          "updates"
+        ]
+      }
+    },
+    "/api/v1/updates/update-when-ready": {
+      "post": {
+        "operationId": "update_when_ready_endpoint_api_v1_updates_update_when_ready_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Update When Ready Endpoint",
+        "tags": [
+          "updates"
         ]
       }
     },

@@ -917,6 +917,143 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
   })
 })
 
+describe('Settings — automatic container updates (ADR-0023)', () => {
+  beforeEach(() => {
+    h.mutateAsync.mockReset()
+    h.mutateAsync.mockResolvedValue({})
+    h.toast.mockReset()
+    h.settingsData = CONFIGURED_SERVICES
+    h.libraries = []
+    h.librariesError = null
+    h.statusLoading = false
+    h.statusIsError = false
+    h.statusError = null
+    h.appKeyExists = false
+  })
+
+  it('prefills the opt-in policy with safe defaults and sends the complete policy on save', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('checkbox', { name: /^Enable automatic updates/i })).not.toBeChecked()
+    expect(screen.getByLabelText('IANA timezone')).not.toHaveValue('')
+    expect(screen.getByLabelText('Window start')).toHaveValue('03:00')
+    expect(screen.getByLabelText('Window end')).toHaveValue('05:00')
+    for (const day of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) {
+      expect(screen.getByRole('checkbox', { name: day })).toBeChecked()
+    }
+    expect(
+      screen.getByRole('checkbox', { name: /^Wait for critical work to become idle/i }),
+    ).toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+
+    expect(lastBody()).toEqual(
+      expect.objectContaining({
+        automatic_updates_enabled: false,
+        automatic_update_timezone: expect.any(String),
+        automatic_update_weekdays: [
+          'monday',
+          'tuesday',
+          'wednesday',
+          'thursday',
+          'friday',
+          'saturday',
+          'sunday',
+        ],
+        automatic_update_window_start: '03:00',
+        automatic_update_window_end: '05:00',
+        automatic_update_idle_only: true,
+      }),
+    )
+  })
+
+  it('round-trips edited policy and discloses overnight/day and channel semantics', async () => {
+    h.settingsData = {
+      ...CONFIGURED_SERVICES,
+      automatic_updates_enabled: true,
+      automatic_update_timezone: 'America/Toronto',
+      automatic_update_weekdays: ['friday', 'saturday'],
+      automatic_update_window_start: '23:00',
+      automatic_update_window_end: '02:00',
+      automatic_update_idle_only: false,
+    }
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('checkbox', { name: /^Enable automatic updates/i })).toBeChecked()
+    expect(screen.getByLabelText('IANA timezone')).toHaveValue('America/Toronto')
+    expect(screen.getByRole('checkbox', { name: 'Fri' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Sat' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Mon' })).not.toBeChecked()
+    expect(screen.getByText(/overnight window belongs to the weekday on which it starts/i)).toBeInTheDocument()
+    expect(screen.getByText(/controlled exclusively by/i)).toHaveTextContent('PLEX_MANAGER_IMAGE')
+
+    fireEvent.change(screen.getByLabelText('IANA timezone'), { target: { value: 'UTC' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Fri' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+
+    expect(lastBody()).toEqual(
+      expect.objectContaining({
+        automatic_updates_enabled: true,
+        automatic_update_timezone: 'UTC',
+        automatic_update_weekdays: ['saturday'],
+        automatic_update_window_start: '23:00',
+        automatic_update_window_end: '02:00',
+        automatic_update_idle_only: false,
+      }),
+    )
+  })
+
+  it('rejects an empty weekday set before sending a save', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    for (const day of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) {
+      fireEvent.click(screen.getByRole('checkbox', { name: day }))
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Save failed',
+          description: 'Select at least one automatic update weekday.',
+          intent: 'error',
+        }),
+      ),
+    )
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('rejects an invalid timezone and equal window endpoints locally', async () => {
+    const { rerender } = render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('IANA timezone'), {
+      target: { value: 'Toronto-ish' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ description: expect.stringContaining('valid IANA timezone') }),
+      ),
+    )
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+
+    h.toast.mockReset()
+    h.settingsData = { ...CONFIGURED_SERVICES, automatic_update_timezone: 'UTC' }
+    // Re-mount so Settings' deliberately one-time form seeding picks up the
+    // replacement fixture instead of preserving the invalid in-progress edit.
+    rerender(<></>)
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Window end'), { target: { value: '03:00' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ description: expect.stringContaining('start and end must differ') }),
+      ),
+    )
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+  })
+})
+
 describe('Settings — Access recovery key (opt-in, ADR-0016)', () => {
   // The exact one-time reveal caption the operator must see (verbatim per the
   // Task 13 amendment) — asserted so a copy drift is a test failure.

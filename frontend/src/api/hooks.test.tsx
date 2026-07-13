@@ -4,6 +4,7 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
+  useCheckForUpdate,
   useEvict,
   useMarkFailed,
   useQueue,
@@ -13,6 +14,8 @@ import {
   useRevokeAppKey,
   useRotateAppKey,
   useUpdateSettings,
+  useUpdateStatus,
+  useUpdateWhenReady,
 } from './hooks'
 import { client } from './client'
 import {
@@ -20,6 +23,7 @@ import {
   QUEUE_REALTIME_FLOOR_MS,
   REQUESTS_POLL_INTERVAL_MS,
   REQUESTS_REALTIME_FLOOR_MS,
+  UPDATE_STATUS_POLL_INTERVAL_MS,
   queryKeys,
 } from '../lib/queryClient'
 import * as apiKeyLib from '../lib/apiKey'
@@ -31,6 +35,7 @@ import type {
   PlexLibraryOption,
   QueueItem,
   SettingsResponse,
+  UpdateStatusResponse,
 } from './types'
 
 // No network: the typed client is replaced with controllable GET/PUT/POST mocks.
@@ -147,6 +152,73 @@ describe('useUpdateSettings', () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth }),
     )
+  })
+
+  it('invalidates update status when update policy changes', async () => {
+    const saved: SettingsResponse = { automatic_updates_enabled: true }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), { wrapper: createWrapper(qc) })
+    await result.current.mutateAsync({ automatic_updates_enabled: true })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.updateStatus })
+  })
+})
+
+function updateStatus(overrides: Partial<UpdateStatusResponse> = {}): UpdateStatusResponse {
+  return {
+    state: 'idle',
+    updater_available: true,
+    current_build: '1.4.0',
+    channel: 'stable',
+    ...overrides,
+  }
+}
+
+describe('update hooks', () => {
+  it('reads the status endpoint on the updater heartbeat polling cadence', async () => {
+    vi.useFakeTimers()
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: updateStatus(),
+      response: { status: 200 },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = renderHook(() => useUpdateStatus(), { wrapper: createWrapper(qc) })
+
+    await act(async () => void (await vi.advanceTimersByTimeAsync(0)))
+    expect(client.GET).toHaveBeenCalledWith('/api/v1/updates/status')
+    await act(async () => void (await vi.advanceTimersByTimeAsync(UPDATE_STATUS_POLL_INTERVAL_MS)))
+    expect(client.GET).toHaveBeenCalledTimes(2)
+
+    unmount()
+    qc.clear()
+  })
+
+  it('sends bodyless check and update requests and refreshes the shared status cache', async () => {
+    const checking = updateStatus({ state: 'checking' })
+    const queued = updateStatus({ state: 'waiting_for_window', available_build: '1.5.0' })
+    ;(client.POST as unknown as Mock)
+      .mockResolvedValueOnce({ data: checking, response: { status: 200 } })
+      .mockResolvedValueOnce({ data: queued, response: { status: 200 } })
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const check = renderHook(() => useCheckForUpdate(), { wrapper: createWrapper(qc) })
+    await check.result.current.mutateAsync()
+    expect(client.POST).toHaveBeenNthCalledWith(1, '/api/v1/updates/check-now')
+    expect(qc.getQueryData(queryKeys.updateStatus)).toEqual(checking)
+
+    const update = renderHook(() => useUpdateWhenReady(), { wrapper: createWrapper(qc) })
+    await update.result.current.mutateAsync()
+    expect(client.POST).toHaveBeenNthCalledWith(2, '/api/v1/updates/update-when-ready')
+    expect(qc.getQueryData(queryKeys.updateStatus)).toEqual(queued)
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.updateStatus })
+
+    check.unmount()
+    update.unmount()
+    qc.clear()
   })
 })
 
