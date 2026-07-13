@@ -47,6 +47,18 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       consecutive_failures: 0,
       cooled_down_scopes: 0,
     },
+    watchlist: {
+      state: 'ok',
+      last_run_at: '2026-01-01T00:00:00Z',
+      last_ok_at: '2026-01-01T00:00:00Z',
+      last_error_type: null,
+      last_error_at: null,
+      fetched: 0,
+      created: 0,
+      existing: 0,
+      failed_users: 0,
+      failed_entries: 0,
+    },
     ...overrides,
   }
 }
@@ -123,7 +135,7 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(6)
+    expect(cards).toHaveLength(7)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',
@@ -374,7 +386,22 @@ describe('Status', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       // Both background loops are fresh (never run), so neither panel may read
       // as "clean" just because failures==0.
-      data: health({ reconcile: freshLoop, autograb: freshLoop }),
+      data: health({
+        reconcile: freshLoop,
+        autograb: freshLoop,
+        watchlist: {
+          state: 'starting',
+          last_run_at: null,
+          last_ok_at: null,
+          last_error_type: null,
+          last_error_at: null,
+          fetched: 0,
+          created: 0,
+          existing: 0,
+          failed_users: 0,
+          failed_entries: 0,
+        },
+      }),
       isLoading: false,
       isError: false,
     })
@@ -385,8 +412,8 @@ describe('Status', () => {
 
     // Never — a fresh boot must not read as "clean" just because failures==0.
     expect(screen.queryByText('running clean')).not.toBeInTheDocument()
-    // Both the reconcile AND auto-grab panels show the honest "starting up".
-    expect(screen.getAllByText('starting up')).toHaveLength(2)
+    // All three background panels show the honest "starting up".
+    expect(screen.getAllByText('starting up')).toHaveLength(3)
     // Both "Last run" and "Last success" render the same honest placeholder.
     const neverValues = screen.getAllByText('never')
     expect(neverValues.length).toBeGreaterThan(0)
@@ -452,6 +479,55 @@ describe('Status', () => {
       'text-searching',
     )
     expect(autograbStats.getByText(/GrabPipelineUnavailable/)).toHaveClass('text-error')
+  })
+
+  it('renders a degraded watchlist cycle without overwriting its last successful run', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        watchlist: {
+          state: 'degraded',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'WatchlistEntryError',
+          last_error_at: '2026-01-02T00:00:01Z',
+          fetched: 7,
+          created: 2,
+          existing: 4,
+          failed_users: 1,
+          failed_entries: 3,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const heading = screen.getByRole('heading', { name: 'Watchlist sync' })
+    const panel = heading.closest('article')
+    expect(panel).not.toBeNull()
+    const watchlist = within(panel as HTMLElement)
+    expect(watchlist.getByText('degraded')).toBeInTheDocument()
+    expect(watchlist.getByText('Existing requests')).toBeInTheDocument()
+    expect(watchlist.getByText('4')).toBeInTheDocument()
+    expect(watchlist.getByText('1')).toBeInTheDocument()
+    expect(watchlist.getByText('Failed entries')).toBeInTheDocument()
+    expect(watchlist.getByText('3')).toBeInTheDocument()
+    expect(watchlist.getByText(/WatchlistEntryError/)).toBeInTheDocument()
+
+    const lastRun = watchlist.getByText('Last run').nextElementSibling
+    const lastSuccess = watchlist.getByText('Last success').nextElementSibling
+    expect(lastRun).not.toBeNull()
+    expect(lastSuccess).not.toBeNull()
+    expect(lastRun).not.toHaveTextContent('never')
+    expect(lastSuccess).not.toHaveTextContent('never')
+    expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {

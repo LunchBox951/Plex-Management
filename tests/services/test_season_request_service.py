@@ -440,6 +440,50 @@ async def test_mark_completed_then_mark_available_promote_the_rollup(
         assert show.status is RequestStatus.available
 
 
+async def test_one_finalizing_season_with_others_available_rolls_up_completed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #265 regression: a season still "Finalizing" (imported, awaiting
+    Plex's availability confirmation) must win the parent rollup outright over
+    already-``available`` siblings, so the whole request reads the in-flight
+    ``completed`` status -- not the settled-sounding ``partially_available`` the
+    nav badge's ``IN_FLIGHT_REQUEST_STATUSES`` (frontend/src/lib/status.ts)
+    deliberately excludes. Before the fix, this show would go dark on the badge
+    for the entire finalizing window even though season 2 is genuinely active."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=705)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=705, seasons=[1, 2, 3]
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # Season 1 fully settled (Plex-confirmed available).
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        # Season 2 still finalizing (imported, not yet Plex-confirmed).
+        await season_request_service.mark_completed(
+            session, media_request_id=show_id, season_number=2
+        )
+        await session.commit()
+    # Season 3 is left at its default 'pending' (not yet started) -- a genuinely
+    # dormant sibling that must NOT be allowed to mask the finalizing season 2
+    # (nor, by the same precedence rule, may it itself win outright).
+
+    async with sessionmaker_() as session:
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.status is RequestStatus.completed  # "Finalizing" -- in-flight
+        seasons = await SqlSeasonRequestRepository(session).list_for_request(show_id)
+    by_season = {s.season_number: s.status for s in seasons}
+    # The individual seasons are untouched by the parent-level precedence fold --
+    # only the ROLLUP promotes; season 1 stays available, season 3 stays pending.
+    assert by_season == {1: "available", 2: "completed", 3: "pending"}
+
+
 async def test_mark_available_clears_the_eviction_regrab_marker(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -665,9 +709,12 @@ async def test_mark_completed_stamps_parent_completed_at_on_first_season_only(
         assert show is not None
         first_stamp = show.completed_at
         assert first_stamp is not None
-        # A partially-complete show is still honestly partial, but completion is now
-        # recorded.
-        assert show.status is RequestStatus.partially_available
+        # Season 1 is finalizing (imported, not yet Plex-confirmed) and season 2 is
+        # still pending -- the finalizing season wins the rollup outright (issue
+        # #265), so the show reads the in-flight "completed" ("Finalizing"), not
+        # the settled-sounding "partially_available". Completion is now recorded
+        # regardless of which status the rollup itself reads.
+        assert show.status is RequestStatus.completed
 
     # Season 2 completes later -> the first stamp is preserved, never moved.
     async with sessionmaker_() as session:

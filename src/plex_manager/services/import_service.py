@@ -2668,6 +2668,7 @@ async def _heal_false_available_movies(
         read, the CAS finds nothing and the row is left for next cycle rather
         than deleted out from under its new owner.
         """
+        await repo.copy_subscribers(row.id, winner.id)
         if await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=row.user_id):
             await session.commit()
             _logger.info(
@@ -2711,6 +2712,7 @@ async def _heal_false_available_movies(
                 extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
             )
             return
+        await repo.add_subscriber(winner.id, owner)
         await _commit_collapse(row, winner, reason=reason)
 
     async def _rearm(row: RequestRecord) -> bool:

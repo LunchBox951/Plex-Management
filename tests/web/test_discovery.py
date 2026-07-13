@@ -189,16 +189,16 @@ async def test_home_composes_rows_and_returns_ordered_plural_spotlights(
     assert states[12] == "available"
     assert [row["row_type"] for row in body["rows"]] == [
         "trending",
-        "popular",
-        "upcoming",
         "trending_tv",
         "popular_tv",
+        "popular",
+        "upcoming",
     ]
     assert body["rows"][0]["items"][0]["backdrop_url"] == "http://img/a.jpg"
     assert [item["tmdb_id"] for item in body["rows"][0]["items"]] == [1, 2, 3]
-    assert [item["tmdb_id"] for item in body["rows"][3]["items"]] == [11, 12, 13]
-    assert [item["tmdb_id"] for item in body["rows"][4]["items"]] == [11]
-    assert body["rows"][2]["items"] == []  # upcoming was empty — an honest empty row
+    assert [item["tmdb_id"] for item in body["rows"][1]["items"]] == [11, 12, 13]
+    assert [item["tmdb_id"] for item in body["rows"][2]["items"]] == [11]
+    assert body["rows"][4]["items"] == []  # upcoming was empty — an honest empty row
     assert library.present_ids_calls == 1
 
 
@@ -487,12 +487,25 @@ def _personalized_tmdb(
         popular_tv_results=[],
         recommendation_profiles=profiles,
         recommendations={
+            # >= discovery_service._MIN_SHELF_TITLES (issue #277): a single-item
+            # page would now be filtered out as a too-thin shelf, so pad with two
+            # extra distinct titles behind the id every caller asserts on at [0].
             ("movie", "genre", 27): [
                 MediaSearchResult(
                     tmdb_id=recommendation_id,
                     media_type="movie",
                     title="Recommended",
-                )
+                ),
+                MediaSearchResult(
+                    tmdb_id=recommendation_id + 1000,
+                    media_type="movie",
+                    title="Recommended 2",
+                ),
+                MediaSearchResult(
+                    tmdb_id=recommendation_id + 2000,
+                    media_type="movie",
+                    title="Recommended 3",
+                ),
             ]
         },
     )

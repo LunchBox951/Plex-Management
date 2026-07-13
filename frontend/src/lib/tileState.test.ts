@@ -26,6 +26,7 @@ function request(overrides: Partial<RequestResponse> = {}): RequestResponse {
     status: 'pending',
     is_anime: false,
     keep_forever: false,
+    can_mutate: false,
     ...overrides,
   }
 }
