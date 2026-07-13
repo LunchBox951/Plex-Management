@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
@@ -43,11 +43,27 @@ vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) 
 // Passthrough Dialog so the shared modal renders as plain DOM (no Radix portal
 // focus-trap noise in jsdom) — same shim Requests.test.tsx uses.
 vi.mock('../components/ui/Dialog', () => ({
-  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
+  Dialog: ({
+    title,
+    children,
+    customChrome = false,
+  }: {
+    title: string
+    children: ReactNode
+    customChrome?: boolean
+  }) => (
     <div>
-      <h2>{title}</h2>
+      {customChrome ? null : <h2>{title}</h2>}
       {children}
     </div>
+  ),
+  DialogTitle: ({ children, ...props }: HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 {...props}>{children}</h2>
+  ),
+  DialogClose: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
   ),
 }))
 
@@ -128,6 +144,25 @@ afterEach(() => {
 })
 
 describe('Discover — hero-first home (issue #188)', () => {
+  it('creates one load id per mount and reuses it across rerenders', () => {
+    const firstView = render(<Discover />)
+    const firstId = (useDiscoverHome as unknown as Mock).mock.calls.at(-1)?.[0]?.loadId
+    expect(firstId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+
+    firstView.rerender(<Discover />)
+    const idsBeforeUnmount = (useDiscoverHome as unknown as Mock).mock.calls.map(
+      (call) => (call[0] as { loadId?: string }).loadId,
+    )
+    expect(new Set(idsBeforeUnmount)).toEqual(new Set([firstId]))
+
+    firstView.unmount()
+    render(<Discover />)
+    const remountedId = (useDiscoverHome as unknown as Mock).mock.calls.at(-1)?.[0]?.loadId
+    expect(remountedId).not.toBe(firstId)
+  })
+
   it('removes the page heading, subtitle, and inline search input', () => {
     render(<Discover />)
 
@@ -153,6 +188,37 @@ describe('Discover — hero-first home (issue #188)', () => {
     expect(view.container.firstElementChild?.firstElementChild?.firstElementChild).toBe(
       screen.getByRole('heading', { name: 'Trending' }).closest('section'),
     )
+  })
+
+  it('honors server row order and forwards personalized subtitles', () => {
+    ;(useDiscoverHome as unknown as Mock).mockReturnValue({
+      data: {
+        spotlights: [],
+        rows: [
+          {
+            row_type: 'personalized:genre:movie:1',
+            title: 'Because you requested Fresh Movie',
+            subtitle: 'more horror',
+            items: [MOVIE],
+          },
+          { row_type: 'popular_tv', title: 'Popular TV shows', subtitle: null, items: [SHOW] },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+      dataUpdatedAt: Date.now(),
+    })
+
+    render(<Discover />)
+
+    const first = screen
+      .getByRole('heading', { name: 'Because you requested Fresh Movie' })
+      .closest('section')
+    const second = screen.getByRole('heading', { name: 'Popular TV shows' }).closest('section')
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+    expect(first!.compareDocumentPosition(second!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(screen.getByText('more horror')).toBeInTheDocument()
   })
 
   it('passes the header search-overlay state through to pause spotlight rotation', () => {

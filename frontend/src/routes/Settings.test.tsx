@@ -917,7 +917,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
   })
 })
 
-describe('Settings — automatic container updates (ADR-0023)', () => {
+describe('Settings — automatic container updates (ADR-0024)', () => {
   beforeEach(() => {
     h.mutateAsync.mockReset()
     h.mutateAsync.mockResolvedValue({})

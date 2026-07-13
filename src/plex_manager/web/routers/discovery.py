@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -20,6 +21,7 @@ from plex_manager.services.discovery_service import (
 )
 from plex_manager.web.deps import (
     AuthContext,
+    AuthMethod,
     get_library_optional,
     get_session,
     get_tmdb,
@@ -142,9 +144,38 @@ async def discover_home(
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
     auth: Annotated[AuthContext, Depends(require_api_key)],
+    response: Response,
+    load_id: Annotated[UUID | None, Query()] = None,
 ) -> DiscoverHomeResponse:
     """Return the server-composed Discover home (spotlights + ordered rows)."""
-    feed = await discovery_service.home(tmdb)
+    personalization_user_id = (
+        auth.user_id if auth.method is AuthMethod.plex_session and load_id is not None else None
+    )
+    history: list[discovery_service.PersonalizationSeed] = []
+    if personalization_user_id is not None:
+        records = await SqlRequestRepository(session).list_personalization_history(
+            personalization_user_id
+        )
+        history = [
+            discovery_service.PersonalizationSeed(
+                tmdb_id=record.tmdb_id,
+                media_type=record.media_type,
+                title=record.title,
+                status=record.status,
+                is_anime=record.is_anime,
+            )
+            for record in records
+            if record.media_type in ("movie", "tv")
+        ]
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie, X-Api-Key"
+
+    feed = await discovery_service.home(
+        tmdb,
+        history=history,
+        user_id=personalization_user_id,
+        load_id=load_id if personalization_user_id is not None else None,
+    )
     all_items: list[MediaSearchResult] = [
         *feed.spotlights,
         *(item for row in feed.rows for item in row.items),
@@ -156,6 +187,7 @@ async def discover_home(
             DiscoverHomeRow(
                 row_type=row.row_type,
                 title=row.title,
+                subtitle=row.subtitle,
                 items=[_to_result(item, _state_for(states, item)) for item in row.items],
             )
             for row in feed.rows

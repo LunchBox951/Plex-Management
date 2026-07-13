@@ -52,6 +52,96 @@ async def test_list_by_status_filters(session: AsyncSession) -> None:
     assert len(await repo.list_by_status()) == 3
 
 
+async def test_personalization_history_is_exactly_user_scoped_and_deduplicated(
+    session: AsyncSession,
+) -> None:
+    repo = SqlRequestRepository(session)
+    admin = User(plex_id=7001, username="admin-history", permissions=1)
+    neighbor = User(plex_id=7002, username="neighbor-history", permissions=0)
+    session.add_all([admin, neighbor])
+    await session.flush()
+
+    # An older settled row followed by an active re-request collapses to the
+    # active row. The chosen rows are then returned by their own ids.
+    await repo.create(
+        tmdb_id=10,
+        media_type="movie",
+        title="Old settled copy",
+        status="available",
+        user_id=admin.id,
+    )
+    second = await repo.create(
+        tmdb_id=20,
+        media_type="tv",
+        title="Second",
+        status="partially_available",
+        user_id=admin.id,
+    )
+    active = await repo.create(
+        tmdb_id=10,
+        media_type="movie",
+        title="Active copy",
+        status="downloading",
+        user_id=admin.id,
+    )
+    await repo.create(
+        tmdb_id=30,
+        media_type="movie",
+        title="Withdrawn",
+        status="cancelled",
+        user_id=admin.id,
+    )
+    await repo.create(
+        tmdb_id=40,
+        media_type="movie",
+        title="Ownerless",
+        status="pending",
+    )
+    await repo.create(
+        tmdb_id=50,
+        media_type="movie",
+        title="Neighbor secret",
+        status="pending",
+        user_id=neighbor.id,
+    )
+
+    history = await repo.list_personalization_history(admin.id)
+
+    assert [row.id for row in history] == [second.id, active.id]
+    assert [(row.tmdb_id, row.title) for row in history] == [
+        (20, "Second"),
+        (10, "Active copy"),
+    ]
+    assert all(row.user_id == admin.id for row in history)
+
+
+async def test_personalization_history_uses_newest_when_every_duplicate_is_settled(
+    session: AsyncSession,
+) -> None:
+    repo = SqlRequestRepository(session)
+    user = User(plex_id=7003, username="settled-history", permissions=0)
+    session.add(user)
+    await session.flush()
+    await repo.create(
+        tmdb_id=60,
+        media_type="movie",
+        title="Previously available",
+        status="available",
+        user_id=user.id,
+    )
+    newest = await repo.create(
+        tmdb_id=60,
+        media_type="movie",
+        title="Later evicted",
+        status="evicted",
+        user_id=user.id,
+    )
+
+    history = await repo.list_personalization_history(user.id)
+
+    assert history == [newest]
+
+
 async def test_find_active_uses_tmdb_media_composite_for_dedup(
     session: AsyncSession,
 ) -> None:

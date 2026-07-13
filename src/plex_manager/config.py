@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # rollbacks never touch it (see the design overview, §6).
     data_dir: str = "./data"
 
-    # Container auto-update bootstrap (ADR-0023). Policy lives in the database;
+    # Container auto-update bootstrap (ADR-0024). Policy lives in the database;
     # these values define only the private sidecar boundary and fixed target.
     image: str = "ghcr.io/lunchbox951/plex-manager:stable"
     container_name: str = "plex-manager"

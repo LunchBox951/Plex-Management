@@ -53,7 +53,7 @@ export const queryKeys = {
   blocklist: (tmdbId?: number) => ['blocklist', tmdbId ?? 'all'] as const,
   qualityProfile: ['quality-profile'] as const,
   discover: (query: string, year?: number) => ['discover', query, year ?? null] as const,
-  discoverHome: ['discover', 'home'] as const,
+  discoverHome: (loadId?: string) => ['discover', 'home', loadId ?? 'standard'] as const,
   searchPreview: ['search-preview'] as const,
   opsHealth: ['ops', 'health'] as const,
   opsDisk: ['ops', 'disk'] as const,

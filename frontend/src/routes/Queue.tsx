@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { useImportDownload, useMarkFailed, useQueue, useRelocateDownload } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
-import { downloadStatus, INTENT_CLASSES } from '../lib/status'
+import { downloadStatus, INTENT_CLASSES, isMarkFailableStatus } from '../lib/status'
 import type { ApiError } from '../lib/errors'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
@@ -32,6 +32,11 @@ const PATH_NOT_VISIBLE_REASON_PREFIX = 'download path not visible inside the con
 function isRelocatable(item: QueueItem): boolean {
   return item.status === 'import_blocked' && (item.failed_reason ?? '').startsWith(PATH_NOT_VISIBLE_REASON_PREFIX)
 }
+
+// Mark failed / Blocklist & fail eligibility lives in `lib/status.ts`
+// (`isMarkFailableStatus`) -- shared with TitleDetailModal's report-a-problem
+// dialog, which drives the identical `mark_failed` mutation, so the two
+// surfaces can never gate the same backend call on two different sets.
 
 /**
  * tv only: "S02E05" (a single episode), "S02E05-E07" (a multi-episode file) or
@@ -80,7 +85,13 @@ function scopeBadges(item: QueueItem): ScopeBadge[] {
   if (item.scopes && item.scopes.length > 0) {
     return item.scopes
       .map((scope) => {
-        const status = scope.status ?? 'active'
+        // Widen to `string` (ScopeBadge's declared field type): otherwise TS
+        // infers the narrower `DownloadScopeStatus | 'active'` literal union
+        // here, which then fails the `.filter` type predicate below (a
+        // predicate's asserted type must be assignable TO the inferred
+        // parameter type, and the wider `ScopeBadge` is not assignable to
+        // that narrower inferred literal type).
+        const status: string = scope.status ?? 'active'
         const label = scopeBadgeLabel(scope.season, scope.episodes, status)
         return label ? { label, status } : null
       })
@@ -118,7 +129,7 @@ export function Queue() {
   const items = data?.queue ?? []
   const activeCount = items.filter((item) => isActive(item.status)).length
   const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
-  const pendingActionable = pendingItem !== null && pendingItem.status !== 'importing'
+  const pendingActionable = pendingItem !== null && isMarkFailableStatus(pendingItem.status)
 
   useEffect(() => {
     if (pending && !pendingActionable) {
@@ -127,7 +138,7 @@ export function Queue() {
   }, [pending, pendingActionable])
 
   async function runConfirm() {
-    if (!pending || !pendingItem || pendingItem.status === 'importing') {
+    if (!pending || !pendingItem || !isMarkFailableStatus(pendingItem.status)) {
       setPending(null)
       return
     }
@@ -289,7 +300,7 @@ function QueueCard({
 }) {
   const presentation = downloadStatus(item.status)
   const showTransferProgress = item.status === 'downloading'
-  const canMarkFailed = item.status !== 'importing'
+  const canMarkFailed = isMarkFailableStatus(item.status)
   const progress = Math.min(1, Math.max(0, item.progress ?? 0))
   const pct = Math.round(progress * 100)
   const shortHash = item.torrent_hash.slice(0, 12)

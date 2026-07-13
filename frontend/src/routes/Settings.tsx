@@ -46,7 +46,7 @@ const LOG_RETENTION_DAYS_DEFAULT = 7
 const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
-// Automatic container updates (ADR-0023) are opt-in. The scheduling defaults
+// Automatic container updates (ADR-0024) are opt-in. The scheduling defaults
 // mirror the backend except for timezone: a fresh browser contributes its IANA
 // zone when the operator first saves, with UTC as the fail-closed fallback.
 const AUTOMATIC_UPDATES_ENABLED_DEFAULT = false

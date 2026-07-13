@@ -14,7 +14,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, delete, exists, or_, select, update
 
-from plex_manager.models import Download, DownloadScope, MediaRequest, MediaType, SeasonRequest
+from plex_manager.models import (
+    Download,
+    DownloadScope,
+    DownloadScopeStatus,
+    MediaRequest,
+    MediaType,
+    SeasonRequest,
+)
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord, QueueRecord
 
 if TYPE_CHECKING:
@@ -53,7 +60,9 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value
 
 
-_ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset({"active", "import_blocked"})
+_ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset(
+    {DownloadScopeStatus.active.value, DownloadScopeStatus.import_blocked.value}
+)
 
 
 def _normalize_episodes(value: list[int] | None) -> list[int] | None:

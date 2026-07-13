@@ -991,6 +991,372 @@ def test_adapter_delete_conforms_to_filesystem_port() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# delete — ancestor-symlink swap AFTER validation (fd-anchored containment)
+#
+# These simulate the exact race a pathname re-check cannot defend against: the
+# guard resolves and validates ``path`` against the real, pre-swap tree, and
+# ONLY THEN does a concurrent actor rename a writable ancestor directory and
+# replace it with a symlink (or a non-directory) pointing elsewhere. A fix that
+# still performs a SECOND pathname-based lookup (``lexists``/``islink``/
+# ``isdir``/``rmtree``/``os.remove`` on a string) would re-traverse the swapped
+# ancestor and delete whatever now sits at the same suffix, outside every
+# configured root. The fd-anchored walk must instead REFUSE the swap (honesty,
+# north-star #3), never follow it.
+# --------------------------------------------------------------------------- #
+def test_delete_ancestor_symlink_swap_after_validation_does_not_escape_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    title_dir = root / "Some Movie (2020)"
+    title_dir.mkdir()
+    target = title_dir / "movie.mkv"
+    target.write_bytes(b"x" * 100)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_movie = outside / "movie.mkv"
+    outside_movie.write_bytes(b"y" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    real_guarded_resolution = fs._guarded_resolution  # pyright: ignore[reportPrivateUsage]
+
+    def swap_after_validation(path: str) -> tuple[str, str] | None:
+        # Validate against the REAL, pre-swap tree first (the guard's honest work) --
+        # then a concurrent actor wins the race: the validated ancestor directory is
+        # renamed away and replaced with a symlink to a same-suffix outside tree.
+        resolution = real_guarded_resolution(path)
+        title_dir.rename(tmp_path / "Some Movie (2020).real")
+        os.symlink(outside, title_dir)
+        return resolution
+
+    monkeypatch.setattr(fs, "_guarded_resolution", swap_after_validation)
+
+    with pytest.raises(LocalFileSystemError, match="ancestor changed"):
+        fs.delete(os.fspath(target))
+
+    # The outside file the swap redirected onto must survive untouched.
+    assert outside_movie.exists()
+    assert outside_movie.read_bytes() == b"y" * 100
+    # And the genuine (now-relocated) original file is untouched too.
+    assert (tmp_path / "Some Movie (2020).real" / "movie.mkv").read_bytes() == b"x" * 100
+
+
+def test_delete_ancestor_symlink_swap_after_validation_does_not_escape_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tv"
+    root.mkdir()
+    show_dir = root / "Show"
+    show_dir.mkdir()
+    season_dir = show_dir / "Season 01"
+    season_dir.mkdir()
+    (season_dir / "Show.S01E01.mkv").write_bytes(b"x" * 100)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_tree = outside / "Season 01"
+    outside_tree.mkdir()
+    outside_episode = outside_tree / "Show.S01E01.mkv"
+    outside_episode.write_bytes(b"y" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    real_guarded_resolution = fs._guarded_resolution  # pyright: ignore[reportPrivateUsage]
+
+    def swap_after_validation(path: str) -> tuple[str, str] | None:
+        resolution = real_guarded_resolution(path)
+        # Swap the target directory's PARENT (not the target itself) so the
+        # fd walk hits the symlink one level above the leaf being removed.
+        show_dir.rename(tmp_path / "Show.real")
+        os.symlink(outside, show_dir)
+        return resolution
+
+    monkeypatch.setattr(fs, "_guarded_resolution", swap_after_validation)
+
+    with pytest.raises(LocalFileSystemError, match="ancestor changed"):
+        fs.delete(os.fspath(season_dir))
+
+    # The outside tree the swap redirected onto must survive, whole and untouched.
+    assert outside_tree.exists()
+    assert outside_episode.read_bytes() == b"y" * 100
+    assert (tmp_path / "Show.real" / "Season 01" / "Show.S01E01.mkv").read_bytes() == b"x" * 100
+
+
+def test_delete_missing_intermediate_dir_is_idempotent_noop(tmp_path: Path) -> None:
+    root = tmp_path / "movies"
+    root.mkdir()
+    # "Gone" was never created (or was already removed out-of-band) -- the
+    # containment check still passes (both checked locations are lexically
+    # under the root), but the fd walk hits a genuinely missing ancestor.
+    never_existed = root / "Gone" / "movie.mkv"
+
+    LocalFileSystem([os.fspath(root)]).delete(os.fspath(never_existed))  # must not raise
+
+
+def test_delete_missing_intermediate_dir_does_not_leak_a_file_descriptor(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: the no-follow parent walk opens ``start_dir`` (and each
+    intermediate ancestor) via ``os.open``, and on a MISSING intermediate
+    ancestor -- exactly the idempotent-retry case above -- it used to
+    ``return None`` straight out of the loop's ``except FileNotFoundError``
+    branch WITHOUT closing the still-open ``dir_fd``: that ``return`` is not an
+    exception, so the surrounding ``except BaseException`` cleanup never ran.
+    A single call leaking one fd is invisible to
+    ``test_delete_missing_intermediate_dir_is_idempotent_noop`` (which only
+    asserts non-raising), but a long-running daemon retrying this exact
+    idempotent path repeatedly leaks one fd per call, walking toward EMFILE and
+    taking down every other file operation in the process. Assert the
+    process's open-fd count is unchanged across many repeats of the no-op
+    delete."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    never_existed = root / "Gone" / "movie.mkv"
+    fs = LocalFileSystem([os.fspath(root)])
+
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("requires /proc/self/fd (Linux)")
+
+    before = len(os.listdir(fd_dir))
+    for _ in range(200):
+        fs.delete(os.fspath(never_existed))  # must not raise, must not leak
+    after = len(os.listdir(fd_dir))
+
+    assert after == before
+
+
+def test_delete_surfaces_ancestor_tamper_rather_than_silently_skipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinguishes a genuinely MISSING ancestor (idempotent no-op, see
+    ``test_delete_missing_intermediate_dir_is_idempotent_noop``) from an ancestor
+    that was TAMPERED WITH (replaced by a non-directory) during deletion: the
+    latter must be surfaced as a refusal, never silently treated the same as a
+    harmless already-gone path."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    title_dir = root / "Some Movie (2020)"
+    title_dir.mkdir()
+    target = title_dir / "movie.mkv"
+    target.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    real_guarded_resolution = fs._guarded_resolution  # pyright: ignore[reportPrivateUsage]
+
+    def swap_ancestor_for_a_plain_file(path: str) -> tuple[str, str] | None:
+        resolution = real_guarded_resolution(path)
+        # Replace the ancestor DIRECTORY with a plain file (ENOTDIR on the
+        # O_DIRECTORY-anchored open), rather than a symlink (ELOOP) -- the
+        # other half of the swapped-ancestor guard.
+        renamed = tmp_path / "Some Movie (2020).real"
+        title_dir.rename(renamed)
+        title_dir.write_bytes(b"not a directory anymore")
+        return resolution
+
+    monkeypatch.setattr(fs, "_guarded_resolution", swap_ancestor_for_a_plain_file)
+
+    with pytest.raises(LocalFileSystemError, match="ancestor changed"):
+        fs.delete(os.fspath(target))
+
+    assert (tmp_path / "Some Movie (2020).real" / "movie.mkv").read_bytes() == b"x" * 100
+
+
+def test_delete_root_parent_symlink_swap_after_validation_does_not_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P1: the swap happens ONE LEVEL ABOVE the configured root -- at the
+    directory CONTAINING it (``dirname(root_real)``). An earlier fix anchored the
+    no-follow walk at ``dirname(root_real)`` opened by PATHNAME and only
+    no-follow-walked components BELOW it, so this level was still trusted: renaming
+    the root's own parent away and dropping a symlink to a same-suffix outside tree
+    in its place made the initial ``os.open`` follow the symlink, and the remaining
+    no-follow walk deleted the outside file. Anchoring at the filesystem root
+    (``os.sep``) and no-follow-opening EVERY component -- including the root's
+    parent and the root itself -- surfaces the swap as a refusal instead."""
+    lib = tmp_path / "trusted"
+    root = lib / "movies"
+    title_dir = root / "Some Movie (2020)"
+    title_dir.mkdir(parents=True)
+    target = title_dir / "movie.mkv"
+    target.write_bytes(b"x" * 100)
+
+    # An outside tree with the SAME suffix below the swapped-in symlink, so a walk
+    # that follows the swap would land on -- and delete -- this file.
+    outside_lib = tmp_path / "attacker"
+    outside_target = outside_lib / "movies" / "Some Movie (2020)" / "movie.mkv"
+    outside_target.parent.mkdir(parents=True)
+    outside_target.write_bytes(b"y" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    real_guarded_resolution = fs._guarded_resolution  # pyright: ignore[reportPrivateUsage]
+
+    def swap_root_parent_after_validation(path: str) -> tuple[str, str] | None:
+        resolution = real_guarded_resolution(path)
+        # The race: the directory CONTAINING the configured root is renamed away
+        # and replaced by a symlink to the attacker's same-suffix tree.
+        lib.rename(tmp_path / "trusted.real")
+        os.symlink(outside_lib, lib)
+        return resolution
+
+    monkeypatch.setattr(fs, "_guarded_resolution", swap_root_parent_after_validation)
+
+    with pytest.raises(LocalFileSystemError, match="ancestor changed"):
+        fs.delete(os.fspath(target))
+
+    # The attacker's same-suffix file the swap redirected onto must survive.
+    assert outside_target.exists()
+    assert outside_target.read_bytes() == b"y" * 100
+    # And the genuine (now-relocated) original is untouched too.
+    relocated = tmp_path / "trusted.real" / "movies" / "Some Movie (2020)" / "movie.mkv"
+    assert relocated.read_bytes() == b"x" * 100
+
+
+def test_delete_missing_root_parent_is_idempotent_noop(tmp_path: Path) -> None:
+    """Codex P2: when a configured root's PARENT has disappeared (e.g. an
+    unmounted ``/mnt/library``), a stale-breadcrumb delete must be an idempotent
+    no-op, not a raised ``FileNotFoundError``. Containment still passes lexically
+    (``realpath`` of a missing prefix is its own literal path), and the fd walk --
+    now anchored at ``os.sep`` and descending every component -- hits the missing
+    parent inside its ENOENT handler and returns cleanly, exactly like a missing
+    intermediate ancestor. Under the earlier ``dirname(root_real)`` anchor the
+    initial ``os.open`` of the missing parent raised before any handler ran."""
+    library = tmp_path / "library"
+    root = library / "movies"
+    target = root / "Some Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])  # root resolved while the mount is present
+    # The mount vanishes: the root's own parent directory is gone.
+    shutil.rmtree(library)
+    assert not library.exists()
+
+    fs.delete(os.fspath(target))  # must NOT raise -- already gone, idempotent no-op
+
+
+def test_delete_guard_refuses_mirrors_platform_capability_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: on a platform that cannot guarantee fd-anchored, no-follow delete
+    containment, ``delete`` refuses EVERY path up front -- so the read-only
+    predicate ``delete_guard_refuses`` (purge / retention-telemetry's would-evict
+    simulation) must refuse the same in-root breadcrumbs, or callers would report
+    them as evictable and walk their bytes before the real delete refuses. Both
+    share ``_delete_containment_supported``; force it False and assert they agree."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    breadcrumb = root / "movie.mkv"
+    breadcrumb.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    # Sanity: with the capability present, an in-root breadcrumb is NOT refused.
+    assert fs.delete_guard_refuses(os.fspath(breadcrumb)) is False
+
+    monkeypatch.setattr(
+        "plex_manager.adapters.filesystem.local._delete_containment_supported",
+        lambda: False,
+    )
+
+    # The predicate must now mirror delete()'s up-front platform refusal.
+    assert fs.delete_guard_refuses(os.fspath(breadcrumb)) is True
+    with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
+        fs.delete(os.fspath(breadcrumb))
+    assert breadcrumb.exists()  # nothing was deleted
+
+
+def test_delete_refuses_dotdot_path_that_normalization_would_retarget(
+    tmp_path: Path,
+) -> None:
+    """Codex P1: ``realpath`` collapses ``Gone/..`` LEXICALLY when ``Gone`` does
+    not exist -- POSIX lookup of ``/root/Gone/../Other`` is ENOENT, yet the
+    normalized guarded location names the live sibling ``/root/Other`` (and a
+    ``..`` LEAF names the parent directory itself, i.e. the whole root). Acting
+    on the normalized location would therefore delete an entry the supplied
+    path does not name. Non-normalized paths must be refused outright -- by
+    ``delete`` (raised) and ``delete_guard_refuses`` (True) alike."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    other = root / "Other"
+    other.mkdir()
+    survivor = other / "movie.mkv"
+    survivor.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    dotdot_sibling = f"{os.fspath(root)}{os.sep}Gone{os.sep}..{os.sep}Other"
+    dotdot_leaf = f"{os.fspath(root)}{os.sep}Gone{os.sep}.."  # collapses to the root
+    dot_component = f"{os.fspath(root)}{os.sep}.{os.sep}Other"
+
+    for malformed in (dotdot_sibling, dotdot_leaf, dot_component):
+        assert fs.delete_guard_refuses(malformed) is True
+        with pytest.raises(LocalFileSystemError, match="refusing to delete"):
+            fs.delete(malformed)
+
+    assert survivor.read_bytes() == b"x" * 100  # the collapsed-onto sibling survives
+    assert root.is_dir()  # and so does the root a '..' leaf collapses onto
+
+
+def test_delete_refuses_trailing_slash_that_would_dereference_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: for ``/root/link.mkv/`` the basename is EMPTY, so the guarded
+    entry location is built from ``realpath('/root/link.mkv')`` -- which
+    dereferences the symlink -- and the walk would unlink the link's TARGET
+    while the caller named the link (POSIX refuses ``link/`` with ENOTDIR).
+    An empty final component must be refused outright, leaving both the link
+    entry and its target untouched."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Other Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+    link = root / "link.mkv"
+    os.symlink(target, link)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    slashed = os.fspath(link) + os.sep
+
+    assert fs.delete_guard_refuses(slashed) is True
+    with pytest.raises(LocalFileSystemError, match="refusing to delete"):
+        fs.delete(slashed)
+
+    assert link.is_symlink()  # the link entry survives
+    assert target.read_bytes() == b"x" * 100  # and its target was never unlinked
+
+
+def test_delete_traverses_execute_only_ancestors_like_pathname_unlink(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: plain pathname ``unlink`` needs only SEARCH (execute)
+    permission on ancestors, but an ``O_RDONLY`` fd walk would demand READ on
+    every one of them and spuriously EACCES on a locked-down, execute-only
+    mount parent -- a path ``delete_guard_refuses`` reports as evictable. The
+    walk opens ancestors with ``O_PATH`` (search-only) where available, so a
+    breadcrumb under an execute-only ancestor still deletes."""
+    if not hasattr(os, "O_PATH"):
+        pytest.skip("requires O_PATH (Linux) for search-only ancestor traversal")
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    locked = tmp_path / "locked"
+    root = locked / "movies"
+    target = root / "Some Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])  # realpath'd while readable
+    # Owner-only masks: 0o100 (owner execute-only, no read) is the scenario
+    # under test -- the walk runs as the owner, so owner-x alone proves
+    # search-only traversal, and is STRICTER than a world-execute mask.
+    os.chmod(locked, 0o100)  # execute-only: search yes, read no
+    try:
+        assert fs.delete_guard_refuses(os.fspath(target)) is False
+        fs.delete(os.fspath(target))
+        assert not target.exists()
+    finally:
+        os.chmod(locked, 0o700)  # restore (owner-only) so pytest can clean tmp_path
+
+
+# --------------------------------------------------------------------------- #
 # reclaimable_bytes — hardlink-aware freed-bytes accounting (R4-6, ADR-0012)
 # --------------------------------------------------------------------------- #
 def test_reclaimable_bytes_reports_full_size_for_a_single_link_file(tmp_path: Path) -> None:

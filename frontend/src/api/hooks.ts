@@ -324,15 +324,22 @@ export function usePlexLibraries(enabled = true) {
 
 /* --------------------------------------------------------------- discover -- */
 
-export function useDiscoverHome(options?: { enabled?: boolean }) {
+export function useDiscoverHome(options?: { enabled?: boolean; loadId?: string }) {
+  const loadId = options?.loadId
   return useQuery({
-    queryKey: queryKeys.discoverHome,
+    queryKey: queryKeys.discoverHome(loadId),
     // Callers that mount on every authenticated route (the header search
     // overlay) gate this on visibility so /discover/home's TMDB fan-out only
-    // runs when its data can actually be seen. Discover itself passes nothing.
+    // runs when its data can actually be seen. Discover itself is always
+    // visible and instead passes its per-mount `loadId`, which seeds the
+    // server's stable personalized-row selection (issue #191).
     enabled: options?.enabled ?? true,
     queryFn: async (): Promise<DiscoverHomeResponse> =>
-      unwrap(await client.GET('/api/v1/discover/home')),
+      unwrap(
+        await client.GET('/api/v1/discover/home', {
+          params: { query: loadId === undefined ? {} : { load_id: loadId } },
+        }),
+      ),
   })
 }
 

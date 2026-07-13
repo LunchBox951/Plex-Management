@@ -1,8 +1,10 @@
-# ADR-0023: First-party container updater with app-owned policy
+# ADR-0024: First-party container updater with app-owned policy
 
 - **Status:** Accepted
 - **Date:** 2026-07-12
 - **Resolves:** [issue #200](https://github.com/LunchBox951/Plex-Management/issues/200)
+- **Qualifies:** [ADR-0023](0023-database-rollback-and-pre-migration-backup.md)
+  for releases published to moving automatic-update tags only.
 - **Context builds on:** [ADR-0003](0003-docker-ghcr-packaging.md) (Docker/GHCR
   packaging), [ADR-0004](0004-edge-stable-release-channels.md) (tag-controlled
   channels), [ADR-0005](0005-zero-terminal-web-operability.md) (web operation),
@@ -82,6 +84,13 @@ secret-bearing URLs.
 
 ### Migration compatibility and rollback
 
+ADR-0023 remains the default policy for manual/pinned releases: a rollback
+across a migration restores the pre-migration database and encryption-key
+recovery unit before starting the older image. This decision defines a narrower
+exception only for releases published to moving tags consumed by the opt-in
+updater. Publishing such a release certifies the compatibility rule below; it
+does not weaken ADR-0023 for any other deployment path.
+
 Container rollback does **not** run `alembic downgrade`; data migrations and
 schema contraction cannot be made reliably reversible after a newer process has
 served traffic. Therefore every release eligible for automatic update must obey
@@ -111,6 +120,15 @@ pinned/manual upgrade instructions. Publishing to such a tag is the release
 process's assertion that the N/N-1 rule holds; this first version does not define
 or enforce a per-image compatibility flag in the updater.
 
+The ordinary entrypoint still creates ADR-0023's pre-migration backup before the
+candidate runs Alembic. The sidecar never restores database or key bytes. A
+partially applied migration, an incorrectly certified release, or an N-1 clone
+that cannot become healthy therefore stops automatic recovery without deleting
+the retained container or updater state; the operator restores the recorded
+pre-migration recovery unit using ADR-0023's runbook. Auto-update migrations
+must be expand-first, N/N-1 compatible, and safe to retry from every interrupted
+point precisely so that this manual path is exceptional rather than implicit.
+
 ## Consequences
 
 - Operators can control updates completely from the admin UI without granting
@@ -123,6 +141,8 @@ or enforce a per-image compatibility flag in the updater.
 - Automatic update rollback restores application bytes and container
   configuration, not old database bytes. The N/N-1 migration compatibility rule
   becomes a release-process requirement for every moving automatic-update tag.
+- ADR-0023's backup remains the manual recovery unit when the stricter moving-tag
+  assertion is violated or a migration is interrupted in an incompatible state.
 - Opting in adds a Docker-socket-bearing container. Operators who do not accept
   that authority can leave the profile disabled and update with normal Compose
   commands.

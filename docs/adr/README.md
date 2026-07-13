@@ -28,12 +28,14 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0020](0020-episode-level-fallback-whole-season.md) | Episode-level fallback for whole-season TV requests | Accepted |
 | [0021](0021-trusted-host-setup-hardening.md) | Trusted-Host validation on the setup flow | Accepted |
 | [0022](0022-claim-before-purge-correction-order.md) | report-issue claims the active slot before the irreversible purge (supersedes ADR-0014's ordering) | Accepted |
-| [0023](0023-first-party-container-auto-updater.md) | First-party container updater with app-owned policy | Accepted |
+| [0023](0023-database-rollback-and-pre-migration-backup.md) | Database rollback policy and automatic pre-migration backup | Accepted |
+| [0024](0024-first-party-container-auto-updater.md) | First-party container updater with app-owned policy | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
 first frontend-alpha session; 0010–0021 across the subsequent beta feature
 sessions (each ADR's own header carries its date); 0022 during the post-beta
-documentation-audit session; and 0023 for the container auto-update design
-(both 2026-07-12). Full context:
+documentation-audit session (2026-07-12); 0023 during the v1 release-readiness
+session (2026-07-12); and 0024 for the container auto-update design
+(2026-07-12). Full context:
 [`docs/design/overview.md`](../design/overview.md).

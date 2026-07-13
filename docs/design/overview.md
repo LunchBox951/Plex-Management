@@ -184,7 +184,7 @@ database-backed drain lease; only the private, internally authenticated sidecar
 receives Docker authority. See
 [ADR-0003](../adr/0003-docker-ghcr-packaging.md),
 [ADR-0004](../adr/0004-edge-stable-release-channels.md), and
-[ADR-0023](../adr/0023-first-party-container-auto-updater.md).
+[ADR-0024](../adr/0024-first-party-container-auto-updater.md).
 
 Two channels, by image **tag**, with a **promotion gate**: the canary (beta)
 fleet rides `:edge`; once a build proves itself, *you promote it by re-tagging the
@@ -209,14 +209,21 @@ flowchart TD
     end
 ```
 
-Config and database live in a **mounted volume** so container replacement never
-removes user data. The updater keeps the previous image/container configuration
-until the replacement is healthy and restores it on startup failure. It never
-runs an Alembic downgrade: rollback starts a clone of the previous application
-image/configuration while bypassing that old image's now-behind Alembic
-entrypoint. Every automatically installable release must therefore leave a
-database that the immediately previous application can still run against, using
-expand/migrate/contract migrations where necessary.
+Config and database live in a **mounted volume**, which persists them across
+restarts and updates — the volume is not a backup. Every container start runs
+`alembic upgrade head` before serving. When no migration ran between two
+versions, rollback is re-pointing a tag; across a migration, rollback instead
+means restoring the pre-migration backup (database + encryption key), then
+running the older tag — see
+[ADR-0023](../adr/0023-database-rollback-and-pre-migration-backup.md).
+
+The opt-in updater keeps the previous image/container configuration until its
+replacement is healthy. Moving tags offered to that updater have the stricter
+ADR-0024 release contract: migrations must leave N-1 able to run against the
+post-migration schema, so a failed startup can restore the retained N-1
+image/configuration without Alembic downgrade. The pre-migration backup remains
+the manual recovery unit for partially applied or incorrectly certified
+migrations; the sidecar never claims to restore database bytes.
 
 ## 7. Technology stack
 

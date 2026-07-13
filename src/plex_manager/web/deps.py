@@ -273,7 +273,7 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # below.
     "anime_movie_root",
     "anime_tv_root",
-    # Opt-in container updates (ADR-0023). The updater's bearer credential is a
+    # Opt-in container updates (ADR-0024). The updater's bearer credential is a
     # Compose secret and deliberately does not appear in this public store.
     "automatic_updates_enabled",
     "automatic_update_timezone",

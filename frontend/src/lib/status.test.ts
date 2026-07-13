@@ -83,6 +83,29 @@ describe('isInFlightRequestStatus', () => {
 })
 
 /**
+ * Issue #205: the `REQUEST_STATUS`/`DOWNLOAD_STATUS` maps are typed
+ * `Record<RequestStatusValue, …>` / `Record<DownloadStateValue, …>` so a
+ * backend enum add/rename fails `tsc` right here, but a value that is
+ * unrecognized AT RUNTIME (a rolling deploy: a stale bundle talking to a
+ * newer backend) must still render neutrally — never throw, never crash the
+ * badge — exactly like it did before the typing (acceptance criterion #3).
+ */
+describe('unknown-status runtime fallback (issue #205)', () => {
+  it('requestStatus renders a future backend status neutrally instead of throwing', () => {
+    expect(() => requestStatus('some_future_status')).not.toThrow()
+    expect(requestStatus('some_future_status')).toEqual({
+      label: 'Some future status',
+      intent: 'neutral',
+    })
+  })
+
+  it('downloadStatus renders a future backend state neutrally instead of throwing', () => {
+    expect(() => downloadStatus('future')).not.toThrow()
+    expect(downloadStatus('future')).toEqual({ label: 'Future', intent: 'neutral' })
+  })
+})
+
+/**
  * `glyphKind` (issue #135) is `TileStatusGlyph`'s StatusPresentation -> icon
  * mapping. Bare `StatusIntent` only has five buckets, but the tile needs six
  * distinct pictograms — these tests pin the two label-based splits that make
