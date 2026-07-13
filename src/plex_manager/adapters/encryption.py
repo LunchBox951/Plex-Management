@@ -403,6 +403,73 @@ def _publish_key_no_hardlink(key_path: Path, key: bytes) -> bytes:
         # every reap; the deadline bounds the wait.
 
 
+def _recover_invalid_final_after_link_exists(key_path: Path, tmp_name: str, key: bytes) -> bytes:
+    """Recover from the primary (hardlink) commit's ``FileExistsError`` when the
+    existing final is INVALID (the caller already handles the valid case: adopt
+    it as-is, unchanged).
+
+    ``os.link``'s EEXIST check fires before a filesystem's hardlink-support
+    check, so this same ``FileExistsError`` -- not the
+    ``_KEY_LINK_FALLBACK_ERRNOS`` ``OSError`` -- also occurs on a
+    hardlink-refusing data dir (exFAT/FAT/SMB) whenever ``key_path`` already
+    holds a crashed fallback committer's invalid partial. That masks the
+    ``OSError`` fallback branch that would otherwise route into
+    :func:`_publish_key_no_hardlink`'s lock-guarded, age-gated recovery,
+    forcing a manual ``secret.key`` deletion to unstick a fresh install.
+
+    Recovery here is a single, lock-guarded, age-gated attempt -- never an
+    unbounded wait:
+
+    1. Acquire the publish lock (mirroring :func:`_publish_key_no_hardlink`'s
+       own use of it) and call :func:`_reap_stale_partial_final`, which only
+       ever removes an INVALID file older than
+       :data:`_STALE_PARTIAL_FINAL_SECONDS`. A young file (a possibly-live
+       racer's in-flight commit) is never touched.
+    2. Release the lock and retry ``os.link`` once more.
+
+    * If the retry succeeds, the tempfile's key is now the canonical final.
+    * If it raises ``FileExistsError`` again, the destination survived the
+      reap attempt (still young, or a valid key materialized meanwhile):
+      adopt it if it is now valid, else fail loudly with no further wait --
+      nothing this call does can ever make a young file valid, and a
+      genuinely hardlink-CAPABLE filesystem with operator-restored garbage
+      must keep failing loudly here, exactly as before (never silently
+      replaced, at any age).
+    * If it raises the hardlink-fallback ``OSError`` -- now unmasked because
+      the blocking destination is gone -- this filesystem genuinely does not
+      support hardlinks: delegate to :func:`_publish_key_no_hardlink` for its
+      full lock-guarded recovery/convergence loop.
+
+    If the publish lock is already held (a live commit in progress via either
+    route), delegate straight to :func:`_publish_key_no_hardlink`, which
+    already knows how to ride out a live holder or reap a genuinely stale
+    lock -- avoiding a second, competing single-shot reap here.
+    """
+    lock_dir = key_path.with_name(key_path.name + _PUBLISH_LOCK_SUFFIX)
+    try:
+        os.mkdir(os.fspath(lock_dir), 0o700)
+    except FileExistsError:
+        return _publish_key_no_hardlink(key_path, key)
+    try:
+        _reap_stale_partial_final(key_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(os.fspath(lock_dir))
+    try:
+        os.link(tmp_name, os.fspath(key_path))
+    except FileExistsError:
+        existing = _read_valid_key(key_path)
+        if existing is not None:
+            return existing
+        raise _corrupt_key_error(key_path) from None
+    except OSError as exc:
+        if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
+            raise
+        return _publish_key_no_hardlink(key_path, key)
+    logger.info("generated new encryption key at %s", key_path)
+    return key
+
+
 def _generate_key_file(key_path: Path) -> bytes:
     """Atomically mint the first-run key, or re-read an existing one on a lost race.
 
@@ -416,6 +483,15 @@ def _generate_key_file(key_path: Path) -> bytes:
     orphan the winner's already-cached key and render any data it encrypted
     permanently undecryptable. An existing key is therefore NEVER overwritten.
     The linked file inherits the tempfile's ``0o600`` mode.
+
+    A ``FileExistsError`` with an INVALID existing final is not necessarily a
+    race loss, though: ``os.link``'s EEXIST check fires before a filesystem's
+    hardlink-support check, so a hardlink-refusing data dir raises this same
+    error -- not the fallback ``OSError`` below -- when the final is a crashed
+    fallback committer's partial.
+    :func:`_recover_invalid_final_after_link_exists` routes that case into the
+    same lock-guarded, age-gated recovery the ``OSError`` branch below uses,
+    instead of failing outright (issue #149).
 
     On a filesystem that does not support hardlinks at all (exFAT/FAT/SMB —
     ``os.link`` raises ``OSError`` with an errno in ``_KEY_LINK_FALLBACK_ERRNOS``,
@@ -445,11 +521,15 @@ def _generate_key_file(key_path: Path) -> bytes:
         try:
             os.link(tmp_name, os.fspath(key_path))
         except FileExistsError:
-            # Lost the race: another worker already published the canonical key.
+            # Lost the race: another worker already published the canonical
+            # key -- OR (see _recover_invalid_final_after_link_exists) the
+            # final is a crashed fallback committer's INVALID partial on a
+            # hardlink-refusing filesystem, where this same error fires
+            # because EEXIST is checked before hardlink support (issue #149).
             existing = _read_valid_key(key_path)
-            if existing is None:
-                raise _corrupt_key_error(key_path) from None
-            return existing
+            if existing is not None:
+                return existing
+            return _recover_invalid_final_after_link_exists(key_path, tmp_name, key)
         except OSError as exc:
             if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
                 raise
@@ -500,9 +580,13 @@ def ensure_secret_key() -> Fernet:
     hardlink-less filesystem it can be a crashed fallback commit's partial, and
     pre-init no data exists under any key, so the publish path may recover it
     (adopt a racing writer's completed key, or age-reap the stale partial and
-    re-mint). On a hardlink-capable filesystem a crash cannot leave a partial
-    final at all, so an invalid file there still fails loudly with the
-    corrupt-key error via the ``os.link`` route -- never silently replaced.
+    re-mint) -- including when that filesystem's ``os.link`` masks the crash as
+    a ``FileExistsError`` rather than the expected fallback ``OSError``, since
+    EEXIST is checked before hardlink support
+    (:func:`_recover_invalid_final_after_link_exists`, issue #149). On a
+    genuinely hardlink-capable filesystem a crash cannot leave a partial final
+    at all, so an invalid file there still fails loudly with the corrupt-key
+    error -- never silently replaced, at any age.
     """
     global _fernet
     if _fernet is not None:

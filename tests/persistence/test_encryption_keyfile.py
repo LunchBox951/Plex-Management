@@ -571,3 +571,102 @@ def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch
     finally:
         get_settings.cache_clear()
         encryption.reset_fernet_cache()
+
+
+def _existence_first_link(src: str, dst: str, **kwargs: object) -> None:
+    """Test double for a hardlink-refusing filesystem (issue #149).
+
+    A REAL hardlink-refusing mount (exFAT/FAT/SMB) still raises
+    ``FileExistsError`` -- not the hardlink-unsupported ``OSError`` -- when
+    the destination already exists: the kernel's EEXIST check fires before it
+    ever gets to ask whether the filesystem supports hardlinks at all. Only
+    once the destination is absent does the "no hardlinks here" ``OSError``
+    (``EPERM``/``EOPNOTSUPP``/etc.) surface. Beta hosts are ext4 (genuinely
+    hardlink-capable), so this fake is what stands in for that filesystem class
+    in tests -- never a real exotic-FS mount.
+    """
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "File exists", dst)
+    raise OSError(errno.EPERM, "hardlinks unsupported", dst)
+
+
+def test_generate_key_file_recovers_crashed_partial_behind_file_exists_error(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #149: on a hardlink-refusing filesystem, a crashed fallback
+    committer's INVALID partial at ``secret.key`` makes the PRIMARY (hardlink)
+    path's ``os.link`` raise ``FileExistsError`` -- not the ``OSError`` the
+    no-hardlink fallback branch expects -- because existence is checked before
+    hardlink support. That must no longer short-circuit straight to the
+    corrupt-key error: once the partial is old enough to be provably a crash
+    victim (not a live racer), it must be routed into the same lock-guarded
+    reap-and-republish recovery the ``OSError`` branch uses, and first-run key
+    creation must complete instead of requiring a manual ``secret.key``
+    deletion."""
+    file_backed_key.write_bytes(b"\x00" * 10)  # a crashed committer's partial
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+    assert not file_backed_key.with_name(file_backed_key.name + ".lock").exists()
+
+
+def test_generate_key_file_existence_first_link_still_adopts_valid_key(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No data loss for a valid existing key: on the same hardlink-refusing,
+    existence-checked-first filesystem double, a VALID existing key must be
+    adopted as-is -- never reaped, never replaced -- even though the primary
+    path observes the identical ``FileExistsError`` as the crashed-partial
+    case."""
+    original = Fernet.generate_key()
+    file_backed_key.write_bytes(original)
+    old = time.time() - 3600  # old enough to be reap-eligible IF it were invalid
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == original
+    assert file_backed_key.read_bytes() == original
+
+
+def test_generate_key_file_existence_first_link_never_reaps_young_partial(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The age gate still applies under the existence-first fake: a YOUNG
+    invalid partial (a possibly-live racer's in-flight commit) must be left
+    untouched and the call must fail loudly and PROMPTLY -- no long wait for
+    it to age out mid-call."""
+    file_backed_key.write_bytes(b"in-flight")  # young: mtime ~now
+    monkeypatch.setattr(os, "link", _existence_first_link)
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep retries instant
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert file_backed_key.read_bytes() == b"in-flight"  # untouched
+
+
+def test_ensure_secret_key_recovers_crashed_partial_behind_file_exists_error(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement (c) end-to-end via ``ensure_secret_key`` (the real first-run
+    entry point): a stale crashed partial that manifests as ``FileExistsError``
+    on the primary path must not brick a fresh install -- no manual
+    ``secret.key`` deletion required."""
+    file_backed_key.write_bytes(b"crashed-partial")
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    fernet = encryption.ensure_secret_key()
+
+    stored = file_backed_key.read_bytes()
+    assert encryption._is_valid_fernet_key(stored)  # pyright: ignore[reportPrivateUsage]
+    assert Fernet(stored).decrypt(fernet.encrypt(b"payload")) == b"payload"
