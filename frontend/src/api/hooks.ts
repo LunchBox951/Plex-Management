@@ -231,6 +231,14 @@ export function useUpdateSettings() {
       // (['discover','home']) and every queryKeys.discover(query, year) variant
       // (['discover', query, year]) with this one call (issue #14).
       void qc.invalidateQueries({ queryKey: ['discover'] })
+      // A save may have re-pointed a service, and the Settings page reads
+      // health with poll:false — so with the realtime stream disconnected
+      // nothing else would ever refresh its cards and they'd keep showing the
+      // OLD server's Connected/Down until a manual Validate (honesty gap;
+      // north star #3). The backend already busts the affected subsystem's
+      // probe cache on PUT /settings (issue #93), so this refetch re-probes
+      // the freshly saved credentials, not a stale snapshot.
+      void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
     },
   })
 }
@@ -304,9 +312,13 @@ export function usePlexLibraries(enabled = true) {
 
 /* --------------------------------------------------------------- discover -- */
 
-export function useDiscoverHome() {
+export function useDiscoverHome(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.discoverHome,
+    // Callers that mount on every authenticated route (the header search
+    // overlay) gate this on visibility so /discover/home's TMDB fan-out only
+    // runs when its data can actually be seen. Discover itself passes nothing.
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<DiscoverHomeResponse> =>
       unwrap(await client.GET('/api/v1/discover/home')),
   })
@@ -328,10 +340,13 @@ export function useDiscoverSearch(query: string, year?: number) {
 
 /* --------------------------------------------------------------- requests -- */
 
-export function useRequests(options?: { poll?: boolean }) {
+export function useRequests(options?: { poll?: boolean; enabled?: boolean }) {
   const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.requests,
+    // Observers behind a closed surface (the header search overlay) disable
+    // themselves entirely; they read the shared cache when they wake up.
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
     // Two-tier: fast cadence when the stream is down, a slow floor (never off)
     // when it is up — the permanent safety net against a zombie stream.

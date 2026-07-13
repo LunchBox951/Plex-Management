@@ -19,6 +19,7 @@ from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
     EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_MAX_ROWS_MAX,
     LOG_RETENTION_DAYS_MAX,
 )
 from plex_manager.web.url_validation import url_shape_error
@@ -530,6 +531,9 @@ class SettingsResponse(BaseModel):
     eviction_proactive_enabled: bool | None = None
     eviction_interval_minutes: float | None = None
     log_retention_days: int | None = None
+    # The row-count companion to log_retention_days (issue #152) — same
+    # unset/degraded-to-default ``None`` wire semantics.
+    log_max_rows: int | None = None
     # Auto-grab worker (ADR-0013) — the master on/off switch for the background
     # request->search->grab loop (default ON in ``web.deps``; ``None`` = unset =
     # the default applies). Plain boolean config, same wire semantics as
@@ -637,6 +641,9 @@ class SettingsUpdate(BaseModel):
         default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
     )
     log_retention_days: int | None = Field(default=None, ge=0, le=LOG_RETENTION_DAYS_MAX)
+    # The row-count companion to log_retention_days (issue #152) — same
+    # write-time bound pattern as every other bounded-count setting above.
+    log_max_rows: int | None = Field(default=None, ge=0, le=LOG_MAX_ROWS_MAX)
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)

@@ -635,6 +635,54 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
 
 
+# Segment forms that are ambiguous under percent-decoding: a reverse proxy
+# (the whole premise of a configured path prefix) commonly decodes these
+# before it routes, so "prowlarr/%2e%2e/admin" reaches the sibling "/admin"
+# backend exactly like a literal "prowlarr/../admin" would. Checked against
+# the RAW, casefolded segment text (no decoding performed here) so we never
+# have to reason about *how much* a downstream proxy decodes.
+_AMBIGUOUS_PATH_SEGMENT_FORMS: Final = frozenset({".", "..", "%2e", "%2e.", ".%2e", "%2e%2e"})
+
+
+def _has_ambiguous_path_segment(segments: tuple[str, ...]) -> bool:
+    for part in segments:
+        folded = part.casefold()
+        if folded in _AMBIGUOUS_PATH_SEGMENT_FORMS:
+            return True
+        # An encoded or literal slash/backslash inside one raw segment hides an
+        # extra path boundary from this segment split entirely; a downstream
+        # proxy or the eventual fetch may still honor it as a separator.
+        if "%2f" in folded or "%5c" in folded or "\\" in part:
+            return True
+    return False
+
+
+def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, ...]] | None:
+    """Like :func:`_source_origin_triple`, plus the candidate's path segments.
+
+    The configured Prowlarr base may carry a reverse-proxy path prefix
+    (``http://127.0.0.1:9696/prowlarr``); ADR-0018 treats that prefix as a
+    service/credential boundary, so the trusted-source match must include it,
+    not just scheme/host/port. Segments are the RAW (undecoded), CASE-SENSITIVE
+    path split on ``/`` with empty segments dropped — paths are case-sensitive
+    (unlike host), and comparing raw text keeps mixed-case tricks from slipping
+    past the match. A literal or percent-encoded ``.``/``..`` segment, or a
+    segment hiding an encoded/literal slash, is ambiguous (its resolved meaning
+    depends on what the reverse proxy normalizes/decodes to) so it is rejected
+    here too: the caller falls through to the full SSRF veto rather than trying
+    to interpret it, mirroring ``ServiceUrl``'s own dot-segment rejection for
+    the configured base itself.
+    """
+    origin = _source_origin_triple(url)
+    if origin is None:
+        return None
+    path = urlparse(url).path
+    segments = tuple(part for part in path.split("/") if part)
+    if _has_ambiguous_path_segment(segments):
+        return None
+    return origin, segments
+
+
 async def _assert_safe_fetch_url(url: str) -> None:
     try:
         parsed = urlparse(url)
@@ -853,15 +901,35 @@ class QbittorrentClient:
         self._source_client = source_client
         # The OPERATOR-CONFIGURED Prowlarr base URL (the endpoint the app already
         # trusts with an API key for every search call), normalized to its
-        # (scheme, host, port) origin. A torrent-source hop on EXACTLY this origin
-        # skips the private-address SSRF veto — Prowlarr routinely serves magnetless
+        # (scheme, host, port) origin plus its reverse-proxy path prefix. A
+        # torrent-source hop on EXACTLY this origin AND beneath this prefix skips
+        # the private-address SSRF veto — Prowlarr routinely serves magnetless
         # .torrent downloadUrls pointing at itself, and on the normal self-hosted
         # layout that host is 127.0.0.1 / RFC1918 / a compose alias, which the veto
-        # would otherwise make ungrabbable. Matching is by URL origin, never DNS
-        # results, and per hop: a redirect OFF this origin re-enters the full veto.
-        self._trusted_source_origin = (
-            _source_origin_triple(trusted_source_origin) if trusted_source_origin else None
-        )
+        # would otherwise make ungrabbable. Matching is by URL origin + path
+        # prefix, never DNS results, and per hop: a redirect OFF this origin or
+        # prefix re-enters the full veto. Parsed through the same canonical
+        # ``ServiceUrl`` the base URL itself uses, so the prefix is validated and
+        # normalized identically (dot-segments, trailing slash, etc). The origin
+        # itself is still derived via ``_source_origin_triple`` (not
+        # ``ServiceUrl.origin``): the latter IDNA-decodes to Unicode via
+        # ``httpx.URL.host``, while every per-hop candidate is normalized with
+        # ``urlparse``, which keeps punycode ASCII — comparing the two would
+        # silently and permanently deny trust for an IDNA-hostname Prowlarr base.
+        # Keeping both sides on ``_source_origin_triple`` preserves the single
+        # normalization the pre-fix code already relied on.
+        self._trusted_source_origin: tuple[str, str, int] | None = None
+        self._trusted_source_prefix: tuple[str, ...] = ()
+        if trusted_source_origin:
+            try:
+                trusted_service = ServiceUrl.parse(trusted_source_origin)
+            except InvalidServiceUrl:
+                pass
+            else:
+                self._trusted_source_origin = _source_origin_triple(trusted_service.base)
+                self._trusted_source_prefix = tuple(
+                    part for part in urlparse(trusted_service.base).path.split("/") if part
+                )
         if trusted_source_origin and self._trusted_source_origin is None:
             # The stored Prowlarr URL is not a usable origin (malformed IPv6
             # literal / bad port / non-http scheme — PUT /settings does not
@@ -1121,10 +1189,24 @@ class QbittorrentClient:
         return None, None
 
     def _is_trusted_source_url(self, url: str) -> bool:
-        """Whether ``url`` sits on the operator-configured trusted source origin."""
+        """Whether ``url`` sits beneath the trusted source origin's configured prefix.
+
+        Origin equality alone is not enough: the configured Prowlarr base may
+        carry a reverse-proxy path prefix that is itself a service/credential
+        boundary (ADR-0018). A same-origin URL must also match that prefix at a
+        path-SEGMENT boundary (``/prowlarr-evil`` must not match a ``/prowlarr``
+        prefix via plain string ``startswith``).
+        """
         if self._trusted_source_origin is None:
             return False
-        return _source_origin_triple(url) == self._trusted_source_origin
+        parsed = _source_origin_and_path(url)
+        if parsed is None:
+            return False
+        origin, segments = parsed
+        if origin != self._trusted_source_origin:
+            return False
+        prefix = self._trusted_source_prefix
+        return len(segments) >= len(prefix) and segments[: len(prefix)] == prefix
 
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
         if self._source_client is not None:

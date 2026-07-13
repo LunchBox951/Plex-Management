@@ -76,6 +76,7 @@ from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
     EVICTION_INTERVAL_MAX_MINUTES,
+    LOG_MAX_ROWS_MAX,
     LOG_RETENTION_DAYS_MAX,
 )
 
@@ -95,6 +96,8 @@ __all__ = [
     "EVICTION_INTERVAL_MINUTES_DEFAULT",
     "EVICTION_PROACTIVE_ENABLED_DEFAULT",
     "KNOWN_SETTING_KEYS",
+    "LOG_MAX_ROWS_DEFAULT",
+    "LOG_MAX_ROWS_MAX",
     "LOG_RETENTION_DAYS_DEFAULT",
     "LOG_RETENTION_DAYS_MAX",
     "PLEX_MACHINE_ID_SETTING",
@@ -129,6 +132,7 @@ __all__ = [
     "get_library",
     "get_library_optional",
     "get_log_handler",
+    "get_log_max_rows",
     "get_log_retention_days",
     "get_media_probe",
     "get_movies_root",
@@ -155,6 +159,7 @@ __all__ = [
     "resolve_disk_pressure_percents",
     "resolve_eviction_grace_days",
     "resolve_eviction_interval_minutes",
+    "resolve_log_max_rows",
     "resolve_log_retention_days",
     "resolve_qbittorrent",
 ]
@@ -237,6 +242,10 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "eviction_proactive_enabled",
     "eviction_interval_minutes",
     "log_retention_days",
+    # The row-count companion to log_retention_days (issue #152): bounds
+    # log_events growth even when age-based pruning alone never trips (a
+    # chatty install with a generous retention window).
+    "log_max_rows",
     # Auto-grab worker (ADR-0013): the master on/off switch for the background
     # request->search->grab loop. Web-editable, plain boolean config (default ON),
     # read every tick so a web toggle takes effect on the next cycle -- the
@@ -1316,6 +1325,12 @@ EVICTION_ENABLED_DEFAULT: bool = True
 EVICTION_PROACTIVE_ENABLED_DEFAULT: bool = False
 EVICTION_INTERVAL_MINUTES_DEFAULT: float = 30.0
 LOG_RETENTION_DAYS_DEFAULT: int = 7
+# The row-count companion to LOG_RETENTION_DAYS_DEFAULT (issue #152): bounds
+# ``log_events`` growth even under a chatty install with a generous retention
+# window, where age-based pruning alone would never trip. 100,000 rows is
+# generous for a single beta-week install's diagnostic trail while staying
+# comfortably small for SQLite.
+LOG_MAX_ROWS_DEFAULT: int = 100_000
 # Auto-grab worker (ADR-0013): the background request->search->grab loop runs by
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
@@ -1528,21 +1543,26 @@ def resolve_eviction_interval_minutes(raw: str | None) -> tuple[float, bool]:
     return parsed, True
 
 
-def _resolve_bounded_days(
+def _resolve_bounded_count(
     key: str, raw: str | None, default: int, maximum: int
 ) -> tuple[int, bool]:
-    """Resolve a day-count setting to ``[0, maximum]`` (grace / log retention).
+    """Resolve a non-negative integer setting to ``[0, maximum]`` (grace / log
+    retention days, and the ``log_max_rows`` row cap -- none of these are a
+    ``timedelta`` specifically, just a bounded non-negative count).
 
     Above ``maximum`` clamps to it: a pre-bounds huge value was a legitimate
-    "effectively never evict / never expire" configuration, and substituting the
-    default on upgrade would be data-destructive (a 30-day grace suddenly makes
-    month-old titles evictable; a 7-day retention deletes logs the operator
-    meant to keep). NEGATIVE values fall back to the default, never a clamp to
-    0 -- a 0-day grace/retention is the DESTRUCTIVE end of the scale
-    (immediately evictable / nothing retained), the opposite of what a corrupt
-    value should degrade to; negative values also push the ``timedelta`` cutoff
-    into the future (over-evicting / wholesale log deletion), and a huge value
-    overflows ``timedelta`` (its own limit is 999,999,999 days).
+    "effectively never evict / never expire / never cap" configuration, and
+    substituting the default on upgrade would be data-destructive (a 30-day
+    grace suddenly makes month-old titles evictable; a 7-day retention deletes
+    logs the operator meant to keep). NEGATIVE values fall back to the default,
+    never a clamp to 0 -- a 0 grace/retention/row-cap is the DESTRUCTIVE end of
+    the scale (immediately evictable / nothing retained / nothing kept), the
+    opposite of what a corrupt value should degrade to; for the two day-count
+    callers, a negative value also pushes the ``timedelta`` cutoff into the
+    future (over-evicting / wholesale log deletion), and a huge value overflows
+    ``timedelta`` (its own limit is 999,999,999 days) -- the row-cap caller has
+    no ``timedelta`` at all, but the same directional policy is still the
+    honest choice for a corrupt/out-of-range stored count.
     """
     if raw is None:
         return default, True
@@ -1562,17 +1582,31 @@ def _resolve_bounded_days(
 
 
 def resolve_eviction_grace_days(raw: str | None) -> tuple[int, bool]:
-    """Resolve ``eviction_grace_days`` -- policy in :func:`_resolve_bounded_days`."""
-    return _resolve_bounded_days(
+    """Resolve ``eviction_grace_days`` -- policy in :func:`_resolve_bounded_count`."""
+    return _resolve_bounded_count(
         "eviction_grace_days", raw, EVICTION_GRACE_DAYS_DEFAULT, EVICTION_GRACE_DAYS_MAX
     )
 
 
 def resolve_log_retention_days(raw: str | None) -> tuple[int, bool]:
-    """Resolve ``log_retention_days`` -- policy in :func:`_resolve_bounded_days`."""
-    return _resolve_bounded_days(
+    """Resolve ``log_retention_days`` -- policy in :func:`_resolve_bounded_count`."""
+    return _resolve_bounded_count(
         "log_retention_days", raw, LOG_RETENTION_DAYS_DEFAULT, LOG_RETENTION_DAYS_MAX
     )
+
+
+def resolve_log_max_rows(raw: str | None) -> tuple[int, bool]:
+    """Resolve ``log_max_rows`` (issue #152) -- policy in :func:`_resolve_bounded_count`.
+
+    The retention sweep's ROW-COUNT companion to ``log_retention_days``'s AGE
+    cutoff: age-based pruning alone leaves ``log_events`` unbounded in row count
+    under a chatty install with a generous retention window. Same directional
+    policy as the day-count settings: a stored value above the cap CLAMPS (a
+    pre-bounds huge value meant "keep effectively everything"), a negative or
+    unparsable one DEFAULTS (0 rows kept is the destructive end of the scale,
+    never what a corrupt value should silently mean).
+    """
+    return _resolve_bounded_count("log_max_rows", raw, LOG_MAX_ROWS_DEFAULT, LOG_MAX_ROWS_MAX)
 
 
 def resolve_bool_setting(key: str, raw: str | None, default: bool) -> tuple[bool, bool]:
@@ -1719,6 +1753,21 @@ async def get_log_retention_days(session: AsyncSession) -> int:
     value, _honored = resolve_log_retention_days(
         await SettingsStore(session).get("log_retention_days")
     )
+    return value
+
+
+async def get_log_max_rows(session: AsyncSession) -> int:
+    """Row-count cap the retention sweep prunes ``log_events`` down to (issue
+    #152, default 100,000) -- the ROW-COUNT companion to
+    :func:`get_log_retention_days`'s AGE cutoff, closing the gap where a
+    chatty install with a generous retention window would otherwise grow the
+    table unboundedly.
+
+    Resolved through :func:`resolve_log_max_rows`, same directional policy as
+    every other bounded-count setting: above the MAX clamps, negative/garbage
+    falls back to the default.
+    """
+    value, _honored = resolve_log_max_rows(await SettingsStore(session).get("log_max_rows"))
     return value
 
 

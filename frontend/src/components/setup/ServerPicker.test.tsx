@@ -192,4 +192,34 @@ describe('ServerPicker', () => {
     // Custom entry stays available so the operator is never stuck.
     expect(screen.getByLabelText('Server URL')).toBeInTheDocument()
   })
+
+  it('embeds only the controls, surfaces errors, and preserves verified server output', async () => {
+    h.validate
+      .mockRejectedValueOnce(toApiError({ detail: 'server_not_owned' }, 403))
+      .mockResolvedValueOnce(plexOk())
+    const onVerified = vi.fn()
+    render(<ServerPicker embedded onVerified={onVerified} />)
+
+    expect(screen.queryByText('Pick your Plex server')).not.toBeInTheDocument()
+    expect(screen.queryByText(/these are the Plex Media Servers/i)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Plex server')).toBeInTheDocument()
+
+    const button = screen.getByRole('button', { name: /verify server/i })
+    fireEvent.click(button)
+    expect(
+      await screen.findByText(
+        'Your Plex account does not own this server. Pick a server you own, or sign in as the owner.',
+      ),
+    ).toBeInTheDocument()
+    expect(onVerified).not.toHaveBeenCalled()
+
+    fireEvent.click(button)
+    await waitFor(() =>
+      expect(onVerified).toHaveBeenCalledWith({
+        url: 'http://127.0.0.1:32400',
+        machine_identifier: 'MID-APOLLO',
+        libraries: plexOk().libraries,
+      }),
+    )
+  })
 })

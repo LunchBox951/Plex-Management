@@ -2,9 +2,12 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { useImportDownload, useMarkFailed, useQueue, useRelocateDownload } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
-import { downloadStatus } from '../lib/status'
+import { downloadStatus, INTENT_CLASSES } from '../lib/status'
 import type { ApiError } from '../lib/errors'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
+import { AdminPageHeader } from '../components/ui/AdminPageHeader'
+import { AdminEmptyState } from '../components/ui/AdminEmptyState'
+import { adminRowPadding } from '../components/ui/adminStyles'
 import { StatusBadge } from '../components/ui/StatusBadge'
 import { ProgressBar } from '../components/ui/ProgressBar'
 import { Button } from '../components/ui/Button'
@@ -191,14 +194,14 @@ export function Queue() {
     )
   } else if (items.length === 0) {
     content = (
-      <StateMessage
+      <AdminEmptyState
         title="Nothing downloading"
         message="Grab a release from a title's detail to see it here."
       />
     )
   } else {
     content = (
-      <div className="space-y-3">
+      <ul className="flex flex-col gap-2">
         {items.map((item) => (
           <QueueCard
             key={item.id}
@@ -211,32 +214,29 @@ export function Queue() {
             onRelocate={() => void runRelocate(item)}
           />
         ))}
-      </div>
+      </ul>
     )
   }
 
   return (
     <div className="mx-auto w-full max-w-[1160px] space-y-6 px-5 py-8 sm:px-8">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div className="flex items-baseline gap-3">
-          <h1 className="font-display text-2xl font-extrabold">Queue</h1>
-          {data ? (
-            <span className="font-mono text-sm text-muted">
-              {activeCount} active
-            </span>
-          ) : null}
-        </div>
-        <span className="inline-flex items-center gap-2 font-mono text-xs text-faint">
-          <span
-            className={cn(
-              'size-1.5 rounded-full',
-              isError ? 'bg-error' : 'animate-pulse bg-downloading',
-            )}
-            aria-hidden
-          />
-          {isError ? 'reconnecting…' : 'updating every 2s'}
-        </span>
-      </header>
+      <AdminPageHeader
+        title="Queue"
+        count={data ? `${activeCount} active` : undefined}
+        description="Everything the download client is holding, including blocked imports."
+        status={
+          <span className="inline-flex items-center gap-2">
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                isError ? 'bg-error' : 'motion-safe:animate-pulse bg-downloading',
+              )}
+              aria-hidden
+            />
+            {isError ? 'reconnecting…' : 'updating every 2s'}
+          </span>
+        }
+      />
 
       {content}
 
@@ -288,11 +288,11 @@ function QueueCard({
   onRelocate: () => void
 }) {
   const presentation = downloadStatus(item.status)
-  const isDownloadingLike = presentation.intent === 'downloading'
+  const showTransferProgress = item.status === 'downloading'
   const canMarkFailed = item.status !== 'importing'
-  const pct = Math.round(Math.min(1, Math.max(0, item.progress ?? 0)) * 100)
+  const progress = Math.min(1, Math.max(0, item.progress ?? 0))
+  const pct = Math.round(progress * 100)
   const shortHash = item.torrent_hash.slice(0, 12)
-  const detail = isDownloadingLike ? `${pct}%` : undefined
   const scopes = scopeBadges(item)
   const heading = queueHeading(item)
   // Only worth a second line when it says something the heading doesn't already:
@@ -306,111 +306,130 @@ function QueueCard({
   const showImg = Boolean(item.poster_url) && !imgFailed
 
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex min-w-0 flex-1 items-start gap-3">
-          {showImg ? (
-            <img
-              src={item.poster_url ?? undefined}
-              alt=""
-              loading="lazy"
-              className="aspect-[2/3] w-11 shrink-0 rounded object-cover"
-              onError={() => setImgFailed(true)}
+    <li
+      className={cn(
+        adminRowPadding,
+        'grid min-w-0 grid-cols-[38px_minmax(0,1fr)] items-start gap-x-[13px] gap-y-2',
+        'rounded-[10px] border border-hairline bg-surface',
+        'lg:grid-cols-[38px_minmax(0,1fr)_auto]',
+      )}
+    >
+      {showImg ? (
+        <img
+          src={item.poster_url ?? undefined}
+          alt=""
+          loading="lazy"
+          className="aspect-[2/3] w-[38px] shrink-0 rounded-[4px] object-cover"
+          onError={() => setImgFailed(true)}
+        />
+      ) : (
+        <div
+          aria-hidden="true"
+          className="aspect-[2/3] w-[38px] shrink-0 rounded-[4px] bg-poster bg-gradient-to-b from-white/10 to-transparent"
+        />
+      )}
+
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-[9px] gap-y-1">
+          <p className="max-w-full min-w-0 truncate font-display text-[14px] leading-[1.2] font-bold text-ink">
+            {heading}
+          </p>
+          <StatusBadge status={presentation} />
+          {scopes.map((scope, index) => {
+            const scopePresentation = scope.status === 'active' ? null : downloadStatus(scope.status)
+            return (
+              <span
+                key={`${scope.label}-${index}`}
+                className={cn(
+                  'rounded px-[7px] py-1 font-mono text-[9.5px] leading-none font-semibold tracking-wide whitespace-nowrap ring-1 ring-inset',
+                  scopePresentation
+                    ? INTENT_CLASSES[scopePresentation.intent]
+                    : INTENT_CLASSES.neutral,
+                )}
+              >
+                {scope.label}
+              </span>
+            )
+          })}
+        </div>
+
+        {showReleaseSubline ? (
+          <p
+            className="mt-[5px] truncate font-mono text-[11.5px] leading-[1.4] text-muted"
+            title={item.release_title ?? undefined}
+          >
+            {item.release_title}
+          </p>
+        ) : null}
+
+        <p className="mt-[3px] font-mono text-[10px] leading-none text-faint">
+          <span title={item.torrent_hash}>{shortHash}</span>
+          <span className="tabular-nums"> · seed {(item.seed_ratio ?? 0).toFixed(2)}</span>
+        </p>
+
+        {showTransferProgress ? (
+          <div className="mt-[9px] flex w-full max-w-[470px] items-center gap-2.5">
+            <ProgressBar
+              value={progress}
+              label={`${heading} download progress`}
+              className="h-[5px] max-w-[420px] flex-1"
             />
-          ) : (
-            <div className="aspect-[2/3] w-11 shrink-0 rounded bg-poster bg-gradient-to-b from-white/10 to-transparent" />
-          )}
-          <div className="min-w-0 flex-1">
-            <div className="flex min-w-0 flex-wrap items-center gap-3">
-              <p className="truncate font-display font-semibold text-ink">{heading}</p>
-              <StatusBadge status={presentation} {...(detail ? { detail } : {})} />
-              {scopes.map((scope, index) => {
-                const scopePresentation = scope.status === 'active' ? null : downloadStatus(scope.status)
-                return (
-                  <span
-                    key={`${scope.label}-${index}`}
-                    className={cn(
-                      'rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide ring-1',
-                      scopePresentation
-                        ? {
-                            searching: 'bg-searching/15 text-searching ring-searching/30',
-                            downloading: 'bg-downloading/15 text-downloading ring-downloading/30',
-                            available: 'bg-available/15 text-available ring-available/30',
-                            error: 'bg-error/15 text-error ring-error/30',
-                            neutral: 'bg-white/8 text-muted ring-white/10',
-                          }[scopePresentation.intent]
-                        : 'bg-white/8 text-muted ring-white/10',
-                    )}
-                  >
-                    {scope.label}
-                  </span>
-                )
-              })}
-            </div>
-            {showReleaseSubline ? (
-              <p className="mt-0.5 truncate font-mono text-xs text-muted">{item.release_title}</p>
-            ) : null}
-            <p className="mt-0.5 flex items-center gap-2 font-mono text-[10px] text-faint">
-              <span title={item.torrent_hash}>{shortHash}</span>
-              <span className="tabular-nums">seed {(item.seed_ratio ?? 0).toFixed(2)}</span>
-            </p>
+            <span className="w-10 shrink-0 text-right font-mono text-[11px] leading-none font-medium text-muted tabular-nums">
+              {pct}%
+            </span>
           </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {isRelocatable(item) ? (
-            <Button
-              variant="secondary"
-              size="sm"
-              loading={relocatePending}
-              disabled={relocatePending || disabled}
-              onClick={onRelocate}
-            >
-              Relocate &amp; retry
-            </Button>
-          ) : null}
-          {item.status === 'import_blocked' ? (
-            <Button
-              size="sm"
-              loading={importPending}
-              disabled={importPending || disabled}
-              onClick={onRetry}
-            >
-              Retry import
-            </Button>
-          ) : null}
-          {canMarkFailed ? (
-            <>
-              <Button
-                variant="danger"
-                size="sm"
-                disabled={disabled}
-                onClick={() => onAction(item, false)}
-              >
-                Mark failed
-              </Button>
-              <Button
-                variant="danger"
-                size="sm"
-                disabled={disabled}
-                onClick={() => onAction(item, true)}
-              >
-                Blocklist &amp; fail
-              </Button>
-            </>
-          ) : null}
-        </div>
+        ) : null}
+
+        {item.failed_reason ? (
+          <p className="mt-2 text-[12.5px] leading-relaxed text-error [overflow-wrap:anywhere]">
+            {item.failed_reason}
+          </p>
+        ) : null}
       </div>
 
-      {isDownloadingLike ? (
-        <div className="mt-3 flex items-center gap-3">
-          <ProgressBar value={item.progress ?? 0} label="Download progress" />
-          <span className="font-mono text-xs text-muted tabular-nums">{pct}%</span>
-        </div>
-      ) : null}
-
-      {item.failed_reason ? (
-        <p className="mt-3 text-sm text-error">{item.failed_reason}</p>
-      ) : null}
-    </div>
+      <div className="col-span-2 flex min-w-0 max-w-full flex-wrap items-center justify-end gap-[7px] lg:col-span-1 lg:col-start-3 lg:row-start-1 lg:self-start">
+        {isRelocatable(item) ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={relocatePending}
+            disabled={relocatePending || disabled}
+            onClick={onRelocate}
+          >
+            Relocate &amp; retry
+          </Button>
+        ) : null}
+        {item.status === 'import_blocked' ? (
+          <Button
+            size="sm"
+            loading={importPending}
+            disabled={importPending || disabled}
+            onClick={onRetry}
+          >
+            Retry import
+          </Button>
+        ) : null}
+        {canMarkFailed ? (
+          <>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, false)}
+            >
+              Mark failed
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onAction(item, true)}
+            >
+              Blocklist &amp; fail
+            </Button>
+          </>
+        ) : null}
+      </div>
+    </li>
   )
 }

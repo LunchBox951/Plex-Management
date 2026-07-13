@@ -3,6 +3,7 @@ import { useAuthMe, useLogout, useRequests } from '../api/hooks'
 import { cn } from '../lib/cn'
 import { isInFlightRequestStatus } from '../lib/status'
 import { HealthDot } from './HealthDot'
+import { SearchOverlay } from './SearchOverlay'
 import { Button } from './ui/Button'
 
 const USER_NAV = [
@@ -95,6 +96,7 @@ export function Layout() {
               </>
             ) : null}
           </div>
+          <SearchOverlay />
           <div className="ml-auto flex shrink-0 items-center gap-3">
             {isAdmin ? (
               <Link

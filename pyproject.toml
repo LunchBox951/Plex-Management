@@ -14,7 +14,10 @@ dependencies = [
     "fastapi>=0.138.2",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
-    "pydantic-settings>=2.3",
+    # >=2.7.0: first release to export ``NoDecode`` (pydantic-settings #492),
+    # which config.py imports for raw comma-separated env parsing. An older
+    # release satisfying a looser bound would ImportError at startup.
+    "pydantic-settings>=2.7.0",
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
     "alembic>=1.13",

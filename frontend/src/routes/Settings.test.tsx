@@ -2,14 +2,23 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PlexLibraryOption, SettingsResponse, SettingsUpdate } from '../api/types'
+import type {
+  HealthResponse,
+  PlexLibraryOption,
+  SettingsResponse,
+  SettingsUpdate,
+} from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { Settings } from './Settings'
 
 // Hoisted shared state so the vi.mock factories (hoisted above imports) can read it.
 const h = vi.hoisted(() => ({
   mutateAsync: vi.fn(),
+  updatePending: false,
   settingsData: null as SettingsResponse | null,
+  settingsLoading: false,
+  settingsError: null as ApiError | null,
+  settingsRefetch: vi.fn(),
   libraries: [] as PlexLibraryOption[],
   toast: vi.fn(),
   librariesError: null as Error | null,
@@ -28,17 +37,28 @@ const h = vi.hoisted(() => ({
   statusIsError: false,
   statusError: null as ApiError | null,
   statusRefetch: vi.fn(),
+  healthData: null as HealthResponse | null,
+  healthError: null as ApiError | null,
+  healthFetching: false,
+  healthRefetch: vi.fn(),
 }))
 
 vi.mock('../api/hooks', () => ({
   useSettings: () => ({
-    data: h.settingsData,
-    isLoading: false,
-    isError: false,
-    error: null,
-    refetch: vi.fn(),
+    data: h.settingsLoading || h.settingsError ? undefined : h.settingsData,
+    isLoading: h.settingsLoading,
+    isError: h.settingsError !== null,
+    error: h.settingsError,
+    refetch: h.settingsRefetch,
   }),
-  useUpdateSettings: () => ({ mutateAsync: h.mutateAsync, isPending: false }),
+  useUpdateSettings: () => ({ mutateAsync: h.mutateAsync, isPending: h.updatePending }),
+  useOpsHealth: () => ({
+    data: h.healthError ? undefined : h.healthData,
+    isError: h.healthError !== null,
+    error: h.healthError,
+    isFetching: h.healthFetching,
+    refetch: h.healthRefetch,
+  }),
   usePlexLibraries: () => ({
     data: h.libraries,
     isError: h.librariesError !== null,
@@ -62,6 +82,17 @@ vi.mock('../components/ui/toast', () => ({
 
 const Wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter>{children}</MemoryRouter>
 
+beforeEach(() => {
+  h.updatePending = false
+  h.settingsLoading = false
+  h.settingsError = null
+  h.settingsRefetch.mockReset()
+  h.healthData = null
+  h.healthError = null
+  h.healthFetching = false
+  h.healthRefetch.mockReset()
+})
+
 function lastBody(): SettingsUpdate {
   return h.mutateAsync.mock.calls[0]![0] as SettingsUpdate
 }
@@ -78,11 +109,202 @@ const CONFIGURED_SERVICES: SettingsResponse = {
   movies_root: '/media/movies',
 }
 
-function serviceSection(name: 'Plex' | 'Prowlarr' | 'qBittorrent') {
+function healthResponse(
+  subsystems: HealthResponse['subsystems'],
+): HealthResponse {
+  return {
+    subsystems,
+    disks: [],
+    reconcile: { consecutive_failures: 0 },
+    autograb: { consecutive_failures: 0, cooled_down_scopes: 0 },
+  }
+}
+
+function serviceSection(name: 'Plex' | 'Prowlarr' | 'qBittorrent' | 'TMDB') {
   const section = screen.getByRole('heading', { name }).closest('section')
   if (section === null) throw new Error(`${name} settings section not found`)
   return within(section)
 }
+
+describe('Settings — admin grammar and saved service health', () => {
+  beforeEach(() => {
+    h.mutateAsync.mockReset()
+    h.mutateAsync.mockResolvedValue({})
+    h.toast.mockReset()
+    h.settingsData = CONFIGURED_SERVICES
+    h.libraries = []
+    h.librariesError = null
+    h.statusLoading = false
+    h.statusIsError = false
+    h.statusError = null
+    h.appKeyExists = false
+  })
+
+  it('puts the single Save action in the admin header and preserves the mutation', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+
+    const save = screen.getByRole('button', { name: 'Save changes' })
+    expect(save.closest('header')).not.toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Save changes' })).toHaveLength(1)
+
+    fireEvent.click(save)
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+  })
+
+  it('exposes the header Save loading state without leaving it interactive', () => {
+    h.updatePending = true
+    render(<Settings />, { wrapper: Wrapper })
+
+    const save = screen.getByRole('button', { name: 'Save changes' })
+    expect(save.closest('header')).not.toBeNull()
+    expect(save).toBeDisabled()
+    expect(save.querySelector('[aria-hidden="true"]')).not.toBeNull()
+  })
+
+  it('keeps the Settings header stable while loading and on an actionable error', () => {
+    h.settingsLoading = true
+    const { rerender } = render(<Settings />, { wrapper: Wrapper })
+
+    expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save changes' })).not.toBeInTheDocument()
+
+    h.settingsLoading = false
+    h.settingsError = {
+      code: 'unknown_error',
+      message: 'Settings are offline',
+      status: 503,
+    }
+    rerender(<Settings />)
+
+    expect(screen.getByRole('heading', { level: 1, name: 'Settings' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(h.settingsRefetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('maps every persisted subsystem state honestly and renders sanitized diagnostics', () => {
+    h.healthData = healthResponse([
+      {
+        name: 'plex',
+        status: 'ok',
+        detail: null,
+        checked_at: '2026-07-12T12:00:00Z',
+      },
+      {
+        name: 'prowlarr',
+        status: 'degraded',
+        detail: 'Two indexers are unavailable.',
+        checked_at: '2026-07-12T12:00:00Z',
+      },
+      {
+        name: 'qbittorrent',
+        status: 'down',
+        detail: 'Authentication failed.',
+        note: 'The default save path is not visible inside this container.',
+        checked_at: '2026-07-12T12:00:00Z',
+      },
+      {
+        name: 'tmdb',
+        status: 'not_configured',
+        detail: null,
+        checked_at: '2026-07-12T12:00:00Z',
+      },
+    ])
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    expect(serviceSection('Plex').getByText('Connected')).toBeInTheDocument()
+    expect(serviceSection('Prowlarr').getByText('Degraded')).toBeInTheDocument()
+    expect(serviceSection('Prowlarr').getByText('Two indexers are unavailable.')).toHaveClass(
+      'text-searching',
+    )
+    expect(serviceSection('qBittorrent').getByText('Down')).toBeInTheDocument()
+    expect(serviceSection('qBittorrent').getByText('Authentication failed.')).toHaveClass(
+      'text-error',
+    )
+    expect(
+      serviceSection('qBittorrent').getByText(/default save path is not visible/i),
+    ).toHaveClass('text-searching')
+    expect(serviceSection('TMDB').getByText('Not configured')).toBeInTheDocument()
+  })
+
+  it('uses a neutral unavailable state when saved health cannot be resolved', () => {
+    h.healthError = {
+      code: 'unknown_error',
+      message: 'Health is unavailable',
+      status: 503,
+    }
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    const unavailable = screen.getAllByText('Status unavailable')
+    expect(unavailable).toHaveLength(4)
+    for (const label of unavailable) {
+      expect(label.querySelector('[aria-hidden="true"]')).toHaveClass('bg-faint')
+      expect(label.querySelector('[aria-hidden="true"]')).not.toHaveClass('bg-available')
+    }
+  })
+
+  it('refreshes only saved health, then disables validation for a dirty card', () => {
+    h.healthData = healthResponse([
+      {
+        name: 'plex',
+        status: 'ok',
+        checked_at: '2026-07-12T12:00:00Z',
+      },
+    ])
+
+    render(<Settings />, { wrapper: Wrapper })
+
+    const validate = screen.getByRole('button', { name: 'Validate Plex connection' })
+    fireEvent.click(validate)
+    expect(h.healthRefetch).toHaveBeenCalledTimes(1)
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+
+    const token = serviceSection('Plex').getByLabelText('Token')
+    expect(token).toHaveValue('')
+    h.healthFetching = true
+    fireEvent.change(token, { target: { value: 'candidate-token' } })
+
+    expect(serviceSection('Plex').getByText('Unsaved changes')).toBeInTheDocument()
+    expect(validate).toBeDisabled()
+    expect(validate.querySelector('[aria-hidden="true"]')).toBeNull()
+    expect(
+      serviceSection('Plex').getByText('Save changes before validating this connection.'),
+    ).toBeInTheDocument()
+    expect(serviceSection('Plex').queryByText('Connected')).not.toBeInTheDocument()
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('retains all services, safety knobs, toggles, and navigation paths', () => {
+    render(<Settings />, { wrapper: Wrapper })
+
+    for (const service of ['Plex', 'Prowlarr', 'qBittorrent', 'TMDB']) {
+      expect(screen.getByRole('heading', { level: 2, name: service })).toBeInTheDocument()
+    }
+    expect(serviceSection('Plex').getByLabelText('Token')).toHaveValue('')
+    expect(serviceSection('Prowlarr').getByLabelText('API key')).toHaveValue('')
+    expect(serviceSection('qBittorrent').getByLabelText('Password')).toHaveValue('')
+    expect(serviceSection('TMDB').getByLabelText('API key')).toHaveValue('')
+
+    for (const label of [
+      'Pressure threshold (%)',
+      'Pressure target (%)',
+      'Eviction grace period (days)',
+      'Eviction check interval (minutes)',
+      'Log retention (days)',
+    ]) {
+      expect(screen.getByLabelText(label)).toBeInTheDocument()
+    }
+    expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /^Enable auto-grab/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'View profile' })).toHaveAttribute('href', '/quality')
+    expect(screen.getByRole('link', { name: 'Manage blocklist' })).toHaveAttribute(
+      'href',
+      '/blocklist',
+    )
+  })
+})
 
 describe('Settings — changed service credential consent', () => {
   beforeEach(() => {
@@ -540,6 +762,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       eviction_proactive_enabled: null,
       eviction_interval_minutes: null,
       log_retention_days: null,
+      log_max_rows: null,
     }
     render(<Settings />, { wrapper: Wrapper })
 
@@ -548,6 +771,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(screen.getByLabelText('Eviction grace period (days)')).toHaveValue(30)
     expect(screen.getByLabelText('Eviction check interval (minutes)')).toHaveValue(30)
     expect(screen.getByLabelText('Log retention (days)')).toHaveValue(7)
+    expect(screen.getByLabelText('Log retention (max rows)')).toHaveValue(100000)
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).not.toBeChecked()
 
@@ -563,6 +787,9 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       target: { value: '15' },
     })
     fireEvent.change(screen.getByLabelText('Log retention (days)'), { target: { value: '3' } })
+    fireEvent.change(screen.getByLabelText('Log retention (max rows)'), {
+      target: { value: '50000' },
+    })
     fireEvent.click(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i }))
     fireEvent.click(screen.getByRole('checkbox', { name: /^Proactive eviction/i }))
 
@@ -575,6 +802,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(body.eviction_grace_days).toBe(14)
     expect(body.eviction_interval_minutes).toBe(15)
     expect(body.log_retention_days).toBe(3)
+    expect(body.log_max_rows).toBe(50000)
     expect(body.eviction_enabled).toBe(false)
     expect(body.eviction_proactive_enabled).toBe(true)
   })
