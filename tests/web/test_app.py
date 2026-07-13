@@ -5,8 +5,11 @@ import logging
 import httpx
 import pytest
 
-from plex_manager.config import get_settings
+from plex_manager.config import Settings, get_settings
 from plex_manager.web.app import (
+    _UNCONFIRMED_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
+    _emit_setup_ready_hint,  # pyright: ignore[reportPrivateUsage]
+    _setup_ready_url,  # pyright: ignore[reportPrivateUsage]
     _warn_if_multi_process,  # pyright: ignore[reportPrivateUsage]
     create_upstream_http_client,
 )
@@ -38,6 +41,99 @@ async def test_upstream_http_client_rejects_response_cookies() -> None:
         assert list(client.cookies.jar) == []
     finally:
         await client.aclose()
+
+
+class TestSetupReadyUrl:
+    """The startup setup-URL hint (issue #65) -- see Codex's follow-up findings:
+    the printed link must use the externally-reachable HOST port, not always the
+    in-container one, and must never carry the bootstrap token as a query string
+    (which uvicorn's default access log would otherwise record verbatim)."""
+
+    def test_uses_host_port_when_the_compose_env_var_is_known(self) -> None:
+        settings = Settings(host="0.0.0.0", port=8000, host_port=9443)  # noqa: S104
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:9443/setup")
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
+
+    def test_falls_back_to_the_in_container_port_and_says_so_when_unknown(self) -> None:
+        settings = Settings(host="0.0.0.0", port=8000, host_port=None)  # noqa: S104
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:8000/setup")
+        assert _UNCONFIRMED_HOST_PORT_NOTE in url
+
+    def test_substitutes_localhost_for_an_undialable_bind_host(self) -> None:
+        settings = Settings(host="::", port=8000, host_port=8000)
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:8000/setup")
+
+    def test_carries_the_token_in_a_fragment_never_a_query_string(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+        get_settings.cache_clear()
+        settings = get_settings()
+
+        url = _setup_ready_url(settings)
+
+        assert "#setup_token=boot-token" in url
+        assert "?setup_token=" not in url
+
+    def test_omits_the_token_entirely_when_unset(self) -> None:
+        settings = Settings(host="127.0.0.1", port=8000, host_port=8000)
+        url = _setup_ready_url(settings)
+        assert "setup_token" not in url
+
+
+def test_emit_setup_ready_hint_writes_the_real_unredacted_url_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole point of issue #65 is a link an operator can follow straight
+    from ``docker logs``. The production entry point runs uvicorn with its own
+    default logging config, which attaches nothing to the ROOT logger this
+    module's ``_logger`` propagates to -- and the app's own root handler
+    (``LogCaptureHandler``) redacts ``token=...`` shapes as defense in depth
+    before persisting them. Neither hazard may swallow this specific line, so it
+    must reach stderr as a direct, unredacted write.
+    """
+    url = "http://localhost:8000/setup#setup_token=boot-token"
+
+    _emit_setup_ready_hint(url)
+
+    captured = capsys.readouterr()
+    assert f"Setup: {url}" in captured.err
+
+
+def test_emit_setup_ready_hint_survives_a_root_logger_with_no_stderr_handler(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reproduces the exact production shape: the root logger has SOME handler
+    attached (as ``configure_logging`` leaves it, via ``LogCaptureHandler``) but
+    nothing that writes to stderr. A plain ``_logger.info(...)`` call has no
+    path to the console in this shape; the hint must not depend on it.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    for handler in saved_handlers:
+        root.removeHandler(handler)
+    root.addHandler(logging.NullHandler())
+    try:
+        _emit_setup_ready_hint("http://localhost:8000/setup#setup_token=boot-token")
+    finally:
+        root.removeHandler(root.handlers[-1])
+        for handler in saved_handlers:
+            root.addHandler(handler)
+
+    captured = capsys.readouterr()
+    assert "boot-token" in captured.err
+
+
+def test_emit_setup_ready_hint_also_records_a_copy_for_the_in_app_log_viewer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="plex_manager.web.app"):
+        _emit_setup_ready_hint("http://localhost:8000/setup#setup_token=boot-token")
+
+    assert any("Setup: http://localhost:8000/setup" in r.message for r in caplog.records)
 
 
 def _clear_multiworker_env(monkeypatch: pytest.MonkeyPatch) -> None:

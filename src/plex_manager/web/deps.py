@@ -118,6 +118,7 @@ __all__ = [
     "SettingsStore",
     "api_key_matches",
     "authenticate_request",
+    "configured_setup_token",
     "enforce_pre_init_setup_token",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
@@ -707,6 +708,21 @@ def _configured_setup_token() -> str | None:
         return None
     value = token.get_secret_value().strip()
     return value or None
+
+
+def configured_setup_token() -> str | None:
+    """Return the configured pre-init hardening token, or ``None`` if unset.
+
+    Public counterpart to :func:`_configured_setup_token`, for the ONE caller
+    outside this module allowed to see the raw value: the startup log line
+    (issue #65) that prints a ready-to-click ``Setup: http://host:port/setup?
+    setup_token=...`` URL so an operator can follow one link from ``docker logs``
+    instead of hunting ``PLEX_MANAGER_SETUP_TOKEN`` across env/compose/scrollback.
+    Callers should gate on :func:`is_setup_token_required` first, so the token is
+    only ever embedded when it is actually enforced — this stays a discoverability
+    aid (ADR-0005's install-time exception), never a new auth surface.
+    """
+    return _configured_setup_token()
 
 
 def is_setup_token_required(request: Request | None = None) -> bool:
