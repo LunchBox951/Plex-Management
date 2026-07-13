@@ -59,6 +59,7 @@ __all__ = [
     "SystemSettings",
     "TmdbCache",
     "User",
+    "WatchlistItem",
 ]
 
 
@@ -452,6 +453,21 @@ class RequestSubscriber(Base):
     subscribed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class WatchlistItem(Base):
+    """One title in a user's last completely synchronized Plex watchlist."""
+
+    __tablename__ = "watchlist_items"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_watchlist_items_media_type_enum"), primary_key=True
+    )
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class RequestDedupLock(Base):

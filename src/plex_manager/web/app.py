@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
@@ -33,6 +34,7 @@ from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.config import get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.logsafe import safe_int
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -41,6 +43,7 @@ from plex_manager.services import (
     log_capture_service,
     queue_service,
     retention_telemetry_service,
+    watchlist_service,
 )
 from plex_manager.services.health_service import (
     AutograbStatus,
@@ -126,6 +129,55 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # the per-cycle search cap keeps the single Prowlarr from being hammered. A
 # constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
+_WATCHLIST_INTERVAL_SECONDS = 15.0 * 60.0
+
+
+async def _watchlist_sync_once(app: FastAPI) -> int:
+    """Synchronize every reusable account token, isolating failures per user."""
+    maker = app.state.sessionmaker
+    client = app.state.http_client
+    async with maker() as session:
+        try:
+            tmdb = await get_tmdb(session, client)
+        except ServiceNotConfiguredError:
+            return 0
+        library = await get_library_optional(session, client)
+        users = await watchlist_service.list_sync_users(session)
+
+    created = 0
+    for user in users:
+        token = user.encrypted_plex_token
+        if token is None:
+            continue
+        try:
+            async with maker() as session:
+                result = await watchlist_service.sync_user(
+                    session,
+                    PlexWatchlist(client, token),
+                    tmdb,
+                    user_id=user.id,
+                    library=library,
+                )
+                created += result.created
+        except Exception as exc:
+            _logger.warning(
+                "watchlist sync failed for user_id=%s (%s); retaining the previous snapshot",
+                safe_int(user.id),
+                type(exc).__name__,
+            )
+    if created:
+        publish_realtime(app, ("requests", "queue", "discover"), reason="watchlist_sync")
+    return created
+
+
+async def _watchlist_sync_loop(app: FastAPI) -> None:
+    """Run watchlist synchronization independently; one bad cycle never kills it."""
+    while True:
+        try:
+            await _watchlist_sync_once(app)
+        except Exception:
+            _logger.exception("watchlist sync tick failed; continuing")
+        await asyncio.sleep(_WATCHLIST_INTERVAL_SECONDS)
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -849,7 +901,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     autograb_task = asyncio.create_task(_autograb_loop(app))
     log_drain_task = asyncio.create_task(_log_drain_loop(app))
     eviction_task = asyncio.create_task(_eviction_loop(app))
-    background_tasks = (reconcile_task, autograb_task, log_drain_task, eviction_task)
+    watchlist_task = asyncio.create_task(_watchlist_sync_loop(app))
+    background_tasks = (
+        reconcile_task,
+        autograb_task,
+        log_drain_task,
+        eviction_task,
+        watchlist_task,
+    )
     try:
         yield
     finally:
