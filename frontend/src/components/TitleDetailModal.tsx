@@ -55,6 +55,17 @@ interface TitleDetailModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
+  /**
+   * Fires once Radix's close handoff has run — after `onCloseAutoFocus`
+   * resolves `returnFocusTo` and (if the target is still connected) restores
+   * focus to it. This is the caller's cue that it is now safe to unmount this
+   * modal instance (issue #271): before this fires, the exit animation and
+   * focus-return handoff are still in flight, and unmounting early would tear
+   * down the Radix root mid-handoff. Callers that keep one modal instance
+   * mounted across titles (Discover/Requests/Queue) have no use for this and
+   * omit it; SearchOverlay is the one caller that unmounts on close.
+   */
+  onClosed?: () => void
   action?: TitleDetailModalAction | null
   /**
    * Pin the modal's request correlation to ONE specific row. The Requests list
@@ -365,6 +376,7 @@ export function TitleDetailModal({
   open,
   onOpenChange,
   returnFocusTo,
+  onClosed,
   action,
   boundRequestId,
 }: TitleDetailModalProps) {
@@ -1192,13 +1204,30 @@ export function TitleDetailModal({
     queueItem,
   )
 
+  // Resolve the real focus target for Dialog's `onCloseAutoFocus`, then signal
+  // `onClosed` — this function only ever runs from THAT event, so it fires
+  // exactly once the close handoff (exit animation + focus return) has run,
+  // never on open or on an unrelated re-render. Only wraps when the caller
+  // actually supplied one of these; otherwise stays `undefined` so Dialog's
+  // own default (unwrapped) behavior is unchanged for callers that never pass
+  // either prop.
+  const handleCloseHandoff =
+    returnFocusTo || onClosed
+      ? () => {
+          const target =
+            typeof returnFocusTo === 'function' ? returnFocusTo() : (returnFocusTo ?? null)
+          onClosed?.()
+          return target
+        }
+      : undefined
+
   return (
     <Dialog
       open={open}
       onOpenChange={onOpenChange}
       title={title.title}
       description={title.title}
-      returnFocusTo={returnFocusTo}
+      returnFocusTo={handleCloseHandoff}
       customChrome
     >
       <div className="relative h-[180px] overflow-hidden bg-poster bg-gradient-to-br from-white/8 via-surface-deep to-surface" data-testid="title-backdrop">

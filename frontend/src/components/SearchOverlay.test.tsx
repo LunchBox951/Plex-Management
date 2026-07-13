@@ -33,31 +33,42 @@ vi.mock('./TitleDetailModal', () => ({
     open,
     onOpenChange,
     returnFocusTo,
+    onClosed,
   }: {
     title: DiscoverResult | null
     open: boolean
     onOpenChange: (open: boolean) => void
     returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
+    onClosed?: () => void
   }) => (
-    <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
-      <RadixDialog.Portal>
-        <RadixDialog.Overlay className="fixed inset-0 z-50" />
-        <RadixDialog.Content
-          className="fixed z-50"
-          aria-label={title ? `Details for ${title.title}` : undefined}
-          onCloseAutoFocus={(event) => {
-            event.preventDefault()
-            const target =
-              typeof returnFocusTo === 'function' ? returnFocusTo() : returnFocusTo
-            target?.focus()
-          }}
-        >
-          <RadixDialog.Title>{title ? `Details for ${title.title}` : 'Title details'}</RadixDialog.Title>
-          <RadixDialog.Description>Request details and actions.</RadixDialog.Description>
-          <RadixDialog.Close>Close details</RadixDialog.Close>
-        </RadixDialog.Content>
-      </RadixDialog.Portal>
-    </RadixDialog.Root>
+    // The outer testid marks whether THIS component instance is mounted at
+    // all — distinct from the inner dialog, which Radix already removes from
+    // the DOM on close regardless of unmounting. Real TitleDetailModal wraps
+    // `returnFocusTo` so calling it also fires `onClosed`, exactly once
+    // `onCloseAutoFocus` runs; mirrored here so the unmount test below
+    // exercises the real caller contract, not just this stand-in's shape.
+    <div data-testid="title-detail-modal-mount">
+      <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
+        <RadixDialog.Portal>
+          <RadixDialog.Overlay className="fixed inset-0 z-50" />
+          <RadixDialog.Content
+            className="fixed z-50"
+            aria-label={title ? `Details for ${title.title}` : undefined}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault()
+              const target =
+                typeof returnFocusTo === 'function' ? returnFocusTo() : returnFocusTo
+              target?.focus()
+              onClosed?.()
+            }}
+          >
+            <RadixDialog.Title>{title ? `Details for ${title.title}` : 'Title details'}</RadixDialog.Title>
+            <RadixDialog.Description>Request details and actions.</RadixDialog.Description>
+            <RadixDialog.Close>Close details</RadixDialog.Close>
+          </RadixDialog.Content>
+        </RadixDialog.Portal>
+      </RadixDialog.Root>
+    </div>
   )),
 }))
 
@@ -553,6 +564,30 @@ describe('SearchOverlay — nested title details', () => {
         screen.queryByRole('dialog', { name: 'Details for Detail Movie' }),
       ).not.toBeInTheDocument()
       expect(input).toHaveFocus()
+    })
+  })
+
+  it('unmounts the details modal once the close handoff finishes (issue #271)', async () => {
+    setSearch({ data: { results: [DETAIL_MOVIE] } })
+    render(<SearchOverlay />)
+    openOverlay()
+    await enterSearch('detail')
+    fireEvent.click(screen.getByRole('button', { name: /View details for Detail Movie/ }))
+
+    // Mounted while the details dialog is open.
+    expect(screen.getByTestId('title-detail-modal-mount')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close details' }))
+
+    // Still mounted the instant `open` flips false — the exit animation and
+    // returnFocusTo handoff are still in flight, and unmounting here would
+    // tear down the Radix root mid-handoff.
+    expect(screen.getByTestId('title-detail-modal-mount')).toBeInTheDocument()
+
+    // Only once onCloseAutoFocus actually runs (the handoff finishing) does
+    // the modal instance go away.
+    await waitFor(() => {
+      expect(screen.queryByTestId('title-detail-modal-mount')).not.toBeInTheDocument()
     })
   })
 })
