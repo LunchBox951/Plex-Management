@@ -647,15 +647,15 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
         if marker["head"] == current:
             # The marked upgrade reached its target; ``current != head`` means a
             # NEWER image is now starting its own upgrade from here. The state
-            # at ``current`` is clean -- clear the marker and back it up fresh.
+            # at ``current`` is clean -- clear the marker and fall through to
+            # back it up fresh.
             _clear_marker(backups_root)
-            marker = None
         elif not (backups_root / marker["backup"]).is_dir():
             # The marked backup was archived/removed (e.g. after a completed
             # manual restore, per the MANIFEST's final step) -- the marker no
-            # longer guards anything real.
+            # longer guards anything real. Clear it and fall through to a
+            # fresh backup.
             _clear_marker(backups_root)
-            marker = None
         else:
             logger.warning(
                 "An upgrade toward revision %s is already IN FLIGHT (it "
