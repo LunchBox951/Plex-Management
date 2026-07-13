@@ -43,7 +43,6 @@ from plex_manager.services import (
     eviction_service,
     import_service,
     log_capture_service,
-    path_visibility,
     queue_service,
     retention_telemetry_service,
     watchlist_service,
@@ -1034,70 +1033,22 @@ _UNCONFIRMED_HOST_PORT_NOTE: Final = (
 )
 
 #: Appended instead of :data:`_UNCONFIRMED_HOST_PORT_NOTE` when
-#: ``settings.host_port`` IS set but :func:`_running_under_documented_compose`
-#: says this process is not actually running under that compose file (issue
+#: ``settings.host_port`` IS set but ``settings.in_container`` is not (issue
 #: #294, finding 3) -- a bare-metal install that copies ``.env.example``
 #: verbatim inherits its compose-only ``PLEX_MANAGER_HOST_PORT=8000`` default
 #: even though no port mapping was ever applied, so trusting the value would
 #: silently print a link the operator's own process isn't actually listening
 #: on that "published" port for. Honesty over silence: say explicitly that the
 #: value is being ignored and why, rather than asserting a possibly-wrong link.
+#: (Inside the shipped image the value IS honored -- see ``_setup_ready_url`` --
+#: so this note never tells a containerized operator to fix a variable that
+#: would then be ignored.)
 _BARE_METAL_HOST_PORT_NOTE: Final = (
-    "(PLEX_MANAGER_HOST_PORT is set, but this process does not look like it is"
-    " running inside the documented docker-compose.yml deployment (the shipped"
-    " container image with its required volumes) -- ignoring it and using the"
-    " in-container port instead; remove the variable on a bare-metal install,"
-    " or fix the port here if this really is a remapped container)"
+    "(PLEX_MANAGER_HOST_PORT is set, but this process is not running inside the"
+    " shipped container image, so no host port mapping can apply -- ignoring it"
+    " and using the in-process port instead; remove the variable on a"
+    " bare-metal install)"
 )
-
-
-def _running_under_documented_compose(settings: Settings) -> bool:
-    """Whether this process looks like it is actually running under the
-    documented ``docker-compose.yml`` topology (issue #294, finding 3).
-
-    Two independent, environment-derived signals must BOTH hold:
-
-    1. ``settings.in_container`` -- the image-baked
-       ``PLEX_MANAGER_IN_CONTAINER=1`` sentinel the Dockerfile's runtime stage
-       sets (second P2 follow-up to #294). Mount-point names alone are NOT
-       evidence of being INSIDE the documented container: a bare-metal media
-       server can have real, unrelated disks mounted at both conventional
-       paths (``/media`` and ``/downloads``) while ALSO having copied the
-       compose-only ``PLEX_MANAGER_HOST_BIND``/``PLEX_MANAGER_HOST_PORT``
-       defaults -- e.g. a widened ``PLEX_MANAGER_HOST_BIND=192.168.1.50``
-       would then print an unreachable setup link even though the process
-       still listens on ``settings.host``. The sentinel cannot false-positive
-       on bare metal: it is baked into the shipped image only, and
-       deliberately kept OUT of ``.env.example`` (see the Dockerfile comment)
-       so a bare-metal install can never copy it by accident.
-    2. BOTH documented bind mounts are live. ``docker-compose.yml`` REQUIRES
-       ``/media`` and ``/downloads`` (``:?set ... in .env`` -- compose refuses
-       to start without them), so their absence means this container -- even
-       our own image -- was NOT launched by that compose file (a hand-rolled
-       ``docker run`` with no equivalent mounts), and its compose-published
-       socket values cannot be presumed either. Deliberately ``all(...)``,
-       not ``any(...)`` (first P2 follow-up to #294): a box can easily have
-       ONE of these paths be a real, unrelated mount point on its own. Reuses
-       :func:`~plex_manager.services.path_visibility.is_live_mount` -- the
-       same check that module already uses to distinguish the compose
-       deployment from a bare-metal host for library/download path
-       remapping -- rather than inventing a second, possibly-drifting
-       detection rule. Module-qualified (``path_visibility.is_live_mount`` /
-       ``.KNOWN_CONTAINER_MOUNTS``) so tests can ``monkeypatch.setattr(
-       path_visibility, "is_live_mount", ...)`` exactly like that module's
-       own test suite already does.
-
-    Without this gate, a bare-metal install that copies ``.env.example``
-    verbatim (which ships the compose-only ``PLEX_MANAGER_HOST_PORT=8000``
-    default so Compose users don't have to add it themselves) would have
-    ``settings.host_port`` set even though no port mapping was ever applied --
-    :func:`_setup_ready_url` would then trust and print that guessed port
-    unconditionally, which happens to be right only by coincidence (the
-    in-container default also being 8000).
-    """
-    return settings.in_container and all(
-        path_visibility.is_live_mount(mount) for mount in path_visibility.KNOWN_CONTAINER_MOUNTS
-    )
 
 
 def _setup_ready_url(settings: Settings) -> str:
@@ -1111,32 +1062,46 @@ def _setup_ready_url(settings: Settings) -> str:
     so the token still survives it.
 
     The HOST component prefers ``settings.host_bind`` (issue #294, finding 4 --
-    the Compose-PUBLISHED bind address, see that field's docstring) over
+    the container-PUBLISHED bind address, see that field's docstring) over
     ``settings.host`` (the in-process listen address, commonly the undialable
     ``0.0.0.0``), substituting ``localhost`` for either when it is itself one
     of :data:`_UNDIALABLE_BIND_HOSTS` (an operator who deliberately widens the
     published bind to a real LAN IP gets a link that actually resolves off the
-    container host, instead of always asserting ``localhost``) -- but ONLY
-    when :func:`_running_under_documented_compose` confirms this process is
-    actually running under that compose file, the same gate applied to
-    ``host_port`` below. ``.env.example`` ships ``PLEX_MANAGER_HOST_BIND=
-    127.0.0.1`` UNCOMMENTED (right beside ``PLEX_MANAGER_HOST_PORT``), so a
-    bare-metal install that copies it verbatim and later widens that value to
-    a LAN IP would otherwise get it trusted unconditionally even though the
-    bare-metal process actually listens on ``settings.host`` -- the identical
-    "compose-only .env default leaks onto bare metal" bug finding 3 already
-    closes for the port. Ungated, the loopback default is harmless, but a
-    widened one would silently print an undialable link.
+    container host, instead of always asserting ``localhost``) -- and the PORT
+    likewise prefers ``settings.host_port`` (the container's PUBLISHED host
+    port) over ``settings.port`` (the in-container port): a Docker install
+    commonly remaps these, and only the host socket is ever reachable from
+    the operator's browser.
 
-    The PORT prefers ``settings.host_port`` (the container's PUBLISHED host
-    port, see that field's docstring) over ``settings.port`` (the in-container
-    port) -- a Docker install commonly remaps these, and only the host port is
-    ever reachable from the operator's browser -- but ONLY when
-    :func:`_running_under_documented_compose` actually confirms this process
-    is running under that compose file (issue #294, finding 3); otherwise it
-    falls back to ``settings.port`` with an explicit caveat
-    (:data:`_BARE_METAL_HOST_PORT_NOTE`). With no ``host_port`` configured at
-    all, the fallback caveat is :data:`_UNCONFIRMED_HOST_PORT_NOTE` instead.
+    Both published values are trusted ONLY when ``settings.in_container``
+    confirms this process runs inside the shipped image (the image-baked
+    ``PLEX_MANAGER_IN_CONTAINER=1`` sentinel -- see that field's docstring).
+    That single gate resolves the two remaining #294 P2 follow-ups at once:
+
+    * Bare metal must NEVER trust them (round 2): ``.env.example`` ships both
+      variables uncommented for Compose's benefit, so a bare-metal install
+      that copies it verbatim -- even one with real disks mounted at both
+      conventional ``/media``/``/downloads`` paths, which is why mount-point
+      probing was abandoned as a topology signal -- would otherwise print a
+      "published" socket nothing is listening on, instead of the real
+      in-process listener. The sentinel cannot be copied by accident: it is
+      baked into the image only and deliberately absent from ``.env.example``.
+    * Inside the shipped image, an EXPLICIT value must always be honored
+      (round 3), however the container was launched. ``host_bind``/
+      ``host_port`` default to ``None``, so a non-``None`` value was
+      necessarily provided by the launch environment -- the documented
+      compose file's ``environment:`` block or a hand-rolled ``docker run
+      -e``/other orchestrator equivalent -- and the app has no better source
+      of truth for a port mapping it cannot see from inside. A prior revision
+      additionally demanded both documented compose mounts before trusting
+      them, which discarded a ``docker run`` operator's explicit
+      ``PLEX_MANAGER_HOST_PORT`` while the printed caveat simultaneously told
+      them to set that very variable -- self-contradictory guidance.
+
+    When ``host_port`` is set but ignored (bare metal, round 2), the fallback
+    to ``settings.port`` carries :data:`_BARE_METAL_HOST_PORT_NOTE`; with no
+    ``host_port`` configured at all, :data:`_UNCONFIRMED_HOST_PORT_NOTE`
+    instead.
 
     Either caveat, when present, is appended on its OWN trailing line -- a
     real ``\\n``, never concatenated into the same line as the URL (P2
@@ -1165,14 +1130,13 @@ def _setup_ready_url(settings: Settings) -> str:
     browser. This is a discoverability aid only (ADR-0005's install-time
     exception).
     """
-    documented_compose = _running_under_documented_compose(settings)
-    if settings.host_bind is not None and documented_compose:
+    if settings.host_bind is not None and settings.in_container:
         host = settings.host_bind
     else:
         host = settings.host
     if host in _UNDIALABLE_BIND_HOSTS:
         host = "localhost"
-    if settings.host_port is not None and documented_compose:
+    if settings.host_port is not None and settings.in_container:
         port: int = settings.host_port
         note = ""
     elif settings.host_port is not None:

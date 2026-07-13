@@ -71,15 +71,17 @@ class Settings(BaseSettings):
 
     # Image-baked sentinel: ``True`` only inside the shipped container image
     # (the Dockerfile's runtime stage sets ``PLEX_MANAGER_IN_CONTAINER=1``).
-    # The startup setup-URL hint requires this before trusting the two
-    # compose-published values above -- the ``/media``+``/downloads`` mount
-    # check alone is not evidence of being INSIDE the documented container (a
-    # bare-metal media server can have real disks mounted at both conventional
-    # paths, and copied compose-only ``host_bind``/``host_port`` values would
-    # then print an unreachable link instead of the real in-process listener).
-    # NOT an operator knob: never set this by hand, and it is deliberately
-    # absent from ``.env.example`` so a bare-metal install cannot copy it by
-    # accident. Defaults ``False`` everywhere the image did not bake it.
+    # The startup setup-URL hint trusts the two published socket values above
+    # ONLY when this is set: outside a container no port mapping can exist, so
+    # copied compose-only ``host_bind``/``host_port`` values would print an
+    # unreachable link instead of the real in-process listener. (Mount-point
+    # probing was rejected as an alternative signal: a bare-metal media server
+    # can have real disks mounted at both conventional paths, while a
+    # ``docker run`` of this image WITHOUT the compose mounts still deserves
+    # its explicitly-provided values honored.) NOT an operator knob: never set
+    # this by hand, and it is deliberately absent from ``.env.example`` so a
+    # bare-metal install cannot copy it by accident. Defaults ``False``
+    # everywhere the image did not bake it.
     in_container: bool = False
 
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync

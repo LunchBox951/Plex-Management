@@ -6,38 +6,14 @@ import httpx
 import pytest
 
 from plex_manager.config import Settings, get_settings
-from plex_manager.services import path_visibility
 from plex_manager.web.app import (
     _BARE_METAL_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _UNCONFIRMED_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _emit_setup_ready_hint,  # pyright: ignore[reportPrivateUsage]
-    _running_under_documented_compose,  # pyright: ignore[reportPrivateUsage]
     _setup_ready_url,  # pyright: ignore[reportPrivateUsage]
     _warn_if_multi_process,  # pyright: ignore[reportPrivateUsage]
     create_upstream_http_client,
 )
-
-
-def _always_a_live_mount(_path: str) -> bool:
-    """A ``path_visibility.is_live_mount`` stand-in simulating the documented
-    compose topology's required bind mounts always being live."""
-    return True
-
-
-def _never_a_live_mount(_path: str) -> bool:
-    """A ``path_visibility.is_live_mount`` stand-in simulating a bare-metal
-    install with neither of the compose-required bind mounts present."""
-    return False
-
-
-def _only_media_is_a_live_mount(path: str) -> bool:
-    """A ``path_visibility.is_live_mount`` stand-in simulating a HALF-mounted
-    box: something real mounted at ``/media`` but no ``/downloads`` mount --
-    ``docker-compose.yml`` requires BOTH, so this can never be the documented
-    Compose topology (whether it is a bare-metal disk that happens to sit at
-    the conventional path, or a hand-rolled ``docker run`` of our image with
-    only one bind)."""
-    return path == "/media"
 
 
 async def test_upstream_http_client_ignores_proxy_environment(
@@ -68,80 +44,32 @@ async def test_upstream_http_client_rejects_response_cookies() -> None:
         await client.aclose()
 
 
-class TestRunningUnderDocumentedCompose:
-    """``_running_under_documented_compose`` gates the compose-only
-    ``host_port``/``host_bind`` settings on BOTH the image-baked container
-    sentinel (``Settings.in_container``) AND both documented bind mounts being
-    live (the two P2 follow-ups to issue #294) -- mount-point names alone are
-    never evidence of being inside the documented container."""
-
-    def test_true_when_containerized_with_both_documented_mounts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
-        assert _running_under_documented_compose(Settings(in_container=True)) is True
-
-    def test_false_on_bare_metal_even_with_both_documented_mounts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Second P2 follow-up to issue #294: a bare-metal media server can
-        have real, unrelated disks mounted at BOTH conventional paths, so the
-        mount check alone proves nothing about being inside the documented
-        container. Without the image-baked ``PLEX_MANAGER_IN_CONTAINER``
-        sentinel, copied compose-only env values must not be trusted."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
-        assert _running_under_documented_compose(Settings(in_container=False)) is False
-
-    def test_false_when_neither_documented_mount_is_live(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
-        assert _running_under_documented_compose(Settings(in_container=True)) is False
-
-    def test_false_when_only_one_documented_mount_is_live(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Even inside our own image (sentinel set -- e.g. a hand-rolled
-        ``docker run``), only one of the two compose-required mounts being
-        live means this container was NOT launched by the documented compose
-        file, so its compose-published socket values cannot be presumed (an
-        ``any()`` gate would wrongly say otherwise)."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _only_media_is_a_live_mount)
-        assert _running_under_documented_compose(Settings(in_container=True)) is False
-
-
 class TestSetupReadyUrl:
     """The startup setup-URL hint (issue #65) -- see Codex's follow-up findings:
     the printed link must use the externally-reachable HOST port, not always the
     in-container one, and must never carry the bootstrap token as a query string
     (which uvicorn's default access log would otherwise record verbatim)."""
 
-    def test_uses_host_port_when_running_under_the_documented_compose(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Simulate the documented compose deployment: the image-baked container
-        # sentinel plus BOTH compose-required bind mounts live (see
-        # `_running_under_documented_compose`) -- a real docker-compose install
-        # always has all three; a bare-metal test process never does.
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
+    def test_uses_host_port_when_running_under_the_documented_compose(self) -> None:
+        # The documented compose deployment: the image bakes the in_container
+        # sentinel and the compose file hands PLEX_MANAGER_HOST_PORT to the
+        # container's own environment.
         settings = Settings(host="0.0.0.0", port=8000, host_port=9443, in_container=True)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:9443/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
         assert _BARE_METAL_HOST_PORT_NOTE not in url
 
-    def test_falls_back_to_the_real_listener_on_bare_metal_with_both_mounts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Second P2 follow-up to issue #294: a bare-metal media server with
-        real, unrelated disks mounted at BOTH ``/media`` and ``/downloads``
-        plus copied compose-only ``PLEX_MANAGER_HOST_BIND``/``HOST_PORT``
-        values must NOT have those values trusted -- e.g. a widened
-        ``host_bind=192.168.1.50`` would print an unreachable link even
-        though the process still listens on ``settings.host``. Without the
-        image-baked container sentinel, the hint must fall back to the actual
-        in-process listener (``settings.host``/``settings.port``) and say so."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
+    def test_falls_back_to_the_real_listener_on_bare_metal_with_both_mounts(self) -> None:
+        """Second P2 follow-up to issue #294: a bare-metal media server --
+        even one with real, unrelated disks mounted at BOTH ``/media`` and
+        ``/downloads``; mount-point probing is deliberately NOT consulted --
+        that copied the compose-only ``PLEX_MANAGER_HOST_BIND``/``HOST_PORT``
+        values must not have them trusted: a widened ``host_bind=
+        192.168.1.50`` would print an unreachable link even though the
+        process still listens on ``settings.host``. Without the image-baked
+        container sentinel, the hint must fall back to the actual in-process
+        listener (``settings.host``/``settings.port``) and say so."""
         settings = Settings(
             host="127.0.0.1",
             port=9000,
@@ -154,27 +82,28 @@ class TestSetupReadyUrl:
         assert _BARE_METAL_HOST_PORT_NOTE in url
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
-    def test_falls_back_to_the_real_listener_when_only_one_mount_is_documented(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """First P2 follow-up to issue #294: even inside our own image
-        (sentinel set -- a hand-rolled ``docker run``), only ONE of the two
-        compose-required mounts being live means this container was not
-        launched by the documented compose file, so its compose-only
-        ``host_port``/``host_bind`` values must not be presumed -- it must
-        fall back to the actual in-process listener
-        (``settings.port``/``settings.host``)."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _only_media_is_a_live_mount)
+    def test_honors_explicit_host_socket_values_in_a_container_outside_compose(self) -> None:
+        """Third P2 follow-up to issue #294: the shipped image launched by
+        ``docker run``/another orchestrator (sentinel baked in, but zero or
+        one of the documented compose mounts) with an EXPLICIT
+        ``PLEX_MANAGER_HOST_PORT``/``HOST_BIND`` -- e.g. host 9443 mapped to
+        container 8000 -- must have those values honored, not discarded. A
+        prior revision gated them on a mount-based compose detector, printing
+        ``settings.port`` while its own caveat told the operator to set the
+        very variable it was ignoring. ``host_port``/``host_bind`` default to
+        ``None``, so any non-``None`` value inside a container was
+        necessarily provided by the launch environment -- the app has no
+        better source of truth for a mapping it cannot see from inside."""
         settings = Settings(
-            host="127.0.0.1",
-            port=9000,
-            host_port=8000,
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
             host_bind="192.168.1.50",
             in_container=True,
         )
         url = _setup_ready_url(settings)
-        assert url.startswith("http://127.0.0.1:9000/setup")
-        assert _BARE_METAL_HOST_PORT_NOTE in url
+        assert url.startswith("http://192.168.1.50:9443/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
     def test_falls_back_to_the_in_container_port_and_says_so_when_unknown(self) -> None:
@@ -183,16 +112,13 @@ class TestSetupReadyUrl:
         assert url.startswith("http://localhost:8000/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE in url
 
-    def test_ignores_a_compose_only_host_port_default_on_bare_metal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_ignores_a_compose_only_host_port_default_on_bare_metal(self) -> None:
         """Issue #294, finding 3: a bare-metal install that copies
         ``.env.example`` verbatim inherits its compose-only
         ``PLEX_MANAGER_HOST_PORT=8000`` default even though no port mapping was
-        ever applied. Without the compose-topology gate, that guessed port
+        ever applied. Without the container-sentinel gate, that guessed port
         would print unchallenged; with it, the app falls back to the
-        in-container port and says so honestly."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
+        in-process port and says so honestly."""
         settings = Settings(host="0.0.0.0", port=9000, host_port=8000)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:9000/setup")
@@ -254,17 +180,14 @@ class TestSetupReadyUrl:
         assert " " not in url_line
         assert url_line.endswith("#setup_token=boot-token")
 
-    def test_uses_the_published_host_bind_over_the_in_process_listen_address(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_uses_the_published_host_bind_over_the_in_process_listen_address(self) -> None:
         """Issue #294, finding 4: a Compose install deliberately published
         under a LAN IP must get that IP in the printed link, not an
         unconditional ``localhost`` that never resolves off the container
         host. ``host_port`` is deliberately distinct from ``port`` here so
-        this only passes via the compose branch honoring both published
+        this only passes via the container branch honoring both published
         values -- not by coincidence with the bare-metal fallback (which
         would print ``port``, not ``host_port``)."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
         settings = Settings(
             host="0.0.0.0",  # noqa: S104
             port=8000,
@@ -277,9 +200,8 @@ class TestSetupReadyUrl:
         assert _BARE_METAL_HOST_PORT_NOTE not in url
 
     def test_substitutes_localhost_when_the_published_host_bind_is_also_undialable(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
     ) -> None:
-        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
         settings = Settings(
             host="0.0.0.0",  # noqa: S104
             port=8000,
@@ -295,18 +217,15 @@ class TestSetupReadyUrl:
         url = _setup_ready_url(settings)
         assert url.startswith("http://127.0.0.1:8000/setup")
 
-    def test_ignores_a_compose_only_host_bind_default_on_bare_metal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_ignores_a_compose_only_host_bind_default_on_bare_metal(self) -> None:
         """A bare-metal install that copies ``.env.example`` verbatim inherits
         its compose-only ``PLEX_MANAGER_HOST_BIND=127.0.0.1`` default -- and an
         operator who then widens it for what they believe is a Compose LAN
         publish would otherwise get that value trusted unconditionally even
         though the bare-metal process actually listens on ``settings.host``.
-        Without the compose-topology gate this prints an undialable link
+        Without the container-sentinel gate this prints an undialable link
         exactly like the ungated ``host_port`` bug finding 3 already closes;
         with it, ``host_bind`` is ignored and the in-process host is used."""
-        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
         settings = Settings(
             host="127.0.0.1",
             port=8000,
