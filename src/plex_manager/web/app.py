@@ -291,7 +291,29 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 type(exc).__name__,
             )
             continue
+        if authorization is watchlist_service.SyncUserAuthorization.STALE:
+            # Rejected token, or the account no longer reaches the configured
+            # server (e.g. after a repoint). Clearing the snapshot stops the stale
+            # account from BOTH creating (skipped sync) and PROTECTING (deleted
+            # rows) requests -- is_watchlisted has no user_id predicate, so its
+            # retained rows would otherwise keep protecting titles from eviction
+            # on the new server forever (#296 finding 1).
+            skipped_users += 1
+            async with maker() as session:
+                cleared = await watchlist_service.clear_user_snapshot(session, user_id=user.id)
+                await session.commit()
+            _logger.info(
+                "watchlist token for user_id=%s is stale for the configured server; "
+                "skipped sync and cleared %s snapshot row(s) so they no longer protect "
+                "titles from eviction",
+                safe_int(user.id),
+                cleared,
+            )
+            continue
         if authorization is not watchlist_service.SyncUserAuthorization.AUTHORIZED:
+            # UNKNOWN: authorization could not be determined (plex.tv unreachable).
+            # Skip this tick but RETAIN the snapshot -- a transient outage must not
+            # be read as a revoked account.
             skipped_users += 1
             _logger.info(
                 "skipping watchlist sync for user_id=%s: %s for the configured server; "

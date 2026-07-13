@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from sqlalchemy import CursorResult, delete, select
 
 from plex_manager.adapters.plex.oauth import (
+    CODE_TOKEN_INVALID,
     PlexTvClient,
     PlexVerifyError,
     account_server_resource,
@@ -24,16 +25,12 @@ if TYPE_CHECKING:
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.watchlist import WatchlistPort
 
-# The oauth adapter's stable error code for a token plex.tv rejected outright
-# (401/403). A rejected token can never be re-authorized for the configured
-# server, so its owner is treated as stale rather than "unknown/retry".
-_TOKEN_INVALID_CODE = "plex_token_invalid"  # noqa: S105 - error code, not a secret
-
 __all__ = [
     "SyncUserAuthorization",
     "WatchlistSyncResult",
     "WatchlistWorkerStatus",
     "clear_snapshots",
+    "clear_user_snapshot",
     "is_watchlisted",
     "list_sync_users",
     "revalidate_sync_user",
@@ -54,8 +51,9 @@ class SyncUserAuthorization(Enum):
 
     STALE = "stale"
     """plex.tv rejected the token, or the account no longer has access to the
-    configured server (e.g. after a verified repoint). Skip it -- do NOT let its
-    old snapshot keep creating/protecting requests on the new server."""
+    configured server (e.g. after a verified repoint). Skip its sync AND clear its
+    snapshot (:func:`clear_user_snapshot`) -- do NOT let its old rows keep creating
+    OR protecting requests on the new server."""
 
     UNKNOWN = "unknown"
     """Authorization could not be determined (plex.tv unreachable). Skip the sync
@@ -171,7 +169,11 @@ async def revalidate_sync_user(
     try:
         resources = await plex_tv.fetch_resources(token)
     except PlexVerifyError as exc:
-        if exc.code == _TOKEN_INVALID_CODE:
+        # A token plex.tv rejected outright (401/403) can never be re-authorized
+        # for the configured server, so its owner is STALE rather than
+        # "unknown/retry". Keyed off the oauth adapter's shared error code so the
+        # coupling is compile-time, not a hand-copied literal.
+        if exc.code == CODE_TOKEN_INVALID:
             return SyncUserAuthorization.STALE
         return SyncUserAuthorization.UNKNOWN
     if account_server_resource(resources, machine_identifier) is None:
@@ -191,6 +193,28 @@ async def clear_snapshots(session: AsyncSession) -> int:
     Idempotent: a no-op (returns 0) once already cleared.
     """
     result = cast("CursorResult[Any]", await session.execute(delete(WatchlistItem)))
+    return result.rowcount or 0
+
+
+async def clear_user_snapshot(session: AsyncSession, *, user_id: int) -> int:
+    """Delete one user's stored watchlist snapshot rows; return how many.
+
+    Used when a candidate token revalidates as :attr:`SyncUserAuthorization.STALE`
+    (rejected by plex.tv, or no longer reaches the configured server after a
+    verified repoint): eviction protection is an unfiltered ``EXISTS`` over
+    :class:`WatchlistItem` by ``(tmdb_id, media_type)`` with no ``user_id``
+    predicate (:func:`is_watchlisted`), so a stale user's retained rows would keep
+    protecting those titles from disk-pressure eviction indefinitely on the new
+    server. Clearing them stops the stale account from both CREATING (skipped
+    sync) and PROTECTING (deleted rows) requests -- issue #296 finding 1 requires
+    both. Not called for :attr:`SyncUserAuthorization.UNKNOWN`: a transient
+    plex.tv outage must not be read as a revoked account, so its snapshot is
+    retained. Idempotent (returns 0 once already cleared). Does not commit.
+    """
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(delete(WatchlistItem).where(WatchlistItem.user_id == user_id)),
+    )
     return result.rowcount or 0
 
 

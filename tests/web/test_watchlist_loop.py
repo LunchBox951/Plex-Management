@@ -75,15 +75,22 @@ async def test_disabling_sync_clears_stale_snapshot_rows(app: FastAPI, seed: See
     assert remaining == []
 
 
-async def test_stale_user_is_skipped_without_syncing(app: FastAPI, seed: SeedFn) -> None:
+async def test_stale_user_is_skipped_and_snapshot_cleared(app: FastAPI, seed: SeedFn) -> None:
     """A stored token that no longer reaches the configured server (e.g. after a
-    repoint) is skipped -- it never creates/protects requests (#296)."""
+    repoint) is skipped AND its pre-existing snapshot rows are deleted, so a stale
+    old-server account can neither create nor keep PROTECTING titles from eviction
+    on the new server (#296 finding 1 -- both halves)."""
     await seed(initialized=True)
     async with app.state.sessionmaker() as session:
         store = SettingsStore(session)
         await store.set("tmdb_api_key", "tmdb-key")
         await store.set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
-        session.add(User(username="stale-watcher", encrypted_plex_token="old-token"))  # noqa: S106
+        user = User(username="stale-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        # A snapshot row left behind from when this account WAS authorized: without
+        # the clear-on-stale fix it would keep protecting tmdb 603 forever.
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
         await session.commit()
 
     # plex.tv only advertises a DIFFERENT server for this token: not authorized.
@@ -98,6 +105,37 @@ async def test_stale_user_is_skipped_without_syncing(app: FastAPI, seed: SeedFn)
     assert status.created == 0
     async with app.state.sessionmaker() as session:
         assert list((await session.execute(WatchlistItem.__table__.select())).all()) == []
+
+
+async def test_unknown_authorization_retains_snapshot(app: FastAPI, seed: SeedFn) -> None:
+    """A transient plex.tv outage (authorization UNKNOWN) must skip the tick but
+    RETAIN the snapshot -- it must never be mistaken for a revoked account and
+    have its eviction-protection rows deleted (#296)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", "tmdb-key")
+        await store.set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    def _unreachable(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/resources":
+            raise httpx.ConnectError("plex.tv unreachable", request=request)
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable))
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.skipped_users == 1
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
 
 
 async def test_watchlist_tick_reports_not_configured_without_tmdb(

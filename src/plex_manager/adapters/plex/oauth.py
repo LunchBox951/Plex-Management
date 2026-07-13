@@ -24,6 +24,7 @@ from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import is_header_safe
 
 __all__ = [
+    "CODE_TOKEN_INVALID",
     "PlexAccount",
     "PlexConnection",
     "PlexResource",
@@ -44,7 +45,10 @@ _HTTP_FORBIDDEN: Final = 403
 # Stable, user-facing error identifiers (see the web error taxonomy).
 _CODE_PLEX_TV_UNREACHABLE: Final = "plex_tv_unreachable_server"
 _CODE_PLEX_TV_BAD_RESPONSE: Final = "plex_tv_bad_response"
-_CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
+# Public: consumers (e.g. watchlist revalidation) key STALE-vs-UNKNOWN off this
+# exact code, so it must be shared -- not hand-copied -- to stay coupled at
+# import time.
+CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
 _CODE_IDENTITY_FAILED: Final = "server_identity_failed"
 _CODE_SERVER_UNREACHABLE: Final = "server_unreachable_from_backend"
 
@@ -109,7 +113,7 @@ def _require_header_safe_token(token: str, host: str) -> None:
     """
     if not is_header_safe(token):
         raise PlexVerifyError(
-            _CODE_TOKEN_INVALID,
+            CODE_TOKEN_INVALID,
             "Plex token is not a valid credential value",
             diagnostics={"host": host},
         )
@@ -243,7 +247,7 @@ class PlexTvClient:
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
             bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
-            invalid_token_code=_CODE_TOKEN_INVALID,
+            invalid_token_code=CODE_TOKEN_INVALID,
         )
         return self.parse_account(payload)
 
@@ -256,7 +260,7 @@ class PlexTvClient:
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
             bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
-            invalid_token_code=_CODE_TOKEN_INVALID,
+            invalid_token_code=CODE_TOKEN_INVALID,
         )
         return self.parse_resources(payload)
 
