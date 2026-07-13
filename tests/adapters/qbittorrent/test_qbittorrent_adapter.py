@@ -1403,13 +1403,21 @@ async def test_assert_safe_fetch_url_shape_never_resolves_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The real network path's per-hop pre-check must be shape-only: scheme +
-    hostname presence, no DNS. The connect-time backend is the sole resolver."""
+    hostname presence, no DNS. The connect-time backend is the sole resolver.
+
+    ``fake_getaddrinfo`` must return normally (not raise) so that ``calls``
+    genuinely reflects whether the resolver was invoked -- a mock that raises
+    on any call would make the post-call ``assert calls == 0`` vacuously true
+    (unreachable otherwise), which is exactly what CodeQL's py/redundant-
+    comparison flagged (alert #339): the assertion could never actually catch
+    a regression that made the shape check resolve DNS.
+    """
     calls = 0
 
     def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
         nonlocal calls
         calls += 1
-        raise AssertionError("shape-only pre-check must not resolve DNS")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80))]
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
