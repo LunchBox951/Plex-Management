@@ -371,6 +371,208 @@ async def test_remove_torrent_skips_the_poll_when_the_host_path_cannot_be_remapp
     assert ok is True
 
 
+async def test_remove_torrent_polls_save_path_plus_name_when_content_path_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #290, finding #1: qBittorrent's adapter NULLS content_path when it
+    # merely echoes save_path (a not-yet-resolved torrent). save_path + name is
+    # then the live content location (exactly as import_service._resolve_content
+    # treats it) and IS distinct -- so the post-ack poll must still run against it,
+    # not be skipped, leaving the issue #240 same-hash race open for that class.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    video = mount / "Some.Movie.2020.1080p-GRP.mkv"
+    video.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.05)
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name=video.name,
+                raw_state="stalledUP",
+                save_path=str(mount),  # host==container here; content_path nulled by the adapter
+                content_path=None,
+            )
+        ],
+        files={("a" * 40): [DownloadedFile(name=video.name, size_bytes=1024)]},
+    )
+
+    async def _delete_shortly_after() -> None:
+        await asyncio.sleep(0.15)
+        video.unlink()
+
+    deleter = asyncio.create_task(_delete_shortly_after())
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    await asyncio.gather(deleter)
+
+    assert ok is True
+    assert not video.exists()  # the poll genuinely waited on save_path/name
+
+
+async def test_remove_torrent_skips_the_poll_when_name_is_absolute() -> None:
+    # A defensive guard mirrored from _resolve_content: an absolute ``name`` must
+    # never be joined onto save_path (it would escape it), so with no content_path
+    # there is nothing distinct to poll -- an honest skip.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="/etc/passwd",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path=None,
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+    assert qbt.removed == [("a" * 40, True)]
+
+
+def test_snapshot_content_path_rejects_a_relative_name_that_escapes_save_path() -> None:
+    # PR #309 codex finding: a RELATIVE name can still escape save_path via ``..``
+    # components (save_path=/srv/downloads + name=../escape.mkv resolves to
+    # /srv/escape.mkv). Mirrors _resolve_content's realpath containment guard:
+    # nothing safe to poll, so the snapshot is None -- the post-delete poll must
+    # never watch an unrelated path and release/delay the same-hash guard on the
+    # wrong file.
+    status = DownloadStatus(
+        info_hash="a" * 40,
+        name="../escape.mkv",
+        raw_state="stalledUP",
+        save_path="/srv/downloads",
+        content_path=None,
+    )
+    assert purge_service._snapshot_content_path(status) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_snapshot_content_path_rejects_a_nested_dotdot_escape_and_a_dot_name() -> None:
+    # ``sub/../../escape`` sneaks the same escape past a naive startswith check on
+    # the unresolved join; a ``.`` name resolves back to save_path ITSELF, which is
+    # shared by sibling torrents and must never be polled.
+    for name in ("sub/../../escape.mkv", "."):
+        status = DownloadStatus(
+            info_hash="a" * 40,
+            name=name,
+            raw_state="stalledUP",
+            save_path="/srv/downloads",
+            content_path=None,
+        )
+        assert (
+            purge_service._snapshot_content_path(status)  # pyright: ignore[reportPrivateUsage]
+            is None
+        )
+
+
+def test_snapshot_content_path_joins_a_normal_relative_name() -> None:
+    # The guard must not disturb the normal fallback: a plain (even nested)
+    # relative name still joins onto save_path unchanged.
+    status = DownloadStatus(
+        info_hash="a" * 40,
+        name="Some.Movie.2020.1080p-GRP/Some.Movie.2020.1080p-GRP.mkv",
+        raw_state="stalledUP",
+        save_path="/srv/downloads",
+        content_path=None,
+    )
+    assert (
+        purge_service._snapshot_content_path(status)  # pyright: ignore[reportPrivateUsage]
+        == "/srv/downloads/Some.Movie.2020.1080p-GRP/Some.Movie.2020.1080p-GRP.mkv"
+    )
+
+
+async def test_remove_torrent_skips_the_poll_when_name_escapes_save_path() -> None:
+    # End-to-end shape of the guard above: with content_path absent and a
+    # ``..``-bearing name, there is nothing distinct AND contained to poll -- the
+    # removal still succeeds, the poll is honestly skipped.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="../escape.mkv",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path=None,
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+    assert qbt.removed == [("a" * 40, True)]
+
+
+async def test_remove_torrent_prefers_the_mounted_file_over_an_outside_mount_phantom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #290, finding #2: the HOST content_path coincidentally exists in this
+    # container as a stale PHANTOM tree OUTSIDE the live /downloads mount, while
+    # the REAL file sits under the mount. Watching the phantom would release the
+    # same-hash guard immediately while qBittorrent still deletes the real file.
+    # The poll must run against the REMAPPED, mounted path -- so it genuinely
+    # waits for the real file to leave disk.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    real = mount / "Some.Movie.2020.1080p-GRP.mkv"
+    real.write_bytes(b"x" * 1024)
+    # The phantom: a host-shaped tree that ALSO exists in-container, outside the mount.
+    host_save_path = str(tmp_path / "srv" / "downloads")
+    phantom = tmp_path / "srv" / "downloads" / real.name
+    phantom.parent.mkdir(parents=True)
+    phantom.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.05)
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name=real.name,
+                raw_state="stalledUP",
+                save_path=host_save_path,
+                content_path=f"{host_save_path}/{real.name}",
+            )
+        ],
+        files={("a" * 40): [DownloadedFile(name=real.name, size_bytes=1024)]},
+    )
+
+    async def _delete_the_real_file() -> None:
+        await asyncio.sleep(0.15)
+        real.unlink()  # only the mounted file is deleted; the phantom lingers
+
+    deleter = asyncio.create_task(_delete_the_real_file())
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    await asyncio.gather(deleter)
+
+    assert ok is True
+    assert not real.exists()  # the poll waited on the MOUNTED path, not the phantom
+    assert phantom.exists()  # never touched -- proves the phantom was not what was watched
+
+
+async def test_visible_content_path_prefers_mounted_remap_over_a_phantom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Direct unit of finding #2: _visible_content_path must not short-circuit to a
+    # verbatim content_path that exists only as a phantom OUTSIDE the live mount.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    real = mount / "clip.mkv"
+    real.write_bytes(b"x" * 512)
+    host_save_path = str(tmp_path / "srv" / "downloads")
+    phantom = tmp_path / "srv" / "downloads" / "clip.mkv"
+    phantom.parent.mkdir(parents=True)
+    phantom.write_bytes(b"x" * 512)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    qbt = FakeQbittorrent(files={("a" * 40): [DownloadedFile(name="clip.mkv", size_bytes=512)]})
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, f"{host_save_path}/clip.mkv", host_save_path
+    )
+    assert result == str(real)
+
+
 async def test_visible_content_path_returns_none_when_save_path_is_empty() -> None:
     # No live save-path anchor (a torrent status with no save path reported) --
     # only the verbatim content path counts; a free suffix search is never

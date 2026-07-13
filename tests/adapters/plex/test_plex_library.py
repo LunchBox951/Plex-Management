@@ -27,7 +27,7 @@ from plex_manager.adapters.plex.library import (
     _resolve_correlated_watch_state,  # pyright: ignore[reportPrivateUsage]
     reset_caches,
 )
-from plex_manager.ports.library import WatchState
+from plex_manager.ports.library import WatchState, WatchStateQuery
 
 PLEX_URL = "http://plex:32400"
 TOKEN = "super-secret-plex-token"  # noqa: S105
@@ -2169,6 +2169,54 @@ def test_resolve_correlated_watch_state_three_way_split_still_fails_closed() -> 
     assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
 
 
+def test_resolve_correlated_watch_state_mid_rewatch_uses_recent_in_progress_timestamp() -> None:
+    # Issue #290, the FAIL-OPEN: the SAME physical file is indexed by two Plex
+    # sections. Section A recorded a completed watch long past the grace cutoff
+    # (watched=True, STALE lastViewedAt). Section B is mid-rewatch -- its
+    # viewCount/viewedLeafCount hasn't incremented yet, so watched=False, but its
+    # lastViewedAt is RECENT. Merging only the WATCHED timestamps would keep A's
+    # stale one and make the file eviction-eligible DURING the active rewatch.
+    # The merge must take the NEWEST across ALL hits (including the in-progress
+    # one), so the recent view protects the file: eviction stays fail-CLOSED.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_NEWER_AT
+    )
+
+
+def test_resolve_correlated_watch_state_partial_view_timestamp_wins_over_stale_watched() -> None:
+    # Issue #290, finding #3 (TV season manifestation): a same-file season hit
+    # that is only partially watched (viewedLeafCount != leafCount => watched=False)
+    # still carries a recent lastViewedAt from the in-progress binge. A different
+    # section reporting the season fully watched long ago (watched=True, stale)
+    # must NOT let its stale timestamp win over the more-recent partial view.
+    season_files = frozenset({"/s1e1.mkv", "/s1e2.mkv"})
+    hits = [
+        (season_files, WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+        (season_files, WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_NEWER_AT
+    )
+
+
+def test_resolve_correlated_watch_state_all_in_progress_stays_unwatched() -> None:
+    # Every hit is in-progress (watched=False) but carries a recent timestamp:
+    # with NO section reporting a completed watch, the merge stays watched=False
+    # (and last_viewed_at=None) -- an in-progress-only item is not "watched", and
+    # eviction ignores it regardless of timestamp. The in-progress timestamps
+    # only ever RAISE protection when SOME section is watched; they never
+    # manufacture a watched verdict on their own.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_WATCHED_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
+
+
 # A broad section ("Movies" at /data/movies) and a NESTED section ("Anime
 # Movies" at /data/movies/Anime) both index the exact same physical file --
 # the issue #239 scenario a real Plex library produces. Section keys are
@@ -2240,6 +2288,64 @@ async def test_watch_state_movie_merges_identical_path_across_sections() -> None
     adapter = _adapter(_movie_overlap_handler, base_url="http://watch-overlap-movie:32400")
     state = await adapter.watch_state(42, "movie", library_path="/data/movies/Anime/Show/ep.mkv")
     assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+# Issue #290 fail-open: the SAME file across two sections, section A watched long
+# ago (stale timestamp), section B mid-rewatch (viewCount not yet incremented, so
+# unwatched, but a RECENT lastViewedAt). The end-to-end adapter read must merge to
+# the RECENT timestamp so eviction's grace window protects the active rewatch.
+MOVIES_REWATCH_SECTION_5: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://77"}],
+                "viewCount": 2,  # a completed watch...
+                "lastViewedAt": _WATCHED_EPOCH,  # ...but long past the grace cutoff
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/rewatch.mkv"}]}],
+            },
+        ],
+    }
+}
+
+MOVIES_REWATCH_SECTION_55: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://77"}],
+                # Mid-rewatch via THIS section: its own viewCount hasn't ticked
+                # over yet (unwatched), but Plex already stamped a RECENT view.
+                "viewCount": 0,
+                "lastViewedAt": _NEWER_EPOCH,
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/rewatch.mkv"}]}],
+            },
+        ],
+    }
+}
+
+
+def _movie_rewatch_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_OVERLAP)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_REWATCH_SECTION_5)
+    if path == "/library/sections/11/all":
+        return httpx.Response(200, json=MOVIES_REWATCH_SECTION_55)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_mid_rewatch_across_sections_keeps_recent_timestamp() -> None:
+    # The fail-open guarded against (issue #290): a disk-pressure sweep landing
+    # mid-rewatch must NOT get a stale watched timestamp that makes the file
+    # eviction-eligible. The recent in-progress view from the other section wins.
+    adapter = _adapter(_movie_rewatch_handler, base_url="http://watch-rewatch-movie:32400")
+    state = await adapter.watch_state(
+        77, "movie", library_path="/data/movies/Anime/Show/rewatch.mkv"
+    )
+    assert state == WatchState(watched=True, last_viewed_at=_NEWER_AT)
 
 
 SHOWS_OVERLAP_SECTION_2: dict[str, Any] = {
@@ -2352,3 +2458,502 @@ async def test_watch_state_tv_merges_identical_episode_path_across_sections() ->
         1399, "tv", season=1, library_path="/data/tv/AnimeShow/Season 01"
     )
     assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_watch_states -- batch discovery (issues #213/#238)
+#
+# The whole point: one section crawl for the WHOLE candidate pool, one season
+# ``/children`` read per DISTINCT show (never once per candidate season), and a
+# result byte-for-byte identical to N per-candidate ``watch_state`` calls.
+# --------------------------------------------------------------------------- #
+_ONE_MOVIE_SECTION_SLASH_M: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "1", "title": "Movies", "type": "movie", "Location": [{"path": "/m"}]}
+        ]
+    }
+}
+
+
+def _make_batch_movie_handler(total: int, calls: dict[str, int]) -> Any:
+    """A movie section of ``total`` items (each with its OWN ``/m/Title{i}`` file);
+    item 1005 is watched, the rest never viewed. ``calls`` records every request
+    path so a test can prove the section is paged ONCE for the whole batch."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_ONE_MOVIE_SECTION_SLASH_M)
+        if path == "/library/sections/1/all":
+            start = int(request.headers["X-Plex-Container-Start"])
+            size = int(request.headers["X-Plex-Container-Size"])
+            chunk: list[dict[str, Any]] = []
+            for i in range(start, min(start + size, total)):
+                item: dict[str, Any] = {
+                    "Guid": [{"id": f"tmdb://{1000 + i}"}],
+                    "Media": [{"Part": [{"file": f"/m/Title{1000 + i}/f.mkv"}]}],
+                }
+                if 1000 + i == 1005:
+                    item["viewCount"] = 2
+                    item["lastViewedAt"] = _WATCHED_EPOCH
+                chunk.append(item)
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": chunk}})
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_pages_a_movie_section_once_for_the_whole_batch() -> None:
+    # 130 items => two pages. Three path-correlated movie candidates would cost
+    # 3 * 2 = 6 section-page reads one at a time; the batch pays exactly 2.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_movie_handler(130, calls), base_url="http://batch-movie:32400")
+    queries = [
+        WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/m/Title1000"),
+        WatchStateQuery(tmdb_id=1005, media_type="movie", library_path="/m/Title1005"),
+        WatchStateQuery(tmdb_id=1129, media_type="movie", library_path="/m/Title1129"),
+    ]
+    states = await adapter.resolve_watch_states(queries)
+
+    assert states == [
+        WatchState(watched=False, last_viewed_at=None),
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),
+        WatchState(watched=False, last_viewed_at=None),
+    ]
+    # ONE crawl (two pages), not one crawl PER candidate.
+    assert calls["/library/sections/1/all"] == 2
+    assert calls["/library/sections"] == 1
+
+
+async def test_resolve_watch_states_matches_per_item_watch_state_for_every_query() -> None:
+    # The batch result must equal what N separate ``watch_state`` calls return.
+    per_item_calls: dict[str, int] = {}
+    per_item = _adapter(
+        _make_batch_movie_handler(130, per_item_calls), base_url="http://per-item-movie:32400"
+    )
+    queries = [
+        WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/m/Title1000"),
+        WatchStateQuery(tmdb_id=1005, media_type="movie", library_path="/m/Title1005"),
+        WatchStateQuery(tmdb_id=1129, media_type="movie", library_path="/m/Title1129"),
+    ]
+    expected = [
+        await per_item.watch_state(q.tmdb_id, q.media_type, library_path=q.library_path)
+        for q in queries
+    ]
+
+    batch_calls: dict[str, int] = {}
+    batch = _adapter(_make_batch_movie_handler(130, batch_calls), base_url="http://batch-eq:32400")
+    assert await batch.resolve_watch_states(queries) == expected
+
+
+async def test_resolve_watch_states_empty_touches_no_network() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_movie_handler(1, calls), base_url="http://batch-empty:32400")
+    assert await adapter.resolve_watch_states([]) == []
+    assert calls == {}
+
+
+_BATCH_SHOW_SECTION: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "2", "title": "TV", "type": "show", "Location": [{"path": "/data/tv"}]}
+        ]
+    }
+}
+
+
+def _batch_show_seasons(watched_seasons: frozenset[int]) -> dict[str, Any]:
+    """Five seasons (index 1..5) of one show, each its own ``ratingKey`` 10X;
+    seasons in ``watched_seasons`` are fully viewed, the rest partially."""
+    metadata: list[dict[str, Any]] = []
+    for season in range(1, 6):
+        fully = season in watched_seasons
+        metadata.append(
+            {
+                "index": season,
+                "ratingKey": str(100 + season),
+                "leafCount": 10,
+                "viewedLeafCount": 10 if fully else 4,
+                "lastViewedAt": _WATCHED_EPOCH if fully else _PARTIAL_EPOCH,
+            }
+        )
+    return {"MediaContainer": {"Metadata": metadata}}
+
+
+def _make_batch_tv_handler(total: int, calls: dict[str, int]) -> Any:
+    """A show section of ``total`` shows; show tmdb 1399 (ratingKey 100) carries
+    five seasons, each backed by an episode under ``/data/tv/Show/Season 0X``.
+    Seasons 2 and 4 are fully watched."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_BATCH_SHOW_SECTION)
+        if path == "/library/sections/2/all":
+            start = int(request.headers["X-Plex-Container-Start"])
+            size = int(request.headers["X-Plex-Container-Size"])
+            chunk: list[dict[str, Any]] = []
+            for i in range(start, min(start + size, total)):
+                # The target show sits first; the rest are unrelated filler tmdb ids.
+                tmdb = 1399 if i == 0 else 5000 + i
+                chunk.append(
+                    {
+                        "ratingKey": str(100 if i == 0 else 9000 + i),
+                        "Guid": [{"id": f"tmdb://{tmdb}"}],
+                    }
+                )
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": chunk}})
+        if path == "/library/metadata/100/children":
+            return httpx.Response(200, json=_batch_show_seasons(frozenset({2, 4})))
+        match = re.fullmatch(r"/library/metadata/(10[1-5])/children", path)
+        if match:
+            season = int(match.group(1)) - 100
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [
+                            {
+                                "Media": [
+                                    {"Part": [{"file": f"/data/tv/Show/Season 0{season}/e01.mkv"}]}
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_reads_a_shows_season_list_once_for_all_its_seasons() -> None:
+    # Five season candidates of ONE show across a 130-show (two-page) section.
+    # Per-candidate today: 5 * (2 section pages + 1 season-list /children) = 15
+    # + 5 episode /children. Batched: 2 section pages, ONE season-list read for
+    # the show, and one episode read per distinct season.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_tv_handler(130, calls), base_url="http://batch-tv:32400")
+    queries = [
+        WatchStateQuery(
+            tmdb_id=1399,
+            media_type="tv",
+            season=season,
+            library_path=f"/data/tv/Show/Season 0{season}",
+        )
+        for season in range(1, 6)
+    ]
+    states = await adapter.resolve_watch_states(queries)
+
+    assert states == [
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 1 partial
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),  # season 2 watched
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 3 partial
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),  # season 4 watched
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 5 partial
+    ]
+    # ONE section crawl (two pages) for the whole batch.
+    assert calls["/library/sections/2/all"] == 2
+    # ONE season-list /children read for the distinct show, NOT one per season.
+    assert calls["/library/metadata/100/children"] == 1
+    # One episode /children per distinct season (issue #238's folded fetch).
+    for season in range(1, 6):
+        assert calls[f"/library/metadata/{100 + season}/children"] == 1
+
+
+async def test_resolve_watch_states_tv_result_matches_per_item_watch_state() -> None:
+    queries = [
+        WatchStateQuery(
+            tmdb_id=1399,
+            media_type="tv",
+            season=season,
+            library_path=f"/data/tv/Show/Season 0{season}",
+        )
+        for season in range(1, 6)
+    ]
+    per_item = _adapter(_make_batch_tv_handler(130, {}), base_url="http://per-item-tv:32400")
+    expected = [
+        await per_item.watch_state(
+            q.tmdb_id, q.media_type, season=q.season, library_path=q.library_path
+        )
+        for q in queries
+    ]
+    batch = _adapter(_make_batch_tv_handler(130, {}), base_url="http://batch-tv-eq:32400")
+    assert await batch.resolve_watch_states(queries) == expected
+
+
+async def test_resolve_watch_states_tv_requires_a_season() -> None:
+    adapter = _adapter(_make_batch_tv_handler(1, {}), base_url="http://batch-tv-noseason:32400")
+    with pytest.raises(ValueError, match="requires a season"):
+        await adapter.resolve_watch_states([WatchStateQuery(tmdb_id=1399, media_type="tv")])
+
+
+# --------------------------------------------------------------------------- #
+# resolve_watch_states -- unrelated-section failure isolation (codex P2 on #306)
+#
+# The batch index must only crawl sections at least one query could read from,
+# matching the per-candidate ``watch_state`` path's ``if scan_path is None:
+# continue`` section filtering. An unrelated section whose ``/all`` errors was
+# never touched per-candidate and must not abort the batch here either; a section
+# a query DOES correlate with is still crawled, so a genuine failure there
+# propagates and aborts the sweep exactly as before.
+# --------------------------------------------------------------------------- #
+_TWO_MOVIE_SECTIONS: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "1", "title": "Movies A", "type": "movie", "Location": [{"path": "/a"}]},
+            {"key": "2", "title": "Movies B", "type": "movie", "Location": [{"path": "/b"}]},
+        ]
+    }
+}
+
+
+def _make_two_section_movie_handler(calls: dict[str, int]) -> Any:
+    """Two movie sections: healthy ``/a`` (key 1, holds watched tmdb 1000) and a
+    down ``/b`` (key 2, whose ``/all`` always 500s). The exact codex P2 shape: a
+    candidate under ``/a`` alongside an unrelated ``/b`` section that is failing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_TWO_MOVIE_SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [
+                            {
+                                "Guid": [{"id": "tmdb://1000"}],
+                                "Media": [{"Part": [{"file": "/a/Title1000/f.mkv"}]}],
+                                "viewCount": 2,
+                                "lastViewedAt": _WATCHED_EPOCH,
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/library/sections/2/all":
+            return httpx.Response(500, json={})
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_skips_a_section_no_query_can_use() -> None:
+    # A movie candidate lives under /a; an unrelated /b section is down (its /all
+    # 500s). The per-candidate ``watch_state`` skips /b (``_section_scan_path`` is
+    # None for a /a path), so the batch must not crawl it either -- the down /b
+    # section must never abort resolving an otherwise-resolvable /a candidate.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_two_section_movie_handler(calls), base_url="http://batch-skip-b:32400")
+    states = await adapter.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000")]
+    )
+    assert states == [WatchState(watched=True, last_viewed_at=_WATCHED_AT)]
+    # The healthy /a section was crawled; the unrelated down /b section was NEVER
+    # touched -- exactly the per-candidate path's behavior.
+    assert calls["/library/sections/1/all"] == 1
+    assert "/library/sections/2/all" not in calls
+
+
+async def test_resolve_watch_states_unrelated_failure_matches_per_candidate_result() -> None:
+    # Parity proof: the single per-candidate ``watch_state`` also resolves the /a
+    # candidate cleanly (never touching /b), so the batch result equals it.
+    per_item_calls: dict[str, int] = {}
+    per_item = _adapter(
+        _make_two_section_movie_handler(per_item_calls), base_url="http://per-item-skip-b:32400"
+    )
+    expected = await per_item.watch_state(1000, "movie", library_path="/a/Title1000")
+    assert "/library/sections/2/all" not in per_item_calls
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-skip-b-eq:32400")
+    assert await batch.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000")]
+    ) == [expected]
+
+
+async def test_resolve_watch_states_a_relevant_failing_section_aborts_like_per_candidate() -> None:
+    # When a query's own path IS under the failing /b section, the per-candidate
+    # ``watch_state`` paged /b and raised ``PlexLibraryError`` (aborting the whole
+    # sweep). The batch must behave identically -- a section a query correlates
+    # with is still crawled up front, and its failure still propagates. The fix
+    # only skips sections NO query can use; it must never swallow a failure in a
+    # section a query genuinely needs.
+    per_item = _adapter(
+        _make_two_section_movie_handler({}), base_url="http://per-item-b-fail:32400"
+    )
+    with pytest.raises(PlexLibraryError):
+        await per_item.watch_state(2000, "movie", library_path="/b/Title2000")
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-b-fail:32400")
+    with pytest.raises(PlexLibraryError):
+        await batch.resolve_watch_states(
+            [WatchStateQuery(tmdb_id=2000, media_type="movie", library_path="/b/Title2000")]
+        )
+
+
+async def test_resolve_watch_states_used_section_failure_aborts_amid_resolvable() -> None:
+    # A resolvable /a candidate batched with one whose path is under the down /b
+    # section: /b is relevant to that second query, so it is crawled and its
+    # failure aborts the batch -- exactly as the per-candidate path aborted the
+    # whole sweep the moment the /b candidate's ``watch_state`` ran. Isolation
+    # applies ONLY to sections no query needs, never to a genuinely-used one.
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-mixed-b:32400")
+    with pytest.raises(PlexLibraryError):
+        await batch.resolve_watch_states(
+            [
+                WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000"),
+                WatchStateQuery(tmdb_id=2000, media_type="movie", library_path="/b/Title2000"),
+            ]
+        )
+
+
+# --------------------------------------------------------------------------- #
+# resolve_watch_states -- uncorrelated first-match failure parity (codex round 2
+# on #306)
+#
+# An uncorrelated (library_path=None) query resolved per-candidate by
+# ``_find_section_item``'s FIRST match never touched later sections (or later
+# pages of the matched section), so their failures were unreachable. The batch's
+# demand-paged index must preserve that: a later failing section is only reached
+# (and only aborts) when a still-unresolved query genuinely walks that far.
+# --------------------------------------------------------------------------- #
+async def test_resolve_watch_states_uncorrelated_first_match_skips_later_failing_section() -> None:
+    # Uncorrelated movie query resolved by the first section; the second
+    # section's /all 500s. Old watch_state returned at the first match and never
+    # touched section 2 -- the batch must not either.
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_two_section_movie_handler(calls), base_url="http://batch-uncorr-skip:32400"
+    )
+    states = await adapter.resolve_watch_states([WatchStateQuery(tmdb_id=1000, media_type="movie")])
+    assert states == [WatchState(watched=True, last_viewed_at=_WATCHED_AT)]
+    assert calls["/library/sections/1/all"] == 1
+    assert "/library/sections/2/all" not in calls
+
+
+async def test_resolve_watch_states_uncorrelated_first_match_matches_per_candidate() -> None:
+    # Parity proof: the per-candidate ``watch_state`` also resolves the
+    # uncorrelated query at the first section without ever touching the down
+    # second section, and the batch result equals it.
+    per_calls: dict[str, int] = {}
+    per_item = _adapter(
+        _make_two_section_movie_handler(per_calls), base_url="http://per-uncorr-skip:32400"
+    )
+    expected = await per_item.watch_state(1000, "movie")
+    assert "/library/sections/2/all" not in per_calls
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-uncorr-eq:32400")
+    assert await batch.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1000, media_type="movie")]
+    ) == [expected]
+
+
+async def test_resolve_watch_states_uncorrelated_unresolved_reaches_failing_section() -> None:
+    # An uncorrelated query whose tmdb id is NOT in the first section walks on to
+    # the second, failing, section -- old ``watch_state`` paged it there and
+    # raised, aborting the sweep, so the batch must raise identically. Laziness
+    # must never swallow a failure the old first-match walk genuinely hit.
+    per_item = _adapter(_make_two_section_movie_handler({}), base_url="http://per-uncorr-hit:32400")
+    with pytest.raises(PlexLibraryError):
+        await per_item.watch_state(9999, "movie")
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-uncorr-hit:32400")
+    with pytest.raises(PlexLibraryError):
+        await batch.resolve_watch_states([WatchStateQuery(tmdb_id=9999, media_type="movie")])
+
+
+async def test_resolve_watch_states_uncorrelated_stops_paging_at_the_first_match() -> None:
+    # Page-level parity within one section: an uncorrelated query matching on the
+    # first page must not page the rest of the section (old
+    # ``_find_section_item`` returned mid-crawl) -- 130 items would be two pages
+    # for a full crawl, but the first-page match costs exactly one.
+    calls: dict[str, int] = {}
+    adapter = _adapter(
+        _make_batch_movie_handler(130, calls), base_url="http://batch-pagelazy:32400"
+    )
+    states = await adapter.resolve_watch_states([WatchStateQuery(tmdb_id=1000, media_type="movie")])
+    assert states == [WatchState(watched=False, last_viewed_at=None)]
+    assert calls["/library/sections/1/all"] == 1
+
+
+_TWO_SHOW_SECTIONS: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "2", "title": "TV A", "type": "show", "Location": [{"path": "/ta"}]},
+            {"key": "3", "title": "TV B", "type": "show", "Location": [{"path": "/tb"}]},
+        ]
+    }
+}
+
+
+def _make_two_section_tv_handler(calls: dict[str, int]) -> Any:
+    """Two show sections: healthy ``/ta`` (key 2, holds show tmdb 1399 with a
+    fully-watched season 1) and a down ``/tb`` (key 3, whose ``/all`` always
+    500s) -- the TV mirror of :func:`_make_two_section_movie_handler`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_TWO_SHOW_SECTIONS)
+        if path == "/library/sections/2/all":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [{"ratingKey": "100", "Guid": [{"id": "tmdb://1399"}]}]
+                    }
+                },
+            )
+        if path == "/library/sections/3/all":
+            return httpx.Response(500, json={})
+        if path == "/library/metadata/100/children":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [
+                            {
+                                "index": 1,
+                                "ratingKey": "101",
+                                "leafCount": 10,
+                                "viewedLeafCount": 10,
+                                "lastViewedAt": _WATCHED_EPOCH,
+                            }
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_tv_uncorrelated_first_match_skips_later_failing_section() -> (
+    None
+):
+    # The TV mirror: an uncorrelated season query resolved by the first show
+    # section never demands the down second section -- old ``_tv_watch_state``
+    # returned at the first tmdb match, and so must the batch.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_two_section_tv_handler(calls), base_url="http://batch-tv-uncorr:32400")
+    states = await adapter.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1399, media_type="tv", season=1)]
+    )
+    assert states == [WatchState(watched=True, last_viewed_at=_WATCHED_AT)]
+    assert calls["/library/sections/2/all"] == 1
+    assert "/library/sections/3/all" not in calls

@@ -28,7 +28,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Final, Literal, cast
 
@@ -37,7 +37,7 @@ import httpx
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import header_value_error
 from plex_manager.logsafe import safe_int
-from plex_manager.ports.library import LibrarySection, WatchState
+from plex_manager.ports.library import LibrarySection, WatchState, WatchStateQuery
 from plex_manager.services import path_visibility
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
@@ -290,13 +290,27 @@ def _resolve_correlated_watch_state(
     whose own watch-state sync lags behind (or that a user happens to browse
     less) must never mask a real watch recorded via another section indexing
     the identical file. The timestamp is the NEWEST ``last_viewed_at`` among
-    the WATCHED hits, never the oldest -- eviction treats
+    ALL correlated hits -- INCLUDING not-yet-fully-watched / in-progress ones
+    (issue #290) -- never the oldest. Eviction treats
     ``last_viewed_at < grace_cutoff`` as eligible and sorts stalest-first, so
     keeping a STALE timestamp from a section that hasn't caught up with a
     recent rewatch another section already recorded would make the item
     eligible for deletion during the grace window right after that rewatch.
-    Deletion safety requires the most-recent watch evidence to win, not the
-    most-conservative one.
+
+    Considering only the WATCHED hits' timestamps here would FAIL OPEN: a
+    physical file indexed by two sections where section A recorded a completed
+    watch long past the grace cutoff (``watched=True``, stale timestamp) while
+    the operator is mid-rewatch via section B (its ``viewCount`` /
+    ``viewedLeafCount`` not yet incremented, so ``watched=False`` -- but its
+    ``lastViewedAt`` is RECENT) would merge to A's stale timestamp and become
+    eviction-eligible DURING the active rewatch. Deletion safety requires the
+    most-recent watch evidence -- from ANY correlated hit, watched or not -- to
+    win, so a disk-pressure sweep landing mid-rewatch never deletes the file
+    out from under the viewer. (The movie case has no season equivalent of the
+    partial-view state, but the same multi-section merge introduces the same
+    fail-open there: a single-section item's own in-progress ``viewCount=0``
+    protects it, but the merge must not let A's stale watched timestamp override
+    B's recent in-progress one.)
     """
     if len(hits) == 1:
         return hits[0][1]
@@ -307,14 +321,16 @@ def _resolve_correlated_watch_state(
         # Genuinely ambiguous: the hits do not all agree on the same underlying
         # file(s) -- fail closed, exactly as issue #207 originally specified.
         return WatchState(watched=False, last_viewed_at=None)
-    watched_timestamps = [
-        state.last_viewed_at
-        for _, state in hits
-        if state.watched and state.last_viewed_at is not None
-    ]
-    if not watched_timestamps:
+    if not any(state.watched for _, state in hits):
         return WatchState(watched=False, last_viewed_at=None)
-    return WatchState(watched=True, last_viewed_at=max(watched_timestamps))
+    # NEWEST across ALL hits (watched or in-progress), not just the watched ones
+    # -- see the docstring's fail-open note (issue #290). A watched hit always
+    # carries a timestamp (``WatchState``'s own contract), so ``watched`` being
+    # true guarantees at least one; the guard below stays defensive regardless.
+    all_timestamps = [state.last_viewed_at for _, state in hits if state.last_viewed_at is not None]
+    if not all_timestamps:
+        return WatchState(watched=False, last_viewed_at=None)
+    return WatchState(watched=True, last_viewed_at=max(all_timestamps))
 
 
 def _is_path_prefix(prefix: str, path: str) -> bool:
@@ -396,6 +412,105 @@ def _section_scan_path(section: LibrarySection, path: str) -> str | None:
         host = _container_to_host_scan_path(location, path)
         if host is not None:
             return host
+    return None
+
+
+class _LazySectionIndex:
+    """The same-type sections, in :meth:`PlexLibrary.list_sections` order, paged
+    ON DEMAND into a memoized tmdb-id -> items index.
+
+    Request/failure parity is the whole point (the two codex P2s on #306): the
+    batch path must make exactly the requests the per-candidate
+    :meth:`PlexLibrary.watch_state` helpers would have made for the same queries
+    -- never more -- so a failing section (or page) the per-candidate path never
+    reached can never abort a batch of otherwise-resolvable candidates. Eagerly
+    indexing sections up front broke that in two rounds: first for sections no
+    path-correlated query covered, then for sections AFTER an uncorrelated
+    (``library_path=None``) query's first match, which the old first-match early
+    return never touched.
+
+    * :meth:`find_first` mirrors :meth:`PlexLibrary._find_section_item`: pages one
+      section only as far as the FIRST ``tmdb_id`` match, so an uncorrelated query
+      resolved by an early section/page never demands a later one.
+    * :meth:`ensure_complete` mirrors :meth:`PlexLibrary._find_section_items`: the
+      whole-section view a path-correlated query needs (every duplicate matters
+      for the issue #207/#239 correlation).
+
+    Every fetched page is shared across the whole batch (the issue #213 win): a
+    page is requested at most once, and only when some query being resolved
+    actually demands it -- the union of what N sequential per-candidate calls
+    would have fetched, deduplicated. Errors are NOT memoized: a failing fetch
+    propagates immediately, aborting the batch exactly as the per-candidate path
+    aborted the sweep when a query genuinely needed the failing section.
+    """
+
+    def __init__(
+        self,
+        sections: Sequence[LibrarySection],
+        fetch_page: Callable[[str, int], Awaitable[Sequence[Mapping[str, object]]]],
+    ) -> None:
+        self._fetch_page = fetch_page
+        self._sections = tuple(sections)
+        self._by_tmdb_id: list[dict[int, list[Mapping[str, object]]]] = [{} for _ in self._sections]
+        self._next_start = [0] * len(self._sections)
+        self._exhausted = [False] * len(self._sections)
+
+    @property
+    def sections(self) -> tuple[LibrarySection, ...]:
+        return self._sections
+
+    async def _page_once(self, index: int) -> None:
+        """Fetch section ``index``'s next page and fold it into the memoized index.
+
+        An item is indexed under EVERY tmdb id its guid(s) resolve to
+        (:func:`_collect_item_tmdb_ids`), matching :func:`_item_matches_tmdb_id`;
+        page-order append keeps ``[0]`` the first match in crawl order.
+        """
+        items = await self._fetch_page(self._sections[index].key, self._next_start[index])
+        by_tmdb_id = self._by_tmdb_id[index]
+        for entry in items:
+            tmdb_ids: set[int] = set()
+            _collect_item_tmdb_ids(entry, tmdb_ids)
+            for tmdb_id in tmdb_ids:
+                by_tmdb_id.setdefault(tmdb_id, []).append(entry)
+        self._next_start[index] += _PAGE_SIZE
+        if len(items) < _PAGE_SIZE:
+            self._exhausted[index] = True
+
+    async def find_first(self, index: int, tmdb_id: int) -> Mapping[str, object] | None:
+        """Section ``index``'s first ``tmdb_id``-matching item in page order,
+        paging only as far as that match -- byte-for-byte
+        :meth:`PlexLibrary._find_section_item` (``None`` once exhausted unmatched).
+        """
+        while True:
+            matches = self._by_tmdb_id[index].get(tmdb_id)
+            if matches:
+                return matches[0]
+            if self._exhausted[index]:
+                return None
+            await self._page_once(index)
+
+    async def ensure_complete(self, index: int) -> dict[int, list[Mapping[str, object]]]:
+        """Section ``index`` fully paged (memoized) -- the whole-section view
+        :meth:`PlexLibrary._find_section_items` gives a path-correlated query."""
+        while not self._exhausted[index]:
+            await self._page_once(index)
+        return self._by_tmdb_id[index]
+
+
+def _find_season_entry_in(
+    entries: Sequence[Mapping[str, object]], season: int
+) -> Mapping[str, object] | None:
+    """The season row matching ``season`` among an already-fetched ``/children`` list.
+
+    The in-memory half of :meth:`PlexLibrary._find_season_entry`: it does the same
+    ``index == season`` scan, but over season rows a batch already read once and
+    memoized, so several seasons of one show never re-fetch its ``/children``
+    (issue #213).
+    """
+    for entry in entries:
+        if _get_int(entry, "index") == season:
+            return entry
     return None
 
 
@@ -1142,9 +1257,11 @@ class PlexLibrary:
         merely indexed by more than one Plex section (e.g. a broad ``/media``
         section plus a nested ``/media/anime`` section covering the same files)
         and are merged into one logical item -- watched if ANY hit is watched, at
-        the NEWEST watched timestamp (deletion safety: a stale timestamp from a
-        section that hasn't caught up with a recent rewatch another section
-        already recorded must never make the item look grace-window-eligible).
+        the NEWEST ``lastViewedAt`` across ALL hits (issue #290: including a
+        not-yet-watched / mid-rewatch section, whose recent in-progress view must
+        win over another section's stale fully-watched timestamp -- deletion
+        safety: a stale timestamp must never make the item look
+        grace-window-eligible while it is being actively rewatched).
         Hits whose file paths genuinely DIFFER remain ambiguous and still FAIL CLOSED, exactly as
         before -- a legitimate duplicate (distinct copies on disk) must never let
         one copy's watched state authorize deleting the other. The TV branch pays
@@ -1313,3 +1430,203 @@ class PlexLibrary:
         for item in items:
             paths.extend(_extract_file_paths(_as_mapping(item)))
         return paths
+
+    async def resolve_watch_states(self, queries: Sequence[WatchStateQuery]) -> list[WatchState]:
+        """Batch :meth:`watch_state` -- shared, demand-paged section crawls.
+
+        See :meth:`LibraryPort.resolve_watch_states`. The result for the Nth query
+        is byte-for-byte what :meth:`watch_state` would return for it; only the
+        round-trip count differs. Nothing is crawled up front: each media type gets
+        a per-batch :class:`_LazySectionIndex`, and each query demands exactly the
+        sections/pages its own per-candidate :meth:`watch_state` call would have
+        read -- an uncorrelated (``library_path=None``) query stops at its first
+        match, a path-correlated one fully pages only the sections covering its
+        path -- with every fetched page memoized and shared across the batch. So a
+        failing section the per-candidate path never reached is never requested
+        and cannot abort the sweep, while a genuinely needed section's failure
+        still propagates exactly as before (the two codex P2s on #306). Every
+        distinct show's season ``/children`` and every distinct season's episode
+        ``/children`` is likewise fetched at most once, shared across all queries
+        that need it. TV and movie queries can be mixed.
+        """
+        if not queries:
+            return []
+        sections = await self.list_sections()
+        movie_index = _LazySectionIndex(
+            [s for s in sections if s.type == "movie"], self._fetch_section_items_page
+        )
+        show_index = _LazySectionIndex(
+            [s for s in sections if s.type == "show"], self._fetch_section_items_page
+        )
+        # Per-batch memoization of the two ``/children`` reads the TV branch makes:
+        # a show's season listing (keyed by the show's ratingKey) and a season's
+        # episode listing (keyed by the season's ratingKey). Shared across every
+        # query in this batch so a show with N tracked seasons pays ONE season-list
+        # fetch, not N -- see :meth:`LibraryPort.resolve_watch_states`'s cost model.
+        show_season_entries: dict[str, list[Mapping[str, object]]] = {}
+        season_episode_paths: dict[str, list[str]] = {}
+        results: list[WatchState] = []
+        for query in queries:
+            if query.media_type == "tv":
+                if query.season is None:
+                    raise ValueError("resolve_watch_states requires a season for media_type='tv'")
+                results.append(
+                    await self._resolve_tv_watch_state(
+                        show_index,
+                        query.tmdb_id,
+                        query.season,
+                        query.library_path,
+                        show_season_entries,
+                        season_episode_paths,
+                    )
+                )
+            else:
+                results.append(
+                    await self._resolve_movie_watch_state_batch(
+                        movie_index, query.tmdb_id, query.library_path
+                    )
+                )
+        return results
+
+    async def _fetch_section_items_page(
+        self, key: str, start: int
+    ) -> Sequence[Mapping[str, object]]:
+        """One ``/all?includeGuids=1`` page of section ``key`` -- the shared pager
+        behind :class:`_LazySectionIndex` (the exact request shape
+        :meth:`_find_section_item` / :meth:`_find_section_items` issue, so the
+        batch's request set stays comparable to theirs page-for-page)."""
+        payload = await self._get(
+            f"/library/sections/{key}/all",
+            {"includeGuids": "1"},
+            headers={
+                "X-Plex-Container-Start": str(start),
+                "X-Plex-Container-Size": str(_PAGE_SIZE),
+            },
+        )
+        return [
+            _as_mapping(item) for item in _as_sequence(_media_container(payload).get("Metadata"))
+        ]
+
+    async def _resolve_movie_watch_state_batch(
+        self, movie_index: _LazySectionIndex, tmdb_id: int, library_path: str | None
+    ) -> WatchState:
+        """The batched movie branch -- mirrors :meth:`_movie_watch_state` against
+        the demand-paged ``movie_index``.
+
+        ``library_path=None`` walks sections in order and resolves at the FIRST
+        matching item (:meth:`_find_section_item`'s first-match early return --
+        later sections/pages are never demanded, so their failures stay exactly as
+        unreachable as the per-item path left them); otherwise every
+        ``tmdb_id``-matching item whose file path sits under the reverse-mapped
+        ``library_path`` is a correlated hit (:meth:`_find_section_items`'s
+        whole-section semantics via ``ensure_complete``), resolved by
+        :func:`_resolve_correlated_watch_state` exactly as the per-item method does.
+        """
+        if library_path is None:
+            for i in range(len(movie_index.sections)):
+                item = await movie_index.find_first(i, tmdb_id)
+                if item is not None:
+                    return _movie_watch_state_from_item(item)
+            return WatchState(watched=False, last_viewed_at=None)
+
+        hits: list[tuple[frozenset[str], WatchState]] = []
+        for i, section in enumerate(movie_index.sections):
+            scan_path = _section_scan_path(section, library_path)
+            if scan_path is None:
+                continue
+            by_tmdb_id = await movie_index.ensure_complete(i)
+            for item in by_tmdb_id.get(tmdb_id, []):
+                file_paths = _extract_file_paths(item)
+                if any(_is_path_prefix(scan_path, fp) for fp in file_paths):
+                    hits.append((frozenset(file_paths), _movie_watch_state_from_item(item)))
+        return _resolve_correlated_watch_state(hits)
+
+    async def _cached_season_entries(
+        self, rating_key: str, cache: dict[str, list[Mapping[str, object]]]
+    ) -> list[Mapping[str, object]]:
+        """One show's ``/children`` season rows, fetched at most once per batch.
+
+        Memoizes the exact ``/children`` read :meth:`_find_season_entry` performs so
+        several tracked seasons of the SAME show share a single fetch (issue #213).
+        """
+        cached = cache.get(rating_key)
+        if cached is None:
+            payload = await self._get(f"/library/metadata/{rating_key}/children")
+            cached = [
+                _as_mapping(item)
+                for item in _as_sequence(_media_container(payload).get("Metadata"))
+            ]
+            cache[rating_key] = cached
+        return cached
+
+    async def _cached_children_file_paths(
+        self, rating_key: str, cache: dict[str, list[str]]
+    ) -> list[str]:
+        """One season's episode file paths, fetched at most once per batch (issue #238)."""
+        cached = cache.get(rating_key)
+        if cached is None:
+            cached = await self._fetch_children_file_paths(rating_key)
+            cache[rating_key] = cached
+        return cached
+
+    async def _resolve_tv_watch_state(
+        self,
+        show_index: _LazySectionIndex,
+        tmdb_id: int,
+        season: int,
+        library_path: str | None,
+        show_season_entries: dict[str, list[Mapping[str, object]]],
+        season_episode_paths: dict[str, list[str]],
+    ) -> WatchState:
+        """The batched TV branch -- mirrors :meth:`_tv_watch_state` against the
+        demand-paged ``show_index`` + shared ``/children`` caches.
+
+        ``library_path=None`` walks show sections in order and commits to the
+        FIRST ``tmdb_id`` match (:meth:`_find_section_item` semantics via
+        ``find_first`` -- later sections/pages are never demanded, preserving
+        their failure irrelevance); the path-correlated branch fully pages only
+        the sections covering ``library_path`` (:meth:`_find_section_items`
+        semantics via ``ensure_complete``).
+        """
+        if library_path is None:
+            for i in range(len(show_index.sections)):
+                item = await show_index.find_first(i, tmdb_id)
+                if item is None:
+                    continue
+                rating_key = _get_str(item, "ratingKey")
+                if rating_key is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                season_entry = _find_season_entry_in(
+                    await self._cached_season_entries(rating_key, show_season_entries), season
+                )
+                if season_entry is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                return _season_watch_state_from_entry(season_entry)
+            return WatchState(watched=False, last_viewed_at=None)
+
+        hits: list[tuple[frozenset[str], WatchState]] = []
+        for i, section in enumerate(show_index.sections):
+            scan_path = _section_scan_path(section, library_path)
+            if scan_path is None:
+                continue
+            by_tmdb_id = await show_index.ensure_complete(i)
+            for item in by_tmdb_id.get(tmdb_id, []):
+                rating_key = _get_str(item, "ratingKey")
+                if rating_key is None:
+                    continue
+                season_entry = _find_season_entry_in(
+                    await self._cached_season_entries(rating_key, show_season_entries), season
+                )
+                if season_entry is None:
+                    continue
+                season_rating_key = _get_str(season_entry, "ratingKey")
+                if season_rating_key is None:
+                    continue
+                episode_paths = await self._cached_children_file_paths(
+                    season_rating_key, season_episode_paths
+                )
+                if any(_is_path_prefix(scan_path, fp) for fp in episode_paths):
+                    hits.append(
+                        (frozenset(episode_paths), _season_watch_state_from_entry(season_entry))
+                    )
+        return _resolve_correlated_watch_state(hits)

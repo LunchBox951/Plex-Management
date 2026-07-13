@@ -7,6 +7,7 @@ import pytest
 
 from plex_manager.config import Settings, get_settings
 from plex_manager.web.app import (
+    _BARE_METAL_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _UNCONFIRMED_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _emit_setup_ready_hint,  # pyright: ignore[reportPrivateUsage]
     _setup_ready_url,  # pyright: ignore[reportPrivateUsage]
@@ -49,10 +50,60 @@ class TestSetupReadyUrl:
     in-container one, and must never carry the bootstrap token as a query string
     (which uvicorn's default access log would otherwise record verbatim)."""
 
-    def test_uses_host_port_when_the_compose_env_var_is_known(self) -> None:
-        settings = Settings(host="0.0.0.0", port=8000, host_port=9443)  # noqa: S104
+    def test_uses_host_port_when_running_under_the_documented_compose(self) -> None:
+        # The documented compose deployment: the image bakes the in_container
+        # sentinel and the compose file hands PLEX_MANAGER_HOST_PORT to the
+        # container's own environment.
+        settings = Settings(host="0.0.0.0", port=8000, host_port=9443, in_container=True)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:9443/setup")
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
+
+    def test_falls_back_to_the_real_listener_on_bare_metal_with_both_mounts(self) -> None:
+        """Second P2 follow-up to issue #294: a bare-metal media server --
+        even one with real, unrelated disks mounted at BOTH ``/media`` and
+        ``/downloads``; mount-point probing is deliberately NOT consulted --
+        that copied the compose-only ``PLEX_MANAGER_HOST_BIND``/``HOST_PORT``
+        values must not have them trusted: a widened ``host_bind=
+        192.168.1.50`` would print an unreachable link even though the
+        process still listens on ``settings.host``. Without the image-baked
+        container sentinel, the hint must fall back to the actual in-process
+        listener (``settings.host``/``settings.port``) and say so."""
+        settings = Settings(
+            host="127.0.0.1",
+            port=9000,
+            host_port=8000,
+            host_bind="192.168.1.50",
+            in_container=False,
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:9000/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE in url
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
+
+    def test_honors_explicit_host_socket_values_in_a_container_outside_compose(self) -> None:
+        """Third P2 follow-up to issue #294: the shipped image launched by
+        ``docker run``/another orchestrator (sentinel baked in, but zero or
+        one of the documented compose mounts) with an EXPLICIT
+        ``PLEX_MANAGER_HOST_PORT``/``HOST_BIND`` -- e.g. host 9443 mapped to
+        container 8000 -- must have those values honored, not discarded. A
+        prior revision gated them on a mount-based compose detector, printing
+        ``settings.port`` while its own caveat told the operator to set the
+        very variable it was ignoring. ``host_port``/``host_bind`` default to
+        ``None``, so any non-``None`` value inside a container was
+        necessarily provided by the launch environment -- the app has no
+        better source of truth for a mapping it cannot see from inside."""
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
+            host_bind="192.168.1.50",
+            in_container=True,
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://192.168.1.50:9443/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
     def test_falls_back_to_the_in_container_port_and_says_so_when_unknown(self) -> None:
@@ -60,6 +111,19 @@ class TestSetupReadyUrl:
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:8000/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE in url
+
+    def test_ignores_a_compose_only_host_port_default_on_bare_metal(self) -> None:
+        """Issue #294, finding 3: a bare-metal install that copies
+        ``.env.example`` verbatim inherits its compose-only
+        ``PLEX_MANAGER_HOST_PORT=8000`` default even though no port mapping was
+        ever applied. Without the container-sentinel gate, that guessed port
+        would print unchallenged; with it, the app falls back to the
+        in-process port and says so honestly."""
+        settings = Settings(host="0.0.0.0", port=9000, host_port=8000)  # noqa: S104
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:9000/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE in url
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
     def test_substitutes_localhost_for_an_undialable_bind_host(self) -> None:
         settings = Settings(host="::", port=8000, host_port=8000)
@@ -82,6 +146,94 @@ class TestSetupReadyUrl:
         settings = Settings(host="127.0.0.1", port=8000, host_port=8000)
         url = _setup_ready_url(settings)
         assert "setup_token" not in url
+
+    def test_keeps_the_setup_token_fragment_attached_to_the_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2 follow-up to issue #294, finding 1: when a setup token AND a
+        non-empty port note are both present, the clickable URL (fragment
+        included) must be one contiguous, space-free line, with the note
+        confined to its own separate line.
+
+        A prior revision spliced the note's prose directly between the path
+        and the ``#setup_token=`` fragment on the SAME line (note still
+        "before the fragment", just not on its own line). Because that prose
+        contains spaces, a terminal linkifier recognizes only the bare
+        ``.../setup`` prefix (stopping at the first space) as the clickable
+        link -- silently dropping the fragment -- while copying the WHOLE
+        printed line verbatim produces a request for a literal
+        ``/setup <prose...>`` path that the React ``/setup`` route does not
+        match, so the wizard never consumes the token either way.
+        """
+        monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+        get_settings.cache_clear()
+        settings = get_settings()
+
+        url = _setup_ready_url(settings)
+
+        # No PLEX_MANAGER_HOST_PORT is configured in this test environment, so
+        # `_setup_ready_url` also attaches `_UNCONFIRMED_HOST_PORT_NOTE` --
+        # exercising exactly the token+note combination the finding was about.
+        assert _UNCONFIRMED_HOST_PORT_NOTE in url
+
+        url_line = url.splitlines()[0]
+        assert " " not in url_line
+        assert url_line.endswith("#setup_token=boot-token")
+
+    def test_uses_the_published_host_bind_over_the_in_process_listen_address(self) -> None:
+        """Issue #294, finding 4: a Compose install deliberately published
+        under a LAN IP must get that IP in the printed link, not an
+        unconditional ``localhost`` that never resolves off the container
+        host. ``host_port`` is deliberately distinct from ``port`` here so
+        this only passes via the container branch honoring both published
+        values -- not by coincidence with the bare-metal fallback (which
+        would print ``port``, not ``host_port``)."""
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
+            host_bind="192.168.1.50",
+            in_container=True,
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://192.168.1.50:9443/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
+
+    def test_substitutes_localhost_when_the_published_host_bind_is_also_undialable(
+        self,
+    ) -> None:
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=9443,
+            host_bind="0.0.0.0",  # noqa: S104
+            in_container=True,
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:9443/setup")
+
+    def test_falls_back_to_settings_host_when_host_bind_is_unset(self) -> None:
+        settings = Settings(host="127.0.0.1", port=8000, host_port=8000, host_bind=None)
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:8000/setup")
+
+    def test_ignores_a_compose_only_host_bind_default_on_bare_metal(self) -> None:
+        """A bare-metal install that copies ``.env.example`` verbatim inherits
+        its compose-only ``PLEX_MANAGER_HOST_BIND=127.0.0.1`` default -- and an
+        operator who then widens it for what they believe is a Compose LAN
+        publish would otherwise get that value trusted unconditionally even
+        though the bare-metal process actually listens on ``settings.host``.
+        Without the container-sentinel gate this prints an undialable link
+        exactly like the ungated ``host_port`` bug finding 3 already closes;
+        with it, ``host_bind`` is ignored and the in-process host is used."""
+        settings = Settings(
+            host="127.0.0.1",
+            port=8000,
+            host_port=8000,
+            host_bind="192.168.1.50",
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:8000/setup")
 
 
 def test_emit_setup_ready_hint_writes_the_real_unredacted_url_to_stderr(
