@@ -550,11 +550,27 @@ class SettingsStore:
         read, so it stays a single round trip. An unset secret contributes
         nothing (never an empty string -- ``redact_known_secrets`` would skip
         it anyway via its length guard, but there is no reason to hand it one).
+
+        Also folds in ``SystemSettings.app_api_key`` -- the recovery/automation
+        break-glass ``X-Api-Key`` credential (see :func:`authenticate_request`).
+        It lives in a SEPARATE table from the generic ``settings`` key/value
+        store this method otherwise reads (:class:`SystemSettings` is a
+        singleton row, not a ``Setting`` row keyed by :data:`SECRET_SETTING_KEYS`),
+        so without this second query a bare occurrence of the break-glass key in
+        a log line -- e.g. echoed back in an error message, or pasted into a
+        support request -- would sail past this redaction pass entirely. A
+        second query (rather than folding it into the query above) is
+        unavoidable: it is a different table with no ``key`` column to join on,
+        and this is still only two round trips total, not N.
         """
         result = await self._session.execute(
             select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
         )
-        return frozenset(value for value in result.scalars().all() if value)
+        values = {value for value in result.scalars().all() if value}
+        system = await load_system_settings(self._session)
+        if system is not None and system.app_api_key:
+            values.add(system.app_api_key)
+        return frozenset(values)
 
 
 # --------------------------------------------------------------------------- #

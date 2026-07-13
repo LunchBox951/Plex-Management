@@ -580,6 +580,21 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
             "FAKETUPLEWRAP2",
             "headers=[('X-Api-Key', <redacted>)]",
         ),
+        # P5a (cookie-jar/mapping repr, issue #270): a dict-repr cookie dump
+        # (``:`` separator, quoted key AND value) rather than a raw
+        # ``name=value`` header line -- the cookie NAME survives, only the
+        # token is masked.
+        (
+            "outgoing cookies: {'plexmgr.session': 'FAKEJARSESSION1'}",
+            "FAKEJARSESSION1",
+            "outgoing cookies: {'plexmgr.session': '<redacted>'}",
+        ),
+        # qBittorrent's SID cookie in the same dict-repr shape.
+        (
+            "cookies={'QBT_SID_8080': 'FAKEJARSID1'}",
+            "FAKEJARSID1",
+            "cookies={'QBT_SID_8080': '<redacted>'}",
+        ),
     ],
 )
 def test_redact_secrets_masks_key_value_shaped_secrets(
@@ -607,6 +622,13 @@ def test_redact_secrets_masks_key_value_shaped_secrets(
         # follows nothing).
         "consider=carefully before retrying",
         "residential=true",
+        # The dict-repr cookie-jar pass (``_COOKIE_JAR_RE``) must not false-
+        # match an unrelated quoted key that merely CONTAINS "sid" without a
+        # separator before the trailing characters ("resid-ential" has no
+        # ``._-`` boundary after "sid").
+        "{'residential': 'true'}",
+        # An ordinary dict entry with no session/sid-shaped key at all.
+        "{'user_id': '12345', 'theme': 'dark'}",
     ],
 )
 def test_redact_secrets_leaves_session_prose_untouched(raw: str) -> None:
@@ -904,26 +926,47 @@ def test_redact_known_secrets_leaves_unrelated_text_untouched_when_value_absent(
     assert redact_known_secrets(raw, [_FAKE_API_KEY]) == raw
 
 
-# --- issue #270: shape-grammar gaps, closed categorically by value matching -- #
+# --- issue #270: shape-grammar gaps, one closed by a dedicated shape rule, --- #
+# --- the other closed categorically by value matching ----------------------- #
 
 
-def test_cookie_jar_mapping_repr_dump_is_not_caught_by_shape_grammar() -> None:
-    """Regression fixture proving the GAP redact_secrets leaves open: a cookie
-    logged as a jar/mapping repr (rather than a raw ``Cookie:`` header line) is
-    NOT recognized by ``_COOKIE_RE``, which requires a direct
-    ``name=value`` assignment."""
+def test_cookie_jar_mapping_repr_dump_is_caught_by_shape_grammar() -> None:
+    """``_COOKIE_JAR_RE`` (issue #270 follow-up) closes the cookie-jar/mapping-
+    repr gap directly in ``redact_secrets`` -- a REAL cookie-shaped value that
+    was NEVER handed to ``redact_known_secrets`` (it is not a settings-store
+    value: the true ``plexmgr.session`` credential is never anything but a
+    HASH at rest) is still masked, because this pass keys on the cookie NAME
+    shape, not on any known value."""
     session_value = "sVeryLongSessionTokenValue123456789"
     raw = f"outgoing cookies: {{'plexmgr.session': '{session_value}'}}"
     result = redact_secrets(raw)
-    # Proves the gap: the shape pass leaves the value exposed.
-    assert session_value in result
+    assert session_value not in result
+    assert "<redacted>" in result
+    assert "plexmgr.session" in result  # the cookie NAME survives, diagnosable
 
 
-def test_cookie_jar_mapping_repr_dump_is_caught_by_value_based_pass() -> None:
+def test_qbittorrent_sid_mapping_repr_dump_is_caught_by_shape_grammar() -> None:
+    """The same shape rule covers qBittorrent's ``SID``/``QBT_SID_<port>``
+    session cookie rendered as a mapping repr -- e.g. ``dict(jar)`` logged for
+    HTTP-client debugging -- with a REAL cookie-shaped value the qBittorrent
+    adapter holds only in memory and never persists to settings, so
+    ``redact_known_secrets`` could never have masked it."""
+    sid_value = "qBTUpstreamSessionIdABCDEF0123456789"
+    raw = f"outgoing cookies: {{'QBT_SID_8080': '{sid_value}'}}"
+    result = redact_secrets(raw)
+    assert sid_value not in result
+    assert "<redacted>" in result
+    assert "QBT_SID_8080" in result
+
+
+def test_cookie_jar_mapping_repr_dump_is_also_caught_by_value_based_pass() -> None:
     """The value-based pass (issue #268) closes issue #270's cookie-jar/
-    mapping-repr gap: it doesn't matter that the shape is a dict repr rather
-    than a ``name=value`` header line -- the exact secret VALUE is masked
-    wherever it appears."""
+    mapping-repr gap categorically WHEN the value happens to be one this app
+    has configured in settings: it doesn't matter that the shape is a dict
+    repr rather than a ``name=value`` header line -- the exact secret VALUE is
+    masked wherever it appears. (In production the real cookie tokens are
+    never settings values at all -- see the shape-grammar test above for the
+    pass that actually covers THAT case.)"""
     session_value = "sVeryLongSessionTokenValue123456789"
     raw = f"outgoing cookies: {{'plexmgr.session': '{session_value}'}}"
     result = redact_known_secrets(raw, [session_value])

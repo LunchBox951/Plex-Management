@@ -234,6 +234,13 @@ def safe_guid(value: str) -> str:
 #    keyed on a cookie name containing ``session``/``sid`` at a word/separator
 #    boundary with an adjacent ``=`` (so the prose word "session" never
 #    false-matches); the value is masked up to the ``;`` attribute separator.
+# 5a. The same cookie names rendered as a JAR/MAPPING ``repr()`` instead of a
+#    raw header line -- ``{'plexmgr.session': 'SECRET'}``,
+#    ``{'QBT_SID_8080': 'SECRET'}`` (see :data:`_COOKIE_JAR_RE`). Neither
+#    token is ever a settings-store value (the session cookie is only ever a
+#    HASH at rest; qBittorrent's SID lives only in the adapter's in-memory
+#    cookie jar), so :func:`redact_known_secrets`'s value-based pass (below)
+#    can never mask this shape -- this SHAPE rule is the only barrier for it.
 #
 # A final, UNCONDITIONAL pass (no key name involved at all) catches a
 # Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
@@ -437,6 +444,40 @@ _COOKIE_RE: Final = re.compile(
     r"(?i)\b[\w.]*(?:session|sid)(?:[._-][\w.-]*)?=(?P<value>[^\s;,'\"}\)\]]+)"
 )
 
+# Cookie/session credentials rendered as a JAR/MAPPING ``repr()`` (issue #270,
+# part 1) -- ``outgoing cookies: {'plexmgr.session': '<token>'}``, or
+# qBittorrent's ``{'QBT_SID_8080': '<token>'}`` -- the shape ``dict(jar)``/
+# ``repr(cookies)`` produces when a request/response cookie jar is logged
+# whole, e.g. for HTTP-client debugging. ``_COOKIE_RE`` above requires a direct
+# ``name=value`` assignment (a raw ``Cookie:``/``Set-Cookie:`` header line) and
+# does NOT recognize this quoted-key-colon-quoted-value dict shape, so it sails
+# through untouched. This is a SHAPE rule, deliberately independent of any
+# settings-derived value: neither of these tokens is ever stored in this app's
+# settings table to begin with -- ``plexmgr.session`` is only ever a HASH
+# (:class:`~plex_manager.models.AuthSession`'s ``token_hash``, the plaintext
+# session token itself is never persisted anywhere) and qBittorrent's ``SID``
+# is held only in the adapter's in-memory cookie jar -- so
+# :func:`redact_known_secrets`'s value-based pass, whose input is exactly
+# "this app's CONFIGURED secret settings", can never see either value and can
+# never mask this shape. A shape rule is the only rule that CAN.
+#
+# Keys on a QUOTED cookie name containing ``session``/``sid`` (the same
+# name-shape ``_COOKIE_RE`` recognizes, reused verbatim so both passes accept
+# exactly the same cookie names) immediately followed by a dict-repr ``:``
+# separator and a quoted value -- masking the value through to its matching
+# close quote via the same escape-aware :data:`_QUOTED_VALUE` run every other
+# quoted-value pass in this module uses (a value containing its own quote,
+# e.g. a JSON-escaped token, is not split early). The cookie NAME survives
+# (diagnosable, matching every other pass's "mask the value, keep the key"
+# convention) -- only the token itself is dropped.
+_COOKIE_JAR_RE: Final = re.compile(
+    r"(?i)(?P<kq>['\"])[\w.]*(?:session|sid)(?:[._-][\w.-]*)?(?P=kq)\s*:\s*"
+    + _BYTES_PREFIX
+    + r"(?P<q>['\"])(?P<value>"
+    + _QUOTED_VALUE
+    + r")"
+)
+
 # ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
 # Group 1 captures ``scheme://user`` (stopping the username at the first
 # ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
@@ -502,6 +543,7 @@ def redact_secrets(text: str) -> str:
     redacted = _SECRET_KV_RE.sub(_mask_value, redacted)
     redacted = _SECRET_TUPLE_RE.sub(_mask_value, redacted)
     redacted = _COOKIE_RE.sub(_mask_value, redacted)
+    redacted = _COOKIE_JAR_RE.sub(_mask_value, redacted)
     redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
     return redacted
 
@@ -512,9 +554,10 @@ def redact_secrets(text: str) -> str:
 # "does this text contain something shaped like a credential" (a key name next
 # to a value, a basic-auth URL, a cookie assignment, ...) -- a denylist of known
 # RENDERINGS that, per that function's own module comment, keeps growing a new
-# rule every time a novel shape turns up (issue #270's cookie-jar/mapping-repr
-# dump and its raw-``@``-in-password basic-auth URL are exactly two such
-# shapes, deliberately NOT patched into the grammar -- see below).
+# rule every time a novel shape turns up. Issue #270 found two such gaps: a
+# cookie-jar/mapping-repr dump (``{'plexmgr.session': 'SECRET'}``) and a
+# basic-auth URL whose password itself contains a raw ``@``
+# (``scheme://user:p@ss@host``).
 #
 # ``redact_known_secrets`` asks a categorically different, STRUCTURALLY
 # STRONGER question: "does this text contain one of THIS APP'S OWN, CURRENTLY
@@ -525,24 +568,35 @@ def redact_secrets(text: str) -> str:
 # ``key=value`` pair, a cookie-jar ``repr()``, a basic-auth URL whose password
 # itself contains ``@``, a third-party library's own log line, or bare mid-
 # prose -- if the EXACT bytes of a known secret appear anywhere in the text,
-# they are masked, regardless of the surrounding shape. This is why issue #270
-# folds its two shape-grammar gaps into THIS function's test matrix rather than
-# into another ``redact_secrets`` pattern: both gaps are simply an instance of
-# "a real settings-store secret value appeared verbatim in a shape the grammar
-# doesn't recognize", which is precisely the class of leak a value-based pass
-# closes by construction, without one more denylist rule that only narrows the
-# NEXT unrecognized shape.
+# they are masked, regardless of the surrounding shape. This closes #270's
+# basic-auth-``@`` gap categorically -- a settings-configured password IS the
+# value that leaked, so the value-based pass sees it no matter how the
+# surrounding URL mangles the shape grammar's own delimiter-based parsing.
+#
+# The cookie-jar/mapping-repr gap is DIFFERENT in kind, not just in shape: the
+# two credentials that dump through it are NEVER settings-store values in the
+# first place. ``plexmgr.session`` (:class:`~plex_manager.models.AuthSession`)
+# persists only a HASH of its token -- the plaintext never exists anywhere
+# this pass could read it from -- and qBittorrent's ``SID`` cookie lives only
+# in the adapter's in-memory ``httpx`` cookie jar, never written to the
+# settings table at all. A pass that only ever sees "this app's configured
+# secret SETTINGS" structurally cannot mask either one: there is no settings
+# value to hand it. That gap is closed instead by a dedicated SHAPE rule,
+# :data:`_COOKIE_JAR_RE` (pass 5a in :func:`redact_secrets`, above) -- the one
+# category where the shape grammar remains the ONLY possible barrier, because
+# the credential never reaches this function's input at all.
 #
 # Deliberately COMPLEMENTARY, not a replacement: this pass can only mask a
 # value it was HANDED, so a secret this app never stored in settings (a
 # user-pasted tracker/indexer token typed into a correction flow, an ad-hoc
-# credential a future adapter accepts but never persists) is invisible to it
-# -- ``redact_secrets``'s key-name grammar is still the only barrier for that
-# class, and both passes run at every capture/export boundary (see
-# ``log_capture_service._capture`` and ``web/routers/ops.py``). Reuses
-# :data:`_REDACTED` -- the same placeholder :func:`redact_secrets` emits, so a
-# reader of a log line can never tell WHICH pass masked a given span, nor does
-# it need to: either way, the answer is "a secret was here".
+# credential a future adapter accepts but never persists, or either of the two
+# cookie-jar tokens above) is invisible to it -- ``redact_secrets``'s key-name
+# and shape rules are still the only barrier for that class, and both passes
+# run at every capture/export boundary (see ``log_capture_service._capture``
+# and ``web/routers/ops.py``). Reuses :data:`_REDACTED` -- the same
+# placeholder :func:`redact_secrets` emits, so a reader of a log line can
+# never tell WHICH pass masked a given span, nor does it need to: either way,
+# the answer is "a secret was here".
 
 #: The minimum LENGTH a configured secret value must have before this pass will
 #: ever mask it. Without a floor, a short value -- an early-beta qBittorrent
@@ -610,18 +664,22 @@ def redact_known_secrets(
 
     Matching is EXACT substring matching (plus the URL-encoded/base64
     renderings :func:`_secret_value_variants` derives from each value), never
-    a regex built FROM the secret's own shape -- so it catches a real secret
-    wherever it appears, independent of the surrounding syntax: inside a
-    cookie-jar/mapping ``repr()`` dump (``{'plexmgr.session': '<value>'}``, a
-    shape :func:`redact_secrets`'s ``_COOKIE_RE`` does not recognize -- it
-    requires a direct ``name=value`` cookie assignment, not a dict repr), or
-    inside a basic-auth URL whose password itself contains a raw ``@``
-    (``scheme://user:p@ss@host`` -- :func:`redact_secrets`'s
+    a regex built FROM the secret's own shape -- so it catches a SETTINGS-
+    CONFIGURED secret wherever it appears, independent of the surrounding
+    syntax: notably inside a basic-auth URL whose password itself contains a
+    raw ``@`` (``scheme://user:p@ss@host`` -- :func:`redact_secrets`'s
     ``_BASIC_AUTH_URL_RE`` stops at the FIRST ``@`` after the colon and leaves
-    the password's remainder exposed past it). Both are issue #270's deferred
-    shape-grammar gaps, folded into this function's test matrix as regression
-    coverage rather than patched into the grammar (see the module comment
-    above for why).
+    the password's remainder exposed past it; issue #270). This function
+    canNOT, by construction, close the cookie-jar/mapping ``repr()`` dump half
+    of issue #270 (``{'plexmgr.session': '<value>'}``) -- neither the
+    ``plexmgr.session`` browser-auth token nor qBittorrent's ``SID`` cookie is
+    ever a settings-store value in the first place (the former persists only
+    a hash; the latter lives only in the adapter's in-memory cookie jar), so
+    there is no settings value for THIS function to have been handed. That
+    half is closed instead by the dedicated shape rule :data:`_COOKIE_JAR_RE`
+    in :func:`redact_secrets` (see the module comment above) -- both passes
+    run at every capture/export boundary, so the cookie-jar shape is covered
+    regardless of which pass runs first.
 
     Every matched variant is replaced whole with ``"<redacted>"`` -- unlike
     ``redact_secrets``'s ``key=<redacted>`` convention (which keeps the key

@@ -51,9 +51,12 @@ for exactly why the order is load-bearing, not incidental): it masks any
 VERBATIM occurrence of this app's own currently-configured secret VALUES
 (fetched decrypted from the settings store — see :meth:`~plex_manager.web.
 deps.SettingsStore.secret_values`), independent of the surrounding shape. This
-catches renderings no shape grammar anticipates — a cookie-jar/mapping
-``repr()`` dump, a basic-auth URL whose password itself contains ``@`` (both
-issue #270) — without adding one more denylist pattern. :class:`LogCaptureHandler`
+catches renderings no shape grammar anticipates — notably a basic-auth URL
+whose password itself contains ``@`` (issue #270) — without adding one more
+denylist pattern. (Issue #270's OTHER gap, a cookie-jar/mapping ``repr()``
+dump, is closed by a dedicated shape rule instead — see ``logsafe``'s
+``_COOKIE_JAR_RE`` module comment for why that one credential can never reach
+this value-based pass at all.) :class:`LogCaptureHandler`
 carries the current secret-value set on :attr:`LogCaptureHandler.secret_values`,
 refreshed each tick by ``web/app.py``'s ``_log_drain_loop`` (this module has no
 DB access of its own, and ``emit`` runs synchronously off any thread, so the
