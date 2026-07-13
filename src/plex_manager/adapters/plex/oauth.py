@@ -407,7 +407,18 @@ class PlexTvClient:
             )
         resources: list[PlexResource] = []
         for item in cast("list[object]", raw_items):
-            fields = _as_mapping(item)
+            if not isinstance(item, Mapping):
+                # Same fail-fatal posture one level down: a real /resources array
+                # holds resource OBJECTS, so a non-mapping entry ([null], ["error"])
+                # is a malformed response. Coercing it to an empty resource would
+                # read as "no matching server" -> STALE -> snapshot cleared, on a
+                # response that determined nothing (#296).
+                raise PlexVerifyError(
+                    _CODE_PLEX_TV_BAD_RESPONSE,
+                    "plex.tv answered in an unexpected way: resources entry was not an object",
+                    diagnostics={"host": _PLEX_TV_HOST},
+                )
+            fields = cast("Mapping[str, object]", item)
             resources.append(
                 PlexResource(
                     name=_get_str(fields, "name"),

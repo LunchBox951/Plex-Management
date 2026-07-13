@@ -173,7 +173,10 @@ async def test_fetch_resources_valid_empty_array_returns_empty_list() -> None:
     assert resources == []
 
 
-@pytest.mark.parametrize("body", [{}, {"error": "nope"}, {"resources": []}, {"items": []}])
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"error": "nope"}, {"resources": []}, {"items": []}, [None], ["error"], [42]],
+)
 async def test_fetch_resources_non_array_shape_is_bad_response(body: object) -> None:
     # NOTE the {"items": []} case: an OBJECT body carrying a public "items" list
     # must not impersonate the array wrapper (parse_resources keys off the private
