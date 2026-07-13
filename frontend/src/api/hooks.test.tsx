@@ -127,6 +127,27 @@ describe('useUpdateSettings', () => {
     // (Discover data stays keyed to the old TMDB credentials).
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] }))
   })
+
+  it('invalidates ops health so saved service cards never show the old server (Codex P2)', async () => {
+    const saved: SettingsResponse = { prowlarr_url: 'http://new-prowlarr:9696' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    qc.setQueryData(queryKeys.settings, { prowlarr_url: 'http://old-prowlarr:9696' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ prowlarr_url: 'http://new-prowlarr:9696' })
+
+    // Settings reads health with poll:false, so without this invalidation a
+    // disconnected realtime stream leaves the cards claiming the OLD server's
+    // Connected/Down status after the save. Fails before the fix.
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth }),
+    )
+  })
 })
 
 describe('useEvict', () => {
