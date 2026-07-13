@@ -1541,18 +1541,21 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
     requests: RequestResponse[] = [],
     queue: QueueItem[] = [],
   ): void {
-    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
-    ;(useSearchPreview as unknown as Mock).mockReturnValue(
-      mutation({ accepted: [], rejected: [], no_acceptable_release: true }),
+    // vi.mocked(...) (the Layout.test.tsx idiom) instead of leading-semicolon
+    // `;(x as Mock)` statements: no statement starts with `(`, so none relies
+    // on automatic semicolon insertion (CodeQL js/automatic-semicolon-insertion).
+    vi.mocked(useCreateRequest).mockReturnValue(idle() as never)
+    vi.mocked(useSearchPreview).mockReturnValue(
+      mutation({ accepted: [], rejected: [], no_acceptable_release: true }) as never,
     )
-    ;(useGrab as unknown as Mock).mockReturnValue(idle())
-    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
-    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
-    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
-    ;(useCancelRequest as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests } })
-    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue } })
+    vi.mocked(useGrab).mockReturnValue(idle() as never)
+    vi.mocked(useMarkFailed).mockReturnValue(idle() as never)
+    vi.mocked(useImportDownload).mockReturnValue(idle() as never)
+    vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
+    vi.mocked(useReportIssue).mockReturnValue(idle() as never)
+    vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
+    vi.mocked(useRequests).mockReturnValue({ data: { requests } } as never)
+    vi.mocked(useQueue).mockReturnValue({ data: { queue } } as never)
   }
 
   beforeEach(() => {
