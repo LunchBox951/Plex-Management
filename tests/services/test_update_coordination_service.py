@@ -517,9 +517,30 @@ async def test_plaintext_lease_token_is_never_persisted(
 
 async def test_renewable_context_holds_no_work_transaction_and_releases(
     sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    # The clock is frozen (never advanced) so lease expiry -- which is decided
+    # by comparing the DB row's expires_at to this clock's "now" -- can never
+    # be reached, regardless of how long a stalled renew task takes to run
+    # under a loaded CI runner (see #311). This makes expiry impossible by
+    # construction rather than merely unlikely. Renewal actually firing is
+    # still proven independently via the spy below, not inferred from
+    # wall-clock survival.
+    clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
     await service.initialize()
+
+    original_renew = service.renew
+    renewals = 0
+
+    async def counting_renew(token: str, *, ttl: timedelta) -> bool:
+        nonlocal renewals
+        renewed = await original_renew(token, ttl=ttl)
+        if renewed:
+            renewals += 1
+        return renewed
+
+    monkeypatch.setattr(service, "renew", counting_renew)
 
     async with service.critical_operation(
         "import",
@@ -533,6 +554,7 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
         snapshot = await service.snapshot()
         assert snapshot.active_critical_operations == 1
 
+    assert renewals >= 1
     assert (await service.snapshot()).active_critical_operations == 0
 
 
