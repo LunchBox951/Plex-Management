@@ -192,7 +192,7 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(7)
+    expect(cards).toHaveLength(8)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',

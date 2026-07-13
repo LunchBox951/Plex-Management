@@ -751,6 +751,7 @@ class SettingsUpdate(BaseModel):
         if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized) is None:
             raise ValueError("automatic update times must use 24-hour HH:MM format")
         return normalized
+
     watchlist_sync_enabled: bool | None = Field(default=None)
     watchlist_sync_interval_minutes: float | None = Field(
         default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
