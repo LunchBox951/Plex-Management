@@ -1384,6 +1384,75 @@ async def test_import_remaps_download_path_under_the_downloads_mount(
     assert request is not None and request.status == RequestStatus.completed
 
 
+async def test_resolve_visible_content_prefers_mounted_remap_over_a_phantom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR #309 codex finding (the import half of issue #290, finding #2): the HOST
+    # content path coincidentally exists in this container as a stale PHANTOM tree
+    # OUTSIDE the live download mount, while the real file sits under the mount.
+    # The fast path must consult content_is_mounted -- not bare existence -- so
+    # the proof-gated remap runs and the MOUNTED file wins, exactly as
+    # purge_service._visible_content_path already behaves for the post-delete poll.
+    mount = tmp_path / "dl"
+    real = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(real)
+    host_save = tmp_path / "srv" / "downloads"
+    phantom = host_save / real.name
+    _make_video(phantom)  # the stale in-container twin, outside the mount
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    qbt = _qbt(phantom, files=[DownloadedFile(name=real.name, size_bytes=60 * 1024 * 1024)])
+    resolved = import_service._ResolvedContent(  # pyright: ignore[reportPrivateUsage]
+        str(phantom), str(host_save)
+    )
+
+    result = await import_service._resolve_visible_content(  # pyright: ignore[reportPrivateUsage]
+        qbt, _HASH, resolved
+    )
+
+    assert result == str(real)
+
+
+async def test_import_places_the_mounted_file_never_an_outside_mount_phantom(
+    tmp_path: Path,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end shape of the finding: the import must PLACE from the real mounted
+    # file, never the phantom. The phantom is a stale twin with a DIFFERENT size
+    # (both above the sample floor), so the placed file's size proves which
+    # source was imported.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    mount = tmp_path / "dl"
+    real = mount / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(real)  # 60 MiB -- the size the torrent's own file list attests
+    host_save = tmp_path / "srv" / "downloads"
+    phantom = host_save / real.name
+    _make_video(phantom, size_bytes=55 * 1024 * 1024)  # the stale, wrong-size twin
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    qbt = _qbt(phantom, files=[DownloadedFile(name=real.name, size_bytes=60 * 1024 * 1024)])
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.exists()
+    # The size pins the SOURCE: the mounted file's 60 MiB, never the phantom's 55.
+    assert dst.stat().st_size == 60 * 1024 * 1024
+    assert phantom.stat().st_size == 55 * 1024 * 1024  # the phantom was never touched
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None and request.status == RequestStatus.completed
+
+
 async def test_import_never_places_a_stale_shorter_suffix_match(
     tmp_path: Path,
     sessionmaker_: SessionMaker,
