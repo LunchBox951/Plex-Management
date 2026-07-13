@@ -956,3 +956,46 @@ async def test_list_active_populate_existing_refreshes_stale_identity_map_row(
     finally:
         await reader.close()
         await engine.dispose()
+
+
+async def test_imported_unscoped_pack_candidates_returns_title_and_added_at(
+    session: AsyncSession,
+) -> None:
+    """Issue #230: the repo method narrows on the PERSISTENCE shape only
+    (``episodes_json`` NULL) -- an episode-UNSCOPED imported download for the
+    ``(request, season)``. It must NOT filter on ``release_title`` content
+    (that classification is the SERVICE layer's job via
+    ``classify_release_scope``): both a genuine pack row and a legacy
+    single-episode row recorded episode-unscoped come back as candidates."""
+    request = MediaRequest(
+        tmdb_id=930, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+    )
+    session.add(request)
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    await repo.create(
+        torrent_hash="pack-hash-230",
+        status="imported",
+        media_request_id=request.id,
+        season=1,
+        episodes=None,
+        release_title="The.Show.S01.1080p.BluRay.x264-GROUP",
+    )
+    # An episode-SCOPED imported row for the same (request, season) must be
+    # excluded -- it names episode 7 explicitly, so it is never pack-shaped.
+    await repo.create(
+        torrent_hash="single-episode-hash-230",
+        status="imported",
+        media_request_id=request.id,
+        season=1,
+        episodes=[7],
+        release_title="The.Show.S01E07.1080p.WEB-DL-GROUP",
+    )
+
+    candidates = await repo.imported_unscoped_pack_candidates(request.id, 1)
+
+    assert len(candidates) == 1
+    release_title, added_at = candidates[0]
+    assert release_title == "The.Show.S01.1080p.BluRay.x264-GROUP"
+    assert added_at is not None

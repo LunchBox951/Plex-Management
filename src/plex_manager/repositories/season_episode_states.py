@@ -9,9 +9,9 @@ work, and the ``IntegrityError``-catch-and-reread pattern for races on the
 from __future__ import annotations
 
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import CursorResult, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import Download, EpisodeState, SeasonEpisodeState
@@ -123,18 +123,35 @@ class SqlSeasonEpisodeStateRepository:
         # the promoted row survives. ``synchronize_session=False``: the stale
         # in-session snapshot instance must NOT be evaluated against the
         # criteria (its stale ``pending`` would wrongly expunge the surviving
-        # row from the identity map); nothing re-reads these instances afterward
-        # and the caller's commit expires them.
+        # row from the identity map). On a WIN (rowcount 1) nothing re-reads
+        # these instances afterward and the caller's commit expires them -- but
+        # on a LOST race (rowcount 0, issue #228) the stale ``pending`` instance
+        # stays in the identity map, and with ``expire_on_commit=False`` a
+        # same-session follow-up read (``reconcile_airing`` -> ``list_for_season``,
+        # ``compute_missing``) would serve that stale ``pending`` instead of the
+        # promoted winner's row, re-arming/re-searching a just-imported episode.
+        # Explicitly expire ONLY the lost-CAS instance so the next read reloads
+        # it from the database.
         for episode_number, row in existing.items():
             if episode_number not in aired and row.status == EpisodeState.pending:
-                await self._session.execute(
-                    delete(SeasonEpisodeState)
-                    .where(
-                        SeasonEpisodeState.id == row.id,
-                        SeasonEpisodeState.status == EpisodeState.pending,
-                    )
-                    .execution_options(synchronize_session=False)
+                result = cast(
+                    CursorResult[Any],
+                    await self._session.execute(
+                        delete(SeasonEpisodeState)
+                        .where(
+                            SeasonEpisodeState.id == row.id,
+                            SeasonEpisodeState.status == EpisodeState.pending,
+                        )
+                        .execution_options(synchronize_session=False)
+                    ),
                 )
+                if result.rowcount == 0:
+                    # Lost the retirement CAS to a concurrent import promotion:
+                    # expire ONLY this instance (not on a win -- the row is
+                    # deleted there, and expiring a deleted instance risks
+                    # ObjectDeletedError on any later attribute access in this
+                    # same session before commit).
+                    self._session.expire(row)
         await self._session.flush()
 
     async def mark_grabbed(
