@@ -38,6 +38,7 @@ interface TitleDetailModalProps {
   title: DiscoverResult | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
 }
 
 function asApiError(error: unknown): ApiError {
@@ -215,7 +216,12 @@ const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'e
  * a state-aware action zone — including an in-modal "report a problem" correction
  * that blocklists the bad release and re-arms the request (north star #1).
  */
-export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModalProps) {
+export function TitleDetailModal({
+  title,
+  open,
+  onOpenChange,
+  returnFocusTo,
+}: TitleDetailModalProps) {
   const { toast } = useToast()
   // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
   // correction / keep-forever verbs all sit behind `require_admin` server-side,
@@ -1044,7 +1050,13 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} title={title.title} description={title.title}>
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={title.title}
+      description={title.title}
+      returnFocusTo={returnFocusTo}
+    >
       <div className="flex flex-col gap-6">
         <div className="flex gap-5">
           <div className="aspect-[2/3] w-28 shrink-0 overflow-hidden rounded-lg bg-poster ring-1 ring-white/10">

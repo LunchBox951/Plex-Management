@@ -12,6 +12,8 @@ interface DialogProps {
   /** Hero/backdrop slot rendered above the body (e.g. a title backdrop). */
   hero?: ReactNode
   className?: string
+  /** Optional explicit focus target for caller-owned (triggerless) dialogs. */
+  returnFocusTo?: HTMLElement | null | (() => HTMLElement | null) | undefined
 }
 
 /** Accessible modal (Radix): focus-trapped, Esc/backdrop close, scroll-locked. */
@@ -23,12 +25,25 @@ export function Dialog({
   children,
   hero,
   className,
+  returnFocusTo,
 }: DialogProps) {
   return (
     <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
       <RadixDialog.Portal>
         <RadixDialog.Overlay className="fixed inset-0 z-50 bg-black/72 backdrop-blur-sm" />
         <RadixDialog.Content
+          onCloseAutoFocus={
+            returnFocusTo
+              ? (event) => {
+                  const target =
+                    typeof returnFocusTo === 'function' ? returnFocusTo() : returnFocusTo
+                  if (target?.isConnected) {
+                    event.preventDefault()
+                    target.focus()
+                  }
+                }
+              : undefined
+          }
           className={cn(
             'fixed top-1/2 left-1/2 z-50 w-[calc(100vw-2rem)] max-w-3xl',
             '-translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl',
