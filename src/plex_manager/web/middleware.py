@@ -53,6 +53,7 @@ _MAINTENANCE_EXCLUDED_PREFIXES = (
     "/api/v1/updates",
     "/api/v1/internal/updates",
 )
+_MAINTENANCE_READ_ONLY_POSTS = frozenset({"/api/v1/search-preview"})
 
 # Exact paths always reachable pre-init.
 SETUP_ALLOWLIST_PATHS: frozenset[str] = frozenset(
@@ -129,6 +130,7 @@ class CriticalMutationMiddleware:
             method in _SAFE_METHODS
             or not path.startswith("/api/v1/")
             or (method == "POST" and path.rstrip("/") == "/api/v1/requests")
+            or (method == "POST" and path.rstrip("/") in _MAINTENANCE_READ_ONLY_POSTS)
             or any(path.startswith(prefix) for prefix in _MAINTENANCE_EXCLUDED_PREFIXES)
         ):
             await self.app(scope, receive, send)

@@ -12,6 +12,39 @@ _TOKEN = "coordinator-test-token-0123456789"  # noqa: S105 - synthetic test cred
 _LEASE_TOKEN = "lease-token-1234567890"  # noqa: S105 - synthetic test credential
 
 
+async def test_eligibility_and_heartbeat_are_generation_bound() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/eligibility"):
+            return httpx.Response(
+                200,
+                json={
+                    "action": "check",
+                    "action_generation": 9,
+                    "automatic_enabled": True,
+                    "window_open": True,
+                    "idle_only": True,
+                    "blocker": None,
+                },
+            )
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ready": False, "lease_seconds": 600})
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        eligibility = await client.eligibility()
+        await client.heartbeat(action_generation=eligibility.action_generation)
+
+    assert eligibility.action_generation == 9
+    assert seen == [{"phase": "checking", "action_generation": 9}]
+
+
 async def test_busy_claim_with_null_token_is_a_normal_deferral() -> None:
     seen: list[httpx.Request] = []
 
@@ -88,6 +121,7 @@ async def test_outcome_sends_all_observation_and_transition_fields() -> None:
         await client.outcome(
             operation="install",
             outcome="rolled_back",
+            action_generation=7,
             lease_token=_LEASE_TOKEN,
             current_digest="repo@sha256:old",
             available_digest="repo@sha256:new",
@@ -101,6 +135,7 @@ async def test_outcome_sends_all_observation_and_transition_fields() -> None:
     assert seen_body == {
         "operation": "install",
         "outcome": "rolled_back",
+        "action_generation": 7,
         "lease_token": _LEASE_TOKEN,
         "current_digest": "repo@sha256:old",
         "available_digest": "repo@sha256:new",
@@ -127,6 +162,10 @@ async def test_outcome_omits_unknown_optional_fields() -> None:
         client = CoordinatorClient(
             "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
         )
-        await client.outcome(operation="check", outcome="no_update")
+        await client.outcome(operation="check", outcome="no_update", action_generation=3)
 
-    assert seen_body == {"operation": "check", "outcome": "no_update"}
+    assert seen_body == {
+        "operation": "check",
+        "outcome": "no_update",
+        "action_generation": 3,
+    }

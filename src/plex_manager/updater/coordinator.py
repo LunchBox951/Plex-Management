@@ -22,6 +22,7 @@ class CoordinatorError(RuntimeError):
 @dataclass(frozen=True)
 class Eligibility:
     action: Action
+    action_generation: int
     automatic_enabled: bool
     window_open: bool
     idle_only: bool
@@ -102,8 +103,12 @@ class CoordinatorClient:
         values = tuple(data.get(key) for key in ("automatic_enabled", "window_open", "idle_only"))
         if not all(isinstance(value, bool) for value in values):
             raise CoordinatorError("coordinator_invalid_response")
+        generation = data.get("action_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise CoordinatorError("coordinator_invalid_response")
         return Eligibility(
             action=cast(Action, action),
+            action_generation=generation,
             automatic_enabled=cast(bool, values[0]),
             window_open=cast(bool, values[1]),
             idle_only=cast(bool, values[2]),
@@ -121,6 +126,8 @@ class CoordinatorClient:
             if expected_generation is None:
                 raise CoordinatorError("coordinator_invalid_recovery_generation")
             body = {"recovery": True, "expected_generation": expected_generation}
+        elif expected_generation is not None:
+            body = {"expected_generation": expected_generation}
         data = await self._post("claim", body)
         ready, seconds, blocker = self._lease_values(data)
         token = data.get("lease_token")
@@ -139,14 +146,28 @@ class CoordinatorClient:
             action_generation=generation,
         )
 
-    async def renew(self, lease_token: str) -> LeaseStatus:
-        data = await self._post("renew", {"lease_token": lease_token})
+    async def renew(
+        self,
+        lease_token: str,
+        *,
+        phase: Literal["installing", "rollback"] | None = None,
+    ) -> LeaseStatus:
+        body: dict[str, object] = {"lease_token": lease_token}
+        if phase is not None:
+            body["phase"] = phase
+        data = await self._post("renew", body)
         ready, seconds, blocker = self._lease_values(data)
         return LeaseStatus(
             lease_token=lease_token,
             ready=ready,
             lease_seconds=seconds,
             blocker=blocker,
+        )
+
+    async def heartbeat(self, *, action_generation: int) -> None:
+        await self._post(
+            "heartbeat",
+            {"phase": "checking", "action_generation": action_generation},
         )
 
     def _lease_values(self, data: dict[str, object]) -> tuple[bool, int, str | None]:
@@ -169,6 +190,7 @@ class CoordinatorClient:
         *,
         operation: Literal["check", "install"],
         outcome: Outcome,
+        action_generation: int,
         lease_token: str | None = None,
         current_digest: str | None = None,
         available_digest: str | None = None,
@@ -178,7 +200,11 @@ class CoordinatorClient:
         to_build: str | None = None,
         detail_code: str | None = None,
     ) -> None:
-        body: dict[str, object] = {"operation": operation, "outcome": outcome}
+        body: dict[str, object] = {
+            "operation": operation,
+            "outcome": outcome,
+            "action_generation": action_generation,
+        }
         optional = {
             "lease_token": lease_token,
             "current_digest": current_digest,

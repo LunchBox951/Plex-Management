@@ -230,6 +230,28 @@ describe('Status', () => {
     expect(screen.getByRole('button', { name: 'Update queued' })).toBeDisabled()
   })
 
+  it.each([
+    ['installing', 'Installing update'],
+    ['rollback', 'Rolling back'],
+  ] as const)('renders the active %s phase and disables update actions', (state, label) => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText(label)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+  })
+
   it('keeps the manual update action available outside the automatic schedule window', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })

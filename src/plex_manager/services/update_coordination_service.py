@@ -69,6 +69,7 @@ class UpdatePhase(StrEnum):
     available = "available"
     draining = "draining"
     installing = "installing"
+    rollback = "rollback"
     succeeded = "succeeded"
     failed = "failed"
     rolled_back = "rolled_back"
@@ -179,6 +180,22 @@ class UpdateCoordinationService:
             await session.commit()
         return await self.snapshot()
 
+    async def touch_updater(
+        self,
+        *,
+        phase: UpdatePhase | None = None,
+        expected_generation: int | None = None,
+    ) -> CoordinatorSnapshot | None:
+        """Refresh liveness/phase without replaying potentially stale image fields."""
+        async with self._sessionmaker() as session:
+            touched = await SqlUpdateCoordinationRepository(session).touch_updater(
+                now=self._now(),
+                phase=phase.value if phase is not None else None,
+                expected_generation=expected_generation,
+            )
+            await session.commit()
+        return await self.snapshot() if touched else None
+
     async def request_action(self, action: UpdateAction) -> int:
         """Persist a new operator intent and return its monotonic generation."""
         async with self._sessionmaker() as session:
@@ -264,6 +281,7 @@ class UpdateCoordinationService:
         owner: str = "container-updater",
         ttl: timedelta,
         action_generation: int | None = None,
+        materialize_install: bool = False,
         require_idle: bool = False,
     ) -> DrainClaim | None:
         """Claim the exclusive drain; ``ready=False`` means existing work remains."""
@@ -276,6 +294,7 @@ class UpdateCoordinationService:
                 token_hash=token_hash,
                 owner=owner,
                 action_generation=action_generation,
+                materialize_install=materialize_install,
                 require_idle=require_idle,
                 now=self._now(),
                 ttl=ttl,
@@ -314,6 +333,25 @@ class UpdateCoordinationService:
             )
             await session.commit()
             return renewed
+
+    async def renew_drain_progress(
+        self,
+        token: str,
+        *,
+        ttl: timedelta,
+        phase: UpdatePhase | None = None,
+    ) -> bool | None:
+        """Renew an exact drain while atomically reporting sidecar liveness."""
+        ttl = _positive_ttl(ttl)
+        async with self._sessionmaker() as session:
+            ready = await SqlUpdateCoordinationRepository(session).renew_drain_progress(
+                _token_hash(token),
+                now=self._now(),
+                ttl=ttl,
+                phase=phase.value if phase is not None else None,
+            )
+            await session.commit()
+            return ready
 
     async def release(self, token: str) -> bool:
         """Release the exact lease; repeated/expired releases are no-ops."""

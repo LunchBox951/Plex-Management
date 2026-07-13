@@ -293,6 +293,76 @@ async def test_expired_leases_are_cleaned_for_crash_recovery(
     assert snapshot.active_critical_operations == 1
 
 
+async def test_automatic_claim_materializes_recoverable_install_generation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+
+    claim = await service.claim_drain(
+        ttl=timedelta(seconds=10),
+        action_generation=0,
+        materialize_install=True,
+    )
+    assert claim is not None
+    assert claim.lease.action_generation == 1
+    snapshot = await service.snapshot()
+    assert snapshot.requested_action == "install"
+    assert snapshot.action_generation == 1
+
+    clock.advance(timedelta(seconds=11))
+    expired = await service.snapshot()
+    assert expired.drain_owner is None
+    assert expired.phase == "idle"
+    assert expired.requested_action == "install"
+    assert expired.action_generation == 1
+
+
+async def test_drain_progress_is_token_bound_and_refreshes_active_phase(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    claim = await service.claim_drain(
+        ttl=timedelta(minutes=10),
+        action_generation=generation,
+    )
+    assert claim is not None
+
+    clock.advance(timedelta(seconds=46))
+    assert (
+        await service.renew_drain_progress(
+            "wrong-token",
+            ttl=timedelta(minutes=10),
+            phase=UpdatePhase.installing,
+        )
+        is None
+    )
+    before = await service.snapshot()
+    assert before.phase == "draining"
+
+    assert await service.renew_drain_progress(
+        claim.lease.token,
+        ttl=timedelta(minutes=10),
+        phase=UpdatePhase.installing,
+    )
+    installing = await service.snapshot()
+    assert installing.phase == "installing"
+    assert service.updater_available(installing, max_age=timedelta(seconds=45))
+
+    assert await service.renew_drain_progress(
+        claim.lease.token,
+        ttl=timedelta(seconds=10),
+        phase=UpdatePhase.rollback,
+    )
+    assert (await service.snapshot()).phase == "rollback"
+    clock.advance(timedelta(seconds=11))
+    assert (await service.snapshot()).phase == "idle"
+
+
 async def test_plaintext_lease_token_is_never_persisted(
     sessionmaker_: SessionMaker,
 ) -> None:

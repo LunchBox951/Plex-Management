@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import cast
 
@@ -26,6 +27,8 @@ _IMAGE_BACKED_FIELDS = (
 )
 _DROP_CONFIG_FIELDS = frozenset({"ArgsEscaped", "OnBuild"})
 _DROP_HOST_CONFIG_FIELDS = frozenset({"ContainerIDFile"})
+_IMAGE_OWNED_ENV = frozenset({"PLEX_MANAGER_BUILD_ID"})
+_MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 
 
 def _object(value: object, code: str) -> JsonObject:
@@ -56,20 +59,18 @@ def _env(values: object) -> tuple[list[str], dict[str, str]]:
 def _candidate_environment(
     current: JsonObject, old_image: JsonObject, new_image: JsonObject
 ) -> list[str]:
-    old_order, old = _env(old_image.get("Env"))
-    del old_order
+    # Inspect exposes only the effective environment, not whether an operator
+    # explicitly supplied a value equal to an image default. Preserve every
+    # effective value under that ambiguity. Only fixed image-owned metadata is
+    # allowed to advance with the new image.
+    del old_image
     current_order, active = _env(current.get("Env"))
     new_order, desired = _env(new_image.get("Env"))
-
-    # Container inspect exposes the resolved environment. Recover only runtime
-    # overrides by subtracting the old image defaults; otherwise the old
-    # PLEX_MANAGER_BUILD_ID would be pinned forever.
-    overrides = {key: value for key, value in active.items() if key not in old or old[key] != value}
     merged_order = list(new_order)
     for key in current_order:
-        if key in overrides and key not in merged_order:
+        if key not in _IMAGE_OWNED_ENV and key not in merged_order:
             merged_order.append(key)
-    desired.update(overrides)
+    desired.update({key: value for key, value in active.items() if key not in _IMAGE_OWNED_ENV})
     return [f"{key}={desired[key]}" for key in merged_order]
 
 
@@ -114,6 +115,11 @@ def capture_networks(container: JsonObject) -> dict[str, JsonObject]:
             value = endpoint.get(key)
             if value not in (None, [], {}, "", 0):
                 requested[key] = deepcopy(value)
+        mac = endpoint.get("MacAddress")
+        if mac not in (None, ""):
+            if not isinstance(mac, str) or _MAC_RE.fullmatch(mac) is None:
+                raise DockerError("docker_invalid_network_mac")
+            requested["MacAddress"] = mac
         captured[name] = requested
     return captured
 
@@ -196,28 +202,19 @@ def capture_port_bindings(container: JsonObject) -> JsonObject:
     host = _object(container.get("HostConfig"), "docker_host_config_missing")
     raw_requested = deepcopy(host.get("PortBindings"))
     if raw_requested is None:
-        return {}
-    if not isinstance(raw_requested, dict):
+        requested: dict[str, object] = {}
+    elif not isinstance(raw_requested, dict):
         raise DockerError("docker_invalid_port_bindings")
-    requested = cast(dict[str, object], raw_requested)
+    else:
+        requested = cast(dict[str, object], raw_requested)
     settings = _object(container.get("NetworkSettings"), "docker_networks_missing")
     effective = settings.get("Ports")
     if effective is not None and not isinstance(effective, dict):
         raise DockerError("docker_invalid_port_bindings")
     effective_values = cast(dict[str, object], effective) if isinstance(effective, dict) else {}
-    for container_port, bindings in requested.items():
-        if bindings is None:
-            continue
-        if not isinstance(bindings, list):
-            raise DockerError("docker_invalid_port_bindings")
-        binding_items = cast(list[object], bindings)
-        if not all(isinstance(item, dict) for item in binding_items):
-            raise DockerError("docker_invalid_port_bindings")
-        needs_resolution = any(
-            cast(JsonObject, item).get("HostPort") in {None, ""} for item in binding_items
-        )
-        if not needs_resolution:
-            continue
+    publish_all = host.get("PublishAllPorts") is True
+
+    def resolved_bindings(container_port: str) -> list[JsonObject]:
         resolved = effective_values.get(container_port)
         if not isinstance(resolved, list) or not resolved:
             raise DockerError("docker_assigned_port_missing")
@@ -228,10 +225,36 @@ def capture_port_bindings(container: JsonObject) -> JsonObject:
             value = cast(JsonObject, item)
             host_ip = value.get("HostIp")
             host_port = value.get("HostPort")
-            if not isinstance(host_ip, str) or not isinstance(host_port, str) or not host_port:
+            if (
+                not isinstance(host_ip, str)
+                or not isinstance(host_port, str)
+                or not host_port
+                or host_port == "0"
+            ):
                 raise DockerError("docker_assigned_port_missing")
             normalized.append({"HostIp": host_ip, "HostPort": host_port})
-        requested[container_port] = normalized
+        return normalized
+
+    for container_port, bindings in list(requested.items()):
+        if bindings is None:
+            if publish_all:
+                requested[container_port] = resolved_bindings(container_port)
+            continue
+        if not isinstance(bindings, list):
+            raise DockerError("docker_invalid_port_bindings")
+        binding_items = cast(list[object], bindings)
+        if not all(isinstance(item, dict) for item in binding_items):
+            raise DockerError("docker_invalid_port_bindings")
+        needs_resolution = any(
+            cast(JsonObject, item).get("HostPort") in {None, "", "0"} for item in binding_items
+        )
+        if not needs_resolution:
+            continue
+        requested[container_port] = resolved_bindings(container_port)
+    if publish_all:
+        for container_port, bindings in effective_values.items():
+            if bindings is not None and container_port not in requested:
+                requested[container_port] = resolved_bindings(container_port)
     return cast(JsonObject, requested)
 
 
@@ -249,8 +272,10 @@ def enabled_healthcheck(value: object) -> bool:
 
 def _primary_network(host_config: JsonObject, networks: dict[str, JsonObject]) -> str | None:
     mode = host_config.get("NetworkMode")
-    if not isinstance(mode, str) or mode in {"", "default", "bridge", "host", "none"}:
+    if not isinstance(mode, str) or mode in {"host", "none"}:
         return None
+    if mode in {"", "default", "bridge"}:
+        return "bridge" if "bridge" in networks else None
     return mode if mode in networks else None
 
 
@@ -265,13 +290,31 @@ def _base_config(container: JsonObject) -> JsonObject:
 
 
 def _with_networking(
-    config: JsonObject, host_config: JsonObject, networks: dict[str, JsonObject]
-) -> tuple[JsonObject, str | None]:
+    config: JsonObject,
+    host_config: JsonObject,
+    networks: dict[str, JsonObject],
+    *,
+    multi_network_create: bool,
+) -> tuple[JsonObject, frozenset[str]]:
     primary = _primary_network(host_config, networks)
     config["HostConfig"] = host_config
+    if multi_network_create and networks:
+        config["NetworkingConfig"] = {"EndpointsConfig": deepcopy(networks)}
+        return config, frozenset(networks)
     if primary is not None:
-        config["NetworkingConfig"] = {"EndpointsConfig": {primary: networks[primary]}}
-    return config, primary
+        endpoint = networks[primary]
+        mac = endpoint.get("MacAddress")
+        if isinstance(mac, str):
+            config["MacAddress"] = mac
+        config["NetworkingConfig"] = {"EndpointsConfig": {primary: endpoint}}
+    unsupported_macs = [
+        name
+        for name, endpoint in networks.items()
+        if name != primary and endpoint.get("MacAddress")
+    ]
+    if unsupported_macs:
+        raise DockerError("docker_secondary_mac_unsupported")
+    return config, frozenset({primary}) if primary is not None else frozenset()
 
 
 def build_candidate_spec(
@@ -283,7 +326,8 @@ def build_candidate_spec(
     operation_id: str,
     networks: dict[str, JsonObject],
     port_bindings: JsonObject | None = None,
-) -> tuple[JsonObject, str | None]:
+    multi_network_create: bool = False,
+) -> tuple[JsonObject, frozenset[str]]:
     """Three-way merge old image, active runtime overrides, and new image defaults."""
     current = _base_config(container)
     old_config = _object(old_image.get("Config") or {}, "docker_old_image_config_missing")
@@ -311,7 +355,12 @@ def build_candidate_spec(
     host_config = _host_config(container)
     if port_bindings is not None:
         host_config["PortBindings"] = deepcopy(port_bindings)
-    return _with_networking(current, host_config, networks)
+    return _with_networking(
+        current,
+        host_config,
+        networks,
+        multi_network_create=multi_network_create,
+    )
 
 
 def build_rollback_spec(
@@ -322,7 +371,8 @@ def build_rollback_spec(
     operation_id: str,
     networks: dict[str, JsonObject],
     port_bindings: JsonObject | None = None,
-) -> tuple[JsonObject, str | None]:
+    multi_network_create: bool = False,
+) -> tuple[JsonObject, frozenset[str]]:
     """Recreate the previous bytes/config but bypass their now-behind Alembic graph."""
     current = _base_config(container)
     old_config = _object(old_image.get("Config") or {}, "docker_old_image_config_missing")
@@ -349,10 +399,15 @@ def build_rollback_spec(
     host_config = _host_config(container)
     if port_bindings is not None:
         host_config["PortBindings"] = deepcopy(port_bindings)
-    return _with_networking(current, host_config, networks)
+    return _with_networking(
+        current,
+        host_config,
+        networks,
+        multi_network_create=multi_network_create,
+    )
 
 
 def remaining_networks(
-    networks: dict[str, JsonObject], primary: str | None
+    networks: dict[str, JsonObject], created: frozenset[str]
 ) -> list[tuple[str, JsonObject]]:
-    return [(name, endpoint) for name, endpoint in networks.items() if name != primary]
+    return [(name, endpoint) for name, endpoint in networks.items() if name not in created]

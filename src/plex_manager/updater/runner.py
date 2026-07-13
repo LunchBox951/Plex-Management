@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections.abc import Awaitable
 from contextlib import suppress
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from plex_manager.updater.config import (
     IMAGE_REF_LABEL,
@@ -37,6 +37,21 @@ from plex_manager.updater.recreation import (
 from plex_manager.updater.state import StateStore, UpdateStage, UpdateState
 
 _logger = logging.getLogger(__name__)
+_PROGRESS_INTERVAL_SECONDS = 15.0
+_MAX_STOP_TIMEOUT_SECONDS = 300
+_OFFLINE_ROLLBACK_STAGES = frozenset(
+    {
+        "stop_requested",
+        "old_stopped",
+        "old_disconnected",
+        "candidate_created",
+        "candidate_started",
+        "rollback_requested",
+        "rollback_created",
+        "rollback_networked",
+        "rollback_started",
+    }
+)
 
 
 class UpdaterError(RuntimeError):
@@ -72,6 +87,22 @@ def _config_labels(container: JsonObject) -> dict[str, str]:
     if not all(isinstance(key, str) and isinstance(value, str) for key, value in labels.items()):
         raise UpdaterError("target_labels_invalid")
     return cast(dict[str, str], labels)
+
+
+def _stop_timeout(container: JsonObject) -> int:
+    config = container.get("Config")
+    if not isinstance(config, dict):
+        raise UpdaterError("target_stop_timeout_invalid")
+    value = cast(JsonObject, config).get("StopTimeout", 10)
+    if value is None:
+        value = 10
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _MAX_STOP_TIMEOUT_SECONDS
+    ):
+        raise UpdaterError("target_stop_timeout_unsupported")
+    return value
 
 
 class UpdaterRunner:
@@ -112,6 +143,16 @@ class UpdaterRunner:
             if pending.stage in {"outcome_acknowledged", "rollback_acknowledged"}:
                 await self._recover(pending)
                 return
+            if pending.stage == "prepared":
+                if pending.detail_code is None:
+                    pending.detail_code = "update_interrupted"
+                    self.state.save(pending)
+                try:
+                    await self._ack_pre_cutover_failure(pending, pending.detail_code)
+                    return
+                except CoordinatorError as exc:
+                    if exc.code != "coordinator_conflict":
+                        raise
             if pending.stage == "candidate_renamed":
                 try:
                     await self._finish_success(pending)
@@ -119,6 +160,11 @@ class UpdaterRunner:
                 except CoordinatorError as exc:
                     if exc.code != "coordinator_conflict":
                         raise
+                except UpdaterError as exc:
+                    if exc.code != "candidate_missing_during_recovery":
+                        raise
+                except DockerError:
+                    pass
             if pending.stage == "rollback_healthy":
                 try:
                     await self._finish_rollback_outcome(pending)
@@ -126,7 +172,25 @@ class UpdaterRunner:
                 except CoordinatorError as exc:
                     if exc.code != "coordinator_conflict":
                         raise
-            lease = await self._ensure_recovery_lease(pending)
+                except UpdaterError as exc:
+                    if exc.code != "rollback_missing_during_recovery":
+                        raise
+                except DockerError:
+                    pass
+            try:
+                lease = await self._ensure_recovery_lease(pending)
+            except CoordinatorError as exc:
+                if (
+                    exc.code != "coordinator_unavailable"
+                    or pending.stage not in _OFFLINE_ROLLBACK_STAGES
+                ):
+                    raise
+                await self._rollback(
+                    pending,
+                    detail_code=pending.detail_code or "coordinator_unavailable",
+                    acknowledge=False,
+                )
+                return
             if lease is None:
                 return
             await self._run_with_lease_keeper(pending, lease.lease_seconds, self._recover(pending))
@@ -134,8 +198,19 @@ class UpdaterRunner:
         eligibility = await self.coordinator.eligibility()
         if eligibility.action == "none":
             return
-        target, old_image = await self._target()
-        desired = await self.engine.pull(self.config.image_ref)
+        try:
+            preflight = await self._run_with_check_heartbeat(
+                eligibility.action_generation,
+            )
+        except (DockerError, UpdaterError) as exc:
+            await self.coordinator.outcome(
+                operation="check",
+                outcome="failed",
+                action_generation=eligibility.action_generation,
+                detail_code=exc.code,
+            )
+            return
+        target, old_image, desired = preflight
         old_id = _container_image_id(target)
         desired_id = image_id(desired)
         old_digest = image_digest(old_image, self.config.image_ref)
@@ -151,23 +226,50 @@ class UpdaterRunner:
                 # triggering eligibility action was install.
                 operation="check",
                 outcome="no_update",
+                action_generation=eligibility.action_generation,
                 current_digest=old_digest,
-                available_digest=desired_digest,
                 current_build=old_build,
-                available_build=desired_build,
             )
             return
+        await self.coordinator.outcome(
+            operation="check",
+            outcome="update_available",
+            action_generation=eligibility.action_generation,
+            current_digest=old_digest,
+            available_digest=desired_digest,
+            current_build=old_build,
+            available_build=desired_build,
+        )
         if eligibility.action == "check":
+            return
+        try:
+            networks = capture_networks(target)
+            port_bindings = capture_port_bindings(target)
+            stop_timeout_seconds = _stop_timeout(target)
+            multi_network_create = await self._multi_network_create()
+            # Validate the complete candidate payload, including legacy-MAC
+            # portability, before claiming a lease or stopping the live target.
+            build_candidate_spec(
+                target,
+                old_image,
+                desired,
+                image_ref=self.config.image_ref,
+                operation_id="preflight",
+                networks=networks,
+                port_bindings=port_bindings,
+                multi_network_create=multi_network_create,
+            )
+        except (DockerError, UpdaterError) as exc:
             await self.coordinator.outcome(
                 operation="check",
-                outcome="update_available",
+                outcome="failed",
+                action_generation=eligibility.action_generation,
                 current_digest=old_digest,
-                available_digest=desired_digest,
                 current_build=old_build,
-                available_build=desired_build,
+                detail_code=exc.code,
             )
             return
-        lease = await self._claim_ready()
+        lease = await self._claim_ready(expected_generation=eligibility.action_generation)
         if lease is None:
             return
         if lease.lease_token is None:  # guarded by _claim_ready
@@ -191,11 +293,12 @@ class UpdaterRunner:
             desired_image_id=desired_id,
             desired_digest=desired_digest,
             desired_build=desired_build,
-            networks=capture_networks(target),
-            port_bindings=capture_port_bindings(target),
+            networks=networks,
+            port_bindings=port_bindings,
+            stop_timeout_seconds=stop_timeout_seconds,
         )
         self.state.save(state)
-        renewed = await self.coordinator.renew(lease_token)
+        renewed = await self.coordinator.renew(lease_token, phase="installing")
         if not renewed.ready:
             raise UpdaterError("maintenance_drain_lost")
         await self._run_with_lease_keeper(
@@ -203,6 +306,45 @@ class UpdaterRunner:
             renewed.lease_seconds,
             self._execute_install(state, target, old_image, desired),
         )
+
+    async def _preflight(self) -> tuple[JsonObject, JsonObject, JsonObject]:
+        target, old_image = await self._target()
+        desired = await self.engine.pull(self.config.image_ref)
+        return target, old_image, desired
+
+    async def _run_with_check_heartbeat(
+        self,
+        action_generation: int,
+    ) -> tuple[JsonObject, JsonObject, JsonObject]:
+        await self.coordinator.heartbeat(action_generation=action_generation)
+        stop = asyncio.Event()
+        lost: list[CoordinatorError] = []
+        owner = asyncio.current_task()
+
+        async def keep_alive() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=_PROGRESS_INTERVAL_SECONDS)
+                    return
+                except TimeoutError:
+                    try:
+                        await self.coordinator.heartbeat(action_generation=action_generation)
+                    except CoordinatorError as exc:
+                        lost.append(exc)
+                        if owner is not None:
+                            owner.cancel()
+                        return
+
+        task = asyncio.create_task(keep_alive())
+        try:
+            return await self._preflight()
+        except asyncio.CancelledError:
+            if lost:
+                raise lost[0] from None
+            raise
+        finally:
+            stop.set()
+            await task
 
     async def _execute_install(
         self,
@@ -267,14 +409,17 @@ class UpdaterRunner:
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + lease_seconds
-        delay = max(0.1, lease_seconds / 3)
+        delay = max(0.1, min(_PROGRESS_INTERVAL_SECONDS, lease_seconds / 3))
         while True:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=delay)
                 return
             except TimeoutError:
                 try:
-                    renewed = await self.coordinator.renew(state.lease_token)
+                    renewed = await self.coordinator.renew(
+                        state.lease_token,
+                        phase=self._progress_phase(state),
+                    )
                 except CoordinatorError as exc:
                     if exc.code == "coordinator_conflict" or loop.time() >= deadline:
                         lost.set()
@@ -290,7 +435,7 @@ class UpdaterRunner:
                     return
                 lease_seconds = renewed.lease_seconds
                 deadline = loop.time() + lease_seconds
-                delay = max(0.1, lease_seconds / 3)
+                delay = max(0.1, min(_PROGRESS_INTERVAL_SECONDS, lease_seconds / 3))
 
     async def _stop_lease_keeper(self) -> None:
         stop = self._lease_stop
@@ -312,7 +457,7 @@ class UpdaterRunner:
                 expected_generation=expected_generation,
             )
             if recovery
-            else await self.coordinator.claim()
+            else await self.coordinator.claim(expected_generation=expected_generation)
         )
         if lease.lease_token is None:
             # Idle-only busy or another updater already owns the drain. This is
@@ -333,7 +478,10 @@ class UpdaterRunner:
     async def _ensure_recovery_lease(self, state: UpdateState) -> LeaseStatus | None:
         """Revalidate ownership before any interrupted-stage Docker mutation."""
         try:
-            renewed = await self.coordinator.renew(state.lease_token)
+            renewed = await self.coordinator.renew(
+                state.lease_token,
+                phase=self._progress_phase(state),
+            )
         except CoordinatorError as exc:
             if exc.code != "coordinator_conflict":
                 raise
@@ -346,7 +494,10 @@ class UpdaterRunner:
                 if loop.time() >= deadline:
                     return None
                 await self._sleep(max(0.5, min(5.0, renewed.lease_seconds / 3)))
-                renewed = await self.coordinator.renew(state.lease_token)
+                renewed = await self.coordinator.renew(
+                    state.lease_token,
+                    phase=self._progress_phase(state),
+                )
             return renewed
 
         replacement = await self._claim_ready(
@@ -358,6 +509,13 @@ class UpdaterRunner:
         state.lease_token = replacement.lease_token
         self.state.save(state)
         return replacement
+
+    @staticmethod
+    def _progress_phase(state: UpdateState) -> Literal["installing", "rollback"]:
+        return "rollback" if state.stage.startswith("rollback_") else "installing"
+
+    async def _multi_network_create(self) -> bool:
+        return await self.engine.api_version() >= (1, 44)
 
     async def _target(self) -> tuple[JsonObject, JsonObject]:
         try:
@@ -392,13 +550,16 @@ class UpdaterRunner:
         desired: JsonObject,
     ) -> None:
         self._stage(state, "stop_requested")
-        await self.engine.stop_container(state.target_id, timeout=10)
+        await self.engine.stop_container(
+            state.target_id,
+            request_timeout=state.stop_timeout_seconds + 10.0,
+        )
         self._stage(state, "old_stopped")
         for network in state.networks:
             await self.engine.disconnect_network(network, state.target_id)
         self._stage(state, "old_disconnected")
 
-        spec, primary = build_candidate_spec(
+        spec, created_networks = build_candidate_spec(
             target,
             old_image,
             desired,
@@ -406,11 +567,12 @@ class UpdaterRunner:
             operation_id=state.operation_id,
             networks=state.networks,
             port_bindings=state.port_bindings,
+            multi_network_create=await self._multi_network_create(),
         )
         candidate_name = f"{self.config.container_name}-candidate-{state.operation_id[:12]}"
         state.candidate_id = await self.engine.create_container(candidate_name, spec)
         self._stage(state, "candidate_created")
-        for network, endpoint in remaining_networks(state.networks, primary):
+        for network, endpoint in remaining_networks(state.networks, created_networks):
             await self.engine.connect_network(network, state.candidate_id, endpoint)
         await self.engine.start_container(state.candidate_id)
         self._stage(state, "candidate_started")
@@ -421,7 +583,8 @@ class UpdaterRunner:
         await self._finish_success(state)
 
     async def _finish_success(self, state: UpdateState) -> None:
-        if state.candidate_id is None or not await self.engine.exists(state.candidate_id):
+        await self._validate_candidate(state)
+        if state.candidate_id is None:  # guarded by _validate_candidate
             raise UpdaterError("candidate_missing_during_recovery")
         await self.engine.wait_healthy(
             state.candidate_id, timeout=self.config.health_timeout_seconds
@@ -445,6 +608,7 @@ class UpdaterRunner:
             await self.coordinator.outcome(
                 operation="install",
                 outcome="succeeded",
+                action_generation=state.action_generation,
                 lease_token=state.lease_token,
                 current_digest=state.desired_digest,
                 available_digest=state.desired_digest,
@@ -454,33 +618,64 @@ class UpdaterRunner:
                 to_build=state.desired_build,
             )
             self._stage(state, "outcome_acknowledged")
-        if await self.engine.exists(state.target_id):
-            await self.engine.remove_container(state.target_id)
-        self.state.clear()
+        await self._cleanup_success(state)
 
-    async def _rollback(self, state: UpdateState, *, detail_code: str) -> None:
+    async def _rollback(
+        self,
+        state: UpdateState,
+        *,
+        detail_code: str,
+        acknowledge: bool = True,
+    ) -> None:
         if state.detail_code is None:
             state.detail_code = detail_code
             self.state.save(state)
+        if not state.stage.startswith("rollback_"):
+            self._stage(state, "rollback_requested")
+        try:
+            progress = await self.coordinator.renew(state.lease_token, phase="rollback")
+        except CoordinatorError as exc:
+            if exc.code != "coordinator_unavailable":
+                raise
+        else:
+            if not progress.ready:
+                raise UpdaterError("maintenance_drain_lost")
         if state.candidate_id is None:
             state.candidate_id = await self._find_operation_container(state, "candidate")
             if state.candidate_id is not None:
                 self.state.save(state)
         if state.candidate_id is not None and await self.engine.exists(state.candidate_id):
+            await self._validate_operation_container(
+                state,
+                state.candidate_id,
+                role="candidate",
+                expected_image=state.desired_image_id,
+                allowed_names={
+                    self.config.container_name,
+                    f"{self.config.container_name}-candidate-{state.operation_id[:12]}",
+                },
+            )
             with suppress(DockerError):
-                await self.engine.stop_container(state.candidate_id, timeout=5)
+                await self.engine.stop_container(
+                    state.candidate_id,
+                    request_timeout=state.stop_timeout_seconds + 10.0,
+                )
             await self.engine.remove_container(state.candidate_id, force=True)
-        if not await self.engine.exists(state.target_id):
-            raise UpdaterError("previous_container_missing")
-        previous = await self.engine.inspect_container(state.target_id)
+        previous = await self._validate_previous(state)
         with suppress(DockerError):
-            await self.engine.stop_container(state.target_id, timeout=5)
+            await self.engine.stop_container(
+                state.target_id,
+                request_timeout=state.stop_timeout_seconds + 10.0,
+            )
         await self._ensure_name(
             state.target_id,
             expected=f"{self.config.container_name}-previous-{state.operation_id[:12]}",
             allowed_current=self.config.container_name,
         )
-        previous = await self.engine.inspect_container(state.target_id)
+        previous = await self._validate_previous(
+            state,
+            allowed_names={f"{self.config.container_name}-previous-{state.operation_id[:12]}"},
+        )
         # Ensure the retained container owns no endpoint while the rollback clone
         # takes its aliases/static addresses. Already-disconnected is harmlessly
         # ignored because recovery may enter at any checkpoint.
@@ -492,34 +687,66 @@ class UpdaterRunner:
             state.rollback_id = await self._find_operation_container(state, "rollback")
             if state.rollback_id is not None:
                 self._stage(state, "rollback_created")
-        if state.rollback_id is None or not await self.engine.exists(state.rollback_id):
+        if state.rollback_id is not None and not await self.engine.exists(state.rollback_id):
+            state.rollback_id = None
+            self._stage(state, "rollback_requested")
+        if state.rollback_id is not None:
+            await self._validate_rollback(state)
+            if state.stage == "rollback_healthy":
+                try:
+                    await self.engine.wait_healthy(
+                        state.rollback_id,
+                        timeout=self.config.health_timeout_seconds,
+                    )
+                except DockerError:
+                    with suppress(DockerError):
+                        await self.engine.stop_container(
+                            state.rollback_id,
+                            request_timeout=state.stop_timeout_seconds + 10.0,
+                        )
+                    await self.engine.remove_container(state.rollback_id, force=True)
+                    state.rollback_id = None
+                    self._stage(state, "rollback_requested")
+        if state.rollback_id is None:
             old_image = await self.engine.inspect_image(state.old_image_id)
-            spec, primary = build_rollback_spec(
+            spec, _created_networks = build_rollback_spec(
                 previous,
                 old_image,
                 image_ref=self.config.image_ref,
                 operation_id=state.operation_id,
                 networks=state.networks,
                 port_bindings=state.port_bindings,
+                multi_network_create=await self._multi_network_create(),
             )
             state.rollback_id = await self.engine.create_container(self.config.container_name, spec)
             self._stage(state, "rollback_created")
-            for network, endpoint in remaining_networks(state.networks, primary):
-                await self.engine.connect_network(network, state.rollback_id, endpoint)
         if state.stage == "rollback_created":
+            await self._ensure_rollback_networks(state)
+            self._stage(state, "rollback_networked")
+        if state.stage == "rollback_networked":
             await self.engine.start_container(state.rollback_id)
             self._stage(state, "rollback_started")
         await self.engine.wait_healthy(
             state.rollback_id, timeout=self.config.health_timeout_seconds
         )
         self._stage(state, "rollback_healthy")
-        await self._finish_rollback_outcome(state)
+        if acknowledge:
+            await self._finish_rollback_outcome(state)
 
     async def _finish_rollback_outcome(self, state: UpdateState) -> None:
+        rollback = await self._validate_rollback(state)
+        self._validate_network_fidelity(rollback, state)
+        if state.rollback_id is None:  # guarded by _validate_rollback
+            raise UpdaterError("rollback_missing_during_recovery")
+        await self.engine.wait_healthy(
+            state.rollback_id,
+            timeout=self.config.health_timeout_seconds,
+        )
         await self._stop_lease_keeper()
         await self.coordinator.outcome(
             operation="install",
             outcome="rolled_back",
+            action_generation=state.action_generation,
             lease_token=state.lease_token,
             current_digest=state.old_digest,
             available_digest=state.desired_digest,
@@ -530,9 +757,7 @@ class UpdaterRunner:
             detail_code=state.detail_code or "update_interrupted",
         )
         self._stage(state, "rollback_acknowledged")
-        if await self.engine.exists(state.target_id):
-            await self.engine.remove_container(state.target_id)
-        self.state.clear()
+        await self._cleanup_rollback(state)
 
     async def _find_operation_container(self, state: UpdateState, role: str) -> str | None:
         matches = await self.engine.containers_by_labels(
@@ -547,6 +772,164 @@ class UpdaterRunner:
             raise UpdaterError("operation_container_id_missing")
         return identifier
 
+    async def _validate_operation_container(
+        self,
+        state: UpdateState,
+        identifier: str,
+        *,
+        role: str,
+        expected_image: str,
+        allowed_names: set[str],
+    ) -> JsonObject:
+        try:
+            container = await self.engine.inspect_container(identifier)
+        except DockerNotFound as exc:
+            raise UpdaterError(f"{role}_missing_during_recovery") from exc
+        if container.get("Id") != identifier or _container_image_id(container) != expected_image:
+            raise UpdaterError(f"{role}_identity_mismatch")
+        if _container_name(container) not in allowed_names:
+            raise UpdaterError(f"{role}_name_mismatch")
+        labels = _config_labels(container)
+        required = {
+            TARGET_LABEL: "true",
+            IMAGE_REF_LABEL: self.config.image_ref,
+            OPERATION_LABEL: state.operation_id,
+            ROLE_LABEL: role,
+        }
+        if any(labels.get(key) != value for key, value in required.items()):
+            raise UpdaterError(f"{role}_label_mismatch")
+        return container
+
+    async def _validate_candidate(self, state: UpdateState) -> JsonObject:
+        if state.candidate_id is None:
+            raise UpdaterError("candidate_missing_during_recovery")
+        names = {self.config.container_name}
+        if state.stage not in {"candidate_renamed", "outcome_acknowledged"}:
+            names.add(f"{self.config.container_name}-candidate-{state.operation_id[:12]}")
+        return await self._validate_operation_container(
+            state,
+            state.candidate_id,
+            role="candidate",
+            expected_image=state.desired_image_id,
+            allowed_names=names,
+        )
+
+    async def _validate_rollback(self, state: UpdateState) -> JsonObject:
+        if state.rollback_id is None:
+            raise UpdaterError("rollback_missing_during_recovery")
+        return await self._validate_operation_container(
+            state,
+            state.rollback_id,
+            role="rollback",
+            expected_image=state.old_image_id,
+            allowed_names={self.config.container_name},
+        )
+
+    async def _validate_previous(
+        self,
+        state: UpdateState,
+        *,
+        allowed_names: set[str] | None = None,
+    ) -> JsonObject:
+        try:
+            container = await self.engine.inspect_container(state.target_id)
+        except DockerNotFound as exc:
+            raise UpdaterError("previous_container_missing") from exc
+        if (
+            container.get("Id") != state.target_id
+            or _container_image_id(container) != state.old_image_id
+        ):
+            raise UpdaterError("previous_container_identity_mismatch")
+        names = allowed_names or {
+            self.config.container_name,
+            f"{self.config.container_name}-previous-{state.operation_id[:12]}",
+        }
+        if _container_name(container) not in names:
+            raise UpdaterError("previous_container_name_mismatch")
+        labels = _config_labels(container)
+        if (
+            labels.get(TARGET_LABEL) != "true"
+            or labels.get(IMAGE_REF_LABEL) != self.config.image_ref
+        ):
+            raise UpdaterError("previous_container_label_mismatch")
+        return container
+
+    async def _ensure_rollback_networks(self, state: UpdateState) -> None:
+        rollback = await self._validate_rollback(state)
+        settings = rollback.get("NetworkSettings")
+        if not isinstance(settings, dict):
+            raise UpdaterError("rollback_networks_missing")
+        current = cast(JsonObject, settings).get("Networks")
+        if not isinstance(current, dict):
+            raise UpdaterError("rollback_networks_missing")
+        current_keys = cast(dict[object, object], current)
+        if not all(isinstance(name, str) for name in current_keys):
+            raise UpdaterError("rollback_networks_invalid")
+        current_names = {cast(str, name) for name in current_keys}
+        expected_names = set(state.networks)
+        if current_names - expected_names:
+            raise UpdaterError("rollback_network_mismatch")
+        if state.rollback_id is None:  # guarded by _validate_rollback
+            raise UpdaterError("rollback_missing_during_recovery")
+        for name in state.networks:
+            if name not in current_names:
+                await self.engine.connect_network(name, state.rollback_id, state.networks[name])
+
+    @staticmethod
+    def _validate_network_fidelity(container: JsonObject, state: UpdateState) -> None:
+        settings = container.get("NetworkSettings")
+        if not isinstance(settings, dict):
+            raise UpdaterError("rollback_networks_missing")
+        current_value = cast(JsonObject, settings).get("Networks")
+        if not isinstance(current_value, dict):
+            raise UpdaterError("rollback_networks_missing")
+        current = cast(dict[object, object], current_value)
+        if not all(
+            isinstance(name, str) and isinstance(value, dict) for name, value in current.items()
+        ):
+            raise UpdaterError("rollback_networks_invalid")
+        if set(cast(dict[str, object], current)) != set(state.networks):
+            raise UpdaterError("rollback_network_mismatch")
+        for name, expected in state.networks.items():
+            expected_mac = expected.get("MacAddress")
+            if expected_mac is not None:
+                actual = cast(JsonObject, current[name])
+                if actual.get("MacAddress") != expected_mac:
+                    raise UpdaterError("rollback_network_mac_mismatch")
+
+    async def _cleanup_success(self, state: UpdateState) -> None:
+        await self._validate_candidate(state)
+        if state.candidate_id is None:  # guarded by _validate_candidate
+            raise UpdaterError("candidate_missing_during_recovery")
+        await self.engine.wait_healthy(
+            state.candidate_id,
+            timeout=self.config.health_timeout_seconds,
+        )
+        if await self.engine.exists(state.target_id):
+            await self._validate_previous(
+                state,
+                allowed_names={f"{self.config.container_name}-previous-{state.operation_id[:12]}"},
+            )
+            await self.engine.remove_container(state.target_id)
+        self.state.clear()
+
+    async def _cleanup_rollback(self, state: UpdateState) -> None:
+        rollback = await self._validate_rollback(state)
+        self._validate_network_fidelity(rollback, state)
+        if state.rollback_id is None:  # guarded by _validate_rollback
+            raise UpdaterError("rollback_missing_during_recovery")
+        await self.engine.wait_healthy(
+            state.rollback_id,
+            timeout=self.config.health_timeout_seconds,
+        )
+        if await self.engine.exists(state.target_id):
+            await self._validate_previous(
+                state,
+                allowed_names={f"{self.config.container_name}-previous-{state.operation_id[:12]}"},
+            )
+            await self.engine.remove_container(state.target_id)
+        self.state.clear()
+
     async def _ensure_name(self, identifier: str, *, expected: str, allowed_current: str) -> None:
         current = _container_name(await self.engine.inspect_container(identifier))
         if current == expected:
@@ -556,20 +939,17 @@ class UpdaterRunner:
         await self.engine.rename_container(identifier, expected)
 
     async def _recover(self, state: UpdateState) -> None:
-        if state.stage in {"outcome_acknowledged"}:
-            if await self.engine.exists(state.target_id):
-                await self.engine.remove_container(state.target_id)
-            self.state.clear()
+        if state.stage == "outcome_acknowledged":
+            await self._cleanup_success(state)
             return
         if state.stage == "rollback_acknowledged":
-            if await self.engine.exists(state.target_id):
-                await self.engine.remove_container(state.target_id)
-            self.state.clear()
+            await self._cleanup_rollback(state)
             return
-        if state.stage in {"rollback_created", "rollback_started", "rollback_healthy"}:
+        if state.stage.startswith("rollback_"):
             await self._rollback(state, detail_code="update_interrupted")
             return
         if state.candidate_id is not None and await self.engine.exists(state.candidate_id):
+            await self._validate_candidate(state)
             try:
                 await self.engine.wait_healthy(
                     state.candidate_id, timeout=self.config.health_timeout_seconds
@@ -585,10 +965,14 @@ class UpdaterRunner:
         await self._rollback(state, detail_code="update_interrupted")
 
     async def _ack_pre_cutover_failure(self, state: UpdateState, detail_code: str) -> None:
+        if state.detail_code is None:
+            state.detail_code = detail_code
+            self.state.save(state)
         await self._stop_lease_keeper()
         await self.coordinator.outcome(
             operation="install",
             outcome="failed",
+            action_generation=state.action_generation,
             lease_token=state.lease_token,
             current_digest=state.old_digest,
             available_digest=state.desired_digest,
@@ -596,7 +980,7 @@ class UpdaterRunner:
             available_build=state.desired_build,
             from_build=state.old_build,
             to_build=state.desired_build,
-            detail_code=detail_code,
+            detail_code=state.detail_code,
         )
         self.state.clear()
 

@@ -99,3 +99,23 @@ async def test_pull_error_body_becomes_a_bounded_code_without_body_disclosure() 
 
     assert caught.value.code == "docker_pull_failed"
     assert private_registry_message not in str(caught.value)
+
+
+async def test_stop_omits_grace_override_and_uses_bounded_response_wait() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"ApiVersion": "1.47"})
+        assert request.url.path == "/v1.47/containers/container-id/stop"
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        base_url="http://docker", transport=httpx.MockTransport(handler)
+    ) as http:
+        engine = DockerEngine("/unused/in-mock.sock", client=http)
+        assert await engine.api_version() == (1, 47)
+        await engine.stop_container("container-id", request_timeout=100)
+
+    assert list(seen[-1].url.params) == []

@@ -137,6 +137,15 @@ restricted to the fixed, labeled `plex-manager` container and configured image
 reference. Rootless Docker and NAS installations whose socket is elsewhere can
 set `PLEX_MANAGER_DOCKER_SOCKET` in `.env` before starting the profile.
 
+The executor negotiates Docker Engine API 1.41–1.47. Dynamic host ports
+(`HostPort: 0` and publish-all) are materialized before replacement so they do
+not silently change. Per-network MAC preservation on a multi-network container
+requires Engine API 1.44 or newer; an older daemon fails the update before
+stopping Plex Manager rather than recreating it inaccurately. A configured
+Compose `stop_grace_period` is honored up to 300 seconds. Negative, indefinite,
+or longer values are rejected before cutover so a sidecar request cannot hang
+without a bounded recovery window.
+
 The initial policy is disabled and preselects every weekday, 03:00–05:00, and
 idle-only operation. Choose an explicit IANA timezone such as
 `America/Toronto`; daylight-saving changes are calculated in that local zone.
@@ -165,6 +174,13 @@ bypassed so it does not reject the newer Alembic revision. Rollback never runs
 post-migration schema compatible with the immediately previous application
 release. The mounted application data and updater state volumes persist across
 replacement and sidecar restarts.
+
+If the candidate's migration is partially applied or the advertised N/N-1
+compatibility guarantee is wrong, the rollback clone may also fail its health
+gate. In that case the updater leaves its durable state and retained previous
+container intact; it does not report a successful rollback or delete recovery
+evidence. Restore the pre-migration recovery unit using **Backup & recovery**
+below, then restart the pinned older image.
 
 If Docker-socket authority is unacceptable, leave the profile disabled and use
 the ordinary manual Compose flow instead:

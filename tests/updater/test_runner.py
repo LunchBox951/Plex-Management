@@ -20,7 +20,7 @@ from plex_manager.updater.coordinator import (
     LeaseStatus,
 )
 from plex_manager.updater.engine import DockerError
-from plex_manager.updater.runner import UpdaterError, UpdaterRunner
+from plex_manager.updater.runner import UpdaterRunner
 from plex_manager.updater.state import UpdateStage, UpdateState
 
 IMAGE_REF = "ghcr.io/lunchbox951/plex-manager:stable"
@@ -84,10 +84,12 @@ class _InstallCoordinator:
     def __init__(self) -> None:
         self.claim_calls = 0
         self.outcomes: list[dict[str, object]] = []
+        self.heartbeat_calls = 0
 
     async def eligibility(self) -> Eligibility:
         return Eligibility(
             action="install",
+            action_generation=1,
             automatic_enabled=True,
             window_open=True,
             idle_only=True,
@@ -96,6 +98,10 @@ class _InstallCoordinator:
 
     async def claim(self) -> None:
         self.claim_calls += 1
+
+    async def heartbeat(self, *, action_generation: int) -> None:
+        assert action_generation == 1
+        self.heartbeat_calls += 1
 
     async def outcome(self, **values: object) -> None:
         self.outcomes.append(values)
@@ -122,10 +128,13 @@ class _Coordinator:
         self.claim_calls = 0
         self.renew_calls = 0
         self.release_calls = 0
+        self.heartbeat_calls = 0
+        self.renew_phases: list[str | None] = []
 
     async def eligibility(self) -> Eligibility:
         return Eligibility(
             action="install",
+            action_generation=1,
             automatic_enabled=True,
             window_open=True,
             idle_only=True,
@@ -139,7 +148,13 @@ class _Coordinator:
         self.claim_calls += 1
         return self.claim_result
 
-    async def renew(self, lease_token: str) -> LeaseStatus:
+    async def renew(
+        self,
+        lease_token: str,
+        *,
+        phase: str | None = None,
+    ) -> LeaseStatus:
+        self.renew_phases.append(phase)
         self.renew_calls += 1
         if self.renew_conflicts:
             self.renew_conflicts -= 1
@@ -159,6 +174,10 @@ class _Coordinator:
             self.fail_success_outcomes -= 1
             raise CoordinatorError("coordinator_unavailable")
         self.outcomes.append(values)
+
+    async def heartbeat(self, *, action_generation: int) -> None:
+        assert action_generation == 1
+        self.heartbeat_calls += 1
 
 
 def _image(identifier: str, digest: str, build: str) -> dict[str, Any]:
@@ -253,11 +272,20 @@ class _Engine:
         self.calls.append(("pull",))
         return self.images[NEW_IMAGE_ID]
 
+    async def api_version(self) -> tuple[int, int]:
+        return (1, 47)
+
     async def exists(self, identifier: str | None) -> bool:
         return identifier is not None and identifier in self.containers
 
-    async def stop_container(self, identifier: str, *, timeout: int) -> None:
-        self.calls.append(("stop", identifier, timeout))
+    async def stop_container(
+        self,
+        identifier: str,
+        *,
+        grace_override: int | None = None,
+        request_timeout: float | None = None,
+    ) -> None:
+        self.calls.append(("stop", identifier, grace_override, request_timeout))
         self.container(identifier)["State"]["Status"] = "exited"
 
     async def disconnect_network(self, network: str, identifier: str) -> None:
@@ -403,10 +431,9 @@ async def test_unchanged_image_is_a_check_no_op_without_maintenance_claim(
         {
             "operation": "check",
             "outcome": "no_update",
+            "action_generation": 1,
             "current_digest": DIGEST,
-            "available_digest": DIGEST,
             "current_build": "build-current",
-            "available_build": "build-current",
         }
     ]
 
@@ -434,6 +461,7 @@ async def test_successful_install_recreates_then_acknowledges_before_removing_pr
     assert coordinator.outcomes[-1] == {
         "operation": "install",
         "outcome": "succeeded",
+        "action_generation": 1,
         "lease_token": "l" * 32,
         "current_digest": NEW_DIGEST,
         "available_digest": NEW_DIGEST,
@@ -450,6 +478,7 @@ async def test_successful_install_recreates_then_acknowledges_before_removing_pr
         "candidate_created",
     ]
     assert state.saved_stages[-1] == "outcome_acknowledged"
+    assert "installing" in coordinator.renew_phases
 
 
 async def test_live_install_renews_lease_while_health_gate_is_running(tmp_path: Path) -> None:
@@ -495,6 +524,7 @@ async def test_unhealthy_candidate_rolls_back_with_direct_non_migrating_entrypoi
     )
     assert coordinator.outcomes[-1]["outcome"] == "rolled_back"
     assert coordinator.outcomes[-1]["detail_code"] == "replacement_unhealthy"
+    assert "rollback" in coordinator.renew_phases
     assert state.value is None
 
 
@@ -532,7 +562,7 @@ async def _seed_healthy_candidate(engine: _Engine, *, canonical: bool) -> str:
     )
     candidate = await engine.create_container("plex-manager-candidate-operation123", spec)
     await engine.start_container(candidate)
-    await engine.stop_container("old-container", timeout=10)
+    await engine.stop_container("old-container", request_timeout=20)
     await engine.disconnect_network("pm_default", "old-container")
     if canonical:
         await engine.rename_container("old-container", "plex-manager-previous-operation123")
@@ -670,11 +700,12 @@ async def test_disabled_target_healthcheck_is_rejected_before_pull_or_claim(
         _config(tmp_path), cast(Any, engine), cast(Any, coordinator), cast(Any, _MemoryState())
     )
 
-    with pytest.raises(UpdaterError, match="target_healthcheck_missing"):
-        await runner.run_once()
+    await runner.run_once()
 
     assert engine.calls == []
     assert coordinator.claim_calls == 0
+    assert coordinator.outcomes[-1]["outcome"] == "failed"
+    assert coordinator.outcomes[-1]["detail_code"] == "target_healthcheck_missing"
 
 
 async def test_lost_success_outcome_retries_without_rolling_back_healthy_candidate(
@@ -723,7 +754,7 @@ async def test_null_busy_claim_is_clean_deferral_without_stopping_target(tmp_pat
 
     assert coordinator.claim_calls == 1
     assert not any(call[0] == "stop" for call in engine.calls)
-    assert coordinator.outcomes == []
+    assert coordinator.outcomes[-1]["outcome"] == "update_available"
     assert state.value is None
 
 
@@ -740,8 +771,253 @@ async def test_name_match_without_required_target_label_is_rejected_before_pull(
         cast(Any, _MemoryState()),
     )
 
-    with pytest.raises(UpdaterError, match="configured_target_label_missing"):
-        await runner.run_once()
+    await runner.run_once()
 
     assert engine.calls == []
     assert coordinator.claim_calls == 0
+    assert coordinator.outcomes[-1]["outcome"] == "failed"
+    assert coordinator.outcomes[-1]["detail_code"] == "configured_target_label_missing"
+
+
+async def test_slow_preflight_keeps_check_heartbeat_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SlowNoOpEngine(_NoOpEngine):
+        async def pull(self, image_ref: str) -> dict[str, Any]:
+            await asyncio.sleep(0.04)
+            return await super().pull(image_ref)
+
+    monkeypatch.setattr("plex_manager.updater.runner._PROGRESS_INTERVAL_SECONDS", 0.01)
+    coordinator = _InstallCoordinator()
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, SlowNoOpEngine()),
+        cast(Any, coordinator),
+        cast(Any, _EmptyState()),
+    )
+
+    await runner.run_once()
+
+    assert coordinator.heartbeat_calls >= 3
+    assert coordinator.outcomes[-1]["outcome"] == "no_update"
+
+
+async def test_prepared_failure_lost_response_replays_before_lease_recovery(
+    tmp_path: Path,
+) -> None:
+    class LostResponseCoordinator(_Coordinator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_payloads: list[dict[str, object]] = []
+
+        async def outcome(self, **values: object) -> None:
+            self.failed_payloads.append(values)
+            if len(self.failed_payloads) == 1:
+                raise CoordinatorError("coordinator_unavailable")
+            assert values == self.failed_payloads[0]
+            self.outcomes.append(values)
+
+    engine = _Engine()
+    coordinator = LostResponseCoordinator()
+    state = _MemoryState(_pending("prepared"))
+    runner = UpdaterRunner(
+        _config(tmp_path), cast(Any, engine), cast(Any, coordinator), cast(Any, state)
+    )
+
+    with pytest.raises(CoordinatorError, match="coordinator_unavailable"):
+        await runner.run_once()
+    assert state.value is not None
+    assert state.value.detail_code == "update_interrupted"
+    await runner.run_once()
+
+    assert state.value is None
+    assert coordinator.renew_calls == 0
+    assert coordinator.claim_calls == 0
+    assert engine.calls == []
+
+
+async def test_coordinator_offline_after_stop_performs_only_compensating_rollback(
+    tmp_path: Path,
+) -> None:
+    class OfflineCoordinator(_Coordinator):
+        async def renew(self, lease_token: str, *, phase: str | None = None) -> LeaseStatus:
+            del lease_token, phase
+            raise CoordinatorError("coordinator_unavailable")
+
+    engine = _Engine()
+    state = _MemoryState(_pending("stop_requested"))
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, OfflineCoordinator()),
+        cast(Any, state),
+    )
+
+    await runner.run_once()
+
+    assert state.value is not None
+    assert state.value.stage == "rollback_healthy"
+    assert engine.container("plex-manager")["Image"] == IMAGE_ID
+    assert "old-container" in engine.containers
+
+
+async def test_rollback_created_recovery_attaches_missing_secondary_before_start(
+    tmp_path: Path,
+) -> None:
+    from plex_manager.updater.recreation import build_rollback_spec, capture_networks
+
+    engine = _Engine()
+    target = engine.container("old-container")
+    target["NetworkSettings"]["Networks"]["pm_aux"] = {"Aliases": ["plex-aux"]}
+    networks = capture_networks(target)
+    await engine.rename_container("old-container", "plex-manager-previous-operation123")
+    spec, _created = build_rollback_spec(
+        target,
+        engine.images[IMAGE_ID],
+        image_ref=IMAGE_REF,
+        operation_id="operation1234567890",
+        networks=networks,
+        multi_network_create=False,
+    )
+    rollback_id = await engine.create_container("plex-manager", spec)
+    engine.calls.clear()
+    pending = _pending("old_disconnected")
+    pending.stage = "rollback_created"
+    pending.rollback_id = rollback_id
+    pending.networks = networks
+    state = _MemoryState(pending)
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, _Coordinator()),
+        cast(Any, state),
+    )
+
+    await runner.run_once()
+
+    connect_index = engine.calls.index(("connect", "pm_aux", rollback_id))
+    start_index = engine.calls.index(("start", "rollback", rollback_id))
+    assert connect_index < start_index
+    assert set(engine.container("plex-manager")["NetworkSettings"]["Networks"]) == {
+        "pm_default",
+        "pm_aux",
+    }
+
+
+async def test_missing_healthy_rollback_is_recreated_before_outcome(
+    tmp_path: Path,
+) -> None:
+    engine = _Engine()
+    pending = _pending("old_disconnected")
+    pending.stage = "rollback_healthy"
+    pending.rollback_id = "missing-rollback"
+    pending.detail_code = "replacement_unhealthy"
+    state = _MemoryState(pending)
+    coordinator = _Coordinator()
+    runner = UpdaterRunner(
+        _config(tmp_path), cast(Any, engine), cast(Any, coordinator), cast(Any, state)
+    )
+
+    await runner.run_once()
+
+    assert state.value is None
+    assert coordinator.outcomes[-1]["outcome"] == "rolled_back"
+    assert engine.container("plex-manager")["Image"] == IMAGE_ID
+
+
+async def test_acknowledged_success_never_deletes_previous_without_healthy_candidate(
+    tmp_path: Path,
+) -> None:
+    engine = _Engine()
+    await engine.rename_container("old-container", "plex-manager-previous-operation123")
+    pending = _pending("outcome_acknowledged", candidate_id="missing-candidate")
+    state = _MemoryState(pending)
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, _Coordinator()),
+        cast(Any, state),
+    )
+
+    with pytest.raises(DockerError):
+        await runner.run_once()
+
+    assert "old-container" in engine.containers
+    assert state.value is not None
+    assert not any(call[0] == "remove" for call in engine.calls)
+
+
+async def test_acknowledged_success_recovers_after_previous_removal_before_state_clear(
+    tmp_path: Path,
+) -> None:
+    engine = _Engine()
+    candidate = await _seed_healthy_candidate(engine, canonical=True)
+    engine.containers.pop("old-container")
+    state = _MemoryState(_pending("outcome_acknowledged", candidate_id=candidate))
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, _Coordinator()),
+        cast(Any, state),
+    )
+
+    await runner.run_once()
+
+    assert state.value is None
+    assert engine.container("plex-manager")["Image"] == NEW_IMAGE_ID
+
+
+async def test_acknowledged_rollback_recovers_after_previous_removal_before_state_clear(
+    tmp_path: Path,
+) -> None:
+    from plex_manager.updater.recreation import build_rollback_spec, capture_networks
+
+    engine = _Engine()
+    target = engine.container("old-container")
+    networks = capture_networks(target)
+    await engine.rename_container("old-container", "plex-manager-previous-operation123")
+    spec, _created = build_rollback_spec(
+        target,
+        engine.images[IMAGE_ID],
+        image_ref=IMAGE_REF,
+        operation_id="operation1234567890",
+        networks=networks,
+        port_bindings={"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8000"}]},
+    )
+    rollback_id = await engine.create_container("plex-manager", spec)
+    await engine.start_container(rollback_id)
+    engine.containers.pop("old-container")
+    pending = _pending("old_disconnected")
+    pending.stage = "rollback_acknowledged"
+    pending.rollback_id = rollback_id
+    pending.networks = networks
+    state = _MemoryState(pending)
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, _Coordinator()),
+        cast(Any, state),
+    )
+
+    await runner.run_once()
+
+    assert state.value is None
+    assert engine.container("plex-manager")["Image"] == IMAGE_ID
+
+
+async def test_configured_stop_timeout_is_preserved_without_engine_grace_override(
+    tmp_path: Path,
+) -> None:
+    engine = _Engine()
+    engine.containers["old-container"]["Config"]["StopTimeout"] = 90
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, _Coordinator()),
+        cast(Any, _MemoryState()),
+    )
+
+    await runner.run_once()
+
+    stop_calls = [call for call in engine.calls if call[0] == "stop"]
+    assert stop_calls[0] == ("stop", "old-container", None, 100.0)

@@ -26,9 +26,11 @@ from plex_manager.web.schemas import (
     UpdateClaimRequest,
     UpdateClaimResponse,
     UpdateEligibilityResponse,
+    UpdateHeartbeatRequest,
     UpdateLeaseRequest,
     UpdateLeaseResponse,
     UpdateOutcomeRequest,
+    UpdateRenewRequest,
     UpdateResultItem,
     UpdateStatusResponse,
 )
@@ -40,6 +42,7 @@ _UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
 _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
+_KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
 
 router = APIRouter(
     prefix="/api/v1/updates",
@@ -119,12 +122,16 @@ def _state_and_blocker(
     updater_available: bool,
     now: datetime,
 ) -> tuple[str, str | None]:
+    if snapshot.phase not in _KNOWN_PHASES:
+        return "unavailable", "coordinator_state_unknown"
     if not updater_available:
         return "unavailable", "updater_unavailable"
     if snapshot.phase == "draining":
         return "draining", "critical_work_draining" if snapshot.active_critical_operations else None
     if snapshot.phase == "installing":
         return "installing", None
+    if snapshot.phase == "rollback":
+        return "rollback", None
     if snapshot.phase == "checking" or snapshot.requested_action == "check":
         return "checking", None
     if snapshot.phase == "failed":
@@ -142,6 +149,8 @@ def _state_and_blocker(
     if snapshot.available_digest is not None:
         if policy.schedule.enabled and not policy.schedule.is_open(now):
             return "waiting_for_window", "outside_update_window"
+        if policy.schedule.enabled and policy.idle_only and snapshot.active_critical_operations:
+            return "waiting_for_idle", "active_critical_work"
         return "update_available", None
     if not policy.schedule.enabled:
         return "disabled", "automatic_updates_disabled"
@@ -193,6 +202,12 @@ async def _request_action(
 ) -> UpdateStatusResponse:
     coordinator = await _coordinator(request)
     snapshot = await coordinator.snapshot()
+    if snapshot.phase not in _KNOWN_PHASES:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
+        )
     if not coordinator.updater_available(snapshot, max_age=_UPDATER_HEARTBEAT_MAX_AGE):
         raise AppError(
             status_code=503,
@@ -233,18 +248,31 @@ async def _eligibility(
 ) -> tuple[UpdateEligibilityResponse, CoordinatorSnapshot]:
     coordinator = await _coordinator(request)
     snapshot = await coordinator.snapshot()
-    if touch:
-        try:
-            phase = UpdatePhase(snapshot.phase)
-        except ValueError:
-            phase = UpdatePhase.idle
-        snapshot = await coordinator.heartbeat(
-            phase=phase,
-            current_build=snapshot.current_build or current_build_id(),
-            current_digest=snapshot.current_digest,
-            available_build=snapshot.available_build,
-            available_digest=snapshot.available_digest,
+    try:
+        phase = UpdatePhase(snapshot.phase)
+    except ValueError:
+        if touch:
+            touched = await coordinator.touch_updater()
+            if touched is not None:
+                snapshot = touched
+        policy = await load_update_policy(session)
+        now = datetime.now(UTC)
+        return (
+            UpdateEligibilityResponse(
+                action="none",
+                action_generation=snapshot.action_generation,
+                automatic_enabled=policy.schedule.enabled,
+                window_open=policy.schedule.is_open(now),
+                idle_only=policy.idle_only,
+                blocker="coordinator_state_unknown",
+                poll_after_seconds=_SIDE_CAR_POLL_SECONDS,
+            ),
+            snapshot,
         )
+    if touch:
+        touched = await coordinator.touch_updater(phase=phase)
+        if touched is not None:
+            snapshot = touched
     policy = await load_update_policy(session)
     now = datetime.now(UTC)
     window_open = policy.schedule.is_open(now)
@@ -272,6 +300,7 @@ async def _eligibility(
     return (
         UpdateEligibilityResponse(
             action=action,
+            action_generation=snapshot.action_generation,
             automatic_enabled=policy.schedule.enabled,
             window_open=window_open,
             idle_only=policy.idle_only,
@@ -292,6 +321,35 @@ async def eligibility_endpoint(
     return eligibility
 
 
+@internal_router.post("/heartbeat")
+async def heartbeat_endpoint(body: UpdateHeartbeatRequest, request: Request) -> UpdateLeaseResponse:
+    coordinator = await _coordinator(request)
+    before = await coordinator.snapshot()
+    if before.phase not in _KNOWN_PHASES:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
+        )
+    after = await coordinator.touch_updater(
+        phase=UpdatePhase(body.phase),
+        expected_generation=body.action_generation,
+    )
+    if after is None:
+        raise AppError(
+            status_code=409,
+            code="update_action_generation_mismatch",
+            message="The update check no longer matches the pending action.",
+        )
+    if before.phase != after.phase:
+        publish_realtime(request.app, ("updates",), reason="update_checking")
+    return UpdateLeaseResponse(
+        ready=False,
+        lease_seconds=int(_DRAIN_TTL.total_seconds()),
+        blocker=None,
+    )
+
+
 @internal_router.post("/claim")
 async def claim_endpoint(
     request: Request,
@@ -301,6 +359,12 @@ async def claim_endpoint(
     coordinator = await _coordinator(request)
     if body is not None and body.recovery:
         snapshot = await coordinator.snapshot()
+        if snapshot.phase not in _KNOWN_PHASES:
+            raise AppError(
+                status_code=409,
+                code="coordinator_state_unknown",
+                message="The update coordinator is in an unrecognized state.",
+            )
         if (
             snapshot.requested_action != "install"
             or snapshot.action_generation != body.expected_generation
@@ -313,6 +377,7 @@ async def claim_endpoint(
         policy = await load_update_policy(session)
         eligibility = UpdateEligibilityResponse(
             action="install",
+            action_generation=snapshot.action_generation,
             automatic_enabled=policy.schedule.enabled,
             window_open=policy.schedule.is_open(datetime.now(UTC)),
             idle_only=policy.idle_only,
@@ -321,6 +386,16 @@ async def claim_endpoint(
         )
     else:
         eligibility, snapshot = await _eligibility(request, session, touch=True)
+        if (
+            body is not None
+            and body.expected_generation is not None
+            and body.expected_generation != snapshot.action_generation
+        ):
+            raise AppError(
+                status_code=409,
+                code="update_action_generation_mismatch",
+                message="The update claim no longer matches the pending action.",
+            )
     if eligibility.action != "install":
         raise AppError(
             status_code=409,
@@ -337,6 +412,9 @@ async def claim_endpoint(
     claim = await (await _coordinator(request)).claim_drain(
         ttl=_DRAIN_TTL,
         action_generation=snapshot.action_generation,
+        materialize_install=(
+            not (body is not None and body.recovery) and snapshot.requested_action == "none"
+        ),
         require_idle=eligibility.idle_only,
     )
     if claim is None:
@@ -347,7 +425,7 @@ async def claim_endpoint(
             else "concurrent_update_claim"
         )
         return UpdateClaimResponse(
-            action_generation=snapshot.action_generation,
+            action_generation=latest.action_generation,
             ready=False,
             lease_seconds=int(_DRAIN_TTL.total_seconds()),
             blocker=blocker,
@@ -363,21 +441,31 @@ async def claim_endpoint(
 
 
 @internal_router.post("/renew")
-async def renew_endpoint(body: UpdateLeaseRequest, request: Request) -> UpdateLeaseResponse:
+async def renew_endpoint(body: UpdateRenewRequest, request: Request) -> UpdateLeaseResponse:
     coordinator = await _coordinator(request)
-    if not await coordinator.renew(body.lease_token, ttl=_DRAIN_TTL):
+    before = await coordinator.snapshot()
+    if before.phase not in _KNOWN_PHASES:
         raise AppError(
             status_code=409,
-            code="update_lease_expired",
-            message="The update maintenance lease is no longer valid.",
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
         )
-    ready = await coordinator.drain_ready(body.lease_token)
+    phase = UpdatePhase(body.phase) if body.phase is not None else None
+    ready = await coordinator.renew_drain_progress(
+        body.lease_token,
+        ttl=_DRAIN_TTL,
+        phase=phase,
+    )
     if ready is None:
         raise AppError(
             status_code=409,
             code="update_lease_expired",
             message="The update maintenance lease is no longer valid.",
         )
+    if body.phase is not None:
+        after = await coordinator.snapshot()
+        if before.phase != after.phase:
+            publish_realtime(request.app, ("updates",), reason=f"update_{body.phase}")
     return UpdateLeaseResponse(
         ready=ready,
         lease_seconds=int(_DRAIN_TTL.total_seconds()),
@@ -414,31 +502,27 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
     snapshot = await coordinator.snapshot()
     result = _service_result(body.outcome)
     if body.operation == "check":
-        phase = (
-            UpdatePhase.available if result is UpdateResult.update_available else UpdatePhase.idle
-        )
-        if result is UpdateResult.failed:
-            phase = UpdatePhase.failed
-        await coordinator.heartbeat(
-            phase=phase,
-            current_build=body.current_build or snapshot.current_build or current_build_id(),
-            current_digest=body.current_digest,
-            available_build=body.available_build,
-            available_digest=body.available_digest,
-            checked=True,
-        )
-        await coordinator.acknowledge_action(
-            expected_generation=snapshot.action_generation,
+        has_update = result is UpdateResult.update_available
+        acknowledged = await coordinator.acknowledge_action(
+            expected_generation=body.action_generation,
             result=result,
             error_code=body.detail_code,
-            current_build=body.current_build,
-            current_digest=body.current_digest,
-            available_build=body.available_build,
-            available_digest=body.available_digest,
+            current_build=body.current_build or snapshot.current_build or current_build_id(),
+            current_digest=(
+                body.current_digest if body.current_digest is not None else snapshot.current_digest
+            ),
+            available_build=body.available_build if has_update else None,
+            available_digest=body.available_digest if has_update else None,
             preserve_action=(
                 snapshot.requested_action == "install" and result is UpdateResult.update_available
             ),
         )
+        if not acknowledged:
+            raise AppError(
+                status_code=409,
+                code="update_action_generation_mismatch",
+                message="The update check no longer matches the pending action.",
+            )
     else:
         token = body.lease_token
         if token is None:  # schema validation guarantees this branch is unreachable
@@ -450,6 +534,7 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
         if not await coordinator.acknowledge_outcome(
             token,
             result=result,
+            expected_generation=body.action_generation,
             error_code=body.detail_code,
             from_build=body.from_build,
             to_build=body.to_build,
@@ -463,14 +548,6 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
                 code="update_lease_expired",
                 message="The update outcome did not match an active maintenance lease.",
             )
-        latest = await coordinator.snapshot()
-        await coordinator.heartbeat(
-            phase=UpdatePhase(latest.phase),
-            current_build=body.current_build or latest.current_build,
-            current_digest=body.current_digest or latest.current_digest,
-            available_build=None,
-            available_digest=None,
-        )
     publish_realtime(request.app, ("updates",), reason=f"update_{body.outcome}")
     settings = get_settings()
     maker = request.app.state.sessionmaker

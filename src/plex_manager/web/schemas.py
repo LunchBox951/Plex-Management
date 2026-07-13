@@ -881,6 +881,7 @@ class UpdateEligibilityResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     action: Literal["none", "check", "install"]
+    action_generation: int = Field(ge=0)
     automatic_enabled: bool
     window_open: bool
     idle_only: bool
@@ -906,6 +907,21 @@ class UpdateLeaseRequest(BaseModel):
     lease_token: str = Field(min_length=32, max_length=256)
 
 
+class UpdateRenewRequest(UpdateLeaseRequest):
+    """Lease renewal plus a bounded, token-owned active phase."""
+
+    phase: Literal["installing", "rollback"] | None = None
+
+
+class UpdateHeartbeatRequest(BaseModel):
+    """Unleased liveness for digest checks before a drain is claimed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: Literal["checking"]
+    action_generation: int = Field(ge=0)
+
+
 class UpdateClaimRequest(BaseModel):
     """Recovery claims bind only to an existing action generation, never a target."""
 
@@ -918,8 +934,6 @@ class UpdateClaimRequest(BaseModel):
     def _recovery_requires_generation(self) -> UpdateClaimRequest:
         if self.recovery and self.expected_generation is None:
             raise ValueError("recovery claims require expected_generation")
-        if not self.recovery and self.expected_generation is not None:
-            raise ValueError("fresh claims must not include expected_generation")
         return self
 
 
@@ -937,6 +951,7 @@ class UpdateOutcomeRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     operation: Literal["check", "install"]
+    action_generation: int = Field(ge=0)
     lease_token: str | None = Field(default=None, min_length=32, max_length=256)
     outcome: Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
     current_digest: str | None = Field(default=None, max_length=255)

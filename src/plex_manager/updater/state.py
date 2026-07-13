@@ -23,7 +23,9 @@ UpdateStage = Literal[
     "old_renamed",
     "candidate_renamed",
     "outcome_acknowledged",
+    "rollback_requested",
     "rollback_created",
+    "rollback_networked",
     "rollback_started",
     "rollback_healthy",
     "rollback_acknowledged",
@@ -40,7 +42,9 @@ _STAGES: frozenset[str] = frozenset(
         "old_renamed",
         "candidate_renamed",
         "outcome_acknowledged",
+        "rollback_requested",
         "rollback_created",
+        "rollback_networked",
         "rollback_started",
         "rollback_healthy",
         "rollback_acknowledged",
@@ -57,7 +61,13 @@ _CANDIDATE_STAGES = frozenset(
     }
 )
 _ROLLBACK_STAGES = frozenset(
-    {"rollback_created", "rollback_started", "rollback_healthy", "rollback_acknowledged"}
+    {
+        "rollback_created",
+        "rollback_networked",
+        "rollback_started",
+        "rollback_healthy",
+        "rollback_acknowledged",
+    }
 )
 
 
@@ -91,6 +101,7 @@ class UpdateState:
     desired_build: str | None
     networks: dict[str, dict[str, Any]]
     port_bindings: dict[str, Any]
+    stop_timeout_seconds: int = 10
     candidate_id: str | None = None
     rollback_id: str | None = None
     detail_code: str | None = None
@@ -123,6 +134,13 @@ class UpdateState:
         port_bindings = data.get("port_bindings")
         if not isinstance(port_bindings, dict):
             raise StateError("updater state has invalid port bindings")
+        stop_timeout = data.get("stop_timeout_seconds", 10)
+        if (
+            isinstance(stop_timeout, bool)
+            or not isinstance(stop_timeout, int)
+            or not 0 <= stop_timeout <= 300
+        ):
+            raise StateError("updater state has invalid stop timeout")
         stage = cast(str, data["stage"])
         if stage not in _STAGES:
             raise StateError("updater state has an unknown stage")
@@ -157,6 +175,7 @@ class UpdateState:
             desired_build=cast(str | None, data.get("desired_build")),
             networks=cast(dict[str, dict[str, Any]], networks),
             port_bindings=cast(dict[str, Any], port_bindings),
+            stop_timeout_seconds=stop_timeout,
             candidate_id=cast(str | None, data.get("candidate_id")),
             rollback_id=cast(str | None, data.get("rollback_id")),
             detail_code=cast(str | None, data.get("detail_code")),

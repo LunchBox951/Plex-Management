@@ -161,7 +161,7 @@ class SqlUpdateCoordinationRepository:
                 update(UpdateCoordinatorState)
                 .where(
                     UpdateCoordinatorState.id == 1,
-                    UpdateCoordinatorState.phase.in_(("draining", "installing")),
+                    UpdateCoordinatorState.phase.in_(("draining", "installing", "rollback")),
                 )
                 .values(phase="idle", updated_at=now)
             )
@@ -223,6 +223,27 @@ class SqlUpdateCoordinationRepository:
             update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
         )
 
+    async def touch_updater(
+        self,
+        *,
+        now: datetime,
+        phase: str | None = None,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Refresh sidecar liveness without replaying stale image observations."""
+        await self._lock()
+        values: dict[str, object] = {"updater_last_seen_at": now, "updated_at": now}
+        if phase is not None:
+            values["phase"] = phase
+        stmt = update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1)
+        if expected_generation is not None:
+            stmt = stmt.where(UpdateCoordinatorState.action_generation == expected_generation)
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(stmt.values(**values)),
+        )
+        return result.rowcount == 1
+
     async def request_action(self, action: str, now: datetime) -> int:
         state = await self._lock()
         generation = state.action_generation + 1
@@ -273,6 +294,7 @@ class SqlUpdateCoordinationRepository:
         token_hash: str,
         owner: str,
         action_generation: int | None,
+        materialize_install: bool,
         require_idle: bool,
         now: datetime,
         ttl: timedelta,
@@ -286,6 +308,24 @@ class SqlUpdateCoordinationRepository:
             return None
         if require_idle and await self._critical_count() != 0:
             return None
+        if materialize_install:
+            if state.requested_action != "none":
+                return None
+            generation = state.action_generation + 1
+            await self._session.execute(
+                update(UpdateCoordinatorState)
+                .where(
+                    UpdateCoordinatorState.id == 1,
+                    UpdateCoordinatorState.action_generation == state.action_generation,
+                    UpdateCoordinatorState.requested_action == "none",
+                )
+                .values(
+                    requested_action="install",
+                    action_generation=generation,
+                    requested_at=now,
+                    updated_at=now,
+                )
+            )
         row = MaintenanceLease(
             token_hash=token_hash,
             kind="drain",
@@ -335,6 +375,36 @@ class SqlUpdateCoordinationRepository:
         )
         return result.rowcount == 1
 
+    async def renew_drain_progress(
+        self,
+        token_hash: str,
+        *,
+        now: datetime,
+        ttl: timedelta,
+        phase: str | None,
+    ) -> bool | None:
+        """Renew one exact drain and atomically refresh its bounded active phase."""
+        state = await self._lock()
+        await self._cleanup_expired(now)
+        drain = await self._lease_for_token(token_hash, "drain")
+        if drain is None:
+            return None
+        ready = (await self._critical_count()) == 0
+        drain.renewed_at = now
+        drain.expires_at = now + ttl
+        values: dict[str, object] = {
+            "updater_last_seen_at": now,
+            "updated_at": now,
+        }
+        if phase is not None:
+            values["phase"] = phase if ready else "draining"
+        elif state.phase not in {"draining", "installing", "rollback"}:
+            values["phase"] = "draining"
+        await self._session.execute(
+            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
+        )
+        return ready
+
     async def release(self, token_hash: str, now: datetime) -> bool:
         await self._lock()
         await self._cleanup_expired(now)
@@ -375,6 +445,8 @@ class SqlUpdateCoordinationRepository:
             "last_outcome_token_hash": None,
             "last_outcome_fingerprint": None,
             "last_completed_at": now,
+            "last_checked_at": now,
+            "updater_last_seen_at": now,
             "updated_at": now,
         }
         if not preserve_action:
@@ -442,6 +514,9 @@ class SqlUpdateCoordinationRepository:
             "last_outcome_token_hash": token_hash,
             "last_outcome_fingerprint": outcome_fingerprint,
             "last_completed_at": now,
+            "available_build": None,
+            "available_digest": None,
+            "updater_last_seen_at": now,
             "updated_at": now,
         }
         if current_build is not None:

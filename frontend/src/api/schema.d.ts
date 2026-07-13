@@ -228,6 +228,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/internal/updates/heartbeat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Heartbeat Endpoint */
+        post: operations["heartbeat_endpoint_api_v1_internal_updates_heartbeat_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/internal/updates/outcome": {
         parameters: {
             query?: never;
@@ -2652,6 +2669,8 @@ export interface components {
              * @enum {string}
              */
             action: "none" | "check" | "install";
+            /** Action Generation */
+            action_generation: number;
             /** Automatic Enabled */
             automatic_enabled: boolean;
             /** Blocker */
@@ -2665,6 +2684,19 @@ export interface components {
             poll_after_seconds: number;
             /** Window Open */
             window_open: boolean;
+        };
+        /**
+         * UpdateHeartbeatRequest
+         * @description Unleased liveness for digest checks before a drain is claimed.
+         */
+        UpdateHeartbeatRequest: {
+            /** Action Generation */
+            action_generation: number;
+            /**
+             * Phase
+             * @constant
+             */
+            phase: "checking";
         };
         /** UpdateLeaseRequest */
         UpdateLeaseRequest: {
@@ -2685,6 +2717,8 @@ export interface components {
          * @description Sidecar acknowledgement. Targets/configuration are intentionally absent.
          */
         UpdateOutcomeRequest: {
+            /** Action Generation */
+            action_generation: number;
             /** Available Build */
             available_build?: string | null;
             /** Available Digest */
@@ -2711,6 +2745,16 @@ export interface components {
             outcome: "no_update" | "update_available" | "succeeded" | "failed" | "rolled_back";
             /** To Build */
             to_build?: string | null;
+        };
+        /**
+         * UpdateRenewRequest
+         * @description Lease renewal plus a bounded, token-owned active phase.
+         */
+        UpdateRenewRequest: {
+            /** Lease Token */
+            lease_token: string;
+            /** Phase */
+            phase?: ("installing" | "rollback") | null;
         };
         /**
          * UpdateResultItem
@@ -3116,6 +3160,39 @@ export interface operations {
             };
         };
     };
+    heartbeat_endpoint_api_v1_internal_updates_heartbeat_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateHeartbeatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateLeaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     outcome_endpoint_api_v1_internal_updates_outcome_post: {
         parameters: {
             query?: never;
@@ -3191,7 +3268,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpdateLeaseRequest"];
+                "application/json": components["schemas"]["UpdateRenewRequest"];
             };
         };
         responses: {

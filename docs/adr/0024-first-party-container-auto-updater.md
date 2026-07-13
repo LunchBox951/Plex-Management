@@ -74,6 +74,11 @@ changed digest it persists each replacement stage outside the target container,
 pulls the new image, recreates only the labeled Plex Manager container while
 preserving its effective mounts, environment, ports, networks, labels, restart
 policy, and healthcheck, and waits for health before acknowledging success.
+Dynamic port assignments are materialized before the target stops. The
+container's configured stop grace is honored within a bounded 300-second
+executor limit. Multi-network per-endpoint MAC fidelity uses atomic create on
+Engine API 1.44+; older daemons fail closed before cutover when that fidelity is
+not representable.
 
 The previous container and image remain available until the replacement is
 healthy. Failed startup restores the previous image and effective container

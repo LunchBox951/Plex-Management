@@ -54,6 +54,7 @@ class DockerEngine:
             trust_env=False,
         )
         self._api_prefix: str | None = None
+        self._api_version: tuple[int, int] | None = None
         self._sleep = sleep
 
     async def close(self) -> None:
@@ -80,7 +81,15 @@ class DockerEngine:
         if chosen < (1, 41) or minimum_parts > (1, 47):
             raise DockerError("docker_api_unsupported")
         self._api_prefix = f"/v{chosen[0]}.{chosen[1]}"
+        self._api_version = cast(tuple[int, int], chosen)
         return self._api_prefix
+
+    async def api_version(self) -> tuple[int, int]:
+        """Return the negotiated Engine API version for portable payload choices."""
+        await self._prefix()
+        if self._api_version is None:  # pragma: no cover - _prefix sets both caches
+            raise DockerError("docker_invalid_version")
+        return self._api_version
 
     async def _request(
         self,
@@ -171,12 +180,23 @@ class DockerEngine:
             raise DockerError("docker_create_invalid_response")
         return identifier
 
-    async def stop_container(self, identifier: str, *, timeout: int = 10) -> None:
+    async def stop_container(
+        self,
+        identifier: str,
+        *,
+        grace_override: int | None = None,
+        request_timeout: float | None = None,
+    ) -> None:
+        params = {"t": grace_override} if grace_override is not None else None
+        request_options: dict[str, Any] = {}
+        if request_timeout is not None:
+            request_options["timeout"] = httpx.Timeout(request_timeout)
         await self._request(
             "POST",
             f"/containers/{quote(identifier, safe='')}/stop",
-            params={"t": timeout},
+            params=params,
             expected=(204, 304),
+            **request_options,
         )
 
     async def start_container(self, identifier: str) -> None:

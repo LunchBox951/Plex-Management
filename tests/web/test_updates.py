@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import update
 
 from plex_manager.config import get_settings
+from plex_manager.models import UpdateCoordinatorState
 from plex_manager.ports.metadata import MovieMetadata
-from plex_manager.services.update_coordination_service import UpdateCoordinationService
+from plex_manager.services.update_coordination_service import (
+    UpdateCoordinationService,
+    UpdatePhase,
+)
 from tests.web.fakes import FakeTmdb, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -20,6 +25,30 @@ SeedFn = Callable[..., Awaitable[None]]
 _API_KEY = "updates-key"
 _ADMIN = {"X-Api-Key": _API_KEY}
 _UPDATER_TOKEN = "updater-test-token-with-at-least-thirty-two-bytes"  # noqa: S105
+
+
+async def _enable_automatic_updates(client: httpx.AsyncClient) -> None:
+    response = await client.put(
+        "/api/v1/settings",
+        headers=_ADMIN,
+        json={
+            "automatic_updates_enabled": True,
+            "automatic_update_timezone": "UTC",
+            "automatic_update_weekdays": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            ],
+            "automatic_update_window_start": "00:00",
+            "automatic_update_window_end": "23:59",
+            "automatic_update_idle_only": True,
+        },
+    )
+    assert response.status_code == 200
 
 
 @pytest.fixture
@@ -83,6 +112,7 @@ async def test_check_and_claim_flow_is_targetless_and_concurrency_safe(
     assert requested.json()["state"] == "checking"
     eligible = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
     assert eligible.json()["action"] == "check"
+    check_generation = eligible.json()["action_generation"]
 
     checked = await client.post(
         "/api/v1/internal/updates/outcome",
@@ -90,6 +120,7 @@ async def test_check_and_claim_flow_is_targetless_and_concurrency_safe(
         json={
             "operation": "check",
             "outcome": "update_available",
+            "action_generation": check_generation,
             "current_build": "old-build",
             "current_digest": "sha256:old",
             "available_build": "new-build",
@@ -144,6 +175,68 @@ async def test_manual_update_without_cached_digest_reports_preflight_checking(
     assert eligibility.json()["action"] == "check"
 
 
+async def test_stale_check_outcome_cannot_consume_newer_install_action(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    stale_generation = eligibility.json()["action_generation"]
+    await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+
+    stale = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "action_generation": stale_generation,
+            "current_digest": "sha256:stale",
+        },
+    )
+    assert stale.status_code == 409
+    snapshot = await app.state.update_coordinator.snapshot()
+    assert snapshot.requested_action == "install"
+    assert snapshot.action_generation == stale_generation + 1
+    assert snapshot.current_digest is None
+
+
+async def test_no_update_defensively_clears_false_availability(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    response = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "action_generation": eligibility.json()["action_generation"],
+            "current_build": "same",
+            "current_digest": "sha256:same",
+            "available_build": "same",
+            "available_digest": "sha256:same",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["available_build"] is None
+    assert response.json()["available_digest"] is None
+    assert response.json()["state"] == "disabled"
+    next_eligibility = await client.post(
+        "/api/v1/internal/updates/eligibility", headers=updater_headers
+    )
+    assert next_eligibility.json()["action"] == "none"
+
+
 async def test_check_after_install_reports_check_without_stale_build_transition(
     client: httpx.AsyncClient,
     seed: SeedFn,
@@ -158,6 +251,7 @@ async def test_check_after_install_reports_check_without_stale_build_transition(
         json={
             "operation": "check",
             "outcome": "update_available",
+            "action_generation": 1,
             "current_build": "old",
             "available_build": "new",
             "available_digest": "sha256:new",
@@ -173,6 +267,7 @@ async def test_check_after_install_reports_check_without_stale_build_transition(
         json={
             "operation": "install",
             "outcome": "succeeded",
+            "action_generation": claim.json()["action_generation"],
             "lease_token": token,
             "current_build": "new",
             "from_build": "old",
@@ -188,6 +283,7 @@ async def test_check_after_install_reports_check_without_stale_build_transition(
         json={
             "operation": "check",
             "outcome": "no_update",
+            "action_generation": 3,
             "current_build": "new",
         },
     )
@@ -217,13 +313,38 @@ async def test_internal_outcome_rejects_impossible_operation_result_pairs(
     with_lease: bool,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
-    body: dict[str, object] = {"operation": operation, "outcome": outcome}
+    body: dict[str, object] = {
+        "operation": operation,
+        "outcome": outcome,
+        "action_generation": 0,
+    }
     if with_lease:
         body["lease_token"] = "l" * 32
     response = await client.post(
         "/api/v1/internal/updates/outcome", headers=updater_headers, json=body
     )
     assert response.status_code == 422
+    if with_lease:
+        assert "l" * 32 not in response.text
+        redacted = response.json()["detail"][0]["input"]["lease_token"]
+        assert len(redacted) == 3 and set(redacted) == {"*"}
+
+
+async def test_invalid_lease_field_is_redacted_from_validation_response(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sentinel = "lease-secret-sentinel-" * 20
+    response = await client.post(
+        "/api/v1/internal/updates/renew",
+        headers=updater_headers,
+        json={"lease_token": sentinel},
+    )
+    assert response.status_code == 422
+    assert sentinel not in response.text
+    assert response.json()["detail"][0]["input"] == "***"
 
 
 async def test_drain_blocks_admin_mutations_but_accepts_new_requests(
@@ -264,3 +385,176 @@ async def test_drain_blocks_admin_mutations_but_accepts_new_requests(
     )
     assert accepted.status_code == 201
     await coordinator.release(claim.lease.token)
+
+
+async def test_automatic_claim_survives_expiry_for_exact_recovery(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _enable_automatic_updates(client)
+    now = [datetime(2026, 7, 12, 12, 0, tzinfo=UTC)]
+    coordinator = UpdateCoordinationService(
+        app.state.sessionmaker,
+        clock=lambda: now[0],
+    )
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await coordinator.heartbeat(
+        phase=UpdatePhase.available,
+        current_digest="sha256:old",
+        available_digest="sha256:new",
+    )
+
+    claim = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"expected_generation": 0},
+    )
+    assert claim.status_code == 200
+    assert claim.json()["action_generation"] == 1
+    assert claim.json()["lease_token"] is not None
+    snapshot = await coordinator.snapshot()
+    assert snapshot.requested_action == "install"
+
+    now[0] += timedelta(minutes=11)
+    recovered = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"recovery": True, "expected_generation": 1},
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["action_generation"] == 1
+    assert recovered.json()["lease_token"] is not None
+    stale = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"recovery": True, "expected_generation": 0},
+    )
+    assert stale.status_code == 409
+
+
+async def test_unknown_coordinator_phase_fails_closed_without_rewrite(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await coordinator.heartbeat(phase=UpdatePhase.idle)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="future_installing",
+                requested_action="install",
+                action_generation=7,
+                available_digest="sha256:new",
+            )
+        )
+        await session.commit()
+
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert eligibility.status_code == 200
+    assert eligibility.json()["action"] == "none"
+    assert eligibility.json()["blocker"] == "coordinator_state_unknown"
+    assert (await coordinator.snapshot()).phase == "future_installing"
+    assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()["state"] == (
+        "unavailable"
+    )
+    assert (await client.post("/api/v1/updates/check-now", headers=_ADMIN)).status_code == 409
+    assert (
+        await client.post(
+            "/api/v1/internal/updates/claim",
+            headers=updater_headers,
+            json={"recovery": True, "expected_generation": 7},
+        )
+    ).status_code == 409
+    assert (await coordinator.snapshot()).action_generation == 7
+
+
+async def test_token_bound_progress_reports_install_and_rollback(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await coordinator.heartbeat(
+        phase=UpdatePhase.available,
+        current_digest="sha256:old",
+        available_digest="sha256:new",
+    )
+    await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+    claim = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"expected_generation": 1},
+    )
+    token = claim.json()["lease_token"]
+
+    installing = await client.post(
+        "/api/v1/internal/updates/renew",
+        headers=updater_headers,
+        json={"lease_token": token, "phase": "installing"},
+    )
+    assert installing.status_code == 200
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["state"] == "installing"
+    assert status.json()["updater_available"] is True
+
+    rollback = await client.post(
+        "/api/v1/internal/updates/renew",
+        headers=updater_headers,
+        json={"lease_token": token, "phase": "rollback"},
+    )
+    assert rollback.status_code == 200
+    assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()[
+        "state"
+    ] == "rollback"
+
+
+async def test_automatic_idle_only_status_matches_claim_blocker(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _enable_automatic_updates(client)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await coordinator.heartbeat(
+        phase=UpdatePhase.available,
+        current_digest="sha256:old",
+        available_digest="sha256:new",
+    )
+    critical = await coordinator.acquire_critical("import")
+    assert critical is not None
+
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["state"] == "waiting_for_idle"
+    assert status.json()["blocker"] == "active_critical_work"
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert eligibility.json()["blocker"] == "active_critical_work"
+    claim = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"expected_generation": eligibility.json()["action_generation"]},
+    )
+    assert claim.json()["lease_token"] is None
+    assert claim.json()["blocker"] == "active_critical_work"
+    await coordinator.release(critical.token)
+    assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()[
+        "state"
+    ] == "update_available"

@@ -65,13 +65,18 @@ class _RecordingCoordinator:
     async def eligibility(self) -> Eligibility:
         return Eligibility(
             action="install",
+            action_generation=1,
             automatic_enabled=True,
             window_open=True,
             idle_only=True,
             blocker=None,
         )
 
-    async def claim(self) -> LeaseStatus:
+    async def claim(
+        self, *, recovery: bool = False, expected_generation: int | None = None
+    ) -> LeaseStatus:
+        del recovery
+        assert expected_generation == 1
         return LeaseStatus(
             lease_token="l" * 32,
             ready=True,
@@ -80,7 +85,8 @@ class _RecordingCoordinator:
             action_generation=1,
         )
 
-    async def renew(self, lease_token: str) -> LeaseStatus:
+    async def renew(self, lease_token: str, *, phase: str | None = None) -> LeaseStatus:
+        del phase
         self.renewals += 1
         return LeaseStatus(
             lease_token=lease_token,
@@ -92,6 +98,9 @@ class _RecordingCoordinator:
     async def outcome(self, **values: object) -> None:
         self.previous_existed_at_ack = await self.engine.exists(self.previous_id)
         self.outcomes.append(values)
+
+    async def heartbeat(self, *, action_generation: int) -> None:
+        assert action_generation == 1
 
 
 @pytest.mark.asyncio
@@ -130,6 +139,7 @@ async def test_real_runner_healthy_cutover_preserves_runtime_and_cleans_state(
             target_name,
             {
                 "Image": image_id(old_image),
+                "StopTimeout": 90,
                 "Env": ["RUNTIME_SETTING=preserved"],
                 "Labels": {
                     TARGET_LABEL: "true",
@@ -142,19 +152,31 @@ async def test_real_runner_healthy_cutover_preserves_runtime_and_cleans_state(
                     "AutoRemove": False,
                     "Binds": [f"{volume}:/data:rw", f"{bind}:/bind:rw"],
                     "NetworkMode": primary,
-                    "PortBindings": {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]},
+                    "PortBindings": {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "0"}]},
                     "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
                 },
                 "NetworkingConfig": {
-                    "EndpointsConfig": {primary: {"Aliases": [target_name, "plex-manager"]}}
+                    "EndpointsConfig": {
+                        primary: {
+                            "Aliases": [target_name, "plex-manager"],
+                            "MacAddress": "02:42:ac:10:00:0a",
+                        },
+                        secondary: {
+                            "Aliases": [target_name],
+                            "MacAddress": "02:42:ac:11:00:0a",
+                        },
+                    }
                 },
             },
         )
-        await engine.connect_network(secondary, original_id, {"Aliases": [target_name]})
         await engine.start_container(original_id)
         await engine.wait_healthy(original_id, timeout=20)
         original = await engine.inspect_container(original_id)
         original_ports = original["NetworkSettings"]["Ports"]
+        original_macs = {
+            name: endpoint["MacAddress"]
+            for name, endpoint in original["NetworkSettings"]["Networks"].items()
+        }
         anonymous = next(
             mount for mount in original["Mounts"] if mount["Destination"] == "/anonymous"
         )
@@ -201,6 +223,11 @@ async def test_real_runner_healthy_cutover_preserves_runtime_and_cleans_state(
         assert current["HostConfig"]["Binds"] == original["HostConfig"]["Binds"]
         assert current["NetworkSettings"]["Ports"] == original_ports
         assert set(current["NetworkSettings"]["Networks"]) == {primary, secondary}
+        assert {
+            name: endpoint["MacAddress"]
+            for name, endpoint in current["NetworkSettings"]["Networks"].items()
+        } == original_macs
+        assert current["Config"]["StopTimeout"] == 90
         assert _docker("exec", target_name, "cat", "/anonymous/value").stdout == "preserved"
         assert coordinator.renewals >= 1
         assert coordinator.previous_existed_at_ack is True
@@ -298,7 +325,7 @@ async def test_real_engine_unhealthy_replacement_rolls_back_preserved_runtime(
         port_bindings = capture_port_bindings(original)
         original_ports = original["NetworkSettings"]["Ports"]
 
-        await engine.stop_container(original_id, timeout=5)
+        await engine.stop_container(original_id, request_timeout=20)
         await engine.disconnect_network(network, original_id)
         candidate_spec, primary = build_candidate_spec(
             original,
@@ -308,7 +335,17 @@ async def test_real_engine_unhealthy_replacement_rolls_back_preserved_runtime(
             operation_id=suffix,
             networks=networks,
             port_bindings=port_bindings,
+            multi_network_create=await engine.api_version() >= (1, 44),
         )
+        # Runtime-environment fidelity intentionally preserves the effective
+        # old FIXTURE_HEALTHY=1 value when its provenance is ambiguous. This low-level
+        # rollback fixture explicitly injects a failing runtime health mode so
+        # it continues to exercise the unhealthy-container path.
+        candidate_env = candidate_spec["Env"]
+        assert isinstance(candidate_env, list)
+        candidate_spec["Env"] = [
+            "FIXTURE_HEALTHY=0" if item == "FIXTURE_HEALTHY=1" else item for item in candidate_env
+        ]
         candidate_id = await engine.create_container(candidate_name, candidate_spec)
         created_ids.add(candidate_id)
         for name, endpoint in remaining_networks(networks, primary):
@@ -327,6 +364,7 @@ async def test_real_engine_unhealthy_replacement_rolls_back_preserved_runtime(
             operation_id=suffix,
             networks=networks,
             port_bindings=port_bindings,
+            multi_network_create=await engine.api_version() >= (1, 44),
         )
         rollback_id = await engine.create_container(target_name, rollback_spec)
         created_ids.add(rollback_id)

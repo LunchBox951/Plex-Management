@@ -3327,6 +3327,11 @@
             "title": "Action",
             "type": "string"
           },
+          "action_generation": {
+            "minimum": 0.0,
+            "title": "Action Generation",
+            "type": "integer"
+          },
           "automatic_enabled": {
             "title": "Automatic Enabled",
             "type": "boolean"
@@ -3358,11 +3363,34 @@
         },
         "required": [
           "action",
+          "action_generation",
           "automatic_enabled",
           "window_open",
           "idle_only"
         ],
         "title": "UpdateEligibilityResponse",
+        "type": "object"
+      },
+      "UpdateHeartbeatRequest": {
+        "additionalProperties": false,
+        "description": "Unleased liveness for digest checks before a drain is claimed.",
+        "properties": {
+          "action_generation": {
+            "minimum": 0.0,
+            "title": "Action Generation",
+            "type": "integer"
+          },
+          "phase": {
+            "const": "checking",
+            "title": "Phase",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "action_generation"
+        ],
+        "title": "UpdateHeartbeatRequest",
         "type": "object"
       },
       "UpdateLeaseRequest": {
@@ -3414,6 +3442,11 @@
         "additionalProperties": false,
         "description": "Sidecar acknowledgement. Targets/configuration are intentionally absent.",
         "properties": {
+          "action_generation": {
+            "minimum": 0.0,
+            "title": "Action Generation",
+            "type": "integer"
+          },
           "available_build": {
             "anyOf": [
               {
@@ -3533,9 +3566,42 @@
         },
         "required": [
           "operation",
+          "action_generation",
           "outcome"
         ],
         "title": "UpdateOutcomeRequest",
+        "type": "object"
+      },
+      "UpdateRenewRequest": {
+        "additionalProperties": false,
+        "description": "Lease renewal plus a bounded, token-owned active phase.",
+        "properties": {
+          "lease_token": {
+            "maxLength": 256,
+            "minLength": 32,
+            "title": "Lease Token",
+            "type": "string"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "enum": [
+                  "installing",
+                  "rollback"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          }
+        },
+        "required": [
+          "lease_token"
+        ],
+        "title": "UpdateRenewRequest",
         "type": "object"
       },
       "UpdateResultItem": {
@@ -4374,6 +4440,52 @@
         ]
       }
     },
+    "/api/v1/internal/updates/heartbeat": {
+      "post": {
+        "operationId": "heartbeat_endpoint_api_v1_internal_updates_heartbeat_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Heartbeat Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
     "/api/v1/internal/updates/outcome": {
       "post": {
         "operationId": "outcome_endpoint_api_v1_internal_updates_outcome_post",
@@ -4473,7 +4585,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateLeaseRequest"
+                "$ref": "#/components/schemas/UpdateRenewRequest"
               }
             }
           },
