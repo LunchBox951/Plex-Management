@@ -2855,6 +2855,113 @@ async def test_settings_store_set_if_absent_routes_secret_keys_to_encrypted_colu
     assert plaintext not in raw_encrypted  # at-rest value is ciphertext, not plaintext
 
 
+# --------------------------------------------------------------------------- #
+# SettingsStore.secret_values (issue #268) — the DECRYPTED value set fed to
+# logsafe.redact_known_secrets, at both the log-capture handler (via
+# web/app.py's _log_drain_loop) and the /ops/logs* read boundaries.
+# --------------------------------------------------------------------------- #
+async def test_secret_values_returns_every_configured_secret_decrypted(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_token", "fake-plex-token-1")
+        await store.set("prowlarr_api_key", "fake-prowlarr-key-1")
+        await store.set("qbittorrent_password", "fake-qbt-password-1")
+        await store.set("tmdb_api_key", "fake-tmdb-key-1")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset(
+        {
+            "fake-plex-token-1",
+            "fake-prowlarr-key-1",
+            "fake-qbt-password-1",
+            "fake-tmdb-key-1",
+        }
+    )
+
+
+async def test_secret_values_omits_unset_secrets(sessionmaker_: SessionMaker) -> None:
+    """Only the secrets actually configured contribute a value -- an unset one
+    is silently absent, never an empty string."""
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("prowlarr_api_key", "fake-prowlarr-key-2")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset({"fake-prowlarr-key-2"})
+
+
+async def test_secret_values_is_empty_with_nothing_configured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_never_returns_a_plaintext_setting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Only :data:`SECRET_SETTING_KEYS` are queried -- an ordinary plaintext
+    setting (a url, a username) never leaks into the value-based redaction set,
+    which would otherwise risk redacting innocuous config values out of logs."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://prowlarr.local")
+        await store.set("qbittorrent_username", "admin")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_includes_the_system_app_api_key(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The recovery/automation break-glass ``X-Api-Key`` credential
+    (``SystemSettings.app_api_key``) lives in a SEPARATE table from the
+    generic ``settings`` key/value store -- it must still be folded into the
+    value-based redaction set, or a bare occurrence of that credential in a
+    log line (e.g. echoed back in an error message) would sail past the
+    value-based pass entirely."""
+    await seed(initialized=True, app_api_key="fake-app-api-key-1234567890")
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert "fake-app-api-key-1234567890" in values
+
+
+async def test_secret_values_combines_the_app_api_key_with_settings_secrets(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Both sources contribute to the SAME set -- the app api key does not
+    replace or shadow the generic settings-table secrets."""
+    await seed(initialized=True, app_api_key="fake-app-api-key-abcdefghij")
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("prowlarr_api_key", "fake-prowlarr-key-3")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset({"fake-app-api-key-abcdefghij", "fake-prowlarr-key-3"})
+
+
+async def test_secret_values_omits_app_api_key_when_unset(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No ``SystemSettings`` row at all (a fresh, pre-setup install) must not
+    raise or contribute a value -- exactly the same honest-absence contract
+    the generic settings query already keeps."""
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
 async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(
     client: httpx.AsyncClient,
     seed: SeedFn,

@@ -52,6 +52,7 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
+    SettingsStore,
     ensure_system_settings,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
@@ -508,6 +509,14 @@ async def _log_drain_loop(app: FastAPI) -> None:
     while True:
         try:
             async with sessionmaker() as session:
+                # Refresh the capture handler's value-based redaction set
+                # (issue #268) EVERY tick, before draining -- ``emit`` (running
+                # synchronously off any thread, no DB access of its own -- see
+                # ``LogCaptureHandler.secret_values``) reads whatever this loop
+                # last assigned here, so a settings change (a rotated api key,
+                # a newly-configured qBittorrent password) is picked up within
+                # one drain interval rather than requiring a restart.
+                handler.secret_values = await SettingsStore(session).secret_values()
                 repo = SqlLogEventRepository(session)
                 drained = await log_capture_service.drain_once(handler.queue, repo, handler=handler)
                 try:
@@ -888,6 +897,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.autograb_cooldowns = autograb_cooldowns
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
+    # Seed the value-based redaction set (issue #268) BEFORE serving traffic --
+    # without this, a request handled in the up-to-``LOG_DRAIN_INTERVAL_SECONDS``
+    # window before ``_log_drain_loop``'s first tick would capture logs with an
+    # empty ``secret_values``, missing this pass entirely for that brief window.
+    async with maker() as seed_session:
+        log_handler.secret_values = await SettingsStore(seed_session).secret_values()
     app.state.log_handler = log_handler
     # The background reconciler closes the request -> grab -> import -> available
     # loop without a GET /queue poll having to do the heavy work. The auto-grab

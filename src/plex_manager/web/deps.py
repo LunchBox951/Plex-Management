@@ -544,6 +544,42 @@ class SettingsStore:
                 out[key] = row.value
         return out
 
+    async def secret_values(self) -> frozenset[str]:
+        """Every currently-configured secret's DECRYPTED value (issue #268) --
+        the input to :func:`~plex_manager.logsafe.redact_known_secrets`'s
+        value-based redaction pass, never returned over the API (unlike
+        :meth:`redacted`, this is for in-process consumption only: the
+        log-capture handler and the ``/ops/logs*`` read boundaries, never a
+        response body).
+
+        One query across all of :data:`SECRET_SETTING_KEYS` rather than one
+        ``get()`` per key -- this is called on every log-capture drain tick
+        (see ``web/app.py``'s ``_log_drain_loop``) and every ``/ops/logs*``
+        read, so it stays a single round trip. An unset secret contributes
+        nothing (never an empty string -- ``redact_known_secrets`` would skip
+        it anyway via its length guard, but there is no reason to hand it one).
+
+        Also folds in ``SystemSettings.app_api_key`` -- the recovery/automation
+        break-glass ``X-Api-Key`` credential (see :func:`authenticate_request`).
+        It lives in a SEPARATE table from the generic ``settings`` key/value
+        store this method otherwise reads (:class:`SystemSettings` is a
+        singleton row, not a ``Setting`` row keyed by :data:`SECRET_SETTING_KEYS`),
+        so without this second query a bare occurrence of the break-glass key in
+        a log line -- e.g. echoed back in an error message, or pasted into a
+        support request -- would sail past this redaction pass entirely. A
+        second query (rather than folding it into the query above) is
+        unavoidable: it is a different table with no ``key`` column to join on,
+        and this is still only two round trips total, not N.
+        """
+        result = await self._session.execute(
+            select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
+        )
+        values = {value for value in result.scalars().all() if value}
+        system = await load_system_settings(self._session)
+        if system is not None and system.app_api_key:
+            values.add(system.app_api_key)
+        return frozenset(values)
+
 
 # --------------------------------------------------------------------------- #
 # Shared HTTP client
