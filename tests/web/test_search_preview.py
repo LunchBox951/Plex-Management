@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 
 import httpx
 from fastapi import FastAPI
 
 from plex_manager.ports.metadata import TvMetadata
+from plex_manager.services.update_coordination_service import UpdateCoordinationService
 from tests.web.fakes import (
     FakeProwlarr,
     FakeTmdb,
@@ -50,6 +52,23 @@ async def test_good_accepted_cam_and_ts_rejected(
     assert "Some.Movie.2020.CAM.x264-GROUP" in rejected_titles
     assert "Some.Movie.2020.HDTS.x264-GROUP" in rejected_titles
     assert all(r["reason"] == "quality_not_wanted" for r in body["rejected"])
+
+
+async def test_read_only_preview_remains_available_during_update_drain(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, prowlarr=FakeProwlarr(good_and_cam_candidates()))
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=1))
+    assert claim is not None and claim.ready
+
+    response = await client.post("/api/v1/search-preview", json=_DESCRIPTOR, headers=_HEADERS)
+
+    assert response.status_code == 200
+    assert (await coordinator.snapshot()).active_critical_operations == 0
 
 
 async def test_all_prerelease_yields_no_acceptable_release(

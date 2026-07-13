@@ -57,6 +57,7 @@ from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
     CreateRequestBody,
     ErrorDetail,
+    ErrorEnvelope,
     KeepForeverBody,
     ReportIssueBody,
     RequestListResponse,
@@ -98,28 +99,26 @@ _LIVE_PROGRESS_DOWNLOAD_STATUSES: frozenset[str] = frozenset({DownloadState.Down
 
 _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Request or season not found"},
-    # This status code has TWO distinct producers, so BOTH shapes are documented
-    # via anyOf (the same pattern as setup/complete's 422 and PUT /settings): the
-    # string-detail ``HTTPException`` 409s (``not_reportable`` /
-    # ``active_duplicate`` -- ``ErrorDetail``) and the ``AppError`` 409
+    # This status code has THREE distinct producers, so ALL shapes are documented
+    # via a union "model" (the same pattern as the cancel endpoint's 409 below --
+    # FastAPI expands ``X | Y | Z`` into an anyOf AND registers every member's
+    # component schema itself, so each ref is self-registering rather than
+    # depending on some OTHER endpoint happening to reference the same model
+    # elsewhere): the string-detail ``HTTPException`` 409s (``not_reportable`` /
+    # ``active_duplicate`` -- ``ErrorDetail``), the ``AppError`` 409
     # (``media_root_unavailable`` -- an ``ErrorEnvelope`` whose message/hint/
-    # diagnostics carry the actionable broken-root guidance). Declaring only one
-    # model would make the generated TS client mis-model the other shape.
+    # diagnostics carry the actionable broken-root guidance), and
+    # ``ServiceNotConfiguredError``'s 409 ``service_not_configured`` (issue #291 --
+    # this endpoint requires Plex/qBittorrent/Prowlarr via NON-optional deps, so an
+    # install missing any of them 409s the same way cancel's does). Declaring
+    # fewer models would make the generated TS client mis-model the missing shape(s).
     409: {
+        "model": ErrorDetail | ErrorEnvelope | ServiceNotConfiguredErrorDetail,
         "description": (
-            "Not reportable in its current state, an active duplicate exists, or the "
-            "title's library folder isn't reachable from the app"
+            "Not reportable in its current state, an active duplicate exists, the "
+            "title's library folder isn't reachable from the app, or a required "
+            "service (Plex/qBittorrent/Prowlarr) is not configured"
         ),
-        "content": {
-            "application/json": {
-                "schema": {
-                    "anyOf": [
-                        {"$ref": "#/components/schemas/ErrorDetail"},
-                        {"$ref": "#/components/schemas/ErrorEnvelope"},
-                    ]
-                }
-            }
-        },
     },
     # A TV request reported with no ``season`` in the body (``ReportSeasonRequiredError``
     # -- ``report_requires_season``), raised BEFORE any state change. Documented

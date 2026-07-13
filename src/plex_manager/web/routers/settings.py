@@ -16,6 +16,8 @@ OAuth-deferral analysis).
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
@@ -34,9 +36,18 @@ from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
+from plex_manager.services.update_policy import (
+    UPDATE_POLICY_SETTING_KEYS,
+    resolve_update_policy,
+)
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
+    AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
+    AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT,
+    AUTOMATIC_UPDATE_WINDOW_END_DEFAULT,
+    AUTOMATIC_UPDATE_WINDOW_START_DEFAULT,
+    AUTOMATIC_UPDATES_ENABLED_DEFAULT,
     DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
     DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
     EVICTION_ENABLED_DEFAULT,
@@ -195,8 +206,20 @@ _BOOL_SETTING_DEFAULTS: dict[str, bool] = {
     "eviction_enabled": EVICTION_ENABLED_DEFAULT,
     "eviction_proactive_enabled": EVICTION_PROACTIVE_ENABLED_DEFAULT,
     "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
+    "automatic_updates_enabled": AUTOMATIC_UPDATES_ENABLED_DEFAULT,
+    "automatic_update_idle_only": AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
     "watchlist_sync_enabled": WATCHLIST_SYNC_ENABLED_DEFAULT,
 }
+
+_UPDATE_POLICY_FIELDS: Final[frozenset[str]] = frozenset(UPDATE_POLICY_SETTING_KEYS)
+_UPDATE_TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+
+
+def _parse_update_time(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized if _UPDATE_TIME_RE.fullmatch(normalized) is not None else None
 
 
 def _present_effective(
@@ -225,7 +248,7 @@ def _present_effective(
     return str(effective)
 
 
-def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None]:
+def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | None]:
     """Present every stored typed value as the EFFECTIVE value the runtime uses.
 
     Each typed key is resolved through the SAME ``web.deps`` resolver its
@@ -256,7 +279,7 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
     padded literal at ``model_validate`` -- the stripped token is the same
     recognized value, minus the crash.
     """
-    out = dict(raw)
+    out: dict[str, object | None] = dict(raw)
 
     pair = resolve_disk_pressure_percents(
         raw.get("disk_pressure_threshold_percent"), raw.get("disk_pressure_target_percent")
@@ -317,6 +340,25 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
         # Honored -> the stripped token (see the docstring); unrecognized -> the
         # default applies at runtime, so unset (None) is the truthful display.
         out[key] = value.strip() if honored else None
+
+    resolved_policy = resolve_update_policy(raw)
+    schedule = resolved_policy.policy.schedule
+    honored = resolved_policy.honored_fields
+    stored_update_policy = any(raw.get(key) is not None for key in UPDATE_POLICY_SETTING_KEYS)
+    out["automatic_update_timezone"] = schedule.timezone_name if stored_update_policy else None
+    out["automatic_update_weekdays"] = (
+        [day for day in AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT if day in schedule.weekdays]
+        if "automatic_update_weekdays" in honored
+        else None
+    )
+    out["automatic_update_window_start"] = (
+        schedule.window_start.strftime("%H:%M")
+        if "automatic_update_window_start" in honored
+        else None
+    )
+    out["automatic_update_window_end"] = (
+        schedule.window_end.strftime("%H:%M") if "automatic_update_window_end" in honored else None
+    )
     return out
 
 
@@ -384,7 +426,7 @@ async def _resolve_root_writes(body: SettingsUpdate) -> dict[str, str]:
     return resolved
 
 
-def _to_stored_string(value: object) -> str:
+def _to_stored_string(field: str, value: object) -> str:
     """Render an incoming ``SettingsUpdate`` field value as the plain-text string
     :meth:`SettingsStore.set` persists (``settings.value`` has no typed columns).
 
@@ -398,6 +440,8 @@ def _to_stored_string(value: object) -> str:
     """
     if isinstance(value, bool):
         return "true" if value else "false"
+    if field == "automatic_update_weekdays" and isinstance(value, list):
+        return json.dumps(value, separators=(",", ":"))
     return value if isinstance(value, str) else str(value)
 
 
@@ -945,6 +989,7 @@ async def put_settings_endpoint(
         # writes, so rolling their read transaction back is safe.
         await session.rollback()
         await _validate_disk_pressure_pair(body, session)
+        await _validate_update_window_pair(body, session)
 
         store = SettingsStore(session)
         await _reject_changed_base_stored_credential_reuse(body, store)
@@ -965,7 +1010,7 @@ async def put_settings_endpoint(
                 continue
             if field in resolved_roots:
                 value = resolved_roots[field]
-            await store.set(field, _to_stored_string(value))
+            await store.set(field, _to_stored_string(field, value))
             written_fields.add(field)
         if plex_identity_changed:
             if machine_identifier is None:
@@ -1007,13 +1052,40 @@ async def put_settings_endpoint(
                 auth_method=AuthMethod.plex_session.value,
             )
         if written_fields or plex_identity_changed:
+            topics = ["settings", "ops:health"]
+            if written_fields.intersection(_UPDATE_POLICY_FIELDS):
+                topics.append("updates")
             publish_realtime(
                 request.app,
-                ("settings", "ops:health"),
+                tuple(topics),
                 reason="settings_updated",
             )
 
         return await _redacted(store)
+
+
+async def _validate_update_window_pair(body: SettingsUpdate, session: AsyncSession) -> None:
+    """Validate the effective partial-update window before persisting either side."""
+    fields = body.model_fields_set
+    store = SettingsStore(session)
+    start = (
+        body.automatic_update_window_start
+        if "automatic_update_window_start" in fields
+        and body.automatic_update_window_start is not None
+        else _parse_update_time(await store.get("automatic_update_window_start"))
+        or AUTOMATIC_UPDATE_WINDOW_START_DEFAULT
+    )
+    end = (
+        body.automatic_update_window_end
+        if "automatic_update_window_end" in fields and body.automatic_update_window_end is not None
+        else _parse_update_time(await store.get("automatic_update_window_end"))
+        or AUTOMATIC_UPDATE_WINDOW_END_DEFAULT
+    )
+    if start == end:
+        raise HTTPException(
+            status_code=422,
+            detail="automatic update window start and end must differ",
+        )
 
 
 async def _validate_disk_pressure_pair(body: SettingsUpdate, session: AsyncSession) -> None:

@@ -48,7 +48,7 @@ dev = [
     # the pre-commit hook in sync; ``pyright`` is NOT a pre-commit hook (it
     # runs via ``make type`` / ``make check`` and CI only), so this pin only
     # keeps local and CI agreeing on it.
-    "ruff==0.15.20",
+    "ruff==0.15.21",
     "pyright==1.1.411",
     "pytest>=8.2",
     "pytest-cov>=5.0",
@@ -114,6 +114,9 @@ reportUnknownArgumentType = false
 testpaths = ["tests"]
 addopts = "--cov=plex_manager --cov-report=term-missing"
 asyncio_mode = "auto"
+markers = [
+    "docker: disposable tests that require a local Docker Engine and explicit opt-in",
+]
 
 [tool.coverage.run]
 source = ["plex_manager"]
