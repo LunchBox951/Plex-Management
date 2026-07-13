@@ -560,11 +560,19 @@ def _bounded_code(value: str | None, field: str) -> str | None:
     return value
 
 
+# A 255-char image reference plus the fixed 72-char ``@sha256:<64 hex>``
+# RepoDigest suffix is 327 chars; 400 leaves headroom without being unbounded.
+# Kept in lockstep with ``UpdateOutcomeRequest`` max_length and the
+# ``String(400)`` coordinator columns so a valid long private-registry digest
+# never fails closed between the API edge and durable storage.
+_BOUNDED_TEXT_MAX = 400
+
+
 def _bounded_text(value: str | None, field: str) -> str | None:
     if value is None:
         return None
     has_control = any(ord(character) < 32 or ord(character) == 127 for character in value)
-    if not value or len(value) > 255 or has_control:
+    if not value or len(value) > _BOUNDED_TEXT_MAX or has_control:
         raise ValueError(f"{field} must be non-empty, bounded text without control characters")
     return value
 

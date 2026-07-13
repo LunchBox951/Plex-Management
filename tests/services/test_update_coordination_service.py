@@ -183,6 +183,42 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
     assert await service.release(drain.lease.token) is False
 
 
+async def test_outcome_round_trips_long_private_registry_repo_digest(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A digest for a >183-char repo path exceeds 255 but must still round-trip.
+
+    Docker reports a pulled image as ``<repository>@sha256:<64 hex>``. The updater
+    accepts image references up to 255 chars, so a long private-registry repo
+    path yields a RepoDigest longer than the old 255-char digest bounds. It must
+    reach durable storage instead of failing closed (issue #298).
+    """
+    long_repo = "registry.internal.example.com/" + "team/" * 40 + "plex-manager"
+    assert len(long_repo) > 183
+    long_digest = f"{long_repo}@sha256:{'a' * 64}"
+    # The digest exceeds the historical 255-char bound but stays within the new one.
+    assert 255 < len(long_digest) <= 400
+
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    drain = await service.claim_drain(ttl=timedelta(minutes=1), action_generation=generation)
+    assert drain is not None
+
+    assert await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="build-old",
+        to_build="build-new",
+        current_build=long_digest,
+        current_digest=long_digest,
+    )
+    snapshot = await service.snapshot()
+    assert snapshot.current_build == long_digest
+    assert snapshot.current_digest == long_digest
+
+
 @pytest.mark.parametrize(
     "phase",
     [UpdatePhase.checking, UpdatePhase.draining, UpdatePhase.installing, UpdatePhase.rollback],
@@ -517,9 +553,30 @@ async def test_plaintext_lease_token_is_never_persisted(
 
 async def test_renewable_context_holds_no_work_transaction_and_releases(
     sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    # The clock is frozen (never advanced) so lease expiry -- which is decided
+    # by comparing the DB row's expires_at to this clock's "now" -- can never
+    # be reached, regardless of how long a stalled renew task takes to run
+    # under a loaded CI runner (see #311). This makes expiry impossible by
+    # construction rather than merely unlikely. Renewal actually firing is
+    # still proven independently via the spy below, not inferred from
+    # wall-clock survival.
+    clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
     await service.initialize()
+
+    original_renew = service.renew
+    renewals = 0
+
+    async def counting_renew(token: str, *, ttl: timedelta) -> bool:
+        nonlocal renewals
+        renewed = await original_renew(token, ttl=ttl)
+        if renewed:
+            renewals += 1
+        return renewed
+
+    monkeypatch.setattr(service, "renew", counting_renew)
 
     async with service.critical_operation(
         "import",
@@ -533,6 +590,7 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
         snapshot = await service.snapshot()
         assert snapshot.active_critical_operations == 1
 
+    assert renewals >= 1
     assert (await service.snapshot()).active_critical_operations == 0
 
 

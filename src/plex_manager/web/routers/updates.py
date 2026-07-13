@@ -493,6 +493,12 @@ def _service_result(outcome: str) -> UpdateResult:
 async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> UpdateStatusResponse:
     coordinator = await _coordinator(request)
     snapshot = await coordinator.snapshot()
+    if snapshot.phase not in _KNOWN_PHASES:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
+        )
     result = _service_result(body.outcome)
     if body.operation == "check":
         has_update = result is UpdateResult.update_available

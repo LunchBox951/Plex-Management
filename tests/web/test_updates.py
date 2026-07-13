@@ -626,6 +626,99 @@ async def test_unknown_coordinator_phase_fails_closed_without_rewrite(
     ).status_code == 409
     assert (await coordinator.snapshot()).action_generation == 7
 
+    before = await coordinator.snapshot()
+    check_outcome = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "action_generation": 7,
+        },
+    )
+    assert check_outcome.status_code == 409
+    assert check_outcome.json()["detail"] == "coordinator_state_unknown"
+    install_outcome = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "lease_token": "irrelevant-because-the-phase-guard-fires-first",
+            "operation": "install",
+            "outcome": "succeeded",
+            "action_generation": 7,
+        },
+    )
+    assert install_outcome.status_code == 409
+    assert install_outcome.json()["detail"] == "coordinator_state_unknown"
+    after = await coordinator.snapshot()
+    assert after.phase == before.phase == "future_installing"
+    assert after.action_generation == before.action_generation == 7
+    assert after.requested_action == before.requested_action == "install"
+    assert after.last_result == before.last_result
+    assert after.last_operation == before.last_operation
+
+
+async def test_unknown_coordinator_phase_blocks_outcome_even_with_matching_generation(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """The phase guard alone must block the rewrite, independent of any CAS.
+
+    Both `acknowledge_action` and `acknowledge_outcome` are generation/lease
+    CAS'd, so most unknown-phase deliveries already 409 on that mismatch
+    alone. This seeds a lease that *matches* the outcome request so the only
+    thing standing between the unknown-phase row and a rewrite is the phase
+    guard itself.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    assert await coordinator.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
+        current_digest="sha256:old",
+        available_digest="sha256:new",
+    )
+    await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+    claim = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"expected_generation": 1},
+    )
+    assert claim.status_code == 200
+    token = claim.json()["lease_token"]
+    generation = claim.json()["action_generation"]
+
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing")
+        )
+        await session.commit()
+
+    before = await coordinator.snapshot()
+    outcome = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "lease_token": token,
+            "operation": "install",
+            "outcome": "succeeded",
+            "action_generation": generation,
+        },
+    )
+    assert outcome.status_code == 409
+    assert outcome.json()["detail"] == "coordinator_state_unknown"
+    after = await coordinator.snapshot()
+    assert after.phase == before.phase == "future_installing"
+    assert after.requested_action == before.requested_action
+    assert after.last_result == before.last_result
+    assert after.drain_owner == before.drain_owner
+
 
 async def test_token_bound_progress_reports_install_and_rollback(
     app: FastAPI,

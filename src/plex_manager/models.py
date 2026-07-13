@@ -896,10 +896,13 @@ class UpdateCoordinatorState(Base):
     action_generation: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     acknowledged_generation: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     phase: Mapped[str] = mapped_column(String(32), default="idle", server_default=sa.text("'idle'"))
-    current_build: Mapped[str | None] = mapped_column(String(255))
-    current_digest: Mapped[str | None] = mapped_column(String(255))
-    available_build: Mapped[str | None] = mapped_column(String(255))
-    available_digest: Mapped[str | None] = mapped_column(String(255))
+    # Width covers the accepted image reference (repo:tag up to 255 chars) plus
+    # the fixed 72-char ``@sha256:<64 hex>`` RepoDigest suffix (255 + 72 = 327),
+    # rounded up to 400 so a long private-registry digest is never truncated.
+    current_build: Mapped[str | None] = mapped_column(String(400))
+    current_digest: Mapped[str | None] = mapped_column(String(400))
+    available_build: Mapped[str | None] = mapped_column(String(400))
+    available_digest: Mapped[str | None] = mapped_column(String(400))
     updater_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -908,8 +911,8 @@ class UpdateCoordinatorState(Base):
     last_operation: Mapped[str | None] = mapped_column(String(16))
     last_result: Mapped[str | None] = mapped_column(String(32))
     last_error_code: Mapped[str | None] = mapped_column(String(128))
-    last_from_build: Mapped[str | None] = mapped_column(String(255))
-    last_to_build: Mapped[str | None] = mapped_column(String(255))
+    last_from_build: Mapped[str | None] = mapped_column(String(400))
+    last_to_build: Mapped[str | None] = mapped_column(String(400))
     # Receipt for idempotently accepting a retried outcome after the original
     # response was lost. This is a one-way SHA-256 digest, never the lease token.
     last_outcome_token_hash: Mapped[str | None] = mapped_column(String(64))
