@@ -24,6 +24,7 @@ __all__ = [
     "DISK_PRESSURE_PERCENT_MIN",
     "EVICTION_GRACE_DAYS_MAX",
     "EVICTION_INTERVAL_MAX_MINUTES",
+    "LOG_MAX_ROWS_MAX",
     "LOG_RETENTION_DAYS_MAX",
 ]
 
@@ -48,3 +49,12 @@ EVICTION_INTERVAL_MAX_MINUTES: float = 10080.0  # 7 days -- a maintenance-sweep
 # Guarantees the loop wakes at least weekly no matter what is stored.
 EVICTION_GRACE_DAYS_MAX: int = 3650  # ~10 years; comfortably under timedelta's limit.
 LOG_RETENTION_DAYS_MAX: int = 3650  # ~10 years; same overflow-safety rationale.
+
+# ``log_max_rows`` (issue #152) feeds a row-count cap, not a ``timedelta`` cutoff,
+# so it carries no overflow risk of its own -- the ceiling here is purely an
+# operator-sanity bound (a fat-fingered huge value degrading to "no cap" is a
+# worse failure than a visible 422) and a guard against an unbounded ``OFFSET``
+# on every prune tick. 2,000,000 is ~20x the 100,000 default -- generously above
+# any install this beta targets, comfortably below anything that would make the
+# prune's ordered ``OFFSET`` scan noticeably expensive on SQLite.
+LOG_MAX_ROWS_MAX: int = 2_000_000

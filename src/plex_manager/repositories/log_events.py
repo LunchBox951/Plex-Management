@@ -204,3 +204,24 @@ class SqlLogEventRepository:
         result = cast(CursorResult[Any], await self._session.execute(stmt))
         await self._session.flush()
         return result.rowcount
+
+    async def prune_excess(self, max_rows: int) -> int:
+        # A negative cap degrades to "keep nothing" (0), never raises -- see
+        # the port's docstring for why that is the safe direction.
+        keep = max(max_rows, 0)
+        # One indexed-scan DELETE, not a row-by-row loop: the subquery walks
+        # ``created_at DESC, id DESC`` (the same ordering/tie-break
+        # ``list_events`` uses), skips the newest ``keep`` rows via OFFSET, and
+        # selects every row beyond that -- the "oldest, beyond the cap" set --
+        # by PK only, so the outer DELETE's ``id IN (...)`` never re-sorts or
+        # re-fetches whole rows. A no-op, zero-row DELETE when the table is
+        # already at or under the cap.
+        overflow_ids = (
+            select(LogEvent.id)
+            .order_by(LogEvent.created_at.desc(), LogEvent.id.desc())
+            .offset(keep)
+        )
+        stmt = delete(LogEvent).where(LogEvent.id.in_(overflow_ids))
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        await self._session.flush()
+        return result.rowcount

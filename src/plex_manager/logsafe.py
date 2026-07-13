@@ -124,3 +124,381 @@ def safe_guid(value: str) -> str:
     if not _SAFE_GUID_LABEL_RE.fullmatch(label):
         label = ""  # a label is emitted validated or not at all (see contract)
     return f"{label}#{digest}"
+
+
+# --------------------------------------------------------------------------- #
+# redact_secrets (issue #153): a defense-in-depth, post-hoc redaction pass over
+# a FULLY-RENDERED log line, applied at capture time (``log_capture_service.
+# _capture``) and again at the ``/ops/logs/export`` boundary. The helpers above
+# are call-site barriers -- they only protect a value a call site remembers to
+# route through them. ``redact_secrets`` is the backstop for the case that
+# discipline misses: a message string assembled elsewhere (a third-party
+# library's own log line, a forgotten call site, a future adapter) that
+# happens to carry one of THIS app's real secret shapes -- the credentials
+# ``config.py`` documents plus the ones the setup wizard stores encrypted (Plex
+# token, Prowlarr/TMDB api keys, qBittorrent password), and the Fernet
+# encryption key protecting them at rest.
+#
+# Deliberately regex-based and KEY-NAME-driven, never a denylist of specific
+# services: every adapter in this codebase sends its secret as one of a small
+# set of shapes --
+#   * a query-string parameter (TMDB's ``api_key``, an X-Plex-Token carried on
+#     a URL rather than a header),
+#   * an HTTP header value (Prowlarr's ``X-Api-Key``, Plex's ``X-Plex-Token``,
+#     a bearer/basic ``Authorization``),
+#   * HTTP basic-auth userinfo (``scheme://user:pass@host``),
+#   * a bare form/dict field (qBittorrent's login ``password``),
+#   * or -- for the Fernet key specifically -- a standalone base64 blob with no
+#     key name attached at all.
+# Matching by KEY NAME (whatever separates it from its value: ``:``/``=``,
+# optionally quoted) generalizes across all four services and any future one
+# without a per-adapter rule, and is CONSERVATIVE the way the task requires:
+# the key name always survives (debuggability), only the value is masked.
+#
+# Independent passes, applied in sequence. Most are a total no-op on text they
+# find nothing to redact in and match disjoint syntactic shapes, so their order
+# would not matter -- EXCEPT the two container passes, whose ``key<sep>[`` /
+# ``('key', [`` shapes overlap the authorization/kv/tuple passes (all would
+# mis-grab the lone opening bracket as a one-char value and leave the bracketed
+# secret behind). The container passes therefore run FIRST, consuming the whole
+# container before the scalar passes can see the bracket:
+#
+# 1. Basic-auth URL userinfo (``scheme://user:pass@host``): the PASSWORD half
+#    of ``user:pass@`` is masked; the username and the rest of the url survive
+#    (diagnosable: which url, which account -- never a byte of the password).
+# 1a. CONTAINER-WRAPPED values -- ``'X-Api-Key': ['SECRET']`` / ``('SECRET',)``
+#    (``key<sep>[...]`` or ``key<sep>(...)``) and ``('X-Api-Key', ['SECRET'])``
+#    (tuple pair with a container value) -- the shape a multi-valued header/
+#    form mapping produces. The whole bracketed container is masked
+#    (escape-aware quoted elements, so an embedded closer cannot end it early;
+#    possessive quantifiers, so no ReDoS; optional close bracket, so a
+#    truncated container is consumed to end -- fail closed; a nested group arm,
+#    so a list-of-lists is consumed at any depth). ``authorization`` is in the
+#    key set (a multi-valued Authorization dump). These run before the scalar
+#    passes (see the ordering note above).
+# 2. ``Authorization`` header values specifically: unlike every other secret
+#    key below, an Authorization value routinely carries internal SPACES and
+#    COMMAS (``Basic <base64>``, ``Bearer <token>``, parameterized ``Digest
+#    username="u", nonce="...", response="..."``) -- a bounded token capture
+#    leaks whatever sits past its bound (a two-token capture left Digest's
+#    later parameters exposed). NO scheme allowlist (RFC 7235 schemes are
+#    open-ended; an allowlist turns every unknown scheme into a leak) and NO
+#    token bound: a QUOTED value is consumed escape-aware through its matching
+#    close quote; an UNQUOTED value is consumed through to the LINE BOUNDARY --
+#    in a raw header line the value IS the rest of the line. Masking trailing
+#    prose (``authorization: abc then text``) is accepted over-redaction: for
+#    an Authorization value, masking too much is fine, leaking is not.
+# 3. Every other secret-key-shaped ``key<sep>value`` pair -- ``api_key``/
+#    ``apikey``, ``access_token``, ``auth_token``, a bare ``token`` (also
+#    matches ``X-Plex-Token``/``X-Api-Key``: the hyphen before the final word
+#    is a non-word boundary, so the alternation matches the LAST word of a
+#    hyphenated header name and the untouched ``X-Plex-``/``X-Api-`` prefix is
+#    simply copied through by ``re.sub`` unmodified), ``fernet_key``,
+#    ``passkey`` (the private-tracker-URL shape ``safe_guid`` already covers at
+#    the call site; this is the same shape's defense-in-depth backstop),
+#    ``password``/``passwd``/``pwd``, ``secret``. A bounded, lazy
+#    ``[\w-]{0,64}?`` prefix in front of the alternation lets the key word be
+#    the SUFFIX of a longer underscore/hyphen-joined identifier, so THIS app's
+#    real settings-field names -- ``tmdb_api_key``, ``prowlarr_api_key``,
+#    ``plex_token``, ``qbittorrent_password``, ``app_api_key``,
+#    ``PLEX_MANAGER_FERNET_KEY`` -- match even though ``_`` is a word char that
+#    would otherwise defeat a bare ``\b``; the whole field name (prefix
+#    included) survives in the output, only the value is masked. The value
+#    capture handles three shapes:
+#      * QUOTED (``key='...'`` / ``key="..."``, optionally bytes ``key=b'...'``):
+#        consumed through to the MATCHING closing quote by the ESCAPE-AWARE run
+#        -- a backslash-escaped quote (``password="abc\"SECRET"``) does not end
+#        it, nor does the opposite quote character -- so no suffix of a quoted
+#        credential is left behind ``<redacted>`` (see :data:`_QUOTED_VALUE`).
+#      * UNQUOTED TOKEN-family (api keys/tokens/passkeys -- machine-generated,
+#        urlsafe by construction, never containing whitespace/``&``/``,``):
+#        exactly one token, stopping at whitespace/``&``/``,``/``;``/quote/
+#        closing bracket -- fail-closed BECAUSE of the value's alphabet, and
+#        keeps a URL query diagnosable (``?api_key=<redacted>&language=en``).
+#      * UNQUOTED FREEFORM-family (passwords/secrets -- human-chosen, ANY
+#        alphabet): consumed through to the LINE BOUNDARY (``password=abc def``
+#        masks whole; a token bound would leak the suffix past the first
+#        space). Over-redacting the rest of the line is accepted; leaking a
+#        password suffix is not. See :data:`_FREEFORM_VALUE` for the
+#        ``<redacted>`` re-match guard.
+# 4. The same secret key names in TUPLE rendering -- ``('X-Api-Key', 'SECRET')``
+#    or the bytes form ``(b'X-Api-Key', b'SECRET')`` (``httpx.Headers.raw``) --
+#    the shape ``list(headers.items())``/raw header dumps produce -- which has
+#    no ``:``/``=`` separator for pass 3 to key on: a quoted key name ending in
+#    a secret key word (or ``authorization``), a comma, then the quoted value
+#    masked whole.
+# 5. COOKIE/session credentials -- ``Cookie: plexmgr.session=SECRET``,
+#    ``Set-Cookie: SID=SECRET``, qBittorrent 5.2's ``QBT_SID_<port>=SECRET`` --
+#    keyed on a cookie name containing ``session``/``sid`` at a word/separator
+#    boundary with an adjacent ``=`` (so the prose word "session" never
+#    false-matches); the value is masked up to the ``;`` attribute separator.
+#
+# A final, UNCONDITIONAL pass (no key name involved at all) catches a
+# Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
+# ``Fernet.generate_key()`` is always exactly 44 urlsafe-base64 characters
+# ending in one ``=`` pad -- distinctive enough to redact on shape alone, which
+# matters because the key is loaded from a file (``<data_dir>/secret.key``),
+# never assigned a "key name" of its own in a log line to key off of.
+# Regex alternations of secret-bearing KEY NAMES (not credentials themselves),
+# split by the ALPHABET of the value they name -- the split decides how far the
+# unquoted-value capture may safely stop (see pass 3 above).
+_TOKEN_KEY_PATTERN: Final = (
+    r"api[-_]?key|access[-_]?token|auth[-_]?token|token|passkey|fernet[-_]?key"  # noqa: S105
+)
+_FREEFORM_KEY_PATTERN: Final = r"password|passwd|pwd|secret"
+_SECRET_KEY_PATTERN: Final = _TOKEN_KEY_PATTERN + r"|" + _FREEFORM_KEY_PATTERN
+
+# The UNQUOTED TOKEN-family value: any run of characters that is not
+# whitespace, a literal delimiter (`&`, `,`, or `;` -- the cookie-attribute
+# separator in ``Set-Cookie: SID=value; Path=/``), a quote, or a closing
+# bracket -- i.e. exactly one token. Correct AND fail-closed for a
+# machine-generated urlsafe credential (see the key-family split above).
+_VALUE_CHARS: Final = r"[^\s&,;'\"}\)\]]+"
+# The UNQUOTED FREEFORM-family value: everything through to the line boundary
+# (a human-chosen password may contain spaces/commas/``&``/anything, so no
+# earlier stop is fail-closed). The ``(?!\s*<redacted>)`` guard keeps a LATER
+# pass from re-consuming a value an EARLIER pass (e.g. the container pass)
+# already masked and then swallowing the text after it; ``\s*`` inside the
+# lookahead so separator-whitespace backtracking cannot sidestep the guard.
+_FREEFORM_VALUE: Final = r"(?!\s*<redacted>)[^\r\n]*"
+# A bytes-repr prefix -- ``b'...'``/``b"..."``, the shape ``httpx.Headers.raw``
+# dumps produce -- consumed (and so preserved verbatim around the masked value)
+# only when a quote actually follows, so a bare unquoted value starting with a
+# literal ``b`` is never split as ``b<redacted>``.
+_BYTES_PREFIX: Final = r"(?:b(?=['\"]))?"
+
+# ``key<sep>value`` for every secret key name EXCEPT ``Authorization`` (below).
+# The separator stops BEFORE the value's opening quote so that quote can be
+# captured into ``q`` and a quoted value consumed through to its matching
+# close:
+#   * leading ``[\w-]{0,64}?`` -- a bounded, lazy prefix so a secret key word can
+#     be the tail of a longer ``_``/``-``-joined field name (``plex_token``,
+#     ``tmdb_api_key``); ``_`` is a word char, so a bare ``\b`` before ``token``
+#     would never fire on ``plex_token``. Bounded to keep the scan linear.
+#     The FREEFORM key alternatives are captured into ``fkey`` so the value
+#     conditional below can pick the line-boundary consumption for them.
+#   * ``(?P<q>['\"])?`` -- the value's optional opening quote (after an optional
+#     bytes ``b`` prefix, see :data:`_BYTES_PREFIX`).
+#   * ``(?P<value> ... )`` -- when ``q`` matched, the ESCAPE-AWARE run
+#     :data:`_QUOTED_VALUE` consumes everything up to (not past) the matching
+#     UNESCAPED closing quote. It models the actual quoting grammar rather than
+#     chasing it: a backslash escapes the next character, so an escaped matching
+#     quote (``password="abc\"SECRET"`` -- the shape a JSON/repr dump of a
+#     ``qbittorrent_password`` containing a quote produces) does NOT end the
+#     value and the ``SECRET`` suffix cannot leak (the P1 that a
+#     matching-quote-only run left open); the OPPOSITE quote character
+#     (``password="abc'def"``, which ``SettingsUpdate`` accepts) is likewise
+#     consumed, never a split point; and a raw newline or a truncated
+#     never-closed value is swallowed whole (fail closed). Otherwise (no ``q``)
+#     the unquoted branch by key family: freeform -> line boundary, token ->
+#     single token (see the key-family split above). The quoted run is linear
+#     and backtracking-free: its two branches are mutually exclusive (branch 1
+#     requires a backslash, branch 2 excludes it), so every position has
+#     exactly one path -- the redactor must never hand a ReDoS (this file's
+#     tests once drew a CodeQL finding). ``_mask_value`` drops from the value
+#     start on, so the closing quote -- deliberately left OUTSIDE the match
+#     (the run cannot cross it) -- survives around ``<redacted>``.
+_KV_SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*"
+# Escape-aware: ``\\[\s\S]`` consumes a backslash-escaped pair (the escaped
+# char, matching quote included, never terminates); ``(?!(?P=q))[^\\]`` consumes
+# any other non-closing, non-backslash char (newlines included -- fail closed on
+# a multi-line/truncated value). Mutually exclusive branches -> linear, no ReDoS.
+_QUOTED_VALUE: Final = r"(?:\\[\s\S]|(?!(?P=q))[^\\])*"
+_SECRET_KV_RE: Final = re.compile(
+    r"(?i)\b[\w-]{0,64}?"
+    + r"(?:(?P<fkey>"
+    + _FREEFORM_KEY_PATTERN
+    + r")|(?:"
+    + _TOKEN_KEY_PATTERN
+    + r"))\b"
+    + _KV_SEP_PATTERN
+    + _BYTES_PREFIX
+    + r"(?P<q>['\"])?(?P<value>(?(q)"
+    + _QUOTED_VALUE
+    + r"|(?(fkey)"
+    + _FREEFORM_VALUE
+    + r"|"
+    + _VALUE_CHARS
+    + r")))"
+)
+
+# ``Authorization`` gets its own pattern (see pass 2 above): the value
+# routinely carries internal SPACES and COMMAS (``<scheme> <credential>``,
+# parameterized ``Digest username="u", nonce="...", response="..."``) that any
+# bounded token capture would leak past (a two-token bound left Digest's later
+# parameters exposed). NO scheme allowlist, deliberately: RFC 7235 schemes are
+# open-ended (``Token``, ``ApiKey``, AWS SigV4, ...) and an allowlist turns
+# every unknown scheme into a leak. The value follows the same quoted/unquoted
+# discrimination as ``_SECRET_KV_RE``'s freeform branch: QUOTED (a dict-repr
+# ``'Authorization': 'Bearer X'``, bytes form included) -> escape-aware through
+# the matching close quote, leaving the pair's neighbors intact; UNQUOTED (a
+# raw header line) -> through to the line boundary, because a header's value
+# IS the rest of the line. Over-redacting trailing prose is accepted; leaking
+# any Authorization parameter is not.
+_AUTHORIZATION_RE: Final = re.compile(
+    r"(?i)\bauthorization\b['\"]?\s*[:=]\s*"
+    + _BYTES_PREFIX
+    + r"(?P<q>['\"])?(?P<value>(?(q)"
+    + _QUOTED_VALUE
+    + r"|"
+    + _FREEFORM_VALUE
+    + r"))"
+)
+
+# A TUPLE-rendered header/field pair -- ``('X-Api-Key', 'SECRET')``, or the
+# bytes form ``(b'X-Api-Key', b'SECRET')`` that ``httpx.Headers.raw`` dumps
+# produce (the leading ``b?`` on both the key and value quote) -- the shape
+# ``list(headers.items())`` or a raw header dump produces. There is no
+# ``:``/``=`` separator for ``_SECRET_KV_RE`` to key on, only a quoted key
+# name, a comma, and a quoted value, so it needs its own pass: a quoted key
+# ending in one of the secret key words (or ``authorization`` -- its
+# space-bearing value is safely consumed here because the quoted-value run
+# masks through to the matching close quote, spaces included), the ``,``
+# separator, then the quoted value masked whole via the same linear escape-
+# aware run as ``_SECRET_KV_RE`` (``kq``/``q`` may be DIFFERENT quote
+# characters -- each closes only its own). ``_mask_value`` keeps everything
+# through the value's opening quote; the closing quote sits outside the match
+# and survives: ``('X-Api-Key', '<redacted>')``.
+_SECRET_TUPLE_RE: Final = re.compile(
+    r"(?i)b?(?P<kq>['\"])[\w-]{0,64}?(?:"
+    + _SECRET_KEY_PATTERN
+    + r"|authorization)(?P=kq)\s*,\s*b?(?P<q>['\"])(?P<value>"
+    + _QUOTED_VALUE
+    + r")"
+)
+
+# A CONTAINER-WRAPPED value -- ``X-Api-Key': ['SECRET']`` / ``api_key=('a',)``
+# -- the shape a header/form mapping with multi-valued entries produces
+# (``dict(multidict)`` then repr; list OR tuple). The generic ``_SECRET_KV_RE``
+# unquoted-value token stops at the opening bracket and would leave the quoted
+# secret behind ``<redacted>['SECRET']``, so the bracketed container needs its
+# own pass that masks the WHOLE container (bracket included). The body is
+# built from :data:`_CONTAINER_ELEM` -- one escape-aware quoted string (single
+# or double, whose embedded closer therefore cannot prematurely end the
+# container) or one non-quote, non-bracket char -- and :data:`_CONTAINER_BODY`
+# is a run of those elements OR a nested ``[...]``/``(...)`` group. The
+# nested-group arm matters: a list of lists (``[['a'], ['SECRET']]``) would
+# otherwise stop at the FIRST inner closer and leave the rest -- secret
+# included -- behind ``<redacted>``. Because a quoted element is itself a
+# ``_CONTAINER_ELEM``, every credential-bearing string is consumed regardless
+# of nesting depth (only trailing bare closers are ever left behind, and those
+# carry no secret) -- fail closed. Every group is possessive (``*+``/``?+``)
+# with mutually exclusive branches (an element never starts with an opener),
+# so there is zero backtracking (no ReDoS); the closing quote/bracket of each
+# element is optional, so an unterminated/truncated container is consumed to
+# end (fail closed). ``authorization`` is in the key alternation (a
+# multi-valued Authorization dump); these passes run BEFORE
+# ``_AUTHORIZATION_RE``/``_SECRET_KV_RE``/``_SECRET_TUPLE_RE`` in
+# :func:`redact_secrets` so those never see the opening bracket to mis-grab
+# (the shapes are NOT disjoint -- both start ``key<sep>`` -- so, unlike the
+# other passes, order matters here).
+_CONTAINER_ELEM: Final = r"(?:\"(?:[^\"\\]|\\.)*+\"?+|'(?:[^'\\]|\\.)*+'?+|[^'\"\[\]\(\)])"
+_CONTAINER_BODY: Final = r"(?:" + _CONTAINER_ELEM + r"|[\[\(]" + _CONTAINER_ELEM + r"*+[\]\)]?+)*+"
+_SECRET_CONTAINER_RE: Final = re.compile(
+    r"(?i)\b[\w-]{0,64}?(?:"
+    + _SECRET_KEY_PATTERN
+    + r"|authorization)\b"
+    + _KV_SEP_PATTERN
+    + r"(?P<value>[\[\(]"
+    + _CONTAINER_BODY
+    + r"[\]\)]?)"
+)
+# The container-value shape with NO ``:``/``=`` separator -- a tuple-rendered
+# pair whose value is a list/tuple, ``('X-Api-Key', ['SECRET'])`` /
+# ``('X-Api-Key', ('SECRET',))`` -- mirroring :data:`_SECRET_TUPLE_RE` but
+# with a bracketed value (and the same optional bytes ``b`` key prefix).
+_SECRET_CONTAINER_TUPLE_RE: Final = re.compile(
+    r"(?i)b?(?P<kq>['\"])[\w-]{0,64}?(?:"
+    + _SECRET_KEY_PATTERN
+    + r"|authorization)(?P=kq)\s*,\s*(?P<value>[\[\(]"
+    + _CONTAINER_BODY
+    + r"[\]\)]?)"
+)
+
+# Cookie/session credentials (issue #153 follow-up): a Cookie/Set-Cookie header
+# dump can persist a live session token -- this app's ``plexmgr.session`` browser
+# auth cookie and qBittorrent's upstream ``SID`` session cookie (named
+# ``QBT_SID_<port>`` on qBittorrent 5.2, the shape the adapter's
+# ``_session_cookie_header`` emits) -- that the api-key/token/password key names
+# above do not cover. A cookie is ALWAYS ``name=value``, so the pass keys on a
+# cookie NAME containing ``session``/``sid`` followed either directly by ``=``
+# or by a ``.``/``_``/``-``-separated suffix (``QBT_SID_8080=``) and masks its
+# value (stopping at the cookie ``;`` attribute separator, so ``Path``/
+# ``HttpOnly`` stay diagnosable; NOT at ``&`` -- RFC 6265 permits ``&`` in a
+# cookie value, and leaking a suffix past it would be an open door). The ``=``
+# is REQUIRED (no ``[:=]`` alternation, no surrounding space) and any extra
+# name characters after ``session``/``sid`` must follow a separator, precisely
+# so common English prose -- "refreshing session: ...", "session established",
+# "consider", "processing" -- never false-matches; only a literal cookie-name
+# assignment does.
+_COOKIE_RE: Final = re.compile(
+    r"(?i)\b[\w.]*(?:session|sid)(?:[._-][\w.-]*)?=(?P<value>[^\s;,'\"}\)\]]+)"
+)
+
+# ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
+# Group 1 captures ``scheme://user`` (stopping the username at the first
+# ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
+# into the output, only its span is consumed so it can be dropped. The username
+# run is ``*`` (not ``+``) so a valid empty-username basic-auth URL
+# (``https://:token@host``) still masks its token instead of leaking it.
+_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s@'\"]+@")
+
+# A standalone Fernet-key-shaped blob: 43 urlsafe-base64 characters plus the
+# one trailing ``=`` pad ``Fernet.generate_key()`` always produces (32 raw
+# bytes base64-encoded), bounded on both sides so it cannot match as a
+# substring of a longer base64/id-shaped run. A preceding ``=`` is deliberately
+# ALLOWED (it is absent from the lookbehind class): base64 padding only ever
+# terminates a run, so a ``=`` before a 44-char blob means a NEW token -- and
+# rejecting it left the master key unredacted in exactly the env/config-dump
+# rendering (``PLEX_MANAGER_FERNET_KEY=<key>``, ``some_var=<key>``) an operator
+# is most likely to paste into a log.
+_FERNET_KEY_RE: Final = re.compile(r"(?<![A-Za-z0-9_+/-])[A-Za-z0-9_-]{43}=(?![A-Za-z0-9_=+/-])")
+
+_REDACTED: Final = "<redacted>"
+
+
+def _mask_value(match: re.Match[str]) -> str:
+    """Replace a ``_SECRET_KV_RE``/``_AUTHORIZATION_RE``/``_SECRET_TUPLE_RE``
+    match's ``value`` group with :data:`_REDACTED`, keeping everything else the
+    match consumed (the key name, separator, and any quote) verbatim -- "mask
+    the value, keep the key name for debuggability"."""
+    whole = match.group(0)
+    value_offset = match.start("value") - match.start(0)
+    return whole[:value_offset] + _REDACTED
+
+
+def _mask_basic_auth(match: re.Match[str]) -> str:
+    """Replace a ``_BASIC_AUTH_URL_RE`` match's password with :data:`_REDACTED`,
+    keeping ``scheme://user:`` and the trailing ``@`` -- the account is
+    diagnosable, the credential never is."""
+    return f"{match.group(1)}:{_REDACTED}@"
+
+
+def redact_secrets(text: str) -> str:
+    """Defense-in-depth: mask this app's known secret shapes in *text* before it
+    is ever persisted or exported (issue #153).
+
+    A conservative, total (never raises) regex pass -- see the module-level
+    comment above for the exact shapes covered and why key-name matching
+    generalizes across every adapter (Plex/Prowlarr/TMDB/qBittorrent) without a
+    per-service rule. A line carrying none of these shapes is returned
+    byte-identical; this is a SECOND line of defense behind the call-site
+    barriers above (:func:`safe_guid` etc.), not a replacement for them --
+    call-site discipline still applies, this only catches what discipline
+    misses.
+    """
+    if not text:
+        return text
+    redacted = _BASIC_AUTH_URL_RE.sub(_mask_basic_auth, text)
+    # Container-wrapped values FIRST: their ``key<sep>[``/``key<sep>(`` shapes
+    # overlap the authorization/kv/tuple passes below (all would mis-grab the
+    # lone opening bracket), so the container must be consumed before them
+    # (see _SECRET_CONTAINER_RE).
+    redacted = _SECRET_CONTAINER_RE.sub(_mask_value, redacted)
+    redacted = _SECRET_CONTAINER_TUPLE_RE.sub(_mask_value, redacted)
+    redacted = _AUTHORIZATION_RE.sub(_mask_value, redacted)
+    redacted = _SECRET_KV_RE.sub(_mask_value, redacted)
+    redacted = _SECRET_TUPLE_RE.sub(_mask_value, redacted)
+    redacted = _COOKIE_RE.sub(_mask_value, redacted)
+    redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
+    return redacted

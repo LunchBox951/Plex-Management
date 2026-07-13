@@ -234,6 +234,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.events import DownloadFailed
+from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
 from plex_manager.domain.reconciler import (
     StallDetection,
     StateTransition,
@@ -257,6 +258,7 @@ from plex_manager.models import (
     DownloadScope,
     RequestStatus,
 )
+from plex_manager.ports.download_client import FailureDetailSource
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -604,7 +606,7 @@ def _operator_fail_marker_removal_done(blocklist: bool, nonce: int) -> str:
     )
 
 
-def _reconcile_removal_done_marker() -> str:
+def _reconcile_removal_done_marker(blocklist: bool) -> str:
     """Render the RECONCILE actor's durable removal-outcome record.
 
     Stamped (CAS'd on the observed plain/NULL reason, committed at once) after a
@@ -612,11 +614,21 @@ def _reconcile_removal_done_marker() -> str:
     leaves a residual every healer can complete WITHOUT a client -- the same
     durability :func:`_operator_fail_marker_removal_done` gives operator rows.
     Same grammar, honest actor prefix ("reconcile failure", not "operator
-    mark-failed"), reconcile-default flags (``blocklist=yes``), and the fixed
-    ``nonce=0`` reconcile tag (operator tokens start at 1).
+    mark-failed"), and the fixed ``nonce=0`` reconcile tag (operator tokens
+    start at 1).
+
+    ``blocklist`` CARRIES THE FAILURE'S CLASSIFICATION (issue #181): an
+    environmental failure (permission denied, disk full) was exonerated of the
+    blocklist in this cycle's completion, and this marker is the only place that
+    verdict survives a Phase-C exhaustion. Hardcoding ``blocklist=yes`` here
+    would re-poison the very release the classification spared when the residual
+    is re-derived next cycle -- so the caller passes the completion's own
+    ``blocklist`` flag.
     """
+    flag = "yes" if blocklist else "no"
     return (
-        f"reconcile failure in progress (blocklist=yes, remove=done, nonce={_RECONCILE_DONE_NONCE})"
+        f"reconcile failure in progress "
+        f"(blocklist={flag}, remove=done, nonce={_RECONCILE_DONE_NONCE})"
     )
 
 
@@ -1091,6 +1103,65 @@ async def _handle_failed(
     return None
 
 
+async def _persist_environmental_reason(
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    completion: _FailureCompletion,
+) -> _FailureCompletion:
+    """Durably stamp an environmental reconcile failure's enriched reason BEFORE
+    Phase B (issue #181); return the completion with ``observed_failed_reason``
+    advanced to the stamped value.
+
+    The in-memory ``blocklist=False`` verdict alone is lost if this cycle's Phase
+    C never commits -- a crash, a removal FAILURE, or Phase-C exhaustion before
+    the removal-done marker is stamped. The row is then re-derived NEXT cycle as
+    an UNMARKED ``failed_pending`` residual that defaults to ``blocklist=True``,
+    re-poisoning exactly the release this exemption spared. Persisting the
+    enriched reason now (CAS on the observed reason, its own commit -- mirroring
+    the Phase-B removal-outcome stamp) lets the residual path RE-CLASSIFY it back
+    to environmental. The reason is a plain string, never a marker, so an
+    operator command landing later still sees an adoptable reconcile residual,
+    and the honest host-side cause is visible in the queue UI during the
+    ``failed_pending`` window (north star #3).
+
+    Best-effort and non-fatal: a lost CAS (an operator marker or a terminal
+    completion already governs the row) or a transient commit failure leaves the
+    completion untouched -- no worse than before this stamp, and this cycle's
+    Phase C still carries the ``blocklist=False`` verdict in memory.
+    """
+    if completion.observed_failed_reason == completion.event.reason:
+        return completion
+    # The CAS UPDATE itself -- not only the commit -- must stay non-fatal: this
+    # stamp runs after Phase A and before Phase B, so a transient SQLAlchemyError
+    # raised during ``execute`` (e.g. SQLite ``database is locked``) would
+    # otherwise abort the WHOLE reconcile/import/availability cycle instead of
+    # leaving this one optional durability stamp best-effort. Catch it exactly
+    # like the commit below, rollback, log (never swallow -- north star #3), and
+    # return the untouched completion; this cycle's Phase C still carries the
+    # ``blocklist=False`` verdict in memory.
+    try:
+        stamped = await download_repo.update_status_if_in(
+            completion.download_id,
+            DownloadState.FailedPending.value,
+            frozenset({DownloadState.FailedPending.value}),
+            failed_reason=completion.event.reason,
+            require_failed_reason=completion.observed_failed_reason,
+        )
+        if not stamped:
+            await session.rollback()
+            return completion
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        _logger.warning(
+            "could not persist the environmental failure reason for download %s; "
+            "its no-blocklist verdict is durable only once Phase C commits",
+            safe_int(completion.download_id),
+        )
+        return completion
+    return replace(completion, observed_failed_reason=completion.event.reason)
+
+
 async def _self_heal_stalled_download(
     session: AsyncSession,
     qbt: DownloadClientPort,
@@ -1403,15 +1474,47 @@ async def reconcile_and_list(
     #      anything else heals with reconcile defaults.
     rows_by_hash = {r.torrent_hash.lower(): r for r in rows}
     completions: list[_FailureCompletion] = []
+    reconcile_completions: list[_FailureCompletion] = []
     for event in failed_download_events(applied_transitions, rows, occurred_at=now):
         event_row = rows_by_hash.get(event.torrent_hash.lower())
         if event_row is None:  # pragma: no cover - events derive from ``rows``
             continue
-        completions.append(
+        # Issue #181: enrich this genuinely-reconcile-detected failure with
+        # qBittorrent-side detail (client I/O, safe to run here -- OUTSIDE any
+        # open write transaction, same as Phase B's removal below) and
+        # classify it environmental-vs-release-fault BEFORE deciding whether
+        # to blocklist. An environmental failure (disk full, permission
+        # denied, I/O error, missing staging files -- the host's fault) must
+        # NOT blocklist the release: blocklisting it would block a perfectly
+        # good release out of every future search for as long as the
+        # blocklist entry lives, long after the host problem is fixed. Only a
+        # release-caused failure (dead torrent, no metadata, tracker
+        # rejection) still blocklists -- the pre-existing, safe default this
+        # classification falls back to when no detail could be fetched.
+        detail = await qbt.get_failure_detail(event.torrent_hash)
+        reason = f"{event.reason}: {detail.text}" if detail else event.reason
+        # Classify the base raw-state text PLUS any LOG-sourced enrichment, but
+        # NEVER a tracker message. A host-side/environmental cause (permission
+        # denied, disk full, I/O error) shows up only in the client's app log;
+        # a tracker status message is a release/network condition even when its
+        # wording coincidentally contains an errno phrase -- so a private-tracker
+        # "Permission denied" rejection must NOT skip the blocklist, and a
+        # transient tracker outage's wording must NOT be what decides it. The
+        # base reason still carries its own environmental signal independent of
+        # any detail (e.g. qBittorrent's own ``missingFiles`` raw state -- data
+        # vanished from disk out from under the torrent, almost always a
+        # host/mount problem), so it is always classified.
+        classify_text = (
+            f"{event.reason}: {detail.text}"
+            if detail is not None and detail.source is FailureDetailSource.log
+            else event.reason
+        )
+        blocklist = classify_failure_detail(classify_text) is not FailureClass.environmental
+        reconcile_completions.append(
             _FailureCompletion(
                 download_id=event_row.id,
-                event=event,
-                blocklist=True,
+                event=replace(event, reason=reason),
+                blocklist=blocklist,
                 remove_torrent=True,
                 blocklist_reason=BlocklistReason.failed.value,
                 # The Phase-A transition CAS never writes ``failed_reason``, so the
@@ -1421,6 +1524,21 @@ async def reconcile_and_list(
                 observed_failed_reason=event_row.failed_reason,
             )
         )
+    # Issue #181: make the environmental (no-blocklist) verdict DURABLE before
+    # Phase B so a crash / removal failure / Phase-C exhaustion cannot let the
+    # row be re-derived next cycle as an unmarked residual and re-blocklisted.
+    # Release-fault completions keep today's no-stamp behavior (their residual
+    # correctly defaults to blocklist). A row an operator mark_failed currently
+    # claims is skipped (the pre-stamp invisibility fast-path): that call owns
+    # the row's ``failed_reason`` and will be deferred just below, so stamping it
+    # here would only risk defeating the operator's own Phase-A CAS.
+    for completion in reconcile_completions:
+        if completion.blocklist or _is_operator_claimed(completion.download_id):
+            completions.append(completion)
+        else:
+            completions.append(
+                await _persist_environmental_reason(session, download_repo, completion)
+            )
     for row in rows:
         if row.status != DownloadState.FailedPending.value:
             continue
@@ -1433,12 +1551,22 @@ async def reconcile_and_list(
         if marker is not None and marker.operator:
             final_reason = _OPERATOR_FAIL_FINAL_REASON
             blocklist_reason = BlocklistReason.user_reported.value
+            blocklist = marker.flags.blocklist
         elif marker is not None:
             final_reason = _RECONCILE_FAIL_FINAL_REASON
             blocklist_reason = BlocklistReason.failed.value
+            blocklist = marker.flags.blocklist
         else:
             final_reason = row.failed_reason or "recovered stranded failed_pending row"
             blocklist_reason = BlocklistReason.failed.value
+            # Re-derive the environmental verdict from the durably-stamped reason
+            # (issue #181): a reconcile failure whose enriched environmental reason
+            # was persisted before Phase B but whose Phase C never committed is an
+            # UNMARKED residual here -- re-classify it so the host-side failure
+            # still skips the blocklist instead of falling back to the poison
+            # default. A plain/None reason classifies as release-fault (today's
+            # default), so genuinely reconcile-derived strands are unchanged.
+            blocklist = classify_failure_detail(row.failed_reason) is not FailureClass.environmental
         completions.append(
             _FailureCompletion(
                 download_id=row.id,
@@ -1449,7 +1577,7 @@ async def reconcile_and_list(
                     tmdb_id=row.tmdb_id,
                     occurred_at=now,
                 ),
-                blocklist=marker.flags.blocklist if marker is not None else True,
+                blocklist=blocklist,
                 remove_torrent=(marker.flags.remove_torrent if marker is not None else True),
                 blocklist_reason=blocklist_reason,
                 # The exact marker (or free text / None) this provenance came from:
@@ -1602,7 +1730,11 @@ async def reconcile_and_list(
                     provenance.flags.blocklist, provenance.nonce
                 )
             elif removed_ok and provenance is None:
-                done_marker = _reconcile_removal_done_marker()
+                # Carry THIS failure's classification into the durable record
+                # (issue #181): an environmental completion (blocklist=False)
+                # must stay un-blocklisted when a Phase-C exhaustion re-derives
+                # this residual next cycle, not fall back to the poison default.
+                done_marker = _reconcile_removal_done_marker(completion.blocklist)
             if done_marker is not None:
                 restamped = await download_repo.update_status_if_in(
                     completion.download_id,
