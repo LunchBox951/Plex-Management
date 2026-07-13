@@ -1016,17 +1016,21 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
     }
   }
 
+  // `vi.mocked(...)` (the Layout.test.tsx idiom) rather than this file's older
+  // `;(hook as unknown as Mock)` leading-semicolon pattern: CodeQL's
+  // js/automatic-semicolon-insertion rule flags the ASI-terminated statement
+  // that pattern leaves at the end of each block (code-scanning alert #323).
   beforeEach(() => {
     vi.clearAllMocks()
-    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
-    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
-    ;(useGrab as unknown as Mock).mockReturnValue(idle())
-    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
-    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
-    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
-    ;(useCancelRequest as unknown as Mock).mockReturnValue(idle())
-    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+    vi.mocked(useCreateRequest).mockReturnValue(idle() as never)
+    vi.mocked(useSearchPreview).mockReturnValue(idle() as never)
+    vi.mocked(useGrab).mockReturnValue(idle() as never)
+    vi.mocked(useMarkFailed).mockReturnValue(idle() as never)
+    vi.mocked(useImportDownload).mockReturnValue(idle() as never)
+    vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
+    vi.mocked(useReportIssue).mockReturnValue(idle() as never)
+    vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
+    vi.mocked(useQueue).mockReturnValue({ data: { queue: [] } } as never)
   })
 
   // A status this bundle's `RequestStatusValue` union doesn't recognize can only
@@ -1036,9 +1040,9 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   const UNKNOWN_STATUS = 'a_future_backend_status' as RequestStatusValue
 
   it('renders a neutral badge for an unrecognized request status, never throwing', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    vi.mocked(useRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
-    })
+    } as never)
     expect(() =>
       render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />),
     ).not.toThrow()
@@ -1046,9 +1050,9 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   })
 
   it('offers no Grab and no Re-search for an unrecognized status (so the release browser, only reachable via Re-search/Preview, can never be opened)', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    vi.mocked(useRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
-    })
+    } as never)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /^grab$/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
@@ -1056,9 +1060,9 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   })
 
   it('still offers Re-search for a KNOWN non-terminal status (no_acceptable_release)', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    vi.mocked(useRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
-    })
+    } as never)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /re-search/i })).toBeInTheDocument()
   })

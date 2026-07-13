@@ -170,6 +170,8 @@ describe('Queue — truthful transfer progress', () => {
     expect(screen.getByText(`${expected}%`)).toBeInTheDocument()
   })
 
+  // `as const` keeps each `status` a literal of the typed `DownloadStateValue`
+  // union (issue #205) instead of widening to `string`.
   it.each([
     { status: 'metadata_fetching', label: 'Fetching metadata', activeCount: 1 },
     { status: 'import_pending', label: 'Import pending' },
@@ -177,7 +179,7 @@ describe('Queue — truthful transfer progress', () => {
     { status: 'import_blocked', label: 'Import blocked', activeCount: 0 },
     { status: 'client_missing', label: 'Client missing', activeCount: 0 },
     { status: 'failed', label: 'Failed', activeCount: 0 },
-  ])(
+  ] as const)(
     'shows the $label badge without claiming transfer progress',
     ({ status, label, activeCount = 1 }) => {
       h.queue = [queueItem({ title: 'Import phase', status, progress: 1 })]
