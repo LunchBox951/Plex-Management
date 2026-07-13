@@ -212,6 +212,66 @@ describe('Status', () => {
     expect(screen.getByText(/Old Watched Movie/)).toBeInTheDocument()
   })
 
+  it('colors the disk gauge by the same pressure tiers the sweep uses (truthful, not decorative)', () => {
+    // The bar color must key off the SAME two settings the eviction sweep reads
+    // (threshold/target), so a red bar always means "a sweep would evict here".
+    // Defaults (settings unloaded): threshold 90%, target 80%.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk({
+        roots: [
+          diskRoot({ root: 'over_threshold', used_percent: 95, candidates: [] }),
+          diskRoot({ root: 'between_target_threshold', used_percent: 85, candidates: [] }),
+          diskRoot({ root: 'below_target', used_percent: 50, candidates: [] }),
+        ],
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // At/over the pressure threshold -> the "a sweep would evict" red.
+    expect(
+      screen.getByRole('progressbar', { name: 'over_threshold disk usage' }).firstElementChild,
+    ).toHaveClass('bg-error')
+    // Above target but below threshold -> the cautionary tone, not red.
+    const caution = screen.getByRole('progressbar', { name: 'between_target_threshold disk usage' })
+      .firstElementChild
+    expect(caution).toHaveClass('bg-searching')
+    expect(caution).not.toHaveClass('bg-error')
+    // Comfortably below target -> the healthy tone.
+    expect(
+      screen.getByRole('progressbar', { name: 'below_target disk usage' }).firstElementChild,
+    ).toHaveClass('bg-available')
+  })
+
+  it('re-tiers the disk gauge color against a settings-supplied threshold, not a hardcoded one', () => {
+    // A root at 85% is healthy (green) under a 95%/90% policy, but the same
+    // percentage is cautionary under the default 90%/80% — the color must track
+    // the operator's actual settings, never a baked-in cutoff.
+    ;(useSettings as unknown as Mock).mockReturnValue({
+      data: { disk_pressure_threshold_percent: 95, disk_pressure_target_percent: 90 } as SettingsResponse,
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk({ roots: [diskRoot({ root: 'movies_root', used_percent: 85, candidates: [] })] }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const fill = screen.getByRole('progressbar', { name: 'movies_root disk usage' }).firstElementChild
+    expect(fill).toHaveClass('bg-available')
+    expect(fill).not.toHaveClass('bg-searching')
+    expect(fill).not.toHaveClass('bg-error')
+  })
+
   it('surfaces an unreadable root\'s error instead of a fabricated gauge, with a Fix-in-Settings link', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({
