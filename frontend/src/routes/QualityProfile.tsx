@@ -8,28 +8,34 @@ export function QualityProfile() {
   const query = useQualityProfile()
 
   if (query.isPending) {
-    return <CenteredSpinner label="Loading quality profile…" />
+    return (
+      <div className="mx-auto w-full max-w-[900px] px-5 py-8 sm:px-8">
+        <CenteredSpinner label="Loading quality profile…" />
+      </div>
+    )
   }
 
   if (query.isError) {
     return (
-      <StateMessage
-        tone="error"
-        title="Couldn't load the quality profile"
-        message={query.error.message}
-        action={
-          <Button variant="secondary" onClick={() => void query.refetch()}>
-            Retry
-          </Button>
-        }
-      />
+      <div className="mx-auto w-full max-w-[900px] px-5 py-8 sm:px-8">
+        <StateMessage
+          tone="error"
+          title="Couldn't load the quality profile"
+          message={query.error.message}
+          action={
+            <Button variant="secondary" onClick={() => void query.refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      </div>
     )
   }
 
   const profile = query.data
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto w-full max-w-[900px] space-y-6 px-5 py-8 sm:px-8">
       <header className="space-y-2">
         <h1 className="font-display text-2xl font-extrabold">{profile.name}</h1>
         <p className="font-mono text-xs text-faint">

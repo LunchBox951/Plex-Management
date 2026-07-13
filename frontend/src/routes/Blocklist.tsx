@@ -29,20 +29,28 @@ export function Blocklist() {
   const { toast } = useToast()
   const [pendingRemoval, setPendingRemoval] = useState<BlocklistEntry | null>(null)
 
-  if (isLoading) return <CenteredSpinner />
+  if (isLoading) {
+    return (
+      <div className="mx-auto w-full max-w-[1060px] px-5 py-8 sm:px-8">
+        <CenteredSpinner />
+      </div>
+    )
+  }
 
   if (error) {
     return (
-      <StateMessage
-        tone="error"
-        title="Couldn't load the blocklist"
-        message={error.message}
-        action={
-          <Button variant="secondary" onClick={() => void refetch()}>
-            Retry
-          </Button>
-        }
-      />
+      <div className="mx-auto w-full max-w-[1060px] px-5 py-8 sm:px-8">
+        <StateMessage
+          tone="error"
+          title="Couldn't load the blocklist"
+          message={error.message}
+          action={
+            <Button variant="secondary" onClick={() => void refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      </div>
     )
   }
 
@@ -60,7 +68,7 @@ export function Blocklist() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto w-full max-w-[1060px] space-y-6 px-5 py-8 sm:px-8">
       <div className="flex items-baseline gap-3">
         <h1 className="font-display text-2xl font-extrabold">Blocklist</h1>
         <span className="font-mono text-sm text-faint">{entries.length}</span>

@@ -386,7 +386,7 @@ export function Settings() {
 
   if (isLoading || (data && form === null)) {
     return (
-      <div className="flex flex-col gap-6">
+      <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
         <Heading />
         <CenteredSpinner label="Loading settings…" />
       </div>
@@ -395,7 +395,7 @@ export function Settings() {
 
   if (isError || !data || !form) {
     return (
-      <div className="flex flex-col gap-6">
+      <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
         <Heading />
         <StateMessage
           tone="error"
@@ -628,7 +628,7 @@ export function Settings() {
   const tvLibraries = libraries.data?.filter((lib) => lib.section_type === 'tv') ?? []
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
       <Heading />
 
       <div className="flex flex-col gap-5">
