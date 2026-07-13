@@ -38,6 +38,7 @@ __all__ = [
     "MaintenanceLeaseLostError",
     "UpdateAction",
     "UpdateCoordinationService",
+    "UpdateOperationInProgressError",
     "UpdatePhase",
     "UpdateResult",
 ]
@@ -92,6 +93,10 @@ class MaintenanceDrainingError(RuntimeError):
 
 class MaintenanceLeaseLostError(RuntimeError):
     """Raised when work is cancelled because its renewable lease was lost."""
+
+
+class UpdateOperationInProgressError(RuntimeError):
+    """Raised when new operator intent would invalidate an active update."""
 
 
 @dataclass(frozen=True)
@@ -167,11 +172,13 @@ class UpdateCoordinationService:
         return await self.snapshot() if touched else None
 
     async def request_action(self, action: UpdateAction) -> int:
-        """Persist a new operator intent and return its monotonic generation."""
+        """Persist operator intent, or refuse while an update operation is active."""
         async with self._sessionmaker() as session:
             generation = await SqlUpdateCoordinationRepository(session).request_action(
                 action.value, self._now()
             )
+            if generation is None:
+                raise UpdateOperationInProgressError("an update operation is already active")
             await session.commit()
             return generation
 

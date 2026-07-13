@@ -23,6 +23,7 @@ from plex_manager.services.update_coordination_service import (
     MaintenanceLeaseLostError,
     UpdateAction,
     UpdateCoordinationService,
+    UpdateOperationInProgressError,
     UpdatePhase,
     UpdateResult,
 )
@@ -180,6 +181,70 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
         current_digest="sha256:new",
     )
     assert await service.release(drain.lease.token) is False
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [UpdatePhase.checking, UpdatePhase.draining, UpdatePhase.installing, UpdatePhase.rollback],
+)
+async def test_active_update_rejects_new_actions_without_invalidating_outcome(
+    sessionmaker_: SessionMaker,
+    phase: UpdatePhase,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    first_action = UpdateAction.check if phase is UpdatePhase.checking else UpdateAction.install
+    generation = await service.request_action(first_action)
+    assert generation is not None
+
+    drain_token: str | None = None
+    if phase is UpdatePhase.checking:
+        assert (
+            await service.touch_updater(
+                phase=UpdatePhase.checking,
+                expected_generation=generation,
+            )
+            is not None
+        )
+    else:
+        drain = await service.claim_drain(
+            ttl=timedelta(minutes=1),
+            action_generation=generation,
+        )
+        assert drain is not None
+        drain_token = drain.lease.token
+        if phase is not UpdatePhase.draining:
+            assert (
+                await service.renew_drain_progress(
+                    drain_token,
+                    ttl=timedelta(minutes=1),
+                    phase=phase,
+                )
+                is True
+            )
+
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.check)
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.install)
+    snapshot = await service.snapshot()
+    assert snapshot.action_generation == generation
+    assert snapshot.requested_action == first_action.value
+
+    if phase is UpdatePhase.checking:
+        assert await service.acknowledge_action(
+            expected_generation=generation,
+            result=UpdateResult.no_update,
+        )
+    else:
+        assert drain_token is not None
+        result = UpdateResult.rolled_back if phase is UpdatePhase.rollback else UpdateResult.success
+        assert await service.acknowledge_outcome(
+            drain_token,
+            expected_generation=generation,
+            result=result,
+        )
+        assert (await service.snapshot()).drain_owner is None
 
 
 async def test_drain_claim_rejects_a_stale_action_generation(

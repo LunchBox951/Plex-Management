@@ -602,6 +602,11 @@ async def test_token_bound_progress_reports_install_and_rollback(
     status = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert status.json()["state"] == "installing"
     assert status.json()["updater_available"] is True
+    for endpoint in ("check-now", "update-when-ready"):
+        blocked = await client.post(f"/api/v1/updates/{endpoint}", headers=_ADMIN)
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"] == "update_operation_in_progress"
+    assert (await coordinator.snapshot()).action_generation == claim.json()["action_generation"]
 
     rollback = await client.post(
         "/api/v1/internal/updates/renew",
@@ -612,6 +617,18 @@ async def test_token_bound_progress_reports_install_and_rollback(
     assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()[
         "state"
     ] == "rollback"
+    outcome = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "lease_token": token,
+            "operation": "install",
+            "outcome": "rolled_back",
+            "action_generation": claim.json()["action_generation"],
+        },
+    )
+    assert outcome.status_code == 200
+    assert (await coordinator.snapshot()).drain_owner is None
 
 
 async def test_automatic_idle_only_status_matches_claim_blocker(

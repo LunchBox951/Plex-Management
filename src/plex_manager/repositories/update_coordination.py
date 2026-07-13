@@ -217,8 +217,10 @@ class SqlUpdateCoordinationRepository:
         )
         return result.rowcount == 1
 
-    async def request_action(self, action: str, now: datetime) -> int:
+    async def request_action(self, action: str, now: datetime) -> int | None:
         state = await self._lock()
+        if state.phase in {"checking", "draining", "installing", "rollback"}:
+            return None
         generation = state.action_generation + 1
         await self._session.execute(
             update(UpdateCoordinatorState)

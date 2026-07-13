@@ -14,6 +14,7 @@ from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
     UpdateAction,
     UpdateCoordinationService,
+    UpdateOperationInProgressError,
     UpdatePhase,
     UpdateResult,
 )
@@ -204,7 +205,14 @@ async def _request_action(
             message="The updater sidecar is not connected.",
             hint="Enable the automatic-update Compose profile, then try again.",
         )
-    await coordinator.request_action(action)
+    try:
+        await coordinator.request_action(action)
+    except UpdateOperationInProgressError as exc:
+        raise AppError(
+            status_code=409,
+            code="update_operation_in_progress",
+            message="An update operation is already in progress.",
+        ) from exc
     publish_realtime(request.app, ("updates",), reason=f"update_{action.value}_requested")
     return await _status(request, session, settings)
 
