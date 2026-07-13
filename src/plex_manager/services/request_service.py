@@ -39,7 +39,9 @@ __all__ = [
     "create_request_result",
     "fold_requests_for_display",
     "get_request",
+    "is_request_visible_to_user",
     "list_requests",
+    "list_requests_for_user",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
@@ -507,12 +509,27 @@ async def _claim_dedup_winner_if_unowned(
     if user_id is None or record.user_id is not None:
         return record
     if await repo.claim_if_unowned(record.id, user_id):
+        await repo.add_subscriber(record.id, user_id)
         await session.commit()
         return await repo.get(record.id) or record
     refreshed = await repo.get_fresh(record.id) or record
     if _owned_by_another_user(refreshed, user_id, actor_is_admin):
         raise RequestOwnedByAnotherUserError(refreshed.tmdb_id, refreshed.media_type)
     return refreshed
+
+
+async def _subscribe_user(
+    session: AsyncSession,
+    repo: SqlRequestRepository,
+    record: RequestRecord,
+    user_id: int | None,
+) -> RequestRecord:
+    """Persist shared visibility for an authenticated requester."""
+    if user_id is None:
+        return record
+    await repo.add_subscriber(record.id, user_id)
+    await session.commit()
+    return record
 
 
 async def _collapse_available_race(
@@ -557,7 +574,11 @@ async def _collapse_available_race(
     winner = await repo.find_earliest_available(tmdb_id, media_type)
     if winner is not None and winner.id != record.id:
         if _owned_by_another_user(winner, user_id, actor_is_admin):
-            return record
+            if user_id is not None:
+                await repo.add_subscriber(winner.id, user_id)
+            await repo.delete(record.id)
+            await session.commit()
+            return await repo.get(winner.id) or winner
         if (
             winner.user_id is None
             and user_id is not None
@@ -720,7 +741,8 @@ async def create_request_result(
         # the IntegrityError race recovery below — every path that can hand back a
         # dedup winner (see _owned_by_another_user).
         if _owned_by_another_user(existing, user_id, actor_is_admin):
-            raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+            existing = await _subscribe_user(session, repo, existing, user_id)
+            return CreateRequestResult(record=existing, created=False)
         # The deduped active request may have no owner (e.g. it was created via the
         # API-key automation path, which carries no user identity). Adopt it for the
         # requesting user so the dedup result appears in THEIR request list instead
@@ -729,6 +751,7 @@ async def create_request_result(
         existing = await _claim_dedup_winner_if_unowned(
             session, repo, existing, user_id, actor_is_admin
         )
+        existing = await _subscribe_user(session, repo, existing, user_id)
         if media_type == "tv":
             season_plan = await _resolve_tv_season_plan(
                 tmdb,
@@ -859,7 +882,9 @@ async def create_request_result(
             existing_active = await repo.find_active(tmdb_id, media_type)
             if existing_active is not None:
                 if _owned_by_another_user(existing_active, user_id, actor_is_admin):
-                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                    await session.rollback()
+                    existing_active = await _subscribe_user(session, repo, existing_active, user_id)
+                    return CreateRequestResult(record=existing_active, created=False)
                 existing_active = await _claim_dedup_winner_if_unowned(
                     session, repo, existing_active, user_id, actor_is_admin
                 )
@@ -910,7 +935,9 @@ async def create_request_result(
                     # ownerless claimable one) over a foreign row when several terminal rows
                     # exist, so this rejection now fires only when EVERY candidate is foreign.
                     if _owned_by_another_user(in_library, user_id, actor_is_admin):
-                        raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                        await session.rollback()
+                        in_library = await _subscribe_user(session, repo, in_library, user_id)
+                        return CreateRequestResult(record=in_library, created=False)
                     # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
                     # must be adopted for this requester, exactly like the active-dedup path
                     # above - else the shared user gets a success for a row their own
@@ -988,7 +1015,9 @@ async def create_request_result(
             existing_active = await repo.find_active(tmdb_id, media_type)
             if existing_active is not None:
                 if _owned_by_another_user(existing_active, user_id, actor_is_admin):
-                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                    await session.rollback()
+                    existing_active = await _subscribe_user(session, repo, existing_active, user_id)
+                    return CreateRequestResult(record=existing_active, created=False)
                 existing_active = await _claim_dedup_winner_if_unowned(
                     session, repo, existing_active, user_id, actor_is_admin
                 )
@@ -1026,7 +1055,9 @@ async def create_request_result(
                 # As in the movie path, the owner-preference lookup means a foreign
                 # row is only rejected when the caller has NO own/ownerless candidate.
                 if _owned_by_another_user(in_library, user_id, actor_is_admin):
-                    raise RequestOwnedByAnotherUserError(tmdb_id, media_type)
+                    await session.rollback()
+                    in_library = await _subscribe_user(session, repo, in_library, user_id)
+                    return CreateRequestResult(record=in_library, created=False)
                 # Adopt an OWNERLESS in-library row for this requester before growing
                 # + returning it, mirroring the movie short-circuit and the active
                 # dedup path - else the shared user's own per-user filter hides the
@@ -1152,7 +1183,7 @@ async def create_request_result(
                     winner = await repo.get(winner.id) or winner
                     created = False
                 record = winner
-    except IntegrityError as integrity_exc:
+    except IntegrityError:
         # A concurrent POST /requests for the same (tmdb_id, media_type) won the
         # race: the partial UNIQUE index over active statuses rejected this insert.
         # Resolve to the existing active request instead of crashing (idempotent
@@ -1166,7 +1197,8 @@ async def create_request_result(
         # not the other user's row (and never mutates its season set below). Our own
         # insert was already rolled back, so nothing is left behind.
         if _owned_by_another_user(winner, user_id, actor_is_admin):
-            raise RequestOwnedByAnotherUserError(tmdb_id, media_type) from integrity_exc
+            winner = await _subscribe_user(session, repo, winner, user_id)
+            return CreateRequestResult(record=winner, created=False)
         # The recovery winner may be OWNERLESS (a shared user's insert lost the
         # active-unique race to an X-Api-Key automation row): adopt it for this
         # user BEFORE returning/mutating it, exactly like the find_active dedup —
@@ -1222,6 +1254,18 @@ async def list_requests(
 ) -> list[RequestRecord]:
     """List media requests, optionally filtered by ``status``."""
     return await SqlRequestRepository(session).list_by_status(status)
+
+
+async def list_requests_for_user(
+    session: AsyncSession, user_id: int, status: str | None = None
+) -> list[RequestRecord]:
+    """List requests visible to a creator or later subscriber."""
+    return await SqlRequestRepository(session).list_for_user(user_id, status)
+
+
+async def is_request_visible_to_user(session: AsyncSession, request_id: int, user_id: int) -> bool:
+    """Return whether a shared user subscribes to a request."""
+    return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
 
 
 def fold_requests_for_display(records: list[RequestRecord]) -> list[RequestRecord]:

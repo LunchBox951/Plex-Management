@@ -52,6 +52,7 @@ __all__ = [
     "MediaType",
     "RequestDedupLock",
     "RequestStatus",
+    "RequestSubscriber",
     "SeasonEpisodeState",
     "SeasonRequest",
     "Setting",
@@ -429,6 +430,28 @@ class MediaRequest(Base):
     tv_request_mode: Mapped[str | None] = mapped_column(String)
     requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
     requested_episodes_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
+
+
+class RequestSubscriber(Base):
+    """A user who can see a shared request without becoming its creator.
+
+    ``MediaRequest.user_id`` remains the immutable creator/audit field.  This
+    association captures every user who expressed request intent, including the
+    creator, so active-title dedup can stay global without hiding the result from
+    later requesters.
+    """
+
+    __tablename__ = "request_subscribers"
+
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    subscribed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class RequestDedupLock(Base):

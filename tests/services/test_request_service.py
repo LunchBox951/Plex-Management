@@ -1631,7 +1631,12 @@ async def _make_user(sm: SessionMaker, *, username: str, permissions: int = 0) -
         return user.id
 
 
-async def test_non_admin_dedup_onto_foreign_owned_tv_request_rejects_and_leaves_it_unmutated(
+async def _is_subscriber(sm: SessionMaker, request_id: int, user_id: int) -> bool:
+    async with sm() as session:
+        return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
+
+
+async def test_non_admin_dedup_onto_foreign_owned_tv_request_subscribes_without_mutating(
     sessionmaker_: SessionMaker,
 ) -> None:
     """A non-admin user POSTing a title already actively requested by a DIFFERENT
@@ -1649,24 +1654,25 @@ async def test_non_admin_dedup_onto_foreign_owned_tv_request_rejects_and_leaves_
     assert await _season_numbers(sessionmaker_, owned.id) == {1}
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7001,
-                media_type="tv",
-                seasons=[2],
-                user_id=intruder_id,
-                actor_is_admin=False,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7001,
+            media_type="tv",
+            seasons=[2],
+            user_id=intruder_id,
+            actor_is_admin=False,
+        )
 
+    assert shared.id == owned.id
+    assert await _is_subscriber(sessionmaker_, owned.id, intruder_id)
     assert await _season_numbers(sessionmaker_, owned.id) == {1}  # NOT grown to {1, 2}
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, owned.id)
         assert row is not None and row.user_id == owner_id  # still the owner's row
 
 
-async def test_non_admin_dedup_onto_foreign_owned_movie_request_rejects(
+async def test_non_admin_dedup_onto_foreign_owned_movie_request_subscribes(
     sessionmaker_: SessionMaker,
 ) -> None:
     """The movie analogue: a non-admin cannot dedup onto another user's active
@@ -1681,15 +1687,15 @@ async def test_non_admin_dedup_onto_foreign_owned_movie_request_rejects(
         )
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7005,
-                media_type="movie",
-                user_id=intruder_id,
-                actor_is_admin=False,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7005,
+            media_type="movie",
+            user_id=intruder_id,
+            actor_is_admin=False,
+        )
+    assert await _is_subscriber(sessionmaker_, shared.id, intruder_id)
 
 
 async def test_admin_dedup_onto_foreign_owned_tv_request_keeps_shared_behavior(
@@ -1805,7 +1811,7 @@ async def test_owner_rededuping_onto_own_tv_request_grows_seasons(
 # --------------------------------------------------------------------------- #
 
 
-async def test_non_admin_movie_in_library_dedup_onto_foreign_row_rejects(
+async def test_non_admin_movie_in_library_dedup_onto_foreign_row_subscribes(
     sessionmaker_: SessionMaker,
 ) -> None:
     """The TERMINAL-row bypass: the prior row is 'available' (outside find_active),
@@ -1823,17 +1829,18 @@ async def test_non_admin_movie_in_library_dedup_onto_foreign_row_rejects(
     assert owned.status == RequestStatus.available.value
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7101,
-                media_type="movie",
-                user_id=intruder_id,
-                actor_is_admin=False,
-                library=library,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7101,
+            media_type="movie",
+            user_id=intruder_id,
+            actor_is_admin=False,
+            library=library,
+        )
 
+    assert shared.id == owned.id
+    assert await _is_subscriber(sessionmaker_, owned.id, intruder_id)
     async with sessionmaker_() as session:
         rows = (
             (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7101)))
@@ -1871,7 +1878,7 @@ async def test_admin_movie_in_library_dedup_onto_foreign_row_unchanged(
     assert result.id == owned.id
 
 
-async def test_non_admin_tv_all_present_dedup_onto_foreign_row_rejects_unmutated(
+async def test_non_admin_tv_all_present_dedup_onto_foreign_row_subscribes_unmutated(
     sessionmaker_: SessionMaker,
 ) -> None:
     """The TV terminal-row bypass: every requested season is already in Plex and the
@@ -1897,18 +1904,19 @@ async def test_non_admin_tv_all_present_dedup_onto_foreign_row_rejects_unmutated
     assert await _season_numbers(sessionmaker_, owned.id) == {1}
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7103,
-                media_type="tv",
-                seasons=[2],
-                user_id=intruder_id,
-                actor_is_admin=False,
-                library=library,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7103,
+            media_type="tv",
+            seasons=[2],
+            user_id=intruder_id,
+            actor_is_admin=False,
+            library=library,
+        )
 
+    assert shared.id == owned.id
+    assert await _is_subscriber(sessionmaker_, owned.id, intruder_id)
     assert await _season_numbers(sessionmaker_, owned.id) == {1}  # NOT grown with season 2
     async with sessionmaker_() as session:
         rows = (
@@ -1920,7 +1928,7 @@ async def test_non_admin_tv_all_present_dedup_onto_foreign_row_rejects_unmutated
     assert rows[0].user_id == owner_id
 
 
-async def test_non_admin_integrity_race_recovery_onto_foreign_row_rejects_unmutated(
+async def test_non_admin_integrity_race_recovery_subscribes_to_foreign_winner(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1957,17 +1965,18 @@ async def test_non_admin_integrity_race_recovery_onto_foreign_row_rejects_unmuta
     monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7104,
-                media_type="tv",
-                seasons=[2],
-                user_id=intruder_id,
-                actor_is_admin=False,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7104,
+            media_type="tv",
+            seasons=[2],
+            user_id=intruder_id,
+            actor_is_admin=False,
+        )
 
+    assert shared.id == owned.id
+    assert await _is_subscriber(sessionmaker_, owned.id, intruder_id)
     assert await _season_numbers(sessionmaker_, owned.id) == {1}  # winner unmutated
     async with sessionmaker_() as session:
         rows = (
@@ -1978,7 +1987,7 @@ async def test_non_admin_integrity_race_recovery_onto_foreign_row_rejects_unmuta
     assert len(rows) == 1  # the loser's insert was rolled back — no orphan row
 
 
-async def test_non_admin_available_race_collapse_keeps_their_own_row(
+async def test_non_admin_available_race_collapses_to_shared_row(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2020,7 +2029,7 @@ async def test_non_admin_available_race_collapse_keeps_their_own_row(
             library=library,
         )
 
-    assert second.id != first.id  # the collapse was SKIPPED — their own row returned
+    assert second.id == first.id
     async with sessionmaker_() as session:
         rows = (
             (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 7105)))
@@ -2028,8 +2037,9 @@ async def test_non_admin_available_race_collapse_keeps_their_own_row(
             .all()
         )
     by_id = {row.id: row for row in rows}
-    assert set(by_id) == {first.id, second.id}  # BOTH rows survive
-    assert by_id[second.id].user_id == intruder_id
+    assert set(by_id) == {first.id}
+    assert by_id[first.id].user_id == owner_id
+    assert await _is_subscriber(sessionmaker_, first.id, intruder_id)
     assert all(row.status is RequestStatus.available for row in rows)
 
 
@@ -2228,7 +2238,7 @@ async def test_non_admin_movie_in_library_dedup_claims_ownerless_over_foreign(
     assert foreign is not None and foreign.user_id == b_id  # the foreign row untouched
 
 
-async def test_non_admin_movie_in_library_dedup_only_foreign_rows_still_409(
+async def test_non_admin_movie_in_library_dedup_only_foreign_rows_subscribes(
     sessionmaker_: SessionMaker,
 ) -> None:
     """When EVERY terminal row belongs to other users, the honest 409 is unchanged
@@ -2243,16 +2253,16 @@ async def test_non_admin_movie_in_library_dedup_only_foreign_rows_still_409(
     library = FakeLibrary(available={7303})
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7303,
-                media_type="movie",
-                user_id=a_id,
-                actor_is_admin=False,
-                library=library,
-            )
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7303,
+            media_type="movie",
+            user_id=a_id,
+            actor_is_admin=False,
+            library=library,
+        )
+    assert await _is_subscriber(sessionmaker_, shared.id, a_id)
 
 
 async def test_non_admin_tv_all_present_dedup_prefers_their_own_older_row(
@@ -2609,7 +2619,7 @@ async def test_force_create_alongside_stale_available_row_keeps_both(
     assert active is not None and active.id == result.record.id
 
 
-async def test_force_create_rejects_foreign_owned_active_request(
+async def test_force_create_subscribes_to_foreign_owned_active_request(
     sessionmaker_: SessionMaker,
 ) -> None:
     """The ownerless-claim/ownership invariant (#58) holds on the force path too:
@@ -2628,17 +2638,17 @@ async def test_force_create_rejects_foreign_owned_active_request(
         )
 
     async with sessionmaker_() as session:
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request_result(
-                session,
-                tmdb,
-                tmdb_id=996,
-                media_type="movie",
-                user_id=intruder_id,
-                actor_is_admin=False,
-                force=True,
-                library=library,
-            )
+        shared = await request_service.create_request_result(
+            session,
+            tmdb,
+            tmdb_id=996,
+            media_type="movie",
+            user_id=intruder_id,
+            actor_is_admin=False,
+            force=True,
+            library=library,
+        )
+    assert await _is_subscriber(sessionmaker_, shared.record.id, intruder_id)
 
 
 async def test_force_create_dedups_onto_own_active_request(

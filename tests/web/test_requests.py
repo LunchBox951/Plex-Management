@@ -291,13 +291,7 @@ def test_create_contract_documents_manual_error_bodies(app: FastAPI) -> None:
     assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
         "/ErrorDetail"
     )
-    # 409 documents the honest "already requested by another user" rejection
-    # (issue #58): a non-admin cannot dedup onto a foreign-owned active request.
-    # (This is NOT the old media_type_deferred 409, which was dead code -- an
-    # unsupported media_type is a Literal, so FastAPI already 422s it.)
-    assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
-        "/ErrorDetail"
-    )
+    assert "409" not in responses
 
 
 def test_get_request_contract_documents_not_found(app: FastAPI) -> None:

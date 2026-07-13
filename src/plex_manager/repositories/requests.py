@@ -20,6 +20,7 @@ from plex_manager.models import (
     MediaType,
     RequestDedupLock,
     RequestStatus,
+    RequestSubscriber,
     SeasonRequest,
 )
 from plex_manager.ports.repositories import RequestRecord
@@ -134,6 +135,40 @@ class SqlRequestRepository:
     async def get(self, request_id: int) -> RequestRecord | None:
         row = await self._session.get(MediaRequest, request_id)
         return _to_record(row) if row is not None else None
+
+    async def add_subscriber(self, request_id: int, user_id: int) -> None:
+        """Idempotently grant ``user_id`` visibility of ``request_id``."""
+        values = {"request_id": request_id, "user_id": user_id}
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            stmt = pg_insert(RequestSubscriber).values(**values).on_conflict_do_nothing()
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(RequestSubscriber).values(**values).on_conflict_do_nothing()
+        else:  # pragma: no cover - supported deployments are SQLite/PostgreSQL.
+            if await self.is_subscriber(request_id, user_id):
+                return
+            stmt = insert(RequestSubscriber).values(**values)
+        await self._session.execute(stmt)
+
+    async def is_subscriber(self, request_id: int, user_id: int) -> bool:
+        stmt = select(RequestSubscriber.request_id).where(
+            RequestSubscriber.request_id == request_id,
+            RequestSubscriber.user_id == user_id,
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def list_for_user(self, user_id: int, status: str | None = None) -> list[RequestRecord]:
+        """Return requests visible through subscriber membership."""
+        stmt = (
+            select(MediaRequest)
+            .join(RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id)
+            .where(RequestSubscriber.user_id == user_id)
+            .order_by(MediaRequest.id)
+        )
+        if status is not None:
+            stmt = stmt.where(MediaRequest.status == RequestStatus(status))
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
 
     async def get_fresh(self, request_id: int) -> RequestRecord | None:
         """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
@@ -446,7 +481,9 @@ class SqlRequestRepository:
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
         stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
         if for_user_id is not None:
-            stmt = stmt.where(MediaRequest.user_id == for_user_id)
+            stmt = stmt.join(
+                RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id
+            ).where(RequestSubscriber.user_id == for_user_id)
         stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
@@ -706,6 +743,8 @@ class SqlRequestRepository:
         )
         self._session.add(row)
         await self._session.flush()
+        if user_id is not None:
+            await self.add_subscriber(row.id, user_id)
         await self._session.refresh(row)
         return _to_record(row)
 

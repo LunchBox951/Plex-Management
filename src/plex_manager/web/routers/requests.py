@@ -28,11 +28,7 @@ from plex_manager.services.correction_service import (
     SeasonNotFoundError,
 )
 from plex_manager.services.library_roots import LibraryRoots
-from plex_manager.services.request_service import (
-    MediaNotFoundError,
-    NoAiredSeasonsError,
-    RequestOwnedByAnotherUserError,
-)
+from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
     AuthContext,
     ServiceNotConfiguredError,
@@ -83,7 +79,6 @@ router = APIRouter(
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
-    409: {"model": ErrorDetail, "description": "Already requested by another user"},
 }
 
 _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -235,14 +230,6 @@ async def create_request_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="media_not_found",
         ) from exc
-    except RequestOwnedByAnotherUserError as exc:
-        # Issue #58: a non-admin cannot dedup onto another user's active request
-        # (it would mutate/return a row they can't even see). Honest 409, not a
-        # silent no-op or a hidden mutation.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="requested_by_another_user",
-        ) from exc
     except NoAiredSeasonsError as exc:
         # The show exists in TMDB but resolved to zero trackable seasons (a data
         # gap, or a specials-only show) -- an honest 404, never a persisted
@@ -268,9 +255,10 @@ async def list_requests_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestListResponse:
     """List all media requests."""
-    records = await request_service.list_requests(session)
-    if not auth.is_admin:
-        records = [record for record in records if record.user_id == auth.user_id]
+    if auth.is_admin or auth.user_id is None:
+        records = await request_service.list_requests(session)
+    else:
+        records = await request_service.list_requests_for_user(session, auth.user_id)
     # Fold duplicate rows for the same media (e.g. a healed-but-not-yet-collapsed
     # false-``available`` row alongside a genuine re-grab) down to ONE visible
     # row per the requester's own preference order -- AFTER the per-user filter
@@ -307,7 +295,12 @@ async def get_request_endpoint(
 ) -> RequestResponse:
     """Return a single media request, or 404."""
     record = await request_service.get_request(session, request_id)
-    if record is None or (not auth.is_admin and record.user_id != auth.user_id):
+    visible = (
+        record is not None
+        and auth.user_id is not None
+        and await request_service.is_request_visible_to_user(session, request_id, auth.user_id)
+    )
+    if record is None or (not auth.is_admin and not visible):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     return await _to_response(session, record)
 
