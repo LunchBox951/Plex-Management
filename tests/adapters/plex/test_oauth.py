@@ -164,6 +164,26 @@ async def test_fetch_resources_hits_v2_not_v1() -> None:
     assert seen[0].url.path == "/api/v2/resources"
 
 
+async def test_fetch_resources_valid_empty_array_returns_empty_list() -> None:
+    # A genuine empty array is a VALID authorization signal (the account has zero
+    # server resources): it must parse to [] cleanly, not raise. Callers read [] as
+    # "not authorized for the configured server" (#296).
+    resources = await _fetch_resources([])
+    assert resources == []
+
+
+@pytest.mark.parametrize("body", [{}, {"error": "nope"}, {"resources": []}])
+async def test_fetch_resources_non_array_shape_is_bad_response(body: object) -> None:
+    # A 2xx body that is NOT the expected JSON array (an error object, a wrapped
+    # shape, HTML that still parsed) is MALFORMED, not "zero resources". It must
+    # raise bad_response rather than silently collapse to [] -- otherwise watchlist
+    # revalidation would read it as STALE and DELETE the user's snapshot on a
+    # transient plex.tv hiccup (#296).
+    with pytest.raises(PlexVerifyError) as excinfo:
+        await _fetch_resources(body)
+    assert excinfo.value.code == "plex_tv_bad_response"
+
+
 async def test_owned_servers_filters_provides_and_owned() -> None:
     resources = await _fetch_resources(V2_RESOURCES)
 

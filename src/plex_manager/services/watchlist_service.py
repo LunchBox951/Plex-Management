@@ -105,8 +105,15 @@ class WatchlistWorkerStatus:
         error: str | None,
         skipped_users: int = 0,
     ) -> None:
-        self.state = "degraded" if failed_users else "ok"
-        if not failed_users:
+        # Skipped users count toward "degraded" exactly like failed users: a tick
+        # that fetched nothing because a token could not be revalidated (plex.tv
+        # unreachable -> UNKNOWN) or no longer governs the server (STALE) has NOT
+        # succeeded, so it must not report "ok" or advance ``last_ok_at`` -- doing so
+        # would let /health claim success while nothing was actually synced (north
+        # star #3: surface the state, don't paper over it). ``skipped_users`` is
+        # surfaced alongside so an operator can see WHY the worker is degraded.
+        self.state = "degraded" if failed_users or skipped_users else "ok"
+        if not failed_users and not skipped_users:
             self.last_ok_at = datetime.now(UTC)
         self.fetched = fetched
         self.created = created
@@ -192,11 +199,11 @@ async def clear_snapshots(session: AsyncSession) -> int:
     watchlist-based protection to end, not to silently persist (north star #3).
     Idempotent: a no-op (returns 0) once already cleared.
     """
-    result = cast("CursorResult[Any]", await session.execute(delete(WatchlistItem)))
+    result = cast(CursorResult[Any], await session.execute(delete(WatchlistItem)))
     return result.rowcount or 0
 
 
-async def clear_user_snapshot(session: AsyncSession, *, user_id: int) -> int:
+async def clear_user_snapshot(session: AsyncSession, *, user_id: int, expected_token: str) -> int:
     """Delete one user's stored watchlist snapshot rows; return how many.
 
     Used when a candidate token revalidates as :attr:`SyncUserAuthorization.STALE`
@@ -210,9 +217,23 @@ async def clear_user_snapshot(session: AsyncSession, *, user_id: int) -> int:
     both. Not called for :attr:`SyncUserAuthorization.UNKNOWN`: a transient
     plex.tv outage must not be read as a revoked account, so its snapshot is
     retained. Idempotent (returns 0 once already cleared). Does not commit.
+
+    ``expected_token`` guards a re-sign-in race: the STALE decision was made from a
+    token loaded (and revalidated) EARLIER, in a separate session. If the user
+    signed in again between that read and this delete, their stored token now backs
+    a freshly-authorized account whose snapshot must NOT be destroyed. So we re-read
+    the user's CURRENT token inside this deleting transaction and only clear when it
+    still equals the token the stale determination was made from; a changed (or
+    cleared/absent) token retains the snapshot (returns 0) and the next tick
+    re-evaluates the new token.
     """
+    current_token = (
+        await session.execute(select(User.encrypted_plex_token).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if current_token != expected_token:
+        return 0
     result = cast(
-        "CursorResult[Any]",
+        CursorResult[Any],
         await session.execute(delete(WatchlistItem).where(WatchlistItem.user_id == user_id)),
     )
     return result.rowcount or 0

@@ -380,8 +380,24 @@ class PlexTvClient:
     @classmethod
     def parse_resources(cls, payload: Mapping[str, object]) -> list[PlexResource]:
         # v2 /resources is a JSON array; ``_request_json`` wraps it as {"items": [...]}.
+        # A 2xx body that is NOT that array shape (an error object, an HTML page that
+        # still parsed as JSON, a truncated payload) is a MALFORMED response, not "an
+        # account with zero resources". The distinction is load-bearing: callers treat
+        # a genuinely-empty resource list as an authorization signal (revalidation maps
+        # it to STALE and DELETES the user's eviction-protection snapshot), so a
+        # malformed shape silently collapsing to ``[]`` would destroy state on a
+        # transient plex.tv hiccup (#296). ``_request_json`` only synthesizes the
+        # "items" key when the body was a JSON array, so its absence (or a non-list
+        # value) means the shape was unexpected -- fail fatal instead of guessing.
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            raise PlexVerifyError(
+                _CODE_PLEX_TV_BAD_RESPONSE,
+                "plex.tv answered in an unexpected way: resources response was not a JSON array",
+                diagnostics={"host": _PLEX_TV_HOST},
+            )
         resources: list[PlexResource] = []
-        for item in _as_sequence(payload.get("items")):
+        for item in cast("list[object]", raw_items):
             fields = _as_mapping(item)
             resources.append(
                 PlexResource(

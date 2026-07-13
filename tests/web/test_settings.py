@@ -984,6 +984,55 @@ async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
     ).status_code == 200
 
 
+async def test_verified_repoint_wakes_watchlist_worker(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A verified repoint (new machine identifier) leaves old-server tokens STALE;
+    the watchlist worker is what clears their eviction-protection snapshots (#296).
+    Wake it immediately instead of waiting out the configured interval (hours/days),
+    even though this PUT touched no watchlist-sync field."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert app.state.watchlist_wake_event.is_set()
+
+
+async def test_non_repoint_edit_does_not_wake_watchlist_worker(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """The mirror guard: a PUT that is neither a repoint nor a watchlist-sync change
+    must NOT wake the worker, so an unrelated edit can't spam immediate ticks."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _no_probe_transport())
+    root = tmp_path / "tv"
+    root.mkdir()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"tv_root": str(root)},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert not app.state.watchlist_wake_event.is_set()
+
+
 async def test_put_non_plex_fields_keep_sessions_active(
     client: httpx.AsyncClient,
     app: FastAPI,

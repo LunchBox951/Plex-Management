@@ -300,7 +300,13 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             # on the new server forever (#296 finding 1).
             skipped_users += 1
             async with maker() as session:
-                cleared = await watchlist_service.clear_user_snapshot(session, user_id=user.id)
+                # Re-read the token inside the deleting transaction (expected_token
+                # guard): if the user signed in again since revalidation loaded this
+                # token, the delete must NOT wipe the now-authorized account's
+                # snapshot. A changed token retains the rows; next tick re-evaluates.
+                cleared = await watchlist_service.clear_user_snapshot(
+                    session, user_id=user.id, expected_token=token
+                )
                 await session.commit()
             _logger.info(
                 "watchlist token for user_id=%s is stale for the configured server; "

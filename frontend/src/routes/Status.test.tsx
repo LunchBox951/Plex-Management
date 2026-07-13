@@ -75,6 +75,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       existing: 0,
       failed_users: 0,
       failed_entries: 0,
+      skipped_users: 0,
     },
     ...overrides,
   }
@@ -632,6 +633,7 @@ describe('Status', () => {
           existing: 0,
           failed_users: 0,
           failed_entries: 0,
+          skipped_users: 0,
         },
       }),
       isLoading: false,
@@ -727,6 +729,7 @@ describe('Status', () => {
           existing: 4,
           failed_users: 1,
           failed_entries: 3,
+          skipped_users: 2,
         },
       }),
       isLoading: false,

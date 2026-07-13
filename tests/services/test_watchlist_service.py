@@ -206,6 +206,25 @@ def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
     assert status.last_error_type == "WatchlistEntryError"
     assert status.last_error_at is not None
 
+    # A tick that fetched nothing because every candidate was SKIPPED (token
+    # unrevalidatable / no longer authorized) has not succeeded: it must read
+    # "degraded" and must NOT advance last_ok_at, exactly like a failed tick --
+    # otherwise /health would claim success though nothing synced (#296, north
+    # star #3). skipped_users drives this even with no error string.
+    status.mark_started()
+    status.mark_completed(
+        fetched=0,
+        created=0,
+        existing=0,
+        failed_users=0,
+        failed_entries=0,
+        error=None,
+        skipped_users=1,
+    )
+    assert status.state == "degraded"
+    assert status.last_ok_at == first_ok
+    assert status.skipped_users == 1
+
     status.mark_started()
     status.mark_error(RuntimeError("boom"))
     assert status.state == "error"
@@ -259,6 +278,76 @@ async def test_revalidate_unknown_when_plex_tv_unreachable() -> None:
     assert result is SyncUserAuthorization.UNKNOWN
 
 
+async def test_revalidate_unknown_when_resources_malformed() -> None:
+    # A 2xx /resources body that is NOT the expected JSON array (an error object,
+    # a truncated/wrapped payload) must NOT be read as "zero resources" -> STALE
+    # -> snapshot deleted. It is an undetermined result: UNKNOWN, retain (#296).
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "unexpected"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await watchlist_service.revalidate_sync_user(plex_tv, _MACHINE_ID, token=_TOKEN)
+    assert result is SyncUserAuthorization.UNKNOWN
+
+
+async def test_revalidate_stale_when_resources_genuinely_empty() -> None:
+    # A genuine empty array IS a valid authorization signal: the account has zero
+    # server resources, so it cannot reach the configured server -> STALE.
+    async with httpx.AsyncClient(transport=_resources_transport([])) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await watchlist_service.revalidate_sync_user(plex_tv, _MACHINE_ID, token=_TOKEN)
+    assert result is SyncUserAuthorization.STALE
+
+
+async def test_clear_user_snapshot_clears_when_token_unchanged(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        user = User(username="watcher", encrypted_plex_token=_TOKEN)
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+        user_id = user.id
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_user_snapshot(
+            session, user_id=user_id, expected_token=_TOKEN
+        )
+        await session.commit()
+    assert cleared == 1
+    async with sessionmaker_() as session:
+        assert list((await session.execute(WatchlistItem.__table__.select())).all()) == []
+
+
+async def test_clear_user_snapshot_retains_when_token_changed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Re-sign-in race: the STALE decision was made from an OLD token, but the user
+    # signed in again before the delete ran, replacing their stored token. Their
+    # snapshot now backs a freshly-authorized account and must be RETAINED (#296).
+    async with sessionmaker_() as session:
+        user = User(username="watcher", encrypted_plex_token="new-token-after-resignin")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+        user_id = user.id
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_user_snapshot(
+            session,
+            user_id=user_id,
+            expected_token="old-stale-token",  # noqa: S106 - test fixture, not a credential
+        )
+        await session.commit()
+    assert cleared == 0
+    async with sessionmaker_() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_clear_snapshots_removes_all_rows(sessionmaker_: SessionMaker) -> None:
     async with sessionmaker_() as session:
         alice = User(username="alice", encrypted_plex_token="a")  # noqa: S106
@@ -303,6 +392,6 @@ async def test_is_watchlisted_ignores_user_and_uses_tmdb_media(
 def test_watchlist_items_has_tmdb_media_index() -> None:
     # The (tmdb_id, media_type) lookup index is what makes is_watchlisted seekable
     # despite the user_id-first composite PK (#296).
-    table = cast("Table", WatchlistItem.__table__)
+    table = cast(Table, WatchlistItem.__table__)
     index_columns = {tuple(col.name for col in index.columns) for index in table.indexes}
     assert ("tmdb_id", "media_type") in index_columns

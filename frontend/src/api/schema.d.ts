@@ -2948,6 +2948,11 @@ export interface components {
             /** Last Run At */
             last_run_at?: string | null;
             /**
+             * Skipped Users
+             * @default 0
+             */
+            skipped_users: number;
+            /**
              * State
              * @enum {string}
              */

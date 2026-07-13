@@ -103,6 +103,10 @@ async def test_stale_user_is_skipped_and_snapshot_cleared(app: FastAPI, seed: Se
     status = app.state.watchlist_status
     assert status.skipped_users == 1
     assert status.created == 0
+    # A tick that only skipped users fetched nothing: it must read degraded and not
+    # advance last_ok_at, so /health cannot claim success (#296, north star #3).
+    assert status.state == "degraded"
+    assert status.last_ok_at is None
     async with app.state.sessionmaker() as session:
         assert list((await session.execute(WatchlistItem.__table__.select())).all()) == []
 
@@ -133,6 +137,9 @@ async def test_unknown_authorization_retains_snapshot(app: FastAPI, seed: SeedFn
     assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
     status = app.state.watchlist_status
     assert status.skipped_users == 1
+    # Nothing was fetched (plex.tv unreachable): the tick is degraded, not ok.
+    assert status.state == "degraded"
+    assert status.last_ok_at is None
     async with app.state.sessionmaker() as session:
         remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
     assert len(remaining) == 1

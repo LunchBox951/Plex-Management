@@ -124,6 +124,7 @@ function healthResponse(
       existing: 0,
       failed_users: 0,
       failed_entries: 0,
+      skipped_users: 0,
     },
   }
 }
