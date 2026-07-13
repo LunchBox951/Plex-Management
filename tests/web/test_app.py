@@ -11,6 +11,7 @@ from plex_manager.web.app import (
     _BARE_METAL_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _UNCONFIRMED_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _emit_setup_ready_hint,  # pyright: ignore[reportPrivateUsage]
+    _running_under_documented_compose,  # pyright: ignore[reportPrivateUsage]
     _setup_ready_url,  # pyright: ignore[reportPrivateUsage]
     _warn_if_multi_process,  # pyright: ignore[reportPrivateUsage]
     create_upstream_http_client,
@@ -27,6 +28,15 @@ def _never_a_live_mount(_path: str) -> bool:
     """A ``path_visibility.is_live_mount`` stand-in simulating a bare-metal
     install with neither of the compose-required bind mounts present."""
     return False
+
+
+def _only_media_is_a_live_mount(path: str) -> bool:
+    """A ``path_visibility.is_live_mount`` stand-in simulating a HALF-mounted
+    bare-metal box: a real disk mounted directly at ``/media`` (its own,
+    unrelated mount point -- nothing to do with the documented Compose
+    topology) but no ``/downloads`` mount, since ``docker-compose.yml``
+    requires BOTH."""
+    return path == "/media"
 
 
 async def test_upstream_http_client_ignores_proxy_environment(
@@ -57,6 +67,35 @@ async def test_upstream_http_client_rejects_response_cookies() -> None:
         await client.aclose()
 
 
+class TestRunningUnderDocumentedCompose:
+    """``_running_under_documented_compose`` gates the compose-only
+    ``host_port``/``host_bind`` settings on BOTH documented bind mounts being
+    live, not just one (P2 follow-up to issue #294)."""
+
+    def test_true_when_both_documented_mounts_are_live(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
+        assert _running_under_documented_compose() is True
+
+    def test_false_when_neither_documented_mount_is_live(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
+        assert _running_under_documented_compose() is False
+
+    def test_false_when_only_one_documented_mount_is_live(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare-metal box can easily have a real, unrelated disk mounted
+        directly at ``/media`` while having no ``/downloads`` mount at all --
+        ``docker-compose.yml`` requires BOTH, so this must not be classified
+        as the documented Compose topology (an ``any()`` gate would wrongly
+        say otherwise)."""
+        monkeypatch.setattr(path_visibility, "is_live_mount", _only_media_is_a_live_mount)
+        assert _running_under_documented_compose() is False
+
+
 class TestSetupReadyUrl:
     """The startup setup-URL hint (issue #65) -- see Codex's follow-up findings:
     the printed link must use the externally-reachable HOST port, not always the
@@ -68,13 +107,35 @@ class TestSetupReadyUrl:
     ) -> None:
         # Simulate the documented compose topology's required bind mounts (see
         # `_running_under_documented_compose`) -- a real docker-compose install
-        # always has one of these live; a bare-metal test process never does.
+        # always has BOTH of these live; a bare-metal test process never does.
         monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
         settings = Settings(host="0.0.0.0", port=8000, host_port=9443)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:9443/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
         assert _BARE_METAL_HOST_PORT_NOTE not in url
+
+    def test_falls_back_to_the_real_listener_when_only_one_mount_is_documented(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2 follow-up to issue #294, finding 3/4: a bare-metal box with a
+        real (but unrelated) ``/media`` mount plus copied ``.env`` defaults for
+        ``PLEX_MANAGER_HOST_PORT``/``PLEX_MANAGER_HOST_BIND`` must NOT be
+        misclassified as the documented Compose topology just because ONE of
+        the two required mounts happens to be live -- it must fall back to
+        the actual in-process listener (``settings.port``/``settings.host``),
+        the same as the fully-unmounted bare-metal case."""
+        monkeypatch.setattr(path_visibility, "is_live_mount", _only_media_is_a_live_mount)
+        settings = Settings(
+            host="127.0.0.1",
+            port=9000,
+            host_port=8000,
+            host_bind="192.168.1.50",
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:9000/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE in url
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
     def test_falls_back_to_the_in_container_port_and_says_so_when_unknown(self) -> None:
         settings = Settings(host="0.0.0.0", port=8000, host_port=None)  # noqa: S104
@@ -120,21 +181,38 @@ class TestSetupReadyUrl:
         url = _setup_ready_url(settings)
         assert "setup_token" not in url
 
-    def test_keeps_the_port_note_outside_the_setup_token_fragment(
+    def test_keeps_the_setup_token_fragment_attached_to_the_url(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Issue #294, finding 1: the explanatory port-guessed note must never
-        land AFTER the ``#setup_token=`` fragment -- copying "the whole printed
-        line" must never risk appending trailing prose onto the token value."""
+        """P2 follow-up to issue #294, finding 1: when a setup token AND a
+        non-empty port note are both present, the clickable URL (fragment
+        included) must be one contiguous, space-free line, with the note
+        confined to its own separate line.
+
+        A prior revision spliced the note's prose directly between the path
+        and the ``#setup_token=`` fragment on the SAME line (note still
+        "before the fragment", just not on its own line). Because that prose
+        contains spaces, a terminal linkifier recognizes only the bare
+        ``.../setup`` prefix (stopping at the first space) as the clickable
+        link -- silently dropping the fragment -- while copying the WHOLE
+        printed line verbatim produces a request for a literal
+        ``/setup <prose...>`` path that the React ``/setup`` route does not
+        match, so the wizard never consumes the token either way.
+        """
         monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
         get_settings.cache_clear()
         settings = get_settings()
 
         url = _setup_ready_url(settings)
 
-        assert url.endswith("#setup_token=boot-token")
-        fragment_index = url.index("#setup_token=")
-        assert _UNCONFIRMED_HOST_PORT_NOTE not in url[fragment_index:]
+        # No PLEX_MANAGER_HOST_PORT is configured in this test environment, so
+        # `_setup_ready_url` also attaches `_UNCONFIRMED_HOST_PORT_NOTE` --
+        # exercising exactly the token+note combination the finding was about.
+        assert _UNCONFIRMED_HOST_PORT_NOTE in url
+
+        url_line = url.splitlines()[0]
+        assert " " not in url_line
+        assert url_line.endswith("#setup_token=boot-token")
 
     def test_uses_the_published_host_bind_over_the_in_process_listen_address(
         self, monkeypatch: pytest.MonkeyPatch

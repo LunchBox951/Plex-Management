@@ -989,7 +989,7 @@ _UNDIALABLE_BIND_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", ""})  # noq
 #: 9000:8000`` with no equivalent env var set) -- so the hint says so explicitly
 #: rather than asserting a link that may not resolve.
 _UNCONFIRMED_HOST_PORT_NOTE: Final = (
-    " (port guessed from the in-container value; if this is a container published"
+    "(port guessed from the in-container value; if this is a container published"
     " under a different host port, use that port instead -- set PLEX_MANAGER_HOST_PORT"
     " to fix this link)"
 )
@@ -1004,7 +1004,7 @@ _UNCONFIRMED_HOST_PORT_NOTE: Final = (
 #: on that "published" port for. Honesty over silence: say explicitly that the
 #: value is being ignored and why, rather than asserting a possibly-wrong link.
 _BARE_METAL_HOST_PORT_NOTE: Final = (
-    " (PLEX_MANAGER_HOST_PORT is set, but this process does not look like it is"
+    "(PLEX_MANAGER_HOST_PORT is set, but this process does not look like it is"
     " running under docker-compose.yml's documented volumes -- ignoring it and"
     " using the in-container port instead; remove the variable on a bare-metal"
     " install, or fix the port here if this really is a remapped container)"
@@ -1017,9 +1017,17 @@ def _running_under_documented_compose() -> bool:
 
     ``docker-compose.yml`` REQUIRES both the ``/media`` and ``/downloads``
     bind mounts (``:?set ... in .env`` -- compose refuses to start without
-    them), so a live mount at either name is a reliable, environment-derived
-    signal that this process is the documented container, not a bare-metal
-    install or a hand-rolled ``docker run`` with no equivalent mounts. Reuses
+    them), so BOTH must be live mounts for this to be a reliable,
+    environment-derived signal that this process is the documented container,
+    not a bare-metal install or a hand-rolled ``docker run`` with no
+    equivalent mounts. Deliberately ``all(...)``, not ``any(...)`` (P2 follow-up
+    to #294): a bare-metal box can easily have ONE of these paths be a real,
+    unrelated mount point on its own (e.g. a media disk mounted directly at
+    ``/media``) while still having copied the compose-only ``.env.example``
+    ``PLEX_MANAGER_HOST_PORT``/``PLEX_MANAGER_HOST_BIND`` defaults -- an
+    ``any()`` gate would misclassify that host as the documented Compose
+    topology (which requires BOTH mounts) and wrongly trust those compose-only
+    values instead of falling back to the real in-process listener. Reuses
     :func:`~plex_manager.services.path_visibility.is_live_mount` -- the same
     check that module already uses to distinguish the compose deployment from
     a bare-metal host for library/download path remapping -- rather than
@@ -1036,7 +1044,7 @@ def _running_under_documented_compose() -> bool:
     unconditionally, which happens to be right only by coincidence (the
     in-container default also being 8000).
     """
-    return any(
+    return all(
         path_visibility.is_live_mount(mount) for mount in path_visibility.KNOWN_CONTAINER_MOUNTS
     )
 
@@ -1078,10 +1086,22 @@ def _setup_ready_url(settings: Settings) -> str:
     falls back to ``settings.port`` with an explicit caveat
     (:data:`_BARE_METAL_HOST_PORT_NOTE`). With no ``host_port`` configured at
     all, the fallback caveat is :data:`_UNCONFIRMED_HOST_PORT_NOTE` instead.
-    Either caveat is appended to the URL BEFORE any ``#setup_token=`` fragment
-    (issue #294, finding 1) -- never after -- so the fragment, when present,
-    is always the last thing in the printed line and copying "the whole line"
-    can never append trailing prose onto the token value itself.
+
+    Either caveat, when present, is appended on its OWN trailing line -- a
+    real ``\\n``, never concatenated into the same line as the URL (P2
+    follow-up to issue #294, finding 1). An earlier revision spliced the
+    caveat's prose directly between the path and the ``#setup_token=``
+    fragment on one line; because that prose contains spaces, a terminal
+    linkifier would then only recognize ``.../setup`` (stopping at the first
+    space) as the clickable link -- silently dropping the fragment -- while
+    copying the whole printed line verbatim produced a request for a literal
+    ``/setup <prose...>`` path that the React ``/setup`` route does not match,
+    so the wizard never saw the token either way. Keeping the URL (including
+    its fragment, when present) as one contiguous, space-free line -- with any
+    caveat confined to its own separate line before/after it -- fixes both
+    failure modes at once: the clickable link always carries the full
+    fragment, and copying just that one line can never tack trailing prose
+    onto the token value.
 
     ``#setup_token=`` -- a URL FRAGMENT, never a query parameter -- is appended
     ONLY when a token is both configured and actually enforced
@@ -1109,11 +1129,17 @@ def _setup_ready_url(settings: Settings) -> str:
     else:
         port = settings.port
         note = _UNCONFIRMED_HOST_PORT_NOTE
-    url = f"http://{host}:{port}/setup{note}"
+    url = f"http://{host}:{port}/setup"
     if is_setup_token_required():
         token = configured_setup_token()
         if token:
             url = f"{url}#setup_token={quote(token, safe='')}"
+    if note:
+        # A real newline, deliberately NOT concatenated into the URL itself --
+        # see the docstring above (P2 follow-up to issue #294, finding 1). This
+        # keeps the URL line (fragment included) one contiguous, space-free
+        # token no matter what the caveat says.
+        url = f"{url}\n{note}"
     return url
 
 
