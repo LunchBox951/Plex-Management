@@ -1050,6 +1050,7 @@ class PlexLibrary:
         media_type: Literal["movie", "tv"],
         *,
         season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         """Whether ``tmdb_id`` (optionally one TV season) has been watched.
 
@@ -1072,38 +1073,93 @@ class PlexLibrary:
         An item/show/season absent from the library reports
         ``watched=False, last_viewed_at=None`` honestly rather than raising -- it
         can never be an eviction candidate anyway.
+
+        ``library_path`` (issue #207) path-correlates the read: when given, EVERY
+        ``tmdb_id``-matching item across every section is collected (not just the
+        first), and only the one whose reported media file path sits at/under the
+        reverse-mapped ``library_path`` (:func:`_section_scan_path` +
+        :func:`_is_path_prefix`, the same machinery :meth:`confirm_paths` uses) is
+        read. Zero or more-than-one such correlated item FAILS CLOSED (see the
+        port docstring) -- legitimate duplicates (the same title in two sections,
+        distinct copies on disk) must never let one copy's watched state authorize
+        deleting the other. The TV branch pays one extra per-season ``/children``
+        (episode) fetch per candidate show to read the season's own episode file
+        paths.
         """
         if media_type == "tv":
             if season is None:
                 raise ValueError("watch_state requires a season for media_type='tv'")
-            return await self._tv_watch_state(tmdb_id, season)
-        return await self._movie_watch_state(tmdb_id)
+            return await self._tv_watch_state(tmdb_id, season, library_path)
+        return await self._movie_watch_state(tmdb_id, library_path)
 
-    async def _movie_watch_state(self, tmdb_id: int) -> WatchState:
+    async def _movie_watch_state(self, tmdb_id: int, library_path: str | None) -> WatchState:
         """The movie branch of :meth:`watch_state` -- see its docstring."""
+        if library_path is None:
+            for section in await self.list_sections():
+                if section.type != "movie":
+                    continue
+                item = await self._find_section_item(section.key, tmdb_id)
+                if item is not None:
+                    return _movie_watch_state_from_item(item)
+            return WatchState(watched=False, last_viewed_at=None)
+
+        hits: list[WatchState] = []
         for section in await self.list_sections():
             if section.type != "movie":
                 continue
-            item = await self._find_section_item(section.key, tmdb_id)
-            if item is not None:
-                return _movie_watch_state_from_item(item)
+            scan_path = _section_scan_path(section, library_path)
+            if scan_path is None:
+                continue
+            for item in await self._find_section_items(section.key, tmdb_id):
+                file_paths = _extract_file_paths(item)
+                if any(_is_path_prefix(scan_path, fp) for fp in file_paths):
+                    hits.append(_movie_watch_state_from_item(item))
+        if len(hits) == 1:
+            return hits[0]
         return WatchState(watched=False, last_viewed_at=None)
 
-    async def _tv_watch_state(self, tmdb_id: int, season: int) -> WatchState:
+    async def _tv_watch_state(
+        self, tmdb_id: int, season: int, library_path: str | None
+    ) -> WatchState:
         """The tv branch of :meth:`watch_state` -- see its docstring."""
+        if library_path is None:
+            for section in await self.list_sections():
+                if section.type != "show":
+                    continue
+                item = await self._find_section_item(section.key, tmdb_id)
+                if item is None:
+                    continue
+                rating_key = _get_str(item, "ratingKey")
+                if rating_key is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                season_entry = await self._find_season_entry(rating_key, season)
+                if season_entry is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                return _season_watch_state_from_entry(season_entry)
+            return WatchState(watched=False, last_viewed_at=None)
+
+        hits: list[WatchState] = []
         for section in await self.list_sections():
             if section.type != "show":
                 continue
-            item = await self._find_section_item(section.key, tmdb_id)
-            if item is None:
+            scan_path = _section_scan_path(section, library_path)
+            if scan_path is None:
                 continue
-            rating_key = _get_str(item, "ratingKey")
-            if rating_key is None:
-                return WatchState(watched=False, last_viewed_at=None)
-            season_entry = await self._find_season_entry(rating_key, season)
-            if season_entry is None:
-                return WatchState(watched=False, last_viewed_at=None)
-            return _season_watch_state_from_entry(season_entry)
+            for item in await self._find_section_items(section.key, tmdb_id):
+                rating_key = _get_str(item, "ratingKey")
+                if rating_key is None:
+                    continue
+                season_entry = await self._find_season_entry(rating_key, season)
+                if season_entry is None:
+                    continue
+                season_rating_key = _get_str(season_entry, "ratingKey")
+                if season_rating_key is None:
+                    continue
+                episode_paths = await self._fetch_children_file_paths(season_rating_key)
+                if any(_is_path_prefix(scan_path, fp) for fp in episode_paths):
+                    hits.append(_season_watch_state_from_entry(season_entry))
+        if len(hits) == 1:
+            return hits[0]
         return WatchState(watched=False, last_viewed_at=None)
 
     async def _find_section_item(self, key: str, tmdb_id: int) -> Mapping[str, object] | None:
@@ -1149,3 +1205,48 @@ class PlexLibrary:
             if _get_int(entry, "index") == season:
                 return entry
         return None
+
+    async def _find_section_items(self, key: str, tmdb_id: int) -> list[Mapping[str, object]]:
+        """Page one section's items, returning EVERY raw entry matching ``tmdb_id``.
+
+        Unlike :meth:`_find_section_item`'s early return on the first hit, this
+        crawls the WHOLE section so a path-correlated :meth:`watch_state` lookup
+        (issue #207) can see every duplicate item sharing ``tmdb_id`` -- e.g. the
+        same title imported into two sections with distinct copies on disk --
+        rather than being blind to all but the first one paged.
+        """
+        matches: list[Mapping[str, object]] = []
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                if _item_matches_tmdb_id(entry, tmdb_id):
+                    matches.append(entry)
+            if len(items) < _PAGE_SIZE:
+                return matches
+            start += _PAGE_SIZE
+
+    async def _fetch_children_file_paths(self, rating_key: str) -> list[str]:
+        """Every episode ``Media[].Part[].file`` path under one season's ``ratingKey``.
+
+        A single non-paged ``/children`` GET (mirrors :meth:`_find_season_entry`'s
+        shape) -- a season's episode count stays well under ``_PAGE_SIZE``. Used
+        by the path-correlated TV branch of :meth:`watch_state` (issue #207) to
+        confirm the season row it found actually backs the candidate's stored
+        ``library_path`` breadcrumb, not just a same-tmdb duplicate elsewhere.
+        """
+        payload = await self._get(f"/library/metadata/{rating_key}/children")
+        items = _as_sequence(_media_container(payload).get("Metadata"))
+        paths: list[str] = []
+        for item in items:
+            paths.extend(_extract_file_paths(_as_mapping(item)))
+        return paths

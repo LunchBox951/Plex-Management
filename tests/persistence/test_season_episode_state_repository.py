@@ -193,6 +193,59 @@ async def test_upsert_target_retraction_loses_race_to_concurrent_import_promotio
     assert by_episode[2].grabbed_download_id == download_id
 
 
+async def test_upsert_target_lost_retirement_cas_expires_stale_instance(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #228: when the guarded retirement DELETE loses to a concurrent
+    import promotion (rowcount 0), the stale ``pending`` ORM instance from the
+    ``_existing_by_episode`` snapshot must be EXPIRED -- not left in the
+    identity map. Mirrors ``test_upsert_target_retraction_loses_race_to_
+    concurrent_import_promotion`` but deliberately WITHOUT the explicit
+    ``session.expire_all()`` that test uses to sidestep the bug: a same-session
+    follow-up read (``list_for_season``, exactly what ``reconcile_airing`` does
+    via ``compute_missing``) must see the winner's ``imported`` status, not the
+    stale ``pending`` snapshot. Pre-fix this assertion fails."""
+    season_request_id = await _make_season(session)
+    download_id = await _make_download(session)
+    repo = SqlSeasonEpisodeStateRepository(session)
+
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8)})
+
+    real_snapshot = (
+        SqlSeasonEpisodeStateRepository._existing_by_episode  # pyright: ignore[reportPrivateUsage]
+    )
+
+    async def _snapshot_then_lose_race(
+        self: SqlSeasonEpisodeStateRepository, sr_id: int
+    ) -> dict[int, SeasonEpisodeState]:
+        snapshot = await real_snapshot(self, sr_id)
+        # AFTER the snapshot (still reads episode 2 as ``pending``) but BEFORE
+        # the retirement delete runs, a concurrent import promotes episode 2.
+        await self._session.execute(  # pyright: ignore[reportPrivateUsage]
+            update(SeasonEpisodeState)
+            .where(
+                SeasonEpisodeState.season_request_id == sr_id,
+                SeasonEpisodeState.episode_number == 2,
+            )
+            .values(status=EpisodeState.imported, grabbed_download_id=download_id)
+            .execution_options(synchronize_session=False)
+        )
+        return snapshot
+
+    monkeypatch.setattr(
+        SqlSeasonEpisodeStateRepository, "_existing_by_episode", _snapshot_then_lose_race
+    )
+    await repo.upsert_target(season_request_id, {1: date(2026, 1, 1)})
+    monkeypatch.undo()
+
+    # Deliberately NO session.expire_all() here -- the fix's own expire() must
+    # be what makes this same-session read honest.
+    rows = await repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r for r in rows}
+    assert by_episode[2].status == "imported"
+    assert by_episode[2].grabbed_download_id == download_id
+
+
 async def test_upsert_target_retraction_never_touches_grabbed_or_imported_rows(
     session: AsyncSession,
 ) -> None:

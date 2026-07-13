@@ -101,6 +101,7 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         episodes=row.episodes_json,
         media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
+        retry_count=row.retry_count,
         first_seen_at=_as_utc(row.first_seen_at),
         added_at=_as_utc(row.added_at),
         timeout_at=_as_utc(row.timeout_at),
@@ -318,31 +319,37 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return await self._to_record_with_scopes(row) if row is not None else None
 
-    async def latest_imported_pack_added_at(
+    async def imported_unscoped_pack_candidates(
         self, media_request_id: int, season: int
-    ) -> datetime | None:
-        """Grab time (``added_at``) of the newest IMPORTED whole-season PACK for
-        ``(request, season)``, or ``None`` when no imported pack exists.
+    ) -> list[tuple[str | None, datetime]]:
+        """``(release_title, added_at)`` for every IMPORTED episode-UNSCOPED
+        download touching ``(request, season)``: the scalar shape
+        (``downloads.season == season`` with ``episodes_json`` NULL) or a season
+        scope of a multi-season download (``download_scopes`` row with NULL
+        ``episodes_json`` and scope status ``imported``).
 
-        "Pack" means episode-unscoped: the scalar shape (``downloads.season ==
-        season`` with ``episodes_json`` NULL) or a season scope of a multi-season
-        download (``download_scopes`` row with NULL ``episodes_json`` and scope
-        status ``imported``). The airing refresh's partial-baseline adoption (P2,
-        issue #178 review round 3) uses this as PROOF the season's content was
-        genuinely owned via a pack -- and as the CUTOFF: only episodes that aired
-        strictly before this grab can have been inside the pack.
+        Episode-unscoped is NECESSARY but not SUFFICIENT pack proof: a pre-#167
+        single-episode grab for a season scope was ALSO recorded with
+        ``episodes_json`` NULL (issue #230 -- the live apollo shape is a
+        ``season=N`` row whose ``release_title`` names a single episode, e.g.
+        ``...S04E07...``). The caller corroborates each candidate's
+        ``release_title`` via :func:`plex_manager.domain.season_pack.
+        classify_release_scope` before trusting it as pack proof + adoption
+        cutoff -- this method only narrows on the PERSISTENCE shape.
         """
         # The pack test (``episodes_json is None``) is evaluated PYTHON-side, like
         # every other reader of this column: SQLAlchemy's JSON type stores a
         # Python ``None`` as the JSON literal ``'null'`` (not SQL NULL), so a
         # DB-side ``IS NULL`` silently misses rows written through the ORM.
-        scalar_stmt = select(Download.episodes_json, Download.added_at).where(
+        scalar_stmt = select(
+            Download.release_title, Download.episodes_json, Download.added_at
+        ).where(
             Download.media_request_id == media_request_id,
             Download.season == season,
             Download.status == "imported",
         )
         scoped_stmt = (
-            select(DownloadScope.episodes_json, Download.added_at)
+            select(Download.release_title, DownloadScope.episodes_json, Download.added_at)
             .select_from(DownloadScope)
             .join(Download, Download.id == DownloadScope.download_id)
             .where(
@@ -351,13 +358,12 @@ class SqlDownloadRepository:
                 DownloadScope.status == "imported",
             )
         )
-        times = [
-            added_at
+        return [
+            (release_title, added_at)
             for stmt in (scalar_stmt, scoped_stmt)
-            for episodes_json, added_at in (await self._session.execute(stmt)).all()
+            for release_title, episodes_json, added_at in (await self._session.execute(stmt)).all()
             if episodes_json is None and added_at is not None
         ]
-        return max(times) if times else None
 
     async def list_active(self, *, populate_existing: bool = False) -> list[DownloadRecord]:
         """Active (non-terminal) downloads as read-model DTOs.
@@ -662,6 +668,7 @@ class SqlDownloadRepository:
         added_at: datetime | None = None,
         timeout_at: datetime | None = None,
         clear_timeout_at: bool = False,
+        retry_count: int | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
@@ -698,6 +705,12 @@ class SqlDownloadRepository:
         overloading ``None`` to mean BOTH "leave unchanged" and "clear" would
         leave a stale 45m/3h deadline on a row that has already left every
         download phase, misleading the observability column it was added for.
+
+        ``retry_count`` (issue #180) lets a caller re-anchor the probe-outage retry
+        count on the SAME CAS as the transition -- ``grab_service._reuse_terminal_row``
+        passes ``0`` so a terminal row resurrected for a fresh grab starts its own
+        honest count instead of inheriting one from a prior, unrelated life of the
+        same torrent-hash row. ``None`` (the default) leaves the column untouched.
 
         ``require_failed_reason`` (default: no predicate) additionally constrains the
         WHERE to rows whose CURRENT ``failed_reason`` exactly equals the given value
@@ -745,6 +758,8 @@ class SqlDownloadRepository:
             values["timeout_at"] = None
         elif timeout_at is not None:
             values["timeout_at"] = timeout_at
+        if retry_count is not None:
+            values["retry_count"] = retry_count
         stmt = (
             update(Download)
             .where(Download.id == download_id, Download.status.in_(allowed_from))
@@ -769,6 +784,28 @@ class SqlDownloadRepository:
                 episodes=episodes,
             )
         return updated
+
+    async def increment_retry_count_if_in(
+        self, download_id: int, allowed_from: frozenset[str]
+    ) -> bool:
+        """Compare-and-swap bump of ``retry_count`` by 1 (issue #180).
+
+        Gated on the row's CURRENT persisted status still being in
+        ``allowed_from`` -- mirrors :meth:`update_status_if_in`'s CAS
+        discipline: a row an operator moved elsewhere (e.g. ``mark_failed``
+        committing in a separate session during the caller's async gap) is
+        never touched. Returns whether the row was updated; the caller already
+        holds the PRE-increment count from its own prior read, so it can
+        derive the new count as ``previous + 1`` without a second read.
+        """
+        stmt = (
+            update(Download)
+            .where(Download.id == download_id, Download.status.in_(allowed_from))
+            .values(retry_count=Download.retry_count + 1)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
 
     async def update_scope_status_if_in(
         self,

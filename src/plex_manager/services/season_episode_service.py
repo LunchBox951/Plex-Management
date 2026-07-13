@@ -24,6 +24,7 @@ from plex_manager.domain.season_completeness import (
 from plex_manager.domain.season_completeness import (
     compute_missing as _compute_missing,
 )
+from plex_manager.domain.season_pack import classify_release_scope
 from plex_manager.logsafe import safe_int
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.metadata import MetadataPort
+    from plex_manager.ports.parser import ParserPort
     from plex_manager.ports.repositories import DownloadRepository, RequestRecord
 
 __all__ = [
@@ -154,6 +156,7 @@ async def reconcile_airing(
     session: AsyncSession,
     metadata: MetadataPort,
     *,
+    parser: ParserPort,
     now: datetime,
     max_refresh: int,
 ) -> int:
@@ -294,9 +297,28 @@ async def reconcile_airing(
             # cutoff also keeps airing GROWTH working: an episode airing after
             # the pack grab is never adopted, so a genuinely new episode still
             # re-arms the season no matter how old the pack evidence is.
-            pack_added_at = await download_repo.latest_imported_pack_added_at(
+            #
+            # Episode-unscoped (``episodes_json`` NULL) is NECESSARY but not
+            # SUFFICIENT pack proof (issue #230): a pre-#167 single-episode grab
+            # for a season scope was ALSO recorded episode-unscoped, so a legacy
+            # row whose ``release_title`` names one episode (e.g. "...S04E07...")
+            # must NOT be trusted as whole-season coverage. Each candidate's
+            # title is corroborated via ``classify_release_scope`` -- only
+            # ``season_pack``/``multi_season_pack`` count. An unparseable or
+            # missing title falls through to the safe re-arm below (a
+            # recoverable duplicate single-episode grab, never a silently
+            # swallowed missing episode).
+            candidates = await download_repo.imported_unscoped_pack_candidates(
                 season.media_request_id, season.season_number
             )
+            pack_times = [
+                added_at
+                for release_title, added_at in candidates
+                if release_title is not None
+                and classify_release_scope(parser.parse(release_title))
+                in ("season_pack", "multi_season_pack")
+            ]
+            pack_added_at = max(pack_times) if pack_times else None
             if pack_added_at is not None:
                 cutoff = pack_added_at.date()
                 adoptable = [

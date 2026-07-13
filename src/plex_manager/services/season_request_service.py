@@ -54,6 +54,7 @@ __all__ = [
     "ensure_seasons",
     "mark_available",
     "mark_completed",
+    "mark_completed_if_in",
     "mark_no_acceptable_release",
     "reset_for_research",
     "set_installed_quality",
@@ -884,6 +885,39 @@ async def mark_completed(
     )
     await season_repo.mark_completed(row.id)
     await _recompute_parent(session, media_request_id, stamp_completion=True)
+
+
+async def mark_completed_if_in(
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    allowed_from: frozenset[str],
+) -> bool:
+    """CAS counterpart of :func:`mark_completed`: move the season to
+    ``completed`` only if its CURRENT persisted status is still in
+    ``allowed_from`` (the DATABASE, not this session's snapshot, is the
+    authority). Recomputes the parent rollup with ``stamp_completion=True``
+    ONLY when the swap happened -- recomputing on a lost CAS would persist a
+    rollup derived from a row this call did not actually move, the exact
+    anti-pattern :func:`set_status_if_in` warns against. Returns whether the
+    swap happened.
+
+    The episode-fallback "aired target is already fully imported" completion
+    shortcut (``auto_grab_service._attempt_episode_fallback``) uses this so a
+    concurrent cancel/correction landing between its due-scope snapshot and
+    this write can never be resurrected as ``completed`` (issue #229).
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    changed = await season_repo.set_status_if_in(
+        row.id, RequestStatus.completed.value, allowed_from
+    )
+    if changed:
+        await _recompute_parent(session, media_request_id, stamp_completion=True)
+    return changed
 
 
 async def mark_available(

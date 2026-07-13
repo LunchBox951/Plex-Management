@@ -12,6 +12,8 @@ assertions turn only on the environment variable under test.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from plex_manager.config import Settings
@@ -28,6 +30,18 @@ def _settings_no_dotenv() -> Settings:
     there would otherwise mask the default we're asserting.
     """
     return Settings(_env_file=None)  # pyright: ignore[reportCallIssue]
+
+
+def test_env_example_does_not_widen_bare_metal_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #217: copying .env.example then running bare-metal must resolve to
+    127.0.0.1. Loading the committed template as the dotenv source must NOT carry
+    an active PLEX_MANAGER_HOST=0.0.0.0 that overrides the loopback default."""
+    monkeypatch.delenv("PLEX_MANAGER_HOST", raising=False)
+    env_example = Path(__file__).resolve().parent.parent / ".env.example"
+    settings = Settings(_env_file=str(env_example))  # pyright: ignore[reportCallIssue]
+    assert settings.host == "127.0.0.1"
 
 
 def test_blank_optional_bool_env_var_infers_none(monkeypatch: pytest.MonkeyPatch) -> None:
