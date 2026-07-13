@@ -1736,6 +1736,122 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       screen.queryByText('Your request is queued and will be searched automatically.'),
     ).not.toBeInTheDocument()
   })
+
+  it('targets the newly clicked row\'s OWN download, not a stale created-row id, for mark-failed (issue #295)', async () => {
+    // Issue #295: the `boundRequestId`-change effect used to reset only
+    // `reboundRequestId`, leaving `requestId` (and `createdGrabbable`/
+    // `createdSeasons`) pointed at whatever row "Request again" created earlier.
+    // `effectiveRequestId` (`requestId ?? liveRequest?.id`) prefers a non-null
+    // `requestId` outright, so — even though the status text above already
+    // resolves correctly via `liveRequest` — "Report a problem" would still
+    // silently target the STALE created row's download (82) instead of the
+    // freshly clicked row's own (83), the very misdirection this bundle exists
+    // to prevent. Continues the scenario above through the same two steps
+    // (rebind via "Request again", then a new row click), but asserts on the
+    // mark-failed ACTION TARGET rather than the status text.
+    const settledRow: RequestResponse = {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'evicted',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+    }
+    const freshRow: RequestResponse = {
+      id: 82,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+    }
+    const otherUsersRow: RequestResponse = {
+      id: 83,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+    }
+    // A queue item for EACH request: the stale created row (82, id 501) and the
+    // freshly clicked row (83, id 502). Both are mark-failable ('downloading')
+    // so the bug can't hide behind a state that would hide the button either way.
+    const staleQueueItem: QueueItem = {
+      id: 501,
+      media_request_id: 82,
+      progress: 0.4,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'stale-hash',
+    }
+    const freshQueueItem: QueueItem = {
+      id: 502,
+      media_request_id: 83,
+      progress: 0.7,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'fresh-hash',
+    }
+    const createRequestMock = mutation(freshRow)
+    const markFailedMock = mutation(freshQueueItem)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(markFailedMock)
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    const view = render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    // Rebind to the fresh row (82) via "Request again", exactly like the tests above.
+    expect(screen.getByText('Evicted')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /request again/i }))
+    await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [settledRow, freshRow, otherUsersRow] },
+    })
+    ;(useQueue as unknown as Mock).mockReturnValue({
+      data: { queue: [staleQueueItem, freshQueueItem] },
+    })
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByText('Your request is queued and will be searched automatically.'),
+      ).toBeInTheDocument(),
+    )
+
+    // The operator now opens a DIFFERENT row (83) for the same title — the
+    // modal stays mounted (issue #271), so only `boundRequestId` changes.
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={83} />,
+    )
+    await waitFor(() => expect(screen.getByText('Downloading')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: /report a problem/i }))
+    fireEvent.click(screen.getByRole('button', { name: /blocklist & re-search/i }))
+
+    // The FRESH row's own download (502) must be the mark-failed target — never
+    // the stale created row's (501), which `effectiveRequestId` would wrongly
+    // keep preferring without the widened reset.
+    await waitFor(() =>
+      expect(markFailedMock.mutateAsync).toHaveBeenCalledWith({
+        downloadId: 502,
+        blocklist: true,
+      }),
+    )
+  })
 })
 
 describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {

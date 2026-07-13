@@ -1277,6 +1277,140 @@ async def test_grab_terminal_tv_untracked_season_empty_preview_is_rejected_not_p
     assert rows == []
 
 
+async def test_grab_cancelled_season_under_non_terminal_parent_rejected_before_preview(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #295: the endpoint's up-front TV terminal gate must check
+    ``cancelled`` BEFORE ``tv_grab_blocked_by_terminal_parent`` -- exactly the
+    order ``grab_service.grab`` already uses internally.
+
+    Season 1 stays ``pending`` (genuinely due) and season 2 is explicitly
+    ``cancelled`` (the operator's cancel verb, ADR-0014). The parent rollup folds
+    to the non-terminal ``pending`` (any ``pending`` season wins over a
+    ``cancelled`` one -- see ``domain/season_rollup.py``), so
+    ``tv_grab_blocked_by_terminal_parent`` alone returns ``False`` for this
+    parent status and would let a grab of the CANCELLED season 2 fall through to
+    ``run_preview`` -- a wasted indexer search for content the operator
+    explicitly stopped, before ``grab_service.grab``'s own deeper gate finally
+    409s. The endpoint must reject up front instead: 409 ``request_not_active``,
+    prowlarr never consulted, nothing handed to the client."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={
+                902: TvMetadata(
+                    tmdb_id=902, title="Cancelled Season Show", year=2021, season_count=2
+                )
+            }
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 902, "media_type": "tv", "seasons": [1, 2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    async with sessionmaker_() as session:
+        await season_request_service.set_status(
+            session, media_request_id=request_id, season_number=2, status="cancelled"
+        )
+        await session.commit()
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        # Sanity: season 1's still-pending status wins the rollup outright, so
+        # the parent reads non-terminal despite season 2 being cancelled.
+        assert request.status is RequestStatus.pending
+
+    prowlarr = FakeProwlarr(
+        [candidate("Cancelled.Season.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="9" * 40)]
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=prowlarr, qbt=qbt)
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    # The whole point of the fix: prowlarr must never even be consulted.
+    assert prowlarr.searched == []
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        season2 = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+    assert season2.status is RequestStatus.cancelled  # untouched, never resurrected
+
+
+async def test_grab_waiting_for_air_date_season_under_non_terminal_parent_rejected_before_preview(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Issue #295, the ``waiting_for_air_date`` twin of the ``cancelled`` case
+    above: an unaired season under a genuinely-due sibling must also be rejected
+    up front, before ``run_preview`` wastes an indexer search on it."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={
+                903: TvMetadata(tmdb_id=903, title="Unaired Season Show", year=2021, season_count=2)
+            }
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 903, "media_type": "tv", "seasons": [1, 2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    async with sessionmaker_() as session:
+        await season_request_service.set_status(
+            session, media_request_id=request_id, season_number=2, status="waiting_for_air_date"
+        )
+        await session.commit()
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.pending
+
+    prowlarr = FakeProwlarr(
+        [candidate("Unaired.Season.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="a" * 40)]
+    )
+    qbt = FakeQbittorrent()
+    override_adapters(app, prowlarr=prowlarr, qbt=qbt)
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "request_not_active"
+    assert prowlarr.searched == []
+    assert qbt.added == []
+
+    async with sessionmaker_() as session:
+        season2 = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+    assert season2.status is RequestStatus.waiting_for_air_date  # untouched
+
+
 async def test_grab_loser_orphaned_torrent_is_removed_from_client(
     app: FastAPI,
     client: httpx.AsyncClient,
