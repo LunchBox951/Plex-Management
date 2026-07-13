@@ -740,6 +740,21 @@ async def _assert_safe_fetch_url(url: str) -> None:
     await _safe_fetch_addresses_async(hostname, port)
 
 
+class _SafeFetchVetoError(httpcore.ConnectError):
+    """The connect-time SSRF/rebinding veto specifically (resolve failure or a
+    private/non-global address), raised only by ``SafeFetchNetworkBackend.connect_tcp``.
+
+    Kept distinct from a plain ``httpcore.ConnectError`` -- a genuine connect
+    failure (refused, unreachable, timed out) -- purely so the operator-facing
+    message survives the httpx wrap in ``_SafeFetchTransport`` and the
+    ``QbittorrentSourceError`` re-raise in ``_resolve_http_source_with_client``:
+    without this, both cases collapsed into httpx's generic
+    ``httpx.RequestError`` and the specific "unsafe torrent source URL" message
+    degraded to the generic "torrent source request failed" for a statically
+    SSRF-blocked source on the real network path.
+    """
+
+
 class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
     """Pin HTTP-source fetches to a vetted global address.
 
@@ -785,7 +800,7 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         try:
             addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
         except QbittorrentError as exc:
-            raise httpcore.ConnectError("unsafe torrent source URL") from exc
+            raise _SafeFetchVetoError("unsafe torrent source URL") from exc
         # ``ConnectTimeout`` is a ``TimeoutException`` subclass, NOT a
         # ``ConnectError`` -- a broken-IPv6 dual-stack host times out on its AAAA
         # address, so catching only ``ConnectError`` would abandon the working IPv4
@@ -804,7 +819,7 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
                 last_error = exc
         if last_error is not None:
             raise last_error
-        raise httpcore.ConnectError("unsafe torrent source URL")
+        raise _SafeFetchVetoError("unsafe torrent source URL")
 
     async def connect_unix_socket(
         self,
@@ -867,6 +882,13 @@ class _SafeFetchTransport(httpx.AsyncBaseTransport):
         )
         try:
             resp = await self._pool.handle_async_request(req)
+        except _SafeFetchVetoError as exc:
+            # Preserve the specific connect-time SSRF/rebinding veto message --
+            # caught ahead of the generic ``_HTTP_CORE_EXCEPTIONS`` tuple below
+            # (``_SafeFetchVetoError`` is itself a ``NetworkError`` subclass and
+            # would otherwise be caught there first and degrade to the generic
+            # message the same as any ordinary connect failure).
+            raise httpx.TransportError("unsafe torrent source URL", request=request) from exc
         except _HTTP_CORE_EXCEPTIONS as exc:
             raise httpx.TransportError("torrent source request failed", request=request) from exc
 
@@ -1235,6 +1257,16 @@ class QbittorrentClient:
                 # "qBittorrent request failed" blamed a healthy client). Still never
                 # an opaque httpx error -> 500; no url/secret in the message. The
                 # auto-grab park backoff retries a transiently-down source later.
+                #
+                # On the real network path, a statically-blocked source (a host
+                # that resolves to a private/non-global address) is vetoed inside
+                # ``SafeFetchNetworkBackend.connect_tcp`` -- ``exc.__cause__`` is
+                # then the distinguishable ``_SafeFetchVetoError`` -- rather than
+                # by the pre-check here, so surface the same specific message the
+                # pre-check would have raised instead of the generic one, keeping
+                # the operator-facing message honest about *why* the fetch failed.
+                if isinstance(exc.__cause__, _SafeFetchVetoError):
+                    raise QbittorrentSourceError("unsafe torrent source URL") from exc
                 raise QbittorrentSourceError("torrent source request failed") from exc
         return None, None
 

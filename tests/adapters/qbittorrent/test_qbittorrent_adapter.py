@@ -1561,7 +1561,11 @@ async def test_redirect_hop_single_resolution_still_vetoes_unsafe_answer(
         PASSWORD,
     )
 
-    with pytest.raises(QbittorrentSourceError):
+    # The message must stay the specific SSRF-veto message, not degrade to the
+    # generic "torrent source request failed" once the veto fires inside
+    # ``SafeFetchNetworkBackend.connect_tcp`` and gets wrapped by httpx/httpcore
+    # on its way back out to the caller.
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
         await client.add("http://indexer.example/download/1", "/downloads", "plex-manager")
 
     assert calls == 1
