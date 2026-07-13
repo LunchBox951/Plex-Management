@@ -171,6 +171,7 @@ class FakeTmdb:
         popular_tv_results: list[MediaSearchResult] | None = None,
         season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
         season_episodes_error: Exception | None = None,
+        get_tv_show_error: Exception | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -197,6 +198,12 @@ class FakeTmdb:
         # Call log (issue #178 pack-first-precedence test): proves the port was
         # NEVER even consulted when Pass 1 alone settled a scope.
         self.season_episodes_calls: list[tuple[int, int]] = []
+        # ``get_tv_show_error`` (issue #210, mirrors ``season_episodes_error``): when
+        # set, raised on every ``get_tv_show`` call -- the "TMDB outage / show state
+        # unknown" test double for the air-date wake pass.
+        self.get_tv_show_error = get_tv_show_error
+        # Call log (issue #210 "resolved once per distinct show" assertion).
+        self.get_tv_show_calls: list[int] = []
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -205,6 +212,9 @@ class FakeTmdb:
         return self.movies.get(tmdb_id)
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
+        self.get_tv_show_calls.append(tmdb_id)
+        if self.get_tv_show_error is not None:
+            raise self.get_tv_show_error
         return self.shows.get(tmdb_id)
 
     @staticmethod
