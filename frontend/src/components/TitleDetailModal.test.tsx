@@ -20,9 +20,11 @@ import {
 } from '../api/hooks'
 import type {
   DiscoverResult,
+  DownloadStateValue,
   GrabRequest,
   QueueItem,
   RequestResponse,
+  RequestStatusValue,
   SearchPreviewResponse,
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
@@ -130,7 +132,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     no_acceptable_release: false,
   }
 
-  function setup(createdStatus: string) {
+  function setup(createdStatus: RequestStatusValue) {
     const created: RequestResponse = {
       id: 7,
       tmdb_id: 42,
@@ -236,7 +238,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
   }
 
   // Request always 'downloading' (the lagging status); only the download status moves.
-  function setDownloadStatus(downloadStatus: string): void {
+  function setDownloadStatus(downloadStatus: DownloadStateValue): void {
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: { requests: [request({ status: 'downloading' })] },
     })
@@ -282,6 +284,34 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
       expect(screen.queryByText(/Blocklist this release/i)).not.toBeInTheDocument()
     })
   })
+
+  // Issue #205 review follow-up: "Report a problem" drives the SAME `mark_failed`
+  // mutation as Queue.tsx's Mark failed/Blocklist buttons, so it must be gated on
+  // the identical positive allowlist (`isMarkFailableStatus`), not a denylist that
+  // only excluded 'importing'. `searching` has no edge to FailedPending (the
+  // backend would 409 an operator's mark-failed there), and a status this bundle
+  // doesn't recognize at all (a future backend state, or corrupt/legacy data)
+  // must fail CLOSED rather than exposing a control that can't succeed.
+  it('hides "Report a problem" for a download state with no legal path to FailedPending (searching)', () => {
+    setDownloadStatus('searching')
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+  })
+
+  it('hides "Report a problem" for a status this bundle does not recognize (fails closed, not open)', () => {
+    setDownloadStatus('a_future_backend_state' as DownloadStateValue)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+  })
+
+  it.each(['metadata_fetching', 'import_pending', 'import_blocked', 'client_missing', 'failed_pending'] as const)(
+    'still offers "Report a problem" for the legal mark-failable state %s',
+    (status) => {
+      setDownloadStatus(status)
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+      expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+    },
+  )
 })
 
 describe('TitleDetailModal — movie path is unchanged by the tv season selector', () => {
@@ -972,6 +1002,72 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
   })
 })
 
+describe('TitleDetailModal — unknown status fails closed, not open (issue #205)', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  // `vi.mocked(...)` (the Layout.test.tsx idiom) rather than this file's older
+  // `;(hook as unknown as Mock)` leading-semicolon pattern: CodeQL's
+  // js/automatic-semicolon-insertion rule flags the ASI-terminated statement
+  // that pattern leaves at the end of each block (code-scanning alert #323).
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(useCreateRequest).mockReturnValue(idle() as never)
+    vi.mocked(useSearchPreview).mockReturnValue(idle() as never)
+    vi.mocked(useGrab).mockReturnValue(idle() as never)
+    vi.mocked(useMarkFailed).mockReturnValue(idle() as never)
+    vi.mocked(useImportDownload).mockReturnValue(idle() as never)
+    vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
+    vi.mocked(useReportIssue).mockReturnValue(idle() as never)
+    vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
+    vi.mocked(useQueue).mockReturnValue({ data: { queue: [] } } as never)
+  })
+
+  // A status this bundle's `RequestStatusValue` union doesn't recognize can only
+  // arrive at runtime (a rolling deploy talking to a newer backend, or a
+  // corrupt/legacy row) -- constructing it here needs a cast, exactly like the
+  // real boundary where untyped JSON crosses into the typed `RequestResponse`.
+  const UNKNOWN_STATUS = 'a_future_backend_status' as RequestStatusValue
+
+  it('renders a neutral badge for an unrecognized request status, never throwing', () => {
+    vi.mocked(useRequests).mockReturnValue({
+      data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
+    } as never)
+    expect(() =>
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />),
+    ).not.toThrow()
+    expect(screen.getByText('A future backend status')).toBeInTheDocument()
+  })
+
+  it('offers no Grab and no Re-search for an unrecognized status (so the release browser, only reachable via Re-search/Preview, can never be opened)', () => {
+    vi.mocked(useRequests).mockReturnValue({
+      data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
+    } as never)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /^grab$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+  })
+
+  it('still offers Re-search for a KNOWN non-terminal status (no_acceptable_release)', () => {
+    vi.mocked(useRequests).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
+    } as never)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /re-search/i })).toBeInTheDocument()
+  })
+})
+
 describe('TitleDetailModal — shared (non-admin) users get a request-only modal', () => {
   function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
     return {
@@ -1510,7 +1606,7 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
   }
 
   function request(
-    status: string,
+    status: RequestStatusValue,
     overrides: Partial<RequestResponse> = {},
   ): RequestResponse {
     return {
@@ -1617,13 +1713,13 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
   })
 
   const stateCases: Array<{
-    status: string | null
+    status: RequestStatusValue | null
     mediaType?: 'movie' | 'tv'
     badge: string
     sentence: string
     actions: string[]
     primary: string | null
-    queueStatus?: string
+    queueStatus?: DownloadStateValue
   }> = [
     {
       status: null,
@@ -1697,7 +1793,13 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       status: 'failed',
       badge: 'Failed',
       sentence: 'The request failed. Request it again to restart.',
-      actions: ['Request again', 'Report a problem'],
+      // No 'Report a problem' here (issue #205): the failed zone's report button
+      // drives the QUEUE mark-failed mutation, and a terminal `failed` download
+      // has no legal edge to FailedPending (domain/state_machine.py TRANSITIONS)
+      // and no adopt path -- the backend 409s it unconditionally. The pre-#205
+      // `!== 'importing'` denylist offered that guaranteed-dead-end button;
+      // `isMarkFailableStatus` fails closed. "Request again" IS the correction.
+      actions: ['Request again'],
       primary: 'Request again',
       queueStatus: 'failed',
     },
@@ -1717,7 +1819,9 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       primary: 'Request again',
     },
     {
-      status: 'mystery_state',
+      // A runtime-unknown status is reachable only via a cast, exactly like the
+      // real untyped-JSON boundary (see UNKNOWN_STATUS in the #205 block above).
+      status: 'mystery_state' as RequestStatusValue,
       badge: 'Mystery state',
       sentence:
         'Plex Manager reported “Mystery state”; no additional detail is available.',
@@ -1835,7 +1939,7 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       'The download finished, but import is blocked: codec validation failed',
     ],
     ['failed', 'failed', 'client removed torrent', 'The request failed: client removed torrent'],
-  ])('surfaces the real queue reason for %s', (status, queueStatus, reason, sentence) => {
+  ] as const)('surfaces the real queue reason for %s', (status, queueStatus, reason, sentence) => {
     setBaseMocks(
       [request(status)],
       [queueItem({ status: queueStatus, failed_reason: reason })],

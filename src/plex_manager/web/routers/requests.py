@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.state_machine import DownloadState
+from plex_manager.models import RequestStatus
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
@@ -201,7 +202,7 @@ async def _to_response(
         tmdb_id=record.tmdb_id,
         media_type=record.media_type,
         title=record.title,
-        status=record.status,
+        status=cast(RequestStatus, record.status),
         year=record.year,
         is_anime=record.is_anime,
         poster_url=record.poster_url,
@@ -217,7 +218,7 @@ async def _to_response(
             [
                 SeasonStatus(
                     season_number=s.season_number,
-                    status=s.status,
+                    status=cast(RequestStatus, s.status),
                     installed_quality_id=s.installed_quality_id,
                     installed_profile_index=s.installed_profile_index,
                     imported_episode_count=((episode_counts or {}).get(s.id, (None, None))[0]),

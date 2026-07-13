@@ -170,6 +170,8 @@ describe('Queue — truthful transfer progress', () => {
     expect(screen.getByText(`${expected}%`)).toBeInTheDocument()
   })
 
+  // `as const` keeps each `status` a literal of the typed `DownloadStateValue`
+  // union (issue #205) instead of widening to `string`.
   it.each([
     { status: 'metadata_fetching', label: 'Fetching metadata', activeCount: 1 },
     { status: 'import_pending', label: 'Import pending' },
@@ -177,7 +179,7 @@ describe('Queue — truthful transfer progress', () => {
     { status: 'import_blocked', label: 'Import blocked', activeCount: 0 },
     { status: 'client_missing', label: 'Client missing', activeCount: 0 },
     { status: 'failed', label: 'Failed', activeCount: 0 },
-  ])(
+  ] as const)(
     'shows the $label badge without claiming transfer progress',
     ({ status, label, activeCount = 1 }) => {
       h.queue = [queueItem({ title: 'Import phase', status, progress: 1 })]
@@ -533,6 +535,54 @@ describe('Queue actions', () => {
         intent: 'error',
       }),
     )
+  })
+
+  // Issue #205: `isMarkFailableStatus` (lib/status.ts) is a positive allowlist
+  // (the states that legally reach FailedPending, per domain/state_machine.py's
+  // TRANSITIONS, plus the failed_pending "adopt" path) rather than a terminal
+  // denylist that only excluded `importing`. `searching` has no edge to
+  // FailedPending (the backend would 409 an operator's mark-failed there), so
+  // the OLD denylist's fail-open behavior was itself a latent bug this
+  // allowlist fixes.
+  it('hides fail actions for a status with no legal path to FailedPending (searching)', () => {
+    h.queue = [queueItem({ status: 'searching' })]
+
+    render(<Queue />)
+
+    expect(screen.queryByRole('button', { name: /^mark failed$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /blocklist & fail/i })).not.toBeInTheDocument()
+  })
+
+  it('shows fail actions for failed_pending (the backend adopts an operator retry on it)', () => {
+    h.queue = [queueItem({ status: 'failed_pending' })]
+
+    render(<Queue />)
+
+    expect(screen.getByRole('button', { name: /^mark failed$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /blocklist & fail/i })).toBeInTheDocument()
+  })
+
+  it.each(['metadata_fetching', 'import_pending', 'import_blocked', 'client_missing'] as const)(
+    'shows fail actions for the legal pre-FailedPending state %s',
+    (status) => {
+      h.queue = [queueItem({ status })]
+
+      render(<Queue />)
+
+      expect(screen.getByRole('button', { name: /^mark failed$/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /blocklist & fail/i })).toBeInTheDocument()
+    },
+  )
+
+  it('hides fail actions for a status this bundle does not recognize (fails closed, not open)', () => {
+    // A future backend state this bundle predates, or corrupt/legacy data --
+    // reachable only via a cast, exactly like the real untyped-JSON boundary.
+    h.queue = [queueItem({ status: 'a_future_backend_state' as QueueItem['status'] })]
+
+    render(<Queue />)
+
+    expect(screen.queryByRole('button', { name: /^mark failed$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /blocklist & fail/i })).not.toBeInTheDocument()
   })
 })
 

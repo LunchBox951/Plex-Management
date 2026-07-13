@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.release import ScoredRelease
+from plex_manager.domain.state_machine import DownloadState
+from plex_manager.models import DownloadScopeStatus
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -114,7 +116,7 @@ def _to_item(record: DownloadRecord) -> QueueItem:
     return QueueItem(
         id=record.id,
         torrent_hash=record.torrent_hash,
-        status=record.status,
+        status=cast(DownloadState, record.status),
         progress=record.progress,
         seed_ratio=record.seed_ratio,
         media_request_id=record.media_request_id,
@@ -130,7 +132,7 @@ def _to_item(record: DownloadRecord) -> QueueItem:
                 media_request_id=scope.media_request_id,
                 season=scope.season,
                 episodes=scope.episodes,
-                status=scope.status,
+                status=cast(DownloadScopeStatus, scope.status),
             )
             for scope in record.scopes
         ],

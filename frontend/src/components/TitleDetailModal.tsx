@@ -19,11 +19,12 @@ import type {
   GrabRequest,
   QueueItem,
   RequestResponse,
+  RequestStatusValue,
   SeasonStatus,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { PLEX_WEB_APP_URL } from '../lib/plex'
-import { requestStatus, type StatusPresentation } from '../lib/status'
+import { isMarkFailableStatus, requestStatus, type StatusPresentation } from '../lib/status'
 import { Dialog, DialogClose, DialogTitle } from './ui/Dialog'
 import { ReleaseList } from './ReleaseList'
 import { Button } from './ui/Button'
@@ -192,28 +193,32 @@ const CANCELLABLE_STATUSES = new Set([
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
- * terminal request id in /queue/grab (`request_not_active`). Terminal statuses are
- * `available` (already in the library), `completed` (imported, finalizing),
- * `failed`, and `evicted` (ADR-0012 — the disk-pressure sweep already deleted the
- * file; re-grabbing the same id would just re-arm a row the backend now treats as
- * settled, see `_SETTLED_REQUEST_STATUSES`). POST /requests can itself hand back a
- * terminal row — Plex already owns the title, or an existing completed/failed/
- * evicted request is reused — so the create path must gate Grab on the returned
- * status, not merely the presence of an id.
+ * terminal request id in /queue/grab (`request_not_active`). Positive allowlist
+ * (issue #205), not a terminal denylist — an unrecognized status (a future
+ * backend enum member this bundle predates, or corrupt/legacy data) is absent
+ * from the set and therefore fails CLOSED (not grabbable), rather than a
+ * denylist's fail-OPEN default. Mirrors the backend's non-terminal statuses:
+ * everything in `RequestStatus` except `available` (already in the library),
+ * `completed` (imported, finalizing), `failed`, `evicted` (ADR-0012 — the
+ * disk-pressure sweep already deleted the file; re-grabbing the same id would
+ * just re-arm a row the backend now treats as settled, see
+ * `_SETTLED_REQUEST_STATUSES`), `waiting_for_air_date`, and `cancelled`
+ * (ADR-0014 — settled and terminal for grab; a fresh "Request again" must be
+ * made before grabbing). `partially_available` is included even though it is a
+ * tv-only rollup NEVER set on a single season (a harmless superset — see
+ * `seasonStatusFor`) because it is genuinely non-terminal at the request level.
  */
+const GRABBABLE_STATUSES = new Set<RequestStatusValue>([
+  'pending',
+  'searching',
+  'no_acceptable_release',
+  'downloading',
+  'import_blocked',
+  'partially_available',
+])
+
 function isGrabbableStatus(status: string): boolean {
-  return (
-    status !== 'available' &&
-    status !== 'completed' &&
-    status !== 'failed' &&
-    status !== 'evicted' &&
-    status !== 'waiting_for_air_date' &&
-    // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
-    // rejects a cancelled id in /queue/grab with request_not_active); a fresh
-    // "Request again" must be made before grabbing. Mirrors the backend's
-    // `_SETTLED_REQUEST_STATUSES` / `TERMINAL_REQUEST_STATUS_VALUES`.
-    status !== 'cancelled'
-  )
+  return GRABBABLE_STATUSES.has(status as RequestStatusValue)
 }
 
 /**
@@ -529,7 +534,14 @@ export function TitleDetailModal({
   const reportTarget = reportFor
     ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
     : null
-  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+  // "Report a problem" drives the identical `mark_failed` mutation Queue.tsx's
+  // Mark failed/Blocklist buttons do (see `runReport` below), so it is gated on
+  // the SAME positive allowlist (`isMarkFailableStatus`, issue #205) rather than
+  // a denylist -- an unrecognized queue-item status (a future backend state
+  // this bundle predates, or corrupt/legacy data) is absent from the allowlist
+  // and therefore fails CLOSED instead of exposing a control that would just
+  // 409 (or worse, silently no-op on a state the backend never expected).
+  const reportActionable = reportTarget !== null && isMarkFailableStatus(reportTarget.status)
 
   useEffect(() => {
     if (reportFor && !reportActionable) {
@@ -856,16 +868,22 @@ export function TitleDetailModal({
   )
 
   // The report button only makes sense when there's a real download to act on,
-  // AND when mark-failed is a legal move. During the import copy/scan window the
-  // download sits in 'importing' (raw DownloadState) while its owning request still
-  // reads 'downloading'; the state machine only allows Importing -> Imported/
-  // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
-  // Don't offer an action that can't succeed — once the import lands the title
-  // re-renders as completed or import_blocked, where the correction paths reappear.
-  // Every correction verb below is admin-only server-side (`require_admin`), so
-  // each button is built only for admins — a shared user gets the request-only
+  // AND when mark-failed is a legal move — `isMarkFailableStatus` (issue #205),
+  // the SAME positive allowlist Queue.tsx's own Mark failed/Blocklist buttons
+  // use, since this button drives the identical `mark_failed` mutation. During
+  // the import copy/scan window the download sits in 'importing' (raw
+  // DownloadState) while its owning request still reads 'downloading'; the
+  // state machine only allows Importing -> Imported/ImportBlocked, so a
+  // mark-failed there always 409s (invalid_state_transition) — 'importing' is
+  // correctly absent from the allowlist. Don't offer an action that can't
+  // succeed — once the import lands the title re-renders as completed or
+  // import_blocked, where the correction paths reappear. An unrecognized
+  // status (future backend state, or corrupt/legacy data) is likewise absent
+  // from the allowlist and fails CLOSED, not just 'importing'. Every
+  // correction verb below is admin-only server-side (`require_admin`), so each
+  // button is built only for admins — a shared user gets the request-only
   // experience (Request / Request again + honest status), never a 403 machine.
-  const canReport = isAdmin && queueItem !== null && queueItem.status !== 'importing'
+  const canReport = isAdmin && queueItem !== null && isMarkFailableStatus(queueItem.status)
   const reportButton =
     canReport && queueItem ? (
       <Button variant="secondary" onClick={() => setReportFor({ downloadId: queueItem.id })}>
@@ -952,15 +970,17 @@ export function TitleDetailModal({
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
   // Admin-only: search-preview and grab are `require_admin` routes, so shared
-  // users never see the release browser at all.
+  // users never see the release browser at all. `unknown` is deliberately
+  // EXCLUDED (issue #205, fail closed): a runtime-unknown status must not open
+  // the release browser or expose Grab/Re-search, even though the header badge
+  // and state sentence still render it honestly.
   const showReleaseSearch =
     isAdmin &&
     (state.kind === 'none' ||
       state.kind === 'pending' ||
       state.kind === 'searching' ||
       state.kind === 'no_acceptable_release' ||
-      state.kind === 'failed' ||
-      state.kind === 'unknown')
+      state.kind === 'failed')
 
   let actionZone: ReactNode
   switch (state.kind) {
@@ -1057,6 +1077,11 @@ export function TitleDetailModal({
       actionZone = requestAgainButton
       break
     case 'unknown':
+      // issue #205: a runtime-unknown status (a future backend enum member this
+      // bundle predates, or corrupt/legacy data) gets NO actions — no Grab, no
+      // Re-search, no release browser. Fail closed on the action, never on the
+      // display: the header StatusBadge and state sentence already render it
+      // honestly via `statePresentation`/`stateSentence`.
       actionZone = null
       break
   }

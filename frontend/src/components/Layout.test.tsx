@@ -42,7 +42,7 @@ vi.mock('./SearchOverlay', () => ({
   ),
 }))
 
-function requestRow(id: number, status: string): RequestResponse {
+function requestRow(id: number, status: RequestResponse['status']): RequestResponse {
   return {
     id,
     tmdb_id: id,

@@ -1,12 +1,25 @@
+import type { DownloadStateValue, RequestStatusValue } from '../api/types'
+
 /**
  * Per-title / per-download status presentation.
  *
- * The backend's `status` fields are free strings carrying the canonical
- * `RequestStatus` / `DownloadState` enum values (see the backend's
- * domain/state machine). The design handoff (§4) collapses these onto five
+ * The backend's `status` fields carry the canonical `RequestStatus` /
+ * `DownloadState` enum values, typed in the OpenAPI contract and generated
+ * client (issue #205). The design handoff (§4) collapses these onto five
  * semantic colors. This map is the single place that translation lives, so
- * every badge/pill across the app reads identically. Unknown values fall back to
- * a neutral intent rather than throwing — honesty over silence.
+ * every badge/pill across the app reads identically.
+ *
+ * The maps below are typed `Record<RequestStatusValue, …>` /
+ * `Record<DownloadStateValue, …>` — a `Record` over a union type requires
+ * every member to have an entry, so adding or renaming a backend enum value
+ * red-builds `tsc` right here until this map is updated (that's the
+ * contract-drift guarantee ADR-0009 promises). `lookup()` still falls back to
+ * a neutral, humanized label for a status that is unknown AT RUNTIME (a
+ * rolling deploy: a stale bundle whose union is missing a value the backend
+ * — running newer code — actually emits) — honesty over silence, not a
+ * contradiction: the exhaustiveness check is compile-time against what THIS
+ * bundle's contract says exists, while the runtime fallback covers a bundle
+ * that hasn't caught up yet.
  */
 export type StatusIntent = 'searching' | 'downloading' | 'available' | 'error' | 'neutral'
 
@@ -15,7 +28,7 @@ export interface StatusPresentation {
   intent: StatusIntent
 }
 
-const REQUEST_STATUS: Record<string, StatusPresentation> = {
+const REQUEST_STATUS: Record<RequestStatusValue, StatusPresentation> = {
   pending: { label: 'Requested', intent: 'neutral' },
   searching: { label: 'Searching', intent: 'searching' },
   no_acceptable_release: { label: 'No release', intent: 'error' },
@@ -39,7 +52,7 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   cancelled: { label: 'Cancelled', intent: 'neutral' },
 }
 
-const DOWNLOAD_STATUS: Record<string, StatusPresentation> = {
+const DOWNLOAD_STATUS: Record<DownloadStateValue, StatusPresentation> = {
   searching: { label: 'Searching', intent: 'searching' },
   downloading: { label: 'Downloading', intent: 'downloading' },
   metadata_fetching: { label: 'Fetching metadata', intent: 'searching' },
@@ -59,8 +72,17 @@ function humanize(value: string): string {
     .replace(/^\w/, (c) => c.toUpperCase())
 }
 
-function lookup(table: Record<string, StatusPresentation>, status: string): StatusPresentation {
-  return table[status] ?? { label: humanize(status), intent: 'neutral' }
+/**
+ * `status` is deliberately plain `string` (callers pass `string | null` from
+ * looser call sites), not the narrower union — so the lookup itself must
+ * treat the table as a partial map and honor a miss (an unknown-at-runtime
+ * value) with the neutral humanized fallback, never a throw.
+ */
+function lookup<T extends string>(
+  table: Partial<Record<T, StatusPresentation>>,
+  status: string,
+): StatusPresentation {
+  return table[status as T] ?? { label: humanize(status), intent: 'neutral' }
 }
 
 export function requestStatus(status: string): StatusPresentation {
@@ -119,6 +141,45 @@ export const IN_FLIGHT_REQUEST_STATUSES: ReadonlySet<string> = new Set([
 
 export function isInFlightRequestStatus(status: string): boolean {
   return IN_FLIGHT_REQUEST_STATUSES.has(status)
+}
+
+/**
+ * The download states Mark failed / Blocklist & fail -- and the title modal's
+ * in-flight "report a problem", which drives the very same `mark_failed`
+ * mutation on a queue download -- can act on without a 409: every state that
+ * legally reaches `FailedPending` per the backend's `TRANSITIONS` graph
+ * (`domain/state_machine.py`) -- `downloading`, `metadata_fetching`,
+ * `import_pending`, `import_blocked`, `client_missing` -- PLUS `failed_pending`
+ * itself. That last one is not a `TRANSITIONS` edge (a state can't transition to
+ * itself there) but `queue_service.mark_failed` special-cases it as an "adopt":
+ * an operator call on an already-`failed_pending` row (a stranded prior attempt,
+ * or one a reconcile cycle just detected) re-stamps it with the fresh
+ * blocklist/remove_torrent flags instead of 409ing, so it is a genuinely legal,
+ * backend-accepted operator action -- omitting it here would violate "known
+ * legal actions remain available" for a real, reachable queue row. `searching`
+ * and `importing` have no such edge or adopt path (mid-search / mid-import
+ * can't be operator-failed) and are correctly excluded.
+ *
+ * Single source of truth for BOTH call sites (Queue.tsx's own Mark
+ * failed/Blocklist buttons and TitleDetailModal's report-a-problem dialog) so
+ * they can never drift onto two different gates for the identical mutation.
+ *
+ * Positive allowlist (issue #205), not a terminal denylist: a runtime-unknown
+ * status (a future backend state this bundle predates, or corrupt/legacy data)
+ * is absent from the set and fails CLOSED (no button/dialog shown), mirroring
+ * the authoritative backend guard rather than a denylist's fail-open default.
+ */
+export const MARK_FAILABLE_STATUSES = new Set<DownloadStateValue>([
+  'downloading',
+  'metadata_fetching',
+  'import_pending',
+  'import_blocked',
+  'client_missing',
+  'failed_pending',
+])
+
+export function isMarkFailableStatus(status: string): boolean {
+  return MARK_FAILABLE_STATUSES.has(status as DownloadStateValue)
 }
 
 /** Tailwind classes per intent (background tint + text + ring), used by StatusBadge. */
