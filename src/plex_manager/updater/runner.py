@@ -344,7 +344,7 @@ class UpdaterRunner:
             raise
         finally:
             stop.set()
-            await task
+            _ = await task
 
     async def _execute_install(
         self,
@@ -393,7 +393,7 @@ class UpdaterRunner:
             raise
         finally:
             stop.set()
-            await task
+            _ = await task
             if self._lease_task is task:
                 self._lease_stop = None
                 self._lease_task = None
@@ -443,7 +443,7 @@ class UpdaterRunner:
         if stop is None or task is None:
             return
         stop.set()
-        await task
+        _ = await task
 
     async def _claim_ready(
         self,
@@ -661,7 +661,7 @@ class UpdaterRunner:
                     request_timeout=state.stop_timeout_seconds + 10.0,
                 )
             await self.engine.remove_container(state.candidate_id, force=True)
-        previous = await self._validate_previous(state)
+        await self._validate_previous(state)
         with suppress(DockerError):
             await self.engine.stop_container(
                 state.target_id,
