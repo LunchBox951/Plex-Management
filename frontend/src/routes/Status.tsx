@@ -230,6 +230,10 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
         <dd className={cn('text-right', watchlist.failed_users > 0 ? 'text-searching' : '')}>
           {watchlist.failed_users}
         </dd>
+        <dt>Failed entries</dt>
+        <dd className={cn('text-right', watchlist.failed_entries > 0 ? 'text-searching' : '')}>
+          {watchlist.failed_entries}
+        </dd>
         {watchlist.last_error_type ? (
           <>
             <dt>Last error</dt>

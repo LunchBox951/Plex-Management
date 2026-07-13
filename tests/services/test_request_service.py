@@ -899,6 +899,63 @@ async def test_create_request_tv_under_lock_dedup_merges_intent(
     assert await _season_numbers(sessionmaker_, regrab_id) == {1, 2}
 
 
+async def test_watchlist_under_lock_foreign_dedup_expands_whole_show(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_id = await _make_user(sessionmaker_, username="under-lock-owner")
+    watcher_id = await _make_user(sessionmaker_, username="under-lock-watcher")
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=672,
+            media_type=MediaType.tv,
+            title="Raced Watchlist",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+            tv_request_mode="explicit_seasons",
+            requested_seasons_json=[1],
+        )
+        session.add(regrab)
+        await session.flush()
+        session.add(
+            SeasonRequest(media_request_id=regrab.id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+        regrab_id = regrab.id
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+    tmdb = FakeTmdb(
+        shows={672: TvMetadata(tmdb_id=672, title="Raced Watchlist", year=2020, season_count=3)}
+    )
+    library = FakeLibrary(available_tv_seasons={672: frozenset({1})})
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=672,
+            media_type="tv",
+            user_id=watcher_id,
+            actor_is_admin=False,
+            library=library,
+            expand_shared_tv=True,
+        )
+
+    assert result.id == regrab_id
+    assert await _is_subscriber(sessionmaker_, regrab_id, watcher_id)
+    assert await _season_numbers(sessionmaker_, regrab_id) == {1, 2, 3}
+
+
 async def test_create_request_after_cancelled_in_window_regrab_still_re_grabs(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1748,12 +1805,10 @@ async def test_key_auth_dedup_onto_owned_tv_request_keeps_shared_behavior(
     assert await _season_numbers(sessionmaker_, owned.id) == {1, 2}
 
 
-async def test_non_admin_claims_ownerless_request_on_dedup_unchanged(
+async def test_non_admin_subscribes_to_ownerless_request_without_claiming(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """The ownerless-claim path is unaffected: a non-admin deduping onto an
-    UNOWNED active request (e.g. one created by API-key automation) adopts it —
-    no 409 — so the dedup result shows up in their own request list."""
+    """An automation-owned active request stays ownerless while becoming visible."""
     claimer_id = await _make_user(sessionmaker_, username="claimer")
     tmdb = FakeTmdb(movies={7004: MovieMetadata(tmdb_id=7004, title="Movie", year=2020)})
 
@@ -1774,7 +1829,8 @@ async def test_non_admin_claims_ownerless_request_on_dedup_unchanged(
     assert result.id == ownerless.id
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, ownerless.id)
-        assert row is not None and row.user_id == claimer_id  # claimed, not rejected
+        assert row is not None and row.user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
 async def test_owner_rededuping_onto_own_tv_request_grows_seasons(
@@ -1986,6 +2042,48 @@ async def test_non_admin_integrity_race_recovery_subscribes_to_foreign_winner(
     assert len(rows) == 1  # the loser's insert was rolled back — no orphan row
 
 
+async def test_watchlist_integrity_race_foreign_winner_expands_whole_show(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_id = await _make_user(sessionmaker_, username="watch-race-owner")
+    watcher_id = await _make_user(sessionmaker_, username="watch-race-viewer")
+    tmdb = FakeTmdb(
+        shows={7105: TvMetadata(tmdb_id=7105, title="Watch Race", year=2020, season_count=3)}
+    )
+    async with sessionmaker_() as session:
+        owned = await request_service.create_request(
+            session, tmdb, tmdb_id=7105, media_type="tv", seasons=[1], user_id=owner_id
+        )
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+    async with sessionmaker_() as session:
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7105,
+            media_type="tv",
+            user_id=watcher_id,
+            actor_is_admin=False,
+            expand_shared_tv=True,
+        )
+
+    assert result.id == owned.id
+    assert await _is_subscriber(sessionmaker_, owned.id, watcher_id)
+    assert await _season_numbers(sessionmaker_, owned.id) == {1, 2, 3}
+
+
 async def test_non_admin_available_race_collapses_to_shared_row(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
@@ -2043,18 +2141,13 @@ async def test_non_admin_available_race_collapses_to_shared_row(
 
 
 # --------------------------------------------------------------------------- #
-# Ownerless-claim on the TERMINAL find_in_library short-circuits (issue #58):   #
-# an X-Api-Key-automation ('user_id' None) in-library row must be ADOPTED for a #
-# non-admin requester, exactly like the active find_active dedup — not merely   #
-# returned, which would succeed yet vanish behind their per-user list filter.   #
+# Ownerless terminal rows are shared through subscriber membership without     #
+# transferring API-key automation provenance or destructive authority.         #
 # --------------------------------------------------------------------------- #
-async def test_non_admin_claims_ownerless_movie_in_library_row_on_dedup(
+async def test_non_admin_subscribes_to_ownerless_movie_in_library_row(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """Terminal-row analogue of ``test_non_admin_claims_ownerless_request_on_dedup``:
-    an OWNERLESS 'available' in-library movie row is adopted for the non-admin
-    requester (no 409), so the dedup shows up in THEIR list instead of a success
-    that instantly vanishes behind the per-user filter."""
+    """An ownerless terminal movie stays automation-owned and becomes visible."""
     claimer_id = await _make_user(sessionmaker_, username="lib-claimer")
     tmdb = FakeTmdb(movies={7106: MovieMetadata(tmdb_id=7106, title="Owned", year=2020)})
     library = FakeLibrary(available={7106})
@@ -2087,15 +2180,14 @@ async def test_non_admin_claims_ownerless_movie_in_library_row_on_dedup(
             .all()
         )
     assert len(rows) == 1  # no duplicate row minted
-    assert rows[0].user_id == claimer_id  # claimed, not left ownerless-and-hidden
+    assert rows[0].user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
-async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
+async def test_non_admin_subscribes_to_ownerless_tv_all_present_row(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """The TV terminal short-circuit adopts an OWNERLESS all-seasons-present row too:
-    the non-admin requester claims it (and its seasons still grow), rather than
-    receiving a row their own per-user list would hide (issue #58)."""
+    """TV terminal dedup subscribes without claiming automation ownership."""
     claimer_id = await _make_user(sessionmaker_, username="tv-claimer")
     tmdb = FakeTmdb(
         shows={7107: TvMetadata(tmdb_id=7107, title="Done Show", year=2020, season_count=3)}
@@ -2130,7 +2222,8 @@ async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
             .all()
         )
     assert len(rows) == 1
-    assert rows[0].user_id == claimer_id  # claimed for the requester
+    assert rows[0].user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -2203,12 +2296,11 @@ async def test_non_admin_movie_in_library_dedup_prefers_their_own_older_row(
     assert by_id[newer_b].user_id == b_id  # B's row untouched
 
 
-async def test_non_admin_movie_in_library_dedup_claims_ownerless_over_foreign(
+async def test_non_admin_movie_in_library_dedup_prefers_ownerless_over_foreign(
     sessionmaker_: SessionMaker,
 ) -> None:
     """With a FOREIGN row and an OWNERLESS one both terminal for the same movie,
-    the ownerless (claimable) row wins for a non-admin — adopted via the existing
-    claim helper — instead of rejecting on the foreign row."""
+    the ownerless row wins and is subscribed without changing its provenance."""
     a_id = await _make_user(sessionmaker_, username="pref-claim-a")
     b_id = await _make_user(sessionmaker_, username="pref-claim-b")
     foreign_older = await _seed_available_row(sessionmaker_, tmdb_id=7302, user_id=b_id)
@@ -2232,7 +2324,8 @@ async def test_non_admin_movie_in_library_dedup_claims_ownerless_over_foreign(
     async with sessionmaker_() as session:
         claimed = await session.get(MediaRequest, ownerless_newer)
         foreign = await session.get(MediaRequest, foreign_older)
-    assert claimed is not None and claimed.user_id == a_id  # adopted for the requester
+    assert claimed is not None and claimed.user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless_newer, a_id)
     assert foreign is not None and foreign.user_id == b_id  # the foreign row untouched
 
 
@@ -2300,21 +2393,16 @@ async def test_non_admin_tv_all_present_dedup_prefers_their_own_older_row(
 
 
 # --------------------------------------------------------------------------- #
-# Lost-claim race + ownerless recovery/collapse (issue #58, wave 3):           #
-#  - the ownerless-adoption helper must NOT bless a LOST claim race as a silent #
-#    success — the loser is routed through the same foreign-owner 409;          #
-#  - the IntegrityError recovery AND the available-race collapse must ADOPT an  #
-#    ownerless winner before returning/mutating it, never hand back a hidden    #
-#    row the requester's own per-user list/get filter out.                      #
+# Ownerless recovery subscribes ordinary dedup callers. Only post-commit        #
+# collapse may adopt a winner to preserve a creator-owned row's authority.      #
 # --------------------------------------------------------------------------- #
 
 
-async def test_lost_claim_race_loser_subscribes_to_concurrent_winner(
+async def test_ownerless_dedup_subscribes_without_calling_claim(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lost ownerless-claim race converges on the winner and subscribes the loser."""
-    other_id = await _make_user(sessionmaker_, username="race-victor")
+    """Automation provenance is never transferred through the ordinary dedup path."""
     claimer_id = await _make_user(sessionmaker_, username="race-loser")
     tmdb = FakeTmdb(movies={7108: MovieMetadata(tmdb_id=7108, title="Race", year=2020)})
 
@@ -2326,20 +2414,13 @@ async def test_lost_claim_race_loser_subscribes_to_concurrent_winner(
         seeded = await session.get(MediaRequest, ownerless.id)
         assert seeded is not None and seeded.user_id is None  # ownerless to start
 
+    async def forbidden_claim(
+        self: SqlRequestRepository, request_id: int, user_id: int
+    ) -> bool:  # pragma: no cover - a call is the regression
+        raise AssertionError("ordinary dedup must not claim automation ownership")
+
+    monkeypatch.setattr(SqlRequestRepository, "claim_if_unowned", forbidden_claim)
     async with sessionmaker_() as session:
-
-        async def losing_claim(self: SqlRequestRepository, request_id: int, user_id: int) -> bool:
-            # Simulate losing the adoption race: a concurrent writer takes ownership
-            # between the ownerless read and our UPDATE (which then touches 0 rows).
-            # Assign it in THIS session (create_request's own) so the helper's
-            # get_fresh re-read observes the winning owner, then report the loss.
-            row = await session.get(MediaRequest, request_id)
-            assert row is not None
-            row.user_id = other_id
-            await session.flush()
-            return False
-
-        monkeypatch.setattr(SqlRequestRepository, "claim_if_unowned", losing_claim)
         result = await request_service.create_request(
             session,
             tmdb,
@@ -2357,18 +2438,15 @@ async def test_lost_claim_race_loser_subscribes_to_concurrent_winner(
             .all()
         )
     assert len(rows) == 1  # a dedup path — the loser never minted a duplicate row
-    assert rows[0].user_id == other_id
+    assert rows[0].user_id is None
     assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
-async def test_integrity_race_recovery_claims_ownerless_movie_winner(
+async def test_integrity_race_recovery_subscribes_to_ownerless_movie_winner(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A shared user whose INSERT loses the active-unique race to an OWNERLESS
-    automation row must ADOPT that recovery winner: without the claim, the
-    ``winner.user_id is None`` guard passes and the ownerless row is returned
-    behind the caller's own per-user filter — a success that vanishes (issue #58)."""
+    """An ownerless recovery winner stays automation-owned but becomes visible."""
     claimer_id = await _make_user(sessionmaker_, username="race-claim-m")
     tmdb = FakeTmdb(movies={7109: MovieMetadata(tmdb_id=7109, title="Race", year=2020)})
 
@@ -2408,16 +2486,15 @@ async def test_integrity_race_recovery_claims_ownerless_movie_winner(
             .all()
         )
     assert len(rows) == 1  # the loser's insert was rolled back — no orphan
-    assert rows[0].user_id == claimer_id  # ownerless winner ADOPTED, not returned hidden
+    assert rows[0].user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
-async def test_integrity_race_recovery_claims_ownerless_tv_winner_and_grows_seasons(
+async def test_integrity_race_recovery_subscribes_ownerless_tv_and_grows_seasons(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The tv mutate case: the recovery winner is adopted BEFORE ensure_seasons, so
-    the claimer's requested season grows an ownerless automation row they now own —
-    never mutates + returns a row hidden behind their own per-user filter (issue #58)."""
+    """TV recovery grows intent without claiming automation ownership."""
     claimer_id = await _make_user(sessionmaker_, username="race-claim-tv")
     tmdb = FakeTmdb(
         shows={7110: TvMetadata(tmdb_id=7110, title="Race Show", year=2020, season_count=5)}
@@ -2462,7 +2539,8 @@ async def test_integrity_race_recovery_claims_ownerless_tv_winner_and_grows_seas
             .all()
         )
     assert len(rows) == 1
-    assert rows[0].user_id == claimer_id  # ADOPTED before the season mutation
+    assert rows[0].user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
 async def test_available_race_collapse_claims_ownerless_winner(
@@ -2687,12 +2765,10 @@ async def test_force_create_dedups_onto_own_active_request(
     assert len(rows) == 1  # no duplicate active row fabricated
 
 
-async def test_force_create_claims_ownerless_active_request(
+async def test_force_create_subscribes_to_ownerless_active_request(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """The ownerless-claim invariant holds on the force path: a non-admin
-    ``force=True`` create dedups onto (and ADOPTS) an existing OWNERLESS active
-    request rather than 409-ing or fabricating a duplicate."""
+    """Force dedup subscribes without claiming automation ownership."""
     claimer_id = await _make_user(sessionmaker_, username="force-claimer")
     tmdb = FakeTmdb(movies={994: MovieMetadata(tmdb_id=994, title="Nobody's", year=2021)})
     library = FakeLibrary(available={994})
@@ -2716,7 +2792,8 @@ async def test_force_create_claims_ownerless_active_request(
         )
     assert result.created is False
     assert result.record.id == ownerless.id
-    assert result.record.user_id == claimer_id  # claimed, not rejected
+    assert result.record.user_id is None
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
     async with sessionmaker_() as session:
         rows = (

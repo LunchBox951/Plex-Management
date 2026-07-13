@@ -19,7 +19,7 @@ from plex_manager.ports.watchlist import WatchlistEntry
 
 __all__ = ["PlexWatchlist", "PlexWatchlistAuthError", "PlexWatchlistError"]
 
-_BASE_URL: Final = "https://metadata.provider.plex.tv"
+_BASE_URL: Final = "https://discover.provider.plex.tv"
 _PATH: Final = "/library/sections/watchlist/all"
 _PAGE_SIZE: Final = 100
 _TMDB_PREFIXES: Final = ("tmdb://", "themoviedb://")
@@ -94,13 +94,16 @@ class PlexWatchlist:
             if not isinstance(raw_container, Mapping):
                 raise PlexWatchlistError("Plex watchlist response is missing MediaContainer")
             container = cast("Mapping[str, object]", raw_container)
-            raw_metadata = container.get("Metadata")
-            if not isinstance(raw_metadata, (list, tuple)):
-                raise PlexWatchlistError("Plex watchlist response has invalid Metadata")
-            raw_items = cast("Sequence[object]", raw_metadata)
             total = container.get("totalSize")
             if isinstance(total, bool) or not isinstance(total, int) or total < 0:
                 raise PlexWatchlistError("Plex watchlist response has invalid totalSize")
+            raw_metadata = container.get("Metadata")
+            if raw_metadata is None and total == 0:
+                raw_items: Sequence[object] = ()
+            elif isinstance(raw_metadata, (list, tuple)):
+                raw_items = cast("Sequence[object]", raw_metadata)
+            else:
+                raise PlexWatchlistError("Plex watchlist response has invalid Metadata")
             for raw in raw_items:
                 item = _mapping(raw)
                 wire_type = item.get("type")

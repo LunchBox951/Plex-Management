@@ -2460,6 +2460,11 @@ export interface components {
              */
             existing: number;
             /**
+             * Failed Entries
+             * @default 0
+             */
+            failed_entries: number;
+            /**
              * Failed Users
              * @default 0
              */

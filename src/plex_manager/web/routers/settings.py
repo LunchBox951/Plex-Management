@@ -984,6 +984,15 @@ async def put_settings_endpoint(
                 )
         await session.commit()
 
+        # A long configured interval must not postpone an enable/shorten change
+        # until the old sleep expires. The worker owns this process-local event.
+        if written_fields.intersection(
+            {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
+        ):
+            wake_event = getattr(request.app.state, "watchlist_wake_event", None)
+            if isinstance(wake_event, asyncio.Event):
+                wake_event.set()
+
         # Clear backend probe caches before publishing: a listening tab can refetch
         # immediately on the SSE event, so publishing first could race it into the
         # stale pre-update health snapshot.

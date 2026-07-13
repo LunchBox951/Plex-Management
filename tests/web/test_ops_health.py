@@ -80,6 +80,7 @@ async def test_every_subsystem_is_honestly_not_configured_by_default(
         "created": 0,
         "existing": 0,
         "failed_users": 0,
+        "failed_entries": 0,
     }
 
 
@@ -266,6 +267,7 @@ async def test_health_reflects_degraded_watchlist_status(
         created=1,
         existing=2,
         failed_users=1,
+        failed_entries=1,
         error="WatchlistEntryError",
     )
     app.state.watchlist_status = worker
@@ -281,3 +283,4 @@ async def test_health_reflects_degraded_watchlist_status(
     assert watchlist["created"] == 1
     assert watchlist["existing"] == 2
     assert watchlist["failed_users"] == 1
+    assert watchlist["failed_entries"] == 1

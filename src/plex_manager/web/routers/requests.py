@@ -462,7 +462,7 @@ async def report_issue_endpoint(
             "re-requested safely.",
             hint="Check the folder is mounted and visible to Plex Manager "
             "(Settings → Library), then try again.",
-            diagnostics=({"root": exc.root_path} if exc.root_path else None),
+            diagnostics=({"root": exc.root_path} if auth.is_admin and exc.root_path else None),
         ) from exc
     response_body = await _to_response(session, updated, can_mutate=True)
     publish_realtime(

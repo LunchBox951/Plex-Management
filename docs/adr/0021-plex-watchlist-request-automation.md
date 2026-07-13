@@ -30,11 +30,15 @@ not cancel requests, delete media, or alter the independent `keep_forever` pin.
 Active-title dedup remains global. A request keeps its original `user_id` as
 creator/audit provenance, while `request_subscribers` grants every later
 requester visibility. Subscribers are read-only; creator/admin mutation authority
-is unchanged. Eviction checks current membership during candidate ranking and
+is unchanged. Ownerless API-key automation rows remain ownerless when a browser
+user later subscribes; visibility never silently grants cancel/report authority.
+When duplicate rows collapse, every subscriber is copied to the surviving row.
+Eviction checks current membership during candidate ranking and
 again in the final database claim immediately before deletion.
 
 Synchronization is enabled by default every 15 minutes. Both enablement and the
-bounded interval are web-editable and re-read each cycle. Per-user failures are
+bounded interval are web-editable; changing either wakes the worker immediately
+rather than waiting out the prior interval. Per-user and per-entry failures are
 isolated and summarized through health status without credential-bearing detail.
 
 ## Consequences

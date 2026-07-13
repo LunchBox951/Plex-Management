@@ -2668,6 +2668,7 @@ async def _heal_false_available_movies(
         read, the CAS finds nothing and the row is left for next cycle rather
         than deleted out from under its new owner.
         """
+        await repo.copy_subscribers(row.id, winner.id)
         if await repo.delete_false_available_sibling_collapse(row.id, expected_user_id=row.user_id):
             await session.commit()
             _logger.info(

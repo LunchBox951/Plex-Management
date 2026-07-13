@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, func, insert, or_, select, update
+from sqlalchemy import CursorResult, case, func, insert, literal, or_, select, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -151,6 +151,40 @@ class SqlRequestRepository:
             stmt = insert(RequestSubscriber).values(**values)
         await self._session.execute(stmt)
 
+    async def copy_subscribers(self, source_request_id: int, target_request_id: int) -> None:
+        """Copy every subscriber to a collapse winner without visibility loss."""
+        subscriber_select = select(literal(target_request_id), RequestSubscriber.user_id).where(
+            RequestSubscriber.request_id == source_request_id
+        )
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            stmt = (
+                pg_insert(RequestSubscriber)
+                .from_select(("request_id", "user_id"), subscriber_select)
+                .on_conflict_do_nothing()
+            )
+            await self._session.execute(stmt)
+            return
+        if dialect_name == "sqlite":
+            stmt = (
+                sqlite_insert(RequestSubscriber)
+                .from_select(("request_id", "user_id"), subscriber_select)
+                .on_conflict_do_nothing()
+            )
+            await self._session.execute(stmt)
+            return
+        user_ids = list(
+            (
+                await self._session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == source_request_id
+                    )
+                )
+            ).scalars()
+        )
+        for user_id in user_ids:  # pragma: no cover - fallback dialect only.
+            await self.add_subscriber(target_request_id, user_id)
+
     async def is_subscriber(self, request_id: int, user_id: int) -> bool:
         stmt = select(RequestSubscriber.request_id).where(
             RequestSubscriber.request_id == request_id,
@@ -270,12 +304,11 @@ class SqlRequestRepository:
         ``prefer_user_id`` (the per-user visibility scope — see the port
         docstring) reorders WHICH terminal row wins when several exist for the
         same media: (a) a row OWNED by that user first, then (b) an OWNERLESS
-        (claimable) row, then (c) anyone else's — newest-by-id within each rank.
+        (subscribable) row, then (c) anyone else's — newest-by-id within each rank.
         Without the preference, the newest GLOBAL row wins unconditionally, so a
         user whose own older ``available`` row is shadowed by another user's
-        newer one would be handed the foreign row — which the service can only
-        honestly reject (409) even though a perfectly returnable row of their own
-        exists. ``None`` (admins / API-key automation) keeps the plain
+        newer one would be handed a less precise foreign row even though a row of
+        their own exists. ``None`` (admins / API-key automation) keeps the plain
         newest-row-wins behavior unchanged.
         """
         stmt = select(MediaRequest).where(
@@ -890,11 +923,9 @@ class SqlRequestRepository:
         decides: an already-owned row is left untouched (an existing owner is never
         reassigned). Returns whether a row was actually claimed.
 
-        Used on the create-dedup path so a signed-in user whose request collapses
-        onto a previously ownerless active request (e.g. one created via the
-        API-key automation path, which carries no user identity) has the request
-        show up in THEIR own list, rather than succeeding yet silently vanishing
-        behind the per-user list filter.
+        Used only by collapse/heal paths that already have a user-owned row to
+        preserve while converging onto an ownerless winner. Ordinary dedup must
+        subscribe instead; automation provenance is not unclaimed authority.
         """
         result = cast(
             CursorResult[Any],

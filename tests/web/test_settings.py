@@ -1410,10 +1410,11 @@ async def test_empty_string_anime_root_reads_back_as_unset(
 # Operability beta (ADR-0012) settings: disk-pressure eviction + log retention
 # --------------------------------------------------------------------------- #
 async def test_put_round_trips_operability_settings(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     headers = {"X-Api-Key": _API_KEY}
+    app.state.watchlist_wake_event = asyncio.Event()
     update = {
         "disk_pressure_threshold_percent": 88.5,
         "disk_pressure_target_percent": 75,
@@ -1428,6 +1429,7 @@ async def test_put_round_trips_operability_settings(
     }
     put = await client.put("/api/v1/settings", json=update, headers=headers)
     assert put.status_code == 200
+    assert app.state.watchlist_wake_event.is_set()
     body = put.json()
     assert body["disk_pressure_threshold_percent"] == 88.5
     assert body["disk_pressure_target_percent"] == 75.0

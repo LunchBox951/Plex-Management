@@ -1232,6 +1232,7 @@ class WatchlistStatusItem(BaseModel):
     created: int = 0
     existing: int = 0
     failed_users: int = 0
+    failed_entries: int = 0
 
 
 class HealthResponse(BaseModel):

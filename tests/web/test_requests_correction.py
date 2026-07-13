@@ -515,6 +515,37 @@ async def test_report_issue_endpoint_409_media_root_unavailable_is_actionable(
     assert body["diagnostics"]["root"] == str(root)
 
 
+async def test_creator_media_root_error_does_not_expose_absolute_path(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    user_id, cookies, headers = await _creator_session(app, tag="root-error-creator")
+    root = tmp_path / "private-movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    await _set_setting(sessionmaker_, "movies_root", str(root))
+    request_id = await _seed_available_movie(
+        sessionmaker_, library_path=str(movie_file), user_id=user_id
+    )
+    override_adapters(app, library=FakeLibrary(), qbt=FakeQbittorrent(), prowlarr=FakeProwlarr([]))
+
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/report-issue",
+        json={"reason": "bad_quality"},
+        cookies=cookies,
+        headers=headers,
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["detail"] == "media_root_unavailable"
+    assert body.get("diagnostics") is None
+    assert str(root) not in response.text
+
+
 async def test_report_issue_endpoint_presence_only_no_culprit_reacquires(
     app: FastAPI,
     client: httpx.AsyncClient,

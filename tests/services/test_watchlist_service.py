@@ -148,7 +148,14 @@ def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
     assert status.state == "starting"
 
     status.mark_started()
-    status.mark_completed(fetched=2, created=1, existing=1, failed_users=0, error=None)
+    status.mark_completed(
+        fetched=2,
+        created=1,
+        existing=1,
+        failed_users=0,
+        failed_entries=0,
+        error=None,
+    )
     first_ok = status.last_ok_at
     assert first_ok is not None
     assert status.state == "ok"
@@ -159,6 +166,7 @@ def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
         created=1,
         existing=0,
         failed_users=1,
+        failed_entries=1,
         error="WatchlistEntryError",
     )
     assert status.state == "degraded"

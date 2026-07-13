@@ -57,6 +57,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       created: 0,
       existing: 0,
       failed_users: 0,
+      failed_entries: 0,
     },
     ...overrides,
   }
@@ -398,6 +399,7 @@ describe('Status', () => {
           created: 0,
           existing: 0,
           failed_users: 0,
+          failed_entries: 0,
         },
       }),
       isLoading: false,
@@ -492,6 +494,7 @@ describe('Status', () => {
           created: 2,
           existing: 4,
           failed_users: 1,
+          failed_entries: 3,
         },
       }),
       isLoading: false,
@@ -514,6 +517,8 @@ describe('Status', () => {
     expect(watchlist.getByText('Existing requests')).toBeInTheDocument()
     expect(watchlist.getByText('4')).toBeInTheDocument()
     expect(watchlist.getByText('1')).toBeInTheDocument()
+    expect(watchlist.getByText('Failed entries')).toBeInTheDocument()
+    expect(watchlist.getByText('3')).toBeInTheDocument()
     expect(watchlist.getByText(/WatchlistEntryError/)).toBeInTheDocument()
 
     const lastRun = watchlist.getByText('Last run').nextElementSibling

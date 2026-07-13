@@ -199,7 +199,7 @@ async def test_subscriber_cannot_mutate_another_users_request(
     assert response.json()["detail"] == "request_not_found"
 
 
-async def test_shared_user_dedup_claims_unowned_request_into_their_list(
+async def test_shared_user_dedup_subscribes_to_unowned_request_without_claiming_authority(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -221,12 +221,56 @@ async def test_shared_user_dedup_claims_unowned_request_into_their_list(
     )
     assert shared.status_code == 200
     assert shared.json()["id"] == admin.json()["id"]
+    assert shared.json()["can_mutate"] is False
 
     # It is now adopted by the requester, so it shows up in THEIR filtered list
     # rather than succeeding yet vanishing behind the per-user filter.
     listed = await client.get("/api/v1/requests", cookies=shared_cookies)
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == [admin.json()["id"]]
+    assert listed.json()["requests"][0]["can_mutate"] is False
+
+
+@pytest.mark.parametrize(
+    ("suffix", "json_body"),
+    [
+        ("keep-forever", {"keep_forever": True}),
+        ("report-issue", {"reason": "bad_quality"}),
+        ("cancel", None),
+    ],
+)
+async def test_ownerless_automation_subscriber_cannot_mutate_request(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    suffix: str,
+    json_body: dict[str, object] | None,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    automation = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        headers=_HEADERS,
+    )
+    cookies, headers = await _shared_user_cookies(app, tag=f"ownerless-{suffix}")
+    subscribed = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=cookies,
+        headers=headers,
+    )
+    assert subscribed.status_code == 200
+    assert subscribed.json()["can_mutate"] is False
+
+    response = await client.post(
+        f"/api/v1/requests/{automation.json()['id']}/{suffix}",
+        json=json_body,
+        cookies=cookies,
+        headers=headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "request_not_found"
 
 
 async def test_create_records_already_in_plex_as_available(

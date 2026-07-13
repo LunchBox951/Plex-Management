@@ -41,6 +41,7 @@ async def test_lists_movie_and_show_tmdb_guids_with_header_token() -> None:
     )
     assert seen[0].headers["X-Plex-Token"] == TOKEN
     assert TOKEN not in str(seen[0].url)
+    assert seen[0].url.host == "discover.provider.plex.tv"
 
 
 async def test_auth_failure_is_typed() -> None:
@@ -107,6 +108,14 @@ async def test_rejects_empty_page_before_declared_total() -> None:
     async with httpx.AsyncClient(transport=transport) as client:
         with pytest.raises(PlexWatchlistError):
             await PlexWatchlist(client, TOKEN).list_entries()
+
+
+async def test_accepts_empty_watchlist_when_metadata_is_omitted() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={"MediaContainer": {"totalSize": 0}})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        assert await PlexWatchlist(client, TOKEN).list_entries() == ()
 
 
 async def test_short_page_continues_until_declared_total() -> None:

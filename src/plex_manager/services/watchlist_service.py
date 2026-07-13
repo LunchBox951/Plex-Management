@@ -40,6 +40,7 @@ class WatchlistWorkerStatus:
     created: int = field(default=0)
     existing: int = field(default=0)
     failed_users: int = field(default=0)
+    failed_entries: int = field(default=0)
 
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
@@ -48,10 +49,17 @@ class WatchlistWorkerStatus:
         self.state = state
         self.last_error_type = None
         self.last_error_at = None
-        self.fetched = self.created = self.existing = self.failed_users = 0
+        self.fetched = self.created = self.existing = self.failed_users = self.failed_entries = 0
 
     def mark_completed(
-        self, *, fetched: int, created: int, existing: int, failed_users: int, error: str | None
+        self,
+        *,
+        fetched: int,
+        created: int,
+        existing: int,
+        failed_users: int,
+        failed_entries: int,
+        error: str | None,
     ) -> None:
         self.state = "degraded" if failed_users else "ok"
         if not failed_users:
@@ -60,6 +68,7 @@ class WatchlistWorkerStatus:
         self.created = created
         self.existing = existing
         self.failed_users = failed_users
+        self.failed_entries = failed_entries
         self.last_error_type = error
         self.last_error_at = datetime.now(UTC) if error is not None else None
 
@@ -67,6 +76,7 @@ class WatchlistWorkerStatus:
         self.state = "error"
         self.last_error_type = type(exc).__name__
         self.last_error_at = datetime.now(UTC)
+        self.fetched = self.created = self.existing = self.failed_users = self.failed_entries = 0
 
 
 @dataclass(frozen=True)

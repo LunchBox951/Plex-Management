@@ -3113,6 +3113,11 @@
             "title": "Existing",
             "type": "integer"
           },
+          "failed_entries": {
+            "default": 0,
+            "title": "Failed Entries",
+            "type": "integer"
+          },
           "failed_users": {
             "default": 0,
             "title": "Failed Users",

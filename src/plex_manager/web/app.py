@@ -158,6 +158,7 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
     fetched = 0
     existing = 0
     failed_users = 0
+    failed_entries = 0
     last_error: str | None = None
     for user in users:
         token = user.encrypted_plex_token
@@ -177,6 +178,7 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 existing += result.existing
                 if result.failed:
                     failed_users += 1
+                    failed_entries += result.failed
                     last_error = "WatchlistEntryError"
         except Exception as exc:
             failed_users += 1
@@ -193,6 +195,7 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         created=created,
         existing=existing,
         failed_users=failed_users,
+        failed_entries=failed_entries,
         error=last_error,
     )
     return created
@@ -213,7 +216,16 @@ async def _watchlist_sync_loop(app: FastAPI) -> None:
                 interval = await get_watchlist_sync_interval_minutes(session)
         except Exception:
             interval = 15.0
-        await asyncio.sleep(interval * 60.0)
+        wake_event = getattr(app.state, "watchlist_wake_event", None)
+        if not isinstance(wake_event, asyncio.Event):
+            wake_event = asyncio.Event()
+            app.state.watchlist_wake_event = wake_event
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=interval * 60.0)
+        except TimeoutError:
+            pass
+        finally:
+            wake_event.clear()
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -922,6 +934,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
     app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
+    app.state.watchlist_wake_event = asyncio.Event()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
     # it survives across auto-grab ticks; a restart clears it, like the health record.
     autograb_cooldowns: auto_grab_service.CooldownRegistry = {}
