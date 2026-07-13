@@ -58,13 +58,23 @@ describe('isInFlightRequestStatus', () => {
       'pending',
       'waiting_for_air_date',
       'available',
-      'partially_available',
       'failed',
       'cancelled',
       'evicted',
     ]) {
       expect(isInFlightRequestStatus(status)).toBe(false)
     }
+  })
+
+  it('excludes partially_available — it never coexists with an in-flight season', () => {
+    // Parent-only TV rollup (domain/season_rollup.py): any in-flight season
+    // (import_blocked/downloading/searching/no_acceptable_release) wins the
+    // parent status outright, so a partially_available parent's non-done
+    // seasons are only ever dormant (pending/waiting_for_air_date) or settled
+    // (failed/evicted/cancelled). A settled-partial show (one season evicted
+    // after being watched, ADR-0012) holds this status indefinitely — counting
+    // it would keep the badge permanently lit with zero activity.
+    expect(isInFlightRequestStatus('partially_available')).toBe(false)
   })
 
   it('treats an unknown status as not in flight rather than throwing', () => {

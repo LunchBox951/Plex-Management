@@ -87,8 +87,19 @@ export function downloadStatus(status: string): StatusPresentation {
  * Deliberately EXCLUDES:
  *   - not-yet-started states with no pipeline activity to report (`pending`,
  *     and `waiting_for_air_date`, which is dormant by design until its wake);
- *   - settled states (`available`, `partially_available`, `failed`,
- *     `cancelled`, `evicted`).
+ *   - settled states (`available`, `failed`, `cancelled`, `evicted`);
+ *   - `partially_available` — the parent-only TV rollup. Non-settled for dedup
+ *     purposes, but by rollup precedence it can NEVER coexist with an in-flight
+ *     season: any `import_blocked`/`downloading`/`searching`/
+ *     `no_acceptable_release` season wins the parent status outright
+ *     (`domain/season_rollup.py`, `_PRECEDENCE_STATUSES`), so the moment real
+ *     work starts on any season the parent reads that in-flight status and the
+ *     badge counts it. A show only sits at `partially_available` when its
+ *     non-done seasons are all dormant (`pending`/`waiting_for_air_date`) or
+ *     settled (`failed`/`evicted`/`cancelled`) — and a settled-partial show
+ *     (e.g. one season evicted after being watched, ADR-0012) holds that status
+ *     indefinitely, so counting it would keep the badge permanently lit with
+ *     zero activity. Overstating activity is as dishonest as understating it.
  *
  * This is the single source of truth for "this request is still being worked"
  * so the shell's Requests nav badge (issue #187) can't silently desync from the
