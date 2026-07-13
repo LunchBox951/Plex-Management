@@ -1441,6 +1441,66 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 81 }),
     )
   })
+
+  it('rebinds to the fresh row after "Request again" replaces a SETTLED bound row', async () => {
+    // Issue #272: the operator opened the modal on a settled (evicted) row via
+    // `boundRequestId`. Firing "Request again" creates a brand-new, active
+    // request — the modal must track THAT row from then on, never the dead
+    // evicted one `boundRequestId` still names, even once a LATER poll brings
+    // both rows back (a literal id match on the stale prop would otherwise win
+    // forever).
+    const settledRow: RequestResponse = {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'evicted',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const freshRow: RequestResponse = {
+      id: 82,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const createRequestMock = mutation(freshRow)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    const view = render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    expect(screen.getByText('Evicted')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /request again/i }))
+    await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
+
+    // The poll catches up: BOTH rows now come back, the old settled one still
+    // present right alongside the fresh one. `boundRequestId` (the prop) is
+    // still literally 81 — before the fix this would keep resolving to the dead
+    // evicted row forever, masking the fresh, genuinely active request.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [settledRow, freshRow] },
+    })
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    await waitFor(() => expect(screen.queryByText('Evicted')).not.toBeInTheDocument())
+    expect(
+      screen.getByText('Your request is queued and will be searched automatically.'),
+    ).toBeInTheDocument()
+  })
 })
 
 describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {

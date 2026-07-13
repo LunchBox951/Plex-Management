@@ -43,9 +43,14 @@ def test_precedence_order_downloading_beats_searching_and_later() -> None:
     assert rollup_status(["downloading", "searching", "no_acceptable_release"]) == "downloading"
 
 
-# -- completed is a DONE state, NOT a precedence winner -------------------------
-# It must never outrank an unstarted/failed sibling: a terminal "completed" over a
-# pending season both lies that the show is finished and blocks that season's grab.
+# -- completed (issue #265): an in-flight precedence winner, like the four above --
+# A season still "Finalizing" (imported, awaiting Plex confirmation) is genuinely
+# active, so -- exactly like import_blocked/downloading/searching/
+# no_acceptable_release -- it must win the parent status outright over EVERY other
+# season, dormant or settled, so the nav badge's IN_FLIGHT_REQUEST_STATUSES check
+# (frontend/src/lib/status.ts) counts the request while it finalizes. It is
+# ordered LAST among the five precedence statuses (lowest urgency): the four
+# "needs attention" statuses above it still win when mixed with it.
 
 
 def test_single_completed_season_is_completed() -> None:
@@ -62,18 +67,27 @@ def test_all_done_available_and_completed_is_completed() -> None:
     assert rollup_status(["available", "completed"]) == "completed"
 
 
-def test_completed_mixed_with_pending_is_partially_available() -> None:
-    # The regression guard: a finished S1 must NOT force the parent to terminal
-    # "completed" while S2 is still pending (unstarted, and must stay grabbable).
-    assert rollup_status(["completed", "pending"]) == "partially_available"
+def test_completed_wins_outright_over_pending() -> None:
+    # The issue #265 regression: a genuinely finalizing S1 must NOT be masked as
+    # "partially_available" (invisible to the nav badge) just because S2 is still
+    # pending (unstarted). The show is finalizing -- it must read that way.
+    assert rollup_status(["completed", "pending"]) == "completed"
 
 
-def test_completed_mixed_with_failed_is_partially_available() -> None:
-    assert rollup_status(["completed", "failed"]) == "partially_available"
+def test_completed_wins_outright_over_waiting_for_air_date() -> None:
+    # Same as above for the other dormant status the issue calls out by name.
+    assert rollup_status(["completed", "waiting_for_air_date"]) == "completed"
 
 
-def test_completed_mixed_with_pending_and_failed_is_partially_available() -> None:
-    assert rollup_status(["available", "completed", "pending", "failed"]) == "partially_available"
+def test_completed_wins_outright_over_failed() -> None:
+    assert rollup_status(["completed", "failed"]) == "completed"
+
+
+def test_completed_wins_outright_over_available_pending_and_failed() -> None:
+    # The exact scenario in issue #265: one season finalizing, another already
+    # available, a third not yet started -- the show is still actively finalizing,
+    # not merely "partially available".
+    assert rollup_status(["available", "completed", "pending", "failed"]) == "completed"
 
 
 # -- no precedence status: available/pending/failed fold -----------------------
@@ -131,8 +145,10 @@ def test_evicted_mixed_with_available_is_partially_available() -> None:
     assert rollup_status(["available", "evicted"]) == "partially_available"
 
 
-def test_evicted_mixed_with_completed_is_partially_available() -> None:
-    assert rollup_status(["completed", "evicted"]) == "partially_available"
+def test_evicted_mixed_with_completed_wins_outright_as_completed() -> None:
+    # issue #265: a still-finalizing sibling wins outright even over an evicted
+    # (settled) one -- the show is genuinely still active, not merely partial.
+    assert rollup_status(["completed", "evicted"]) == "completed"
 
 
 def test_evicted_mixed_with_available_and_pending_is_partially_available() -> None:
@@ -180,8 +196,9 @@ def test_cancelled_mixed_with_available_is_partially_available() -> None:
     assert rollup_status(["available", "cancelled"]) == "partially_available"
 
 
-def test_cancelled_mixed_with_completed_is_partially_available() -> None:
-    assert rollup_status(["completed", "cancelled"]) == "partially_available"
+def test_cancelled_mixed_with_completed_wins_outright_as_completed() -> None:
+    # issue #265: mirrors the evicted case above -- completed wins over cancelled too.
+    assert rollup_status(["completed", "cancelled"]) == "completed"
 
 
 def test_cancelled_mixed_with_pending_and_no_done_season_is_pending() -> None:

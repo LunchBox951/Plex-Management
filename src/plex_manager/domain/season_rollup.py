@@ -27,17 +27,38 @@ __all__ = ["rollup_status"]
 # behind). Mirrors (as bare literals) ``models.RequestStatus`` members of the same
 # name; order is for readability only, membership is what is tested.
 #
-# ``completed`` is deliberately NOT here: it is a DONE state (imported, awaiting
-# Plex confirmation), and a done season must never outrank an unstarted/failed
-# sibling. If it won precedence, ``[completed, pending]`` would roll the parent up
-# to the TERMINAL ``completed`` — both lying that the whole show is finished and
-# blocking the pending season's grab (grab_endpoint gates on the parent's terminal
-# status). ``completed`` is folded into the done/partial branch below instead.
+# ``completed`` (issue #265) IS here, deliberately last: it is the in-flight
+# "Finalizing" phase (imported, awaiting Plex's availability confirmation --
+# deliberately NOT settled, see ``_SETTLED_REQUEST_STATUSES`` in
+# ``repositories/requests.py``), not a quietly-done state like ``available``. A
+# season that finished importing but hasn't been Plex-confirmed yet is every bit
+# as "active" as one still searching or downloading, so it must win over a
+# dormant (``pending``/``waiting_for_air_date``) or settled (``failed``/
+# ``evicted``/``cancelled``) sibling the exact same way the four statuses above
+# it do -- otherwise the parent reads the honest-sounding but WRONG
+# ``partially_available`` while a season is still finalizing, and
+# ``frontend/src/lib/status.ts``'s nav badge (which deliberately excludes
+# ``partially_available`` from ``IN_FLIGHT_REQUEST_STATUSES``, precisely BECAUSE
+# it assumes precedence already promotes every genuinely-active season) goes dark
+# for the whole finalizing window. Placed LAST in the tuple (lowest urgency of
+# the five): a season that is merely awaiting confirmation must never outrank a
+# sibling that is actually blocked/downloading/searching/exhausted -- those four
+# are still real problems or real activity; ``completed`` is neither.
+#
+# This intentionally accepts the same coarse-grained trade-off the rollup already
+# has for ``failed``/``evicted``/``cancelled`` (see the module docstring and
+# ``test_cancelled_mixed_with_failed_and_no_done_season_is_failed``): the PARENT
+# status is a single fold over every season, so a request-level consumer that
+# switches on it (e.g. ``grab_service``'s up-front
+# ``TERMINAL_REQUEST_STATUS_VALUES`` gate) sees one value for the whole show, not
+# a per-season one. That has never been season-precise for TV, and this change
+# does not make it any less precise than it already was.
 _PRECEDENCE_STATUSES: tuple[str, ...] = (
     "import_blocked",
     "downloading",
     "searching",
     "no_acceptable_release",
+    "completed",
 )
 
 # The complete, legitimate season-status vocabulary (issue #79): every bare-string
@@ -73,32 +94,41 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
     Precedence, in order:
 
     1. Any season in :data:`_PRECEDENCE_STATUSES` (``import_blocked`` /
-       ``downloading`` / ``searching`` / ``no_acceptable_release``) wins outright.
+       ``downloading`` / ``searching`` / ``no_acceptable_release`` /
+       ``completed``, issue #265) wins outright. ``completed`` is the in-flight
+       "Finalizing" phase (imported, awaiting Plex's availability confirmation),
+       not a quietly-settled one, so a show with one season still finalizing must
+       read that way even while its other seasons are dormant (``pending`` /
+       ``waiting_for_air_date``), settled (``failed`` / ``evicted`` /
+       ``cancelled``), or genuinely done (``available``) -- exactly like the four
+       statuses above it, and for the same reason: understating activity is as
+       dishonest as overstating it (see :data:`_PRECEDENCE_STATUSES` for the full
+       rationale, including why it is ordered last).
     2. Every season ``evicted`` (ADR-0012's disk-pressure sweep reclaimed every
        tracked season's file) -> the (non-terminal, re-requestable) ``"evicted"``,
        mirroring the movie-level ``RequestStatus.evicted`` semantics.
-    3. Otherwise every remaining season is one of ``pending``/``available``/
-       ``completed``/``failed``/``evicted``. ``available`` and ``completed`` are
-       the two REAL-DONE states (``completed`` = imported, Plex-confirmation
-       pending) — something is actually watchable/imported right now.
+    3. Otherwise (no ``completed`` season -- rule 1 already claimed those) every
+       remaining season is one of ``pending``/``available``/``failed``/
+       ``evicted``/``cancelled``. ``available`` is now the ONLY real-done state
+       reachable here — something is actually watchable right now.
        ``"partially_available"`` must only ever be reported when at least one
-       season is REAL-DONE; an ``evicted`` season never earns it on its own,
-       because nothing about an eviction leaves anything watchable behind:
-       - every season done, all ``available``, none ``evicted`` -> ``"available"``
-       - every season done, at least one still ``completed`` (no ``evicted``) ->
-         ``"completed"``
-       - a done season mixed with an ``evicted`` one (no ``pending``/``failed``) ->
-         ``"partially_available"`` (some seasons present, one reclaimed)
-       - a REAL-DONE season mixed with any ``pending``/``failed``/``evicted`` ->
+       season is real-done; an ``evicted``/``cancelled`` season never earns it on
+       its own, because nothing about an eviction or a cancellation leaves
+       anything watchable behind:
+       - every season done, all ``available``, none gone -> ``"available"``
+       - an ``available`` season mixed with a gone (``evicted``/``cancelled``)
+         one (no ``pending``/``failed``) -> ``"partially_available"`` (some
+         seasons present, one reclaimed/never fetched)
+       - an ``available`` season mixed with any ``pending``/``failed``/gone ->
          ``"partially_available"`` (honest, and non-terminal so the unfinished
          season stays grabbable)
-       - NO real-done season is present (only ``evicted``/``pending``/``failed``,
-         e.g. one season evicted and another failed) -> nothing is actually
-         watchable, so this must NOT read ``"partially_available"``; ``evicted``
-         folds in alongside ``failed`` for this purpose (both mean "nothing on
-         disk for this season right now") and the remaining ``pending``/
-         ``failed`` rule applies: any ``pending`` -> ``"pending"``, else
-         -> ``"failed"``
+       - NO ``available`` season is present (only ``evicted``/``cancelled``/
+         ``pending``/``failed``, e.g. one season evicted and another failed) ->
+         nothing is actually watchable, so this must NOT read
+         ``"partially_available"``; ``evicted``/``cancelled`` fold in alongside
+         ``failed`` for this purpose (all three mean "nothing on disk for this
+         season right now") and the remaining ``pending``/``failed`` rule
+         applies: any ``pending`` -> ``"pending"``, else -> ``"failed"``
 
     Pure and total over the season-status vocabulary: every combination of
     ``pending``/``searching``/``no_acceptable_release``/``downloading``/
@@ -147,30 +177,31 @@ def rollup_status(season_statuses: Sequence[str]) -> str:
     if statuses == {"waiting_for_air_date"}:
         return "waiting_for_air_date"
 
-    # Only pending/available/completed/failed/evicted/cancelled remain among the
-    # season statuses. ``evicted`` and ``cancelled`` fold alongside available/
-    # completed as "gone/settled" for the purposes of this branch, EXCEPT neither
-    # may ever let the whole show read as cleanly "available" (their file is gone /
-    # was never fetched) -- see the docstring above. They are grouped identically
-    # here: both mean "nothing on disk for this season right now".
-    _DONE = {"available", "completed"}
+    # Only pending/available/failed/evicted/cancelled can remain among the season
+    # statuses here -- ``completed`` is impossible past this point, the precedence
+    # loop above always claims it first (issue #265). ``evicted`` and ``cancelled``
+    # fold alongside ``available`` as "gone/done" for the purposes of this branch,
+    # EXCEPT neither may ever let the whole show read as cleanly "available"
+    # (their file is gone / was never fetched) -- see the docstring above. They
+    # are grouped identically here: both mean "nothing on disk for this season
+    # right now".
+    _DONE = {"available"}
     _GONE = {"evicted", "cancelled"}
     _DONE_OR_GONE = _DONE | _GONE
-    # Every season is done-or-gone AND at least one is REAL-DONE (available/
-    # completed). A ``statuses & _DONE`` guard is REQUIRED: an all-GONE mix with no
-    # done season (e.g. ``{evicted, cancelled}`` -- neither single-type early return
-    # above caught it) has nothing watchable and must NOT read partially_available;
-    # it falls through to the pending/failed tail below instead.
+    # Every season is done-or-gone AND at least one is REAL-DONE (available). A
+    # ``statuses & _DONE`` guard is REQUIRED: an all-GONE mix with no done season
+    # (e.g. ``{evicted, cancelled}`` -- neither single-type early return above
+    # caught it) has nothing watchable and must NOT read partially_available; it
+    # falls through to the pending/failed tail below instead.
     if statuses <= _DONE_OR_GONE and statuses & _DONE:
         if statuses == {"available"}:
             return "available"
-        if statuses & _GONE:
-            return "partially_available"
-        # Every season is done (available/completed, none gone) but at least one
-        # is still awaiting Plex confirmation -> the (terminal) "completed".
-        return "completed"
+        # Every season is available/evicted/cancelled, at least one is available,
+        # and (since the ``{"available"}`` case was just excluded) at least one is
+        # gone -- some seasons present, one reclaimed/never fetched.
+        return "partially_available"
     if statuses & _DONE:
-        # At least one REAL-DONE season (available/completed) is mixed with a
+        # At least one REAL-DONE (``available``) season is mixed with a
         # pending/failed/evicted/cancelled one: honestly partial -- something is
         # actually watchable right now, and never a terminal status that would mask
         # the unfinished season or block its grab. Deliberately checked against
