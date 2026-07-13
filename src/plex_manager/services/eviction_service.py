@@ -76,7 +76,7 @@ from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestSt
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import purge_service, season_request_service
+from plex_manager.services import purge_service, season_request_service, watchlist_service
 from plex_manager.services.health_service import read_disk_usage
 from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
@@ -316,6 +316,7 @@ async def _movie_candidates(
             watched=watch.watched,
             last_viewed_at=watch.last_viewed_at,
             keep_forever=row.keep_forever,
+            watchlisted=await watchlist_service.is_watchlisted(session, row.tmdb_id, "movie"),
             in_flight=in_flight,
             library_path=row.library_path,
             size_percent=size_percent,
@@ -385,6 +386,7 @@ async def _season_candidates(
             watched=watch.watched,
             last_viewed_at=watch.last_viewed_at,
             keep_forever=parent.keep_forever,
+            watchlisted=await watchlist_service.is_watchlisted(session, row.tmdb_id, "tv"),
             in_flight=in_flight,
             library_path=row.library_path,
             size_percent=size_percent,
@@ -446,6 +448,7 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
         ) is not None
         return (
             not parent.keep_forever
+            and not await watchlist_service.is_watchlisted(session, pending.tmdb_id, "tv")
             and season.status == RequestStatus.available.value
             and not in_flight
         )
@@ -458,6 +461,7 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
     ) is not None
     return (
         not request.keep_forever
+        and not await watchlist_service.is_watchlisted(session, pending.tmdb_id, "movie")
         and request.status == RequestStatus.available.value
         and not in_flight
     )
@@ -1452,6 +1456,7 @@ async def _evict_one(
             status=RequestStatus.evicted.value,
             allowed_from=frozenset({RequestStatus.available.value}),
             require_parent_unpinned=True,
+            require_not_watchlisted=True,
             tolerate_active_conflict=True,
         )
     else:
@@ -1460,6 +1465,7 @@ async def _evict_one(
             RequestStatus.evicted.value,
             frozenset({RequestStatus.available.value}),
             require_unpinned=True,
+            require_not_watchlisted=True,
         )
 
     if not claimed:

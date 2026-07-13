@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING, Any, cast
 from sqlalchemy import ColumnElement, CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+    WatchlistItem,
+)
 from plex_manager.ports.repositories import SeasonRequestRecord
 
 if TYPE_CHECKING:
@@ -442,6 +448,7 @@ class SqlSeasonRequestRepository:
         allowed_from: frozenset[str],
         *,
         require_parent_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
         status is in ``allowed_from`` (and, with ``require_parent_unpinned``, only
@@ -482,6 +489,17 @@ class SqlSeasonRequestRepository:
                 .exists()
             )
             predicates.append(~parent_pinned)
+        if require_not_watchlisted:
+            watchlisted = (
+                select(WatchlistItem.user_id)
+                .join(MediaRequest, MediaRequest.tmdb_id == WatchlistItem.tmdb_id)
+                .where(
+                    MediaRequest.id == SeasonRequest.media_request_id,
+                    WatchlistItem.media_type == MediaType.tv,
+                )
+                .exists()
+            )
+            predicates.append(~watchlisted)
         stmt = (
             update(SeasonRequest)
             .where(*predicates)

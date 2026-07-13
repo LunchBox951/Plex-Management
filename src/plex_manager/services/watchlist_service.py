@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.watchlist import WatchlistPort
 
-__all__ = ["WatchlistSyncResult", "list_sync_users", "sync_user"]
+__all__ = ["WatchlistSyncResult", "is_watchlisted", "list_sync_users", "sync_user"]
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,14 @@ async def list_sync_users(session: AsyncSession) -> list[User]:
     """Return users with reusable Plex account credentials."""
     stmt = select(User).where(User.encrypted_plex_token.is_not(None)).order_by(User.id)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def is_watchlisted(session: AsyncSession, tmdb_id: int, media_type: str) -> bool:
+    stmt = select(WatchlistItem.user_id).where(
+        WatchlistItem.tmdb_id == tmdb_id,
+        WatchlistItem.media_type == MediaType(media_type),
+    )
+    return (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None
 
 
 async def sync_user(

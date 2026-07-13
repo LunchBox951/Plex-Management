@@ -22,6 +22,7 @@ from plex_manager.models import (
     RequestStatus,
     RequestSubscriber,
     SeasonRequest,
+    WatchlistItem,
 )
 from plex_manager.ports.repositories import RequestRecord
 
@@ -778,6 +779,7 @@ class SqlRequestRepository:
         allowed_from: frozenset[str],
         *,
         require_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
         status is in ``allowed_from`` (and, with ``require_unpinned``, only if the
@@ -825,6 +827,16 @@ class SqlRequestRepository:
         ]
         if require_unpinned:
             predicates.append(MediaRequest.keep_forever.is_(False))
+        if require_not_watchlisted:
+            watchlisted = (
+                select(WatchlistItem.user_id)
+                .where(
+                    WatchlistItem.tmdb_id == MediaRequest.tmdb_id,
+                    WatchlistItem.media_type == MediaRequest.media_type,
+                )
+                .exists()
+            )
+            predicates.append(~watchlisted)
         stmt = (
             update(MediaRequest)
             .where(*predicates)

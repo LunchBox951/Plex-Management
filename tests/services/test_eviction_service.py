@@ -39,6 +39,8 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
     SeasonRequest,
+    User,
+    WatchlistItem,
 )
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
@@ -446,6 +448,106 @@ async def test_never_evicts_a_keep_forever_pinned_movie(
 
     assert outcomes == []
     assert Path(library_path).exists()
+
+
+async def test_never_evicts_a_movie_on_any_user_watchlist(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    library_path = _movie_file(tmp_path, "Watchlisted.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=4004, title="Watchlisted", library_path=library_path
+    )
+    async with sessionmaker_() as session:
+        user = User(username="watcher")
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=4004, media_type=MediaType.movie))
+        await session.commit()
+    library = FakeLibrary(
+        watch_states={(4004, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+        row = await session.get(MediaRequest, request_id)
+
+    assert outcomes == []
+    assert row is not None and row.status is RequestStatus.available
+    assert Path(library_path).exists()
+
+
+async def test_movie_claim_cas_rejects_watchlist_added_after_assembly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4005,
+        title="Late Watchlist",
+        library_path=_movie_file(tmp_path, "Late Watchlist.mkv"),
+    )
+    async with sessionmaker_() as session:
+        user = User(username="late-watcher")
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=4005, media_type=MediaType.movie))
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        claimed = await SqlRequestRepository(session).set_status_if_in(
+            request_id,
+            RequestStatus.evicted.value,
+            frozenset({RequestStatus.available.value}),
+            require_unpinned=True,
+            require_not_watchlisted=True,
+        )
+        row = await session.get(MediaRequest, request_id)
+    assert claimed is False
+    assert row is not None and row.status is RequestStatus.available
+
+
+async def test_tv_claim_cas_rejects_watchlist_added_after_assembly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    show_id = await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=4006,
+        title="Late Show Watchlist",
+        seasons={1: _movie_file(tmp_path, "Late Show Watchlist.mkv")},
+    )
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+            )
+        ).scalar_one()
+        season_id = season.id
+        user = User(username="late-show-watcher")
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=4006, media_type=MediaType.tv))
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        claimed = await SqlSeasonRequestRepository(session).set_status_if_in(
+            season_id,
+            RequestStatus.evicted.value,
+            frozenset({RequestStatus.available.value}),
+            require_parent_unpinned=True,
+            require_not_watchlisted=True,
+        )
+        row = await session.get(SeasonRequest, season_id)
+    assert claimed is False
+    assert row is not None and row.status is RequestStatus.available
 
 
 async def test_never_evicts_a_title_with_an_active_download_in_flight(

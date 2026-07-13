@@ -99,6 +99,7 @@ class EvictionCandidate:
     in_flight: bool
     library_path: str | None
     size_percent: float
+    watchlisted: bool = False
 
 
 def _is_eligible(
@@ -122,6 +123,7 @@ def _is_eligible(
         and candidate.watched
         and last_viewed_at < grace_cutoff
         and not candidate.keep_forever
+        and not candidate.watchlisted
         and not candidate.in_flight
     )
 

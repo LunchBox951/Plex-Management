@@ -444,6 +444,7 @@ class RequestRepository(Protocol):
         allowed_from: frozenset[str],
         *,
         require_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
         (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
@@ -755,6 +756,7 @@ class SeasonRequestRepository(Protocol):
         allowed_from: frozenset[str],
         *,
         require_parent_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
         (and, with ``require_parent_unpinned``, only if the PARENT show is not
