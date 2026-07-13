@@ -207,8 +207,13 @@ flowchart TD
     end
 ```
 
-Config and database live in a **mounted volume** so updates and rollbacks never
-touch user data. Rollback is re-pointing a tag.
+Config and database live in a **mounted volume**, which persists them across
+restarts and updates — the volume is not a backup. Every container start runs
+`alembic upgrade head` before serving. When no migration ran between two
+versions, rollback is re-pointing a tag; across a migration, rollback instead
+means restoring the pre-migration backup (database + encryption key), then
+running the older tag — see
+[ADR-0023](../adr/0023-database-rollback-and-pre-migration-backup.md).
 
 ## 7. Technology stack
 

@@ -121,10 +121,100 @@ set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
 
 Each host is *designed* to auto-pull its release channel (the updater mechanism —
 Watchtower vs. a systemd timer — is an open decision and is not bundled in the
-compose file yet). Your config and database live in a mounted volume and are
-untouched by updates. See
+compose file yet). Your config and database live in a **mounted volume, which
+persists them across restarts and updates — but the volume is not a backup.**
+Every container start runs `alembic upgrade head` (startup migrations) before
+serving traffic. See
 [ADR-0003](docs/adr/0003-docker-ghcr-packaging.md) and
 [ADR-0004](docs/adr/0004-edge-stable-release-channels.md).
+
+**Rollback:** if no migration ran between the two versions (same schema),
+rollback is simply re-pointing the older image tag. If a migration *did* run,
+an older image generally **cannot start** against a database already stamped
+with a newer revision it doesn't know — rolling back across a migration means
+restoring the pre-migration backup (below), then running the older tag. See
+[ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) for the
+full policy and why Alembic's `downgrade` scripts are not treated as a general,
+non-destructive rollback path.
+
+### Backup & recovery
+
+The database and the Fernet encryption key at `<data_dir>/secret.key` (or the
+`PLEX_MANAGER_FERNET_KEY` env override, for k8s-style deployments) are **one
+recovery unit**. A replacement key cannot decrypt Plex tokens, service
+credentials, the recovery API key, or magnet links already stored in the
+database — losing the key without a copy of it makes an otherwise-intact
+database backup useless for recovering those secrets.
+
+On the **SQLite** deployment, every container start that finds a pending
+migration automatically snapshots this unit *before* applying it, into
+`<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/` (the database file, the
+key file when one exists, and a `MANIFEST.txt` restore runbook), pruned to the
+most recent 5. This is advisory and best-effort — fail-loud but never fatal to
+startup — not a replacement for your own backup strategy. Know its limits:
+
+- **`PLEX_MANAGER_FERNET_KEY` deployments:** the automatic backup is
+  **database-only**. The active key lives in your environment/secret store, so
+  no key file is written into the backup (a stale on-disk `secret.key`, if one
+  is left over, is deliberately *not* copied — it is not the active key). You
+  must preserve the `PLEX_MANAGER_FERNET_KEY` value yourself; it is the key
+  half of the recovery unit, and the `MANIFEST.txt` records this.
+- **PostgreSQL deployments:** **no automatic backup is taken at all.** Take
+  your own `pg_dump` (below) *and* save the key before upgrading — do not rely
+  on a `pre-migrate-*` directory existing.
+
+**SQLite (the default, named-volume) deployment:**
+```bash
+# Stop the container, then snapshot the database via the SQLite backup API --
+# a bare `cp` of plex_manager.db can miss committed rows still sitting in the
+# -wal sidecar (e.g. after a crash/kill; this is why the automatic backup
+# uses the same API):
+sqlite3 /path/to/volume/plex_manager.db ".backup './backup/plex_manager.db'"
+# Key-file (default) deployments: the key is the other half of the recovery
+# unit; keep it with the snapshot (mode 0600 must be preserved on restore):
+cp /path/to/volume/secret.key ./backup/
+chmod 600 ./backup/secret.key
+```
+
+The key half follows the same disposition rules as the PostgreSQL section
+below: on `PLEX_MANAGER_FERNET_KEY` deployments, skip the `secret.key` copy
+and preserve the env value instead — any leftover `secret.key` in the volume
+is stale and must **not** be saved as the key half.
+
+**Restoring** a SQLite backup: after copying `plex_manager.db` (and `secret.key`,
+per the key-half rules above) back into the volume, remove any stale
+`plex_manager.db-wal` / `plex_manager.db-shm` sidecar files left next to it
+*before* starting the older image. The backup is a standalone snapshot;
+leftover WAL frames belong to whatever database was running most recently
+(likely a newer one) and SQLite replays them on open, which can silently
+reintroduce the very data/schema you are trying to roll back away from.
+If you copied the files from the host as root (typical for named-volume
+restores), also restore ownership — the image runs the app as the non-root
+`appuser` (UID 10001), which must be able to *write* the database and *read*
+the key: `chown 10001:10001 plex_manager.db secret.key` (keep the key at mode
+0600).
+
+**PostgreSQL deployment:** `pg_dump` backs up the database only — the Fernet
+key is never in Postgres. Where the key half lives depends on your deployment:
+
+- **Key file (the default):** the active key is `secret.key` in the app
+  container's data directory — copy it alongside the dump and keep the two
+  together:
+  ```bash
+  pg_dump -Fc plexmanager > plexmanager.dump
+  cp /path/to/data_dir/secret.key ./backup/secret.key
+  chmod 600 ./backup/secret.key
+  ```
+- **`PLEX_MANAGER_FERNET_KEY` deployments:** the active key is the environment
+  value, and any on-disk `secret.key` is absent or stale — it is **not** the
+  active key, so do not save it as if it were. Preserve the
+  `PLEX_MANAGER_FERNET_KEY` value from your environment/secret store together
+  with the dump.
+
+**Restore verification:** after restoring, start the container, sign in, and
+confirm a configured service (Plex/Prowlarr/qBittorrent/TMDB) still shows its
+stored credential correctly — if it doesn't decrypt, the key and database are
+out of sync.
 
 ## Developing
 
