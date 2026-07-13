@@ -206,8 +206,24 @@ export function Requests() {
 
   const reSearchRequest = (request: RequestResponse) => {
     nextActionToken.current += 1
+    // Resolve the target season from THIS request row's fresh season data — the
+    // first no-release season is exactly the state the shortcut exists to fix.
+    // The modal must not derive it from its own season selection: a reused modal
+    // instance can still hold another title's pick when the action fires (see
+    // TitleDetailModalAction.season). `null` for movies, and as the defensive tv
+    // fallback (request-scoped preview) if no tracked season reads no-release.
+    const season =
+      request.media_type === 'tv'
+        ? (request.seasons?.find((s) => s.status === 'no_acceptable_release')?.season_number ??
+          null)
+        : null
     setSelected(requestToDiscoverResult(request))
-    setModalAction({ kind: 're-search', requestId: request.id, token: nextActionToken.current })
+    setModalAction({
+      kind: 're-search',
+      requestId: request.id,
+      season,
+      token: nextActionToken.current,
+    })
     setModalOpen(true)
   }
 

@@ -35,6 +35,15 @@ import { useTitleReleasePreview } from './useTitleReleasePreview'
 export interface TitleDetailModalAction {
   kind: 're-search'
   requestId: number
+  /**
+   * The TV season the shortcut targets, resolved by the CALLER from the fresh
+   * request row it was clicked on (`null` for a movie). The action effect must
+   * not fall back to the modal's own `currentSeason`: when one long-mounted
+   * modal instance is reused across titles, the title-reset effect has not yet
+   * applied in the render this action first fires in, so `currentSeason` can
+   * still read a season the operator picked on a DIFFERENT title.
+   */
+  season: number | null
   token: number
 }
 
@@ -441,7 +450,12 @@ export function TitleDetailModal({
       return
     }
     consumedActionToken.current = action.token
-    void runPreview(action.requestId)
+    // The season comes from the action itself (resolved by the caller from the
+    // clicked request row), passed as an explicit override: `runPreview`'s
+    // `currentSeason` fallback closes over pre-reset state in this effect pass
+    // (see TitleDetailModalAction.season). `null` explicitly omits the season
+    // (movie, or a defensive tv fallback -> request-scoped series preview).
+    void runPreview(action.requestId, action.season)
   }, [action, isAdmin, open, runPreview])
 
   const onRequest = useCallback(async () => {

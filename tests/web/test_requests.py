@@ -531,8 +531,10 @@ async def test_list_requests_batches_season_rows_not_one_query_per_tv_row(
 async def test_request_download_progress_is_truthful_or_null(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
-    """Known zero/42% survive, while missing, ambiguous, and non-downloading
-    projections remain null rather than fabricating an aggregate/default."""
+    """Known zero/42% survive, while missing, ambiguous, non-downloading, and
+    client-missing projections remain null rather than fabricating an
+    aggregate/default/stale value — and one live transfer beside a
+    client-missing sibling still projects its own honest number."""
     await seed(initialized=True, app_api_key=_API_KEY)
 
     async with app.state.sessionmaker() as session:
@@ -566,7 +568,29 @@ async def test_request_download_progress_is_truthful_or_null(
             title="Still Searching",
             status=RequestStatus.searching,
         )
-        session.add_all([known_zero, known_42, missing, ambiguous_tv, not_downloading])
+        vanished = MediaRequest(
+            tmdb_id=615,
+            media_type=MediaType.movie,
+            title="Vanished From Client",
+            status=RequestStatus.downloading,
+        )
+        one_live_one_missing = MediaRequest(
+            tmdb_id=616,
+            media_type=MediaType.tv,
+            title="One Live One Missing",
+            status=RequestStatus.downloading,
+        )
+        session.add_all(
+            [
+                known_zero,
+                known_42,
+                missing,
+                ambiguous_tv,
+                not_downloading,
+                vanished,
+                one_live_one_missing,
+            ]
+        )
         await session.flush()
         session.add_all(
             [
@@ -607,6 +631,35 @@ async def test_request_download_progress_is_truthful_or_null(
                     media_type=MediaType.movie,
                     progress=0.8,
                 ),
+                # Non-terminal but NOT live: the torrent vanished from qBittorrent
+                # and the reconciler parked the row in ``client_missing`` while the
+                # request rides out the grace window still reading ``downloading``.
+                # Its frozen last-known 97% must not be presented as live progress.
+                Download(
+                    torrent_hash="vanished-row",
+                    status="client_missing",
+                    media_request_id=vanished.id,
+                    media_type=MediaType.movie,
+                    progress=0.97,
+                ),
+                # A client-missing sibling does not make the ONE genuinely live
+                # transfer ambiguous: its live value is still the only honest number.
+                Download(
+                    torrent_hash="olom-live",
+                    status="downloading",
+                    media_request_id=one_live_one_missing.id,
+                    media_type=MediaType.tv,
+                    season=1,
+                    progress=0.33,
+                ),
+                Download(
+                    torrent_hash="olom-missing",
+                    status="client_missing",
+                    media_request_id=one_live_one_missing.id,
+                    media_type=MediaType.tv,
+                    season=2,
+                    progress=0.66,
+                ),
             ]
         )
         await session.commit()
@@ -620,6 +673,8 @@ async def test_request_download_progress_is_truthful_or_null(
         "Missing Download": None,
         "Two Seasons": None,
         "Still Searching": None,
+        "Vanished From Client": None,
+        "One Live One Missing": 0.33,
     }
 
     # Single-record responses use the same one-request projection semantics.

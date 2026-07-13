@@ -69,6 +69,28 @@ describe('useTitleReleasePreview', () => {
     expect(mocks.mutateAsync).toHaveBeenLastCalledWith({ request_id: 12, season: 3 })
   })
 
+  it('clears (not merely masks) the result when the title changes', async () => {
+    const other: DiscoverResult = {
+      ...MOVIE,
+      tmdb_id: 43,
+      title: 'Other Movie',
+    }
+    const hook = renderHook(
+      ({ title }: { title: DiscoverResult }) => useTitleReleasePreview(title, null),
+      { initialProps: { title: MOVIE } },
+    )
+
+    await act(async () => hook.result.current.runPreview(7))
+    expect(hook.result.current.preview).toEqual(PREVIEW)
+
+    // A long-mounted modal moving A -> B -> back to A must NOT resurface A's old
+    // result: the request/blocklist context that produced it may have changed.
+    hook.rerender({ title: other })
+    expect(hook.result.current.preview).toBeNull()
+    hook.rerender({ title: MOVIE })
+    expect(hook.result.current.preview).toBeNull()
+  })
+
   it('drops a result that resolves after the modal moves to another title', async () => {
     let resolvePreview: ((value: SearchPreviewResponse) => void) | undefined
     mocks.mutateAsync.mockReturnValue(

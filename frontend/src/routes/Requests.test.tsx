@@ -331,7 +331,7 @@ describe('Requests — admin no-release shortcut', () => {
     await waitFor(() => expect(previewMutation).toHaveBeenCalledTimes(1))
   })
 
-  it('uses the modal-selected TV season for an inline re-search', async () => {
+  it('targets the row-resolved no-release TV season for an inline re-search', async () => {
     const previewMutation = vi.fn().mockResolvedValue(EMPTY_PREVIEW)
     ;(useSearchPreview as unknown as Mock).mockReturnValue({
       mutateAsync: previewMutation,

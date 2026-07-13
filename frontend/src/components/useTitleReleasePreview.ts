@@ -37,9 +37,19 @@ export function useTitleReleasePreview(
     latestTitleKey.current = titleKey
   }, [titleKey])
 
-  // Key the result instead of synchronously clearing state in an effect. A title
-  // change therefore hides the old result in that very render, even before the
-  // stale async guard's ref update runs.
+  // CLEAR (not merely mask) the stored result whenever the title changes. A
+  // long-mounted modal can move A -> B -> back to A; a masked-but-retained A
+  // result would resurface then, even though the request/blocklist context that
+  // produced it may have changed. Adjusting state during render makes the old
+  // result invisible in this very render (no stale-frame flash) AND drops it for
+  // good; the keyed derivation below stays as the same-render guard for results
+  // the async path stored before this render committed.
+  const [clearedForTitleKey, setClearedForTitleKey] = useState(titleKey)
+  if (clearedForTitleKey !== titleKey) {
+    setClearedForTitleKey(titleKey)
+    setPreviewState(null)
+  }
+
   const preview = previewState?.titleKey === titleKey ? previewState.value : null
 
   const clearPreview = useCallback(() => setPreviewState(null), [])

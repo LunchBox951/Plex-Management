@@ -1053,7 +1053,7 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
       keep_forever: false,
     }
     const previewMutation = baseMocks([request])
-    const action = { kind: 're-search' as const, requestId: 71, token: 9 }
+    const action = { kind: 're-search' as const, requestId: 71, season: null, token: 9 }
     const view = render(
       <StrictMode>
         <TitleDetailModal title={TITLE} open onOpenChange={() => {}} action={action} />
@@ -1073,7 +1073,7 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
     await waitFor(() => expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1))
   })
 
-  it('uses the modal-selected actionable TV season', async () => {
+  it('uses the action-supplied TV season, not the modal season state', async () => {
     const title: DiscoverResult = {
       media_type: 'tv',
       tmdb_id: 100,
@@ -1101,12 +1101,83 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
         title={title}
         open
         onOpenChange={() => {}}
-        action={{ kind: 're-search', requestId: 72, token: 10 }}
+        action={{ kind: 're-search', requestId: 72, season: 2, token: 10 }}
       />,
     )
 
     await waitFor(() =>
       expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 72, season: 2 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a stale season picked on a PREVIOUS title in the same modal instance', async () => {
+    // A long-mounted modal is reused across titles. The operator picks season 1
+    // on show A; the shortcut then opens show B in the same instance. The action
+    // effect fires in the render where `activeSeason` still holds A's pick (the
+    // title-reset effect has not applied yet), so the search must use the season
+    // the action carries — resolved from B's own fresh request row — never the
+    // modal's stale season state.
+    const showA: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 100,
+      title: 'Show A',
+      year: 2022,
+      library_state: 'processing',
+    }
+    const showB: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 200,
+      title: 'Show B',
+      year: 2023,
+      library_state: 'processing',
+    }
+    const requestA: RequestResponse = {
+      id: 73,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Show A',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'downloading' },
+        { season_number: 2, status: 'pending' },
+      ],
+    }
+    const requestB: RequestResponse = {
+      id: 74,
+      tmdb_id: 200,
+      media_type: 'tv',
+      title: 'Show B',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'no_acceptable_release' },
+      ],
+    }
+    const previewMutation = baseMocks([requestA, requestB])
+
+    const view = render(
+      <TitleDetailModal title={showA} open onOpenChange={() => {}} action={null} />,
+    )
+    // Show B also tracks a season 1, so this stale pick stays "valid" for B and
+    // would silently win inside `resolveSeason` without the explicit override.
+    fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
+
+    view.rerender(
+      <TitleDetailModal
+        title={showB}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 74, season: 2, token: 12 }}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 74, season: 2 }),
     )
     expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
   })
@@ -1128,7 +1199,7 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
         title={TITLE}
         open
         onOpenChange={() => {}}
-        action={{ kind: 're-search', requestId: 71, token: 11 }}
+        action={{ kind: 're-search', requestId: 71, season: null, token: 11 }}
       />,
     )
 
