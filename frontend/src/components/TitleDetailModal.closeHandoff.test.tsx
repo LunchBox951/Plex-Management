@@ -68,7 +68,7 @@ beforeEach(() => {
   ;(useReportIssue as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useCancelRequest as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { requests: [] } })
-  ;(useQueue as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { queue: [] } })
+  ;(useQueue as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { queue: [] } });
 })
 
 /** Renders the real TitleDetailModal beside a focusable trigger, controlled
