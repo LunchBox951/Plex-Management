@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import type { ReactNode } from 'react'
+import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useAuthMe, useRequests, useSearchPreview } from '../api/hooks'
@@ -35,11 +35,27 @@ vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) 
 // Passthrough Dialog so the modal's content renders as plain DOM — no Radix
 // portal focus-trap noise in a jsdom test environment.
 vi.mock('../components/ui/Dialog', () => ({
-  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
+  Dialog: ({
+    title,
+    children,
+    customChrome = false,
+  }: {
+    title: string
+    children: ReactNode
+    customChrome?: boolean
+  }) => (
     <div>
-      <h2>{title}</h2>
+      {customChrome ? null : <h2>{title}</h2>}
       {children}
     </div>
+  ),
+  DialogTitle: ({ children, ...props }: HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 {...props}>{children}</h2>
+  ),
+  DialogClose: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
   ),
 }))
 
