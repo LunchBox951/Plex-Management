@@ -53,7 +53,7 @@ def test_changelog_covers_shipped_beta_milestones() -> None:
         "ADR-0011",  # TV support
         "ADR-0014",  # correction verbs
         "ADR-0016",  # Plex owner sessions
-        "ADR-0021",  # backup/rollback policy this PR introduces
+        "ADR-0023",  # backup/rollback policy this PR introduces
         "db_backup",
     ):
         assert marker in text, f"expected {marker!r} to be covered in CHANGELOG.md"

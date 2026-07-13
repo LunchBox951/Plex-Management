@@ -133,7 +133,7 @@ rollback is simply re-pointing the older image tag. If a migration *did* run,
 an older image generally **cannot start** against a database already stamped
 with a newer revision it doesn't know — rolling back across a migration means
 restoring the pre-migration backup (below), then running the older tag. See
-[ADR-0021](docs/adr/0021-database-rollback-and-pre-migration-backup.md) for the
+[ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) for the
 full policy and why Alembic's `downgrade` scripts are not treated as a general,
 non-destructive rollback path.
 

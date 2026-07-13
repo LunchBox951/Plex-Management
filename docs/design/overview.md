@@ -213,7 +213,7 @@ restarts and updates — the volume is not a backup. Every container start runs
 versions, rollback is re-pointing a tag; across a migration, rollback instead
 means restoring the pre-migration backup (database + encryption key), then
 running the older tag — see
-[ADR-0021](../adr/0021-database-rollback-and-pre-migration-backup.md).
+[ADR-0023](../adr/0023-database-rollback-and-pre-migration-backup.md).
 
 ## 7. Technology stack
 

@@ -35,7 +35,7 @@ blast shield for release *and* migration bugs.
 - Stable deployments provably run what was tested on the canary, not a fresh build.
 - Migrations are de-risked: they execute on the canary before any stable host.
 - Rollback is re-pointing a tag.
-  > **Qualified by [ADR-0021](0021-database-rollback-and-pre-migration-backup.md):**
+  > **Qualified by [ADR-0023](0023-database-rollback-and-pre-migration-backup.md):**
   > this holds only when no migration ran between the two versions. An older
   > image generally cannot start against a database already stamped with a
   > newer revision — cross-migration rollback restores the pre-migration

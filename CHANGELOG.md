@@ -41,7 +41,7 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
 - `plex_manager.db_backup`: an advisory, WAL-consistent snapshot of the SQLite
   database and the Fernet encryption key as one recovery unit, taken before a
   pending migration is applied at container start, pruned to the most recent 5
-  ([ADR-0021](docs/adr/0021-database-rollback-and-pre-migration-backup.md)).
+  ([ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md)).
 - Documented single-source app/package version (`plex_manager.__version__`,
   read by hatch, surfaced as OpenAPI `info.version`) and a release checklist in
   `CONTRIBUTING.md` so the app version and a promoted image tag cannot silently
@@ -58,7 +58,7 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
 - 17 Alembic migrations have shipped since the alpha's initial schema; every
   container start runs `alembic upgrade head` before serving. Rollback and
   backup expectations are now documented honestly rather than implied — see
-  [ADR-0021](docs/adr/0021-database-rollback-and-pre-migration-backup.md) and
+  [ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) and
   the README "Backup & recovery" section.
 
 ### Fixed

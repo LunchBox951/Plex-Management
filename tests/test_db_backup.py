@@ -1,4 +1,4 @@
-"""Tests for the advisory pre-migration DB + key backup (ADR-0021, #221, #222).
+"""Tests for the advisory pre-migration DB + key backup (ADR-0023, #221, #222).
 
 Each test builds a throwaway ``Settings`` pointed at a ``tmp_path`` SQLite file
 (via ``Settings(_env_file=None, ...)`` so no real ``.env``/process env leaks
@@ -541,7 +541,7 @@ def test_unknown_head_backup_does_not_prune_existing_backups(
     per restart (the head is undeterminable each time). If each of those
     triggered the normal keep-5 prune, enough restarts would evict the genuine
     pre-migration backup that guards the last successful migration -- exactly
-    the recovery unit ADR-0021 depends on. So an unknown-head backup must add
+    the recovery unit ADR-0023 depends on. So an unknown-head backup must add
     itself without pruning anything, even when the total now exceeds
     ``_KEEP_COUNT``.
     """

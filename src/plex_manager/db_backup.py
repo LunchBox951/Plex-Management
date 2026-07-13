@@ -1,4 +1,4 @@
-"""Advisory pre-migration backup of the SQLite database + Fernet key (ADR-0021).
+"""Advisory pre-migration backup of the SQLite database + Fernet key (ADR-0023).
 
 Run as ``python -m plex_manager.db_backup`` from the container entrypoint,
 *before* ``alembic upgrade head``. When a migration is actually pending, this
@@ -30,7 +30,7 @@ This is advisory, not a replacement for an operator's own backup strategy
 (Postgres deployments are explicitly out of scope -- see :func:`_sqlite_file_path`)
 and it is deliberately **fail-loud but never fatal**: :func:`main` always exits
 0 so the entrypoint's ``set -e`` never bricks a container start over a failed
-backup. See ADR-0021 for the policy this implements and the reasoning against
+backup. See ADR-0023 for the policy this implements and the reasoning against
 relying on Alembic downgrade scripts as a general rollback path.
 """
 
@@ -140,7 +140,7 @@ def _current_revision(db_path: Path) -> str | None:
     publish and prune around a misleading ``pre-migrate-base-*`` unit before
     Alembic itself later fails on the same database. Instead they propagate to
     :func:`main`, which logs loudly and takes the documented fail-loud /
-    no-fresh-backup path (ADR-0021).
+    no-fresh-backup path (ADR-0023).
     """
     conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
     try:
@@ -378,7 +378,7 @@ Restore steps:
      overrides the container user).
   6. Re-point the deployment at the older image tag that matches this
      database revision (same-schema rollback: just re-point; cross-migration
-     rollback: this backup unit IS the recovery path -- see ADR-0021).
+     rollback: this backup unit IS the recovery path -- see ADR-0023).
   7. Start the container and verify: sign in, and confirm a stored credential
      (e.g. a configured service) still decrypts correctly.
   8. Move this backup directory out of <data_dir>/backups/ (keep it as an
@@ -388,7 +388,7 @@ Restore steps:
      this same database revision will find this directory and skip taking a
      fresh pre-migration snapshot until it is moved away.
 
-See docs/adr/0021-database-rollback-and-pre-migration-backup.md and the
+See docs/adr/0023-database-rollback-and-pre-migration-backup.md and the
 README "Backup & recovery" section for the full policy.
 """
     (dest_dir / _MANIFEST_NAME).write_text(manifest, encoding="utf-8")
@@ -467,7 +467,7 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
             "No on-disk SQLite database file (non-SQLite backend, or an "
             "in-memory database); automatic pre-migration file backup is not "
             "performed. Snapshot the database AND the encryption key "
-            "externally before upgrades (see ADR-0021 / README Backup & recovery)."
+            "externally before upgrades (see ADR-0023 / README Backup & recovery)."
         )
         return None
 
@@ -491,7 +491,7 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     # will refuse to upgrade from it, so backing up here would only snapshot the
     # already-migrated (useless-for-rollback) DB -- and, under
     # ``restart: unless-stopped``, every restart would _prune() away the genuine
-    # pre-migration backup ADR-0021's recovery path relies on. Skip backup AND
+    # pre-migration backup ADR-0023's recovery path relies on. Skip backup AND
     # prune, and log the mismatch honestly. (When head itself is undeterminable
     # we cannot trust the graph read, so fall through to a defensive backup.)
     if current is not None and head != _UNKNOWN_HEAD and not _revision_in_graph(current):
@@ -502,7 +502,7 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
             "an unknown revision, so there is no forward migration to guard; "
             "skipping the pre-migration backup AND prune so a genuine pre-migration "
             "backup is neither overwritten nor pruned away. Re-point the deployment "
-            "at the image that matches revision %s (see ADR-0021).",
+            "at the image that matches revision %s (see ADR-0023).",
             current,
             current,
         )
@@ -598,7 +598,7 @@ def main() -> None:
     (exit 0), so a failed backup -- a full disk, a permissions fault, a locked
     file -- trades an *unprotected but running* startup for never bricking a
     container over a snapshot (the entrypoint runs under ``set -e``). See
-    ADR-0021.
+    ADR-0023.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:

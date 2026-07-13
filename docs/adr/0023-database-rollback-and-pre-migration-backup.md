@@ -1,4 +1,4 @@
-# ADR-0021: Database rollback policy and automatic pre-migration backup
+# ADR-0023: Database rollback policy and automatic pre-migration backup
 
 - **Status:** Accepted
 - **Date:** 2026-07-13

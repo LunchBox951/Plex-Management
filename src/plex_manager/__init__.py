@@ -6,5 +6,5 @@
 # to it when no image build id is injected. No release has been promoted yet
 # (see CHANGELOG.md `[Unreleased]`), so this stays "0.0.0" until the maintainer
 # bumps it as the first step of the release checklist in CONTRIBUTING.md — see
-# ADR-0021.
+# ADR-0023.
 __version__ = "0.0.0"
