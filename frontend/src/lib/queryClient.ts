@@ -19,6 +19,10 @@ export const REQUESTS_REALTIME_FLOOR_MS = 45000
 // cache on the upstream probes (ADR-0012), so polling faster than this would
 // just re-read the same cached snapshot without learning anything new.
 export const OPS_POLL_INTERVAL_MS = 15000
+// The updater sidecar heartbeats on a similarly coarse cadence. Realtime
+// invalidations make transitions feel immediate; this poll is the permanent
+// safety net when the stream is disconnected or an event is missed.
+export const UPDATE_STATUS_POLL_INTERVAL_MS = 15000
 // The Logs page's live-tail toggle — a snappier cadence than the durable
 // store poll above, since the ring buffer is meant to feel "live".
 export const LOG_TAIL_POLL_INTERVAL_MS = 3000
@@ -53,6 +57,7 @@ export const queryKeys = {
   searchPreview: ['search-preview'] as const,
   opsHealth: ['ops', 'health'] as const,
   opsDisk: ['ops', 'disk'] as const,
+  updateStatus: ['updates', 'status'] as const,
   opsLogsTail: ['ops', 'logs', 'tail'] as const,
   opsLogs: (filter: {
     level?: string

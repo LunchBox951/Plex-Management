@@ -30,6 +30,7 @@ data
 *.db
 *.sqlite3
 .env
+.plex-manager-updater-token
 
 # Docs & tests are not needed at runtime
 docs
