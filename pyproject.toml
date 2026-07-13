@@ -23,6 +23,11 @@ dependencies = [
     "alembic>=1.13",
     "httpcore>=1.0,<2.0",
     "httpx>=0.27",
+    # Direct import in the qbittorrent adapter (catching idna.IDNAError, which
+    # leaks raw out of httpx URL/Host handling for malformed A-labels). Always
+    # present anyway as httpx's own hard dependency; declared so the import is
+    # first-class rather than transitive.
+    "idna>=3",
     # Release-name parser (borrowed brains, ADR-0008). Pinned exactly: the
     # parse output drives the safety-critical CAM/TS hard cutoff, so a silent
     # upgrade must never shift classification (golden tests guard it too).

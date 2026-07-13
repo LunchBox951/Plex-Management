@@ -63,6 +63,7 @@ from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 import anyio.to_thread
 import httpcore
 import httpx
+import idna
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.domain.failure_classification import ENVIRONMENTAL_FAILURE_PATTERNS
@@ -616,13 +617,37 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     """Normalize a URL to its ``(scheme, host, port)`` origin, or ``None``.
 
     The identity used to match a torrent-source hop against the OPERATOR-
-    CONFIGURED Prowlarr endpoint: compared by URL origin (scheme + casefolded
-    host + effective port), deliberately NEVER by resolved addresses — a
-    hostile DNS answer must not be able to claim the trust. ``None`` for a
-    non-http(s), hostless, malformed-port, or entirely UNPARSABLE URL (e.g. a
-    bad IPv6 literal makes ``urlparse``/``parsed.hostname`` raise ValueError):
-    nothing trustable — the caller keeps the SSRF veto fully closed rather
-    than crashing outside the source-error taxonomy.
+    CONFIGURED Prowlarr endpoint: compared by URL origin (scheme + host +
+    effective port), deliberately NEVER by resolved addresses — a hostile DNS
+    answer must not be able to claim the trust. ``None`` for a non-http(s),
+    hostless, malformed-port, or entirely UNPARSABLE URL (e.g. a bad IPv6
+    literal makes ``urlparse``/``parsed.hostname`` raise ValueError, and an
+    IPvFuture literal or invalid-IDNA host makes ``httpx.URL`` raise
+    InvalidURL): nothing trustable — the caller keeps the SSRF veto fully
+    closed rather than crashing outside the source-error taxonomy.
+
+    The host term is the CONNECT-TIME identity: the exact ASCII form httpx's
+    own encoder will hand the transport (IDNA-encoded, lowercased) — NOT a
+    plain ``casefold`` of ``parsed.hostname``. Casefolding is the wrong
+    equivalence here: ``"faß.de".casefold() == "fass.de"``, yet httpx connects
+    a ``faß.de`` URL to ``xn--fa-hia.de`` — a DIFFERENT host that a
+    casefold-based match would let inherit the trusted origin's
+    private-address exemption. Deriving BOTH the stored trusted origin and
+    every per-hop candidate through the same httpx encoding keeps the trust
+    decision and the actual connection agreeing by construction: punycode
+    ASCII stays as-is, a Unicode host encodes to its IDNA form on both sides
+    (``ServiceUrl.parse`` already stores the configured base in IDNA form),
+    and plain ASCII hosts are merely lowercased — preserving the pre-existing
+    case-insensitive host match.
+
+    The ``.lower()`` on the encoded host exists for IP literals: httpx
+    lowercases registered names itself but PRESERVES hex-letter case in an
+    IPv6 literal (``[FE80::1]`` stays ``FE80::1``), so without it a trusted
+    origin configured in one case would deny its own downloadUrls written in
+    the other — failing CLOSED on legitimate fetches. Post-encoding the host
+    is pure ASCII (reg-names already IDNA/punycode), where lowercasing is
+    both IDNA-correct and DNS/IP-semantics-preserving; it cannot reintroduce
+    the Unicode-casefold hole, which exists only in PRE-encoding comparisons.
     """
     try:
         parsed = urlparse(url)
@@ -632,7 +657,17 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
         port = parsed.port
     except ValueError:
         return None
-    return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
+    # ``idna.IDNAError`` (a UnicodeError sibling of UnicodeDecodeError, NOT an
+    # httpx.InvalidURL) escapes some httpx URL operations raw -- e.g. a
+    # malformed A-label like ``xn--`` fails idna-decoding in httpx internals.
+    # Nothing trustable either way: the veto stays fully closed.
+    try:
+        host = httpx.URL(url).raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, idna.IDNAError, UnicodeDecodeError):
+        return None
+    if not host:
+        return None
+    return scheme, host, port or (443 if scheme == "https" else 80)
 
 
 # Segment forms that are ambiguous under percent-decoding: a reverse proxy
@@ -683,7 +718,17 @@ def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, 
     return origin, segments
 
 
-async def _assert_safe_fetch_url(url: str) -> None:
+def _safe_fetch_shape(url: str) -> tuple[str, int]:
+    """Validate scheme + hostname SHAPE only (no DNS) and return ``(host, port)``.
+
+    ``SafeFetchNetworkBackend.connect_tcp`` never sees the URL scheme (only a
+    host/port pair), so an unsupported scheme -- e.g. a redirect hop that left
+    http(s) -- must still be caught here, before any connection is attempted.
+    Everything DNS-shaped (resolution + the private/global address veto) is
+    deliberately NOT done here: see ``_assert_safe_fetch_url_shape`` and
+    ``_assert_safe_fetch_url`` for why the two callers need different amounts
+    of work at this point.
+    """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
@@ -699,7 +744,50 @@ async def _assert_safe_fetch_url(url: str) -> None:
         # down" 502.
         raise QbittorrentSourceError("unsupported torrent source URL")
     port = _safe_fetch_port(parsed, parsed.scheme)
+    return hostname, port
+
+
+async def _assert_safe_fetch_url_shape(url: str) -> None:
+    """Per-hop pre-check for the REAL network path: scheme/host shape only.
+
+    Used when the fetch will go through ``SafeFetchNetworkBackend``, which
+    performs the single AUTHORITATIVE DNS resolution + SSRF/rebinding pin at
+    connect time and connects to exactly the address it validated. Resolving
+    DNS again here (issue #38) would be a second, wasted lookup that buys no
+    extra safety -- the connect-time pin already independently re-validates
+    whatever IT resolves before connecting to it -- while reopening a window
+    where the two lookups could answer differently for a rebinding host.
+    """
+    _safe_fetch_shape(url)
+
+
+async def _assert_safe_fetch_url(url: str) -> None:
+    """Full per-hop pre-check: shape + DNS resolution/vetting.
+
+    Used ONLY for the ``source_client``-injected fetch path (a test seam: no
+    production caller ever passes ``source_client``). That path supplies its
+    own transport and never goes through ``SafeFetchNetworkBackend``, so this
+    is the ONLY place DNS gets resolved and vetted for it -- unlike the real
+    network path (``_assert_safe_fetch_url_shape``), collapsing this one to
+    shape-only would drop DNS vetting entirely rather than just deduplicate it.
+    """
+    hostname, port = _safe_fetch_shape(url)
     await _safe_fetch_addresses_async(hostname, port)
+
+
+class _SafeFetchVetoError(httpcore.ConnectError):
+    """The connect-time SSRF/rebinding veto specifically (resolve failure or a
+    private/non-global address), raised only by ``SafeFetchNetworkBackend.connect_tcp``.
+
+    Kept distinct from a plain ``httpcore.ConnectError`` -- a genuine connect
+    failure (refused, unreachable, timed out) -- purely so the operator-facing
+    message survives the httpx wrap in ``_SafeFetchTransport`` and the
+    ``QbittorrentSourceError`` re-raise in ``_resolve_http_source_with_client``:
+    without this, both cases collapsed into httpx's generic
+    ``httpx.RequestError`` and the specific "unsafe torrent source URL" message
+    degraded to the generic "torrent source request failed" for a statically
+    SSRF-blocked source on the real network path.
+    """
 
 
 class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -712,26 +800,47 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
     rejects any non-global answer, then asks the real backend to connect to the
     vetted IP while httpcore keeps the original origin for Host and TLS SNI.
 
-    ``trusted_host_port`` is the single OPERATOR-CONFIGURED trusted source
-    endpoint (the Prowlarr host + effective port, derived from the same
-    configured base URL the app already calls for every Prowlarr API request):
-    a connection to exactly that host+port may resolve to a private address
-    (``http://prowlarr:9696`` on a compose network, ``127.0.0.1``, RFC1918 —
-    the normal self-hosted layout). Every other host keeps the full veto, so a
-    redirect OFF the configured endpoint re-enters the normal SSRF guard.
+    ``connect_tcp`` itself only ever sees a bare host+port -- it has no idea
+    which URL, and therefore which PATH, is being fetched. The operator-
+    configured trusted source origin (the Prowlarr host + effective port the
+    app already calls for every API request) may carry a reverse-proxy path
+    PREFIX that is itself a service/credential boundary (ADR-0018): a redirect
+    that stays on that exact host+port but steps outside the trusted prefix
+    must NOT inherit the private-address allowance, even though its connection
+    identity (host+port) is indistinguishable from a genuinely trusted hop.
+    Host+port alone can therefore never be the trust signal here -- the only
+    place with the full URL is the caller
+    (``QbittorrentClient._resolve_http_source_with_client``, via
+    ``_is_trusted_source_url``), which reports its per-hop decision through
+    :meth:`note_hop_trust` immediately before the request that will trigger
+    the connection for that hop. The grant is not a bare boolean either: it
+    carries the exact (ASCII/IDNA-form) host+port the trusted origin will
+    connect to, and ``connect_tcp`` honors it only when the host+port it is
+    ACTUALLY asked to connect matches -- so a grant issued against one URL can
+    never leak to a different encoded host that merely compared equal at the
+    URL level. Trust defaults to, and is reset to, CLOSED after every
+    ``connect_tcp`` call, so a hop the caller forgot to mark -- or an extra
+    connection this backend didn't anticipate -- fails safe.
     """
 
-    def __init__(
-        self,
-        delegate: httpcore.AsyncNetworkBackend | None = None,
-        trusted_host_port: tuple[str, int] | None = None,
-    ) -> None:
+    def __init__(self, delegate: httpcore.AsyncNetworkBackend | None = None) -> None:
         self._delegate: httpcore.AsyncNetworkBackend = (
             delegate
             if delegate is not None
             else cast(httpcore.AsyncNetworkBackend, httpcore.AnyIOBackend())
         )
-        self._trusted_host_port = trusted_host_port
+        self._hop_trust: tuple[str, int] | None = None
+
+    def note_hop_trust(self, host_port: tuple[str, int] | None) -> None:
+        """Grant (or, with ``None``, withhold) the private-address exemption
+        for the NEXT ``connect_tcp`` call -- and only if that call's actual
+        host+port equals ``host_port`` exactly. ``host_port`` must be the
+        connect-time identity: the trusted origin's host in the same
+        ASCII/IDNA form httpx hands the transport, lowercased
+        (``_source_origin_triple`` produces exactly that form). See the class
+        docstring for why ``connect_tcp`` can't make this decision on its
+        own."""
+        self._hop_trust = host_port
 
     async def connect_tcp(
         self,
@@ -741,13 +850,24 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        trusted = self._trusted_host_port is not None and (
-            (host.casefold(), port) == self._trusted_host_port
-        )
+        granted = self._hop_trust
+        # Consume the grant: fail closed by default for any call the caller
+        # didn't explicitly mark trusted immediately beforehand.
+        self._hop_trust = None
+        # The exemption applies only when the connection's ACTUAL host+port is
+        # the granted one -- a URL whose host merely compared equal under some
+        # looser equivalence (e.g. a Unicode casefold alias that IDNA-encodes
+        # to a different registrable host) connects to a different host and
+        # must keep the full veto. ``host`` is lowercased for the comparison
+        # because httpx preserves hex-letter case in IPv6 literals
+        # (``[FE80::1]`` connects as ``FE80::1``) while the grant is stored
+        # lowercase (``_source_origin_triple``); post-encoding ASCII
+        # lowercasing is IDNA/DNS/IP-correct and cannot widen the grant.
+        trusted = granted is not None and (host.lower(), port) == granted
         try:
             addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
         except QbittorrentError as exc:
-            raise httpcore.ConnectError("unsafe torrent source URL") from exc
+            raise _SafeFetchVetoError("unsafe torrent source URL") from exc
         # ``ConnectTimeout`` is a ``TimeoutException`` subclass, NOT a
         # ``ConnectError`` -- a broken-IPv6 dual-stack host times out on its AAAA
         # address, so catching only ``ConnectError`` would abandon the working IPv4
@@ -766,7 +886,7 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
                 last_error = exc
         if last_error is not None:
             raise last_error
-        raise httpcore.ConnectError("unsafe torrent source URL")
+        raise _SafeFetchVetoError("unsafe torrent source URL")
 
     async def connect_unix_socket(
         self,
@@ -803,14 +923,22 @@ class _SafeFetchResponseStream(httpx.AsyncByteStream):
 class _SafeFetchTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport for untrusted indexer/Prowlarr torrent URLs."""
 
-    def __init__(self, trusted_host_port: tuple[str, int] | None = None) -> None:
+    def __init__(self) -> None:
+        self._network_backend = SafeFetchNetworkBackend()
         self._pool = httpcore.AsyncConnectionPool(
-            network_backend=SafeFetchNetworkBackend(trusted_host_port=trusted_host_port),
+            network_backend=self._network_backend,
             http1=True,
             http2=False,
             retries=0,
             max_keepalive_connections=0,
         )
+
+    def note_hop_trust(self, host_port: tuple[str, int] | None) -> None:
+        """Forward the caller's per-hop trust grant (the trusted origin's
+        connect-time host+port, or ``None`` for an untrusted hop) to the
+        connect-time backend for the request about to be sent. See
+        :meth:`SafeFetchNetworkBackend.note_hop_trust`."""
+        self._network_backend.note_hop_trust(host_port)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if not isinstance(request.stream, httpx.AsyncByteStream):
@@ -829,6 +957,13 @@ class _SafeFetchTransport(httpx.AsyncBaseTransport):
         )
         try:
             resp = await self._pool.handle_async_request(req)
+        except _SafeFetchVetoError as exc:
+            # Preserve the specific connect-time SSRF/rebinding veto message --
+            # caught ahead of the generic ``_HTTP_CORE_EXCEPTIONS`` tuple below
+            # (``_SafeFetchVetoError`` is itself a ``NetworkError`` subclass and
+            # would otherwise be caught there first and degrade to the generic
+            # message the same as any ordinary connect failure).
+            raise httpx.TransportError("unsafe torrent source URL", request=request) from exc
         except _HTTP_CORE_EXCEPTIONS as exc:
             raise httpx.TransportError("torrent source request failed", request=request) from exc
 
@@ -1114,24 +1249,61 @@ class QbittorrentClient:
 
     # ---- add ------------------------------------------------------------ #
     async def _resolve_http_source_with_client(
-        self, client: httpx.AsyncClient, url: str
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        precheck_resolves_dns: bool,
+        transport: _SafeFetchTransport | None = None,
     ) -> tuple[str | None, bytes | None]:
         """Walk an HTTP(S) source to a magnet URI or ``.torrent`` body.
 
         Returns ``(magnet_uri, None)`` if a redirect leads to a magnet, or
         ``(None, torrent_bytes)`` if the URL serves a bencoded ``.torrent``.
         qBittorrent cannot follow HTTP->magnet redirects itself, hence this walk.
+
+        ``precheck_resolves_dns`` picks which per-hop pre-check runs: the real
+        network path (``client`` backed by ``_SafeFetchTransport``) passes
+        ``False`` -- DNS resolution happens exactly once per hop, authoritatively,
+        inside ``SafeFetchNetworkBackend.connect_tcp`` below. The
+        ``source_client``-injected path (test seam; no connect-time backend of
+        its own) passes ``True`` so this pre-check remains the one place that
+        resolves + vets DNS for it. See :func:`_assert_safe_fetch_url_shape` and
+        :func:`_assert_safe_fetch_url`.
+
+        ``transport`` is the real network path's ``_SafeFetchTransport`` (``None``
+        for the ``source_client`` seam, which has no connect-time backend of its
+        own). It must be told this hop's trust decision -- via
+        ``_is_trusted_source_url``, the only place with the full URL including
+        its path -- immediately before every request: ``connect_tcp`` only ever
+        sees a bare host+port, so it cannot re-derive whether THIS hop sits
+        beneath the trusted origin's prefix on its own (see
+        :class:`SafeFetchNetworkBackend`).
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
-            # Per-hop trust check, by URL ORIGIN only (never DNS results): a hop on
-            # exactly the operator-configured Prowlarr origin skips the private-
-            # address veto (Prowlarr serves .torrent downloadUrls pointing at itself,
-            # typically a private/compose address); any redirect OFF that origin --
-            # including to another private host -- re-enters the full SSRF veto on
-            # its own next iteration.
-            if not self._is_trusted_source_url(current):
-                await _assert_safe_fetch_url(current)
+            # Per-hop trust check, by URL ORIGIN + PATH PREFIX (never DNS
+            # results): a hop beneath the operator-configured Prowlarr origin's
+            # prefix skips the private-address veto (Prowlarr serves .torrent
+            # downloadUrls pointing at itself, typically a private/compose
+            # address); any redirect OFF that origin or prefix -- including to
+            # another private host, or a sibling path on the SAME host+port --
+            # re-enters the full SSRF veto on its own next iteration.
+            is_trusted = self._is_trusted_source_url(current)
+            if transport is not None:
+                # The grant carries the trusted origin's connect-time host+port
+                # (already in httpx's ASCII/IDNA form via _source_origin_triple);
+                # the backend honors it only when the actual connect matches.
+                transport.note_hop_trust(
+                    (self._trusted_source_origin[1], self._trusted_source_origin[2])
+                    if is_trusted and self._trusted_source_origin is not None
+                    else None
+                )
+            if not is_trusted:
+                if precheck_resolves_dns:
+                    await _assert_safe_fetch_url(current)
+                else:
+                    await _assert_safe_fetch_url_shape(current)
             try:
                 async with client.stream("GET", current, follow_redirects=False) as response:
                     if response.is_redirect:
@@ -1178,6 +1350,22 @@ class QbittorrentClient:
                         if body[:1] == b"d":
                             return None, body
                     break
+            except (httpx.InvalidURL, idna.IDNAError) as exc:
+                # A source URL that urlparse accepts but httpx rejects while
+                # BUILDING the request. Two distinct escape routes, neither a
+                # ``httpx.RequestError`` subclass, so without this catch an
+                # attacker-suppliable indexer URL would escape the adapter's
+                # source-error taxonomy and 500 the manual grab / abort the
+                # auto-grab cycle instead of being a 422 release problem:
+                # ``httpx.InvalidURL`` (Exception directly) from URL parsing
+                # -- e.g. an IPvFuture literal like ``http://[v1.fe80::]/`` --
+                # and raw ``idna.IDNAError`` (a UnicodeError) leaking out of
+                # ``httpx.URL.host``'s idna-decode during Host-header
+                # preparation for a malformed A-label like ``http://xn--/``.
+                # The shape-only pre-check on the real network path
+                # deliberately no longer resolves the hostname (issue #38), so
+                # these now surface here instead of at resolve time.
+                raise QbittorrentSourceError("unsupported torrent source URL") from exc
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):
                 # a SOURCE problem -- qBittorrent was never contacted, so the
@@ -1185,6 +1373,16 @@ class QbittorrentClient:
                 # "qBittorrent request failed" blamed a healthy client). Still never
                 # an opaque httpx error -> 500; no url/secret in the message. The
                 # auto-grab park backoff retries a transiently-down source later.
+                #
+                # On the real network path, a statically-blocked source (a host
+                # that resolves to a private/non-global address) is vetoed inside
+                # ``SafeFetchNetworkBackend.connect_tcp`` -- ``exc.__cause__`` is
+                # then the distinguishable ``_SafeFetchVetoError`` -- rather than
+                # by the pre-check here, so surface the same specific message the
+                # pre-check would have raised instead of the generic one, keeping
+                # the operator-facing message honest about *why* the fetch failed.
+                if isinstance(exc.__cause__, _SafeFetchVetoError):
+                    raise QbittorrentSourceError("unsafe torrent source URL") from exc
                 raise QbittorrentSourceError("torrent source request failed") from exc
         return None, None
 
@@ -1210,22 +1408,32 @@ class QbittorrentClient:
 
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
         if self._source_client is not None:
-            return await self._resolve_http_source_with_client(self._source_client, url)
-        # The connection-time backend needs the same single allowance the per-hop
-        # URL check grants: the trusted origin's host may legitimately resolve to a
-        # private address. (scheme is enforced at the URL level; host+port is the
-        # connection's identity.)
-        trusted_host_port = (
-            (self._trusted_source_origin[1], self._trusted_source_origin[2])
-            if self._trusted_source_origin is not None
-            else None
-        )
+            # Test seam only (never wired in production): this client's own
+            # transport is not ``_SafeFetchTransport``, so it has no connect-time
+            # DNS pin of its own -- the per-hop pre-check must do the full
+            # resolve + vet.
+            return await self._resolve_http_source_with_client(
+                self._source_client, url, precheck_resolves_dns=True
+            )
+        # The connection-time backend needs the same per-hop allowance the URL
+        # check grants (the trusted origin's host, beneath its configured
+        # prefix, may legitimately resolve to a private address) -- reported
+        # fresh for every hop via ``note_hop_trust``, never derived from a
+        # host+port comparison at connect time (that can't see the path, so it
+        # can't tell a trusted hop from an off-prefix sibling on the same
+        # host+port; see ``SafeFetchNetworkBackend``).
+        transport = _SafeFetchTransport()
         async with httpx.AsyncClient(
-            transport=_SafeFetchTransport(trusted_host_port=trusted_host_port),
+            transport=transport,
             timeout=30.0,
             trust_env=False,
         ) as client:
-            return await self._resolve_http_source_with_client(client, url)
+            # The real network path: DNS resolves exactly once per hop, inside
+            # ``SafeFetchNetworkBackend.connect_tcp``, which is also the
+            # connection's authority -- the pre-check here is shape-only.
+            return await self._resolve_http_source_with_client(
+                client, url, precheck_resolves_dns=False, transport=transport
+            )
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         """Add a torrent; return its lowercased info-hash + whether it was created.
