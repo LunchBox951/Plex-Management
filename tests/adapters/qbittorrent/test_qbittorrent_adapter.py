@@ -1152,15 +1152,55 @@ def test_is_trusted_source_url_prefix_matrix(url: str, expected: bool) -> None:
 
 def test_trusted_origin_idna_host_normalizes_symmetrically_with_candidates() -> None:
     """The stored trusted origin and every per-hop candidate origin MUST be
-    derived through the same normalization. ``ServiceUrl.origin`` IDNA-decodes
-    the host to Unicode (via ``httpx.URL.host``), while every candidate hop is
-    normalized with plain ``urlparse`` (punycode ASCII, never decoded) -- had
-    the stored side been taken from ``ServiceUrl.origin`` directly, an
-    IDNA-hostname Prowlarr base would never again match its own downloadUrls."""
+    derived through the same normalization -- both now go through httpx's own
+    host encoder (``_source_origin_triple``), which keeps punycode ASCII
+    as-is. Had the stored side been IDNA-decoded to Unicode (as
+    ``ServiceUrl.origin`` does via ``httpx.URL.host``) while candidates
+    stayed ASCII, an IDNA-hostname Prowlarr base would never again match its
+    own downloadUrls."""
     idna_origin = "http://xn--e1afmkfd.example:9696/prowlarr"
     client = _client(trusted_source_origin=idna_origin)
     assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
         f"{idna_origin}/1/download?apikey=x"
+    )
+
+
+def test_unicode_casefold_alias_of_trusted_host_is_not_trusted() -> None:
+    """``"faß.de".casefold() == "fass.de"``, but httpx connects a ``faß.de``
+    URL to ``xn--fa-hia.de`` -- a DIFFERENT registrable host. A casefold-based
+    origin match would hand that other host the trusted origin's
+    private-address exemption; the httpx-encoder-based match must not. The
+    match must also stay symmetric: a Unicode-configured base still trusts its
+    own downloadUrls in either spelling (``ServiceUrl.parse`` stores the base
+    in IDNA form, and candidates encode to the same form), and plain ASCII
+    hosts keep their case-insensitive match."""
+    client = _client(trusted_source_origin="http://fass.de/prowlarr")
+    # The genuine trusted host, in any ASCII case, stays trusted.
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://fass.de/prowlarr/1/download"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://FASS.de/prowlarr/1/download"
+    )
+    # The Unicode casefold alias encodes to a different host: never trusted.
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://faß.de/prowlarr/1/download"
+    )
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://xn--fa-hia.de/prowlarr/1/download"
+    )
+
+    # Symmetric case: a Unicode-configured base trusts its own host in both
+    # Unicode and punycode spellings, and does NOT trust the casefold alias.
+    unicode_client = _client(trusted_source_origin="http://faß.de/prowlarr")
+    assert unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://faß.de/prowlarr/1/download"
+    )
+    assert unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://xn--fa-hia.de/prowlarr/1/download"
+    )
+    assert not unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://fass.de/prowlarr/1/download"
     )
 
 
@@ -1277,11 +1317,11 @@ async def test_safe_fetch_backend_allows_private_answer_only_when_hop_marked_tru
     a genuinely trusted hop from an off-prefix sibling that happens to share
     the same host+port (see ``SafeFetchNetworkBackend``'s docstring and issue
     #38's follow-up: a same-host, off-prefix redirect must NOT inherit the
-    private-address allowance). Trust is instead reported per hop by the
+    private-address allowance). Trust is instead granted per hop by the
     caller via ``note_hop_trust`` immediately before the connect it applies
     to, and is consumed (reset to closed) by that one ``connect_tcp`` call --
-    a private DNS answer connects only for a call explicitly marked trusted;
-    the identical answer for an unmarked call, on the very same host+port,
+    a private DNS answer connects only for a call explicitly granted trust;
+    the identical answer for an ungranted call, on the very same host+port,
     stays a refused connect."""
 
     def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
@@ -1290,25 +1330,60 @@ async def test_safe_fetch_backend_allows_private_answer_only_when_hop_marked_tru
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
     trusted_backend = SafeFetchNetworkBackend(_AcceptingBackend())
-    trusted_backend.note_hop_trust(True)
+    trusted_backend.note_hop_trust(("prowlarr.local", 9696))
     stream = await trusted_backend.connect_tcp("prowlarr.local", 9696)
     assert isinstance(stream, _DummyNetworkStream)
 
     # Same private DNS answer, same host+port, but this connect was never
-    # marked trusted: refused before any delegate connect.
+    # granted trust: refused before any delegate connect.
     delegate = _RecordingBackend()
     untrusted_backend = SafeFetchNetworkBackend(delegate)
     with pytest.raises(httpcore.ConnectError):
         await untrusted_backend.connect_tcp("prowlarr.local", 9696)
     assert delegate.hosts == []
 
-    # The trust flag is consumed: a second connect on the SAME backend and
-    # SAME host+port, without a fresh note_hop_trust(True), fails closed too
-    # -- exactly what stops an off-prefix hop from riding a prior hop's trust.
-    trusted_backend.note_hop_trust(True)
+    # The grant is consumed: a second connect on the SAME backend and SAME
+    # host+port, without a fresh grant, fails closed too -- exactly what
+    # stops an off-prefix hop from riding a prior hop's trust.
+    trusted_backend.note_hop_trust(("prowlarr.local", 9696))
     await trusted_backend.connect_tcp("prowlarr.local", 9696)
     with pytest.raises(httpcore.ConnectError):
         await trusted_backend.connect_tcp("prowlarr.local", 9696)
+
+
+async def test_safe_fetch_backend_trust_grant_is_bound_to_the_connect_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grant carries the expected connect host+port; a connect for ANY
+    other host or port -- e.g. the IDNA encoding of a Unicode casefold alias
+    (``faß.de`` casefolds to ``fass.de`` but connects to ``xn--fa-hia.de``) --
+    must not inherit the exemption even when the grant is pending."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    delegate = _RecordingBackend()
+    backend = SafeFetchNetworkBackend(delegate)
+
+    # Grant for fass.de, actual connect to the alias's real IDNA host: veto.
+    backend.note_hop_trust(("fass.de", 80))
+    with pytest.raises(httpcore.ConnectError):
+        await backend.connect_tcp("xn--fa-hia.de", 80)
+    assert delegate.hosts == []
+
+    # Grant for the right host but the wrong port: veto too.
+    backend.note_hop_trust(("fass.de", 80))
+    with pytest.raises(httpcore.ConnectError):
+        await backend.connect_tcp("fass.de", 9999)
+    assert delegate.hosts == []
+
+    # Exact match connects.
+    accepting = SafeFetchNetworkBackend(_AcceptingBackend())
+    accepting.note_hop_trust(("fass.de", 80))
+    stream = await accepting.connect_tcp("fass.de", 80)
+    assert isinstance(stream, _DummyNetworkStream)
 
 
 class _AcceptingBackend(httpcore.AsyncNetworkBackend):
@@ -1671,6 +1746,93 @@ async def test_redirect_off_prefix_same_host_port_over_real_network_path_is_veto
     # The trusted (in-prefix) hop connected; the off-prefix redirect target --
     # on the SAME host+port -- must never have been allowed to connect at all.
     assert backend.hosts == ["127.0.0.1"]
+
+
+async def test_unicode_casefold_alias_over_real_network_path_keeps_full_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end mirror of the casefold-alias unit test, over the REAL
+    (non-``source_client``) network path: with trusted origin
+    ``http://fass.de/prowlarr``, a source URL on ``faß.de`` (casefolds equal,
+    but httpx connects to ``xn--fa-hia.de`` -- a DIFFERENT host) must get the
+    full SSRF veto when it resolves privately, never the trusted origin's
+    private-address exemption; the genuine trusted host must keep working.
+    Two independent layers now enforce this: ``_is_trusted_source_url``
+    compares httpx-encoded (connect-time) host forms, and the connect-time
+    grant is bound to the trusted origin's exact host+port."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    torrent_response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: "
+        + str(len(_TORRENT_BYTES)).encode()
+        + b"\r\n\r\n"
+        + _TORRENT_BYTES
+    )
+
+    # The casefold alias resolves privately: full veto, no connection at all.
+    alias_backend = _ScriptedBackend(torrent_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: alias_backend)
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin="http://fass.de/prowlarr",
+    )
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
+        await client.add("http://faß.de/prowlarr/1/download", "/downloads", "plex-manager")
+    assert alias_backend.hosts == []
+
+    # The genuine trusted host, resolving to the same private answer, is the
+    # configured allowance and must still fetch (regression guard in the
+    # other direction: binding the grant must not break the trusted origin).
+    trusted_backend = _ScriptedBackend(torrent_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: trusted_backend)
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin="http://fass.de/prowlarr",
+    )
+    result = await client.add("http://fass.de/prowlarr/1/download", "/downloads", "plex-manager")
+    assert result.torrent_hash == _TORRENT_HASH
+    # The backend connects to the RESOLVED address it vetted (the pin), not
+    # the hostname -- exactly one connection, for the trusted hop.
+    assert trusted_backend.hosts == ["127.0.0.1"]
+
+
+async def test_httpx_rejected_source_url_stays_in_source_error_taxonomy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source URL that ``urlparse`` accepts (so the real path's shape-only
+    pre-check passes) but httpx rejects while building the request -- e.g. an
+    IPvFuture literal -- raises ``httpx.InvalidURL``, which inherits from
+    ``Exception`` directly, NOT ``httpx.RequestError``. It must be converted
+    to the SourceError subtype (a 422 release problem), never escape the
+    adapter taxonomy as a raw exception that 500s the manual grab and aborts
+    the auto-grab cycle. Before issue #38's shape-only pre-check, the full
+    per-hop DNS resolve caught these at resolve time; the real path no longer
+    resolves there, so the conversion has to happen at the fetch."""
+    backend = _ScriptedBackend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+    )
+
+    with pytest.raises(QbittorrentSourceError, match="unsupported torrent source URL"):
+        await client.add("http://[v1.fe80::]/file.torrent", "/downloads", "plex-manager")
+
+    # Rejected while building the request: nothing was ever connected.
+    assert backend.hosts == []
 
 
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:
