@@ -1,16 +1,19 @@
 import { useState } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
-import { client } from '../api/client'
-import { clearApiKey, disableApiKeyAuth, enableApiKeyAuth, setApiKey } from '../lib/apiKey'
+import { useExchangeApiKey } from '../api/hooks'
 import { Button } from './ui/Button'
 import { Field } from './ui/Field'
 
 /**
- * In-app recovery for an initialized install whose stored access key is missing
- * or invalid (new browser, cleared storage, rotated key). Without this the
- * operator would be bounced /setup -> / on every authenticated request with no
- * way to re-enter a key — i.e. recovery would require a terminal, which the
- * zero-terminal north star (ADR-0005) forbids.
+ * In-app break-glass recovery for an initialized install: the operator pastes the
+ * recovery key (Settings → Access) when Plex sign-in is unavailable (plex.tv
+ * outage, or a browser with no Plex account). Without this the operator would be
+ * bounced on every authenticated request with no terminal-free way back in, which
+ * the zero-terminal north star (ADR-0005) forbids.
+ *
+ * The key is exchanged ONCE for the same HTTP-only session cookie the Plex flow
+ * issues (`POST /api/v1/auth/api-key`): it rides a single request header and is
+ * never stored in the browser, so nothing JS-readable ever holds it (CodeQL
+ * #263). Recovery thereafter runs on the cookie exactly like a Plex session.
  */
 export function KeyEntry({
   onAuthenticated,
@@ -19,37 +22,21 @@ export function KeyEntry({
   onAuthenticated: () => void
   onUsePlex?: () => void
 }) {
-  const queryClient = useQueryClient()
+  const exchange = useExchangeApiKey()
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | undefined>(undefined)
-  const [checking, setChecking] = useState(false)
 
   const submit = async () => {
     const key = value.trim()
-    if (!key || checking) return
-    setChecking(true)
+    if (!key || exchange.isPending) return
     setError(undefined)
-    setApiKey(key)
-    enableApiKeyAuth()
-    // Validate against a cheap protected endpoint before committing to it. The
-    // GET can REJECT (not just return an error body) on a network/connection
-    // failure — openapi-fetch rethrows when no onError middleware is registered —
-    // so a try/finally keeps the screen honest and retryable instead of stranding
-    // it on a stuck spinner.
     try {
-      const { error: apiError } = await client.GET('/api/v1/settings')
-      if (apiError) {
-        clearApiKey()
-        setError('That access key was rejected. Double-check it and try again.')
-        return
-      }
-      await queryClient.invalidateQueries()
+      await exchange.mutateAsync(key)
       onAuthenticated()
     } catch {
-      clearApiKey()
-      setError("Couldn't reach the server to check that key. Try again.")
-    } finally {
-      setChecking(false)
+      // The exchange either rejected the key (401) or the server was unreachable;
+      // either way the screen stays honest and retryable rather than proceeding.
+      setError('That access key was rejected, or the server was unreachable. Try again.')
     }
   }
 
@@ -58,8 +45,8 @@ export function KeyEntry({
       <div className="rounded-2xl border border-hairline bg-surface p-6">
         <div className="font-display text-xl font-extrabold">Enter your access key</div>
         <p className="mt-2 text-sm text-muted">
-          This install is already set up, but this browser doesn't have a valid access key. Paste the
-          recovery key you generated from Settings → Access.
+          This install is already set up, but this browser isn't signed in. Paste the recovery key
+          you generated from Settings → Access.
         </p>
         <form
           className="mt-5 flex flex-col gap-4"
@@ -77,18 +64,11 @@ export function KeyEntry({
             onChange={(e) => setValue(e.target.value)}
             error={error}
           />
-          <Button type="submit" loading={checking} disabled={value.trim().length === 0}>
+          <Button type="submit" loading={exchange.isPending} disabled={value.trim().length === 0}>
             Continue
           </Button>
           {onUsePlex ? (
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => {
-                disableApiKeyAuth()
-                onUsePlex()
-              }}
-            >
+            <Button type="button" variant="secondary" onClick={onUsePlex}>
               Use Plex sign-in
             </Button>
           ) : null}
