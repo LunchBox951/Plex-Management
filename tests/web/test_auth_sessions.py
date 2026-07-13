@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 import httpx
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, Request
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -456,3 +457,51 @@ async def test_last_seen_refresh_failure_never_fails_auth() -> None:
     # Never raised; reported the pre-refresh effective value; rolled the write back.
     assert result == sl.session_effective_last_seen(auth_session)
     assert fake.rolled_back is True
+
+
+async def test_auth_survives_refresh_commit_failure_end_to_end(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Post-rollback attribute reads must not resurrect the failure (issue #56).
+
+    A REAL session's ``rollback()`` EXPIRES every loaded ORM instance, so any
+    plain ``auth_session`` attribute read after the failed refresh — the log's
+    ``id``, the caller's ``user_id`` — would lazy-refresh outside greenlet
+    context and raise ``MissingGreenlet``: the exact write-lock scenario the
+    handler tolerates would still fail the request, just with a different
+    exception. The fake-session test above cannot reproduce expiry, so this one
+    drives the full ``_session_auth_context`` path against a real session whose
+    ``commit`` raises, asserting auth still returns a complete AuthContext.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    stale = datetime.now(UTC) - sl.SESSION_LAST_SEEN_REFRESH_INTERVAL - timedelta(minutes=1)
+    user_id, _, _ = await _mint_session(
+        app, plex_id=900, tag="wlock2", is_admin=True, last_seen_at=stale
+    )
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/v1/auth/me",
+        "query_string": b"",
+        "headers": [(b"cookie", b"plexmgr.session=sess-wlock2")],
+    }
+    request = Request(scope)
+
+    async with app.state.sessionmaker() as session:
+
+        async def _failing_commit() -> None:
+            raise SQLAlchemyError("simulated write-lock contention")
+
+        monkeypatch.setattr(session, "commit", _failing_commit)
+        context = await deps._session_auth_context(  # pyright: ignore[reportPrivateUsage]
+            request, session, enforce_csrf=False
+        )
+
+    # Auth survived: a full context, not an exception and not a None.
+    assert context is not None
+    assert context.user_id == user_id
+    assert context.is_admin is True
+    # The idle window stayed honest: still measured from the STALE last_seen
+    # (the refresh never landed), not from the failed attempt's `now`.
+    assert context.session_idle_deadline == stale + sl.SESSION_IDLE_WINDOW

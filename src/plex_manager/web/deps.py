@@ -934,13 +934,24 @@ async def _maybe_refresh_last_seen(
     on failure we roll back the aborted transaction and log (no secrets), leaving
     the stored ``last_seen`` untouched (a later request retries the refresh), and
     return the pre-refresh effective value so the idle deadline stays honest.
+
+    EXPIRY HAZARD: ``rollback()`` expires every ORM instance loaded in the
+    session, including ``auth_session`` — a plain attribute read afterwards
+    triggers an async lazy refresh outside greenlet context and raises
+    ``MissingGreenlet``, i.e. the exact write-lock scenario this handler
+    tolerates would still fail the request, just with a different exception. So
+    every scalar needed after the attempt is captured BEFORE it (``session_id``,
+    ``effective``), and no ``auth_session`` attribute is touched after the
+    rollback — the CALLER must obey the same rule (see ``_session_auth_context``,
+    which snapshots ``user_id`` before invoking this).
     """
     effective = session_lifecycle.session_effective_last_seen(auth_session)
     if now - effective < session_lifecycle.SESSION_LAST_SEEN_REFRESH_INTERVAL:
         return effective
+    session_id = auth_session.id
     try:
         await session.execute(
-            update(AuthSession).where(AuthSession.id == auth_session.id).values(last_seen_at=now)
+            update(AuthSession).where(AuthSession.id == session_id).values(last_seen_at=now)
         )
         await session.commit()
     except SQLAlchemyError:
@@ -951,7 +962,7 @@ async def _maybe_refresh_last_seen(
         _logger.warning(
             "failed to refresh session last_seen_at (id=%s); leaving idle window "
             "unchanged, auth proceeds",
-            auth_session.id,
+            session_id,
             exc_info=True,
         )
         return effective
@@ -989,13 +1000,19 @@ async def _session_auth_context(
         return None
     if enforce_csrf:
         _require_csrf_for_session(request)
+    # Snapshot every ``auth_session`` scalar read below BEFORE the refresh: its
+    # failure path rolls back, and rollback EXPIRES all loaded instances — a
+    # later plain attribute read would lazy-refresh outside greenlet context and
+    # raise ``MissingGreenlet``, failing the very request the refresh handler
+    # exists to protect (see the EXPIRY HAZARD note on ``_maybe_refresh_last_seen``).
+    user_id = auth_session.user_id
     # Refresh ``last_seen_at`` on this authenticated activity, throttled so a busy
     # tab writes at most once per ``SESSION_LAST_SEEN_REFRESH_INTERVAL`` rather
     # than once per request. Done only after every validity + CSRF check passes,
     # so a rejected request never slides the window forward.
     effective_last_seen = await _maybe_refresh_last_seen(session, auth_session, now)
     idle_deadline = effective_last_seen + session_lifecycle.SESSION_IDLE_WINDOW
-    if auth_session.user_id is None:
+    if user_id is None:
         # A recovery session: minted by exchanging a valid ``X-Api-Key`` for this
         # HTTP-only cookie (``POST /auth/api-key``, CodeQL #263). It carries the
         # recovery key's admin authority with no Plex identity — reported exactly
@@ -1013,7 +1030,7 @@ async def _session_auth_context(
             via_api_key_header=False,
             session_idle_deadline=idle_deadline,
         )
-    user = await session.get(User, auth_session.user_id)
+    user = await session.get(User, user_id)
     if user is None:
         # The owning user row was deleted out from under a still-live session
         # (ondelete=CASCADE normally removes both together; this guards the race).
