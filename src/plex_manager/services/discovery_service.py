@@ -2,7 +2,7 @@
 
 ``search`` is a thin pass-through. ``home`` composes the home feed SERVER-SIDE
 (rows with items embedded) so the frontend renders generically and stays dumb
-about why a row exists — TV / recommendation rows are additive later. The row
+about why a row exists — including optional personalized rows. The standard row
 fetches fan out concurrently; one failing row is logged and returned empty
 (honest, retryable), but if EVERY row fails the underlying error is surfaced
 rather than a silently blank home.
@@ -11,13 +11,24 @@ rather than a silently blank home.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import random
 from typing import TYPE_CHECKING, Literal, NamedTuple
+from uuid import UUID
 
 from plex_manager.adapters.tmdb.adapter import TmdbApiError, TmdbAuthError
-from plex_manager.ports.metadata import MediaPage
+from plex_manager.logsafe import safe_int, safe_text
+from plex_manager.ports.metadata import (
+    MediaKind,
+    MediaPage,
+    RecommendationFacet,
+    RecommendationMetric,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from plex_manager.ports.metadata import MediaSearchResult, MetadataPort
 
 # Upstream failures we tolerate per-row (a flaky/rate-limited TMDB): the row is an
@@ -28,13 +39,32 @@ __all__ = [
     "DiscoverCategory",
     "HomeFeed",
     "HomeRow",
+    "PersonalizationSeed",
     "home",
+    "interleave_personalized_rows",
     "list_category",
     "search",
     "select_spotlights",
 ]
 
 _logger = logging.getLogger(__name__)
+
+_PERSONALIZED_ROW_LIMIT = 2
+# Bound the TMDB detail fan-out for ONE home load: without a cap a heavy user
+# whose early-shuffled seeds happen to lack usable facets (or transiently fail)
+# would drive one uncached ``recommendation_profile`` call per history row before
+# giving up. Probing a shuffled prefix keeps worst-case upstream calls constant
+# while leaving generous headroom to still fill both rows (nearly every title
+# yields at least a genre facet); a fresh load_id reshuffles which seeds a
+# subsequent load probes, so the whole history still participates over time.
+_PERSONALIZATION_PROBE_LIMIT = _PERSONALIZED_ROW_LIMIT * 4
+_METRIC_ORDER: tuple[RecommendationMetric, ...] = ("genre", "director", "cast", "anime")
+# Statuses that honestly support the "<title> is in your library" subtitle:
+# Plex-VERIFIED availability only. ``completed`` is deliberately NOT here — it is
+# the in-flight "Finalizing" state (imported, awaiting Plex confirmation; see the
+# settled-status commentary in ``repositories/requests.py``), so claiming library
+# membership for it would be false until Plex confirms.
+_ANIME_LIBRARY_STATUSES: frozenset[str] = frozenset({"available", "partially_available"})
 
 DiscoverCategory = Literal["trending", "popular", "upcoming", "trending_tv", "popular_tv"]
 
@@ -105,10 +135,9 @@ def derive_library_state(request_status: str | None, present: bool) -> LibrarySt
     return "available" if present else "none"
 
 
-# Ordered rows the home composes. Order + titles live here (a code constant, no DB)
-# — the recommendation engine that decides rows dynamically is deferred. The tv
-# rows are appended after the movie rows (no reordering of the existing three, so
-# an established home feed's row order is unchanged); there is no tv "upcoming"
+# Ordered STANDARD rows the home composes. Order + titles live here (a code
+# constant, no DB). Personalized rows are composed independently and interleaved
+# without changing this order or the spotlight source. There is no tv "upcoming"
 # row -- TMDB has no tv endpoint comparable to its movie release-date listing.
 _ROWS: tuple[tuple[DiscoverCategory, str], ...] = (
     ("trending", "Trending this week"),
@@ -132,6 +161,17 @@ class HomeRow(NamedTuple):
     row_type: str
     title: str
     items: tuple[MediaSearchResult, ...]
+    subtitle: str | None = None
+
+
+class PersonalizationSeed(NamedTuple):
+    """Service-local request-history shape; contains no repository/ORM objects."""
+
+    tmdb_id: int
+    media_type: MediaKind
+    title: str
+    status: str
+    is_anime: bool
 
 
 class HomeFeed(NamedTuple):
@@ -210,8 +250,155 @@ async def list_category(
     return await tmdb.upcoming_movies(page)
 
 
-async def home(tmdb: MetadataPort) -> HomeFeed:
-    """Compose the Discover home: fan out page 1 and select spotlight candidates."""
+def interleave_personalized_rows(
+    standard_rows: Sequence[HomeRow], personalized_rows: Sequence[HomeRow]
+) -> list[HomeRow]:
+    """Insert compacted successful personalized rows at one-based positions 2/4."""
+    personalized = list(personalized_rows[:_PERSONALIZED_ROW_LIMIT])
+    rows: list[HomeRow] = []
+    for index, row in enumerate(standard_rows):
+        rows.append(row)
+        if index < len(personalized) and index < _PERSONALIZED_ROW_LIMIT:
+            rows.append(personalized[index])
+    return rows
+
+
+def _stable_random(user_id: int, load_id: UUID) -> random.Random:
+    """Build a process-independent PRNG from the user/load presentation identity."""
+    digest = hashlib.sha256(f"{user_id}\x00{load_id}".encode()).digest()
+    # Presentation diversity only, never an authorization/security decision. A
+    # local PRNG is required so later choices consume one deterministic stream.
+    return random.Random(  # noqa: S311
+        int.from_bytes(digest, byteorder="big", signed=False)
+    )
+
+
+def _usable_facet_buckets(
+    seed: PersonalizationSeed, facets: Sequence[RecommendationFacet]
+) -> dict[RecommendationMetric, list[RecommendationFacet]]:
+    buckets: dict[RecommendationMetric, list[RecommendationFacet]] = {}
+    for metric in _METRIC_ORDER:
+        matching: list[RecommendationFacet] = []
+        for facet in facets:
+            if facet.metric != metric or not facet.label.strip():
+                continue
+            if metric == "anime":
+                # Anime is the adapter-owned keyword bucket, not a caller-
+                # supplied genre/person id. Treat a value-bearing anime facet as
+                # malformed so optional personalization omits it instead of
+                # silently changing the required discover query semantics.
+                if not seed.is_anime or facet.value_id is not None:
+                    continue
+            elif facet.value_id is None or facet.value_id <= 0:
+                continue
+            if seed.media_type == "tv" and metric in ("director", "cast"):
+                continue
+            matching.append(facet)
+        if matching:
+            buckets[metric] = matching
+    return buckets
+
+
+def _personalized_copy(seed: PersonalizationSeed, facet: RecommendationFacet) -> tuple[str, str]:
+    if facet.metric == "genre":
+        return f"Because you requested {seed.title}", f"more {facet.label.lower()}"
+    if facet.metric == "director":
+        return f"Directed by {facet.label}", f"because you requested {seed.title}"
+    if facet.metric == "cast":
+        return f"Starring {facet.label}", f"because you requested {seed.title}"
+    if seed.status in _ANIME_LIBRARY_STATUSES:
+        return "Because you watch anime", f"{seed.title} is in your library"
+    return "Because you watch anime", f"because you requested {seed.title}"
+
+
+def _log_optional_failure(
+    phase: str, seed: PersonalizationSeed, exc: TmdbApiError | TmdbAuthError
+) -> None:
+    """Log only bounded ids/types for optional recommendation outages."""
+    _logger.warning(
+        "personalized discover %s unavailable",
+        safe_text(phase),
+        extra={
+            "tmdb_id": safe_int(seed.tmdb_id),
+            "media_type": safe_text(seed.media_type),
+            "error": safe_text(type(exc).__name__),
+        },
+    )
+
+
+async def _personalized_rows(
+    tmdb: MetadataPort,
+    history: Sequence[PersonalizationSeed],
+    *,
+    user_id: int | None,
+    load_id: UUID | None,
+) -> list[HomeRow]:
+    if user_id is None or load_id is None or not history:
+        return []
+
+    distinct: list[PersonalizationSeed] = []
+    seen: set[tuple[int, MediaKind]] = set()
+    for seed in history:
+        key = (seed.tmdb_id, seed.media_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(seed)
+
+    rng = _stable_random(user_id, load_id)
+    rng.shuffle(distinct)
+    rows: list[HomeRow] = []
+    for seed in distinct[:_PERSONALIZATION_PROBE_LIMIT]:
+        if len(rows) >= _PERSONALIZED_ROW_LIMIT:
+            break
+        try:
+            profile = await tmdb.recommendation_profile(seed.tmdb_id, seed.media_type)
+        except _EXPECTED_ROW_ERRORS as exc:
+            _log_optional_failure("profile", seed, exc)
+            continue
+        if profile is None:
+            continue
+
+        buckets = _usable_facet_buckets(seed, profile.facets)
+        if not buckets:
+            continue
+        metric = rng.choice(list(buckets))
+        facet = rng.choice(buckets[metric])
+        try:
+            page = await tmdb.discover_recommendations(seed.media_type, facet)
+        except _EXPECTED_ROW_ERRORS as exc:
+            _log_optional_failure("recommendations", seed, exc)
+            continue
+
+        items = tuple(
+            item
+            for item in page.results
+            if not (item.tmdb_id == seed.tmdb_id and item.media_type == seed.media_type)
+        )
+        if not items:
+            continue
+        title, subtitle = _personalized_copy(seed, facet)
+        rows.append(
+            HomeRow(
+                row_type=(
+                    f"personalized:{facet.metric}:{seed.media_type}:{safe_int(seed.tmdb_id)}"
+                ),
+                title=title,
+                items=items,
+                subtitle=subtitle,
+            )
+        )
+    return rows
+
+
+async def home(
+    tmdb: MetadataPort,
+    *,
+    history: Sequence[PersonalizationSeed] = (),
+    user_id: int | None = None,
+    load_id: UUID | None = None,
+) -> HomeFeed:
+    """Compose standard rows plus up to two stable, optional personalized rows."""
     results = await asyncio.gather(
         *(list_category(tmdb, category) for category, _ in _ROWS),
         return_exceptions=True,
@@ -231,7 +418,7 @@ async def home(tmdb: MetadataPort) -> HomeFeed:
             if isinstance(result, BaseException):
                 raise result
 
-    rows: list[HomeRow] = []
+    standard_rows: list[HomeRow] = []
     for (category, title), result in zip(_ROWS, results, strict=True):
         if isinstance(result, MediaPage):
             items = result.results
@@ -240,5 +427,11 @@ async def home(tmdb: MetadataPort) -> HomeFeed:
             # just the type) so a flaky row is diagnosable.
             _logger.warning("discover row %r unavailable: %s", category, result)
             items = ()
-        rows.append(HomeRow(row_type=category, title=title, items=items))
-    return HomeFeed(spotlights=select_spotlights(rows), rows=rows)
+        standard_rows.append(HomeRow(row_type=category, title=title, items=items))
+
+    spotlights = select_spotlights(standard_rows)
+    personalized_rows = await _personalized_rows(tmdb, history, user_id=user_id, load_id=load_id)
+    return HomeFeed(
+        spotlights=spotlights,
+        rows=interleave_personalized_rows(standard_rows, personalized_rows),
+    )

@@ -27,6 +27,17 @@ export type QueueItem = Schemas['QueueItem']
 export type QueueResponse = Schemas['QueueResponse']
 export type GrabRequest = Schemas['GrabRequest']
 
+/**
+ * The typed lifecycle-status unions (issue #205). Deriving these FROM the
+ * generated response types (rather than re-declaring the member lists) means
+ * a backend enum add/rename changes `schema.d.ts`, which changes these
+ * aliases, which red-builds every exhaustive `Record<..., …>` map and
+ * allowlist `Set<...>` built on them below — the whole point of typing the
+ * wire contract.
+ */
+export type RequestStatusValue = RequestResponse['status']
+export type DownloadStateValue = QueueItem['status']
+
 export type BlocklistEntry = Schemas['BlocklistEntry']
 export type BlocklistResponse = Schemas['BlocklistResponse']
 

@@ -13,7 +13,9 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
+from plex_manager.models import DownloadScopeStatus, RequestStatus
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
@@ -785,6 +787,7 @@ class DiscoverHomeRow(BaseModel):
 
     row_type: str
     title: str
+    subtitle: str | None = None
     items: list[DiscoverResult]
 
 
@@ -861,13 +864,29 @@ class ReportIssueBody(BaseModel):
     season: int | None = None
 
 
+# Issue #205: the four wire ``status`` fields below (this one, ``RequestResponse``,
+# ``QueueScope``, ``QueueItem``) are typed onto the canonical enums instead of
+# plain ``str`` so OpenAPI/the generated TS client can detect a backend enum
+# add/rename (see ``docs/adr/0009-frontend-typed-spa.md``). Conscious tradeoff,
+# flagged rather than silently accepted: pydantic now VALIDATES a response's
+# status at construction time, so a persisted value outside the enum -- corrupt
+# data, a manually-edited row, or a status a since-superseded migration never
+# renamed -- raises ``ValidationError`` (a 500) for the endpoint's WHOLE list,
+# rather than passing the raw string through for the frontend's neutral render.
+# This is deliberately NOT softened with a coerce-to-unknown escape hatch here:
+# doing so would defeat the very drift detection this typing exists for, and
+# every write path already only ever persists a canonical enum value (see
+# ``RequestStatus``/``DownloadState``/``DownloadScopeStatus``), so the failure
+# mode is a defense-in-depth backstop against out-of-band data corruption, not
+# an expected runtime state. Honesty over silence: a loud 500 on a corrupt row
+# is preferred over quietly masking it as some fabricated "unknown" status.
 class SeasonStatus(BaseModel):
     """One tracked season's status, embedded in a tv ``RequestResponse``."""
 
     model_config = ConfigDict(frozen=True)
 
     season_number: int
-    status: str
+    status: RequestStatus
     installed_quality_id: int | None = None
     installed_profile_index: int | None = None
     # Episode-level fallback progress (ADR-0020, issue #178): "N/M episodes"
@@ -890,7 +909,7 @@ class RequestResponse(BaseModel):
     tmdb_id: int
     media_type: str
     title: str
-    status: str
+    status: RequestStatus  # see the wire-boundary-validation note on SeasonStatus above
     year: int | None = None
     is_anime: bool = False
     poster_url: str | None = None
@@ -902,6 +921,11 @@ class RequestResponse(BaseModel):
     # for a movie (movies have no ``SeasonRequest`` rows). ``status`` above is the
     # COMPUTED fold of these (``domain.season_rollup.rollup_status``).
     seasons: list[SeasonStatus] | None = None
+    # Passive projection of the reconciler-refreshed physical download row.
+    # Present only while this request reads ``downloading`` and exactly one active
+    # physical download maps to it. ``None`` means absent or ambiguous (for
+    # example, concurrent TV-season downloads); ``0.0`` is a real known value.
+    download_progress: float | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` will never
     # select this title (or, for a show, any of its seasons) regardless of watch
     # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.
@@ -1014,7 +1038,7 @@ class QueueScope(BaseModel):
     media_request_id: int | None = None
     season: int | None = None
     episodes: list[int] | None = None
-    status: str = "active"
+    status: DownloadScopeStatus = DownloadScopeStatus.active  # see SeasonStatus's note above
 
 
 def _empty_queue_scopes() -> list[QueueScope]:
@@ -1028,7 +1052,7 @@ class QueueItem(BaseModel):
 
     id: int
     torrent_hash: str
-    status: str
+    status: DownloadState  # see SeasonStatus's wire-boundary note above
     progress: float = 0.0
     seed_ratio: float = 0.0
     media_request_id: int | None = None

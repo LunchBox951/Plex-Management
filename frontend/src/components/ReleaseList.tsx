@@ -46,6 +46,8 @@ interface ReleaseListProps {
   grabbingGuid: string | null
   /** false until a request exists — grabbing needs a request id. */
   canGrab: boolean
+  /** Denser, darker rows for the title modal's administrator footer. */
+  variant?: 'default' | 'admin'
 }
 
 /**
@@ -53,11 +55,18 @@ interface ReleaseListProps {
  * releases that were rejected, with the reason. Rejections are surfaced, never
  * hidden — "no acceptable release" is a visible, honest state (north star #3).
  */
-export function ReleaseList({ preview, onGrab, grabbingGuid, canGrab }: ReleaseListProps) {
+export function ReleaseList({
+  preview,
+  onGrab,
+  grabbingGuid,
+  canGrab,
+  variant = 'default',
+}: ReleaseListProps) {
   const { accepted, rejected, no_acceptable_release } = preview
+  const admin = variant === 'admin'
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className={admin ? 'flex flex-col gap-4' : 'flex flex-col gap-5'}>
       {no_acceptable_release || accepted.length === 0 ? (
         <StateMessage
           tone="error"
@@ -69,26 +78,55 @@ export function ReleaseList({ preview, onGrab, grabbingGuid, canGrab }: ReleaseL
           }
         />
       ) : (
-        <section className="flex flex-col gap-2">
-          <h3 className="font-mono text-xs tracking-wide text-faint uppercase">
+        <section className={admin ? 'flex min-w-0 flex-col gap-2' : 'flex flex-col gap-2'}>
+          <h3
+            className={
+              admin
+                ? 'font-mono text-[10.5px] tracking-[0.12em] text-faint uppercase'
+                : 'font-mono text-xs tracking-wide text-faint uppercase'
+            }
+          >
             Ranked releases · {accepted.length}
           </h3>
-          <ol className="flex flex-col gap-2">
+          <ol className={admin ? 'flex min-w-0 flex-col gap-1.5' : 'flex flex-col gap-2'}>
             {accepted.map((rel, i) => {
               const seasonEpisode = seasonEpisodeChip(rel.title)
               return (
                 <li
                   key={rel.guid}
-                  className="flex items-center gap-3 rounded-xl border border-hairline bg-surface p-3"
+                  className={
+                    admin
+                      ? 'flex min-w-0 flex-col gap-2 rounded-lg border border-hairline bg-black/15 px-3 py-2.5 sm:flex-row sm:items-center sm:gap-3'
+                      : 'flex items-center gap-3 rounded-xl border border-hairline bg-surface p-3'
+                  }
                 >
-                  <span className="w-6 shrink-0 text-center font-display text-sm font-bold text-gold">
+                  <span
+                    className={
+                      admin
+                        ? 'hidden w-5 shrink-0 text-center font-mono text-[11px] font-semibold text-gold sm:inline'
+                        : 'w-6 shrink-0 text-center font-display text-sm font-bold text-gold'
+                    }
+                  >
                     {i + 1}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium text-ink" title={rel.title}>
+                    <div
+                      className={
+                        admin
+                          ? 'truncate font-mono text-[12px] font-medium text-ink'
+                          : 'truncate text-sm font-medium text-ink'
+                      }
+                      title={rel.title}
+                    >
                       {rel.title}
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-faint">
+                    <div
+                      className={
+                        admin
+                          ? 'mt-1 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 font-mono text-[10.5px] text-faint'
+                          : 'mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-faint'
+                      }
+                    >
                       {seasonEpisode ? (
                         <span className="rounded bg-white/8 px-1.5 py-0.5 font-semibold text-muted ring-1 ring-white/10">
                           {seasonEpisode}
@@ -97,13 +135,22 @@ export function ReleaseList({ preview, onGrab, grabbingGuid, canGrab }: ReleaseL
                       <span className="text-muted">{rel.quality_name}</span>
                       <span>{rel.resolution}</span>
                       <span>{rel.source}</span>
-                      {typeof rel.seeders === 'number' ? <span>{rel.seeders} seeders</span> : null}
-                      <span className="truncate">{rel.indexer}</span>
+                      {typeof rel.seeders === 'number' ? (
+                        <span>{rel.seeders} seeders</span>
+                      ) : null}
+                      <span className={admin ? 'max-w-full break-words' : 'truncate'}>
+                        {rel.indexer}
+                      </span>
                     </div>
                   </div>
                   <Button
                     size="sm"
-                    variant={i === 0 ? 'primary' : 'secondary'}
+                    variant={admin ? 'secondary' : i === 0 ? 'primary' : 'secondary'}
+                    className={
+                      admin
+                        ? 'self-end bg-gold/8 text-gold ring-gold/30 hover:bg-gold/15 focus-visible:ring-gold/60 sm:self-auto'
+                        : undefined
+                    }
                     disabled={!canGrab}
                     loading={grabbingGuid === rel.guid}
                     onClick={() => onGrab(rel)}
@@ -122,20 +169,43 @@ export function ReleaseList({ preview, onGrab, grabbingGuid, canGrab }: ReleaseL
       )}
 
       {rejected.length > 0 ? (
-        <section className="flex flex-col gap-2">
-          <h3 className="font-mono text-xs tracking-wide text-faint uppercase">
+        <section className={admin ? 'flex min-w-0 flex-col gap-2' : 'flex flex-col gap-2'}>
+          <h3
+            className={
+              admin
+                ? 'font-mono text-[10.5px] tracking-[0.12em] text-faint uppercase'
+                : 'font-mono text-xs tracking-wide text-faint uppercase'
+            }
+          >
             Rejected · {rejected.length}
           </h3>
-          <ul className="flex flex-col gap-1.5">
+          <ul className={admin ? 'flex min-w-0 flex-col gap-1.5' : 'flex flex-col gap-1.5'}>
             {rejected.map((rel, i) => (
               <li
                 key={`${rel.title}-${i}`}
-                className="flex items-center justify-between gap-3 rounded-lg border border-hairline/60 px-3 py-2"
+                className={
+                  admin
+                    ? 'flex min-w-0 flex-col items-start gap-1.5 rounded-lg border border-hairline/60 bg-black/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3'
+                    : 'flex items-center justify-between gap-3 rounded-lg border border-hairline/60 px-3 py-2'
+                }
               >
-                <span className="min-w-0 flex-1 truncate text-[13px] text-muted" title={rel.title}>
+                <span
+                  className={
+                    admin
+                      ? 'min-w-0 max-w-full flex-1 truncate font-mono text-[11.5px] text-muted'
+                      : 'min-w-0 flex-1 truncate text-[13px] text-muted'
+                  }
+                  title={rel.title}
+                >
                   {rel.title}
                 </span>
-                <span className="shrink-0 font-mono text-[11px] text-error/90">
+                <span
+                  className={
+                    admin
+                      ? 'max-w-full rounded bg-error/10 px-1.5 py-0.5 font-mono text-[10px] leading-snug text-error ring-1 ring-inset ring-error/20 sm:shrink-0'
+                      : 'shrink-0 font-mono text-[11px] text-error/90'
+                  }
+                >
                   {rejectionLabel(rel.reason)}
                 </span>
               </li>

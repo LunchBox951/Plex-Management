@@ -16,11 +16,19 @@ standard. This guide covers the dev workflow.
 ```bash
 make install      # creates editable install with dev extras + installs pre-commit
 make ui-install   # installs frontend dependencies used by make check
+make migrate      # create/upgrade the local database schema (required before first run)
 # equivalent to:
 #   pip install -e ".[dev]"
 #   pre-commit install
 #   npm --prefix frontend ci
+#   alembic upgrade head
 ```
+
+> **Note — local vs Docker migration:** Docker runs `alembic upgrade head`
+> automatically on every container start (see `docker/entrypoint.sh`). The local
+> entry point does **not** — you must run `make migrate` (or `alembic upgrade head`)
+> manually before the first `make run` and again after pulling any commit that adds
+> a new migration.
 
 ## Day-to-day
 
@@ -30,6 +38,7 @@ make format   # ruff format
 make type     # pyright (strict)
 make test     # pytest + coverage
 make check    # backend + frontend gates — run this before pushing
+make migrate  # apply any new migrations after pulling (run before make run)
 make run      # run the app locally (http://localhost:8000)
 ```
 
@@ -114,3 +123,30 @@ adapter directly. See [docs/design/overview.md](docs/design/overview.md).
 `main` → CI builds `:edge` → the canary host runs it → once proven, promote the
 *same image* to `:stable` (no rebuild) via the **Promote to stable** workflow. See
 [ADR-0004](docs/adr/0004-edge-stable-release-channels.md).
+
+### Release checklist
+
+Run through this in order when cutting a real release (do not do this per
+merge — only when actually preparing a promotion):
+
+1. Curate `CHANGELOG.md`: move `[Unreleased]` to a new `## [x.y.z] - <date>`
+   section, then restore an empty `## [Unreleased]` above it for the next cycle.
+2. Bump the single version source: `src/plex_manager/__init__.py`'s
+   `__version__` to `x.y.z`. This is the one place hatch (`pyproject.toml`),
+   OpenAPI (`info.version`), and `events.current_build_id()`'s fallback all
+   read from.
+3. Run `make openapi` and commit the regenerated `docs/api/openapi.json` — its
+   `info.version` must match the bump in step 2 (CI diffs this file).
+4. Merge to `main`. CI builds `:edge` and the immutable `:edge-<sha>`; let the
+   canary host prove the build.
+5. Promote: run the **Promote to stable** workflow with that exact
+   `edge-<sha>` and the same `x.y.z` from step 2. **The `x.y.z` you promote
+   must equal the `__version__` baked into that `edge-<sha>` build** — until an
+   automated image-label gate exists (tracked as a follow-up to #114), this is
+   a human checklist step, not an enforced one. Getting steps 2–5 out of order
+   is exactly how the app-reported version and the release tag end up silently
+   disagreeing.
+6. Remember: promotion re-tags an already-built image without rebuilding it, so
+   the promoted image reports whatever `__version__` was baked in at *its*
+   build time — bump the version (step 2) and merge it to `main` **before**
+   the `:edge` build you intend to promote, not after.

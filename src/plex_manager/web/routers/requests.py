@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
+from plex_manager.domain.state_machine import DownloadState
+from plex_manager.models import RequestStatus
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.ports.repositories import RequestRecord
+from plex_manager.ports.repositories import DownloadRecord, RequestRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, request_service
@@ -80,6 +83,18 @@ _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Media not found"},
 }
 
+# The ONE download state whose ``progress`` is a live transfer percentage. Every
+# other non-terminal state stays in ``list_active_for_requests``' batch for
+# ownership purposes but is deliberately excluded from the projection:
+# ``client_missing`` (the torrent vanished from qBittorrent, so its stored
+# progress is a frozen last-known value while the request rides out the grace
+# window), ``metadata_fetching`` (no payload transfer exists yet to have a
+# truthful percentage), and ``import_pending`` (the transfer is over -- the wait
+# is for import, which a percent bar would misreport as still-downloading).
+# Mirrors the Queue UI, which shows transfer progress ONLY for
+# ``status === 'downloading'`` and an honest state label for everything else.
+_LIVE_PROGRESS_DOWNLOAD_STATUSES: frozenset[str] = frozenset({DownloadState.Downloading.value})
+
 _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Request or season not found"},
     # This status code has TWO distinct producers, so BOTH shapes are documented
@@ -130,6 +145,7 @@ async def _to_response(
     record: RequestRecord,
     seasons_by_request: dict[int, list[SeasonRequestRecord]] | None = None,
     episode_counts_by_season_id: dict[int, tuple[int, int]] | None = None,
+    active_downloads_by_request: dict[int, list[DownloadRecord]] | None = None,
     *,
     can_mutate: bool = False,
 ) -> RequestResponse:
@@ -152,6 +168,15 @@ async def _to_response(
     absent from the map (no tracked ``season_episode_states`` rows -- the common
     clean-single-pack-import case) renders both counts ``None``, never a fabricated
     ``0/0``.
+
+    ``active_downloads_by_request`` follows the same batching rule for byte
+    progress. The list endpoint supplies one actor-filtered batch; single-record
+    and mutation responses perform one corresponding request-id read. Progress is
+    truthful only for a displayed ``downloading`` request with exactly one
+    physical download actually transferring (``_LIVE_PROGRESS_DOWNLOAD_STATUSES``
+    -- client-missing/metadata/import-pending rows never drive the bar).
+    Multiple concurrent live TV-season downloads are intentionally ambiguous --
+    never averaged, summed, or selected arbitrarily.
     """
     seasons: list[SeasonRequestRecord] | None = None
     if record.media_type == "tv":
@@ -164,12 +189,33 @@ async def _to_response(
         episode_counts = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
             [s.id for s in seasons]
         )
+    active_downloads = active_downloads_by_request
+    if active_downloads is None:
+        active_downloads = await SqlDownloadRepository(session).list_active_for_requests(
+            [record.id]
+        )
+    # Only ``downloading`` rows may drive the bar: every other non-terminal row
+    # still belongs to the request (and stays in the batch) but has no truthful
+    # transfer percentage to show (see ``_LIVE_PROGRESS_DOWNLOAD_STATUSES``).
+    # The exact-one rule is applied AFTER this filter: one live transfer next to
+    # a client-missing/metadata/import-pending sibling is still one honest
+    # number, while two live transfers remain ambiguous.
+    live_downloads = [
+        download
+        for download in active_downloads.get(record.id, [])
+        if download.status in _LIVE_PROGRESS_DOWNLOAD_STATUSES
+    ]
+    download_progress = (
+        live_downloads[0].progress
+        if record.status == "downloading" and len(live_downloads) == 1
+        else None
+    )
     return RequestResponse(
         id=record.id,
         tmdb_id=record.tmdb_id,
         media_type=record.media_type,
         title=record.title,
-        status=record.status,
+        status=cast(RequestStatus, record.status),
         year=record.year,
         is_anime=record.is_anime,
         poster_url=record.poster_url,
@@ -185,7 +231,7 @@ async def _to_response(
             [
                 SeasonStatus(
                     season_number=s.season_number,
-                    status=s.status,
+                    status=cast(RequestStatus, s.status),
                     installed_quality_id=s.installed_quality_id,
                     installed_profile_index=s.installed_profile_index,
                     imported_episode_count=((episode_counts or {}).get(s.id, (None, None))[0]),
@@ -196,6 +242,7 @@ async def _to_response(
             if seasons is not None
             else None
         ),
+        download_progress=download_progress,
         keep_forever=record.keep_forever,
         can_mutate=can_mutate,
     )
@@ -288,6 +335,13 @@ async def list_requests_endpoint(
     records = request_service.fold_requests_for_display(
         records, subscriber_scoped=not auth.is_admin
     )
+    # Batch active physical downloads only AFTER actor filtering + display folding.
+    # This preserves the shared-user boundary and gives every visible request a
+    # consistent progress projection without calling the admin-only queue endpoint
+    # or issuing one query per row.
+    active_downloads_by_request = await SqlDownloadRepository(session).list_active_for_requests(
+        [r.id for r in records]
+    )
     # Batch every tv row's season rows in ONE query (avoids an N+1 query per tv
     # request that calling ``_to_response`` per-row without this would cause).
     tv_ids = [r.id for r in records if r.media_type == "tv"]
@@ -306,6 +360,7 @@ async def list_requests_endpoint(
                 r,
                 seasons_by_request,
                 episode_counts_by_season_id,
+                active_downloads_by_request,
                 can_mutate=_can_mutate_request(auth, r),
             )
             for r in records

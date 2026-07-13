@@ -39,6 +39,8 @@ from plex_manager.ports.metadata import (
     MediaSearchResult,
     MetadataPort,
     MovieMetadata,
+    RecommendationFacet,
+    RecommendationProfile,
     TvMetadata,
 )
 from plex_manager.web.deps import (
@@ -170,6 +172,12 @@ class FakeTmdb:
         upcoming: list[MediaSearchResult] | None = None,
         trending_tv_results: list[MediaSearchResult] | None = None,
         popular_tv_results: list[MediaSearchResult] | None = None,
+        recommendation_profiles: dict[tuple[int, Literal["movie", "tv"]], RecommendationProfile]
+        | None = None,
+        recommendations: dict[
+            tuple[Literal["movie", "tv"], str, int | None], list[MediaSearchResult]
+        ]
+        | None = None,
         season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
         season_episodes_error: Exception | None = None,
         get_tv_show_error: Exception | None = None,
@@ -191,6 +199,12 @@ class FakeTmdb:
         self._popular_tv = (
             list(popular_tv_results) if popular_tv_results is not None else list(self.results)
         )
+        self._recommendation_profiles = recommendation_profiles or {}
+        self._recommendations = recommendations or {}
+        self.recommendation_profile_calls: list[tuple[int, Literal["movie", "tv"]]] = []
+        self.recommendation_calls: list[
+            tuple[Literal["movie", "tv"], RecommendationFacet, int]
+        ] = []
         # ADR-0020 (issue #178): keyed (tmdb_id, season_number). ``season_episodes_error``
         # (when set) is raised on every call -- the "TMDB outage / target unknown"
         # test double.
@@ -236,6 +250,21 @@ class FakeTmdb:
 
     async def popular_tv(self, page: int = 1) -> MediaPage:
         return self._page(self._popular_tv)
+
+    async def recommendation_profile(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"]
+    ) -> RecommendationProfile | None:
+        self.recommendation_profile_calls.append((tmdb_id, media_type))
+        return self._recommendation_profiles.get((tmdb_id, media_type))
+
+    async def discover_recommendations(
+        self,
+        media_type: Literal["movie", "tv"],
+        facet: RecommendationFacet,
+        page: int = 1,
+    ) -> MediaPage:
+        self.recommendation_calls.append((media_type, facet, page))
+        return self._page(self._recommendations.get((media_type, facet.metric, facet.value_id), []))
 
     async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
         self.season_episodes_calls.append((tmdb_id, season_number))

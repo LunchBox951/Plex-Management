@@ -1,9 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import userEvent from '@testing-library/user-event'
+import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, it, vi, type Mock } from 'vitest'
-import { useRequests } from '../api/hooks'
-import type { RequestResponse } from '../api/types'
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { useAuthMe, useRequests, useSearchPreview } from '../api/hooks'
+import type { RequestResponse, SearchPreviewResponse } from '../api/types'
 import { Requests } from './Requests'
 
 // The row-click path mounts the shared `TitleDetailModal`, which calls every
@@ -34,13 +35,49 @@ vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) 
 // Passthrough Dialog so the modal's content renders as plain DOM — no Radix
 // portal focus-trap noise in a jsdom test environment.
 vi.mock('../components/ui/Dialog', () => ({
-  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
+  Dialog: ({
+    title,
+    children,
+    customChrome = false,
+  }: {
+    title: string
+    children: ReactNode
+    customChrome?: boolean
+  }) => (
     <div>
-      <h2>{title}</h2>
+      {customChrome ? null : <h2>{title}</h2>}
       {children}
     </div>
   ),
+  DialogTitle: ({ children, ...props }: HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 {...props}>{children}</h2>
+  ),
+  DialogClose: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
+  ),
 }))
+
+const ADMIN_AUTH = {
+  data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+  isLoading: false,
+}
+
+const EMPTY_PREVIEW: SearchPreviewResponse = {
+  accepted: [],
+  rejected: [],
+  no_acceptable_release: true,
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  ;(useAuthMe as unknown as Mock).mockReturnValue(ADMIN_AUTH)
+  ;(useSearchPreview as unknown as Mock).mockReturnValue({
+    mutateAsync: vi.fn().mockResolvedValue(EMPTY_PREVIEW),
+    isPending: false,
+  })
+})
 
 function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
   return {
@@ -221,6 +258,145 @@ describe('Requests — poster rendering (issue #26)', () => {
   })
 })
 
+describe('Requests — truthful inline download progress', () => {
+  it('renders known 42% and known 0% with labelled progressbars', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 1, title: 'Forty Two', download_progress: 0.42 }),
+          movieRequest({ id: 2, title: 'Known Zero', download_progress: 0 }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+
+    expect(screen.getByRole('progressbar', { name: 'Download progress for Forty Two' })).toHaveAttribute(
+      'aria-valuenow',
+      '42',
+    )
+    expect(screen.getByRole('progressbar', { name: 'Download progress for Known Zero' })).toHaveAttribute(
+      'aria-valuenow',
+      '0',
+    )
+    expect(screen.getByText('42%')).toBeInTheDocument()
+    expect(screen.getByText('0%')).toBeInTheDocument()
+  })
+
+  it('omits progress when absent/ambiguous or when the request is not downloading', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 1, title: 'Unknown', download_progress: null }),
+          movieRequest({
+            id: 2,
+            title: 'Not Downloading',
+            status: 'searching',
+            download_progress: 0.42,
+          }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.queryByText('42%')).not.toBeInTheDocument()
+  })
+
+  it('uses the shared progress convention to clamp out-of-range values', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ download_progress: 1.4 })] },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100')
+    expect(screen.getByText('100%')).toBeInTheDocument()
+  })
+})
+
+describe('Requests — admin no-release shortcut', () => {
+  it('opens the modal and runs its one shared preview path exactly once', async () => {
+    const previewMutation = vi.fn().mockResolvedValue(EMPTY_PREVIEW)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue({
+      mutateAsync: previewMutation,
+      isPending: false,
+    })
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [movieRequest({ id: 17, status: 'no_acceptable_release' })],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    const view = render(<Requests />, { wrapper: MemoryRouter })
+
+    const details = screen.getByRole('button', { name: 'Open details for Test Movie' })
+    const shortcut = screen.getByRole('button', { name: 'Re-search Test Movie' })
+    expect(details.contains(shortcut)).toBe(false)
+    expect(shortcut.contains(details)).toBe(false)
+
+    fireEvent.click(shortcut)
+    expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
+    await waitFor(() => expect(previewMutation).toHaveBeenCalledWith({ request_id: 17 }))
+    expect(previewMutation).toHaveBeenCalledTimes(1)
+
+    // The same action token survives ordinary route/modal rerenders but is already
+    // consumed, so the effect cannot fire a second API request.
+    view.rerender(<Requests />)
+    await waitFor(() => expect(previewMutation).toHaveBeenCalledTimes(1))
+  })
+
+  it('targets the row-resolved no-release TV season for an inline re-search', async () => {
+    const previewMutation = vi.fn().mockResolvedValue(EMPTY_PREVIEW)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue({
+      mutateAsync: previewMutation,
+      isPending: false,
+    })
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          tvRequest({
+            id: 23,
+            status: 'no_acceptable_release',
+            seasons: [
+              { season_number: 1, status: 'available' },
+              { season_number: 2, status: 'no_acceptable_release' },
+            ],
+          }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Re-search Test Show' }))
+    await waitFor(() =>
+      expect(previewMutation).toHaveBeenCalledWith({ request_id: 23, season: 2 }),
+    )
+    expect(previewMutation).toHaveBeenCalledTimes(1)
+  })
+
+  it('is hidden for shared/unknown users and for statuses other than no-release', () => {
+    ;(useAuthMe as unknown as Mock).mockReturnValue({ data: undefined, isLoading: true })
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 1, status: 'no_acceptable_release' }),
+          movieRequest({ id: 2, title: 'Searching Movie', status: 'searching' }),
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    })
+    render(<Requests />, { wrapper: MemoryRouter })
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+  })
+})
+
 describe('Requests — opening the shared TitleDetailModal from a row', () => {
   it('clicking a movie row opens the modal on that title', () => {
     ;(useRequests as unknown as Mock).mockReturnValue({
@@ -229,7 +405,7 @@ describe('Requests — opening the shared TitleDetailModal from a row', () => {
       isError: false,
     })
     render(<Requests />, { wrapper: MemoryRouter })
-    fireEvent.click(screen.getByRole('button', { name: /test movie/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open details for Test Movie' }))
     // The reused modal renders its Dialog title as the title's own name — the
     // co-located correction surface (re-search, retry-import, ...) is the same
     // component Discover uses, just opened from a request row instead.
@@ -243,7 +419,29 @@ describe('Requests — opening the shared TitleDetailModal from a row', () => {
       isError: false,
     })
     render(<Requests />, { wrapper: MemoryRouter })
-    fireEvent.click(screen.getByRole('button', { name: /test show/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open details for Test Show' }))
     expect(screen.getByRole('heading', { name: 'Test Show' })).toBeInTheDocument()
+  })
+
+  it('supports native Enter and Space activation on the details control', async () => {
+    const user = userEvent.setup()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest()] },
+      isLoading: false,
+      isError: false,
+    })
+    const enterView = render(<Requests />, { wrapper: MemoryRouter })
+    let details = screen.getByRole('button', { name: 'Open details for Test Movie' })
+
+    details.focus()
+    await user.keyboard('{Enter}')
+    expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
+    enterView.unmount()
+
+    render(<Requests />, { wrapper: MemoryRouter })
+    details = screen.getByRole('button', { name: 'Open details for Test Movie' })
+    details.focus()
+    await user.keyboard(' ')
+    expect(screen.getByRole('heading', { name: 'Test Movie' })).toBeInTheDocument()
   })
 })

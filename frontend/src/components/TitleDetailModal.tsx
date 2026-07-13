@@ -9,7 +9,6 @@ import {
   useQueue,
   useReportIssue,
   useRequests,
-  useSearchPreview,
   useSetKeepForever,
   type ReportReason,
 } from '../api/hooks'
@@ -20,25 +19,54 @@ import type {
   GrabRequest,
   QueueItem,
   RequestResponse,
-  SearchPreviewRequest,
-  SearchPreviewResponse,
+  RequestStatusValue,
   SeasonStatus,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
-import { requestStatus, type StatusPresentation } from '../lib/status'
-import { Dialog } from './ui/Dialog'
+import { PLEX_WEB_APP_URL } from '../lib/plex'
+import { isMarkFailableStatus, requestStatus, type StatusPresentation } from '../lib/status'
+import { Dialog, DialogClose, DialogTitle } from './ui/Dialog'
 import { ReleaseList } from './ReleaseList'
 import { Button } from './ui/Button'
+import { buttonClasses } from './ui/button-variants'
 import { StatusBadge } from './ui/StatusBadge'
 import { ProgressBar } from './ui/ProgressBar'
 import { CenteredSpinner } from './ui/feedback'
 import { useToast } from './ui/toast'
+import { useTitleReleasePreview } from './useTitleReleasePreview'
+
+export interface TitleDetailModalAction {
+  kind: 're-search'
+  requestId: number
+  /**
+   * The TV season the shortcut targets, resolved by the CALLER from the fresh
+   * request row it was clicked on (`null` for a movie). The action effect must
+   * not fall back to the modal's own `currentSeason`: when one long-mounted
+   * modal instance is reused across titles, the title-reset effect has not yet
+   * applied in the render this action first fires in, so `currentSeason` can
+   * still read a season the operator picked on a DIFFERENT title.
+   */
+  season: number | null
+  token: number
+}
 
 interface TitleDetailModalProps {
   title: DiscoverResult | null
   open: boolean
   onOpenChange: (open: boolean) => void
   returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
+  action?: TitleDetailModalAction | null
+  /**
+   * Pin the modal's request correlation to ONE specific row. The Requests list
+   * passes the clicked row's id: an admin's list legitimately shows two
+   * different users' rows for the same title (the display fold keys on user_id
+   * too), and the modal's own `(tmdb_id, media_type)` correlation would
+   * otherwise resolve `liveRequest` — and with it the preview/grab/report/
+   * cancel/pin targets — to the FIRST matching row, which can be a DIFFERENT
+   * user's request than the one that was clicked. Omitted (Discover), the
+   * correlation behaves exactly as before.
+   */
+  boundRequestId?: number | null
 }
 
 function asApiError(error: unknown): ApiError {
@@ -165,28 +193,32 @@ const CANCELLABLE_STATUSES = new Set([
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
- * terminal request id in /queue/grab (`request_not_active`). Terminal statuses are
- * `available` (already in the library), `completed` (imported, finalizing),
- * `failed`, and `evicted` (ADR-0012 — the disk-pressure sweep already deleted the
- * file; re-grabbing the same id would just re-arm a row the backend now treats as
- * settled, see `_SETTLED_REQUEST_STATUSES`). POST /requests can itself hand back a
- * terminal row — Plex already owns the title, or an existing completed/failed/
- * evicted request is reused — so the create path must gate Grab on the returned
- * status, not merely the presence of an id.
+ * terminal request id in /queue/grab (`request_not_active`). Positive allowlist
+ * (issue #205), not a terminal denylist — an unrecognized status (a future
+ * backend enum member this bundle predates, or corrupt/legacy data) is absent
+ * from the set and therefore fails CLOSED (not grabbable), rather than a
+ * denylist's fail-OPEN default. Mirrors the backend's non-terminal statuses:
+ * everything in `RequestStatus` except `available` (already in the library),
+ * `completed` (imported, finalizing), `failed`, `evicted` (ADR-0012 — the
+ * disk-pressure sweep already deleted the file; re-grabbing the same id would
+ * just re-arm a row the backend now treats as settled, see
+ * `_SETTLED_REQUEST_STATUSES`), `waiting_for_air_date`, and `cancelled`
+ * (ADR-0014 — settled and terminal for grab; a fresh "Request again" must be
+ * made before grabbing). `partially_available` is included even though it is a
+ * tv-only rollup NEVER set on a single season (a harmless superset — see
+ * `seasonStatusFor`) because it is genuinely non-terminal at the request level.
  */
+const GRABBABLE_STATUSES = new Set<RequestStatusValue>([
+  'pending',
+  'searching',
+  'no_acceptable_release',
+  'downloading',
+  'import_blocked',
+  'partially_available',
+])
+
 function isGrabbableStatus(status: string): boolean {
-  return (
-    status !== 'available' &&
-    status !== 'completed' &&
-    status !== 'failed' &&
-    status !== 'evicted' &&
-    status !== 'waiting_for_air_date' &&
-    // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
-    // rejects a cancelled id in /queue/grab with request_not_active); a fresh
-    // "Request again" must be made before grabbing. Mirrors the backend's
-    // `_SETTLED_REQUEST_STATUSES` / `TERMINAL_REQUEST_STATUS_VALUES`.
-    status !== 'cancelled'
-  )
+  return GRABBABLE_STATUSES.has(status as RequestStatusValue)
 }
 
 /**
@@ -208,6 +240,80 @@ function isSeasonGrabbable(request: RequestResponse, season: number | null): boo
 
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
 const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'error' }
+const NOT_REQUESTED: StatusPresentation = { label: 'Not requested', intent: 'neutral' }
+
+function statePresentation(state: DerivedState): StatusPresentation {
+  switch (state.kind) {
+    case 'none':
+      return NOT_REQUESTED
+    case 'import_blocked':
+      return IMPORT_BLOCKED
+    case 'completed':
+      return FINALIZING
+    case 'unknown':
+      return requestStatus(state.status)
+    default:
+      return requestStatus(state.kind)
+  }
+}
+
+/** Plain-language copy over the already-derived lifecycle; no new state fold. */
+function stateSentence(
+  state: DerivedState,
+  mediaType: DiscoverResult['media_type'],
+  libraryState: DiscoverResult['library_state'],
+  currentSeason: number | null,
+  queueItem: QueueItem | null,
+): string {
+  switch (state.kind) {
+    case 'none':
+      // Presence without a tracked request (issue #131): the discovery
+      // projection says Plex owns this title even though no request row exists
+      // (added out-of-band, or rows pruned). Never claim it is "not in the
+      // library" — for a movie the actions zone simultaneously offers
+      // Re-acquire BECAUSE it is owned, and the copy must agree with it.
+      if (libraryState === 'available' || libraryState === 'partially_available') {
+        const presence =
+          libraryState === 'partially_available' ? 'Partly in the library' : 'In the library'
+        return mediaType === 'movie'
+          ? `${presence}, but not tracked by a request. Re-acquire it if its file is missing or was replaced.`
+          : `${presence}, but not tracked by a request.`
+      }
+      return 'Not in the library and not requested.'
+    case 'pending':
+      return 'Your request is queued and will be searched automatically.'
+    case 'searching':
+      return 'Scanning configured indexers for an acceptable release.'
+    case 'downloading':
+      return mediaType === 'tv'
+        ? `Season ${currentSeason ?? 1} is downloading.`
+        : 'A release was grabbed and is transferring.'
+    case 'no_acceptable_release':
+      return 'No acceptable release was found. Nothing was grabbed; automatic retries will continue.'
+    case 'waiting_for_air_date':
+      return "This season hasn't aired yet. It will be searched automatically after its air date."
+    case 'import_blocked':
+      return queueItem?.failed_reason
+        ? `The download finished, but import is blocked: ${queueItem.failed_reason}`
+        : 'The download finished, but import needs operator attention.'
+    case 'completed':
+      return 'Imported and awaiting Plex confirmation.'
+    case 'available':
+      return mediaType === 'tv'
+        ? 'This season is imported and visible in Plex.'
+        : 'This title is imported and visible in Plex.'
+    case 'failed':
+      return queueItem?.failed_reason
+        ? `The request failed: ${queueItem.failed_reason}`
+        : 'The request failed. Request it again to restart.'
+    case 'evicted':
+      return 'The disk-pressure sweep reclaimed this file. Deliberate space management — request again any time.'
+    case 'cancelled':
+      return 'This request was cancelled. Request it again any time.'
+    case 'unknown':
+      return `Plex Manager reported “${requestStatus(state.status).label}”; no additional detail is available.`
+  }
+}
 
 /**
  * The headline flow: request a title, run the decision engine (search-preview),
@@ -221,6 +327,8 @@ export function TitleDetailModal({
   open,
   onOpenChange,
   returnFocusTo,
+  action,
+  boundRequestId,
 }: TitleDetailModalProps) {
   const { toast } = useToast()
   // Preview, queue, and grab remain operator tools. Request correction and pin
@@ -229,7 +337,6 @@ export function TitleDetailModal({
   const auth = useAuthMe()
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const createRequest = useCreateRequest()
-  const searchPreview = useSearchPreview()
   const grab = useGrab()
   const markFailed = useMarkFailed()
   const importDownload = useImportDownload()
@@ -259,7 +366,6 @@ export function TitleDetailModal({
   // `null` until they touch the control — `currentSeason` below resolves the
   // real default (the first actionable tracked season, else 1).
   const [activeSeason, setActiveSeason] = useState<number | null>(null)
-  const [preview, setPreview] = useState<SearchPreviewResponse | null>(null)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   // The confirm dialog for "report a problem"; carries the download to re-arm.
   const [reportFor, setReportFor] = useState<{ downloadId: number } | null>(null)
@@ -276,6 +382,8 @@ export function TitleDetailModal({
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
   const [reacquireOpen, setReacquireOpen] = useState(false)
+  const [backdropFailed, setBackdropFailed] = useState(false)
+  const [posterFailed, setPosterFailed] = useState(false)
 
   // Reset the per-title flow whenever a different title is opened. Keyed on
   // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
@@ -292,13 +400,14 @@ export function TitleDetailModal({
     setCreatedCanMutate(false)
     setWholeSeries(true)
     setActiveSeason(null)
-    setPreview(null)
     setGrabbingGuid(null)
     setReportFor(null)
     setReportIssueFor(null)
     setReportReason('bad_quality')
     setCancelFor(null)
     setReacquireOpen(false)
+    setBackdropFailed(false)
+    setPosterFailed(false)
   }, [titleKey])
 
   // The live request for this exact title (media_type + tmdb_id), if any. /requests
@@ -314,6 +423,15 @@ export function TitleDetailModal({
     const matches = (requestsQuery.data?.requests ?? []).filter(
       (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
+    // A caller-pinned row wins outright — the operator clicked THAT row, so its
+    // state (even a settled one) is what the modal must present and act on. The
+    // title-match filter above still applies: a bound id that no longer matches
+    // this title (or vanished from the poll) falls through to normal resolution
+    // rather than binding the modal to a foreign title's request.
+    if (boundRequestId != null) {
+      const bound = matches.find((r) => r.id === boundRequestId)
+      if (bound) return bound
+    }
     const active = matches.find(
       (r) =>
         r.status !== 'available' &&
@@ -325,7 +443,7 @@ export function TitleDetailModal({
         r.status !== 'cancelled',
     )
     return active ?? matches[matches.length - 1] ?? null
-  }, [requestsQuery.data, title])
+  }, [requestsQuery.data, title, boundRequestId])
 
   // A just-created request shows immediately even before the next poll lands. Used
   // for preview + queue correlation (a terminal request still owns its old download).
@@ -398,7 +516,11 @@ export function TitleDetailModal({
   // download would shadow the one the operator is looking at. Movies never carry a
   // season, so this filter is a no-op for them (unchanged behaviour).
   const queueItem = useMemo<QueueItem | null>(() => {
-    if (!title) return null
+    // A disabled query may still expose data left in the shared React Query cache
+    // by a previous administrator session. Treat /queue as unavailable unless the
+    // CURRENT caller is an admin so a role/account transition cannot leak progress,
+    // release failure reasons, or actionable download ids to a shared user.
+    if (!title || !isAdmin) return null
     const items = queueQuery.data?.queue ?? []
     const matches = items.filter((q) => {
       if (effectiveRequestId === null) return q.tmdb_id === title.tmdb_id
@@ -406,7 +528,7 @@ export function TitleDetailModal({
       return title.media_type === 'tv' ? queueItemCoversSeason(q, currentSeason) : true
     })
     return matches.length > 0 ? matches[matches.length - 1]! : null
-  }, [queueQuery.data, title, effectiveRequestId, currentSeason])
+  }, [queueQuery.data, title, effectiveRequestId, currentSeason, isAdmin])
 
   const state = deriveState(
     liveRequest ? seasonStatusFor(liveRequest, currentSeason) : null,
@@ -415,7 +537,14 @@ export function TitleDetailModal({
   const reportTarget = reportFor
     ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
     : null
-  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+  // "Report a problem" drives the identical `mark_failed` mutation Queue.tsx's
+  // Mark failed/Blocklist buttons do (see `runReport` below), so it is gated on
+  // the SAME positive allowlist (`isMarkFailableStatus`, issue #205) rather than
+  // a denylist -- an unrecognized queue-item status (a future backend state
+  // this bundle predates, or corrupt/legacy data) is absent from the allowlist
+  // and therefore fails CLOSED instead of exposing a control that would just
+  // 409 (or worse, silently no-op on a state the backend never expected).
+  const reportActionable = reportTarget !== null && isMarkFailableStatus(reportTarget.status)
 
   useEffect(() => {
     if (reportFor && !reportActionable) {
@@ -423,40 +552,31 @@ export function TitleDetailModal({
     }
   }, [reportFor, reportActionable])
 
-  const runPreview = useCallback(
-    // `seasonOverride` lets a caller preview a season that hasn't made it into
-    // `currentSeason` yet — namely `onRequest`, which must search the season the
-    // BRAND NEW create resolved to, not the one `currentSeason` still reads at
-    // click time (see onRequest below). Omitted (not merely `null`), it falls back
-    // to `currentSeason` — every other caller's behaviour is unchanged.
-    async (forRequestId: number | null, seasonOverride?: number | null) => {
-      if (!title) return
-      const startedKey = `${title.media_type}:${title.tmdb_id}`
-      const body: SearchPreviewRequest =
-        forRequestId !== null
-          ? { request_id: forRequestId }
-          : { tmdb_id: title.tmdb_id, media_type: title.media_type, title: title.title }
-      if (forRequestId === null && typeof title.year === 'number') {
-        body.year = title.year
-      }
-      const season = seasonOverride !== undefined ? seasonOverride : currentSeason
-      // tv only: search/grab is always per-season, so a concrete season is threaded
-      // whenever one is known — `season` is `null` for a movie, so this is a
-      // no-op there (the field stays entirely absent, same payload as before).
-      if (title.media_type === 'tv' && season != null) {
-        body.season = season
-      }
-      try {
-        const result = await searchPreview.mutateAsync(body)
-        if (latestTitleKey.current !== startedKey) return // modal moved to another title
-        setPreview(result)
-      } catch (error) {
-        if (latestTitleKey.current !== startedKey) return
-        toast({ title: 'Search failed', description: asApiError(error).message, intent: 'error' })
-      }
-    },
-    [title, searchPreview, toast, currentSeason],
-  )
+  const { preview, isPending: previewPending, clearPreview, runPreview } =
+    useTitleReleasePreview(title, currentSeason)
+
+  // A route-level shortcut opens this same modal and asks it to run the same
+  // preview path once. Mark the token consumed BEFORE starting the async call so
+  // rerenders, changing mutation identities, and StrictMode's repeated effect
+  // setup cannot issue a duplicate search. Fail closed until admin auth resolves.
+  const consumedActionToken = useRef<number | null>(null)
+  useEffect(() => {
+    if (
+      !open ||
+      !isAdmin ||
+      action?.kind !== 're-search' ||
+      consumedActionToken.current === action.token
+    ) {
+      return
+    }
+    consumedActionToken.current = action.token
+    // The season comes from the action itself (resolved by the caller from the
+    // clicked request row), passed as an explicit override: `runPreview`'s
+    // `currentSeason` fallback closes over pre-reset state in this effect pass
+    // (see TitleDetailModalAction.season). `null` explicitly omits the season
+    // (movie, or a defensive tv fallback -> request-scoped series preview).
+    void runPreview(action.requestId, action.season)
+  }, [action, isAdmin, open, runPreview])
 
   const onRequest = useCallback(async () => {
     if (!title) return
@@ -508,13 +628,13 @@ export function TitleDetailModal({
       if (grabbable && isAdmin) {
         await runPreview(created.id, resolvedSeason)
       } else {
-        setPreview(null)
+        clearPreview()
       }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin])
+  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin, clearPreview])
 
   // Re-acquire (issue #131), movie-only: force-create a fresh grabbable request
   // even though Plex still reports the title present (its file was deleted or
@@ -541,13 +661,13 @@ export function TitleDetailModal({
       if (grabbable && isAdmin) {
         await runPreview(created.id, null)
       } else {
-        setPreview(null)
+        clearPreview()
       }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Re-acquire failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, isAdmin])
+  }, [title, createRequest, toast, runPreview, isAdmin, clearPreview])
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
@@ -677,6 +797,8 @@ export function TitleDetailModal({
 
   const canGrab = grabRequestId !== null
   const meta = [title.year, title.media_type === 'tv' ? 'TV' : 'Movie'].filter(Boolean).join(' · ')
+  const showBackdrop = Boolean(title.backdrop_url) && !backdropFailed
+  const showPoster = Boolean(title.poster_url) && !posterFailed
 
   // Owned but no visible request (issue #131): the title is present in Plex per
   // the discovery projection, yet there is no tracked request row at all -- Plex
@@ -691,13 +813,13 @@ export function TitleDetailModal({
   // enumerate them in a picker that also drives which one is searched/grabbed/shown.
   const seasonSelector: ReactNode =
     title.media_type !== 'tv' ? null : effectiveSeasons && effectiveSeasons.length > 0 ? (
-      <div className="mt-3 flex items-center gap-2">
+      <div className="flex min-w-0 items-center gap-2 max-sm:w-full">
         <label htmlFor="season-select" className="font-mono text-xs text-faint">
           Season
         </label>
         <select
           id="season-select"
-          className="h-8 rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+          className="h-8 min-w-0 max-w-full rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
           value={currentSeason ?? ''}
           onChange={(e) => {
             setActiveSeason(Number(e.target.value))
@@ -705,7 +827,7 @@ export function TitleDetailModal({
             // different scope, and grabbing one now would send the newly selected
             // season and 404 (release_not_found) or grab under the wrong context.
             // The operator re-searches for the newly selected season.
-            setPreview(null)
+            clearPreview()
           }}
         >
           {effectiveSeasons.map((s) => (
@@ -716,10 +838,11 @@ export function TitleDetailModal({
         </select>
       </div>
     ) : state.kind === 'none' ? (
-      <div className="mt-3 flex flex-wrap items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4 max-sm:w-full">
         <label className="flex items-center gap-2 text-xs text-muted">
           <input
             type="checkbox"
+            className="size-4 accent-gold outline-none focus-visible:ring-2 focus-visible:ring-gold/60"
             checked={wholeSeries}
             onChange={(e) => setWholeSeries(e.target.checked)}
           />
@@ -750,24 +873,34 @@ export function TitleDetailModal({
   )
 
   // The report button only makes sense when there's a real download to act on,
-  // AND when mark-failed is a legal move. During the import copy/scan window the
-  // download sits in 'importing' (raw DownloadState) while its owning request still
-  // reads 'downloading'; the state machine only allows Importing -> Imported/
-  // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
-  // Don't offer an action that can't succeed — once the import lands the title
-  // re-renders as completed or import_blocked, where the correction paths reappear.
-  // Queue mark-failed remains admin-only because GET /queue is admin-only.
-  const canReport = isAdmin && queueItem !== null && queueItem.status !== 'importing'
+  // AND when mark-failed is a legal move — `isMarkFailableStatus` (issue #205),
+  // the SAME positive allowlist Queue.tsx's own Mark failed/Blocklist buttons
+  // use, since this button drives the identical `mark_failed` mutation. During
+  // the import copy/scan window the download sits in 'importing' (raw
+  // DownloadState) while its owning request still reads 'downloading'; the
+  // state machine only allows Importing -> Imported/ImportBlocked, so a
+  // mark-failed there always 409s (invalid_state_transition) — 'importing' is
+  // correctly absent from the allowlist. Don't offer an action that can't
+  // succeed — once the import lands the title re-renders as completed or
+  // import_blocked, where the correction paths reappear. An unrecognized
+  // status (future backend state, or corrupt/legacy data) is likewise absent
+  // from the allowlist and fails CLOSED, not just 'importing'. Queue mark-failed
+  // remains admin-only because GET /queue is admin-only.
+  const canReport = isAdmin && queueItem !== null && isMarkFailableStatus(queueItem.status)
   const reportButton =
     canReport && queueItem ? (
-      <Button variant="danger" onClick={() => setReportFor({ downloadId: queueItem.id })}>
+      <Button variant="secondary" onClick={() => setReportFor({ downloadId: queueItem.id })}>
         Report a problem
       </Button>
     ) : null
 
   const retryImportButton =
     isAdmin && queueItem ? (
-      <Button onClick={() => void onRetryImport()} loading={importDownload.isPending}>
+      <Button
+        variant="secondary"
+        onClick={() => void onRetryImport()}
+        loading={importDownload.isPending}
+      >
         Retry import
       </Button>
     ) : null
@@ -778,7 +911,7 @@ export function TitleDetailModal({
   const reportIssueButton =
     canMutateRequest && effectiveRequestId !== null ? (
       <Button
-        variant="danger"
+        variant="secondary"
         onClick={() =>
           setReportIssueFor({ requestId: effectiveRequestId, season: currentSeason })
         }
@@ -791,9 +924,15 @@ export function TitleDetailModal({
   // file was deleted/replaced out-of-band. Opens a confirm dialog, then
   // force-creates a fresh grabbable request (see `onReacquire`). NOT admin-gated:
   // POST /requests (force included) is at the same authZ bar as any create.
-  const reacquireButton =
+  const reacquirePrimary =
     title.media_type === 'movie' ? (
-      <Button variant="secondary" onClick={() => setReacquireOpen(true)}>
+      <Button onClick={() => setReacquireOpen(true)}>
+        Re-acquire
+      </Button>
+    ) : null
+  const reacquireQuiet =
+    title.media_type === 'movie' ? (
+      <Button variant="ghost" onClick={() => setReacquireOpen(true)}>
         Re-acquire
       </Button>
     ) : null
@@ -817,240 +956,157 @@ export function TitleDetailModal({
     !anySeasonImported
   const cancelButton =
     canCancel && liveRequest ? (
-      <Button variant="secondary" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
+      <Button variant="danger" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
         Cancel request
       </Button>
     ) : null
 
-  const reSearchButton = isAdmin ? (
+  const reSearchNowButton = isAdmin ? (
     <Button
-      variant="secondary"
       onClick={() => void runPreview(effectiveRequestId)}
-      loading={searchPreview.isPending}
+      loading={previewPending}
     >
-      Re-search
+      Re-search now
     </Button>
   ) : null
 
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
   // Admin-only: search-preview and grab are `require_admin` routes, so shared
-  // users never see the release browser at all.
-  const showReleases =
+  // users never see the release browser at all. `unknown` is deliberately
+  // EXCLUDED (issue #205, fail closed): a runtime-unknown status must not open
+  // the release browser or expose Grab/Re-search, even though the header badge
+  // and state sentence still render it honestly.
+  const showReleaseSearch =
     isAdmin &&
     (state.kind === 'none' ||
       state.kind === 'pending' ||
       state.kind === 'searching' ||
       state.kind === 'no_acceptable_release' ||
-      state.kind === 'failed' ||
-      state.kind === 'unknown')
+      state.kind === 'failed')
 
   let actionZone: ReactNode
   switch (state.kind) {
     case 'none':
       actionZone = (
-        <div className="flex flex-wrap gap-2">
+        <>
           {/* Owned movie with no tracked request (issue #131): "Request" would just
               short-circuit back to a terminal `available` row with no grab, so the
               honest verb here is Re-acquire (force-create). */}
           {presenceOnly ? (
-            reacquireButton
+            reacquirePrimary
           ) : (
             <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
-              Request
+              + Request
             </Button>
           )}
-          {/* Preview drives admin-only /search-preview: request-only for shared users. */}
-          {isAdmin ? (
-            <Button
-              variant="secondary"
-              onClick={() => void runPreview(null)}
-              loading={searchPreview.isPending}
-            >
-              Preview releases
-            </Button>
-          ) : null}
-        </div>
+        </>
       )
       break
     case 'pending':
     case 'searching':
-      actionZone = (
-        <div className="flex flex-wrap items-center gap-4">
-          <span className="inline-flex items-center gap-2 text-sm font-semibold text-searching">
-            <span className="size-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
-            Searching
-          </span>
-          {reSearchButton}
-          {cancelButton}
-        </div>
-      )
+      actionZone = cancelButton
       break
     case 'downloading':
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center gap-3">
-            <StatusBadge status={requestStatus('downloading')} />
-            {/* Progress comes from admin-only GET /queue (disabled for shared
-                sessions), so a shared user gets the honest badge, never a
-                fabricated stuck-at-0% bar. */}
-            {isAdmin ? (
-              <div className="flex flex-1 items-center gap-3">
-                <ProgressBar value={queueItem?.progress ?? 0} label="Download progress" />
-                <span className="font-mono text-xs text-muted tabular-nums">
-                  {Math.round(Math.min(1, Math.max(0, queueItem?.progress ?? 0)) * 100)}%
-                </span>
-              </div>
-            ) : null}
-          </div>
-          {reportButton || cancelButton ? (
-            <div className="flex flex-wrap gap-2">
-              {reportButton}
-              {cancelButton}
-            </div>
-          ) : null}
-        </div>
-      )
+      actionZone =
+        reportButton || cancelButton ? (
+          <>
+            {reportButton}
+            {cancelButton}
+          </>
+        ) : null
       break
     case 'no_acceptable_release':
-      actionZone = (
-        <div className="flex flex-wrap items-center gap-3">
-          <StatusBadge status={requestStatus('no_acceptable_release')} />
-          <span className="text-sm text-muted">
-            Nothing was grabbed. Re-search to try again later.
-          </span>
-          {reSearchButton}
-          {cancelButton}
-        </div>
-      )
+      actionZone =
+        reSearchNowButton || cancelButton ? (
+          <>
+            {reSearchNowButton}
+            {cancelButton}
+          </>
+        ) : null
       break
     case 'waiting_for_air_date':
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={requestStatus('waiting_for_air_date')} />
-            <span className="text-sm text-muted">
-              This season has not aired yet. Cancel the request if you no longer want it.
-            </span>
-          </div>
-          <div className="flex flex-wrap gap-2">{cancelButton}</div>
-        </div>
-      )
+      actionZone = cancelButton
       break
     case 'import_blocked':
-      // Honest, retryable: the download finished but the import was blocked (a bad
-      // file or an import error). Show the reason + the two correction buttons —
-      // retry the import, or reject the release (blocklist + re-search).
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={IMPORT_BLOCKED} />
-            {queueItem?.failed_reason ? (
-              <span className="text-sm text-error">{queueItem.failed_reason}</span>
-            ) : null}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {retryImportButton}
-            {reportButton}
-          </div>
-        </div>
-      )
+      actionZone = reportButton
       break
     case 'completed':
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={FINALIZING} />
-            <span className="text-sm text-muted">Imported — awaiting Plex confirmation.</span>
-          </div>
-          {/* Imported (finalizing): report-issue can already redo it (ADR-0014). */}
-          {reportIssueButton ? (
-            <div className="flex flex-wrap gap-2">{reportIssueButton}</div>
-          ) : null}
-        </div>
-      )
+      actionZone = reportIssueButton
       break
     case 'available':
       // In the library. The download is terminal (gone from the active queue), so
       // there is no mark-failed target — instead report-issue-with-purge (ADR-0014)
       // blocklists the release, deletes it from Plex/disk, and re-searches inline.
       actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="inline-flex items-center gap-1.5 rounded-lg bg-available/15 px-3 py-1 text-sm font-semibold text-available ring-1 ring-available/30">
-              ✓ In your library
-            </span>
-          </div>
+        <>
+          <a
+            href={PLEX_WEB_APP_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={buttonClasses()}
+          >
+            Open in Plex ↗<span className="sr-only"> opens in a new tab</span>
+          </a>
           {/* Re-acquire (issue #131) sits beside report-issue for a movie. The
               request creator (or an admin) can report; a subscriber sees only
-              Re-acquire. TV shows only report-issue because re-acquisition there
-              is season-scoped. */}
-          {reportIssueButton || reacquireButton ? (
-            <div className="flex flex-wrap gap-2">
-              {reacquireButton}
-              {reportIssueButton}
-            </div>
-          ) : null}
-        </div>
+              Re-acquire (reacquireQuiet is null for tv — per-season
+              re-acquisition is the report-issue verb's job). */}
+          {reportIssueButton}
+          {reacquireQuiet}
+        </>
       )
       break
     case 'failed':
       actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={requestStatus('failed')} />
-            {queueItem?.failed_reason ? (
-              <span className="text-sm text-error">{queueItem.failed_reason}</span>
-            ) : null}
-          </div>
+        <>
           {/* The prior request is terminal — "Request again" makes a fresh, grabbable
               one (re-searching the dead id would show releases that all fail to grab). */}
-          <div className="flex flex-wrap gap-2">
-            {requestAgainButton}
-            {reportButton}
-          </div>
-        </div>
+          {requestAgainButton}
+          {reportButton}
+        </>
       )
       break
     case 'evicted':
       // ADR-0012: honest, retryable — the disk-pressure sweep freed this title's
       // file on purpose (not a failure), and re-requesting grabs it again from
       // scratch (the old id is settled, same as available/failed).
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={requestStatus('evicted')} />
-            <span className="text-sm text-muted">
-              Freed to relieve disk pressure. Request it again to re-grab it.
-            </span>
-          </div>
-          <div className="flex flex-wrap gap-2">{requestAgainButton}</div>
-        </div>
-      )
+      actionZone = requestAgainButton
       break
     case 'cancelled':
       // ADR-0014: the operator cancelled this (not-yet-imported) request. Settled,
       // same as evicted/available/failed — "Request again" makes a fresh, grabbable
       // request (the old id is settled).
-      actionZone = (
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={requestStatus('cancelled')} />
-            <span className="text-sm text-muted">Cancelled. Request it again to restart.</span>
-          </div>
-          <div className="flex flex-wrap gap-2">{requestAgainButton}</div>
-        </div>
-      )
+      actionZone = requestAgainButton
       break
     case 'unknown':
-      actionZone = (
-        <div className="flex flex-wrap items-center gap-3">
-          <StatusBadge status={requestStatus(state.status)} />
-          {reSearchButton}
-        </div>
-      )
+      // issue #205: a runtime-unknown status (a future backend enum member this
+      // bundle predates, or corrupt/legacy data) gets NO actions — no Grab, no
+      // Re-search, no release browser. Fail closed on the action, never on the
+      // display: the header StatusBadge and state sentence already render it
+      // honestly via `statePresentation`/`stateSentence`.
+      actionZone = null
       break
   }
+
+  const progressPercent =
+    state.kind === 'downloading' &&
+    isAdmin &&
+    !queueQuery.isLoading &&
+    !queueQuery.isError &&
+    queueItem
+      ? Math.round(Math.min(1, Math.max(0, queueItem.progress)) * 100)
+      : null
+  const progressLabel = `Download progress for ${title.title}${
+    title.media_type === 'tv' ? `, season ${currentSeason ?? 1}` : ''
+  }`
+  const statusCopy = stateSentence(
+    state,
+    title.media_type,
+    title.library_state,
+    currentSeason,
+    queueItem,
+  )
 
   return (
     <Dialog
@@ -1059,51 +1115,195 @@ export function TitleDetailModal({
       title={title.title}
       description={title.title}
       returnFocusTo={returnFocusTo}
+      customChrome
     >
-      <div className="flex flex-col gap-6">
-        <div className="flex gap-5">
-          <div className="aspect-[2/3] w-28 shrink-0 overflow-hidden rounded-lg bg-poster ring-1 ring-white/10">
-            {title.poster_url ? (
-              <img src={title.poster_url} alt="" className="size-full object-cover" />
-            ) : null}
-          </div>
-          <div className="min-w-0">
-            <div className="font-mono text-xs text-faint">{meta}</div>
+      <div className="relative h-[180px] overflow-hidden bg-poster bg-gradient-to-br from-white/8 via-surface-deep to-surface" data-testid="title-backdrop">
+        {showBackdrop ? (
+          <img
+            src={title.backdrop_url ?? undefined}
+            alt=""
+            aria-hidden="true"
+            className="absolute inset-0 size-full object-cover"
+            onError={() => setBackdropFailed(true)}
+          />
+        ) : null}
+        <div
+          aria-hidden="true"
+          className="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-surface to-transparent"
+        />
+      </div>
+
+      <DialogClose
+        aria-label="Close"
+        className="absolute top-3 right-3 z-20 flex size-10 items-center justify-center rounded-full bg-black/65 text-base text-ink shadow-lg ring-1 ring-inset ring-white/15 outline-none transition-colors hover:bg-black/85 focus-visible:ring-2 focus-visible:ring-gold/70 sm:size-8"
+      >
+        ✕
+      </DialogClose>
+
+      <div className="relative z-10 -mt-16 px-4 sm:px-[26px]">
+        <section aria-labelledby="title-detail-heading">
+          <div className="grid min-w-0 grid-cols-[96px_minmax(0,1fr)] gap-x-3 gap-y-3 sm:grid-cols-[148px_minmax(0,1fr)] sm:gap-x-5">
+            <div
+              data-testid="title-poster"
+              className="aspect-[2/3] w-24 overflow-hidden rounded-lg border border-white/12 bg-poster bg-gradient-to-b from-white/10 to-transparent shadow-xl sm:row-span-2 sm:w-[148px]"
+            >
+              {showPoster ? (
+                <img
+                  src={title.poster_url ?? undefined}
+                  alt=""
+                  aria-hidden="true"
+                  className="size-full object-cover"
+                  onError={() => setPosterFailed(true)}
+                />
+              ) : null}
+            </div>
+            <div className="min-w-0 pt-[70px]">
+              <DialogTitle
+                id="title-detail-heading"
+                className="break-words font-display text-[24px] leading-tight font-extrabold text-ink sm:text-[26px]"
+              >
+                {title.title}
+              </DialogTitle>
+              <p className="mt-1 font-mono text-[11px] tracking-wide text-faint">{meta}</p>
+            </div>
             {title.overview ? (
-              <p className="mt-2 line-clamp-6 text-sm leading-relaxed text-muted">
+              <p className="col-span-2 min-w-0 break-words text-sm leading-relaxed text-muted sm:col-span-1">
                 {title.overview}
               </p>
             ) : null}
-            {seasonSelector}
-            {/* Creators and admins may pin; subscribers keep a read-only view. */}
-            {canMutateRequest && pinRequestId != null ? (
-              <label className="mt-3 flex items-center gap-2 text-xs text-muted">
-                <input
-                  type="checkbox"
-                  checked={keepForever}
-                  disabled={setKeepForever.isPending}
-                  onChange={() => void onToggleKeepForever()}
-                />
-                Keep forever (never auto-evicted)
-              </label>
-            ) : null}
-            <div className="mt-4">{actionZone}</div>
           </div>
-        </div>
+        </section>
+      </div>
 
-        {showReleases ? (
-          searchPreview.isPending && !preview ? (
-            <CenteredSpinner label="Running the decision engine…" />
-          ) : preview ? (
-            <ReleaseList
-              preview={preview}
-              onGrab={(rel) => void onGrab(rel)}
-              grabbingGuid={grabbingGuid}
-              canGrab={canGrab}
-            />
-          ) : null
+      <div className="px-4 pt-6 pb-7 sm:px-[26px]">
+        <section
+          aria-labelledby="title-state-heading"
+          className="rounded-xl border border-hairline bg-surface-deep p-4 sm:p-[18px]"
+        >
+          <h3 id="title-state-heading" className="sr-only">
+            State
+          </h3>
+          <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex min-w-0 items-start gap-3">
+              <StatusBadge status={statePresentation(state)} className="mt-0.5 shrink-0" />
+              <p className="min-w-0 break-words text-sm leading-relaxed text-muted">{statusCopy}</p>
+            </div>
+            {seasonSelector ? <div className="shrink-0 sm:max-w-[48%]">{seasonSelector}</div> : null}
+          </div>
+
+          {progressPercent != null && queueItem ? (
+            <div className="mt-4 flex min-w-0 items-center gap-3">
+              <ProgressBar
+                value={queueItem.progress}
+                label={progressLabel}
+                className="min-w-0 flex-1"
+              />
+              <span className="shrink-0 font-mono text-xs text-muted tabular-nums">
+                {progressPercent}%
+              </span>
+            </div>
+          ) : null}
+
+          {effectiveSeasons && effectiveSeasons.length > 0 ? (
+            <ul aria-label="Season states" className="mt-4 flex min-w-0 flex-wrap gap-1.5">
+              {effectiveSeasons.map((season) => {
+                const imported = season.imported_episode_count
+                const target = season.target_episode_count
+                const detail =
+                  imported != null && target != null && imported < target
+                    ? `S${season.season_number} ${imported}/${target}`
+                    : `S${season.season_number}`
+                return (
+                  <li key={season.season_number}>
+                    <StatusBadge status={requestStatus(season.status)} detail={detail} />
+                  </li>
+                )
+              })}
+            </ul>
+          ) : null}
+        </section>
+
+        {actionZone || (canMutateRequest && pinRequestId != null && state.kind === 'available') ? (
+          <section aria-labelledby="title-actions-heading" className="mt-5">
+            <h3 id="title-actions-heading" className="sr-only">
+              Actions
+            </h3>
+            <div className="flex flex-wrap items-center gap-2.5">
+              {actionZone}
+              {/* Keep-forever is available only for a known, watchable pin target.
+                  Creators and admins may pin; subscribers keep a read-only view. */}
+              {canMutateRequest && pinRequestId != null && state.kind === 'available' ? (
+                <label className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-xs text-muted">
+                  <input
+                    type="checkbox"
+                    className="size-4 accent-gold outline-none focus-visible:ring-2 focus-visible:ring-gold/60"
+                    checked={keepForever}
+                    disabled={setKeepForever.isPending}
+                    onChange={() => void onToggleKeepForever()}
+                  />
+                  Keep forever · never evicted
+                </label>
+              ) : null}
+            </div>
+          </section>
         ) : null}
       </div>
+
+      {isAdmin ? (
+        <section
+          aria-labelledby="title-admin-heading"
+          className="min-w-0 border-t border-hairline bg-black/20 px-4 py-5 sm:px-[26px] sm:py-6"
+        >
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+            <h3
+              id="title-admin-heading"
+              className="font-mono text-[10.5px] font-semibold tracking-[0.14em] text-faint uppercase"
+            >
+              ADMIN · RELEASES
+            </h3>
+            <div className="flex flex-wrap items-center gap-2">
+              {state.kind === 'import_blocked' && queueItem ? retryImportButton : null}
+              {showReleaseSearch ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void runPreview(effectiveRequestId)}
+                  loading={previewPending}
+                >
+                  Search releases
+                </Button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="mt-4 min-w-0">
+            {showReleaseSearch && previewPending ? (
+              <CenteredSpinner label="Running the decision engine…" />
+            ) : showReleaseSearch && preview ? (
+              <ReleaseList
+                preview={preview}
+                onGrab={(rel) => void onGrab(rel)}
+                grabbingGuid={grabbingGuid}
+                canGrab={canGrab}
+                variant="admin"
+              />
+            ) : showReleaseSearch ? (
+              <p className="text-sm text-faint">
+                No release search run yet for this title.
+                {title.media_type === 'tv' ? ` Season ${currentSeason ?? 1}.` : ''}
+              </p>
+            ) : (
+              // Honest in the states where searching is deliberately closed
+              // (downloading/blocked/finalizing/available/settled): a search may
+              // well have run — its grab is why we're here — so never claim
+              // "no search run yet"; say why the browser is shut instead.
+              <p className="text-sm text-faint">
+                Release search isn&apos;t available in this state.
+              </p>
+            )}
+          </div>
+        </section>
+      ) : null}
 
       {reportFor && reportActionable ? (
         <Dialog

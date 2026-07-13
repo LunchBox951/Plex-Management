@@ -46,6 +46,7 @@ __all__ = [
     "DownloadHistory",
     "DownloadHistoryEvent",
     "DownloadScope",
+    "DownloadScopeStatus",
     "EpisodeState",
     "LogEvent",
     "MediaRequest",
@@ -118,6 +119,36 @@ class RequestStatus(StrEnum):
     # length, so adding this member needs NO column migration; and because the active
     # partial index is an INCLUSION list that never named ``cancelled``, it is
     # excluded by omission -- no index migration either (mirrors ``evicted``).
+    cancelled = "cancelled"
+
+
+class DownloadScopeStatus(StrEnum):
+    """Lifecycle of one logical TV scope attached to a physical torrent download.
+
+    Mirrors the vocabulary the services actually persist to
+    ``download_scopes.status`` — ``repositories/downloads.py`` and
+    ``import_service`` write the pipeline states, and
+    ``correction_service._mark_download_scopes_terminal`` additionally stamps
+    ``cancelled`` when an operator cancels a request whose scoped download is
+    still live (ADR-0014). It is a plain ``String`` column, no CHECK constraint —
+    same rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this
+    enum needs no column migration. Kept separate from :class:`RequestStatus`
+    because a scope's vocabulary is a strict subset with different terminality
+    (``imported``/``failed``/``cancelled`` are scope-terminal; the request-level
+    rollup is a different state machine in ``domain/season_rollup.py``).
+    """
+
+    active = "active"
+    import_blocked = "import_blocked"
+    imported = "imported"
+    failed = "failed"
+    no_acceptable_release = "no_acceptable_release"
+    # Persisted by ``correction_service.cancel_request`` (via
+    # ``_mark_download_scopes_terminal``) on every still-unresolved scope of the
+    # cancelled request's download. Omitting it here made ``QueueScope``
+    # serialization raise a ValidationError (an HTTP 500) for any queue row
+    # carrying such a scope — a legitimately persisted state, not corrupt data
+    # (Codex review on PR #269). Scope-terminal, like ``imported``/``failed``.
     cancelled = "cancelled"
 
 
