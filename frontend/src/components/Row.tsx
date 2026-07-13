@@ -32,11 +32,13 @@ const LOOP_ITEM_TARGET = 20
 const LOOP_COPY_COUNT = 3
 /**
  * The one copy whose original (un-padded) tiles are the real, operable set: they
- * carry the interactive controls and are the only tiles left in the accessibility
- * tree. Everything else — the other two copies plus any padding repeats — is inert
- * decorative runway (see `isRealTile`). The middle copy is chosen because the track
- * initializes scrolled to its start, so the real set is exactly what's on screen and
- * in reach the moment the row mounts.
+ * carry the focusable controls and are the only tiles in the accessibility tree.
+ * Everything else — the other two copies plus any padding repeats — is a clone:
+ * aria-hidden and untabbable so screen readers and keyboard users see each item
+ * exactly once, yet still mouse/touch-operable via a delegated click that routes
+ * to the real source item (see `isRealTile` in the tile map). The middle copy is
+ * chosen because the track initializes scrolled to its start, so the real set is
+ * exactly what's on screen and in reach the moment the row mounts.
  */
 const REAL_COPY_INDEX = 1
 const WRAP_EPSILON = 5
@@ -79,9 +81,10 @@ function wrapAtEdge(track: HTMLDivElement, setWidth: number): void {
  * A titled, horizontally-scrollable poster strip. Three content-identical copies
  * make native scrolling and chevron navigation appear continuous in either
  * direction; only the middle copy's original tiles are real (focusable,
- * accessible, interactive) — the rest are inert decorative runway (see the tile
- * map's `isRealTile`), so the loop illusion never leaks duplicate tiles into the
- * tab order or the accessibility tree.
+ * accessible), so the loop illusion never leaks duplicate tiles into the tab
+ * order or the accessibility tree — but clone tiles remain mouse-operable,
+ * delegating clicks to the real source item (see the tile map's `isRealTile`),
+ * because after a wrap the copy on screen IS what the user is pointing at.
  */
 export function Row({
   title,
@@ -190,16 +193,33 @@ export function Row({
               ))
             : loopTiles.map(({ item, slotIndex, copyIndex }) => {
                 const state = tileState?.(item) ?? null
-                // Exactly one copy of each source item is a real, operable tile:
-                // the un-padded slots of the middle copy. Every other rendered tile
-                // — the two mirror copies and any padding repeats — is inert
-                // decorative runway: it makes the loop look continuous but is removed
-                // from the tab order AND the accessibility tree, so a keyboard user
-                // never tabs through phantom clones and a screen reader hears each
-                // title (and the row's item count) exactly once, not padded/tripled.
-                // `inert` also blocks pointer targeting, so a stray request can only
-                // ever originate from the single real tile.
+                // Exactly one copy of each source item is a real tile: the
+                // un-padded slots of the middle copy. It alone renders focusable
+                // controls (details trigger + quick-request) and sits in the
+                // accessibility tree, so a keyboard user never tabs through
+                // phantom clones and a screen reader hears each title (and the
+                // row's item count) exactly once, not padded/tripled. Every other
+                // rendered tile — the two mirror copies and any padding repeats —
+                // is an aria-hidden clone. Clones stay MOUSE-operable (after a
+                // wrap, the copy on screen is what the user is pointing at):
+                // the wrapper delegates a click to the real source item's
+                // details action, with no focusable control of its own.
                 const isRealTile = copyIndex === REAL_COPY_INDEX && slotIndex < items.length
+                // Which real slot this tile mirrors (padding repeats fold back
+                // into the source range).
+                const sourceSlot = slotIndex % items.length
+                const openFromClone = () => {
+                  // Hand focus to the real tile's trigger first (invisible to the
+                  // scroll position) so the details modal opens with a sane
+                  // previously-focused element — closing it returns focus to the
+                  // REAL tile, never to <body> or an aria-hidden clone.
+                  trackRef.current
+                    ?.querySelector<HTMLElement>(
+                      `[data-loop-real][data-loop-slot="${sourceSlot}"] [data-poster-card-trigger]`,
+                    )
+                    ?.focus({ preventScroll: true })
+                  onSelect(item)
+                }
                 return (
                   <div
                     key={`${item.media_type}-${item.tmdb_id}-slot-${slotIndex}-copy-${copyIndex}`}
@@ -208,9 +228,9 @@ export function Row({
                     data-loop-copy-start={slotIndex === 0 ? copyIndex : undefined}
                     data-loop-real={isRealTile ? '' : undefined}
                     aria-hidden={isRealTile ? undefined : true}
-                    // React 19 renders the boolean `inert` attribute; spread it only
-                    // when set so real tiles carry no `inert=""` at all.
-                    {...(isRealTile ? {} : { inert: true })}
+                    // Delegated pointer path for clones only; the real tile's own
+                    // button handles its clicks, so nothing can double-fire.
+                    {...(isRealTile ? {} : { onClick: openFromClone })}
                     className="w-[150px] shrink-0 snap-start"
                   >
                     <PosterCard
@@ -218,10 +238,17 @@ export function Row({
                       year={item.year ?? null}
                       posterUrl={item.poster_url ?? null}
                       seed={item.tmdb_id}
-                      // Omit onClick entirely on inert clones (under
-                      // exactOptionalPropertyTypes a bare `undefined` is a type
-                      // error): a clone renders no details trigger button at all.
-                      {...(isRealTile ? { onClick: () => onSelect(item) } : {})}
+                      // Real tiles get the native focusable trigger. Clones omit
+                      // onClick (no button, nothing tabbable inside aria-hidden)
+                      // and instead restore the interactive hover affordances —
+                      // lift, ring, pointer cursor — so a clone looks and feels
+                      // identical to the real tile it mirrors.
+                      {...(isRealTile
+                        ? { onClick: () => onSelect(item) }
+                        : {
+                            className:
+                              'cursor-pointer hover:-translate-y-1 hover:ring-white/15',
+                          })}
                       badge={state ? <TileStatusGlyph status={state} /> : undefined}
                       action={
                         isRealTile && state === null && (quickRequestable?.(item) ?? true) ? (

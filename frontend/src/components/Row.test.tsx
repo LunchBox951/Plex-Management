@@ -361,11 +361,12 @@ describe('Row looping track (issue #190)', () => {
       expect(document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)).toHaveLength(20)
     }
     // Slot 4 is a padding REPEAT of SHOW (4 % 3 === 1) — its poster art is present
-    // for the loop runway, but as an inert clone it exposes no interactive control.
+    // for the loop runway, but as an aria-hidden clone it renders no focusable
+    // control of its own (its clicks delegate to the real item; see the clone suite).
     const paddingRepeat = loopTile(1, 4)
     expect(paddingRepeat).toHaveTextContent('Already Requested Show')
-    expect(paddingRepeat).toHaveAttribute('inert')
-    expect(within(paddingRepeat).queryByRole('button')).not.toBeInTheDocument()
+    expect(paddingRepeat).toHaveAttribute('aria-hidden', 'true')
+    expect(paddingRepeat.querySelectorAll('button')).toHaveLength(0)
     // The single real SHOW tile (first, un-padded occurrence) keeps its control.
     expect(
       within(loopTile(1, 1)).getByRole('button', {
@@ -551,7 +552,7 @@ describe('Row looping track (issue #190)', () => {
   })
 })
 
-describe('Row loop-clone inertness and screen-reader honesty (issue #190)', () => {
+describe('Row loop-clone a11y contract and screen-reader honesty (issue #190)', () => {
   const REQUEST_MOVIE = 'Request Unbadged Movie'
 
   it('leaves only the middle copy of an already-long source in the tab order and a11y tree', () => {
@@ -561,22 +562,23 @@ describe('Row loop-clone inertness and screen-reader honesty (issue #190)', () =
     render(<Row title="Home row" items={longItems} onSelect={() => {}} tileState={() => null} />)
 
     // 63 tiles are rendered for the visual loop, but exactly the 21 real ones (the
-    // middle copy) are non-inert and in the accessibility tree.
+    // middle copy) are in the accessibility tree; mirror copies are aria-hidden
+    // and contain nothing focusable (no buttons at all — the delegated click
+    // lives on the untabbable wrapper).
     expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(63)
     expect(document.querySelectorAll('[data-loop-real]')).toHaveLength(21)
     for (const copyIndex of [0, 2]) {
       for (const el of document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)) {
-        expect(el).toHaveAttribute('inert')
         expect(el).toHaveAttribute('aria-hidden', 'true')
+        expect(el.querySelectorAll('button, [tabindex]')).toHaveLength(0)
       }
     }
     for (const el of document.querySelectorAll('[data-loop-copy="1"]')) {
-      expect(el).not.toHaveAttribute('inert')
       expect(el).not.toHaveAttribute('aria-hidden')
     }
 
     // Screen-reader honesty: one details button + one request action per real item,
-    // never one-per-clone. getAllByRole ignores inert/aria-hidden subtrees.
+    // never one-per-clone. getAllByRole ignores aria-hidden subtrees.
     expect(screen.getAllByRole('button', { name: /^View details for/ })).toHaveLength(21)
     expect(screen.getAllByRole('button', { name: /^Request / })).toHaveLength(21)
   })
@@ -612,8 +614,8 @@ describe('Row loop-clone inertness and screen-reader honesty (issue #190)', () =
     render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
 
     // The padded clone at copy 1, slot 1 carries no request control at all.
-    expect(within(loopTile(1, 1)).queryByRole('button')).not.toBeInTheDocument()
-    expect(loopTile(1, 1)).toHaveAttribute('inert')
+    expect(loopTile(1, 1).querySelectorAll('button')).toHaveLength(0)
+    expect(loopTile(1, 1)).toHaveAttribute('aria-hidden', 'true')
 
     // The lone reachable request action belongs to the real tile and POSTs the
     // real item's identity — clones can never source a request.
@@ -624,6 +626,64 @@ describe('Row loop-clone inertness and screen-reader honesty (issue #190)', () =
       tmdb_id: MOVIE.tmdb_id,
       media_type: MOVIE.media_type,
     } satisfies CreateRequestBody)
+  })
+
+  it('opens details from a clicked clone, acting on the real source item (codex P2 round 1)', () => {
+    // A mirror-copy tile is exactly what the user sees after a wrap, and a padding
+    // repeat is visible immediately for a short row — both must respond to a click
+    // by opening the REAL item's details, not ignore it.
+    const onSelect = vi.fn()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row title="Home row" items={[MOVIE, SHOW]} onSelect={onSelect} tileState={() => null} />,
+    )
+
+    // Mirror copy (copy 0, slot 1 => SHOW).
+    fireEvent.click(loopTile(0, 1))
+    expect(onSelect).toHaveBeenLastCalledWith(SHOW)
+    // Padding repeat inside the real copy (slot 3 folds to source slot 1 => SHOW).
+    fireEvent.click(loopTile(1, 3))
+    expect(onSelect).toHaveBeenLastCalledWith(SHOW)
+    expect(onSelect).toHaveBeenCalledTimes(2)
+
+    // Before opening, the delegated handler hands focus to the REAL tile's details
+    // trigger so a modal opened from a clone returns focus somewhere sane on close
+    // (the real tile), never to <body> or an aria-hidden clone.
+    expect(
+      within(loopTile(1, 1)).getByRole('button', {
+        name: 'View details for Already Requested Show (2019)',
+      }),
+    ).toHaveFocus()
+  })
+
+  it('does not double-fire when the real tile itself is clicked', () => {
+    // The real tile's clicks are handled by its own native button; the delegated
+    // clone path only exists on aria-hidden wrappers. One click, one onSelect.
+    const onSelect = vi.fn()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
+
+    fireEvent.click(
+      within(loopTile(1, 0)).getByRole('button', {
+        name: 'View details for Unbadged Movie (2020)',
+      }),
+    )
+    expect(onSelect).toHaveBeenCalledTimes(1)
+    expect(onSelect).toHaveBeenCalledWith(MOVIE)
+  })
+
+  it('gives clones the same hover affordances as real tiles', () => {
+    // Codex round 1: a visible poster that looks interactive must feel interactive.
+    // Clones restore the pointer cursor and hover lift/ring that PosterCard only
+    // applies when it has an onClick of its own.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    const cloneCard = loopTile(0, 0).querySelector('[data-poster-card]')
+    expect(cloneCard).not.toBeNull()
+    expect(cloneCard!.className).toContain('cursor-pointer')
+    expect(cloneCard!.className).toContain('hover:-translate-y-1')
+    expect(cloneCard!.className).toContain('hover:ring-white/15')
   })
 
   it('pads deterministically by modular repetition (no randomness, stable across renders)', () => {
