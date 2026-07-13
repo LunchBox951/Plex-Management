@@ -104,7 +104,7 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
         'flex size-8 items-center justify-center rounded-full',
         'bg-gold text-gold-ink ring-1 ring-inset ring-black/10',
         'pointer-events-none opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100',
-        'hover:bg-gold/90 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60',
+        'hover:bg-gold-hover focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60',
         'disabled:cursor-not-allowed disabled:opacity-100 disabled:hover:bg-gold',
       )}
     >
