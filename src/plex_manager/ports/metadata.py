@@ -136,10 +136,23 @@ class MetadataPort(Protocol):
         raise NotImplementedError
 
     async def get_movie(self, tmdb_id: int) -> MovieMetadata | None:
-        """Resolve a movie by tmdb id, or ``None`` if not found."""
+        """Resolve a movie by tmdb id, or ``None`` if not found.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "not found"
+        answer, silently hiding a forgotten override -- a caller keying a
+        grab/request decision off this must fail loudly at call time instead,
+        mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
-        """Resolve a TV show by tmdb id, or ``None`` if not found."""
+        """Resolve a TV show by tmdb id, or ``None`` if not found.
+
+        Raises ``NotImplementedError`` by default (issue #204): same rationale
+        as :meth:`get_movie`.
+        """
+        raise NotImplementedError
 
     async def trending_movies(self, page: int = 1) -> MediaPage:
         """List the week's trending movies, one page at a time."""
