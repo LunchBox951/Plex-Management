@@ -70,6 +70,14 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.services.update_policy import (
+    AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
+    AUTOMATIC_UPDATE_TIMEZONE_DEFAULT,
+    AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT,
+    AUTOMATIC_UPDATE_WINDOW_END_DEFAULT,
+    AUTOMATIC_UPDATE_WINDOW_START_DEFAULT,
+    AUTOMATIC_UPDATES_ENABLED_DEFAULT,
+)
 from plex_manager.web.errors import AppError
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
@@ -82,6 +90,12 @@ from plex_manager.web.settings_bounds import (
 
 __all__ = [
     "API_KEY_HEADER_NAME",
+    "AUTOMATIC_UPDATES_ENABLED_DEFAULT",
+    "AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT",
+    "AUTOMATIC_UPDATE_TIMEZONE_DEFAULT",
+    "AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT",
+    "AUTOMATIC_UPDATE_WINDOW_END_DEFAULT",
+    "AUTOMATIC_UPDATE_WINDOW_START_DEFAULT",
     "AUTO_GRAB_ENABLED_DEFAULT",
     "CSRF_COOKIE_NAME",
     "CSRF_HEADER_NAME",
@@ -259,6 +273,14 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # below.
     "anime_movie_root",
     "anime_tv_root",
+    # Opt-in container updates (ADR-0023). The updater's bearer credential is a
+    # Compose secret and deliberately does not appear in this public store.
+    "automatic_updates_enabled",
+    "automatic_update_timezone",
+    "automatic_update_weekdays",
+    "automatic_update_window_start",
+    "automatic_update_window_end",
+    "automatic_update_idle_only",
 )
 
 # Keys whose values are secrets: stored encrypted, masked on read. Everything

@@ -24,6 +24,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from plex_manager.db import get_sessionmaker
+from plex_manager.services.update_coordination_service import (
+    MaintenanceDrainingError,
+    MaintenanceLeaseLostError,
+    UpdateCoordinationService,
+)
 from plex_manager.web.deps import load_system_settings
 
 if TYPE_CHECKING:
@@ -33,7 +38,24 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
-__all__ = ["SETUP_ALLOWLIST_PATHS", "SETUP_ALLOWLIST_PREFIXES", "SetupGuardMiddleware"]
+__all__ = [
+    "SETUP_ALLOWLIST_PATHS",
+    "SETUP_ALLOWLIST_PREFIXES",
+    "CriticalMutationMiddleware",
+    "SetupGuardMiddleware",
+]
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_MAINTENANCE_EXCLUDED_PREFIXES = (
+    "/api/v1/auth",
+    "/api/v1/setup",
+    # Recovery-key rotation/revocation is an auth-domain write, not media or
+    # updater-critical work. Keeping it available also preserves its own
+    # concurrency/CAS boundary instead of serializing outside that lock.
+    "/api/v1/settings/app-key",
+    "/api/v1/updates",
+    "/api/v1/internal/updates",
+)
 
 # Exact paths always reachable pre-init.
 SETUP_ALLOWLIST_PATHS: frozenset[str] = frozenset(
@@ -87,3 +109,68 @@ class SetupGuardMiddleware(BaseHTTPMiddleware):
         async with maker() as session:
             system = await load_system_settings(session)
             return system is not None and system.initialized
+
+
+class CriticalMutationMiddleware(BaseHTTPMiddleware):
+    """Lease state-changing API work so an updater drain cannot race it.
+
+    The request-creation endpoint is deliberately excluded: requests remain
+    accepted during the short maintenance drain, while background auto-grab is
+    leased separately and therefore leaves the critical handoff queued.
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        path = request.url.path
+        if (
+            request.method in _SAFE_METHODS
+            or not path.startswith("/api/v1/")
+            or (request.method == "POST" and path.rstrip("/") == "/api/v1/requests")
+            or any(path.startswith(prefix) for prefix in _MAINTENANCE_EXCLUDED_PREFIXES)
+        ):
+            return await call_next(request)
+
+        coordinator = getattr(request.app.state, "update_coordinator", None)
+        if not isinstance(coordinator, UpdateCoordinationService):
+            maker_obj = getattr(request.app.state, "sessionmaker", None)
+            maker = (
+                cast("async_sessionmaker[AsyncSession]", maker_obj)
+                if isinstance(maker_obj, async_sessionmaker)
+                else get_sessionmaker()
+            )
+            coordinator = UpdateCoordinationService(maker)
+            try:
+                await coordinator.initialize()
+            except Exception:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": "maintenance_coordinator_unavailable",
+                        "message": "A safe mutation lease could not be established.",
+                    },
+                )
+            request.app.state.update_coordinator = coordinator
+        try:
+            async with coordinator.critical_operation(f"http_{request.method.lower()}"):
+                return await call_next(request)
+        except MaintenanceDrainingError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_in_progress",
+                    "message": "Container update maintenance is draining critical work.",
+                    "hint": "Try again after the update finishes.",
+                },
+            )
+        except MaintenanceLeaseLostError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_lease_lost",
+                    "message": "The mutation finished with uncertain maintenance ownership.",
+                    "hint": "Refresh the affected resource before retrying.",
+                },
+            )

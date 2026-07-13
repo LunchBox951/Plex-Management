@@ -17,6 +17,7 @@ from typing import Any, Literal, cast
 
 import httpx
 from fastapi import APIRouter, FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -46,6 +47,10 @@ from plex_manager.services.health_service import (
     AutograbStatus,
     ReconcileStatus,
     read_disk_usage,
+)
+from plex_manager.services.update_coordination_service import (
+    MaintenanceDrainingError,
+    UpdateCoordinationService,
 )
 from plex_manager.web.deps import (
     CSRF_HEADER_NAME,
@@ -85,7 +90,7 @@ from plex_manager.web.events import (
     publish_realtime,
     warn_if_multiworker,
 )
-from plex_manager.web.middleware import SetupGuardMiddleware
+from plex_manager.web.middleware import CriticalMutationMiddleware, SetupGuardMiddleware
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
@@ -97,6 +102,7 @@ from plex_manager.web.routers import requests as requests_router
 from plex_manager.web.routers import search_preview as search_preview_router
 from plex_manager.web.routers import settings as settings_router
 from plex_manager.web.routers import setup as setup_router
+from plex_manager.web.routers import updates as updates_router
 from plex_manager.web.spa import mount_spa
 from plex_manager.web.trusted_host import TrustedHostMiddleware
 
@@ -126,6 +132,23 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # the per-cycle search cap keeps the single Prowlarr from being hammered. A
 # constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
+
+
+async def _ensure_update_coordinator(app: FastAPI) -> UpdateCoordinationService:
+    """Return the lifespan coordinator, constructing it for direct unit-test apps."""
+    coordinator = getattr(app.state, "update_coordinator", None)
+    if isinstance(coordinator, UpdateCoordinationService):
+        return coordinator
+    maker_obj = getattr(app.state, "sessionmaker", None)
+    maker = (
+        cast("async_sessionmaker[AsyncSession]", maker_obj)
+        if isinstance(maker_obj, async_sessionmaker)
+        else get_sessionmaker()
+    )
+    coordinator = UpdateCoordinationService(maker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    return coordinator
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -186,6 +209,16 @@ def health() -> dict[str, str]:
 
 
 async def _reconcile_once(app: FastAPI) -> None:
+    """Run one reconcile/import pass unless updater maintenance is draining."""
+    coordinator = await _ensure_update_coordinator(app)
+    try:
+        async with coordinator.critical_operation("reconcile_import"):
+            await _reconcile_once_leased(app)
+    except MaintenanceDrainingError:
+        return
+
+
+async def _reconcile_once_leased(app: FastAPI) -> None:
     """One reconcile + import + availability pass with a fresh session.
 
     Best-effort: if the download client isn't configured yet, the cycle is a
@@ -316,6 +349,16 @@ async def _reconcile_loop(app: FastAPI) -> None:
 
 
 async def _autograb_once(app: FastAPI) -> None:
+    """Run one grab-handoff pass unless updater maintenance is draining."""
+    coordinator = await _ensure_update_coordinator(app)
+    try:
+        async with coordinator.critical_operation("auto_grab_handoff"):
+            await _autograb_once_leased(app)
+    except MaintenanceDrainingError:
+        return
+
+
+async def _autograb_once_leased(app: FastAPI) -> None:
     """One auto-grab pass with a fresh session (ADR-0013), the beta automation spine.
 
     Best-effort and honest:
@@ -496,6 +539,17 @@ async def _log_drain_loop(app: FastAPI) -> None:
 
 
 async def _eviction_tick(app: FastAPI) -> float:
+    """Run one destructive eviction pass unless updater maintenance is draining."""
+    coordinator = await _ensure_update_coordinator(app)
+    try:
+        async with coordinator.critical_operation("eviction"):
+            return await _eviction_tick_leased(app)
+    except MaintenanceDrainingError:
+        async with app.state.sessionmaker() as session:
+            return (await get_eviction_interval_minutes(session)) * 60.0
+
+
+async def _eviction_tick_leased(app: FastAPI) -> float:
     """One disk-pressure eviction pass across every configured root — plus,
     for any root whose pressure gate does NOT fire this tick, a DELETE-NOTHING
     retention-telemetry sweep (:func:`~plex_manager.services.
@@ -830,6 +884,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await session.commit()
     prepare_encryption(initialized=initialized)
 
+    update_coordinator = UpdateCoordinationService(maker)
+    await update_coordinator.initialize()
+    app.state.update_coordinator = update_coordinator
+
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
@@ -938,6 +996,7 @@ def create_app() -> FastAPI:
     # would silently drop cross-worker events.
     warn_if_multiworker()
     app.state.realtime_hub = EventHub(app_version=current_build_id())
+    app.add_middleware(CriticalMutationMiddleware)
     app.add_middleware(SetupGuardMiddleware)
     # Starlette applies middleware in reverse of add order, so this is the
     # OUTERMOST layer: every request's Host is validated before SetupGuard (or
@@ -961,6 +1020,8 @@ def create_app() -> FastAPI:
     app.include_router(blocklist_router.router)
     app.include_router(quality_profile_router.router)
     app.include_router(ops_router.router)
+    app.include_router(updates_router.router)
+    app.include_router(updates_router.internal_router)
     _install_cookie_security_scheme(app)
     # Mount the built SPA LAST so its catch-all fallback has the lowest match
     # priority (no-op when the frontend hasn't been built; see spa.mount_spa).
