@@ -52,7 +52,7 @@ vi.mock('../api/hooks', () => ({
   usePlexSignIn: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }))
 
-vi.mock('../lib/apiKey', () => ({
+vi.mock('../lib/setupToken', () => ({
   getSetupToken: () => h.storedSetupToken,
   setSetupToken: h.setSetupToken,
   clearSetupToken: h.clearSetupToken,
