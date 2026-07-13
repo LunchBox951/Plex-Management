@@ -1295,8 +1295,19 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
     either the ``X-Api-Key`` header OR the browser session cookie together with the
     double-submit ``X-CSRF-Token`` header; a single security requirement object is
     OpenAPI's AND, while the list is OR.
+
+    A short list of operations is HEADER-ONLY by design and MUST NOT gain the cookie
+    OR: the recovery-key exchange (``POST /api/v1/auth/api-key``) deliberately accepts
+    only the ``X-Api-Key`` header — honouring a session cookie there would let any
+    signed-in non-admin mint an ADMIN recovery session (see the endpoint docstring),
+    so it uses the raw ``APIKeyHeader`` dependency and no cookie fallback exists. Those
+    are excluded from the rewrite so the published contract matches reality (issue
+    #293), leaving their ``[{"APIKeyHeader": []}]`` requirement intact.
     """
     default_openapi = app.openapi
+    # (path, method) pairs whose real auth is header-only — never rewritten to add the
+    # cookie/CSRF OR (see docstring).
+    header_only_operations: set[tuple[str, str]] = {("/api/v1/auth/api-key", "post")}
     api_key_only: list[dict[str, list[str]]] = [{"APIKeyHeader": []}]
     api_key_or_cookie: list[dict[str, list[str]]] = [
         {"APIKeyHeader": []},
@@ -1331,10 +1342,13 @@ def _install_cookie_security_scheme(app: FastAPI) -> None:
             },
         )
         paths: dict[str, Any] = schema.get("paths", {})
-        for path_item in paths.values():
+        for path, path_item in paths.items():
             operations: dict[str, Any] = path_item
             for method, value in operations.items():
                 if not isinstance(value, dict):
+                    continue
+                if (path, method) in header_only_operations:
+                    # Header-only by design — leave its APIKeyHeader requirement as is.
                     continue
                 operation = cast(dict[str, Any], value)
                 if operation.get("security") == api_key_only:

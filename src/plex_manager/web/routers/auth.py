@@ -45,6 +45,7 @@ from plex_manager.web.deps import (
     SettingsStore,
     api_key_header,
     api_key_matches,
+    app_key_rotate_lock,
     authenticate_request,
     enforce_pre_init_setup_token,
     ensure_system_settings,
@@ -159,26 +160,41 @@ async def exchange_api_key_endpoint(
     the recovery key gets one.
     """
     _throttle_sign_in(request)
-    system = await load_system_settings(session)
-    expected = system.app_api_key if system is not None else None
-    # The header is sourced via the shared ``APIKeyHeader`` dependency (issue #293
-    # finding 5) so the ``X-Api-Key`` requirement appears in the exported OpenAPI —
-    # a raw ``Request.headers.get`` left the contract silent and generated clients
-    # would omit the key and get an undocumented 401.
-    if not api_key_matches(provided, expected):
-        # A DISTINCT code from the generic ``invalid_api_key`` an expired session
-        # yields (issue #293 finding 2): a rejected/mistyped recovery key at this
-        # exchange endpoint must NOT trip the SPA's global "session expired ->
-        # bounce to Plex login" 401 handler, which would yank the operator off the
-        # break-glass key screen. The frontend branches on this code to keep the
-        # KeyEntry screen showing "key rejected" instead.
-        raise AppError(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            code="recovery_key_rejected",
-            message="That access key was not accepted.",
-            hint="Check the recovery key from Settings → Access, then try again.",
-        )
-    await _issue_browser_session(session, response, request=request, user_id=None)
+    # Serialize the key check + session mint against the app-key rotate/revoke
+    # critical section on the SAME ``app_key_rotate_lock`` those endpoints hold (issue
+    # #293 P2). Without it the exchange could validate ``provided`` against the OLD
+    # key, a concurrent rotate could then commit a new key while bulk-revoking only
+    # the recovery sessions that EXISTED at that moment, and this exchange would go on
+    # to insert a fresh recovery session minted from the now-stale key — a session that
+    # outlives the key it was born from. Holding the lock across the re-read, the
+    # ``api_key_matches`` check, and ``_issue_browser_session``'s insert+commit makes
+    # the two orderings mutually exclusive: if rotate wins the lock, the re-read below
+    # sees the NEW key and we reject; if the exchange wins, its session is committed
+    # BEFORE rotate runs, so rotate's bulk-revoke sweeps it up like any other. The
+    # ``load_system_settings`` here is the first DB read on this request's session
+    # (``_throttle_sign_in`` is pure in-memory), so it opens a fresh transaction inside
+    # the lock and observes any rotation that already committed.
+    async with app_key_rotate_lock:
+        system = await load_system_settings(session)
+        expected = system.app_api_key if system is not None else None
+        # The header is sourced via the shared ``APIKeyHeader`` dependency (issue #293
+        # finding 5) so the ``X-Api-Key`` requirement appears in the exported OpenAPI —
+        # a raw ``Request.headers.get`` left the contract silent and generated clients
+        # would omit the key and get an undocumented 401.
+        if not api_key_matches(provided, expected):
+            # A DISTINCT code from the generic ``invalid_api_key`` an expired session
+            # yields (issue #293 finding 2): a rejected/mistyped recovery key at this
+            # exchange endpoint must NOT trip the SPA's global "session expired ->
+            # bounce to Plex login" 401 handler, which would yank the operator off the
+            # break-glass key screen. The frontend branches on this code to keep the
+            # KeyEntry screen showing "key rejected" instead.
+            raise AppError(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                code="recovery_key_rejected",
+                message="That access key was not accepted.",
+                hint="Check the recovery key from Settings → Access, then try again.",
+            )
+        await _issue_browser_session(session, response, request=request, user_id=None)
     return _me_response(AuthContext(method=AuthMethod.api_key, is_admin=True))
 
 

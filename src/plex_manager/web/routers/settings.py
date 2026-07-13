@@ -59,18 +59,21 @@ from plex_manager.web.deps import (
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
+    SESSION_COOKIE_NAME,
     WATCHLIST_SYNC_ENABLED_DEFAULT,
     WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
     SettingsStore,
     api_key_matches,
+    app_key_rotate_lock,
     ensure_system_settings,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_health_cache,
     get_http_client,
     get_library,
+    hash_session_token,
     load_system_settings,
     require_admin,
     resolve_bool_setting,
@@ -177,7 +180,12 @@ _PUT_SETTINGS_RESPONSES: dict[int | str, dict[str, Any]] = {
 # option here: the key column is EncryptedStr/Fernet, whose ciphertext is
 # non-deterministic, so a ``WHERE app_api_key = <ciphertext>`` predicate can never
 # match).
-_rotate_lock = asyncio.Lock()
+#
+# The lock itself lives in ``deps`` (``app_key_rotate_lock``) so the recovery-key
+# EXCHANGE endpoint in the ``auth`` router can serialize against the SAME instance
+# (issue #293): an exchange must not mint a fresh recovery session from a key that a
+# concurrent rotate/revoke is retiring. This module-local name is a readability alias.
+_rotate_lock = app_key_rotate_lock
 
 # A settings update validates an EFFECTIVE destination/credential pair and then
 # writes its individual rows in one transaction.  Without serializing that whole
@@ -220,8 +228,28 @@ def _observed_app_key(request: Request, auth: AuthContext, system: SystemSetting
     return system.app_api_key
 
 
-async def _revoke_recovery_sessions(session: AsyncSession) -> None:
-    """Revoke every live recovery-cookie session (``AuthSession.user_id IS NULL``).
+def _acting_recovery_session_hash(request: Request, auth: AuthContext) -> str | None:
+    """Token hash of the acting recovery-cookie session, or ``None`` if not one.
+
+    Returns a hash ONLY when the caller authenticated as a break-glass recovery
+    session: ``api_key`` admin authority carried by the httpOnly session cookie, with
+    NO ``X-Api-Key`` header (a recovery session sends none — see ``_observed_app_key``).
+    A header ``X-Api-Key`` caller and a Plex-session admin both yield ``None``. Used to
+    EXEMPT that one session from the rotate bulk-revoke (see below).
+    """
+    if auth.method is not AuthMethod.api_key:
+        return None
+    if request.headers.get(API_KEY_HEADER_NAME) is not None:
+        # A genuine header caller, not a cookie session — nothing to exempt.
+        return None
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    return hash_session_token(token) if token else None
+
+
+async def _revoke_recovery_sessions(
+    session: AsyncSession, *, exempt_token_hash: str | None = None
+) -> None:
+    """Revoke live recovery-cookie sessions (``AuthSession.user_id IS NULL``).
 
     When the underlying app key is rotated or revoked, a still-open recovery
     session minted by exchanging that key (``POST /auth/api-key``) must lose its
@@ -230,12 +258,26 @@ async def _revoke_recovery_sessions(session: AsyncSession) -> None:
     revoke/rotate semantics a direct ``X-Api-Key`` caller already gets (its next
     request 401s immediately). Staged in the caller's transaction; the caller's
     own ``commit`` persists it alongside the key change.
+
+    ``exempt_token_hash`` spares exactly ONE session from the bulk revoke — the
+    session of the admin PERFORMING a rotation, when that admin is themselves signed
+    in via a recovery cookie (issue #293 P1). Rotation hands the actor the new
+    plaintext key exactly once in the HTTP response; revoking their OWN cookie in the
+    same commit would 401 their post-rotate refetch and realtime reconnect before the
+    SPA renders the key, potentially unmounting Settings and hiding it. An operator
+    with no Plex sign-in would then hold NEITHER the old nor the new key. The actor
+    legitimately performed the rotation and the response IS their copy of the new key,
+    so their session survives; every OTHER recovery session is still revoked (its
+    authority ends with the key it was minted from). REVOKE passes no exemption — with
+    the key destroyed there is no new key to hand back, so the actor's break-glass
+    session is retired along with all the others.
     """
-    await session.execute(
-        update(AuthSession)
-        .where(AuthSession.user_id.is_(None), AuthSession.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(UTC))
+    stmt = update(AuthSession).where(
+        AuthSession.user_id.is_(None), AuthSession.revoked_at.is_(None)
     )
+    if exempt_token_hash is not None:
+        stmt = stmt.where(AuthSession.token_hash != exempt_token_hash)
+    await session.execute(stmt.values(revoked_at=datetime.now(UTC)))
 
 
 # The default each boolean key degrades to on an unrecognized stored value --
@@ -667,10 +709,18 @@ async def rotate_app_key_endpoint(
                 raise HTTPException(status_code=409, detail="app_key_changed")
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
-        # Invalidate any recovery-cookie session born from the OLD key (finding 4):
-        # its authority ends with the key it was minted from. Staged in this same
-        # transaction so it commits atomically with the new key.
-        await _revoke_recovery_sessions(session)
+        # Invalidate every recovery-cookie session born from the OLD key (finding 4):
+        # its authority ends with the key it was minted from. EXCEPT the acting admin's
+        # OWN session when THEY rotated from a recovery cookie (issue #293 P1): this
+        # response carries their one-time copy of the new key, so revoking their cookie
+        # in this same commit would 401 the SPA's post-rotate refetch/reconnect before
+        # it renders the key and leave a Plex-less operator with neither key. They
+        # legitimately performed the rotation, so their session survives; all OTHER
+        # recovery sessions are still revoked. Staged in this same transaction so it
+        # commits atomically with the new key.
+        await _revoke_recovery_sessions(
+            session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
+        )
         await session.commit()
     close_realtime_streams(
         request.app,

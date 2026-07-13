@@ -3557,6 +3557,134 @@ async def test_revoke_app_key_revokes_active_recovery_sessions(
     assert later.status_code == 401
 
 
+async def _recovery_session_revoked(sessionmaker_: SessionMaker, *, tag: str) -> bool:
+    """Whether the recovery session minted by :func:`_recovery_session_cookies` for
+    ``tag`` is revoked (``revoked_at is not None``)."""
+    token_hash = hash_session_token(f"recovery-session-{tag}")
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(AuthSession).where(AuthSession.token_hash == token_hash))
+        ).scalar_one()
+    return row.revoked_at is not None
+
+
+async def test_rotate_via_recovery_cookie_keeps_actor_and_revokes_other_recovery_sessions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """P1 (issue #293): a break-glass admin who ROTATES from their OWN recovery cookie
+    keeps that one session; every OTHER recovery session is still revoked.
+
+    The rotate response hands the actor the new plaintext key exactly once. Revoking
+    their own cookie in the same commit (as the blanket finding-4 sweep did) would 401
+    the SPA's post-rotate refetch + realtime reconnect before it renders the key,
+    potentially unmounting Settings and hiding it — leaving a Plex-less operator with
+    NEITHER the old nor the new key. The actor legitimately performed the rotation and
+    the response IS their copy of the new key, so their session survives; all OTHER
+    recovery sessions lose authority with the old key.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    actor_cookies, actor_csrf = await _recovery_session_cookies(app, tag="actor")
+    other_cookies, _ = await _recovery_session_cookies(app, tag="other")
+
+    rotate = await client.post(
+        "/api/v1/settings/app-key/rotate", cookies=actor_cookies, headers=actor_csrf
+    )
+
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key != _API_KEY
+
+    # The actor's own recovery session survived; the bystander recovery session did not.
+    assert await _recovery_session_revoked(sessionmaker_, tag="actor") is False
+    assert await _recovery_session_revoked(sessionmaker_, tag="other") is True
+
+    # The actor can still authenticate with their cookie after the rotation …
+    still_valid = await client.get("/api/v1/settings", cookies=actor_cookies)
+    assert still_valid.status_code == 200
+    # … while the revoked bystander recovery cookie no longer authenticates.
+    locked_out = await client.get("/api/v1/settings", cookies=other_cookies)
+    assert locked_out.status_code == 401
+
+
+async def test_rotate_via_plex_session_still_revokes_every_recovery_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A NORMAL Plex-admin rotation still revokes EVERY recovery session — the P1
+    actor-exemption is unchanged behaviour here.
+
+    The exemption applies ONLY when the rotator is themselves a recovery-cookie
+    session (they need the response to keep their break-glass access). A Plex admin
+    holds a separate, Plex-backed identity untouched by the app-key change, so every
+    break-glass recovery cookie is swept exactly as finding 4 intends.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _recovery_session_cookies(app, tag="sweep-a")
+    await _recovery_session_cookies(app, tag="sweep-b")
+    admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9301, tag="rotator")
+
+    rotate = await client.post(
+        "/api/v1/settings/app-key/rotate", cookies=admin_cookies, headers=admin_csrf
+    )
+
+    assert rotate.status_code == 200
+    # BOTH recovery sessions were revoked — the Plex rotator is not exempt.
+    assert await _recovery_session_states(sessionmaker_) == [True, True]
+
+
+async def test_exchange_blocks_on_the_shared_app_key_rotate_lock(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 (issue #293): the key exchange runs its re-read + validate + session insert
+    under the SAME lock the app-key rotate/revoke critical section holds, so a key
+    change cannot interleave and leave a recovery session minted from a retired key.
+
+    Proven directly by holding that lock and firing the exchange: it must BLOCK for the
+    whole time the lock is held (the rotate path holds it across mint+revoke), then
+    complete once released. Were the exchange on its own lock — the pre-fix state — it
+    would ignore the held lock and complete immediately (``task.done()`` would be true
+    while we still hold it), reopening the race this serialization closes.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    from plex_manager.web.routers import auth as auth_router
+    from plex_manager.web.routers import settings as settings_router
+
+    # A contended asyncio.Lock binds to the loop that first contended it; give this
+    # test a fresh, loop-local instance shared by BOTH the exchange (auth router) and
+    # the rotate (settings router) so a hold here blocks the exchange exactly as a
+    # concurrent rotate would.
+    fresh_lock = asyncio.Lock()
+    monkeypatch.setattr(settings_router, "_rotate_lock", fresh_lock)
+    monkeypatch.setattr(auth_router, "app_key_rotate_lock", fresh_lock)
+
+    await fresh_lock.acquire()
+    try:
+        task = asyncio.create_task(
+            client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+        )
+        # An unblocked in-process request finishes in low single-digit ms; give it far
+        # longer, then assert it has NOT completed — it is parked on the shared lock.
+        await asyncio.sleep(0.1)
+        assert not task.done()
+    finally:
+        fresh_lock.release()
+
+    exchange = await task
+    assert exchange.status_code == 200
+    # Releasing the lock let the exchange mint exactly one live recovery session.
+    assert await _recovery_session_states(sessionmaker_) == [False]
+
+
 # --------------------------------------------------------------------------- #
 # Opt-in recovery key — status / generate-from-null / revoke (keyless setup)
 # --------------------------------------------------------------------------- #

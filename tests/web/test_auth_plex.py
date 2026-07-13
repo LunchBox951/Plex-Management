@@ -1015,7 +1015,17 @@ async def test_openapi_declares_api_key_header_on_recovery_exchange(app: FastAPI
     """The recovery-key exchange sources ``X-Api-Key`` via the shared
     ``APIKeyHeader`` dependency (issue #293 finding 5), so the endpoint advertises
     the requirement in OpenAPI — a raw ``Request.headers.get`` left the contract
-    silent and generated clients would omit the key and hit an undocumented 401."""
+    silent and generated clients would omit the key and hit an undocumented 401.
+
+    It is HEADER-ONLY (issue #293 P2): the endpoint deliberately refuses the session
+    cookie (honouring it would let a non-admin mint an ADMIN recovery session), so the
+    app-wide cookie-security rewrite MUST leave this operation alone. The published
+    contract advertises ONLY ``APIKeyHeader`` — never the ``APIKeyCookie``/``CSRFHeader``
+    OR that every other unsafe operation gets.
+    """
     schema = app.openapi()
     security = schema["paths"]["/api/v1/auth/api-key"]["post"]["security"]
-    assert {"APIKeyHeader": []} in security
+    assert security == [{"APIKeyHeader": []}]
+    flattened = {scheme for requirement in security for scheme in requirement}
+    assert "APIKeyCookie" not in flattened
+    assert "CSRFHeader" not in flattened

@@ -33,6 +33,7 @@ Wiring rules:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -223,6 +224,18 @@ _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 # finding 5). Reusing the one instance keeps a single ``X-Api-Key`` scheme in the
 # document instead of minting a duplicate.
 api_key_header = _api_key_header
+
+# Serializes the app-key critical section across router modules. The rotate/revoke
+# endpoints (``settings`` router) do a read-modify-write on ``SystemSettings.app_api_key``
+# under this lock; the recovery-key EXCHANGE (``POST /api/v1/auth/api-key``, ``auth``
+# router) re-validates the key and mints its recovery session under the SAME lock so a
+# key change cannot interleave with an in-flight exchange (issue #293). Living in
+# ``deps`` (a module both routers already import) lets them share ONE lock instance
+# rather than importing a private name across sibling routers. Like the settings-update
+# lock, this is a deliberate SINGLE-PROCESS guard: the supported uvicorn deployment runs
+# one worker. A future multi-worker deployment must replace it with a database-level
+# version/CAS or advisory lock spanning the same critical section.
+app_key_rotate_lock = asyncio.Lock()
 
 
 class AuthMethod(StrEnum):
