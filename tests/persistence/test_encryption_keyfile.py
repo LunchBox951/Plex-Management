@@ -541,6 +541,80 @@ def test_ensure_secret_key_still_rejects_invalid_key_on_hardlink_fs(
     assert file_backed_key.read_bytes() == b"tooshort"
 
 
+def test_ensure_secret_key_still_rejects_old_invalid_key_on_real_hardlink_fs(
+    file_backed_key: Path,
+) -> None:
+    """Regression pin for the reap/probe ordering bug: on a REAL hardlink-capable
+    filesystem (no ``os.link`` monkeypatch here -- these tests run on
+    ext4/tmpfs, the beta hosts' real filesystem class) an invalid key OLDER
+    than the stale-partial bound must still fail loudly and be left completely
+    untouched. Age alone must never be sufficient to reap+replace real
+    operator-restored garbage; only a filesystem PROVEN (non-destructively) to
+    refuse hardlinks may ever recover a crashed partial. Pre-fix, the reap ran
+    before the hardlink-capability probe, so this exact case was silently
+    reaped and replaced with a fresh key instead of failing loudly."""
+    file_backed_key.write_bytes(b"tooshort")
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption.ensure_secret_key()
+
+    assert file_backed_key.read_bytes() == b"tooshort"
+
+
+def test_probe_hardlink_capability_true_on_real_fs(tmp_path: Path) -> None:
+    """The capability probe hardlinks the tempfile to a throwaway sibling path
+    and cleans up after itself, without ever touching any other file."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    assert encryption._probe_hardlink_capability(  # pyright: ignore[reportPrivateUsage]
+        tmp_name
+    )
+
+    assert not Path(tmp_name + ".hlprobe").exists()  # probe link removed
+    assert Path(tmp_name).exists()  # the tempfile itself is untouched
+
+
+def test_probe_hardlink_capability_false_when_fs_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``os.link`` raises a known hardlink-unsupported errno, the probe
+    reports incapability rather than propagating -- this is the signal that
+    makes it safe to reap a crashed partial."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    assert not encryption._probe_hardlink_capability(  # pyright: ignore[reportPrivateUsage]
+        tmp_name
+    )
+
+
+def test_probe_hardlink_capability_reraises_non_fallback_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine failure (e.g. ``ENOSPC``) during the probe must propagate, not
+    be swallowed as if it meant "hardlinks unsupported"."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    def _failing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(os, "link", _failing_link)
+
+    with pytest.raises(OSError) as exc_info:
+        encryption._probe_hardlink_capability(tmp_name)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.errno == errno.ENOSPC
+
+
 def test_reap_stale_key_tempfiles_removes_old_orphans_only(tmp_path: Path) -> None:
     """The stale-tempfile sweep removes a crashed publish's orphaned
     ``.secret.*.tmp`` (by age) but never a concurrent live publish's young
