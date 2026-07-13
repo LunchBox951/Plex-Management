@@ -24,7 +24,15 @@ if TYPE_CHECKING:
 # honest empty row, retryable. ANY other exception is a bug and must surface.
 _EXPECTED_ROW_ERRORS = (TmdbApiError, TmdbAuthError)
 
-__all__ = ["DiscoverCategory", "HomeFeed", "HomeRow", "home", "list_category", "search"]
+__all__ = [
+    "DiscoverCategory",
+    "HomeFeed",
+    "HomeRow",
+    "home",
+    "list_category",
+    "search",
+    "select_spotlights",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -127,10 +135,53 @@ class HomeRow(NamedTuple):
 
 
 class HomeFeed(NamedTuple):
-    """The composed home: an optional spotlight title + the ordered rows."""
+    """The composed home: immutable spotlight candidates + the ordered rows."""
 
-    spotlight: MediaSearchResult | None
+    spotlights: tuple[MediaSearchResult, ...]
     rows: list[HomeRow]
+
+
+def select_spotlights(rows: list[HomeRow], limit: int = 6) -> tuple[MediaSearchResult, ...]:
+    """Select a balanced, deterministic hero set from the already-fetched rows.
+
+    Candidates retain the server's row/item order, need usable backdrop artwork,
+    and are unique by media identity. Up to three movies and three TV shows are
+    interleaved movie-first. If either pool is scarce, later candidates from the
+    other pool backfill the remaining slots in that pool's original source order.
+
+    This selector is intentionally pure: home composition owns why these titles
+    appear, while TMDB is still called exactly once for each normal home row.
+    """
+    limit = min(limit, 6)
+    if limit <= 0:
+        return ()
+
+    movies: list[MediaSearchResult] = []
+    shows: list[MediaSearchResult] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        for item in row.items:
+            key = (item.media_type, item.tmdb_id)
+            if not item.backdrop_url or key in seen:
+                continue
+            seen.add(key)
+            if item.media_type == "movie":
+                movies.append(item)
+            elif item.media_type == "tv":
+                shows.append(item)
+
+    selected: list[MediaSearchResult] = []
+    for index in range(3):
+        if index < len(movies):
+            selected.append(movies[index])
+        if index < len(shows):
+            selected.append(shows[index])
+
+    # Balanced picks above consume at most three per kind. Fill any unused
+    # capacity from the abundant pool(s), retaining each pool's source order.
+    selected.extend(movies[3:])
+    selected.extend(shows[3:])
+    return tuple(selected[:limit])
 
 
 async def search(
@@ -160,7 +211,7 @@ async def list_category(
 
 
 async def home(tmdb: MetadataPort) -> HomeFeed:
-    """Compose the Discover home: fan out page 1 of each row, pick a spotlight."""
+    """Compose the Discover home: fan out page 1 and select spotlight candidates."""
     results = await asyncio.gather(
         *(list_category(tmdb, category) for category, _ in _ROWS),
         return_exceptions=True,
@@ -181,7 +232,6 @@ async def home(tmdb: MetadataPort) -> HomeFeed:
                 raise result
 
     rows: list[HomeRow] = []
-    spotlight: MediaSearchResult | None = None
     for (category, title), result in zip(_ROWS, results, strict=True):
         if isinstance(result, MediaPage):
             items = result.results
@@ -191,6 +241,4 @@ async def home(tmdb: MetadataPort) -> HomeFeed:
             _logger.warning("discover row %r unavailable: %s", category, result)
             items = ()
         rows.append(HomeRow(row_type=category, title=title, items=items))
-        if spotlight is None:
-            spotlight = next((item for item in items if item.backdrop_url), None)
-    return HomeFeed(spotlight=spotlight, rows=rows)
+    return HomeFeed(spotlights=select_spotlights(rows), rows=rows)

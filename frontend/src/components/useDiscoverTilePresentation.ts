@@ -59,5 +59,12 @@ export function useDiscoverTilePresentation(
     [requestRows, requestsSettled],
   )
 
-  return { tileState, quickRequestable }
+  return {
+    tileState,
+    quickRequestable,
+    // Zero while stale/invalidated; a new positive revision proves the
+    // post-mutation /requests refetch has settled even when its honest result is
+    // a settled-bad row whose derived tile presentation is still null.
+    requestStateRevision: requestsSettled ? requests.dataUpdatedAt : 0,
+  }
 }
