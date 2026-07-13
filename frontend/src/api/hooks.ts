@@ -312,9 +312,13 @@ export function usePlexLibraries(enabled = true) {
 
 /* --------------------------------------------------------------- discover -- */
 
-export function useDiscoverHome() {
+export function useDiscoverHome(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.discoverHome,
+    // Callers that mount on every authenticated route (the header search
+    // overlay) gate this on visibility so /discover/home's TMDB fan-out only
+    // runs when its data can actually be seen. Discover itself passes nothing.
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<DiscoverHomeResponse> =>
       unwrap(await client.GET('/api/v1/discover/home')),
   })

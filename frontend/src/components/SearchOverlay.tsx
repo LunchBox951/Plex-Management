@@ -77,7 +77,9 @@ export function SearchOverlay() {
   // Pass a non-empty query only after the raw value has remained stable for the
   // full debounce. Clearing/changing the input disables the prior query at once.
   const search = useDiscoverSearch(queryReady ? trimmedDebouncedQuery : '')
-  const home = useDiscoverHome()
+  // The overlay mounts on every authenticated route; only fetch the Discover
+  // home feed (a TMDB fan-out) once the dialog is actually open.
+  const home = useDiscoverHome({ enabled: open })
   const suggestions = useMemo(() => popularTitles(home.data), [home.data])
   const results = queryReady ? (search.data?.results ?? []) : []
   const activeDataUpdatedAt = hasQuery ? search.dataUpdatedAt : home.dataUpdatedAt
@@ -133,7 +135,11 @@ export function SearchOverlay() {
   } else if (!queryReady || (search.isFetching && results.length === 0)) {
     announcement = 'Searching.'
   } else if (results.length > 0) {
-    announcement = `${results.length} ${results.length === 1 ? 'result' : 'results'} for ${trimmedDebouncedQuery}.`
+    // A failed refetch keeps the last good data; say so instead of presenting
+    // stale results as current.
+    announcement = search.isError
+      ? `Couldn’t update results for ${trimmedDebouncedQuery}. Showing ${results.length} earlier ${results.length === 1 ? 'result' : 'results'}.`
+      : `${results.length} ${results.length === 1 ? 'result' : 'results'} for ${trimmedDebouncedQuery}.`
   } else if (search.isError) {
     announcement = 'Search failed.'
   } else {
@@ -288,6 +294,20 @@ export function SearchOverlay() {
                     {search.isFetching ? (
                       <span role="status" className="shrink-0 font-mono text-xs text-faint">
                         Updating…
+                      </span>
+                    ) : search.isError ? (
+                      // TanStack Query keeps the last good `data` when a refetch
+                      // fails, so these results are stale. Never present them as
+                      // current: surface the failure and a retry inline.
+                      <span className="flex shrink-0 items-center gap-3 font-mono text-xs text-error">
+                        Couldn’t update — showing earlier results
+                        <button
+                          type="button"
+                          onClick={() => void search.refetch()}
+                          className="rounded-md bg-white/8 px-2.5 py-1 font-sans text-xs font-semibold text-ink ring-1 ring-inset ring-white/10 hover:bg-white/12 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60"
+                        >
+                          Retry
+                        </button>
                       </span>
                     ) : null}
                   </div>

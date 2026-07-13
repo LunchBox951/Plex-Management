@@ -281,6 +281,18 @@ describe('SearchOverlay — trigger, keyboard, and focus', () => {
 })
 
 describe('SearchOverlay — popular suggestions and debounced search', () => {
+  it('does not fetch the Discover home feed until the overlay opens', () => {
+    render(<SearchOverlay />)
+
+    // Mounted in the Layout header on every route: the /discover/home TMDB
+    // fan-out must stay disabled while the dialog is closed.
+    expect(useDiscoverHome).toHaveBeenLastCalledWith({ enabled: false })
+    expect(useDiscoverHome).not.toHaveBeenCalledWith({ enabled: true })
+
+    openOverlay()
+    expect(useDiscoverHome).toHaveBeenLastCalledWith({ enabled: true })
+  })
+
   it('combines popular movie and TV rows in server order and removes duplicates', () => {
     render(<SearchOverlay />)
     openOverlay()
@@ -384,6 +396,48 @@ describe('SearchOverlay — honest search states', () => {
     expect(screen.getByText('Search failed')).toBeInTheDocument()
     expect(screen.getByText('TMDB is unavailable')).toBeInTheDocument()
     expect(refetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces a failed refetch over cached results instead of presenting them as current', async () => {
+    // TanStack Query keeps the last good `data` while `isError` is true, so a
+    // failed refetch would otherwise show stale results with no failure signal.
+    const refetch = vi.fn()
+    setSearch({
+      data: { results: [OWNED_MOVIE] },
+      isError: true,
+      error: new Error('TMDB is unavailable'),
+      refetch,
+    })
+    render(<SearchOverlay />)
+    openOverlay()
+
+    await enterSearch('stale')
+
+    // The cached results stay usable…
+    expect(screen.getByRole('heading', { name: '1 result for “stale”' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /View details for Owned Movie/ })).toBeInTheDocument()
+    // …but the failure is explicit, with a working retry.
+    expect(screen.getByText('Couldn’t update — showing earlier results')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(refetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('prefers the in-flight indicator over the stale banner while a retry is fetching', async () => {
+    setSearch({
+      data: { results: [OWNED_MOVIE] },
+      isError: true,
+      error: new Error('TMDB is unavailable'),
+      isFetching: true,
+    })
+    render(<SearchOverlay />)
+    openOverlay()
+
+    await enterSearch('retrying')
+
+    expect(screen.getByRole('status', { name: '' })).toHaveTextContent('Updating…')
+    expect(
+      screen.queryByText('Couldn’t update — showing earlier results'),
+    ).not.toBeInTheDocument()
   })
 
   it('shows the existing no-match copy for an empty result set', async () => {
