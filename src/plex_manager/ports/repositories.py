@@ -113,6 +113,10 @@ class DownloadRecord(BaseModel):
     episodes: list[int] | None = None
     media_type: str | None = None
     failed_reason: str | None = None
+    # Consecutive resumed-import probe-outage retries (``downloads.retry_count``,
+    # issue #180) -- see ``services.import_service._refresh_resumed_import_after_probe_outage``
+    # and ``_PROBE_OUTAGE_MAX_RETRIES``. Reset to 0 on terminal-row reuse.
+    retry_count: int = 0
     first_seen_at: datetime | None = None
     # When this download was grabbed (``downloads.added_at``, server-defaulted at
     # row creation, and explicitly RE-STAMPED to now by
@@ -649,7 +653,7 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def list_for_airing_refresh(
-        self, statuses: frozenset[str], limit: int
+        self, statuses: frozenset[str], limit: int, *, checked_before: datetime | None = None
     ) -> list[SeasonRequestRecord]:
         """List up to ``limit`` seasons in ``statuses`` due for an airing-target
         refresh (ADR-0020 §6, ``season_episode_service.reconcile_airing``), oldest
@@ -660,6 +664,12 @@ class SeasonRequestRepository(Protocol):
         checked` advances a row to the back of the queue, so a bounded per-cycle
         ``limit`` still eventually revisits every row instead of permanently
         starving whichever ones do not fit in the first ``limit``-sized slice.
+
+        ``checked_before`` (when set) additionally suppresses any row already
+        stamped AT OR AFTER it, so a row re-checked this recently is not re-selected
+        -- a never-checked (``NULL``) row is always eligible. This is the per-row
+        due cutoff ``wake_waiting_for_air_date`` uses to keep still-future seasons
+        on an hours-scale re-check cadence instead of one TMDB lookup per cycle.
         """
         raise NotImplementedError
 

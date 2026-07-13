@@ -142,6 +142,19 @@ _MAX_BLOCK_REASONS: Final = 10
 # while probing serially.
 _VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS: Final = 30.0
 
+# Bounded crash-resumed probe-outage retry (issue #180): a crash-resumed
+# ``Importing`` row auto-retries a ``MediaProbeUnavailableError`` (transient --
+# e.g. a container restart mid-cycle), but must not do so FOREVER: a
+# permanently broken probe adapter (an image regression, a missing ffprobe
+# binary) would otherwise leave the row silently stuck ``Importing`` with no
+# operator correction path (north star 1). Past this many consecutive
+# resumed-import cycles the row escalates through the standard ``_block`` ->
+# ``import_blocked`` path instead. Persisted on ``downloads.retry_count`` (an
+# existing, previously-unused column -- no migration needed) so the count
+# survives an app restart rather than resetting to zero and buying the outage
+# another full window.
+_PROBE_OUTAGE_MAX_RETRIES: Final = 20
+
 # Bounded Finalizing (issue #158): "Finalizing" ("completed", not yet
 # "available") was previously an UNBOUNDED silent state -- a row whose Plex item
 # carries no (or the wrong) tmdb GUID can never confirm via
@@ -536,6 +549,16 @@ async def _verified_plex_video_sources(
     siblings remain useful, but a batch with no verified candidate is surfaced as
     unavailable rather than importing without verification. The aggregate deadline
     prevents a many-file release from multiplying the adapter's per-file timeout.
+
+    Deadline truncation (issue #179) is kept STRICTLY separate from a genuine
+    per-file probe failure: a candidate the deadline never reached was never
+    attempted at all, so it must never be tallied alongside a candidate ffprobe
+    actually looked at and couldn't verify. If the deadline truncates the batch
+    with candidates still unattempted, the WHOLE batch (including any subset
+    already accepted) is surfaced as retryable rather than silently importing
+    only the accepted subset -- a slow disk or a many-episode season pack must
+    never drop its late episodes for a reason unrelated to file validity; the
+    next reconcile cycle re-probes the entire batch from scratch.
     """
     if not sources:
         raise _VideoVerificationError(
@@ -546,14 +569,17 @@ async def _verified_plex_video_sources(
     rejected = 0
     unavailable = 0
     unavailable_detail: str | None = None
+    not_attempted = 0
+    deadline_detail: str | None = None
     deadline = time.monotonic() + _VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS
     for index, source in enumerate(sources):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            unavailable += len(sources) - index
-            unavailable_detail = unavailable_detail or (
+            not_attempted = len(sources) - index
+            deadline_detail = (
                 "verification batch exceeded its "
-                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline"
+                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline "
+                f"({index} of {len(sources)} candidate(s) probed)"
             )
             break
         started = threading.Event()
@@ -577,10 +603,11 @@ async def _verified_plex_video_sources(
                 started=started,
                 cancelled=cancelled,
             )
-            unavailable += len(sources) - index
-            unavailable_detail = unavailable_detail or (
+            not_attempted = len(sources) - index
+            deadline_detail = (
                 "verification batch exceeded its "
-                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline"
+                f"{_VIDEO_VERIFICATION_BATCH_TIMEOUT_SECONDS:g}-second deadline "
+                f"({index} of {len(sources)} candidate(s) probed)"
             )
             break
         except asyncio.CancelledError:
@@ -597,6 +624,15 @@ async def _verified_plex_video_sources(
             rejected += 1
         else:
             accepted.append(source)
+
+    if not_attempted:
+        # The deadline truncated the batch before every candidate could be
+        # probed -- retryable exactly like probe-infrastructure unavailability,
+        # NEVER a lossy partial import that drops the un-probed tail (even a
+        # tail that follows some already-accepted candidates).
+        raise _VideoVerificationUnavailableError(
+            f"video verification unavailable: {deadline_detail}"
+        )
 
     if not accepted:
         if unavailable_detail is not None:
@@ -629,23 +665,58 @@ async def _refresh_resumed_import_after_probe_outage(
     request_id: int,
     reason: _VideoVerificationUnavailableError,
     season: int | None = None,
+    seasons: tuple[int, ...] = (),
 ) -> DownloadRecord | None:
-    """Refresh a crash-resumed row before claiming it remains auto-retryable."""
+    """Refresh a crash-resumed row before claiming it remains auto-retryable.
+
+    Bounded (issue #180): a transient probe outage (e.g. a container restart
+    mid-cycle) is auto-retried, but NOT forever -- a permanently broken probe
+    adapter must not leave the row silently stuck ``Importing``. ``retry_count``
+    (persisted; survives a restart) counts consecutive probe-outage cycles for
+    THIS row; past ``_PROBE_OUTAGE_MAX_RETRIES`` the row escalates through the
+    same ``_block`` -> ``import_blocked`` path every other honest import
+    failure uses, so the operator gets the standard correction UI.
+    """
     await session.rollback()
     current = await download_repo.get_by_hash(torrent_hash)
     if current is None or current.status != DownloadState.Importing.value:
         return current
+    incremented = await download_repo.increment_retry_count_if_in(
+        download_id, frozenset({DownloadState.Importing.value})
+    )
+    if not incremented:
+        # Lost the CAS: an operator's mark_failed (or similar) committed in a
+        # separate session during the async gap above and moved the row out of
+        # Importing. Honor that -- don't overwrite it, don't retry it.
+        await session.rollback()
+        return await download_repo.get_by_hash(torrent_hash)
+    retry_count = current.retry_count + 1
+    if retry_count > _PROBE_OUTAGE_MAX_RETRIES:
+        await _block(
+            session,
+            download_repo,
+            download_id,
+            f"video verification unavailable for {retry_count} consecutive "
+            f"resumed-import attempts: {reason}",
+            request_id=request_id,
+            season=season,
+            seasons=seasons,
+        )
+        return await download_repo.get_by_hash(torrent_hash)
     extra = {"request_id": safe_int(request_id)}
     if season is not None:
         extra["season"] = safe_int(season)
     _logger.warning(
-        "video verification unavailable while resuming download %s; "
-        "keeping Importing for automatic retry: %s",
+        "video verification unavailable while resuming download %s "
+        "(%s/%s consecutive retries); keeping Importing for automatic retry: %s",
         safe_int(download_id),
+        safe_int(retry_count),
+        safe_int(_PROBE_OUTAGE_MAX_RETRIES),
         reason,
         extra=extra,
     )
-    return current
+    await session.commit()
+    return await download_repo.get_by_hash(torrent_hash)
 
 
 def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
@@ -1632,6 +1703,7 @@ async def _import_tv_targets_locked(
                 download_id=download_id,
                 request_id=request.id,
                 reason=exc,
+                seasons=target_seasons,
             )
         await _block(
             session,

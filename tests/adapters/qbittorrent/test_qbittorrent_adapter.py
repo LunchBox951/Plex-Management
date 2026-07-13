@@ -1287,6 +1287,103 @@ async def test_add_short_decoding_padded_btih_magnet_raises_source_error() -> No
     assert PASSWORD not in str(exc_info.value)
 
 
+async def test_add_mixed_case_hex_btih_magnet_normalizes_to_lowercase() -> None:
+    """A 40-char hex ``btih`` with mixed upper/lower case is a valid hex value --
+    it must still normalize to the fully-lowercased form qBittorrent reports."""
+    mixed = "1234567890ABCDEF1234567890abcdef12345678"
+    assert mixed.lower() == MAGNET_HASH
+    magnet = f"magnet:?xt=urn:btih:{mixed}&dn=Test"
+    result = await _client().add(magnet, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+
+
+async def test_add_39_char_btih_magnet_raises_source_error() -> None:
+    """Issue #212: a wrong-length value (39 chars -- one short of 40-char hex)
+    is a MALFORMED source, not a hash. Before this fix it was silently
+    lowercased and passed through as if it were real, stranding the download
+    as ClientMissing once qBittorrent reports a different (real) hash."""
+    too_short = MAGNET_HASH[:-1]
+    bad_magnet = f"magnet:?xt=urn:btih:{too_short}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_41_char_btih_magnet_raises_source_error() -> None:
+    """Issue #212: a wrong-length value (41 chars -- one past 40-char hex) must
+    also raise the typed source error rather than being silently accepted."""
+    too_long = MAGNET_HASH + "0"
+    bad_magnet = f"magnet:?xt=urn:btih:{too_long}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_40_char_non_hex_btih_magnet_raises_source_error() -> None:
+    """Issue #212: a 40-char value that is NOT hex (``g``-``z`` are outside the
+    hex alphabet) was previously accepted unchecked -- it must now raise the
+    typed source error, the same as any other malformed btih."""
+    non_hex = "g" * 40
+    bad_magnet = f"magnet:?xt=urn:btih:{non_hex}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(bad_magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_magnet_with_duplicate_identical_btih_is_accepted() -> None:
+    """Issue #212: two ``xt=urn:btih:`` values that normalize to the SAME
+    hash (here: the hex form and the base32 encoding of the identical 20
+    bytes, in differing case) are not a conflict -- accept and use the one
+    normalized hash, exactly as if only one value had been present."""
+    raw = bytes.fromhex(MAGNET_HASH)
+    b32 = base64.b32encode(raw).decode()
+    dup_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH.upper()}&xt=urn:btih:{b32}&dn=Test"
+    result = await _client().add(dup_magnet, "/downloads/movies", "plex-manager")
+    assert result.torrent_hash == MAGNET_HASH
+
+
+async def test_add_magnet_with_conflicting_btih_values_is_rejected_before_client_add() -> None:
+    """Issue #212: a magnet naming two DISTINCT valid BTIH values is ambiguous.
+    libtorrent (what qBittorrent actually uses) overwrites the v1 hash as it
+    parses ``xt`` parameters, so it ends up tracking the LAST valid value --
+    while naively picking the first (the prior behaviour here) can persist a
+    DIFFERENT hash than the one qBittorrent will actually track. That false
+    mismatch later makes the reconciler decide ClientMissing, rearm the
+    request, and attempt to remove the wrong hash, orphaning a live torrent.
+    Reject outright -- and never even reach ``/torrents/add`` -- rather than
+    guess which of the two the client will pick."""
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return _router()(request)
+
+    other_hash = "fedcba9876543210fedcba9876543210fedcba98"
+    conflicting_magnet = f"magnet:?xt=urn:btih:{MAGNET_HASH}&xt=urn:btih:{other_hash}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client(handler).add(conflicting_magnet, "/downloads/movies", "plex-manager")
+    assert "/api/v2/torrents/add" not in seen_paths
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
+async def test_add_magnet_with_one_invalid_one_valid_btih_is_rejected() -> None:
+    """Issue #212: one malformed ``btih`` alongside one otherwise-valid value is
+    still an untrustworthy source -- reject the whole magnet rather than
+    silently using the valid value and ignoring the malformed one. Any
+    conflicting/invalid signal among multiple ``xt`` values is grounds for
+    rejection, not just a length/content mismatch on a single value."""
+    bad_b32 = "0" * 32  # not valid base32
+    magnet = f"magnet:?xt=urn:btih:{bad_b32}&xt=urn:btih:{MAGNET_HASH}&dn=Test"
+    with pytest.raises(QbittorrentSourceError) as exc_info:
+        await _client().add(magnet, "/downloads/movies", "plex-manager")
+    assert BASE_URL not in str(exc_info.value)
+    assert PASSWORD not in str(exc_info.value)
+
+
 async def test_transport_outage_raises_qbittorrent_error() -> None:
     """qBittorrent unreachable (connection error) surfaces a wrapped, retryable
     QbittorrentError — never an opaque httpx error -> 500."""

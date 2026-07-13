@@ -64,11 +64,15 @@ committed. Current status:
       do **not** also enable CodeQL *default* setup (the two conflict and default
       would disable the committed workflow).
 - [x] `main` is protected: a PR is required; the `quality`, `tests-py314`,
-      `frontend`, `analyze (python)`, `analyze (javascript-typescript)`,
-      `secret-scan`, `dependency-audit`, and `build` (container) checks must
-      pass; branches must be up to date; and force-pushes and deletion are
-      blocked. Admins are **not** forced through the gate, so the solo maintainer
-      can still self-merge and hotfix.
+      `frontend`, `analyze`, `secret-scan`, `dependency-audit`, and `build`
+      (container) checks must pass; branches must be up to date; and
+      force-pushes and deletion are blocked. Admins are **not** forced through
+      the gate, so the solo maintainer can still self-merge and hotfix.
+      `analyze` is the required context: `.github/workflows/codeql.yml` runs a
+      `codeql (python)` / `codeql (javascript-typescript)` matrix (diagnostic
+      job names, not required contexts) and then a summary `analyze` job that
+      fails unless every matrix leg succeeded — required-context recreation
+      must use the literal `analyze` name, not the per-language matrix names.
 - [ ] Restrict GHCR package visibility/permissions as desired.
 - [ ] (Planned) pin Actions to commit SHAs — Dependabot keeps the version tags
       current in the meantime.

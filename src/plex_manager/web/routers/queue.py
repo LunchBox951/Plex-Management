@@ -33,6 +33,7 @@ from plex_manager.services.grab_service import (
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
+    TorrentRemovalInFlightError,
 )
 from plex_manager.services.queue_service import InvalidStateTransitionError, RemovalInProgressError
 from plex_manager.web.deps import (
@@ -324,6 +325,13 @@ async def grab_endpoint(
         # untouched, so surface a conflict.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="torrent_already_tracked"
+        ) from exc
+    except TorrentRemovalInFlightError as exc:
+        # #206: the same torrent's removal is mid-flight (a concurrent cancel), so
+        # reusing its terminal row would re-own data about to be deleted. Honest 409;
+        # the operator/auto-grab retries once the removal settles.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="removal_in_progress"
         ) from exc
     except GrabError as exc:
         # qBittorrent took the grab but no real info-hash could be determined;

@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_409_CONFLICT
@@ -417,8 +417,22 @@ async def plex_libraries_endpoint(
     )
 
 
+def _set_no_store_headers(response: Response) -> None:
+    """Forbid any cache from persisting a plaintext-key response (issue #208).
+
+    A caching reverse proxy keyed only on method/URI could otherwise replay one
+    authenticated caller's response to a different requester. ``no-store``
+    (never write) plus ``private`` (a shared cache must not store it even if it
+    ignored ``no-store``) is the modern directive; ``Pragma: no-cache`` is
+    carried alongside for HTTP/1.0 intermediaries that predate ``Cache-Control``.
+    """
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+
+
 @router.get("/app-key")
 async def reveal_app_key_endpoint(
+    response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AppApiKeyResponse:
     """Return the current app ``X-Api-Key`` in plaintext.
@@ -431,6 +445,9 @@ async def reveal_app_key_endpoint(
     Setup mints no key, so a fresh install has none to reveal: that is an honest
     ``app_key_not_set`` envelope (404) whose hint points the operator at the
     Generate control, never a bare/opaque failure (north star #3).
+
+    The success response never touches an intermediate cache (issue #208): the
+    plaintext key is a recovery credential, not cacheable content.
     """
     system = await load_system_settings(session)
     if system is None or system.app_api_key is None:
@@ -440,6 +457,7 @@ async def reveal_app_key_endpoint(
             message="No recovery key exists.",
             hint="Generate one below.",
         )
+    _set_no_store_headers(response)
     return AppApiKeyResponse(app_api_key=system.app_api_key)
 
 
@@ -461,6 +479,7 @@ async def app_key_status_endpoint(
 @router.post("/app-key/rotate")
 async def rotate_app_key_endpoint(
     request: Request,
+    response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
     auth: Annotated[AuthContext, Depends(require_admin)],
 ) -> AppApiKeyResponse:
@@ -470,7 +489,8 @@ async def rotate_app_key_endpoint(
     (``app_api_key IS NULL``) it GENERATES the first key (the CAS below has nothing
     to compare against, so it simply mints); when a key exists it ROTATES,
     invalidating the old one. Both run under ``_rotate_lock`` and return the
-    plaintext exactly once.
+    plaintext exactly once. Like the plaintext GET, the response is never
+    cache-eligible (issue #208).
 
     Every OTHER device/browser with the OLD key saved (localStorage) is
     immediately locked out -- there is exactly one live key at a time, matching
@@ -552,6 +572,7 @@ async def rotate_app_key_endpoint(
         auth_method=AuthMethod.api_key.value,
     )
     publish_realtime(request.app, ("access",), reason="app_key_rotated")
+    _set_no_store_headers(response)
     return AppApiKeyResponse(app_api_key=new_key)
 
 
