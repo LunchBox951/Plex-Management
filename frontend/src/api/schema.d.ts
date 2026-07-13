@@ -4,6 +4,42 @@
  */
 
 export interface paths {
+    "/api/v1/auth/api-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange Api Key Endpoint
+         * @description Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.
+         *
+         *     The recovery / automation key (ADR-0005, ADR-0016) is the terminal-free
+         *     break-glass credential that authenticates when plex.tv is unreachable. Before
+         *     this endpoint the browser had to keep the raw key in JS-readable
+         *     ``localStorage`` so the break-glass path survived a reload — exactly the
+         *     cleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the
+         *     same cookie the Plex sign-in flow mints means the key never needs JS-readable
+         *     storage: the resulting session is an admin-authority recovery session with no
+         *     Plex identity (``auth_sessions.user_id`` NULL), and every later request
+         *     authenticates by the HTTP-only cookie exactly like a Plex session does.
+         *
+         *     The key is validated against the stored ``SystemSettings.app_api_key`` with a
+         *     constant-time compare — accepting a Plex session cookie here (as
+         *     ``require_api_key`` would) is deliberately NOT done: that would let any
+         *     signed-in NON-admin mint an ADMIN recovery session. Only a caller who proves
+         *     the recovery key gets one.
+         */
+        post: operations["exchange_api_key_endpoint_api_v1_auth_api_key_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/logout": {
         parameters: {
             query?: never;
@@ -2493,6 +2529,26 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    exchange_api_key_endpoint_api_v1_auth_api_key_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+        };
+    };
     logout_endpoint_api_v1_auth_logout_post: {
         parameters: {
             query?: never;

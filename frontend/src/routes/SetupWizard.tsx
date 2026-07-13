@@ -8,7 +8,7 @@ import {
 } from '../api/hooks'
 import type { PlexLibraryOption, SetupCompleteRequest } from '../api/types'
 import { libraryOptionNote, libraryOptionValue } from '../api/types'
-import { clearSetupToken, getSetupToken, setSetupToken } from '../lib/apiKey'
+import { clearSetupToken, getSetupToken, setSetupToken } from '../lib/setupToken'
 import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { cn } from '../lib/cn'
 import { PlexLogin } from '../components/PlexLogin'
