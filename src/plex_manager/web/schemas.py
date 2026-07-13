@@ -778,6 +778,7 @@ class DiscoverHomeRow(BaseModel):
 
     row_type: str
     title: str
+    subtitle: str | None = None
     items: list[DiscoverResult]
 
 
