@@ -2588,10 +2588,25 @@ export interface components {
          */
         UpdateActionRequest: Record<string, never>;
         /**
+         * UpdateClaimRequest
+         * @description Recovery claims bind only to an existing action generation, never a target.
+         */
+        UpdateClaimRequest: {
+            /** Expected Generation */
+            expected_generation?: number | null;
+            /**
+             * Recovery
+             * @default false
+             */
+            recovery: boolean;
+        };
+        /**
          * UpdateClaimResponse
          * @description A newly-created drain claim, or a fail-closed busy response.
          */
         UpdateClaimResponse: {
+            /** Action Generation */
+            action_generation?: number | null;
             /** Blocker */
             blocker?: string | null;
             /** Lease Seconds */
@@ -3007,7 +3022,7 @@ export interface operations {
         };
         requestBody?: {
             content: {
-                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+                "application/json": components["schemas"]["UpdateClaimRequest"] | null;
             };
         };
         responses: {

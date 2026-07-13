@@ -828,6 +828,7 @@ class UpdateCoordinatorState(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_operation: Mapped[str | None] = mapped_column(String(16))
     last_result: Mapped[str | None] = mapped_column(String(32))
     last_error_code: Mapped[str | None] = mapped_column(String(128))
     last_from_build: Mapped[str | None] = mapped_column(String(255))
@@ -835,6 +836,9 @@ class UpdateCoordinatorState(Base):
     # Receipt for idempotently accepting a retried outcome after the original
     # response was lost. This is a one-way SHA-256 digest, never the lease token.
     last_outcome_token_hash: Mapped[str | None] = mapped_column(String(64))
+    # Canonical acknowledgement payload receipt. A replay must match every
+    # outcome field before it can be treated as the already-committed response.
+    last_outcome_fingerprint: Mapped[str | None] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

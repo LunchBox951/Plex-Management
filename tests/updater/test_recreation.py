@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from plex_manager.updater.config import (
     IMAGE_REF_LABEL,
     OPERATION_LABEL,
     ROLE_LABEL,
     TARGET_LABEL,
 )
+from plex_manager.updater.engine import DockerError
 from plex_manager.updater.recreation import (
     build_candidate_spec,
     build_rollback_spec,
     capture_networks,
+    capture_port_bindings,
     remaining_networks,
 )
 
@@ -107,7 +111,17 @@ def _container() -> dict[str, object]:
             "ReadonlyRootfs": False,
             "ContainerIDFile": "/stale/engine/internal",
         },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "anonymous-cache-volume",
+                "Source": "/var/lib/docker/volumes/anonymous-cache-volume/_data",
+                "Destination": "/app/cache",
+                "RW": True,
+            }
+        ],
         "NetworkSettings": {
+            "Ports": {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8000"}]},
             "Networks": {
                 "plex_default": {
                     "Aliases": ["plex-manager", "app"],
@@ -121,7 +135,7 @@ def _container() -> dict[str, object]:
                     "DriverOpts": {"com.example.option": "one"},
                     "NetworkID": "other-network-id",
                 },
-            }
+            },
         },
     }
 
@@ -171,6 +185,14 @@ def test_candidate_three_way_merge_preserves_runtime_contract_and_adopts_new_ima
     host = spec["HostConfig"]
     assert isinstance(host, dict)
     assert host["Binds"] == ["plex-manager-data:/app/data:rw", "/srv/media:/media:rw"]
+    assert host["Mounts"] == [
+        {
+            "Type": "volume",
+            "Source": "anonymous-cache-volume",
+            "Target": "/app/cache",
+            "ReadOnly": False,
+        }
+    ]
     assert host["PortBindings"] == {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8000"}]}
     assert host["RestartPolicy"] == {"Name": "unless-stopped", "MaximumRetryCount": 0}
     assert host["NetworkMode"] == "plex_default"
@@ -197,6 +219,55 @@ def test_candidate_three_way_merge_preserves_runtime_contract_and_adopts_new_ima
     ]
     assert "NetworkID" not in networks["plex_default"]
     assert "EndpointID" not in networks["plex_default"]
+
+
+def test_docker_assigned_port_is_materialized_for_candidate_and_rollback() -> None:
+    container = _container()
+    host = container["HostConfig"]
+    assert isinstance(host, dict)
+    host["PortBindings"] = {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]}
+    settings = container["NetworkSettings"]
+    assert isinstance(settings, dict)
+    settings["Ports"] = {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "32780"}]}
+    materialized = capture_port_bindings(container)
+    assert materialized == {"8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "32780"}]}
+
+    networks = capture_networks(container)
+    candidate, _ = build_candidate_spec(
+        container,
+        _old_image(),
+        _new_image(),
+        image_ref=IMAGE_REF,
+        operation_id="operation-ports",
+        networks=networks,
+        port_bindings=materialized,
+    )
+    rollback, _ = build_rollback_spec(
+        container,
+        _old_image(),
+        image_ref=IMAGE_REF,
+        operation_id="operation-ports",
+        networks=networks,
+        port_bindings=materialized,
+    )
+    assert candidate["HostConfig"]["PortBindings"] == materialized  # type: ignore[index]
+    assert rollback["HostConfig"]["PortBindings"] == materialized  # type: ignore[index]
+
+
+def test_disabled_candidate_healthcheck_is_rejected() -> None:
+    new_image = _new_image()
+    config = new_image["Config"]
+    assert isinstance(config, dict)
+    config["Healthcheck"] = {"Test": ["NONE"]}
+    with pytest.raises(DockerError, match="target_healthcheck_missing"):
+        build_candidate_spec(
+            _container(),
+            _old_image(),
+            new_image,
+            image_ref=IMAGE_REF,
+            operation_id="operation-disabled-health",
+            networks=capture_networks(_container()),
+        )
 
 
 def test_rollback_reuses_previous_image_but_bypasses_migration_entrypoint() -> None:

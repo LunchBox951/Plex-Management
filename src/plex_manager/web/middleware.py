@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from starlette.requests import Request
     from starlette.responses import Response
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 __all__ = [
     "SETUP_ALLOWLIST_PATHS",
@@ -49,10 +50,6 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAINTENANCE_EXCLUDED_PREFIXES = (
     "/api/v1/auth",
     "/api/v1/setup",
-    # Recovery-key rotation/revocation is an auth-domain write, not media or
-    # updater-critical work. Keeping it available also preserves its own
-    # concurrency/CAS boundary instead of serializing outside that lock.
-    "/api/v1/settings/app-key",
     "/api/v1/updates",
     "/api/v1/internal/updates",
 )
@@ -111,7 +108,7 @@ class SetupGuardMiddleware(BaseHTTPMiddleware):
             return system is not None and system.initialized
 
 
-class CriticalMutationMiddleware(BaseHTTPMiddleware):
+class CriticalMutationMiddleware:
     """Lease state-changing API work so an updater drain cannot race it.
 
     The request-creation endpoint is deliberately excluded: requests remain
@@ -119,23 +116,28 @@ class CriticalMutationMiddleware(BaseHTTPMiddleware):
     leased separately and therefore leaves the critical handoff queued.
     """
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        path = request.url.path
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        method = str(scope.get("method", "GET"))
         if (
-            request.method in _SAFE_METHODS
+            method in _SAFE_METHODS
             or not path.startswith("/api/v1/")
-            or (request.method == "POST" and path.rstrip("/") == "/api/v1/requests")
+            or (method == "POST" and path.rstrip("/") == "/api/v1/requests")
             or any(path.startswith(prefix) for prefix in _MAINTENANCE_EXCLUDED_PREFIXES)
         ):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        coordinator = getattr(request.app.state, "update_coordinator", None)
+        request_app = scope["app"]
+        coordinator = getattr(request_app.state, "update_coordinator", None)
         if not isinstance(coordinator, UpdateCoordinationService):
-            maker_obj = getattr(request.app.state, "sessionmaker", None)
+            maker_obj = getattr(request_app.state, "sessionmaker", None)
             maker = (
                 cast("async_sessionmaker[AsyncSession]", maker_obj)
                 if isinstance(maker_obj, async_sessionmaker)
@@ -145,19 +147,29 @@ class CriticalMutationMiddleware(BaseHTTPMiddleware):
             try:
                 await coordinator.initialize()
             except Exception:
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=503,
                     content={
                         "detail": "maintenance_coordinator_unavailable",
                         "message": "A safe mutation lease could not be established.",
                     },
                 )
-            request.app.state.update_coordinator = coordinator
+                await response(scope, receive, send)
+                return
+            request_app.state.update_coordinator = coordinator
+        response_started = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
         try:
-            async with coordinator.critical_operation(f"http_{request.method.lower()}"):
-                return await call_next(request)
+            async with coordinator.critical_operation(f"http_{method.lower()}"):
+                await self.app(scope, receive, tracking_send)
         except MaintenanceDrainingError:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=503,
                 content={
                     "detail": "maintenance_in_progress",
@@ -165,8 +177,11 @@ class CriticalMutationMiddleware(BaseHTTPMiddleware):
                     "hint": "Try again after the update finishes.",
                 },
             )
+            await response(scope, receive, send)
         except MaintenanceLeaseLostError:
-            return JSONResponse(
+            if response_started:
+                raise
+            response = JSONResponse(
                 status_code=503,
                 content={
                     "detail": "maintenance_lease_lost",
@@ -174,3 +189,4 @@ class CriticalMutationMiddleware(BaseHTTPMiddleware):
                     "hint": "Refresh the affected resource before retrying.",
                 },
             )
+            await response(scope, receive, send)

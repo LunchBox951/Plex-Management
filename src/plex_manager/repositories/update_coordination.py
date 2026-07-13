@@ -45,6 +45,7 @@ class CoordinatorSnapshot:
     last_checked_at: datetime | None
     last_started_at: datetime | None
     last_completed_at: datetime | None
+    last_operation: str | None
     last_result: str | None
     last_error_code: str | None
     last_from_build: str | None
@@ -185,6 +186,7 @@ class SqlUpdateCoordinationRepository:
             last_checked_at=_as_utc(state.last_checked_at),
             last_started_at=_as_utc(state.last_started_at),
             last_completed_at=_as_utc(state.last_completed_at),
+            last_operation=state.last_operation,
             last_result=state.last_result,
             last_error_code=state.last_error_code,
             last_from_build=state.last_from_build,
@@ -271,6 +273,7 @@ class SqlUpdateCoordinationRepository:
         token_hash: str,
         owner: str,
         action_generation: int | None,
+        require_idle: bool,
         now: datetime,
         ttl: timedelta,
     ) -> tuple[LeaseRecord, bool] | None:
@@ -280,6 +283,8 @@ class SqlUpdateCoordinationRepository:
             return None
         generation = state.action_generation if action_generation is None else action_generation
         if action_generation is not None and generation != state.action_generation:
+            return None
+        if require_idle and await self._critical_count() != 0:
             return None
         row = MaintenanceLease(
             token_hash=token_hash,
@@ -354,20 +359,27 @@ class SqlUpdateCoordinationRepository:
         result: str,
         error_code: str | None,
         image_values: Mapping[str, str | None],
+        preserve_action: bool,
         now: datetime,
     ) -> bool:
         state = await self._lock()
         if state.action_generation != expected_generation:
             return False
         values: dict[str, object] = {
-            "requested_action": "none",
-            "acknowledged_generation": expected_generation,
             "phase": phase,
+            "last_operation": "check",
             "last_result": result,
             "last_error_code": error_code,
+            "last_from_build": None,
+            "last_to_build": None,
+            "last_outcome_token_hash": None,
+            "last_outcome_fingerprint": None,
             "last_completed_at": now,
             "updated_at": now,
         }
+        if not preserve_action:
+            values["requested_action"] = "none"
+            values["acknowledged_generation"] = expected_generation
         # A check outcome has no drain lease but is still authoritative for the
         # digest/build observation it just completed. ``None`` deliberately clears
         # an old available image after an unchanged-digest result.
@@ -394,6 +406,7 @@ class SqlUpdateCoordinationRepository:
         to_build: str | None,
         current_build: str | None,
         current_digest: str | None,
+        outcome_fingerprint: str,
         now: datetime,
     ) -> bool:
         state = await self._lock()
@@ -409,6 +422,7 @@ class SqlUpdateCoordinationRepository:
             return (
                 generation_matches
                 and state.last_outcome_token_hash == token_hash
+                and state.last_outcome_fingerprint == outcome_fingerprint
                 and state.last_result == result
             )
         if expected_generation is not None and (
@@ -420,11 +434,13 @@ class SqlUpdateCoordinationRepository:
         generation = drain.action_generation
         values: dict[str, object] = {
             "phase": phase,
+            "last_operation": "install",
             "last_result": result,
             "last_error_code": error_code,
             "last_from_build": from_build,
             "last_to_build": to_build,
             "last_outcome_token_hash": token_hash,
+            "last_outcome_fingerprint": outcome_fingerprint,
             "last_completed_at": now,
             "updated_at": now,
         }

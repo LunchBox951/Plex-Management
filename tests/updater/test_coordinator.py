@@ -21,6 +21,7 @@ async def test_busy_claim_with_null_token_is_a_normal_deferral() -> None:
             200,
             json={
                 "lease_token": None,
+                "action_generation": 4,
                 "ready": False,
                 "lease_seconds": 30,
                 "blocker": "critical_work_active",
@@ -37,6 +38,7 @@ async def test_busy_claim_with_null_token_is_a_normal_deferral() -> None:
         claim = await client.claim()
 
     assert claim.lease_token is None
+    assert claim.action_generation == 4
     assert claim.ready is False
     assert claim.lease_seconds == 30
     assert claim.blocker == "critical_work_active"

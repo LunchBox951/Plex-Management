@@ -84,6 +84,7 @@ __all__ = [
     "SubsystemHealthItem",
     "TmdbValidateRequest",
     "UpdateActionRequest",
+    "UpdateClaimRequest",
     "UpdateClaimResponse",
     "UpdateEligibilityResponse",
     "UpdateLeaseRequest",
@@ -891,6 +892,7 @@ class UpdateClaimResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     lease_token: str | None = None
+    action_generation: int | None = None
     ready: bool
     lease_seconds: int
     blocker: str | None = None
@@ -900,6 +902,23 @@ class UpdateLeaseRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     lease_token: str = Field(min_length=32, max_length=256)
+
+
+class UpdateClaimRequest(BaseModel):
+    """Recovery claims bind only to an existing action generation, never a target."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    recovery: bool = False
+    expected_generation: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _recovery_requires_generation(self) -> UpdateClaimRequest:
+        if self.recovery and self.expected_generation is None:
+            raise ValueError("recovery claims require expected_generation")
+        if not self.recovery and self.expected_generation is not None:
+            raise ValueError("fresh claims must not include expected_generation")
+        return self
 
 
 class UpdateLeaseResponse(BaseModel):
@@ -928,6 +947,12 @@ class UpdateOutcomeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _install_requires_lease(self) -> UpdateOutcomeRequest:
+        allowed = {
+            "check": {"no_update", "update_available", "failed"},
+            "install": {"succeeded", "failed", "rolled_back"},
+        }
+        if self.outcome not in allowed[self.operation]:
+            raise ValueError(f"{self.outcome} is not a valid {self.operation} outcome")
         if self.operation == "install" and self.lease_token is None:
             raise ValueError("install outcomes require a lease_token")
         if self.operation == "check" and self.lease_token is not None:

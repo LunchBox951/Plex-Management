@@ -50,7 +50,7 @@ class DockerEngine:
         self._client = client or httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=socket_path),
             base_url="http://docker",
-            timeout=httpx.Timeout(30.0, read=None),
+            timeout=httpx.Timeout(30.0),
             trust_env=False,
         )
         self._api_prefix: str | None = None
@@ -136,21 +136,30 @@ class DockerEngine:
 
     async def pull(self, image_ref: str) -> JsonObject:
         repository, tag = split_tag(image_ref)
-        response = await self._request(
-            "POST",
-            "/images/create",
-            params={"fromImage": repository, "tag": tag},
-            expected=(200,),
-        )
-        # Pull responses are newline-delimited progress objects. Never log them:
-        # registry implementations may include sensitive authentication detail.
-        for line in response.text.splitlines():
-            try:
-                item: object = json.loads(line)
-            except ValueError as exc:
-                raise DockerError("docker_pull_invalid_response") from exc
-            if isinstance(item, dict) and ("error" in item or "errorDetail" in item):
-                raise DockerError("docker_pull_failed")
+        prefix = await self._prefix()
+        pull_timeout = httpx.Timeout(30.0, read=None)
+        try:
+            async with self._client.stream(
+                "POST",
+                f"{prefix}/images/create",
+                params={"fromImage": repository, "tag": tag},
+                timeout=pull_timeout,
+            ) as response:
+                if response.status_code != 200:
+                    raise DockerError("docker_api_error", status_code=response.status_code)
+                # Pull responses are newline-delimited progress objects. Never log
+                # them: registries may include sensitive authentication detail.
+                async for line in response.aiter_lines():
+                    try:
+                        item: object = json.loads(line)
+                    except ValueError as exc:
+                        raise DockerError("docker_pull_invalid_response") from exc
+                    if isinstance(item, dict) and ("error" in item or "errorDetail" in item):
+                        raise DockerError("docker_pull_failed")
+        except DockerError:
+            raise
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            raise DockerError("docker_unavailable") from exc
         return await self.inspect_image(image_ref)
 
     async def create_container(self, name: str, spec: JsonObject) -> str:
@@ -236,7 +245,14 @@ class DockerEngine:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
-            container = await self.inspect_container(identifier)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise DockerError("replacement_health_timeout")
+            try:
+                async with asyncio.timeout(remaining):
+                    container = await self.inspect_container(identifier)
+            except TimeoutError as exc:
+                raise DockerError("replacement_health_timeout") from exc
             state = container.get("State")
             if not isinstance(state, dict):
                 raise DockerError("docker_invalid_container_state")

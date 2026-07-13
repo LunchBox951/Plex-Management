@@ -124,8 +124,127 @@ def _host_config(container: JsonObject) -> JsonObject:
         raise DockerError("target_auto_remove_unsupported")
     for key in _DROP_HOST_CONFIG_FIELDS:
         value.pop(key, None)
+    _preserve_anonymous_volumes(container, value)
     value["AutoRemove"] = False
     return value
+
+
+def _mount_destinations(host_config: JsonObject) -> set[str]:
+    destinations: set[str] = set()
+    binds = host_config.get("Binds")
+    if isinstance(binds, list):
+        for raw in cast(list[object], binds):
+            if isinstance(raw, str):
+                parts = raw.split(":")
+                if len(parts) >= 2:
+                    destinations.add(parts[1])
+    mounts = host_config.get("Mounts")
+    if isinstance(mounts, list):
+        for raw in cast(list[object], mounts):
+            if isinstance(raw, dict):
+                target = cast(JsonObject, raw).get("Target")
+                if isinstance(target, str):
+                    destinations.add(target)
+    tmpfs = host_config.get("Tmpfs")
+    if isinstance(tmpfs, dict):
+        destinations.update(
+            key for key in cast(dict[object, object], tmpfs) if isinstance(key, str)
+        )
+    return destinations
+
+
+def _preserve_anonymous_volumes(container: JsonObject, host_config: JsonObject) -> None:
+    """Materialize anonymous/image-declared volumes by their Engine-assigned name."""
+    raw_mounts = container.get("Mounts")
+    if not isinstance(raw_mounts, list):
+        return
+    destinations = _mount_destinations(host_config)
+    raw_existing = deepcopy(host_config.get("Mounts"))
+    if raw_existing is None:
+        mounts: list[object] = []
+    elif isinstance(raw_existing, list):
+        mounts = cast(list[object], raw_existing)
+    else:
+        raise DockerError("docker_invalid_mounts")
+    for raw in cast(list[object], raw_mounts):
+        if not isinstance(raw, dict):
+            raise DockerError("docker_invalid_mounts")
+        mount = cast(JsonObject, raw)
+        if mount.get("Type") != "volume":
+            continue
+        destination = mount.get("Destination")
+        source = mount.get("Name") or mount.get("Source")
+        if not isinstance(destination, str) or not isinstance(source, str):
+            raise DockerError("docker_invalid_mounts")
+        if destination in destinations:
+            continue
+        mounts.append(
+            {
+                "Type": "volume",
+                "Source": source,
+                "Target": destination,
+                "ReadOnly": mount.get("RW") is False,
+            }
+        )
+        destinations.add(destination)
+    if mounts:
+        host_config["Mounts"] = mounts
+
+
+def capture_port_bindings(container: JsonObject) -> JsonObject:
+    """Resolve Docker-assigned host ports before the target is stopped."""
+    host = _object(container.get("HostConfig"), "docker_host_config_missing")
+    raw_requested = deepcopy(host.get("PortBindings"))
+    if raw_requested is None:
+        return {}
+    if not isinstance(raw_requested, dict):
+        raise DockerError("docker_invalid_port_bindings")
+    requested = cast(dict[str, object], raw_requested)
+    settings = _object(container.get("NetworkSettings"), "docker_networks_missing")
+    effective = settings.get("Ports")
+    if effective is not None and not isinstance(effective, dict):
+        raise DockerError("docker_invalid_port_bindings")
+    effective_values = cast(dict[str, object], effective) if isinstance(effective, dict) else {}
+    for container_port, bindings in requested.items():
+        if bindings is None:
+            continue
+        if not isinstance(bindings, list):
+            raise DockerError("docker_invalid_port_bindings")
+        binding_items = cast(list[object], bindings)
+        if not all(isinstance(item, dict) for item in binding_items):
+            raise DockerError("docker_invalid_port_bindings")
+        needs_resolution = any(
+            cast(JsonObject, item).get("HostPort") in {None, ""} for item in binding_items
+        )
+        if not needs_resolution:
+            continue
+        resolved = effective_values.get(container_port)
+        if not isinstance(resolved, list) or not resolved:
+            raise DockerError("docker_assigned_port_missing")
+        normalized: list[JsonObject] = []
+        for item in cast(list[object], resolved):
+            if not isinstance(item, dict):
+                raise DockerError("docker_invalid_port_bindings")
+            value = cast(JsonObject, item)
+            host_ip = value.get("HostIp")
+            host_port = value.get("HostPort")
+            if not isinstance(host_ip, str) or not isinstance(host_port, str) or not host_port:
+                raise DockerError("docker_assigned_port_missing")
+            normalized.append({"HostIp": host_ip, "HostPort": host_port})
+        requested[container_port] = normalized
+    return cast(JsonObject, requested)
+
+
+def enabled_healthcheck(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    test = cast(JsonObject, value).get("Test")
+    items = cast(list[object], test) if isinstance(test, list) else []
+    return (
+        len(items) >= 2
+        and items[0] in {"CMD", "CMD-SHELL"}
+        and all(isinstance(item, str) for item in items)
+    )
 
 
 def _primary_network(host_config: JsonObject, networks: dict[str, JsonObject]) -> str | None:
@@ -163,6 +282,7 @@ def build_candidate_spec(
     image_ref: str,
     operation_id: str,
     networks: dict[str, JsonObject],
+    port_bindings: JsonObject | None = None,
 ) -> tuple[JsonObject, str | None]:
     """Three-way merge old image, active runtime overrides, and new image defaults."""
     current = _base_config(container)
@@ -186,9 +306,12 @@ def build_candidate_spec(
                 current[field] = deepcopy(new_config[field])
             else:
                 current.pop(field, None)
-    if not isinstance(current.get("Healthcheck"), dict):
+    if not enabled_healthcheck(current.get("Healthcheck")):
         raise DockerError("target_healthcheck_missing")
-    return _with_networking(current, _host_config(container), networks)
+    host_config = _host_config(container)
+    if port_bindings is not None:
+        host_config["PortBindings"] = deepcopy(port_bindings)
+    return _with_networking(current, host_config, networks)
 
 
 def build_rollback_spec(
@@ -198,6 +321,7 @@ def build_rollback_spec(
     image_ref: str,
     operation_id: str,
     networks: dict[str, JsonObject],
+    port_bindings: JsonObject | None = None,
 ) -> tuple[JsonObject, str | None]:
     """Recreate the previous bytes/config but bypass their now-behind Alembic graph."""
     current = _base_config(container)
@@ -220,9 +344,12 @@ def build_rollback_spec(
         role="rollback",
         target_image_id=old_image_id,
     )
-    if not isinstance(current.get("Healthcheck"), dict):
+    if not enabled_healthcheck(current.get("Healthcheck")):
         raise DockerError("target_healthcheck_missing")
-    return _with_networking(current, _host_config(container), networks)
+    host_config = _host_config(container)
+    if port_bindings is not None:
+        host_config["PortBindings"] = deepcopy(port_bindings)
+    return _with_networking(current, host_config, networks)
 
 
 def remaining_networks(

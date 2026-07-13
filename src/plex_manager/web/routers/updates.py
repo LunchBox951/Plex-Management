@@ -23,6 +23,7 @@ from plex_manager.web.errors import AppError
 from plex_manager.web.events import current_build_id, publish_realtime
 from plex_manager.web.schemas import (
     UpdateActionRequest,
+    UpdateClaimRequest,
     UpdateClaimResponse,
     UpdateEligibilityResponse,
     UpdateLeaseRequest,
@@ -99,9 +100,7 @@ def _last_result(snapshot: CoordinatorSnapshot) -> UpdateResultItem | None:
     if outcome is None:
         return None
     operation: Literal["check", "install"] = (
-        "install"
-        if snapshot.last_from_build is not None or snapshot.last_to_build is not None
-        else "check"
+        "install" if snapshot.last_operation == "install" else "check"
     )
     return UpdateResultItem(
         operation=operation,
@@ -135,10 +134,11 @@ def _state_and_blocker(
     if snapshot.phase == "succeeded":
         return "succeeded", None
     if snapshot.requested_action == "install":
+        if snapshot.available_digest is None:
+            return "checking", "checking_for_update"
         if policy.idle_only and snapshot.active_critical_operations:
             return "waiting_for_idle", "active_critical_work"
-        if snapshot.available_digest is not None:
-            return "update_available", None
+        return "update_available", None
     if snapshot.available_digest is not None:
         if policy.schedule.enabled and not policy.schedule.is_open(now):
             return "waiting_for_window", "outside_update_window"
@@ -296,9 +296,31 @@ async def eligibility_endpoint(
 async def claim_endpoint(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    _body: Annotated[UpdateActionRequest | None, Body()] = None,
+    body: Annotated[UpdateClaimRequest | None, Body()] = None,
 ) -> UpdateClaimResponse:
-    eligibility, snapshot = await _eligibility(request, session, touch=True)
+    coordinator = await _coordinator(request)
+    if body is not None and body.recovery:
+        snapshot = await coordinator.snapshot()
+        if (
+            snapshot.requested_action != "install"
+            or snapshot.action_generation != body.expected_generation
+        ):
+            raise AppError(
+                status_code=409,
+                code="update_recovery_generation_mismatch",
+                message="The interrupted update no longer matches the pending action.",
+            )
+        policy = await load_update_policy(session)
+        eligibility = UpdateEligibilityResponse(
+            action="install",
+            automatic_enabled=policy.schedule.enabled,
+            window_open=policy.schedule.is_open(datetime.now(UTC)),
+            idle_only=policy.idle_only,
+            blocker=None,
+            poll_after_seconds=_SIDE_CAR_POLL_SECONDS,
+        )
+    else:
+        eligibility, snapshot = await _eligibility(request, session, touch=True)
     if eligibility.action != "install":
         raise AppError(
             status_code=409,
@@ -307,6 +329,7 @@ async def claim_endpoint(
         )
     if eligibility.idle_only and snapshot.active_critical_operations:
         return UpdateClaimResponse(
+            action_generation=snapshot.action_generation,
             ready=False,
             lease_seconds=int(_DRAIN_TTL.total_seconds()),
             blocker="active_critical_work",
@@ -314,16 +337,25 @@ async def claim_endpoint(
     claim = await (await _coordinator(request)).claim_drain(
         ttl=_DRAIN_TTL,
         action_generation=snapshot.action_generation,
+        require_idle=eligibility.idle_only,
     )
     if claim is None:
+        latest = await (await _coordinator(request)).snapshot()
+        blocker = (
+            "active_critical_work"
+            if eligibility.idle_only and latest.active_critical_operations
+            else "concurrent_update_claim"
+        )
         return UpdateClaimResponse(
+            action_generation=snapshot.action_generation,
             ready=False,
             lease_seconds=int(_DRAIN_TTL.total_seconds()),
-            blocker="concurrent_update_claim",
+            blocker=blocker,
         )
     publish_realtime(request.app, ("updates",), reason="update_drain_claimed")
     return UpdateClaimResponse(
         lease_token=claim.lease.token,
+        action_generation=claim.lease.action_generation,
         ready=claim.ready,
         lease_seconds=int(_DRAIN_TTL.total_seconds()),
         blocker=None if claim.ready else "critical_work_draining",
@@ -395,16 +427,18 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
             available_digest=body.available_digest,
             checked=True,
         )
-        if snapshot.requested_action == "check" or result is not UpdateResult.update_available:
-            await coordinator.acknowledge_action(
-                expected_generation=snapshot.action_generation,
-                result=result,
-                error_code=body.detail_code,
-                current_build=body.current_build,
-                current_digest=body.current_digest,
-                available_build=body.available_build,
-                available_digest=body.available_digest,
-            )
+        await coordinator.acknowledge_action(
+            expected_generation=snapshot.action_generation,
+            result=result,
+            error_code=body.detail_code,
+            current_build=body.current_build,
+            current_digest=body.current_digest,
+            available_build=body.available_build,
+            available_digest=body.available_digest,
+            preserve_action=(
+                snapshot.requested_action == "install" and result is UpdateResult.update_available
+            ),
+        )
     else:
         token = body.lease_token
         if token is None:  # schema validation guarantees this branch is unreachable
@@ -421,6 +455,8 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
             to_build=body.to_build,
             current_build=body.current_build,
             current_digest=body.current_digest,
+            available_build=body.available_build,
+            available_digest=body.available_digest,
         ):
             raise AppError(
                 status_code=409,

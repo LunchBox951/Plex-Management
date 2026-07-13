@@ -52,10 +52,11 @@ def test_existing_install_gains_seeded_coordinator_and_lease_indexes(
     with sqlite3.connect(db_path) as connection:
         state = connection.execute(
             "SELECT id, requested_action, action_generation, phase, "
-            "last_from_build, last_to_build, last_outcome_token_hash "
+            "last_operation, last_from_build, last_to_build, last_outcome_token_hash, "
+            "last_outcome_fingerprint "
             "FROM update_coordinator_state"
         ).fetchall()
-        assert state == [(1, "none", 0, "idle", None, None, None)]
+        assert state == [(1, "none", 0, "idle", None, None, None, None, None)]
         index_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'uq_maintenance_leases_drain'"
         ).fetchone()

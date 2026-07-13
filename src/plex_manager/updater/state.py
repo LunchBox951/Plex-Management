@@ -12,6 +12,53 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast
 
 Operation = Literal["install"]
+UpdateStage = Literal[
+    "prepared",
+    "stop_requested",
+    "old_stopped",
+    "old_disconnected",
+    "candidate_created",
+    "candidate_started",
+    "candidate_healthy",
+    "old_renamed",
+    "candidate_renamed",
+    "outcome_acknowledged",
+    "rollback_created",
+    "rollback_started",
+    "rollback_healthy",
+    "rollback_acknowledged",
+]
+_STAGES: frozenset[str] = frozenset(
+    {
+        "prepared",
+        "stop_requested",
+        "old_stopped",
+        "old_disconnected",
+        "candidate_created",
+        "candidate_started",
+        "candidate_healthy",
+        "old_renamed",
+        "candidate_renamed",
+        "outcome_acknowledged",
+        "rollback_created",
+        "rollback_started",
+        "rollback_healthy",
+        "rollback_acknowledged",
+    }
+)
+_CANDIDATE_STAGES = frozenset(
+    {
+        "candidate_created",
+        "candidate_started",
+        "candidate_healthy",
+        "old_renamed",
+        "candidate_renamed",
+        "outcome_acknowledged",
+    }
+)
+_ROLLBACK_STAGES = frozenset(
+    {"rollback_created", "rollback_started", "rollback_healthy", "rollback_acknowledged"}
+)
 
 
 class StateError(RuntimeError):
@@ -31,8 +78,9 @@ class UpdateState:
     version: int
     operation_id: str
     operation: Operation
-    stage: str
+    stage: UpdateStage
     lease_token: str
+    action_generation: int
     target_id: str
     target_name: str
     old_image_id: str
@@ -42,8 +90,10 @@ class UpdateState:
     desired_digest: str
     desired_build: str | None
     networks: dict[str, dict[str, Any]]
+    port_bindings: dict[str, Any]
     candidate_id: str | None = None
     rollback_id: str | None = None
+    detail_code: str | None = None
 
     @classmethod
     def from_json(cls, value: object) -> UpdateState:
@@ -67,15 +117,36 @@ class UpdateState:
         networks = data.get("networks")
         if not isinstance(networks, dict):
             raise StateError("updater state has invalid network data")
-        for key in ("old_digest", "old_build", "desired_build", "candidate_id", "rollback_id"):
+        generation = data.get("action_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise StateError("updater state has invalid action generation")
+        port_bindings = data.get("port_bindings")
+        if not isinstance(port_bindings, dict):
+            raise StateError("updater state has invalid port bindings")
+        stage = cast(str, data["stage"])
+        if stage not in _STAGES:
+            raise StateError("updater state has an unknown stage")
+        for key in (
+            "old_digest",
+            "old_build",
+            "desired_build",
+            "candidate_id",
+            "rollback_id",
+            "detail_code",
+        ):
             if data.get(key) is not None and not isinstance(data.get(key), str):
                 raise StateError(f"updater state field {key} is invalid")
+        if stage in _CANDIDATE_STAGES and not isinstance(data.get("candidate_id"), str):
+            raise StateError("updater state stage requires a candidate container")
+        if stage in _ROLLBACK_STAGES and not isinstance(data.get("rollback_id"), str):
+            raise StateError("updater state stage requires a rollback container")
         return cls(
             version=1,
             operation_id=cast(str, data["operation_id"]),
             operation="install",
-            stage=cast(str, data["stage"]),
+            stage=cast(UpdateStage, stage),
             lease_token=cast(str, data["lease_token"]),
+            action_generation=generation,
             target_id=cast(str, data["target_id"]),
             target_name=cast(str, data["target_name"]),
             old_image_id=cast(str, data["old_image_id"]),
@@ -85,8 +156,10 @@ class UpdateState:
             desired_digest=cast(str, data["desired_digest"]),
             desired_build=cast(str | None, data.get("desired_build")),
             networks=cast(dict[str, dict[str, Any]], networks),
+            port_bindings=cast(dict[str, Any], port_bindings),
             candidate_id=cast(str | None, data.get("candidate_id")),
             rollback_id=cast(str | None, data.get("rollback_id")),
+            detail_code=cast(str | None, data.get("detail_code")),
         )
 
 

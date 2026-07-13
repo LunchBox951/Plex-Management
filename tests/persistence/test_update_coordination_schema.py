@@ -24,9 +24,11 @@ async def test_update_coordinator_defaults_and_build_history_round_trip(
     assert row.action_generation == 0
     assert row.acknowledged_generation == 0
     assert row.phase == "idle"
+    assert row.last_operation is None
     assert row.last_from_build is None
     assert row.last_to_build is None
     assert row.last_outcome_token_hash is None
+    assert row.last_outcome_fingerprint is None
 
     row.last_from_build = "old-build"
     row.last_to_build = "new-build"

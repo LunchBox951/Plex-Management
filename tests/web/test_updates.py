@@ -128,6 +128,104 @@ async def test_check_and_claim_flow_is_targetless_and_concurrency_safe(
     assert released.status_code == 200
 
 
+async def test_manual_update_without_cached_digest_reports_preflight_checking(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    queued = await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+    assert queued.status_code == 200
+    assert queued.json()["state"] == "checking"
+    assert queued.json()["blocker"] == "checking_for_update"
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert eligibility.status_code == 200
+    assert eligibility.json()["action"] == "check"
+
+
+async def test_check_after_install_reports_check_without_stale_build_transition(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    available = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "update_available",
+            "current_build": "old",
+            "available_build": "new",
+            "available_digest": "sha256:new",
+        },
+    )
+    assert available.status_code == 200
+    await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+    claim = await client.post("/api/v1/internal/updates/claim", headers=updater_headers)
+    token = claim.json()["lease_token"]
+    installed = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "install",
+            "outcome": "succeeded",
+            "lease_token": token,
+            "current_build": "new",
+            "from_build": "old",
+            "to_build": "new",
+        },
+    )
+    assert installed.status_code == 200
+
+    await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    checked = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "current_build": "new",
+        },
+    )
+    assert checked.status_code == 200
+    last = checked.json()["last_result"]
+    assert last["operation"] == "check"
+    assert last["outcome"] == "no_update"
+    assert last["from_build"] is None
+    assert last["to_build"] is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "outcome", "with_lease"),
+    [
+        ("check", "succeeded", False),
+        ("check", "rolled_back", False),
+        ("install", "no_update", True),
+        ("install", "update_available", True),
+    ],
+)
+async def test_internal_outcome_rejects_impossible_operation_result_pairs(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    operation: str,
+    outcome: str,
+    with_lease: bool,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    body: dict[str, object] = {"operation": operation, "outcome": outcome}
+    if with_lease:
+        body["lease_token"] = "l" * 32
+    response = await client.post(
+        "/api/v1/internal/updates/outcome", headers=updater_headers, json=body
+    )
+    assert response.status_code == 422
+
+
 async def test_drain_blocks_admin_mutations_but_accepts_new_requests(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -147,6 +245,11 @@ async def test_drain_blocks_admin_mutations_but_accepts_new_requests(
     )
     assert blocked.status_code == 503
     assert blocked.json()["detail"] == "maintenance_in_progress"
+
+    rotated = await client.post("/api/v1/settings/app-key/rotate", headers=_ADMIN)
+    assert rotated.status_code == 503
+    revoked = await client.delete("/api/v1/settings/app-key", headers=_ADMIN)
+    assert revoked.status_code == 503
 
     override_adapters(
         app,

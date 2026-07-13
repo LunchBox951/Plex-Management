@@ -3181,9 +3181,45 @@
         "title": "UpdateActionRequest",
         "type": "object"
       },
+      "UpdateClaimRequest": {
+        "additionalProperties": false,
+        "description": "Recovery claims bind only to an existing action generation, never a target.",
+        "properties": {
+          "expected_generation": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Generation"
+          },
+          "recovery": {
+            "default": false,
+            "title": "Recovery",
+            "type": "boolean"
+          }
+        },
+        "title": "UpdateClaimRequest",
+        "type": "object"
+      },
       "UpdateClaimResponse": {
         "description": "A newly-created drain claim, or a fail-closed busy response.",
         "properties": {
+          "action_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Generation"
+          },
           "blocker": {
             "anyOf": [
               {
@@ -4155,13 +4191,13 @@
               "schema": {
                 "anyOf": [
                   {
-                    "$ref": "#/components/schemas/UpdateActionRequest"
+                    "$ref": "#/components/schemas/UpdateClaimRequest"
                   },
                   {
                     "type": "null"
                   }
                 ],
-                "title": " Body"
+                "title": "Body"
               }
             }
           }

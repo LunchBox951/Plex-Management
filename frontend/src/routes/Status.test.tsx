@@ -274,6 +274,25 @@ describe('Status', () => {
     expect(screen.getByRole('button', { name: 'Update when ready' })).toBeEnabled()
   })
 
+  it('renders queued install preflight honestly and prevents duplicate actions', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state: 'checking', blocker: 'checking_for_update' }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Checking for an update')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+  })
+
   it('disables actions when the sidecar is unavailable', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })

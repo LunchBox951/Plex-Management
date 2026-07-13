@@ -37,6 +37,10 @@ from plex_manager.models import AuthSession, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
+from plex_manager.services.update_policy import (
+    AUTOMATIC_UPDATE_TIMEZONE_DEFAULT,
+    UPDATE_POLICY_SETTING_KEYS,
+)
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
@@ -362,7 +366,15 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | N
         # default applies at runtime, so unset (None) is the truthful display.
         out[key] = value.strip() if honored else None
 
-    out["automatic_update_timezone"] = _parse_update_timezone(raw.get("automatic_update_timezone"))
+    stored_update_policy = any(raw.get(key) is not None for key in UPDATE_POLICY_SETTING_KEYS)
+    parsed_timezone = _parse_update_timezone(raw.get("automatic_update_timezone"))
+    out["automatic_update_timezone"] = (
+        parsed_timezone
+        if parsed_timezone is not None
+        else AUTOMATIC_UPDATE_TIMEZONE_DEFAULT
+        if stored_update_policy
+        else None
+    )
     out["automatic_update_weekdays"] = _parse_update_weekdays(raw.get("automatic_update_weekdays"))
     start = _parse_update_time(raw.get("automatic_update_window_start"))
     end = _parse_update_time(raw.get("automatic_update_window_end"))

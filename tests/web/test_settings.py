@@ -1546,7 +1546,23 @@ async def test_get_settings_degrades_corrupt_automatic_update_policy(
         await session.commit()
     response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     assert response.status_code == 200
-    assert response.json()[field] is None
+    expected = "UTC" if field == "automatic_update_timezone" else None
+    assert response.json()[field] == expected
+
+
+async def test_partial_update_policy_displays_the_effective_utc_timezone(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("automatic_updates_enabled", "true")
+        await session.commit()
+
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json()["automatic_update_timezone"] == "UTC"
 
 
 async def test_put_rejects_out_of_range_operability_settings(
@@ -2680,6 +2696,17 @@ async def test_rotate_app_key_lock_serializes_two_concurrent_rotations(
 
     monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
 
+    from plex_manager.web import middleware as middleware_module
+
+    monkeypatch.setattr(
+        middleware_module,
+        "_MAINTENANCE_EXCLUDED_PREFIXES",
+        (
+            *middleware_module._MAINTENANCE_EXCLUDED_PREFIXES,  # pyright: ignore[reportPrivateUsage]
+            "/api/v1/settings/app-key",
+        ),
+    )
+
     first, second = await asyncio.gather(
         client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
         client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
@@ -3070,6 +3097,17 @@ async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
     # contended it (the api-key barrier test above); this test runs in its own
     # loop, so give it a fresh, loop-local lock — same serialization semantics.
     monkeypatch.setattr(settings_router, "_rotate_lock", asyncio.Lock())
+
+    from plex_manager.web import middleware as middleware_module
+
+    monkeypatch.setattr(
+        middleware_module,
+        "_MAINTENANCE_EXCLUDED_PREFIXES",
+        (
+            *middleware_module._MAINTENANCE_EXCLUDED_PREFIXES,  # pyright: ignore[reportPrivateUsage]
+            "/api/v1/settings/app-key",
+        ),
+    )
 
     first, second = await asyncio.gather(
         client.post("/api/v1/settings/app-key/rotate", cookies=cookies_a, headers=headers_a),

@@ -8,11 +8,12 @@ monkeypatched on the app module -- mirroring ``tests/web/test_reconcile_loop.py`
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.prowlarr import IndexerError
@@ -22,6 +23,7 @@ from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import EpisodeInfo, MetadataPort, TvMetadata
 from plex_manager.services.health_service import AutograbStatus
+from plex_manager.services.update_coordination_service import UpdateCoordinationService
 from plex_manager.web import app as app_module
 from tests.web.fakes import (
     FakeLibrary,
@@ -114,6 +116,45 @@ async def test_autograb_grabs_a_pending_request(
     status = app.state.autograb_status
     assert status.last_ok_at is not None
     assert status.last_error_type is None
+
+
+async def test_autograb_keeps_accepted_request_queued_during_update_drain(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = await _seed_pending_movie(sessionmaker_)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+    app = _build_app(sessionmaker_)
+    coordinator = UpdateCoordinationService(sessionmaker_)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    drain = await coordinator.claim_drain(ttl=timedelta(minutes=1))
+    assert drain is not None
+
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+        assert prowlarr.searched == []
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+            assert request is not None
+            assert request.status == RequestStatus.pending
+            download = (
+                await session.execute(
+                    select(Download).where(Download.media_request_id == request_id)
+                )
+            ).scalar_one_or_none()
+            assert download is None
+
+        assert await coordinator.release(drain.lease.token)
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status == RequestStatus.downloading
 
 
 async def test_autograb_disabled_toggle_is_a_clean_no_op(

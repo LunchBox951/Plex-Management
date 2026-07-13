@@ -20,6 +20,7 @@ from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.models import MaintenanceLease
 from plex_manager.services.update_coordination_service import (
     MaintenanceDrainingError,
+    MaintenanceLeaseLostError,
     UpdateAction,
     UpdateCoordinationService,
     UpdatePhase,
@@ -169,6 +170,15 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
         expected_generation=generation,
         result=UpdateResult.failed,
     )
+    assert not await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="different-old",
+        to_build="build-new",
+        current_build="build-new",
+        current_digest="sha256:new",
+    )
     assert await service.release(drain.lease.token) is False
 
 
@@ -189,6 +199,75 @@ async def test_drain_claim_rejects_a_stale_action_generation(
         is None
     )
     assert (await service.snapshot()).drain_owner is None
+
+
+async def test_idle_only_claim_atomically_refuses_active_critical_work(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    critical = await service.acquire_critical("import")
+    assert critical is not None
+
+    assert await service.claim_drain(ttl=timedelta(minutes=1), require_idle=True) is None
+    assert (await service.snapshot()).drain_owner is None
+
+    draining = await service.claim_drain(ttl=timedelta(minutes=1), require_idle=False)
+    assert draining is not None and not draining.ready
+
+
+async def test_check_result_clears_install_history_and_old_receipt(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    drain = await service.claim_drain(ttl=timedelta(minutes=1), action_generation=generation)
+    assert drain is not None
+    assert await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="old",
+        to_build="new",
+    )
+
+    check_generation = await service.request_action(UpdateAction.check)
+    assert await service.acknowledge_action(
+        expected_generation=check_generation,
+        result=UpdateResult.no_update,
+    )
+    snapshot = await service.snapshot()
+    assert snapshot.last_operation == "check"
+    assert snapshot.last_from_build is None
+    assert snapshot.last_to_build is None
+    assert not await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="old",
+        to_build="new",
+    )
+
+
+async def test_prefetch_check_records_result_without_consuming_install_intent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    assert await service.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.update_available,
+        available_digest="sha256:new",
+        preserve_action=True,
+    )
+    snapshot = await service.snapshot()
+    assert snapshot.requested_action == "install"
+    assert snapshot.acknowledged_generation == 0
+    assert snapshot.last_operation == "check"
+    assert snapshot.last_result == "update_available"
+    assert snapshot.last_completed_at is not None
 
 
 async def test_expired_leases_are_cleaned_for_crash_recovery(
@@ -246,6 +325,32 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
         snapshot = await service.snapshot()
         assert snapshot.active_critical_operations == 1
 
+    assert (await service.snapshot()).active_critical_operations == 0
+
+
+async def test_critical_context_cancels_work_immediately_when_renewal_is_rejected(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    mutation_completed = False
+
+    async def reject_renewal(_token: str, *, ttl: timedelta) -> bool:
+        del ttl
+        return False
+
+    monkeypatch.setattr(service, "renew", reject_renewal)
+    with pytest.raises(MaintenanceLeaseLostError):
+        async with service.critical_operation(
+            "import",
+            ttl=timedelta(milliseconds=200),
+            renew_every=timedelta(milliseconds=20),
+        ):
+            await asyncio.sleep(1)
+            mutation_completed = True
+
+    assert mutation_completed is False
     assert (await service.snapshot()).active_critical_operations == 0
 
 

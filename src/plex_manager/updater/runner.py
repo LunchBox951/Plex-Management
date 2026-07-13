@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable
 from contextlib import suppress
 from typing import Any, cast
 
@@ -29,9 +30,11 @@ from plex_manager.updater.recreation import (
     build_candidate_spec,
     build_rollback_spec,
     capture_networks,
+    capture_port_bindings,
+    enabled_healthcheck,
     remaining_networks,
 )
-from plex_manager.updater.state import StateStore, UpdateState
+from plex_manager.updater.state import StateStore, UpdateStage, UpdateState
 
 _logger = logging.getLogger(__name__)
 
@@ -88,6 +91,8 @@ class UpdaterRunner:
         self.coordinator = coordinator
         self.state = state
         self._sleep = sleep
+        self._lease_stop: asyncio.Event | None = None
+        self._lease_task: asyncio.Task[None] | None = None
 
     async def run_forever(self) -> None:
         while True:
@@ -104,7 +109,27 @@ class UpdaterRunner:
     async def run_once(self) -> None:
         pending = self.state.load()
         if pending is not None:
-            await self._recover(pending)
+            if pending.stage in {"outcome_acknowledged", "rollback_acknowledged"}:
+                await self._recover(pending)
+                return
+            if pending.stage == "candidate_renamed":
+                try:
+                    await self._finish_success(pending)
+                    return
+                except CoordinatorError as exc:
+                    if exc.code != "coordinator_conflict":
+                        raise
+            if pending.stage == "rollback_healthy":
+                try:
+                    await self._finish_rollback_outcome(pending)
+                    return
+                except CoordinatorError as exc:
+                    if exc.code != "coordinator_conflict":
+                        raise
+            lease = await self._ensure_recovery_lease(pending)
+            if lease is None:
+                return
+            await self._run_with_lease_keeper(pending, lease.lease_seconds, self._recover(pending))
             return
         eligibility = await self.coordinator.eligibility()
         if eligibility.action == "none":
@@ -147,6 +172,8 @@ class UpdaterRunner:
             return
         if lease.lease_token is None:  # guarded by _claim_ready
             raise UpdaterError("maintenance_claim_missing")
+        if lease.action_generation is None:
+            raise UpdaterError("maintenance_generation_missing")
         lease_token = lease.lease_token
         operation_id = uuid.uuid4().hex
         state = UpdateState(
@@ -155,6 +182,7 @@ class UpdaterRunner:
             operation="install",
             stage="prepared",
             lease_token=lease_token,
+            action_generation=lease.action_generation,
             target_id=cast(str, target["Id"]),
             target_name=self.config.container_name,
             old_image_id=old_id,
@@ -164,12 +192,26 @@ class UpdaterRunner:
             desired_digest=desired_digest,
             desired_build=desired_build,
             networks=capture_networks(target),
+            port_bindings=capture_port_bindings(target),
         )
         self.state.save(state)
+        renewed = await self.coordinator.renew(lease_token)
+        if not renewed.ready:
+            raise UpdaterError("maintenance_drain_lost")
+        await self._run_with_lease_keeper(
+            state,
+            renewed.lease_seconds,
+            self._execute_install(state, target, old_image, desired),
+        )
+
+    async def _execute_install(
+        self,
+        state: UpdateState,
+        target: JsonObject,
+        old_image: JsonObject,
+        desired: JsonObject,
+    ) -> None:
         try:
-            renewed = await self.coordinator.renew(lease_token)
-            if not renewed.ready:
-                raise UpdaterError("maintenance_drain_lost")
             await self._install(state, target, old_image, desired)
         except (CoordinatorError, DockerError, UpdaterError) as exc:
             if state.stage == "prepared":
@@ -187,8 +229,91 @@ class UpdaterRunner:
                 raise
             await self._rollback(state, detail_code=exc.code)
 
-    async def _claim_ready(self) -> LeaseStatus | None:
-        lease = await self.coordinator.claim()
+    async def _run_with_lease_keeper(
+        self,
+        state: UpdateState,
+        lease_seconds: int,
+        work: Awaitable[None],
+    ) -> None:
+        stop = asyncio.Event()
+        lost = asyncio.Event()
+        owner = asyncio.current_task()
+        task = asyncio.create_task(
+            self._keep_lease(state, lease_seconds, stop=stop, lost=lost, owner=owner)
+        )
+        self._lease_stop = stop
+        self._lease_task = task
+        try:
+            await work
+        except asyncio.CancelledError:
+            if lost.is_set():
+                raise UpdaterError("maintenance_drain_lost") from None
+            raise
+        finally:
+            stop.set()
+            await task
+            if self._lease_task is task:
+                self._lease_stop = None
+                self._lease_task = None
+
+    async def _keep_lease(
+        self,
+        state: UpdateState,
+        lease_seconds: int,
+        *,
+        stop: asyncio.Event,
+        lost: asyncio.Event,
+        owner: asyncio.Task[object] | None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + lease_seconds
+        delay = max(0.1, lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+                return
+            except TimeoutError:
+                try:
+                    renewed = await self.coordinator.renew(state.lease_token)
+                except CoordinatorError as exc:
+                    if exc.code == "coordinator_conflict" or loop.time() >= deadline:
+                        lost.set()
+                        if owner is not None:
+                            owner.cancel()
+                        return
+                    delay = 1.0
+                    continue
+                if not renewed.ready:
+                    lost.set()
+                    if owner is not None:
+                        owner.cancel()
+                    return
+                lease_seconds = renewed.lease_seconds
+                deadline = loop.time() + lease_seconds
+                delay = max(0.1, lease_seconds / 3)
+
+    async def _stop_lease_keeper(self) -> None:
+        stop = self._lease_stop
+        task = self._lease_task
+        if stop is None or task is None:
+            return
+        stop.set()
+        await task
+
+    async def _claim_ready(
+        self,
+        *,
+        recovery: bool = False,
+        expected_generation: int | None = None,
+    ) -> LeaseStatus | None:
+        lease = (
+            await self.coordinator.claim(
+                recovery=True,
+                expected_generation=expected_generation,
+            )
+            if recovery
+            else await self.coordinator.claim()
+        )
         if lease.lease_token is None:
             # Idle-only busy or another updater already owns the drain. This is
             # normal deferral, not a malformed response and not a failed update.
@@ -204,6 +329,35 @@ class UpdaterRunner:
             if lease.lease_token is None:
                 raise UpdaterError("maintenance_drain_lost")
         return lease
+
+    async def _ensure_recovery_lease(self, state: UpdateState) -> LeaseStatus | None:
+        """Revalidate ownership before any interrupted-stage Docker mutation."""
+        try:
+            renewed = await self.coordinator.renew(state.lease_token)
+        except CoordinatorError as exc:
+            if exc.code != "coordinator_conflict":
+                raise
+        else:
+            if renewed.ready:
+                return renewed
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.config.drain_timeout_seconds
+            while not renewed.ready:
+                if loop.time() >= deadline:
+                    return None
+                await self._sleep(max(0.5, min(5.0, renewed.lease_seconds / 3)))
+                renewed = await self.coordinator.renew(state.lease_token)
+            return renewed
+
+        replacement = await self._claim_ready(
+            recovery=True,
+            expected_generation=state.action_generation,
+        )
+        if replacement is None or replacement.lease_token is None:
+            return None
+        state.lease_token = replacement.lease_token
+        self.state.save(state)
+        return replacement
 
     async def _target(self) -> tuple[JsonObject, JsonObject]:
         try:
@@ -221,8 +375,8 @@ class UpdaterRunner:
         # A health gate is mandatory before any destructive operation; otherwise
         # there is no objective success/rollback decision.
         config = container.get("Config")
-        if not isinstance(config, dict) or not isinstance(
-            cast(JsonObject, config).get("Healthcheck"), dict
+        if not isinstance(config, dict) or not enabled_healthcheck(
+            cast(JsonObject, config).get("Healthcheck")
         ):
             raise UpdaterError("target_healthcheck_missing")
         identifier = container.get("Id")
@@ -251,6 +405,7 @@ class UpdaterRunner:
             image_ref=self.config.image_ref,
             operation_id=state.operation_id,
             networks=state.networks,
+            port_bindings=state.port_bindings,
         )
         candidate_name = f"{self.config.container_name}-candidate-{state.operation_id[:12]}"
         state.candidate_id = await self.engine.create_container(candidate_name, spec)
@@ -286,6 +441,7 @@ class UpdaterRunner:
             )
             self._stage(state, "candidate_renamed")
         if state.stage == "candidate_renamed":
+            await self._stop_lease_keeper()
             await self.coordinator.outcome(
                 operation="install",
                 outcome="succeeded",
@@ -303,6 +459,9 @@ class UpdaterRunner:
         self.state.clear()
 
     async def _rollback(self, state: UpdateState, *, detail_code: str) -> None:
+        if state.detail_code is None:
+            state.detail_code = detail_code
+            self.state.save(state)
         if state.candidate_id is None:
             state.candidate_id = await self._find_operation_container(state, "candidate")
             if state.candidate_id is not None:
@@ -332,7 +491,7 @@ class UpdaterRunner:
         if state.rollback_id is None:
             state.rollback_id = await self._find_operation_container(state, "rollback")
             if state.rollback_id is not None:
-                self.state.save(state)
+                self._stage(state, "rollback_created")
         if state.rollback_id is None or not await self.engine.exists(state.rollback_id):
             old_image = await self.engine.inspect_image(state.old_image_id)
             spec, primary = build_rollback_spec(
@@ -341,6 +500,7 @@ class UpdaterRunner:
                 image_ref=self.config.image_ref,
                 operation_id=state.operation_id,
                 networks=state.networks,
+                port_bindings=state.port_bindings,
             )
             state.rollback_id = await self.engine.create_container(self.config.container_name, spec)
             self._stage(state, "rollback_created")
@@ -353,6 +513,10 @@ class UpdaterRunner:
             state.rollback_id, timeout=self.config.health_timeout_seconds
         )
         self._stage(state, "rollback_healthy")
+        await self._finish_rollback_outcome(state)
+
+    async def _finish_rollback_outcome(self, state: UpdateState) -> None:
+        await self._stop_lease_keeper()
         await self.coordinator.outcome(
             operation="install",
             outcome="rolled_back",
@@ -363,7 +527,7 @@ class UpdaterRunner:
             available_build=state.desired_build,
             from_build=state.old_build,
             to_build=state.desired_build,
-            detail_code=detail_code,
+            detail_code=state.detail_code or "update_interrupted",
         )
         self._stage(state, "rollback_acknowledged")
         if await self.engine.exists(state.target_id):
@@ -421,6 +585,7 @@ class UpdaterRunner:
         await self._rollback(state, detail_code="update_interrupted")
 
     async def _ack_pre_cutover_failure(self, state: UpdateState, detail_code: str) -> None:
+        await self._stop_lease_keeper()
         await self.coordinator.outcome(
             operation="install",
             outcome="failed",
@@ -435,6 +600,6 @@ class UpdaterRunner:
         )
         self.state.clear()
 
-    def _stage(self, state: UpdateState, stage: str) -> None:
+    def _stage(self, state: UpdateState, stage: UpdateStage) -> None:
         state.stage = stage
         self.state.save(state)

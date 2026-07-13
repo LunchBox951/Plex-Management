@@ -105,8 +105,11 @@ Schema changes on the auto-update train are expand-first and tolerant of unknown
 columns/rows. A destructive rename, type narrowing, constraint tightening, or
 column/table removal must be split across releases: expand and dual-read/write,
 then migrate/backfill and stop old writes, and only contract after the rollback
-horizon has passed. If that guarantee cannot be met, the release must be marked
-manual-update-only and automatic installation refused before replacement.
+horizon has passed. If that guarantee cannot be met, the release must stay off
+moving tags consumed by automatic updates and ship only with documented
+pinned/manual upgrade instructions. Publishing to such a tag is the release
+process's assertion that the N/N-1 rule holds; this first version does not define
+or enforce a per-image compatibility flag in the updater.
 
 ## Consequences
 
@@ -119,7 +122,7 @@ manual-update-only and automatic installation refused before replacement.
   interrupted-stage recovery require dedicated tests.
 - Automatic update rollback restores application bytes and container
   configuration, not old database bytes. The N/N-1 migration compatibility rule
-  becomes a release gate.
+  becomes a release-process requirement for every moving automatic-update tag.
 - Opting in adds a Docker-socket-bearing container. Operators who do not accept
   that authority can leave the profile disabled and update with normal Compose
   commands.

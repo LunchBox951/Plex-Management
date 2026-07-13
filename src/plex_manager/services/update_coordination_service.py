@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -89,7 +90,7 @@ class MaintenanceDrainingError(RuntimeError):
 
 
 class MaintenanceLeaseLostError(RuntimeError):
-    """Raised after work returns if its renewable lease was lost."""
+    """Raised when work is cancelled because its renewable lease was lost."""
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,7 @@ class UpdateCoordinationService:
         current_digest: str | None | _UnsetValue = _UNSET,
         available_build: str | None | _UnsetValue = _UNSET,
         available_digest: str | None | _UnsetValue = _UNSET,
+        preserve_action: bool = False,
     ) -> bool:
         """CAS-acknowledge a non-install action such as an image check."""
         error_code = _bounded_code(error_code, "error_code")
@@ -217,6 +219,7 @@ class UpdateCoordinationService:
                 result=result.value,
                 error_code=error_code,
                 image_values=image_values,
+                preserve_action=preserve_action,
                 now=self._now(),
             )
             await session.commit()
@@ -261,6 +264,7 @@ class UpdateCoordinationService:
         owner: str = "container-updater",
         ttl: timedelta,
         action_generation: int | None = None,
+        require_idle: bool = False,
     ) -> DrainClaim | None:
         """Claim the exclusive drain; ``ready=False`` means existing work remains."""
         owner = _bounded_code(owner, "owner") or ""
@@ -272,6 +276,7 @@ class UpdateCoordinationService:
                 token_hash=token_hash,
                 owner=owner,
                 action_generation=action_generation,
+                require_idle=require_idle,
                 now=self._now(),
                 ttl=ttl,
             )
@@ -330,6 +335,8 @@ class UpdateCoordinationService:
         to_build: str | None = None,
         current_build: str | None = None,
         current_digest: str | None = None,
+        available_build: str | None = None,
+        available_digest: str | None = None,
     ) -> bool:
         """CAS-record a terminal install outcome and release its drain lease."""
         error_code = _bounded_code(error_code, "error_code")
@@ -337,6 +344,19 @@ class UpdateCoordinationService:
         to_build = _bounded_text(to_build, "to_build")
         current_build = _bounded_text(current_build, "current_build")
         current_digest = _bounded_text(current_digest, "current_digest")
+        available_build = _bounded_text(available_build, "available_build")
+        available_digest = _bounded_text(available_digest, "available_digest")
+        outcome_fingerprint = _outcome_fingerprint(
+            expected_generation=expected_generation,
+            result=result,
+            error_code=error_code,
+            from_build=from_build,
+            to_build=to_build,
+            current_build=current_build,
+            current_digest=current_digest,
+            available_build=available_build,
+            available_digest=available_digest,
+        )
         async with self._sessionmaker() as session:
             acknowledged = await SqlUpdateCoordinationRepository(session).acknowledge_outcome(
                 token_hash=_token_hash(token),
@@ -348,6 +368,7 @@ class UpdateCoordinationService:
                 to_build=to_build,
                 current_build=current_build,
                 current_digest=current_digest,
+                outcome_fingerprint=outcome_fingerprint,
                 now=self._now(),
             )
             await session.commit()
@@ -401,11 +422,29 @@ class UpdateCoordinationService:
 
         held_token = self._held_critical.set(_HeldLease(lease=lease, task=current_task))
         stop = asyncio.Event()
-        renewal = asyncio.create_task(self._renew_until_stopped(lease.token, ttl, interval, stop))
+        lease_lost = asyncio.Event()
+        renewal = asyncio.create_task(
+            self._renew_until_stopped(
+                lease.token,
+                ttl,
+                interval,
+                stop,
+                lease_lost,
+                current_task,
+                lease.expires_at,
+            )
+        )
         body_failed = False
         lease_held = True
         try:
             yield lease
+        except asyncio.CancelledError:
+            body_failed = True
+            if lease_lost.is_set():
+                raise MaintenanceLeaseLostError(
+                    "critical-operation lease expired before completion"
+                ) from None
+            raise
         except BaseException:
             body_failed = True
             raise
@@ -432,6 +471,9 @@ class UpdateCoordinationService:
         ttl: timedelta,
         interval: timedelta,
         stop: asyncio.Event,
+        lease_lost: asyncio.Event,
+        owner_task: asyncio.Task[object] | None,
+        known_expires_at: datetime,
     ) -> bool:
         delay = interval.total_seconds()
         while True:
@@ -441,11 +483,21 @@ class UpdateCoordinationService:
             except TimeoutError:
                 try:
                     if not await self.renew(token, ttl=ttl):
+                        lease_lost.set()
+                        if owner_task is not None:
+                            owner_task.cancel()
                         return False
+                    known_expires_at = self._now() + ttl
+                    delay = interval.total_seconds()
                 except Exception:
                     # The sidecar also needs this database to claim a drain, so a
                     # transient outage is fail-closed. Retry promptly; once the DB
                     # returns, the expiry predicate decides whether ownership held.
+                    if self._now() >= known_expires_at:
+                        lease_lost.set()
+                        if owner_task is not None:
+                            owner_task.cancel()
+                        return False
                     delay = min(delay, 1.0)
 
     def _now(self) -> datetime:
@@ -465,6 +517,33 @@ def _token_hash(token: str) -> str:
     if not token:
         raise ValueError("lease token must not be empty")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _outcome_fingerprint(
+    *,
+    expected_generation: int | None,
+    result: UpdateResult,
+    error_code: str | None,
+    from_build: str | None,
+    to_build: str | None,
+    current_build: str | None,
+    current_digest: str | None,
+    available_build: str | None,
+    available_digest: str | None,
+) -> str:
+    payload = [
+        expected_generation,
+        result.value,
+        error_code,
+        from_build,
+        to_build,
+        current_build,
+        current_digest,
+        available_build,
+        available_digest,
+    ]
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _bounded_code(value: str | None, field: str) -> str | None:

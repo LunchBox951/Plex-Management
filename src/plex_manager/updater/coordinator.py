@@ -34,6 +34,7 @@ class LeaseStatus:
     ready: bool
     lease_seconds: int
     blocker: str | None
+    action_generation: int | None = None
 
 
 def _object(response: httpx.Response) -> dict[str, object]:
@@ -83,8 +84,13 @@ class CoordinatorClient:
     async def _post(self, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
         try:
             response = await self._client.post(path, headers=self._headers, json=body)
-            response.raise_for_status()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            raise CoordinatorError("coordinator_unavailable") from exc
+        if response.status_code == 409:
+            raise CoordinatorError("coordinator_conflict")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
             raise CoordinatorError("coordinator_unavailable") from exc
         return _object(response)
 
@@ -104,19 +110,33 @@ class CoordinatorClient:
             blocker=_optional_string(data.get("blocker")),
         )
 
-    async def claim(self) -> LeaseStatus:
-        data = await self._post("claim")
+    async def claim(
+        self,
+        *,
+        recovery: bool = False,
+        expected_generation: int | None = None,
+    ) -> LeaseStatus:
+        body: dict[str, object] | None = None
+        if recovery:
+            if expected_generation is None:
+                raise CoordinatorError("coordinator_invalid_recovery_generation")
+            body = {"recovery": True, "expected_generation": expected_generation}
+        data = await self._post("claim", body)
         ready, seconds, blocker = self._lease_values(data)
         token = data.get("lease_token")
         if token is not None and (not isinstance(token, str) or not 32 <= len(token) <= 256):
             raise CoordinatorError("coordinator_invalid_response")
         if token is None and ready:
             raise CoordinatorError("coordinator_invalid_response")
+        generation = data.get("action_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise CoordinatorError("coordinator_invalid_response")
         return LeaseStatus(
             lease_token=token,
             ready=ready,
             lease_seconds=seconds,
             blocker=blocker,
+            action_generation=generation,
         )
 
     async def renew(self, lease_token: str) -> LeaseStatus:
