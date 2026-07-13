@@ -36,6 +36,7 @@ import type {
   SettingsUpdate,
   SetupCompleteRequest,
   SetupStatusResponse,
+  UpdateStatusResponse,
 } from './types'
 import {
   LOG_TAIL_POLL_INTERVAL_MS,
@@ -44,6 +45,7 @@ import {
   QUEUE_REALTIME_FLOOR_MS,
   REQUESTS_POLL_INTERVAL_MS,
   REQUESTS_REALTIME_FLOOR_MS,
+  UPDATE_STATUS_POLL_INTERVAL_MS,
   queryKeys,
 } from '../lib/queryClient'
 import { useRealtimeConnected } from '../lib/realtimeState'
@@ -258,6 +260,16 @@ export function useUpdateSettings() {
       // probe cache on PUT /settings (issue #93), so this refetch re-probes
       // the freshly saved credentials, not a stale snapshot.
       void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
+      if (
+        variables.automatic_updates_enabled !== undefined ||
+        variables.automatic_update_timezone !== undefined ||
+        variables.automatic_update_weekdays !== undefined ||
+        variables.automatic_update_window_start !== undefined ||
+        variables.automatic_update_window_end !== undefined ||
+        variables.automatic_update_idle_only !== undefined
+      ) {
+        void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
+      }
     },
   })
 }
@@ -648,6 +660,48 @@ export function useQualityProfile() {
     queryKey: queryKeys.qualityProfile,
     queryFn: async (): Promise<QualityProfileResponse> =>
       unwrap(await client.GET('/api/v1/quality-profile')),
+  })
+}
+
+/* --------------------------------------------------------------- updates -- */
+
+/** Honest updater/coordinator snapshot. SSE drives prompt transitions while a
+ * coarse poll guarantees eventual recovery if a realtime event is missed. */
+export function useUpdateStatus() {
+  return useQuery({
+    queryKey: queryKeys.updateStatus,
+    queryFn: async (): Promise<UpdateStatusResponse> =>
+      unwrap(await client.GET('/api/v1/updates/status')),
+    refetchInterval: UPDATE_STATUS_POLL_INTERVAL_MS,
+  })
+}
+
+/** Ask the sidecar to compare the configured image tag with its remote digest.
+ * The returned snapshot only confirms that the request was accepted. */
+export function useCheckForUpdate() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<UpdateStatusResponse> =>
+      unwrap(await client.POST('/api/v1/updates/check-now')),
+    onSuccess: (data) => {
+      qc.setQueryData(queryKeys.updateStatus, data)
+      void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
+    },
+  })
+}
+
+/** Queue a manual install once critical work is idle. This explicit action
+ * bypasses the automatic schedule window; acceptance is never equated with a
+ * completed container replacement. */
+export function useUpdateWhenReady() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<UpdateStatusResponse> =>
+      unwrap(await client.POST('/api/v1/updates/update-when-ready')),
+    onSuccess: (data) => {
+      qc.setQueryData(queryKeys.updateStatus, data)
+      void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
+    },
   })
 }
 

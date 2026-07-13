@@ -403,6 +403,138 @@ def _publish_key_no_hardlink(key_path: Path, key: bytes) -> bytes:
         # every reap; the deadline bounds the wait.
 
 
+def _probe_hardlink_capability(tmp_name: str) -> bool:
+    """Non-destructively determine whether ``tmp_name``'s filesystem supports
+    hardlinks, WITHOUT ever touching the (possibly invalid) existing final.
+
+    Links ``tmp_name`` to a throwaway probe path -- derived from ``tmp_name``
+    itself, so it is guaranteed fresh and collision-free without a second
+    ``mkstemp`` round trip -- in the same directory. A successful link proves
+    the filesystem supports hardlinks (the probe is then removed; it was only
+    ever a second name for the same, still-untouched tempfile inode). A
+    ``_KEY_LINK_FALLBACK_ERRNOS`` ``OSError`` proves the opposite. Any other
+    ``OSError`` is a genuine failure and propagates uncaught.
+
+    This MUST run, and be resolved, before any reap of the existing final:
+    reaping first and then retrying the real link would make a
+    hardlink-CAPABLE filesystem's retry succeed for the wrong reason (the
+    blocking file is simply gone), silently replacing operator-restored
+    garbage with a fresh key instead of failing loudly.
+    """
+    probe_name = tmp_name + ".hlprobe"
+    try:
+        os.link(tmp_name, probe_name)
+    except OSError as exc:
+        if exc.errno in _KEY_LINK_FALLBACK_ERRNOS:
+            return False
+        raise
+    with contextlib.suppress(OSError):
+        os.unlink(probe_name)
+    return True
+
+
+def _recover_invalid_final_after_link_exists(key_path: Path, tmp_name: str, key: bytes) -> bytes:
+    """Recover from the primary (hardlink) commit's ``FileExistsError`` when the
+    existing final is INVALID (the caller already handles the valid case: adopt
+    it as-is, unchanged).
+
+    ``os.link``'s EEXIST check fires before a filesystem's hardlink-support
+    check, so this same ``FileExistsError`` -- not the
+    ``_KEY_LINK_FALLBACK_ERRNOS`` ``OSError`` -- also occurs on a
+    hardlink-refusing data dir (exFAT/FAT/SMB) whenever ``key_path`` already
+    holds a crashed fallback committer's invalid partial. That masks the
+    ``OSError`` fallback branch that would otherwise route into
+    :func:`_publish_key_no_hardlink`'s lock-guarded, age-gated recovery,
+    forcing a manual ``secret.key`` deletion to unstick a fresh install.
+
+    Recovery here is a lock-guarded, age-gated attempt -- the wait for the
+    lock is bounded by :data:`_PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS`, never
+    unbounded -- and, critically, proves hardlink capability BEFORE ever
+    reaping anything:
+
+    1. Acquire the publish lock (mirroring :func:`_publish_key_no_hardlink`'s
+       own use of it) and call :func:`_probe_hardlink_capability`, which
+       hardlinks the tempfile to a throwaway probe path -- never touching
+       ``key_path`` -- to find out, non-destructively, whether this
+       filesystem supports hardlinks at all.
+    2. If the probe SUCCEEDS, the filesystem is genuinely hardlink-capable, so
+       a crash could never have left a partial final here: the existing
+       invalid file is operator-restored garbage, not a crash artifact, and
+       must never be reaped. Re-check the final (a valid key may have
+       materialized meanwhile) and either adopt it or fail loudly with the
+       corrupt-key error -- exactly as before this recovery path existed
+       (never silently replaced, at any age).
+    3. If the probe raises the hardlink-fallback ``OSError``, this filesystem
+       genuinely refuses hardlinks, so it is now safe to call
+       :func:`_reap_stale_partial_final` (age-gated, validity re-checked
+       immediately before the unlink) and retry the real ``os.link`` once
+       more.
+    4. Release the lock, then act on step 2/3's outcome: adopt/fail loud, or
+       retry the real link (adopting a racer's win on ``FileExistsError``, or
+       delegating to :func:`_publish_key_no_hardlink` on the fallback
+       ``OSError`` -- now unmasked because the blocking destination is gone).
+
+    If the publish lock is already held -- a live commit in progress via
+    either route, OR a crashed holder's leftover from handling this exact
+    invalid final -- this function waits for/reaps it and acquires the lock
+    ITSELF (mirroring :func:`_publish_key_no_hardlink`'s own acquire loop)
+    rather than delegating straight to :func:`_publish_key_no_hardlink`.
+    Delegating on mere lock contention would skip step 1's probe entirely:
+    that function reaps an invalid partial unconditionally once it holds the
+    lock, with no hardlink-capability check at all, so a stale lock alone
+    (e.g. this helper crashed after creating the lock while still deciding
+    what to do about an old invalid ``secret.key``) would let a
+    hardlink-CAPABLE filesystem's operator-restored invalid key be silently
+    reaped and replaced instead of failing loud -- exactly the regression the
+    probe exists to prevent. Winning the lock ourselves guarantees the probe
+    always runs before any reap, no matter how the lock came to be held.
+    """
+    lock_dir = key_path.with_name(key_path.name + _PUBLISH_LOCK_SUFFIX)
+    deadline = time.monotonic() + _PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.mkdir(os.fspath(lock_dir), 0o700)
+            break
+        except FileExistsError:
+            # A live holder is mid-commit (ride it out and adopt its result),
+            # or a crashed one left the lock behind (age-reap it, then retry
+            # acquiring it OURSELVES -- never hand off to
+            # _publish_key_no_hardlink here, which would skip the probe).
+            adopted = _read_valid_key(key_path)  # bounded retry: ride out a live commit
+            if adopted is not None:
+                return adopted
+            _reap_stale_publish_lock(lock_dir)
+            if time.monotonic() >= deadline:
+                raise _unbreakable_publish_lock_error(key_path, lock_dir) from None
+    try:
+        if _probe_hardlink_capability(tmp_name):
+            # Proven hardlink-capable WITHOUT touching the existing final:
+            # a crash can never leave a partial here, so this is genuine
+            # operator-restored garbage -- never reaped, at any age.
+            existing = _read_valid_key(key_path)
+            if existing is not None:
+                return existing
+            raise _corrupt_key_error(key_path)
+        # Proven hardlink-refusing: only now is it safe to reap.
+        _reap_stale_partial_final(key_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(os.fspath(lock_dir))
+    try:
+        os.link(tmp_name, os.fspath(key_path))
+    except FileExistsError:
+        existing = _read_valid_key(key_path)
+        if existing is not None:
+            return existing
+        raise _corrupt_key_error(key_path) from None
+    except OSError as exc:
+        if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
+            raise
+        return _publish_key_no_hardlink(key_path, key)
+    logger.info("generated new encryption key at %s", key_path)
+    return key
+
+
 def _generate_key_file(key_path: Path) -> bytes:
     """Atomically mint the first-run key, or re-read an existing one on a lost race.
 
@@ -416,6 +548,15 @@ def _generate_key_file(key_path: Path) -> bytes:
     orphan the winner's already-cached key and render any data it encrypted
     permanently undecryptable. An existing key is therefore NEVER overwritten.
     The linked file inherits the tempfile's ``0o600`` mode.
+
+    A ``FileExistsError`` with an INVALID existing final is not necessarily a
+    race loss, though: ``os.link``'s EEXIST check fires before a filesystem's
+    hardlink-support check, so a hardlink-refusing data dir raises this same
+    error -- not the fallback ``OSError`` below -- when the final is a crashed
+    fallback committer's partial.
+    :func:`_recover_invalid_final_after_link_exists` routes that case into the
+    same lock-guarded, age-gated recovery the ``OSError`` branch below uses,
+    instead of failing outright (issue #149).
 
     On a filesystem that does not support hardlinks at all (exFAT/FAT/SMB —
     ``os.link`` raises ``OSError`` with an errno in ``_KEY_LINK_FALLBACK_ERRNOS``,
@@ -445,11 +586,15 @@ def _generate_key_file(key_path: Path) -> bytes:
         try:
             os.link(tmp_name, os.fspath(key_path))
         except FileExistsError:
-            # Lost the race: another worker already published the canonical key.
+            # Lost the race: another worker already published the canonical
+            # key -- OR (see _recover_invalid_final_after_link_exists) the
+            # final is a crashed fallback committer's INVALID partial on a
+            # hardlink-refusing filesystem, where this same error fires
+            # because EEXIST is checked before hardlink support (issue #149).
             existing = _read_valid_key(key_path)
-            if existing is None:
-                raise _corrupt_key_error(key_path) from None
-            return existing
+            if existing is not None:
+                return existing
+            return _recover_invalid_final_after_link_exists(key_path, tmp_name, key)
         except OSError as exc:
             if exc.errno not in _KEY_LINK_FALLBACK_ERRNOS:
                 raise
@@ -500,9 +645,13 @@ def ensure_secret_key() -> Fernet:
     hardlink-less filesystem it can be a crashed fallback commit's partial, and
     pre-init no data exists under any key, so the publish path may recover it
     (adopt a racing writer's completed key, or age-reap the stale partial and
-    re-mint). On a hardlink-capable filesystem a crash cannot leave a partial
-    final at all, so an invalid file there still fails loudly with the
-    corrupt-key error via the ``os.link`` route -- never silently replaced.
+    re-mint) -- including when that filesystem's ``os.link`` masks the crash as
+    a ``FileExistsError`` rather than the expected fallback ``OSError``, since
+    EEXIST is checked before hardlink support
+    (:func:`_recover_invalid_final_after_link_exists`, issue #149). On a
+    genuinely hardlink-capable filesystem a crash cannot leave a partial final
+    at all, so an invalid file there still fails loudly with the corrupt-key
+    error -- never silently replaced, at any age.
     """
     global _fernet
     if _fernet is not None:

@@ -55,6 +55,7 @@ _SECRET_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
         "qbittorrent_password",
         "tmdb_api_key",
         "auth_token",
+        "lease_token",
         "token",
         "api_key",
         "password",

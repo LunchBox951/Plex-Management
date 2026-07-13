@@ -287,7 +287,7 @@ export function Spotlight({
     <section
       aria-label="Featured titles"
       aria-roledescription="carousel"
-      className="relative mb-10 h-[440px] w-full overflow-hidden bg-bg"
+      className="relative mb-10 h-[520px] w-full overflow-hidden bg-bg sm:h-[600px] lg:h-[680px]"
       onPointerEnter={() => setPointerInside(true)}
       onPointerLeave={() => setPointerInside(false)}
       onFocusCapture={() => setFocusInside(true)}
@@ -399,11 +399,13 @@ function SpotlightSlide({
       )}
 
       <div
-        className="absolute inset-0 bg-gradient-to-t from-bg via-bg/30 to-transparent"
+        data-testid="spotlight-bottom-fade"
+        className="spotlight-bottom-fade absolute inset-0"
         aria-hidden
       />
       <div
-        className="absolute inset-0 bg-gradient-to-r from-bg via-bg/55 to-transparent"
+        data-testid="spotlight-side-fade"
+        className="spotlight-side-fade absolute inset-0"
         aria-hidden
       />
       <div className="spotlight-radial-scrim absolute inset-0" aria-hidden />

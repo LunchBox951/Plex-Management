@@ -415,3 +415,49 @@ describe('Spotlight — honest CTA behavior', () => {
     expect(screen.queryByRole('region', { name: 'Featured titles' })).not.toBeInTheDocument()
   })
 })
+
+describe('Spotlight — banner size and fade (#275, #276)', () => {
+  it('sizes the banner well beyond the old fixed 440px band, scaling up at wider breakpoints', () => {
+    renderSpotlight()
+    const carousel = screen.getByRole('region', { name: 'Featured titles' })
+
+    // The old implementation pinned every breakpoint to a single h-[440px].
+    // The banner must now be taller everywhere, and grow (not shrink) as the
+    // viewport widens, so the hero reads as prominent before any scroll.
+    expect(carousel.className).not.toMatch(/(?:^|\s)h-\[440px\](?:\s|$)/)
+
+    const heightTokens = [...carousel.className.matchAll(/(?:^|\s)(sm:|lg:)?h-\[(\d+)px\]/g)]
+    expect(heightTokens.length).toBeGreaterThan(0)
+
+    const base = heightTokens.find((token) => token[1] === undefined)
+    const atSm = heightTokens.find((token) => token[1] === 'sm:')
+    const atLg = heightTokens.find((token) => token[1] === 'lg:')
+    expect(base).toBeDefined()
+    expect(Number(base![2])).toBeGreaterThan(440)
+    if (atSm) expect(Number(atSm[2])).toBeGreaterThanOrEqual(Number(base![2]))
+    if (atLg) expect(Number(atLg[2])).toBeGreaterThanOrEqual(Number((atSm ?? base)![2]))
+  })
+
+  it('fades the bottom section smoothly across the whole slide instead of a hard two-stop band', () => {
+    renderSpotlight()
+    const bottomFade = screen.getAllByTestId('spotlight-bottom-fade')[0]!
+
+    // A hard band reads as two color stops (from/to); the honest fix spans the
+    // full slide with a multi-stop eased curve so there is no visible seam.
+    expect(bottomFade.className).not.toMatch(/\bbg-gradient-to-t\b/)
+    expect(bottomFade.className).toMatch(/\bspotlight-bottom-fade\b/)
+    expect(bottomFade.className).toMatch(/\babsolute\b/)
+    expect(bottomFade.className).toMatch(/\binset-0\b/)
+  })
+
+  it('fades the side section smoothly across the whole slide instead of a hard two-stop band', () => {
+    renderSpotlight()
+    const sideFade = screen.getAllByTestId('spotlight-side-fade')[0]!
+
+    // Same banding fix as the bottom fade, applied to the left-side vignette.
+    expect(sideFade.className).not.toMatch(/\bbg-gradient-to-r\b/)
+    expect(sideFade.className).toMatch(/\bspotlight-side-fade\b/)
+    expect(sideFade.className).toMatch(/\babsolute\b/)
+    expect(sideFade.className).toMatch(/\binset-0\b/)
+  })
+})
