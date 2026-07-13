@@ -214,17 +214,22 @@ def _observed_app_key(request: Request, auth: AuthContext, system: SystemSetting
     — the issue #293 finding 3 fix — a cookie-based recovery/break-glass admin.
 
     A recovery session reports ``AuthMethod.api_key`` (it carries the recovery
-    key's admin authority) yet, being a COOKIE credential, sends no ``X-Api-Key``
-    header. Sourcing the baseline from the (absent) header for that admin made the
-    CAS compare the stored key against ``None`` and ALWAYS 409, so a break-glass
+    key's admin authority) yet authenticated by the httpOnly COOKIE, not a header.
+    The pre-fix CAS sourced the baseline from the (absent) header for that admin,
+    compared the stored key against ``None``, and ALWAYS 409'd — a break-glass
     admin could never rotate or revoke the very key they signed in with from the
-    browser — a north-star-#1 (never require a terminal) violation. Keying off the
-    header's PRESENCE (not merely ``auth.method``) is the reliable discriminator:
-    only a genuine header caller has one to compare against.
+    browser (a north-star-#1, never-require-a-terminal violation).
+
+    ``auth.via_api_key_header`` — set at the single place each auth path constructs
+    its context — is the reliable discriminator. Sniffing the header's mere PRESENCE
+    here is NOT (issue #293 round 2): a client or proxy can send a stale/empty
+    ``X-Api-Key`` alongside a valid recovery cookie; ``authenticate_request`` rejects
+    the header and falls back to the cookie (still reporting ``api_key``), so
+    presence-sniffing would adopt the REJECTED value as the baseline and 409 a
+    legitimately cookie-authenticated admin.
     """
-    header = request.headers.get(API_KEY_HEADER_NAME)
-    if auth.method is AuthMethod.api_key and header is not None:
-        return header
+    if auth.method is AuthMethod.api_key and auth.via_api_key_header:
+        return request.headers.get(API_KEY_HEADER_NAME)
     return system.app_api_key
 
 
@@ -232,15 +237,15 @@ def _acting_recovery_session_hash(request: Request, auth: AuthContext) -> str | 
     """Token hash of the acting recovery-cookie session, or ``None`` if not one.
 
     Returns a hash ONLY when the caller authenticated as a break-glass recovery
-    session: ``api_key`` admin authority carried by the httpOnly session cookie, with
-    NO ``X-Api-Key`` header (a recovery session sends none — see ``_observed_app_key``).
-    A header ``X-Api-Key`` caller and a Plex-session admin both yield ``None``. Used to
-    EXEMPT that one session from the rotate bulk-revoke (see below).
+    session: ``api_key`` admin authority that was NOT proven by the ``X-Api-Key``
+    header (``auth.via_api_key_header`` is ``False``) — i.e. the httpOnly session
+    cookie authenticated. A header-authenticated caller and a Plex-session admin both
+    yield ``None``. Used to EXEMPT that one session from the rotate bulk-revoke (see
+    below). Keyed off the AUTHENTICATED credential source, not the header's presence
+    (issue #293 round 2): a stale ``X-Api-Key`` riding alongside the valid recovery
+    cookie must not cost the actor their exemption.
     """
-    if auth.method is not AuthMethod.api_key:
-        return None
-    if request.headers.get(API_KEY_HEADER_NAME) is not None:
-        # A genuine header caller, not a cookie session — nothing to exempt.
+    if auth.method is not AuthMethod.api_key or auth.via_api_key_header:
         return None
     token = request.cookies.get(SESSION_COOKIE_NAME)
     return hash_session_token(token) if token else None

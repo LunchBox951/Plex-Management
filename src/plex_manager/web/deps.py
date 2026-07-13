@@ -252,6 +252,18 @@ class AuthContext:
 
     ``user_*`` is populated only for Plex session auth. The legacy app API key has
     no user identity and remains a recovery/automation credential.
+
+    ``via_api_key_header`` records WHICH credential actually authenticated when
+    ``method`` is ``api_key``: ``True`` iff the presented ``X-Api-Key`` header
+    matched the stored key; ``False`` for a recovery-cookie session (which reports
+    ``api_key`` authority but authenticated by the httpOnly session cookie). The two
+    must be distinguishable by the app-key CAS and the rotate self-exemption, and the
+    header's mere PRESENCE is not a safe discriminator (issue #293 round 2): a client
+    or proxy can send a stale/empty ``X-Api-Key`` alongside a valid recovery cookie —
+    ``authenticate_request`` rejects the header, falls back to the cookie, and still
+    reports ``api_key``, so sniffing the raw header would misattribute the REJECTED
+    value to the authenticated context. Set only at the construction sites that KNOW
+    which credential matched; always ``False`` for ``plex_session``/``dev_bypass``.
     """
 
     method: AuthMethod
@@ -262,6 +274,7 @@ class AuthContext:
     avatar_url: str | None = None
     is_admin: bool = False
     session_expires_at: datetime | None = None
+    via_api_key_header: bool = False
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -923,11 +936,14 @@ async def _session_auth_context(
         # ``/auth/me`` answer and every gate see one consistent api-key context
         # whether the key rode the header or was exchanged for the cookie. CSRF is
         # still enforced above because this IS a cookie credential, unlike the
-        # header path.
+        # header path. ``via_api_key_header=False``: the COOKIE authenticated this
+        # request — any ``X-Api-Key`` header that rode along was already rejected
+        # upstream and must not be mistaken for the credential (issue #293 round 2).
         return AuthContext(
             method=AuthMethod.api_key,
             is_admin=True,
             session_expires_at=expires_at,
+            via_api_key_header=False,
         )
     user = await session.get(User, auth_session.user_id)
     if user is None:
@@ -964,7 +980,11 @@ async def authenticate_request(
     system = await load_system_settings(session)
     expected = system.app_api_key if system is not None else None
     if api_key_matches(provided_api_key, expected):
-        return AuthContext(method=AuthMethod.api_key, is_admin=True)
+        # The header credential itself authenticated — record that explicitly. A
+        # REJECTED header (stale/empty, e.g. sent by a proxy alongside a valid
+        # recovery cookie) falls through to the session path below, whose recovery
+        # branch reports ``api_key`` with ``via_api_key_header=False``.
+        return AuthContext(method=AuthMethod.api_key, is_admin=True, via_api_key_header=True)
     return await _session_auth_context(request, session, enforce_csrf=enforce_csrf)
 
 

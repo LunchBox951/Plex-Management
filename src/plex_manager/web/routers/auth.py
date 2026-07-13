@@ -195,7 +195,12 @@ async def exchange_api_key_endpoint(
                 hint="Check the recovery key from Settings → Access, then try again.",
             )
         await _issue_browser_session(session, response, request=request, user_id=None)
-    return _me_response(AuthContext(method=AuthMethod.api_key, is_admin=True))
+    # ``via_api_key_header=True``: the header itself authenticated this exchange (the
+    # cookie it just minted has authenticated nothing yet). Later requests ride the
+    # cookie and get ``False`` from ``_session_auth_context``.
+    return _me_response(
+        AuthContext(method=AuthMethod.api_key, is_admin=True, via_api_key_header=True)
+    )
 
 
 @router.get("/me")

@@ -2807,10 +2807,11 @@ async def test_rotate_app_key_cas_returns_409_when_stored_key_already_advanced(
 
     # The racing second request already passed require_api_key against the old key.
     # ``require_api_key`` now returns an ``AuthContext`` (was ``None``); the stale
-    # racer authenticated via the static key, so mirror that method here so the
-    # rotate handler takes its api-key CAS path and the guard sees an admin.
+    # racer authenticated via the static key HEADER, so mirror that method AND
+    # credential source (``via_api_key_header=True``) so the rotate handler takes
+    # the header-baseline CAS path and the guard sees an admin.
     app.dependency_overrides[require_api_key] = lambda: AuthContext(
-        method=AuthMethod.api_key, is_admin=True
+        method=AuthMethod.api_key, is_admin=True, via_api_key_header=True
     )
     try:
         stale = await client.post(
@@ -3607,6 +3608,74 @@ async def test_rotate_via_recovery_cookie_keeps_actor_and_revokes_other_recovery
     # … while the revoked bystander recovery cookie no longer authenticates.
     locked_out = await client.get("/api/v1/settings", cookies=other_cookies)
     assert locked_out.status_code == 401
+
+
+async def test_rotate_via_recovery_cookie_with_stale_header_succeeds_and_keeps_actor(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A recovery-cookie admin whose client/proxy ALSO sends a stale ``X-Api-Key``
+    header can still rotate, and keeps the actor exemption (issue #293 round 2).
+
+    ``authenticate_request`` rejects the stale header and falls back to the cookie,
+    still reporting ``api_key`` auth. The pre-fix CAS keyed off the header's mere
+    PRESENCE, so it adopted the REJECTED value as its baseline and 409'd
+    (``app_key_changed``) — and the actor self-exemption, using the same heuristic,
+    treated the actor as a header caller and revoked their session. Keying both off
+    ``AuthContext.via_api_key_header`` (the credential that actually authenticated)
+    fixes both: the rotate succeeds and the actor's session survives while other
+    recovery sessions are swept.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    actor_cookies, actor_csrf = await _recovery_session_cookies(app, tag="stale-actor")
+    await _recovery_session_cookies(app, tag="stale-other")
+
+    rotate = await client.post(
+        "/api/v1/settings/app-key/rotate",
+        cookies=actor_cookies,
+        headers={**actor_csrf, "X-Api-Key": "stale-or-mistyped-key"},
+    )
+
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key != _API_KEY
+
+    # The cookie authenticated, so the actor exemption still applies: the actor's
+    # session survives, the bystander recovery session is revoked.
+    assert await _recovery_session_revoked(sessionmaker_, tag="stale-actor") is False
+    assert await _recovery_session_revoked(sessionmaker_, tag="stale-other") is True
+    still_valid = await client.get("/api/v1/settings", cookies=actor_cookies)
+    assert still_valid.status_code == 200
+
+
+async def test_revoke_via_recovery_cookie_with_stale_header_succeeds(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The DELETE (revoke) CAS shares ``_observed_app_key``: a stale ``X-Api-Key``
+    riding alongside the authenticated recovery cookie must not 409 the revoke
+    either (issue #293 round 2). The actor's session is still swept — revoke has no
+    exemption (there is no new key to hand back)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _recovery_session_cookies(app, tag="stale-revoker")
+
+    revoke = await client.delete(
+        "/api/v1/settings/app-key",
+        cookies=cookies,
+        headers={**csrf, "X-Api-Key": "stale-or-mistyped-key"},
+    )
+
+    assert revoke.status_code == 204
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+    # No exemption on revoke: the actor's own recovery session was retired too.
+    assert await _recovery_session_states(sessionmaker_) == [True]
 
 
 async def test_rotate_via_plex_session_still_revokes_every_recovery_session(
