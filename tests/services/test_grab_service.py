@@ -1945,6 +1945,154 @@ async def test_grab_ignores_the_parent_rollups_terminal_status_for_tv(
     assert by_season[2] is RequestStatus.downloading  # the due sibling actually moved
 
 
+@pytest.mark.parametrize(
+    ("parent_status", "season_status"),
+    [
+        # Every tracked season genuinely settled the same way (no finalizing
+        # sibling anywhere) -- the rollup can ONLY fold to these parent values
+        # when every season already matches, so the specific season being
+        # grabbed here is never a "due sibling hidden behind a finalizing
+        # parent" (issue #265's one carve-out is `completed`-only).
+        (RequestStatus.evicted, RequestStatus.evicted),
+        (RequestStatus.available, RequestStatus.available),
+        (RequestStatus.failed, RequestStatus.failed),
+        (RequestStatus.cancelled, RequestStatus.cancelled),
+    ],
+)
+async def test_grab_rejects_a_wholly_settled_tv_row_and_adds_nothing(
+    sessionmaker_: SessionMaker,
+    parent_status: RequestStatus,
+    season_status: RequestStatus,
+) -> None:
+    """Senior-review regression (issue #287): the TV bypass added for issues
+    #265/#272 must not swallow the ORIGINAL guarantee for a wholly-settled/
+    terminal TV row (no season anywhere finalizing) -- e.g. every season
+    `evicted`/`available`/`failed`/`cancelled`. Before this fix, bypassing the
+    coarse gate for ALL TV requests let a stale, fully-settled row reach
+    `qbt.add()` unrejected (e.g. grabbing an old evicted row's season after a
+    fresh re-request already owns the `uq_media_requests_active` slot would only
+    fail AFTER the client already created an untracked torrent). The up-front
+    gate must still refuse before anything reaches the client."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=713,
+            media_type=MediaType.tv,
+            title="Wholly Settled Show",
+            status=parent_status,
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(media_request_id=show.id, season_number=1, status=season_status)
+        session.add(season_1)
+        await session.commit()
+        show_id = show.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(RequestNotActiveError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored_tv(_HASH, "Wholly.Settled.Show.S01.1080p.WEB-DL.x264-GROUP"),
+                request_id=show_id,
+                tmdb_id=713,
+                season=1,
+            )
+    assert qbt.added == []  # refused BEFORE anything reached the client
+
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(Download).where(Download.media_request_id == show_id)))
+            .scalars()
+            .all()
+        )
+    assert rows == []
+
+
+async def test_grab_rejects_a_settled_season_even_while_a_sibling_finalizes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Narrowing companion to ``test_grab_ignores_the_parent_rollups_terminal_status_for_tv``:
+    the TV bypass must key off the SPECIFIC season being grabbed, not merely
+    "some season somewhere is finalizing". Season 1 finalizes (``completed``,
+    winning the parent rollup outright), season 2 is ALREADY ``available`` --
+    genuinely settled, not a due sibling -- so grabbing season 2 must still be
+    refused exactly like it would be if no sibling were finalizing at all."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=714,
+            media_type=MediaType.tv,
+            title="Settled Sibling Show",
+            status=RequestStatus.completed,  # the parent ROLLUP, not a real state
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.completed
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id, season_number=2, status=RequestStatus.available
+        )
+        session.add_all([season_1, season_2])
+        await session.commit()
+        show_id = show.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(RequestNotActiveError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored_tv(_HASH, "Settled.Sibling.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                request_id=show_id,
+                tmdb_id=714,
+                season=2,
+            )
+    assert qbt.added == []  # refused BEFORE anything reached the client
+
+
+async def test_grab_allows_a_failed_season_retry_while_a_sibling_finalizes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Companion to the two tests above: a FAILED season is a first-class retry
+    target (mirrors ``_PACK_TARGET_SEASON_STATUS_VALUES`` and the frontend's
+    ``isSeasonGrabbable``), never settled for grab purposes -- so it must
+    remain grabbable even while a sibling season's ``completed`` status wins
+    the parent rollup outright (issue #265's precedence)."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=715,
+            media_type=MediaType.tv,
+            title="Failed Sibling Show",
+            status=RequestStatus.completed,  # the parent ROLLUP, not a real state
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.completed
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id, season_number=2, status=RequestStatus.failed
+        )
+        session.add_all([season_1, season_2])
+        await session.commit()
+        show_id = show.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            qbt,
+            session,
+            scored=_scored_tv(_HASH, "Failed.Sibling.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=show_id,
+            tmdb_id=715,
+            season=2,
+        )
+    assert record.status == "downloading"
+    assert record.season == 2
+    assert qbt.added != []  # the retry actually reached the client
+
+
 # --------------------------------------------------------------------------- #
 # Codex round-8 finding 2: the lost-grab cleanup removes ONLY torrents this
 # grab genuinely created. qbt.add's 409-already-present branch resolves to a

@@ -106,6 +106,25 @@ _PACK_TARGET_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
         RequestStatus.failed.value,
     }
 )
+# The SPECIFIC season statuses that count as settled/terminal FOR THE UP-FRONT
+# TV COARSE-GATE CARVE-OUT below (issue #287 senior review) -- deliberately
+# excludes ``failed``: a failed season is a first-class retry target, mirroring
+# ``_PACK_TARGET_SEASON_STATUS_VALUES`` and the frontend's
+# ``isSeasonGrabbable`` (its ``seasonStatus === 'failed'`` branch), never
+# settled for grab purposes the way a movie's ``failed`` request is.
+# ``cancelled``/``waiting_for_air_date`` are excluded too, but for a different
+# reason: both already raise unconditionally, above, before this set is ever
+# consulted. What is left -- ``available`` (already fetched), ``completed``
+# (this exact season is itself the one finalizing, nothing further to grab),
+# and ``evicted`` (nothing left on disk for this exact row) -- is genuinely
+# done/settled and must never bypass the coarse gate.
+_SETTLED_TV_SEASON_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        RequestStatus.available.value,
+        RequestStatus.completed.value,
+        RequestStatus.evicted.value,
+    }
+)
 
 
 class NoGrabSourceError(Exception):
@@ -606,25 +625,39 @@ async def grab(
     # ``downloading`` would be rejected by that index — but only AFTER qbt.add had
     # already created an untracked torrent. Refuse up front so nothing is added.
     #
-    # MOVIE-ONLY. ``request.status`` for a TV request is not a real state of its
-    # own -- it is ``season_rollup.rollup_status``'s COMPUTED fold over every
-    # tracked season, a single value standing in for the whole show. That fold's
-    # precedence (issue #265) lets a still-in-flight ``completed`` ("Finalizing")
-    # season win the parent status outright over a genuinely due sibling (e.g.
-    # ``[completed, pending]`` rolls up to ``completed``), and ``completed`` is
-    # ALSO a member of ``TERMINAL_REQUEST_STATUS_VALUES`` (the movie-level "nothing
-    # left to grab" set). Gating a TV grab on that coarse rollup would refuse the
-    # pending sibling's grab with a confusing 409 (issue #272 review) and make
-    # auto-grab silently settle the scope with no visible park -- exactly the
-    # honesty-over-silence and correction-without-a-terminal violations the north
-    # stars forbid. TV instead gates on the SEASON's own observed status just
-    # below (``cancelled`` / ``waiting_for_air_date`` / a stale caller premise),
-    # which is season-precise where the parent rollup never was.
+    # ``request.status`` for a TV request is not a real state of its own -- it is
+    # ``season_rollup.rollup_status``'s COMPUTED fold over every tracked season, a
+    # single value standing in for the whole show. That fold's precedence (issue
+    # #265) lets a still-in-flight ``completed`` ("Finalizing") season win the
+    # parent status outright over a genuinely due sibling (e.g. ``[completed,
+    # pending]`` rolls up to ``completed``), and ``completed`` is ALSO a member of
+    # ``TERMINAL_REQUEST_STATUS_VALUES`` (the movie-level "nothing left to grab"
+    # set). Gating a TV grab on that coarse rollup unconditionally would refuse
+    # the pending sibling's grab with a confusing 409 (issue #272 review) and
+    # make auto-grab silently settle the scope with no visible park -- exactly
+    # the honesty-over-silence and correction-without-a-terminal violations the
+    # north stars forbid. But BYPASSING the coarse gate for every TV request
+    # (issue #287 senior review) over-corrected: a wholly-settled/terminal TV row
+    # (e.g. every season ``evicted``/``available``/``failed``, none finalizing)
+    # would then reach ``qbt.add()`` unrejected, same as a stale/terminal movie
+    # row would -- e.g. grabbing an old evicted TV row's season after a fresh
+    # re-request already owns the ``uq_media_requests_active`` slot only fails
+    # AFTER the torrent is already added. ``completed`` is structurally the ONLY
+    # ``TERMINAL_REQUEST_STATUS_VALUES`` member the fold can ever produce while a
+    # genuinely due season is still present elsewhere (see
+    # ``domain/season_rollup.py``'s precedence docstring: every other terminal
+    # fold branch -- ``available``/``failed``/``evicted``/``cancelled`` -- is only
+    # reached when EVERY tracked season already settled that way, no
+    # precedence-winning season anywhere), so the TV carve-out below narrows to
+    # EXACTLY that one case, and only when the SPECIFIC season being grabbed here
+    # is itself genuinely due (not the finalizing season, nor separately settled)
+    # -- see ``_SETTLED_TV_SEASON_STATUS_VALUES``. Every other terminal parent
+    # value still refuses the grab up front, restoring the original
+    # 409-and-adds-nothing guarantee for a genuinely settled/terminal TV
+    # row/season, exactly like the movie-only gate always has.
     if request_id is not None:
         request = await SqlRequestRepository(session).get(request_id)
         if request is not None:
-            if request.media_type != "tv" and request.status in TERMINAL_REQUEST_STATUS_VALUES:
-                raise RequestNotActiveError(request_id)
             observed_request_status = request.status
             request_media_type = request.media_type
             # Domain-boundary backstop: branch on the request's ACTUAL media
@@ -664,7 +697,21 @@ async def grab(
                     # would download a duplicate of on-disk content the caller
                     # never decided to re-fetch.
                     raise RequestNotActiveError(request_id)
+                if request.status in TERMINAL_REQUEST_STATUS_VALUES and not (
+                    request.status == RequestStatus.completed.value
+                    and observed_season_status not in _SETTLED_TV_SEASON_STATUS_VALUES
+                ):
+                    # The parent rollup is terminal and this is NOT the one
+                    # precedence carve-out (a due sibling hidden behind a
+                    # finalizing season) -- either every season genuinely settled
+                    # this way (available/failed/evicted/cancelled-wide), or this
+                    # exact season is itself settled (available/completed/
+                    # evicted) even though a sibling is finalizing. Nothing here
+                    # is due; refuse up front exactly like the movie gate below.
+                    raise RequestNotActiveError(request_id)
             else:
+                if request.status in TERMINAL_REQUEST_STATUS_VALUES:
+                    raise RequestNotActiveError(request_id)
                 # Non-tv (movie): season/episodes are meaningless -- coerce
                 # rather than trust the caller, so a movie can never spawn a
                 # SeasonRequest row or have its one-active guard scoped to a

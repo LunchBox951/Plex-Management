@@ -479,6 +479,102 @@ describe('TitleDetailModal — tv season selector', () => {
     expect(grab).toBeEnabled()
   })
 
+  it('keeps a failed TV season grabbable when the parent reads completed only because a sibling is finalizing (issue #265/#287)', async () => {
+    // S1 completed (finalizing, still awaiting Plex's confirmation) always wins the
+    // parent rollup outright (season_rollup's precedence), so the show reads
+    // 'completed' -- terminal-looking, but NOT because S2 settled. S2 is genuinely
+    // 'failed' and must stay retryable exactly like it would under any other
+    // non-terminal parent, matching what the backend (grab_service.grab) allows.
+    const created: RequestResponse = {
+      id: 16,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'completed',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'completed' },
+        { season_number: 2, status: 'failed' },
+      ],
+    }
+    const release = {
+      guid: 'g4',
+      indexer: 'Indexer A',
+      quality_name: 'WEBDL-1080p',
+      resolution: '1080p',
+      score: 1000,
+      source: 'WEBDL',
+      title: 'Test.Show.S02.1080p.WEB-DL',
+      seeders: 10,
+      info_hash: 'hash4',
+      covered_seasons: [],
+      target_seasons: [],
+      upgrade_seasons: [],
+      waste_seasons: [],
+      ignored_seasons: [],
+      skipped_seasons: [],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(
+      mutation({
+        accepted: [release],
+        rejected: [],
+        no_acceptable_release: false,
+      } satisfies SearchPreviewResponse),
+    )
+    ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
+    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+
+    const grab = await screen.findByRole('button', { name: /grab/i })
+    expect(grab).toBeEnabled()
+  })
+
+  it('defaults the season picker to a failed season over a finalizing sibling (issue #287)', () => {
+    // Neither 'completed' (S1) nor 'failed' (S2) is grabbable in isolation, but S2
+    // is the season that actually needs attention -- the picker must not silently
+    // default to the finalizing S1 and hide the retry action behind an extra click.
+    const request: RequestResponse = {
+      id: 17,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'completed',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'completed' },
+        { season_number: 2, status: 'failed' },
+      ],
+    }
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
+
+    // Defaults to season 2 (the failed, actually-actionable season) -- never
+    // season 1, the finalizing sibling that merely happens to be listed first.
+    const select = screen.getByLabelText('Season') as HTMLSelectElement
+    expect(select.value).toBe('2')
+    expect(
+      screen.getByText('The request failed. Request it again to restart.'),
+    ).toBeInTheDocument()
+  })
+
   it('previews and arms Grab against the season the create RESOLVED to, not the click-time default (whole-series request, season 1 already in the library)', async () => {
     // "Whole series" stays checked (the default) — no season exists to pick before
     // the request is created, so the click-time default is season 1. The create
@@ -1500,6 +1596,87 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     expect(
       screen.getByText('Your request is queued and will be searched automatically.'),
     ).toBeInTheDocument()
+  })
+
+  it('lets a newly clicked row win over a stale rebind from a previous "Request again" (issue #287)', async () => {
+    // Issue #271 (separate, still open): the modal can stay MOUNTED across a
+    // close, so `titleKey` never changes between two clicks on the SAME title's
+    // duplicate rows. Continuing the scenario above -- the modal already
+    // rebound itself to the fresh row (82) after "Request again" fired on the
+    // settled bound row (81) -- the operator now opens a DIFFERENT existing
+    // Requests row (83, e.g. another user's active request) for the SAME
+    // title. That new click must win outright: the stale rebind must never
+    // keep misdirecting preview/grab/cancel/pin at row 82 once a genuinely new
+    // `boundRequestId` is supplied.
+    const settledRow: RequestResponse = {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'evicted',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const freshRow: RequestResponse = {
+      id: 82,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'pending',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const otherUsersRow: RequestResponse = {
+      id: 83,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const createRequestMock = mutation(freshRow)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    const view = render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    // Rebind to the fresh row, exactly like the test above.
+    expect(screen.getByText('Evicted')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /request again/i }))
+    await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [settledRow, freshRow, otherUsersRow] },
+    })
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByText('Your request is queued and will be searched automatically.'),
+      ).toBeInTheDocument(),
+    )
+
+    // The operator now opens a DIFFERENT row (83) for the same title — the
+    // modal stays mounted (issue #271), so only `boundRequestId` changes.
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={83} />,
+    )
+
+    // The newly clicked row (83, 'downloading') must win — never the stale
+    // rebind (82, 'pending').
+    await waitFor(() => expect(screen.getByText('Downloading')).toBeInTheDocument())
+    expect(
+      screen.queryByText('Your request is queued and will be searched automatically.'),
+    ).not.toBeInTheDocument()
   })
 })
 

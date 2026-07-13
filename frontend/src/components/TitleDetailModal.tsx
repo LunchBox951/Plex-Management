@@ -131,10 +131,24 @@ function queueItemCoversSeason(item: QueueItem, season: number | null): boolean 
   return item.season === season
 }
 
-/** The first non-terminal tracked season, else the first tracked season. */
+/**
+ * The first non-terminal tracked season, else the first tracked season.
+ *
+ * A `failed` season counts as actionable too when ANOTHER season in the list
+ * is `completed` ("Finalizing"): that combination only ever arises from
+ * issue #265's rollup precedence (a finalizing season always wins the parent
+ * fold outright), the exact case `isSeasonGrabbable` below carves out for its
+ * failed-season retry action. Without this, the plain `isGrabbableStatus`
+ * check sees neither `completed` nor `failed` as actionable and defaults the
+ * picker to the finalizing season instead of the one that actually needs a
+ * retry.
+ */
 function firstActionableSeason(seasons: SeasonStatus[] | null): number | null {
   if (!seasons || seasons.length === 0) return null
-  const active = seasons.find((s) => isGrabbableStatus(s.status))
+  const hasFinalizingSibling = seasons.some((s) => s.status === 'completed')
+  const active = seasons.find(
+    (s) => isGrabbableStatus(s.status) || (hasFinalizingSibling && s.status === 'failed'),
+  )
   return (active ?? seasons[0])!.season_number
 }
 
@@ -231,18 +245,35 @@ function isGrabbableStatus(status: string): boolean {
 /**
  * Whether the Grab button should be live for the SELECTED season (or, for a movie,
  * the request itself). A season is grabbable when its own status is non-terminal —
- * OR when it is `failed` but the PARENT request is still non-terminal. The backend
- * gates /queue/grab on the parent, so a failed season under an active (e.g.
- * `partially_available`) show can be re-searched from the UI; without this it would
- * dead-end into "Request again", which dedups straight back to the same failed
- * season (an active show is never re-created), leaving the user unable to retry it.
- * A movie (`season == null` → `seasonStatusFor` returns `request.status`) never
- * enters the failed branch: its failed status equals the parent's terminal one.
+ * OR when it is `failed` but the PARENT request is still non-terminal (or reads
+ * `completed` only because a DIFFERENT season is finalizing, see below). The
+ * backend gates /queue/grab on the parent, so a failed season under an active
+ * (e.g. `partially_available`) show can be re-searched from the UI; without this
+ * it would dead-end into "Request again", which dedups straight back to the same
+ * failed season (an active show is never re-created), leaving the user unable to
+ * retry it. A movie (`season == null` → `seasonStatusFor` returns `request.status`)
+ * never enters the failed branch: its failed status equals the parent's terminal one.
+ *
+ * `request.status === 'completed'` is included alongside `isGrabbableStatus`
+ * (issue #287 senior review, #265/#272 follow-up): a `completed` PARENT rollup
+ * can ONLY arise because a DIFFERENT season is still finalizing (season_rollup's
+ * precedence always lets `completed` win the fold outright) — a genuinely,
+ * wholly-settled show never reads `completed` at the parent level (that fold
+ * only happens per-season). So THIS season being `failed` while the parent is
+ * `completed` still means a sibling is finalizing, never that every season
+ * (this one included) is done; the backend's matching carve-out
+ * (`grab_service.grab`) accepts exactly this shape. Every OTHER terminal parent
+ * value (`available`/`failed`/`evicted`/`cancelled`) is reached only when EVERY
+ * season already settled that way, so those correctly stay excluded.
  */
 function isSeasonGrabbable(request: RequestResponse, season: number | null): boolean {
   const seasonStatus = seasonStatusFor(request, season)
   if (isGrabbableStatus(seasonStatus)) return true
-  return season != null && seasonStatus === 'failed' && isGrabbableStatus(request.status)
+  return (
+    season != null &&
+    seasonStatus === 'failed' &&
+    (isGrabbableStatus(request.status) || request.status === 'completed')
+  )
 }
 
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
@@ -372,6 +403,26 @@ export function TitleDetailModal({
   // modal instance should now be bound to — and reset alongside the rest of the
   // per-title state below so a newly opened title starts unbound again.
   const [reboundRequestId, setReboundRequestId] = useState<number | null>(null)
+  // issue #287 senior review: `reboundRequestId` above must not outlive the
+  // click that made it stale. The modal can stay MOUNTED across a close (issue
+  // #271, separate/still-open) with `titleKey` unchanged, so the effect below
+  // (keyed on `titleKey`) never fires between two clicks on the SAME title's
+  // DIFFERENT duplicate rows -- e.g. rebind from "Request again" on row A (sets
+  // `reboundRequestId` to the fresh row), then the operator opens row C (a
+  // different existing row for the same title, possibly a different user's).
+  // Without this, `liveRequest` above keeps preferring the stale rebind over
+  // the just-clicked `boundRequestId`, misdirecting preview/grab/cancel/pin at
+  // the WRONG row. Tracks the previous PROP value (not the resolved
+  // `effectiveBoundRequestId`) so setting `reboundRequestId` ourselves from a
+  // mutation response never trips this — only a genuinely new `boundRequestId`
+  // supplied by the caller (a new row click) does.
+  const previousBoundRequestId = useRef(boundRequestId)
+  useEffect(() => {
+    if (boundRequestId !== previousBoundRequestId.current) {
+      previousBoundRequestId.current = boundRequestId
+      setReboundRequestId(null)
+    }
+  }, [boundRequestId])
   // Whether the just-created `requestId` is still grabbable. Tracked separately from
   // the id because POST /requests can return a TERMINAL row, and Grab must not arm
   // for it in the window before the /requests poll reveals the live status.
