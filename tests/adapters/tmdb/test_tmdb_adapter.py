@@ -601,12 +601,8 @@ async def test_tv_profile_exposes_genre_and_anime_but_never_people_facets() -> N
             "/3/discover/tv",
             ("with_genres", "18"),
         ),
-        (
-            "movie",
-            RecommendationFacet(metric="director", value_id=525, label="Nolan"),
-            "/3/discover/movie",
-            ("with_crew", "525"),
-        ),
+        # director deliberately absent: it routes through the person-credits
+        # source (job == "Director"), not /discover — see the dedicated tests.
         (
             "movie",
             RecommendationFacet(metric="cast", value_id=287, label="Actor"),
@@ -647,6 +643,107 @@ async def test_discover_recommendations_maps_exact_typed_query(
     assert request.url.params["include_adult"] == "false"
     assert request.url.params["page"] == "1"
     assert all(item.media_type == media_type for item in first.results)
+
+
+DIRECTOR_MOVIE_CREDITS: dict[str, Any] = {
+    "id": 525,
+    "cast": [
+        {
+            "id": 9001,
+            "title": "Acted Only",
+            "release_date": "2001-01-01",
+            "popularity": 99.0,
+            "character": "Cameo",
+        }
+    ],
+    "crew": [
+        {
+            "id": 9100,
+            "title": "Directed Hit",
+            "release_date": "2010-07-15",
+            "popularity": 50.0,
+            "poster_path": "/hit.jpg",
+            "job": "Director",
+            "department": "Directing",
+        },
+        {
+            "id": 9200,
+            "title": "Produced Only",
+            "release_date": "2012-01-01",
+            "popularity": 80.0,
+            "job": "Producer",
+            "department": "Production",
+        },
+        {
+            "id": 9300,
+            "title": "Wrote Only",
+            "release_date": "2014-01-01",
+            "popularity": 70.0,
+            "job": "Writer",
+            "department": "Writing",
+        },
+        {
+            "id": 9400,
+            "title": "Directed Sleeper",
+            "release_date": "2005-05-05",
+            "popularity": 10.0,
+            "job": "Director",
+            "department": "Directing",
+        },
+        {
+            # A duplicate directing credit for the same movie (TMDB data quirk)
+            # must not repeat the tile.
+            "id": 9100,
+            "title": "Directed Hit",
+            "release_date": "2010-07-15",
+            "popularity": 50.0,
+            "job": "Director",
+            "department": "Directing",
+        },
+    ],
+}
+
+
+async def test_director_recommendations_use_directing_credits_only() -> None:
+    """`Directed by X` rows must never include titles X merely produced/wrote.
+
+    TMDB's ``/discover/movie`` ``with_crew`` filter matches ANY crew role, so the
+    honest source is ``/person/{id}/movie_credits`` constrained to
+    ``job == "Director"``.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=DIRECTOR_MOVIE_CREDITS)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    facet = RecommendationFacet(metric="director", value_id=525, label="Nolan")
+    first = await adapter.discover_recommendations("movie", facet)
+    second = await adapter.discover_recommendations("movie", facet)
+
+    assert second is first
+    assert len(calls) == 1
+    assert calls[0].url.path == "/3/person/525/movie_credits"
+    # Only actually-directed titles, deduplicated, popularity-ranked.
+    assert [item.tmdb_id for item in first.results] == [9100, 9400]
+    assert [item.title for item in first.results] == ["Directed Hit", "Directed Sleeper"]
+    assert first.total_results == 2
+    assert all(item.media_type == "movie" for item in first.results)
+
+
+async def test_director_recommendations_pages_beyond_one_are_honestly_empty() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=DIRECTOR_MOVIE_CREDITS)
+
+    adapter = TmdbMetadata(httpx.AsyncClient(transport=httpx.MockTransport(handler)), API_KEY)
+    facet = RecommendationFacet(metric="director", value_id=525, label="Nolan")
+
+    beyond = await adapter.discover_recommendations("movie", facet, page=2)
+
+    assert beyond.results == ()
+    assert beyond.total_results == 2
+    assert beyond.total_pages == 1
 
 
 @pytest.mark.parametrize("metric", ["director", "cast"])

@@ -59,9 +59,12 @@ _PERSONALIZED_ROW_LIMIT = 2
 # subsequent load probes, so the whole history still participates over time.
 _PERSONALIZATION_PROBE_LIMIT = _PERSONALIZED_ROW_LIMIT * 4
 _METRIC_ORDER: tuple[RecommendationMetric, ...] = ("genre", "director", "cast", "anime")
-_ANIME_LIBRARY_STATUSES: frozenset[str] = frozenset(
-    {"completed", "available", "partially_available"}
-)
+# Statuses that honestly support the "<title> is in your library" subtitle:
+# Plex-VERIFIED availability only. ``completed`` is deliberately NOT here — it is
+# the in-flight "Finalizing" state (imported, awaiting Plex confirmation; see the
+# settled-status commentary in ``repositories/requests.py``), so claiming library
+# membership for it would be false until Plex confirms.
+_ANIME_LIBRARY_STATUSES: frozenset[str] = frozenset({"available", "partially_available"})
 
 DiscoverCategory = Literal["trending", "popular", "upcoming", "trending_tv", "popular_tv"]
 

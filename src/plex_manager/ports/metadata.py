@@ -178,6 +178,9 @@ class MetadataPort(Protocol):
 
         TMDB-specific query parameter names remain an adapter concern. Unsupported
         combinations (notably cast/crew filters for TV) must not be sent upstream.
+        A ``director`` facet's results must reflect actual directing credits —
+        callers label these rows "Directed by X", so a role-agnostic crew match
+        would be a dishonest result set.
         """
         raise NotImplementedError
 

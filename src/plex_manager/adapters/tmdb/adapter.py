@@ -127,6 +127,15 @@ def _get_str(fields: Mapping[str, object], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _get_float(fields: Mapping[str, object], key: str) -> float | None:
+    value = fields.get(key)
+    if isinstance(value, bool):  # bool is an int subclass — exclude it
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def _year_from_date(fields: Mapping[str, object], key: str) -> int | None:
     """Extract the leading year from a ``YYYY-MM-DD`` TMDB date string."""
     date_str = _get_str(fields, key)
@@ -471,7 +480,11 @@ class TmdbMetadata:
     async def discover_recommendations(
         self, media_type: MediaKind, facet: RecommendationFacet, page: int = 1
     ) -> MediaPage:
-        """Discover popular titles matching one typed recommendation facet."""
+        """Discover popular titles matching one typed recommendation facet.
+
+        Director rows are sourced from the person's actual directing credits, not
+        ``/discover`` — see ``_directed_movies`` for why.
+        """
         clamped = max(_MIN_PAGE, min(page, _MAX_PAGE))
         value_id = facet.value_id
         if facet.metric == "genre":
@@ -483,7 +496,7 @@ class TmdbMetadata:
                 raise ValueError("director recommendations are unsupported for TV")
             if value_id is None or value_id <= 0:
                 raise ValueError("director recommendations require a positive facet id")
-            facet_param = ("with_crew", str(value_id))
+            return await self._directed_movies(value_id, clamped)
         elif facet.metric == "cast":
             if media_type != "movie":
                 raise ValueError("cast recommendations are unsupported for TV")
@@ -525,6 +538,49 @@ class TmdbMetadata:
             total_pages=_get_int(fields, "total_pages") or 0,
             total_results=_get_int(fields, "total_results") or 0,
             results=tuple(results),
+        )
+        self._recommendation_page_cache.set(cache_key, media_page)
+        return media_page
+
+    async def _directed_movies(self, person_id: int, page: int) -> MediaPage:
+        """Movies the person actually DIRECTED, popularity-ranked.
+
+        ``/discover/movie``'s ``with_crew`` filter matches ANY crew role, so a
+        "Directed by X" row built from it could include titles X only produced or
+        wrote — a dishonest label. ``/person/{id}/movie_credits`` preserves the
+        per-credit ``job``, so filtering to ``job == "Director"`` keeps the copy
+        truthful. The credits endpoint is unpaginated: the full directed list is
+        served as page one and later pages are honestly empty (never a repeat of
+        page one). Adult titles are dropped to mirror ``include_adult=false`` on
+        the discover paths; duplicate credits for one movie collapse to one tile.
+        """
+        cache_key = f"recommendation:movie:director:{person_id}:p{page}"
+        cached = self._recommendation_page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        payload = await self._get(
+            f"/person/{person_id}/movie_credits", {}, not_found_returns_none=False
+        )
+        fields: Mapping[str, object] = payload if payload is not None else {}
+        ranked: list[tuple[float, MediaSearchResult]] = []
+        seen: set[int] = set()
+        for row in _as_sequence(fields.get("crew")):
+            credit = _as_mapping(row)
+            if _get_str(credit, "job") != "Director" or credit.get("adult") is True:
+                continue
+            parsed = self._parse_search_row(credit, "movie")
+            if parsed is None or parsed.tmdb_id in seen:
+                continue
+            seen.add(parsed.tmdb_id)
+            ranked.append((_get_float(credit, "popularity") or 0.0, parsed))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+
+        media_page = MediaPage(
+            page=page,
+            total_pages=1 if ranked else 0,
+            total_results=len(ranked),
+            results=tuple(item for _, item in ranked) if page == 1 else (),
         )
         self._recommendation_page_cache.set(cache_key, media_page)
         return media_page

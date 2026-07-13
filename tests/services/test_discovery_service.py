@@ -367,6 +367,31 @@ async def test_malformed_value_bearing_anime_facet_is_omitted() -> None:
     assert tmdb.recommendation_calls == []
 
 
+async def test_completed_anime_request_never_claims_library_membership() -> None:
+    # ``completed`` is the in-flight Finalizing state (imported, awaiting Plex
+    # confirmation) — see repositories/requests.py. The "is in your library"
+    # subtitle must only fire for Plex-verified availability.
+    anime = RecommendationFacet(metric="anime", value_id=None, label="anime")
+    tmdb = FakeTmdb(
+        trending=[],
+        popular=[],
+        upcoming=[],
+        recommendation_profiles={(90, "movie"): RecommendationProfile(facets=(anime,))},
+        recommendations={("movie", "anime", None): [_recommendation(900)]},
+    )
+
+    feed = await discovery_service.home(
+        tmdb,
+        history=[_seed(90, is_anime=True, status="completed")],
+        user_id=7,
+        load_id=UUID(int=1),
+    )
+
+    personalized = [row for row in feed.rows if row.row_type.startswith("personalized:")]
+    assert personalized[0].title == "Because you watch anime"
+    assert personalized[0].subtitle == "because you requested Seed 90"
+
+
 async def test_seed_is_removed_and_successful_rows_compact_into_positions_two_and_four() -> None:
     first_seed = _seed(30)
     second_seed = _seed(40, is_anime=True, status="available")
