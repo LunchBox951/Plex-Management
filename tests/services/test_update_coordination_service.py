@@ -87,20 +87,20 @@ async def test_check_action_cas_updates_builds_without_drain_lease(
     assert snapshot.drain_owner is None
 
 
-async def test_check_ack_with_omitted_image_fields_preserves_heartbeat_observation(
+async def test_check_ack_with_omitted_image_fields_preserves_previous_observation(
     sessionmaker_: SessionMaker,
 ) -> None:
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
-    generation = await service.request_action(UpdateAction.check)
-    await service.heartbeat(
-        phase=UpdatePhase.checking,
+    assert await service.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
         current_build="build-a",
         current_digest="sha256:a",
         available_build="build-b",
         available_digest="sha256:b",
-        checked=True,
     )
+    generation = await service.request_action(UpdateAction.check)
     assert await service.acknowledge_action(
         expected_generation=generation,
         result=UpdateResult.update_available,
@@ -130,13 +130,13 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
     assert await service.renew("wrong-token", ttl=timedelta(minutes=1)) is False
 
     assert await service.release(critical.token)
-    assert await service.drain_ready(drain.lease.token) is True
+    assert await service.renew_drain_progress(drain.lease.token, ttl=timedelta(minutes=1)) is True
     assert not await service.acknowledge_outcome(
         drain.lease.token,
         expected_generation=generation + 1,
         result=UpdateResult.success,
     )
-    assert await service.drain_ready(drain.lease.token) is True
+    assert await service.renew_drain_progress(drain.lease.token, ttl=timedelta(minutes=1)) is True
 
     assert await service.acknowledge_outcome(
         drain.lease.token,
@@ -452,15 +452,15 @@ async def test_nested_critical_flow_reuses_outer_lease_after_drain_begins(
         concurrent = await asyncio.create_task(service.acquire_critical("eviction"))
         assert concurrent is None
 
-    assert await service.drain_ready(drain.lease.token) is True
+    assert await service.renew_drain_progress(drain.lease.token, ttl=timedelta(minutes=1)) is True
 
 
 async def test_heartbeat_freshness_is_bounded(sessionmaker_: SessionMaker) -> None:
     clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
     service = UpdateCoordinationService(sessionmaker_, clock=clock)
     await service.initialize()
-    await service.heartbeat(phase=UpdatePhase.idle, current_build="build-a")
-    snapshot = await service.snapshot()
+    snapshot = await service.touch_updater(phase=UpdatePhase.idle)
+    assert snapshot is not None
     assert service.updater_available(snapshot, max_age=timedelta(seconds=30))
     clock.advance(timedelta(seconds=31))
     assert not service.updater_available(snapshot, max_age=timedelta(seconds=30))

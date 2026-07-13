@@ -19,7 +19,6 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -116,6 +115,9 @@ from plex_manager.web.routers import setup as setup_router
 from plex_manager.web.routers import updates as updates_router
 from plex_manager.web.spa import mount_spa
 from plex_manager.web.trusted_host import TrustedHostMiddleware
+from plex_manager.web.update_coordinator import (
+    ensure_update_coordinator as _ensure_update_coordinator,
+)
 
 router = APIRouter()
 
@@ -186,23 +188,6 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # the per-cycle search cap keeps the single Prowlarr from being hammered. A
 # constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
-
-
-async def _ensure_update_coordinator(app: FastAPI) -> UpdateCoordinationService:
-    """Return the lifespan coordinator, constructing it for direct unit-test apps."""
-    coordinator = getattr(app.state, "update_coordinator", None)
-    if isinstance(coordinator, UpdateCoordinationService):
-        return coordinator
-    maker_obj = getattr(app.state, "sessionmaker", None)
-    maker = (
-        cast(async_sessionmaker[AsyncSession], maker_obj)
-        if isinstance(maker_obj, async_sessionmaker)
-        else get_sessionmaker()
-    )
-    coordinator = UpdateCoordinationService(maker)
-    await coordinator.initialize()
-    app.state.update_coordinator = coordinator
-    return coordinator
 
 
 async def _watchlist_sync_once(app: FastAPI) -> int:

@@ -198,6 +198,11 @@ class UpdaterRunner:
         eligibility = await self.coordinator.eligibility()
         if eligibility.action == "none":
             return
+        # Eligibility blockers are advisory snapshots; the claim below remains
+        # the atomic race check. Avoid expensive Docker work when the coordinator
+        # already knows an idle-only install cannot currently acquire that claim.
+        if eligibility.action == "install" and eligibility.blocker is not None:
+            return
         try:
             preflight = await self._run_with_check_heartbeat(
                 eligibility.action_generation,
@@ -286,7 +291,6 @@ class UpdaterRunner:
             lease_token=lease_token,
             action_generation=lease.action_generation,
             target_id=cast(str, target["Id"]),
-            target_name=self.config.container_name,
             old_image_id=old_id,
             old_digest=old_digest,
             old_build=old_build,

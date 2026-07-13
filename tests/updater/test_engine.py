@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 
+from plex_manager.updater import engine as engine_module
 from plex_manager.updater.engine import (
     DockerEngine,
     DockerError,
@@ -19,6 +22,12 @@ from plex_manager.updater.engine import (
 IMAGE_REF = "registry.example.test:5443/media/plex-manager:stable"
 IMAGE_ID = "sha256:" + "a" * 64
 DIGEST = "registry.example.test:5443/media/plex-manager@sha256:" + "b" * 64
+
+
+class _StalledPullStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        await asyncio.Event().wait()
+        yield b""  # pragma: no cover - the event never fires
 
 
 async def test_pull_negotiates_api_and_inspects_the_immutable_result() -> None:
@@ -101,7 +110,27 @@ async def test_pull_error_body_becomes_a_bounded_code_without_body_disclosure() 
     assert private_registry_message not in str(caught.value)
 
 
-async def test_stop_omits_grace_override_and_uses_bounded_response_wait() -> None:
+async def test_pull_fails_with_bounded_code_when_progress_stream_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "_PULL_PROGRESS_IDLE_TIMEOUT_SECONDS", 0.01)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"ApiVersion": "1.47"})
+        return httpx.Response(200, stream=_StalledPullStream())
+
+    async with httpx.AsyncClient(
+        base_url="http://docker", transport=httpx.MockTransport(handler)
+    ) as http:
+        engine = DockerEngine("/unused/in-mock.sock", client=http)
+        with pytest.raises(DockerError) as caught:
+            await engine.pull(IMAGE_REF)
+
+    assert caught.value.code == "docker_pull_timeout"
+
+
+async def test_stop_uses_configured_grace_and_bounded_response_wait() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:

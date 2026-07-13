@@ -27,9 +27,9 @@ from plex_manager.db import get_sessionmaker
 from plex_manager.services.update_coordination_service import (
     MaintenanceDrainingError,
     MaintenanceLeaseLostError,
-    UpdateCoordinationService,
 )
 from plex_manager.web.deps import load_system_settings
+from plex_manager.web.update_coordinator import ensure_update_coordinator
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -137,28 +137,18 @@ class CriticalMutationMiddleware:
             return
 
         request_app = scope["app"]
-        coordinator = getattr(request_app.state, "update_coordinator", None)
-        if not isinstance(coordinator, UpdateCoordinationService):
-            maker_obj = getattr(request_app.state, "sessionmaker", None)
-            maker = (
-                cast("async_sessionmaker[AsyncSession]", maker_obj)
-                if isinstance(maker_obj, async_sessionmaker)
-                else get_sessionmaker()
+        try:
+            coordinator = await ensure_update_coordinator(request_app)
+        except Exception:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_coordinator_unavailable",
+                    "message": "A safe mutation lease could not be established.",
+                },
             )
-            coordinator = UpdateCoordinationService(maker)
-            try:
-                await coordinator.initialize()
-            except Exception:
-                response = JSONResponse(
-                    status_code=503,
-                    content={
-                        "detail": "maintenance_coordinator_unavailable",
-                        "message": "A safe mutation lease could not be established.",
-                    },
-                )
-                await response(scope, receive, send)
-                return
-            request_app.state.update_coordinator = coordinator
+            await response(scope, receive, send)
+            return
         response_started = False
 
         async def tracking_send(message: Message) -> None:

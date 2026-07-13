@@ -1575,6 +1575,24 @@ async def test_partial_update_policy_displays_the_effective_utc_timezone(
     assert response.json()["automatic_update_timezone"] == "UTC"
 
 
+async def test_get_settings_degrades_equal_automatic_update_window(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("automatic_update_window_start", "04:30")
+        await store.set("automatic_update_window_end", "04:30")
+        await session.commit()
+
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json()["automatic_update_window_start"] is None
+    assert response.json()["automatic_update_window_end"] is None
+
+
 async def test_put_rejects_out_of_range_operability_settings(
     client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

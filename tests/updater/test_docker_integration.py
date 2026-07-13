@@ -38,7 +38,11 @@ _FIXTURE = Path(__file__).with_name("fixtures")
 _DOCKER_PATH = shutil.which("docker")
 
 
-def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _docker(
+    *args: str,
+    check: bool = True,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess[str]:
     if _DOCKER_PATH is None:  # pragma: no cover - module-level marker skips first
         raise RuntimeError("Docker CLI is unavailable")
     return subprocess.run(  # noqa: S603 -- fixed executable and test-generated arguments only
@@ -46,6 +50,7 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         check=check,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -66,9 +71,6 @@ class _RecordingCoordinator:
         return Eligibility(
             action="install",
             action_generation=1,
-            automatic_enabled=True,
-            window_open=True,
-            idle_only=True,
             blocker=None,
         )
 
@@ -130,6 +132,7 @@ async def test_real_runner_healthy_cutover_preserves_runtime_and_cleans_state(
             "--build-arg",
             "HEALTHY=1",
             str(_FIXTURE),
+            timeout=600,
         )
         _docker("network", "create", primary)
         _docker("network", "create", secondary)
@@ -193,6 +196,7 @@ async def test_real_runner_healthy_cutover_preserves_runtime_and_cleans_state(
             "--build-arg",
             "HEALTHY=1",
             str(_FIXTURE),
+            timeout=600,
         )
         _docker("image", "tag", new_tag, moving_tag)
 
@@ -278,6 +282,7 @@ async def test_real_engine_unhealthy_replacement_rolls_back_preserved_runtime(
             "--build-arg",
             "HEALTHY=1",
             str(_FIXTURE),
+            timeout=600,
         )
         _docker(
             "build",
@@ -289,6 +294,7 @@ async def test_real_engine_unhealthy_replacement_rolls_back_preserved_runtime(
             "--build-arg",
             "HEALTHY=0",
             str(_FIXTURE),
+            timeout=600,
         )
         _docker("network", "create", network)
         _docker("volume", "create", volume)

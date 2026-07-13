@@ -5,7 +5,7 @@ does not know about either table and continues to operate unchanged if a failed
 container update restores its image. Automatic rollback never runs downgrade.
 
 Revision ID: a2c4e6f8b0d1
-Revises: 3d28d05107aa
+Revises: a9c31e72b4f6
 Create Date: 2026-07-12 00:00:00.000000
 """
 
@@ -18,7 +18,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "a2c4e6f8b0d1"
-down_revision: str | None = "3d28d05107aa"
+down_revision: str | None = "a9c31e72b4f6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -59,12 +59,6 @@ def upgrade() -> None:
         sa.CheckConstraint("id = 1", name="ck_update_coordinator_singleton"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "ix_update_coordinator_state_updater_last_seen_at",
-        "update_coordinator_state",
-        ["updater_last_seen_at"],
-        unique=False,
-    )
     op.bulk_insert(
         sa.table(
             "update_coordinator_state",
@@ -101,7 +95,6 @@ def upgrade() -> None:
     op.create_index(
         "ix_maintenance_leases_expires_at", "maintenance_leases", ["expires_at"], unique=False
     )
-    op.create_index("ix_maintenance_leases_kind", "maintenance_leases", ["kind"], unique=False)
     op.create_index(
         "ix_maintenance_leases_kind_expires",
         "maintenance_leases",
@@ -128,11 +121,6 @@ def downgrade() -> None:
     op.drop_index("uq_maintenance_leases_drain", table_name="maintenance_leases")
     op.drop_index("ix_maintenance_leases_token_hash", table_name="maintenance_leases")
     op.drop_index("ix_maintenance_leases_kind_expires", table_name="maintenance_leases")
-    op.drop_index("ix_maintenance_leases_kind", table_name="maintenance_leases")
     op.drop_index("ix_maintenance_leases_expires_at", table_name="maintenance_leases")
     op.drop_table("maintenance_leases")
-    op.drop_index(
-        "ix_update_coordinator_state_updater_last_seen_at",
-        table_name="update_coordinator_state",
-    )
     op.drop_table("update_coordinator_state")

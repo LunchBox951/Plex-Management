@@ -150,36 +150,6 @@ class UpdateCoordinationService:
             await session.commit()
             return snapshot
 
-    async def heartbeat(
-        self,
-        *,
-        phase: UpdatePhase,
-        current_build: str | None = None,
-        current_digest: str | None = None,
-        available_build: str | None = None,
-        available_digest: str | None = None,
-        checked: bool = False,
-    ) -> CoordinatorSnapshot:
-        """Record updater liveness and its latest bounded image observation."""
-        current_build = _bounded_text(current_build, "current_build")
-        current_digest = _bounded_text(current_digest, "current_digest")
-        available_build = _bounded_text(available_build, "available_build")
-        available_digest = _bounded_text(available_digest, "available_digest")
-        now = self._now()
-        async with self._sessionmaker() as session:
-            repo = SqlUpdateCoordinationRepository(session)
-            await repo.heartbeat(
-                now=now,
-                phase=phase.value,
-                current_build=current_build,
-                current_digest=current_digest,
-                available_build=available_build,
-                available_digest=available_digest,
-                checked=checked,
-            )
-            await session.commit()
-        return await self.snapshot()
-
     async def touch_updater(
         self,
         *,
@@ -314,15 +284,6 @@ class UpdateCoordinationService:
             ),
             ready=ready,
         )
-
-    async def drain_ready(self, token: str) -> bool | None:
-        """Return readiness for the exact unexpired drain token, else ``None``."""
-        async with self._sessionmaker() as session:
-            ready = await SqlUpdateCoordinationRepository(session).drain_ready(
-                _token_hash(token), self._now()
-            )
-            await session.commit()
-            return ready
 
     async def renew(self, token: str, *, ttl: timedelta) -> bool:
         """CAS-renew an exact, still-unexpired lease."""

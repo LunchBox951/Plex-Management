@@ -39,6 +39,7 @@ def _compose_config(tmp_path: Path, *, updater: bool) -> dict[str, Any]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     result: object = json.loads(completed.stdout)
     assert isinstance(result, dict)

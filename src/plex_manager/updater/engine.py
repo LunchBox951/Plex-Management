@@ -11,6 +11,8 @@ import httpx
 
 JsonObject = dict[str, Any]
 
+_PULL_PROGRESS_IDLE_TIMEOUT_SECONDS = 300.0
+
 
 class DockerError(RuntimeError):
     """A bounded Docker failure safe to surface as a detail code."""
@@ -146,7 +148,7 @@ class DockerEngine:
     async def pull(self, image_ref: str) -> JsonObject:
         repository, tag = split_tag(image_ref)
         prefix = await self._prefix()
-        pull_timeout = httpx.Timeout(30.0, read=None)
+        pull_timeout = httpx.Timeout(30.0, read=_PULL_PROGRESS_IDLE_TIMEOUT_SECONDS)
         try:
             async with self._client.stream(
                 "POST",
@@ -158,7 +160,15 @@ class DockerEngine:
                     raise DockerError("docker_api_error", status_code=response.status_code)
                 # Pull responses are newline-delimited progress objects. Never log
                 # them: registries may include sensitive authentication detail.
-                async for line in response.aiter_lines():
+                lines = response.aiter_lines()
+                while True:
+                    try:
+                        async with asyncio.timeout(_PULL_PROGRESS_IDLE_TIMEOUT_SECONDS):
+                            line = await anext(lines)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise DockerError("docker_pull_timeout") from exc
                     try:
                         item: object = json.loads(line)
                     except ValueError as exc:
@@ -167,7 +177,9 @@ class DockerEngine:
                         raise DockerError("docker_pull_failed")
         except DockerError:
             raise
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        except httpx.TimeoutException as exc:
+            raise DockerError("docker_pull_timeout") from exc
+        except httpx.HTTPError as exc:
             raise DockerError("docker_unavailable") from exc
         return await self.inspect_image(image_ref)
 
@@ -184,17 +196,14 @@ class DockerEngine:
         self,
         identifier: str,
         *,
-        grace_override: int | None = None,
         request_timeout: float | None = None,
     ) -> None:
-        params = {"t": grace_override} if grace_override is not None else None
         request_options: dict[str, Any] = {}
         if request_timeout is not None:
             request_options["timeout"] = httpx.Timeout(request_timeout)
         await self._request(
             "POST",
             f"/containers/{quote(identifier, safe='')}/stop",
-            params=params,
             expected=(204, 304),
             **request_options,
         )
@@ -246,20 +255,6 @@ class DockerEngine:
         except DockerNotFound:
             return False
         return True
-
-    async def health_status(self, identifier: str) -> str:
-        container = await self.inspect_container(identifier)
-        state = container.get("State")
-        if not isinstance(state, dict):
-            raise DockerError("docker_invalid_container_state")
-        state_data = cast(JsonObject, state)
-        health = state_data.get("Health")
-        if not isinstance(health, dict):
-            raise DockerError("target_healthcheck_missing")
-        status = cast(JsonObject, health).get("Status")
-        if not isinstance(status, str):
-            raise DockerError("target_healthcheck_missing")
-        return status
 
     async def wait_healthy(self, identifier: str, *, timeout: float) -> None:
         loop = asyncio.get_running_loop()

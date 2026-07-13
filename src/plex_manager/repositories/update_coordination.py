@@ -196,33 +196,6 @@ class SqlUpdateCoordinationRepository:
             drain_expires_at=_as_utc(drain.expires_at) if drain is not None else None,
         )
 
-    async def heartbeat(
-        self,
-        *,
-        now: datetime,
-        phase: str,
-        current_build: str | None,
-        current_digest: str | None,
-        available_build: str | None,
-        available_digest: str | None,
-        checked: bool,
-    ) -> None:
-        await self.ensure_state()
-        values: dict[str, object] = {
-            "phase": phase,
-            "current_build": current_build,
-            "current_digest": current_digest,
-            "available_build": available_build,
-            "available_digest": available_digest,
-            "updater_last_seen_at": now,
-            "updated_at": now,
-        }
-        if checked:
-            values["last_checked_at"] = now
-        await self._session.execute(
-            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
-        )
-
     async def touch_updater(
         self,
         *,
@@ -344,14 +317,6 @@ class SqlUpdateCoordinationRepository:
             .values(phase="draining", last_started_at=now, updated_at=now)
         )
         return _lease_record(row), (await self._critical_count()) == 0
-
-    async def drain_ready(self, token_hash: str, now: datetime) -> bool | None:
-        await self._lock()
-        await self._cleanup_expired(now)
-        drain = await self._lease_for_token(token_hash, "drain")
-        if drain is None:
-            return None
-        return (await self._critical_count()) == 0
 
     async def renew(
         self,

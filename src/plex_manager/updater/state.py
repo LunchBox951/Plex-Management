@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, Self, cast, get_args
 
 Operation = Literal["install"]
 UpdateStage = Literal[
@@ -30,26 +30,7 @@ UpdateStage = Literal[
     "rollback_healthy",
     "rollback_acknowledged",
 ]
-_STAGES: frozenset[str] = frozenset(
-    {
-        "prepared",
-        "stop_requested",
-        "old_stopped",
-        "old_disconnected",
-        "candidate_created",
-        "candidate_started",
-        "candidate_healthy",
-        "old_renamed",
-        "candidate_renamed",
-        "outcome_acknowledged",
-        "rollback_requested",
-        "rollback_created",
-        "rollback_networked",
-        "rollback_started",
-        "rollback_healthy",
-        "rollback_acknowledged",
-    }
-)
+_STAGES: frozenset[str] = frozenset(cast(tuple[str, ...], get_args(UpdateStage)))
 _CANDIDATE_STAGES = frozenset(
     {
         "candidate_created",
@@ -92,7 +73,6 @@ class UpdateState:
     lease_token: str
     action_generation: int
     target_id: str
-    target_name: str
     old_image_id: str
     old_digest: str | None
     old_build: str | None
@@ -116,7 +96,6 @@ class UpdateState:
             "stage",
             "lease_token",
             "target_id",
-            "target_name",
             "old_image_id",
             "desired_image_id",
             "desired_digest",
@@ -166,7 +145,6 @@ class UpdateState:
             lease_token=cast(str, data["lease_token"]),
             action_generation=generation,
             target_id=cast(str, data["target_id"]),
-            target_name=cast(str, data["target_name"]),
             old_image_id=cast(str, data["old_image_id"]),
             old_digest=cast(str | None, data.get("old_digest")),
             old_build=cast(str | None, data.get("old_build")),

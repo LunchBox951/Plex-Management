@@ -11,7 +11,7 @@ from alembic.config import Config
 
 from plex_manager.config import get_settings
 
-_PRE_UPDATE_REVISION = "3d28d05107aa"
+_PRE_UPDATE_REVISION = "a9c31e72b4f6"
 
 
 def _run(
@@ -62,6 +62,13 @@ def test_existing_install_gains_seeded_coordinator_and_lease_indexes(
         ).fetchone()
         assert index_sql is not None
         assert "WHERE kind = 'drain'" in str(index_sql[0])
+        indexes = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        assert "ix_update_coordinator_state_updater_last_seen_at" not in indexes
+        assert "ix_maintenance_leases_kind" not in indexes
+        assert "ix_maintenance_leases_kind_expires" in indexes
 
 
 def test_migration_downgrade_drops_only_new_tables(

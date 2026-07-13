@@ -23,9 +23,6 @@ class CoordinatorError(RuntimeError):
 class Eligibility:
     action: Action
     action_generation: int
-    automatic_enabled: bool
-    window_open: bool
-    idle_only: bool
     blocker: str | None
 
 
@@ -100,18 +97,12 @@ class CoordinatorClient:
         action = data.get("action")
         if action not in {"none", "check", "install"}:
             raise CoordinatorError("coordinator_invalid_response")
-        values = tuple(data.get(key) for key in ("automatic_enabled", "window_open", "idle_only"))
-        if not all(isinstance(value, bool) for value in values):
-            raise CoordinatorError("coordinator_invalid_response")
         generation = data.get("action_generation")
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise CoordinatorError("coordinator_invalid_response")
         return Eligibility(
             action=cast(Action, action),
             action_generation=generation,
-            automatic_enabled=cast(bool, values[0]),
-            window_open=cast(bool, values[1]),
-            idle_only=cast(bool, values[2]),
             blocker=_optional_string(data.get("blocker")),
         )
 

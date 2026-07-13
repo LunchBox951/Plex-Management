@@ -56,14 +56,11 @@ def _env(values: object) -> tuple[list[str], dict[str, str]]:
     return ordered, mapping
 
 
-def _candidate_environment(
-    current: JsonObject, old_image: JsonObject, new_image: JsonObject
-) -> list[str]:
+def _candidate_environment(current: JsonObject, new_image: JsonObject) -> list[str]:
     # Inspect exposes only the effective environment, not whether an operator
     # explicitly supplied a value equal to an image default. Preserve every
     # effective value under that ambiguity. Only fixed image-owned metadata is
     # allowed to advance with the new image.
-    del old_image
     current_order, active = _env(current.get("Env"))
     new_order, desired = _env(new_image.get("Env"))
     merged_order = list(new_order)
@@ -334,7 +331,7 @@ def build_candidate_spec(
     new_config = _object(new_image.get("Config") or {}, "docker_new_image_config_missing")
     target_image_id = image_id(new_image)
     current["Image"] = target_image_id
-    current["Env"] = _candidate_environment(current, old_config, new_config)
+    current["Env"] = _candidate_environment(current, new_config)
     current["Labels"] = _labels(
         current,
         old_config,

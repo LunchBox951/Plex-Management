@@ -24,7 +24,6 @@ def _state(*, stage: UpdateStage = "prepared") -> UpdateState:
         lease_token=_LEASE_TOKEN,
         action_generation=7,
         target_id="container-old",
-        target_name="plex-manager",
         old_image_id="sha256:" + "a" * 64,
         old_digest="ghcr.io/example/plex@sha256:" + "a" * 64,
         old_build="build-old",
@@ -53,6 +52,13 @@ def test_state_round_trips_atomically_with_private_permissions(tmp_path: Path) -
 
     store.clear()
     assert store.load() is None
+
+
+def test_legacy_target_name_is_ignored_when_loading_version_one_state() -> None:
+    payload = asdict(_state())
+    payload["target_name"] = "legacy-container-name"
+
+    assert UpdateState.from_json(payload) == _state()
 
 
 def test_failed_atomic_replace_keeps_last_durable_state(

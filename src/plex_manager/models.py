@@ -900,9 +900,7 @@ class UpdateCoordinatorState(Base):
     current_digest: Mapped[str | None] = mapped_column(String(255))
     available_build: Mapped[str | None] = mapped_column(String(255))
     available_digest: Mapped[str | None] = mapped_column(String(255))
-    updater_last_seen_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), index=True
-    )
+    updater_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -945,7 +943,7 @@ class MaintenanceLease(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    kind: Mapped[str] = mapped_column(String(16), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
     owner: Mapped[str] = mapped_column(String(128))
     operation: Mapped[str | None] = mapped_column(String(64))
     action_generation: Mapped[int | None] = mapped_column()

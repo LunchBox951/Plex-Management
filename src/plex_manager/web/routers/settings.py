@@ -20,8 +20,7 @@ import json
 import re
 import secrets
 from datetime import UTC, datetime
-from typing import Annotated, Any, Final, cast
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Annotated, Any, Final
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -38,8 +37,8 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.services.update_policy import (
-    AUTOMATIC_UPDATE_TIMEZONE_DEFAULT,
     UPDATE_POLICY_SETTING_KEYS,
+    resolve_update_policy,
 )
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
@@ -212,30 +211,8 @@ _BOOL_SETTING_DEFAULTS: dict[str, bool] = {
     "watchlist_sync_enabled": WATCHLIST_SYNC_ENABLED_DEFAULT,
 }
 
-_UPDATE_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
-    {
-        "automatic_updates_enabled",
-        "automatic_update_timezone",
-        "automatic_update_weekdays",
-        "automatic_update_window_start",
-        "automatic_update_window_end",
-        "automatic_update_idle_only",
-    }
-)
+_UPDATE_POLICY_FIELDS: Final[frozenset[str]] = frozenset(UPDATE_POLICY_SETTING_KEYS)
 _UPDATE_TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
-
-
-def _parse_update_timezone(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return None
-    try:
-        ZoneInfo(normalized)
-    except (ValueError, ZoneInfoNotFoundError):
-        return None
-    return normalized
 
 
 def _parse_update_time(value: str | None) -> str | None:
@@ -243,22 +220,6 @@ def _parse_update_time(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized if _UPDATE_TIME_RE.fullmatch(normalized) is not None else None
-
-
-def _parse_update_weekdays(value: str | None) -> list[str] | None:
-    if value is None:
-        return None
-    try:
-        parsed: object = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, list) or not parsed:
-        return None
-    items = cast("list[object]", parsed)
-    if not all(isinstance(day, str) and day in AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT for day in items):
-        return None
-    days = [day for day in AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT if day in items]
-    return days if len(days) == len(items) else None
 
 
 def _present_effective(
@@ -380,25 +341,24 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | N
         # default applies at runtime, so unset (None) is the truthful display.
         out[key] = value.strip() if honored else None
 
+    resolved_policy = resolve_update_policy(raw)
+    schedule = resolved_policy.policy.schedule
+    honored = resolved_policy.honored_fields
     stored_update_policy = any(raw.get(key) is not None for key in UPDATE_POLICY_SETTING_KEYS)
-    parsed_timezone = _parse_update_timezone(raw.get("automatic_update_timezone"))
-    out["automatic_update_timezone"] = (
-        parsed_timezone
-        if parsed_timezone is not None
-        else AUTOMATIC_UPDATE_TIMEZONE_DEFAULT
-        if stored_update_policy
+    out["automatic_update_timezone"] = schedule.timezone_name if stored_update_policy else None
+    out["automatic_update_weekdays"] = (
+        [day for day in AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT if day in schedule.weekdays]
+        if "automatic_update_weekdays" in honored
         else None
     )
-    out["automatic_update_weekdays"] = _parse_update_weekdays(raw.get("automatic_update_weekdays"))
-    start = _parse_update_time(raw.get("automatic_update_window_start"))
-    end = _parse_update_time(raw.get("automatic_update_window_end"))
-    # A corrupt equal-time pair would define an empty/always-open window. Both
-    # sides degrade together to the documented 03:00-05:00 default.
-    if start is not None and end is not None and start == end:
-        start = None
-        end = None
-    out["automatic_update_window_start"] = start
-    out["automatic_update_window_end"] = end
+    out["automatic_update_window_start"] = (
+        schedule.window_start.strftime("%H:%M")
+        if "automatic_update_window_start" in honored
+        else None
+    )
+    out["automatic_update_window_end"] = (
+        schedule.window_end.strftime("%H:%M") if "automatic_update_window_end" in honored else None
+    )
     return out
 
 

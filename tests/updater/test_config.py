@@ -66,6 +66,8 @@ def test_from_env_loads_a_fixed_authority_envelope(
         ("PLEX_MANAGER_UPDATER_SECRET_FILE", "relative.secret"),
         ("PLEX_MANAGER_UPDATER_STATE_FILE", "relative-state.json"),
         ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "0"),
+        ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "0.01"),
+        ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "0.999"),
         ("PLEX_MANAGER_UPDATER_REQUEST_TIMEOUT_SECONDS", "3601"),
         ("PLEX_MANAGER_UPDATER_HEALTH_TIMEOUT_SECONDS", "soon"),
     ],
@@ -78,6 +80,13 @@ def test_from_env_rejects_authority_expansion_or_invalid_bounds(
 
     with pytest.raises(UpdaterConfigError):
         UpdaterConfig.from_env()
+
+
+def test_from_env_accepts_minimum_poll_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clean_updater_env(monkeypatch)
+    monkeypatch.setenv("PLEX_MANAGER_UPDATER_POLL_SECONDS", "1")
+
+    assert UpdaterConfig.from_env().poll_seconds == 1.0
 
 
 def test_read_secret_accepts_a_private_file_without_exposing_its_value(

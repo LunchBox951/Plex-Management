@@ -90,9 +90,6 @@ class _InstallCoordinator:
         return Eligibility(
             action="install",
             action_generation=1,
-            automatic_enabled=True,
-            window_open=True,
-            idle_only=True,
             blocker=None,
         )
 
@@ -105,6 +102,15 @@ class _InstallCoordinator:
 
     async def outcome(self, **values: object) -> None:
         self.outcomes.append(values)
+
+
+class _BlockedInstallCoordinator(_InstallCoordinator):
+    async def eligibility(self) -> Eligibility:
+        return Eligibility(
+            action="install",
+            action_generation=1,
+            blocker="active_critical_work",
+        )
 
 
 class _Coordinator:
@@ -135,9 +141,6 @@ class _Coordinator:
         return Eligibility(
             action="install",
             action_generation=1,
-            automatic_enabled=True,
-            window_open=True,
-            idle_only=True,
             blocker=None,
         )
 
@@ -282,10 +285,9 @@ class _Engine:
         self,
         identifier: str,
         *,
-        grace_override: int | None = None,
         request_timeout: float | None = None,
     ) -> None:
-        self.calls.append(("stop", identifier, grace_override, request_timeout))
+        self.calls.append(("stop", identifier, request_timeout))
         self.container(identifier)["State"]["Status"] = "exited"
 
     async def disconnect_network(self, network: str, identifier: str) -> None:
@@ -386,7 +388,6 @@ def _pending(stage: UpdateStage, *, candidate_id: str | None = None) -> UpdateSt
         lease_token="l" * 32,
         action_generation=1,
         target_id="old-container",
-        target_name="plex-manager",
         old_image_id=IMAGE_ID,
         old_digest=DIGEST,
         old_build="build-old",
@@ -436,6 +437,24 @@ async def test_unchanged_image_is_a_check_no_op_without_maintenance_claim(
             "current_build": "build-current",
         }
     ]
+
+
+async def test_blocked_install_defers_before_docker_preflight(tmp_path: Path) -> None:
+    engine = _NoOpEngine()
+    coordinator = _BlockedInstallCoordinator()
+    runner = UpdaterRunner(
+        _config(tmp_path),
+        cast(Any, engine),
+        cast(Any, coordinator),
+        cast(Any, _EmptyState()),
+    )
+
+    await runner.run_once()
+
+    assert engine.pull_calls == 0
+    assert coordinator.heartbeat_calls == 0
+    assert coordinator.outcomes == []
+    assert coordinator.claim_calls == 0
 
 
 async def test_successful_install_recreates_then_acknowledges_before_removing_previous(
@@ -1005,7 +1024,7 @@ async def test_acknowledged_rollback_recovers_after_previous_removal_before_stat
     assert engine.container("plex-manager")["Image"] == IMAGE_ID
 
 
-async def test_configured_stop_timeout_is_preserved_without_engine_grace_override(
+async def test_configured_stop_timeout_bounds_wait_without_overriding_docker_grace(
     tmp_path: Path,
 ) -> None:
     engine = _Engine()
@@ -1020,4 +1039,4 @@ async def test_configured_stop_timeout_is_preserved_without_engine_grace_overrid
     await runner.run_once()
 
     stop_calls = [call for call in engine.calls if call[0] == "stop"]
-    assert stop_calls[0] == ("stop", "old-container", None, 100.0)
+    assert stop_calls[0] == ("stop", "old-container", 100.0)

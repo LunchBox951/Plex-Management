@@ -14,9 +14,11 @@ from sqlalchemy import update
 from plex_manager.config import get_settings
 from plex_manager.models import UpdateCoordinatorState
 from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
     UpdateCoordinationService,
     UpdatePhase,
+    UpdateResult,
 )
 from tests.web.fakes import FakeTmdb, override_adapters
 
@@ -61,7 +63,7 @@ def updater_headers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
 
 
 async def test_status_is_honestly_unavailable_without_a_sidecar(
-    client: httpx.AsyncClient, seed: SeedFn
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/updates/status", headers=_ADMIN)
@@ -71,6 +73,50 @@ async def test_status_is_honestly_unavailable_without_a_sidecar(
     assert body["updater_available"] is False
     assert body["channel"] == "stable"
     assert body["blocker"] == "updater_unavailable"
+    assert isinstance(app.state.update_coordinator, UpdateCoordinationService)
+
+
+async def test_update_route_preserves_coordinator_failure_response(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plex_manager.web.routers import updates as updates_module
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async def fail_coordinator(_app: FastAPI) -> UpdateCoordinationService:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(updates_module, "ensure_update_coordinator", fail_coordinator)
+    response = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "updater_coordinator_unavailable"
+
+
+async def test_mutation_middleware_preserves_coordinator_failure_response(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plex_manager.web import middleware as middleware_module
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async def fail_coordinator(_app: FastAPI) -> UpdateCoordinationService:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(middleware_module, "ensure_update_coordinator", fail_coordinator)
+    response = await client.put(
+        "/api/v1/settings",
+        json={"automatic_updates_enabled": False},
+        headers=_ADMIN,
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "maintenance_coordinator_unavailable",
+        "message": "A safe mutation lease could not be established.",
+    }
 
 
 async def test_public_update_routes_require_admin(client: httpx.AsyncClient, seed: SeedFn) -> None:
@@ -90,6 +136,50 @@ async def test_internal_api_accepts_only_the_compose_secret(
     valid = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
     assert valid.status_code == 200
     assert valid.json()["action"] == "none"
+
+
+async def test_eligibility_touch_reuses_its_returned_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    class CountingCoordinator(UpdateCoordinationService):
+        snapshot_calls = 0
+        touch_calls = 0
+
+        async def snapshot(self) -> CoordinatorSnapshot:
+            self.snapshot_calls += 1
+            return await super().snapshot()
+
+        async def touch_updater(
+            self,
+            *,
+            phase: UpdatePhase | None = None,
+            expected_generation: int | None = None,
+        ) -> CoordinatorSnapshot | None:
+            self.touch_calls += 1
+            return await super().touch_updater(
+                phase=phase,
+                expected_generation=expected_generation,
+            )
+
+    coordinator = CountingCoordinator(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+
+    response = await client.post(
+        "/api/v1/internal/updates/eligibility",
+        headers=updater_headers,
+    )
+
+    assert response.status_code == 200
+    assert coordinator.touch_calls == 1
+    # touch_updater() returns the one snapshot used by eligibility; the router
+    # must not perform a second full snapshot before touching.
+    assert coordinator.snapshot_calls == 1
 
 
 async def test_check_and_claim_flow_is_targetless_and_concurrency_safe(
@@ -402,8 +492,9 @@ async def test_automatic_claim_survives_expiry_for_exact_recovery(
     )
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
-    await coordinator.heartbeat(
-        phase=UpdatePhase.available,
+    assert await coordinator.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
         current_digest="sha256:old",
         available_digest="sha256:new",
     )
@@ -446,7 +537,6 @@ async def test_unknown_coordinator_phase_fails_closed_without_rewrite(
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
-    await coordinator.heartbeat(phase=UpdatePhase.idle)
     async with app.state.sessionmaker() as session:
         await session.execute(
             update(UpdateCoordinatorState)
@@ -489,8 +579,9 @@ async def test_token_bound_progress_reports_install_and_rollback(
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
-    await coordinator.heartbeat(
-        phase=UpdatePhase.available,
+    assert await coordinator.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
         current_digest="sha256:old",
         available_digest="sha256:new",
     )
@@ -534,8 +625,9 @@ async def test_automatic_idle_only_status_matches_claim_blocker(
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
-    await coordinator.heartbeat(
-        phase=UpdatePhase.available,
+    assert await coordinator.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
         current_digest="sha256:old",
         available_digest="sha256:new",
     )

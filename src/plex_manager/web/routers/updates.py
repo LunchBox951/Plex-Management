@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, Request
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.config import Settings, get_settings
-from plex_manager.db import get_session, get_sessionmaker
+from plex_manager.db import get_session
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
     UpdateAction,
@@ -34,6 +34,7 @@ from plex_manager.web.schemas import (
     UpdateResultItem,
     UpdateStatusResponse,
 )
+from plex_manager.web.update_coordinator import ensure_update_coordinator
 from plex_manager.web.updater_auth import require_updater
 
 __all__ = ["internal_router", "router"]
@@ -57,26 +58,14 @@ internal_router = APIRouter(
 
 
 async def _coordinator(request: Request) -> UpdateCoordinationService:
-    value = getattr(request.app.state, "update_coordinator", None)
-    if isinstance(value, UpdateCoordinationService):
-        return value
-    maker_obj = getattr(request.app.state, "sessionmaker", None)
-    maker: async_sessionmaker[AsyncSession] = (
-        cast("async_sessionmaker[AsyncSession]", maker_obj)
-        if isinstance(maker_obj, async_sessionmaker)
-        else get_sessionmaker()
-    )
-    value = UpdateCoordinationService(maker)
     try:
-        await value.initialize()
+        return await ensure_update_coordinator(request.app)
     except Exception as exc:
         raise AppError(
             status_code=503,
             code="updater_coordinator_unavailable",
             message="The update coordinator is not available.",
         ) from exc
-    request.app.state.update_coordinator = value
-    return value
 
 
 def _channel(image: str) -> str:
@@ -247,14 +236,14 @@ async def _eligibility(
     touch: bool,
 ) -> tuple[UpdateEligibilityResponse, CoordinatorSnapshot]:
     coordinator = await _coordinator(request)
-    snapshot = await coordinator.snapshot()
+    if touch:
+        touched = await coordinator.touch_updater()
+        snapshot = touched if touched is not None else await coordinator.snapshot()
+    else:
+        snapshot = await coordinator.snapshot()
     try:
-        phase = UpdatePhase(snapshot.phase)
+        UpdatePhase(snapshot.phase)
     except ValueError:
-        if touch:
-            touched = await coordinator.touch_updater()
-            if touched is not None:
-                snapshot = touched
         policy = await load_update_policy(session)
         now = datetime.now(UTC)
         return (
@@ -269,10 +258,6 @@ async def _eligibility(
             ),
             snapshot,
         )
-    if touch:
-        touched = await coordinator.touch_updater(phase=phase)
-        if touched is not None:
-            snapshot = touched
     policy = await load_update_policy(session)
     now = datetime.now(UTC)
     window_open = policy.schedule.is_open(now)

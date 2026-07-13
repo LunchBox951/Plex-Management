@@ -25,7 +25,13 @@ class UpdaterConfigError(ValueError):
     """The install-time sidecar configuration is unsafe or incomplete."""
 
 
-def _positive_float(name: str, default: float, *, maximum: float = 3600.0) -> float:
+def _positive_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 3600.0,
+) -> float:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
@@ -33,8 +39,9 @@ def _positive_float(name: str, default: float, *, maximum: float = 3600.0) -> fl
         value = float(raw)
     except ValueError as exc:
         raise UpdaterConfigError(f"{name} must be a number") from exc
-    if not 0 < value <= maximum:
-        raise UpdaterConfigError(f"{name} must be greater than zero and at most {maximum:g}")
+    if value <= 0 or value < minimum or value > maximum:
+        lower = f"at least {minimum:g}" if minimum > 0 else "greater than zero"
+        raise UpdaterConfigError(f"{name} must be {lower} and at most {maximum:g}")
     return value
 
 
@@ -102,7 +109,7 @@ class UpdaterConfig:
             coordinator_url=coordinator_url,
             secret_file=secret_file,
             state_file=state_file,
-            poll_seconds=_positive_float("PLEX_MANAGER_UPDATER_POLL_SECONDS", 30.0),
+            poll_seconds=_positive_float("PLEX_MANAGER_UPDATER_POLL_SECONDS", 30.0, minimum=1.0),
             request_timeout_seconds=_positive_float(
                 "PLEX_MANAGER_UPDATER_REQUEST_TIMEOUT_SECONDS", 10.0
             ),
