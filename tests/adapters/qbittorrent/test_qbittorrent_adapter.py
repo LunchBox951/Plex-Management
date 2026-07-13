@@ -919,6 +919,50 @@ async def test_dot_segment_traversal_off_prefix_is_vetoed() -> None:
     assert seen == []
 
 
+async def test_percent_encoded_dot_segment_traversal_off_prefix_is_vetoed() -> None:
+    """A PERCENT-ENCODED ``%2e%2e`` segment must be treated exactly like the
+    literal ``..`` case above: a reverse proxy commonly decodes escapes before
+    routing, so an undecoded match here would let this reach the sibling
+    ``/admin`` backend behind the same proxy."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/%2e%2e/admin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_encoded_slash_traversal_off_prefix_is_vetoed() -> None:
+    """An encoded ``..%2f..%2fadmin`` segment hides an extra path boundary
+    from the raw ``/``-split entirely -- it must fall through to the full
+    veto rather than being read as one harmless path element beneath the
+    trusted prefix."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
 async def test_trusted_source_fetch_forwards_no_stored_credential_headers() -> None:
     """The dedicated source fetch must not carry the qBittorrent session cookie
     or an Authorization header -- only the verbatim query credential Prowlarr
@@ -972,6 +1016,14 @@ def test_is_trusted_source_url_root_prefix_allows_any_path() -> None:
         ("http://127.0.0.1:9696/prowlarrx", False),
         ("http://127.0.0.1:9696", False),  # empty path under a set prefix
         ("http://127.0.0.1:9696/prowlarr/../admin", False),  # dot-segment
+        # percent-encoded dot-segment: a reverse proxy commonly decodes this
+        # before routing, reaching the sibling "/admin" backend just like the
+        # literal ".." case above must not be allowed to.
+        ("http://127.0.0.1:9696/prowlarr/%2e%2e/admin", False),
+        ("http://127.0.0.1:9696/prowlarr/%2E%2E/admin", False),  # uppercase escape
+        # encoded traversal slash: an encoded "/" hides an extra path boundary
+        # from the segment split, so this must not be trusted either.
+        ("http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", False),
         ("http://127.0.0.1:9697/prowlarr/1/download", False),  # different port
         # userinfo before the authority is stripped by ``parsed.hostname``, so
         # this resolves to host ``evil.example`` -- not the trusted host -- and
@@ -982,6 +1034,20 @@ def test_is_trusted_source_url_root_prefix_allows_any_path() -> None:
 def test_is_trusted_source_url_prefix_matrix(url: str, expected: bool) -> None:
     client = _client(trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
     assert client._is_trusted_source_url(url) is expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_trusted_origin_idna_host_normalizes_symmetrically_with_candidates() -> None:
+    """The stored trusted origin and every per-hop candidate origin MUST be
+    derived through the same normalization. ``ServiceUrl.origin`` IDNA-decodes
+    the host to Unicode (via ``httpx.URL.host``), while every candidate hop is
+    normalized with plain ``urlparse`` (punycode ASCII, never decoded) -- had
+    the stored side been taken from ``ServiceUrl.origin`` directly, an
+    IDNA-hostname Prowlarr base would never again match its own downloadUrls."""
+    idna_origin = "http://xn--e1afmkfd.example:9696/prowlarr"
+    client = _client(trusted_source_origin=idna_origin)
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{idna_origin}/1/download?apikey=x"
+    )
 
 
 class _RecordingBackend(httpcore.AsyncNetworkBackend):

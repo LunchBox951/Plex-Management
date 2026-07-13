@@ -497,6 +497,28 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
 
 
+# Segment forms that are ambiguous under percent-decoding: a reverse proxy
+# (the whole premise of a configured path prefix) commonly decodes these
+# before it routes, so "prowlarr/%2e%2e/admin" reaches the sibling "/admin"
+# backend exactly like a literal "prowlarr/../admin" would. Checked against
+# the RAW, casefolded segment text (no decoding performed here) so we never
+# have to reason about *how much* a downstream proxy decodes.
+_AMBIGUOUS_PATH_SEGMENT_FORMS: Final = frozenset({".", "..", "%2e", "%2e.", ".%2e", "%2e%2e"})
+
+
+def _has_ambiguous_path_segment(segments: tuple[str, ...]) -> bool:
+    for part in segments:
+        folded = part.casefold()
+        if folded in _AMBIGUOUS_PATH_SEGMENT_FORMS:
+            return True
+        # An encoded or literal slash/backslash inside one raw segment hides an
+        # extra path boundary from this segment split entirely; a downstream
+        # proxy or the eventual fetch may still honor it as a separator.
+        if "%2f" in folded or "%5c" in folded or "\\" in part:
+            return True
+    return False
+
+
 def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, ...]] | None:
     """Like :func:`_source_origin_triple`, plus the candidate's path segments.
 
@@ -505,19 +527,20 @@ def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, 
     service/credential boundary, so the trusted-source match must include it,
     not just scheme/host/port. Segments are the RAW (undecoded), CASE-SENSITIVE
     path split on ``/`` with empty segments dropped — paths are case-sensitive
-    (unlike host), and comparing raw text keeps ``%2e``/``%2f`` percent-escapes
-    and mixed-case tricks from slipping past the match. A ``.``/``..`` segment
-    is ambiguous (its resolved meaning depends on what the prefix normalizes
-    to) so it is rejected here too: the caller falls through to the full SSRF
-    veto rather than trying to interpret it, mirroring ``ServiceUrl``'s own
-    dot-segment rejection for the configured base itself.
+    (unlike host), and comparing raw text keeps mixed-case tricks from slipping
+    past the match. A literal or percent-encoded ``.``/``..`` segment, or a
+    segment hiding an encoded/literal slash, is ambiguous (its resolved meaning
+    depends on what the reverse proxy normalizes/decodes to) so it is rejected
+    here too: the caller falls through to the full SSRF veto rather than trying
+    to interpret it, mirroring ``ServiceUrl``'s own dot-segment rejection for
+    the configured base itself.
     """
     origin = _source_origin_triple(url)
     if origin is None:
         return None
     path = urlparse(url).path
     segments = tuple(part for part in path.split("/") if part)
-    if any(part in (".", "..") for part in segments):
+    if _has_ambiguous_path_segment(segments):
         return None
     return origin, segments
 
@@ -749,7 +772,14 @@ class QbittorrentClient:
         # prefix, never DNS results, and per hop: a redirect OFF this origin or
         # prefix re-enters the full veto. Parsed through the same canonical
         # ``ServiceUrl`` the base URL itself uses, so the prefix is validated and
-        # normalized identically (dot-segments, trailing slash, etc).
+        # normalized identically (dot-segments, trailing slash, etc). The origin
+        # itself is still derived via ``_source_origin_triple`` (not
+        # ``ServiceUrl.origin``): the latter IDNA-decodes to Unicode via
+        # ``httpx.URL.host``, while every per-hop candidate is normalized with
+        # ``urlparse``, which keeps punycode ASCII — comparing the two would
+        # silently and permanently deny trust for an IDNA-hostname Prowlarr base.
+        # Keeping both sides on ``_source_origin_triple`` preserves the single
+        # normalization the pre-fix code already relied on.
         self._trusted_source_origin: tuple[str, str, int] | None = None
         self._trusted_source_prefix: tuple[str, ...] = ()
         if trusted_source_origin:
@@ -758,7 +788,7 @@ class QbittorrentClient:
             except InvalidServiceUrl:
                 pass
             else:
-                self._trusted_source_origin = trusted_service.origin
+                self._trusted_source_origin = _source_origin_triple(trusted_service.base)
                 self._trusted_source_prefix = tuple(
                     part for part in urlparse(trusted_service.base).path.split("/") if part
                 )
