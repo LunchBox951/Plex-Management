@@ -531,28 +531,62 @@ describe('Status', () => {
     ).toBeInTheDocument()
   })
 
-  it('keeps cached health and disk snapshots visible when a background refetch fails', () => {
+  it('keeps cached snapshots visible on a failed background refetch, but never silently stale', () => {
+    // Stale beats blank — the last good snapshot stays up — but the page must
+    // SAY the probe is failing (north star #3), per query, with its own retry.
+    const healthRefetch = vi.fn()
+    const diskRefetch = vi.fn()
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       data: health(),
       isLoading: false,
       isError: true,
       error: { code: 'unknown_error', message: 'Health refresh failed', status: 0 },
+      refetch: healthRefetch,
     })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({
       data: disk(),
       isLoading: false,
       isError: true,
       error: { code: 'unknown_error', message: 'Disk refresh failed', status: 0 },
+      refetch: diskRefetch,
     })
     ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
 
     render(<Status />, { wrapper: Wrapper })
 
+    // The cached cards are all still on screen…
     expect(screen.getByRole('heading', { level: 3, name: 'plex' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 3, name: 'Reconcile loop' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
+    // …without the blank-view error states (those are for the no-cache case)…
     expect(screen.queryByText("Couldn't load health")).not.toBeInTheDocument()
     expect(screen.queryByText("Couldn't load disk usage")).not.toBeInTheDocument()
+    // …but each failing probe announces its staleness, naming its own error.
+    const healthNotice = screen.getByText(/couldn't refresh health \(Health refresh failed\)/i)
+    expect(healthNotice.closest('[role="status"]')).toHaveClass('text-error')
+    expect(healthNotice.textContent).toMatch(/showing the last known snapshot/i)
+    const diskNotice = screen.getByText(/couldn't refresh disk usage \(Disk refresh failed\)/i)
+    expect(diskNotice.closest('[role="status"]')).toHaveClass('text-error')
+
+    // Each notice's Retry drives ITS query's refetch, not the other's.
+    const retries = screen.getAllByRole('button', { name: /^retry$/i })
+    expect(retries).toHaveLength(2)
+    fireEvent.click(retries[0] as HTMLElement)
+    expect(healthRefetch).toHaveBeenCalledTimes(1)
+    expect(diskRefetch).not.toHaveBeenCalled()
+    fireEvent.click(retries[1] as HTMLElement)
+    expect(diskRefetch).toHaveBeenCalledTimes(1)
+    expect(healthRefetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows no staleness notice while a refetch is merely succeeding', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.queryByText(/couldn't refresh/i)).not.toBeInTheDocument()
   })
 
   it('shows a retry action when the health read fails', () => {

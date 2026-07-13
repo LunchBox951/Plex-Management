@@ -299,6 +299,38 @@ function DiskRootCard({
   )
 }
 
+/** A failed *background* refresh keeps the last good snapshot on screen
+ * (stale beats blank) — but never silently (north star #3): name the failing
+ * probe, show the error, and offer an immediate retry, mirroring Queue's
+ * "reconnecting…" idiom. Rendered only when cached data exists; a failure
+ * with no cache still gets the section's full error state instead. */
+function RefreshFailedNotice({
+  what,
+  message,
+  onRetry,
+}: {
+  what: string
+  message?: string
+  onRetry: () => void
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] text-error"
+    >
+      <span className="size-1.5 shrink-0 rounded-full bg-error" aria-hidden />
+      <span className="min-w-0 [overflow-wrap:anywhere]">
+        Couldn&apos;t refresh {what}
+        {message ? ` (${message})` : ''} — showing the last known snapshot.
+      </span>
+      <Button variant="secondary" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
 /**
  * One operator view answering "is every subsystem healthy, is the reconcile
  * loop running, how full is the disk" — without `docker logs` (ADR-0012,
@@ -380,11 +412,23 @@ export function Status() {
       <section className="flex flex-col gap-[10px]">
         <SectionHeader>Subsystems</SectionHeader>
         {health.data ? (
-          <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2 lg:grid-cols-3">
-            {health.data.subsystems.map((s) => (
-              <SubsystemCard key={s.name} subsystem={s} />
-            ))}
-          </div>
+          <>
+            {/* A failed background poll must not silently freeze the health
+                picture — the cards below cover Background loops too (same
+                query), so this one notice speaks for both sections. */}
+            {health.isError ? (
+              <RefreshFailedNotice
+                what="health"
+                {...(health.error ? { message: health.error.message } : {})}
+                onRetry={() => void health.refetch()}
+              />
+            ) : null}
+            <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2 lg:grid-cols-3">
+              {health.data.subsystems.map((s) => (
+                <SubsystemCard key={s.name} subsystem={s} />
+              ))}
+            </div>
+          </>
         ) : health.isLoading ? (
           <CenteredSpinner label="Checking subsystems…" />
         ) : (
@@ -414,23 +458,35 @@ export function Status() {
       <section className="flex flex-col gap-[10px]">
         <SectionHeader>Disk</SectionHeader>
         {disk.data ? (
-          disk.data.roots.length === 0 ? (
-            <AdminEmptyState
-              title="No library root configured"
-              message="Set a Movies or TV library folder in Settings to see disk usage."
-            />
-          ) : (
-            <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
-              {disk.data.roots.map((r) => (
-                <DiskRootCard
-                  key={r.root}
-                  root={r}
-                  thresholdPercent={thresholdPercent}
-                  targetPercent={targetPercent}
-                />
-              ))}
-            </div>
-          )
+          <>
+            {/* Same honesty rule as health: a stale gauge (and stale eviction
+                candidates) must say it's stale, or a filling disk looks fine
+                right up until it isn't. */}
+            {disk.isError ? (
+              <RefreshFailedNotice
+                what="disk usage"
+                {...(disk.error ? { message: disk.error.message } : {})}
+                onRetry={() => void disk.refetch()}
+              />
+            ) : null}
+            {disk.data.roots.length === 0 ? (
+              <AdminEmptyState
+                title="No library root configured"
+                message="Set a Movies or TV library folder in Settings to see disk usage."
+              />
+            ) : (
+              <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
+                {disk.data.roots.map((r) => (
+                  <DiskRootCard
+                    key={r.root}
+                    root={r}
+                    thresholdPercent={thresholdPercent}
+                    targetPercent={targetPercent}
+                  />
+                ))}
+              </div>
+            )}
+          </>
         ) : disk.isLoading ? (
           <CenteredSpinner label="Reading disk usage…" />
         ) : (
