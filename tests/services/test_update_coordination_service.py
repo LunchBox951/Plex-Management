@@ -519,13 +519,17 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    # The clock is frozen (never advanced) so lease expiry -- which is decided
+    # by comparing the DB row's expires_at to this clock's "now" -- can never
+    # be reached, regardless of how long a stalled renew task takes to run
+    # under a loaded CI runner (see #311). This makes expiry impossible by
+    # construction rather than merely unlikely. Renewal actually firing is
+    # still proven independently via the spy below, not inferred from
+    # wall-clock survival.
+    clock = MutableClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
     await service.initialize()
 
-    # The lease TTL is generous relative to renew_every and to the body's sleep
-    # so a stalled renew task under a loaded CI runner cannot let the TTL expire
-    # mid-body (see #311). Renewal actually firing is asserted via observed
-    # events below, not inferred from wall-clock survival alone.
     original_renew = service.renew
     renewals = 0
 
@@ -540,7 +544,7 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
 
     async with service.critical_operation(
         "import",
-        ttl=timedelta(seconds=5),
+        ttl=timedelta(milliseconds=180),
         renew_every=timedelta(milliseconds=40),
     ):
         # This independent write proves the context did not retain its acquisition
