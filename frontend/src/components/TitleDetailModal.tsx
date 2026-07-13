@@ -24,7 +24,7 @@ import type {
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { PLEX_WEB_APP_URL } from '../lib/plex'
-import { requestStatus, type StatusPresentation } from '../lib/status'
+import { isMarkFailableStatus, requestStatus, type StatusPresentation } from '../lib/status'
 import { Dialog, DialogClose, DialogTitle } from './ui/Dialog'
 import { ReleaseList } from './ReleaseList'
 import { Button } from './ui/Button'
@@ -534,7 +534,14 @@ export function TitleDetailModal({
   const reportTarget = reportFor
     ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
     : null
-  const reportActionable = reportTarget !== null && reportTarget.status !== 'importing'
+  // "Report a problem" drives the identical `mark_failed` mutation Queue.tsx's
+  // Mark failed/Blocklist buttons do (see `runReport` below), so it is gated on
+  // the SAME positive allowlist (`isMarkFailableStatus`, issue #205) rather than
+  // a denylist -- an unrecognized queue-item status (a future backend state
+  // this bundle predates, or corrupt/legacy data) is absent from the allowlist
+  // and therefore fails CLOSED instead of exposing a control that would just
+  // 409 (or worse, silently no-op on a state the backend never expected).
+  const reportActionable = reportTarget !== null && isMarkFailableStatus(reportTarget.status)
 
   useEffect(() => {
     if (reportFor && !reportActionable) {
@@ -861,16 +868,22 @@ export function TitleDetailModal({
   )
 
   // The report button only makes sense when there's a real download to act on,
-  // AND when mark-failed is a legal move. During the import copy/scan window the
-  // download sits in 'importing' (raw DownloadState) while its owning request still
-  // reads 'downloading'; the state machine only allows Importing -> Imported/
-  // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
-  // Don't offer an action that can't succeed — once the import lands the title
-  // re-renders as completed or import_blocked, where the correction paths reappear.
-  // Every correction verb below is admin-only server-side (`require_admin`), so
-  // each button is built only for admins — a shared user gets the request-only
+  // AND when mark-failed is a legal move — `isMarkFailableStatus` (issue #205),
+  // the SAME positive allowlist Queue.tsx's own Mark failed/Blocklist buttons
+  // use, since this button drives the identical `mark_failed` mutation. During
+  // the import copy/scan window the download sits in 'importing' (raw
+  // DownloadState) while its owning request still reads 'downloading'; the
+  // state machine only allows Importing -> Imported/ImportBlocked, so a
+  // mark-failed there always 409s (invalid_state_transition) — 'importing' is
+  // correctly absent from the allowlist. Don't offer an action that can't
+  // succeed — once the import lands the title re-renders as completed or
+  // import_blocked, where the correction paths reappear. An unrecognized
+  // status (future backend state, or corrupt/legacy data) is likewise absent
+  // from the allowlist and fails CLOSED, not just 'importing'. Every
+  // correction verb below is admin-only server-side (`require_admin`), so each
+  // button is built only for admins — a shared user gets the request-only
   // experience (Request / Request again + honest status), never a 403 machine.
-  const canReport = isAdmin && queueItem !== null && queueItem.status !== 'importing'
+  const canReport = isAdmin && queueItem !== null && isMarkFailableStatus(queueItem.status)
   const reportButton =
     canReport && queueItem ? (
       <Button variant="secondary" onClick={() => setReportFor({ downloadId: queueItem.id })}>

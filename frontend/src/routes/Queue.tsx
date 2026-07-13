@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useImportDownload, useMarkFailed, useQueue, useRelocateDownload } from '../api/hooks'
-import type { DownloadStateValue, QueueItem } from '../api/types'
+import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
-import { downloadStatus, INTENT_CLASSES } from '../lib/status'
+import { downloadStatus, INTENT_CLASSES, isMarkFailableStatus } from '../lib/status'
 import type { ApiError } from '../lib/errors'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
@@ -33,39 +33,10 @@ function isRelocatable(item: QueueItem): boolean {
   return item.status === 'import_blocked' && (item.failed_reason ?? '').startsWith(PATH_NOT_VISIBLE_REASON_PREFIX)
 }
 
-/**
- * The download states Mark failed / Blocklist & fail can act on without a 409:
- * every state that legally reaches `FailedPending` per the backend's
- * `TRANSITIONS` graph (`domain/state_machine.py`) -- `downloading`,
- * `metadata_fetching`, `import_pending`, `import_blocked`, `client_missing` --
- * PLUS `failed_pending` itself. That last one is not a `TRANSITIONS` edge (a
- * state can't transition to itself there) but `queue_service.mark_failed`
- * special-cases it as an "adopt": an operator call on an already-`failed_pending`
- * row (a stranded prior attempt, or one a reconcile cycle just detected) re-stamps
- * it with the fresh blocklist/remove_torrent flags instead of 409ing, so it is a
- * genuinely legal, backend-accepted operator action -- omitting it here would
- * violate "known legal actions remain available" for a real, reachable queue row.
- * `searching` and `importing` have no such edge or adopt path (mid-search / mid-import
- * can't be operator-failed) and are correctly excluded.
- *
- * Positive allowlist (issue #205), not a terminal denylist: a runtime-unknown
- * status (a future backend state this bundle predates, or corrupt/legacy data)
- * is absent from the set and fails CLOSED (no buttons shown), mirroring the
- * authoritative backend guard rather than merely excluding the one denylisted
- * `importing` value the old code checked.
- */
-const MARK_FAILABLE = new Set<DownloadStateValue>([
-  'downloading',
-  'metadata_fetching',
-  'import_pending',
-  'import_blocked',
-  'client_missing',
-  'failed_pending',
-])
-
-function canMarkFailedStatus(status: string): boolean {
-  return MARK_FAILABLE.has(status as DownloadStateValue)
-}
+// Mark failed / Blocklist & fail eligibility lives in `lib/status.ts`
+// (`isMarkFailableStatus`) -- shared with TitleDetailModal's report-a-problem
+// dialog, which drives the identical `mark_failed` mutation, so the two
+// surfaces can never gate the same backend call on two different sets.
 
 /**
  * tv only: "S02E05" (a single episode), "S02E05-E07" (a multi-episode file) or
@@ -158,7 +129,7 @@ export function Queue() {
   const items = data?.queue ?? []
   const activeCount = items.filter((item) => isActive(item.status)).length
   const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
-  const pendingActionable = pendingItem !== null && canMarkFailedStatus(pendingItem.status)
+  const pendingActionable = pendingItem !== null && isMarkFailableStatus(pendingItem.status)
 
   useEffect(() => {
     if (pending && !pendingActionable) {
@@ -167,7 +138,7 @@ export function Queue() {
   }, [pending, pendingActionable])
 
   async function runConfirm() {
-    if (!pending || !pendingItem || !canMarkFailedStatus(pendingItem.status)) {
+    if (!pending || !pendingItem || !isMarkFailableStatus(pendingItem.status)) {
       setPending(null)
       return
     }
@@ -329,7 +300,7 @@ function QueueCard({
 }) {
   const presentation = downloadStatus(item.status)
   const showTransferProgress = item.status === 'downloading'
-  const canMarkFailed = canMarkFailedStatus(item.status)
+  const canMarkFailed = isMarkFailableStatus(item.status)
   const progress = Math.min(1, Math.max(0, item.progress ?? 0))
   const pct = Math.round(progress * 100)
   const shortHash = item.torrent_hash.slice(0, 12)

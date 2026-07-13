@@ -284,6 +284,34 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
       expect(screen.queryByText(/Blocklist this release/i)).not.toBeInTheDocument()
     })
   })
+
+  // Issue #205 review follow-up: "Report a problem" drives the SAME `mark_failed`
+  // mutation as Queue.tsx's Mark failed/Blocklist buttons, so it must be gated on
+  // the identical positive allowlist (`isMarkFailableStatus`), not a denylist that
+  // only excluded 'importing'. `searching` has no edge to FailedPending (the
+  // backend would 409 an operator's mark-failed there), and a status this bundle
+  // doesn't recognize at all (a future backend state, or corrupt/legacy data)
+  // must fail CLOSED rather than exposing a control that can't succeed.
+  it('hides "Report a problem" for a download state with no legal path to FailedPending (searching)', () => {
+    setDownloadStatus('searching')
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+  })
+
+  it('hides "Report a problem" for a status this bundle does not recognize (fails closed, not open)', () => {
+    setDownloadStatus('a_future_backend_state' as DownloadStateValue)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
+  })
+
+  it.each(['metadata_fetching', 'import_pending', 'import_blocked', 'client_missing', 'failed_pending'] as const)(
+    'still offers "Report a problem" for the legal mark-failable state %s',
+    (status) => {
+      setDownloadStatus(status)
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+      expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+    },
+  )
 })
 
 describe('TitleDetailModal — movie path is unchanged by the tv season selector', () => {

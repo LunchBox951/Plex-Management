@@ -535,12 +535,13 @@ describe('Queue actions', () => {
     )
   })
 
-  // Issue #205: MARK_FAILABLE is a positive allowlist (the states that legally
-  // reach FailedPending, per domain/state_machine.py's TRANSITIONS, plus the
-  // failed_pending "adopt" path) rather than a terminal denylist that only
-  // excluded `importing`. `searching` has no edge to FailedPending (the backend
-  // would 409 an operator's mark-failed there), so the OLD denylist's fail-open
-  // behavior was itself a latent bug this allowlist fixes.
+  // Issue #205: `isMarkFailableStatus` (lib/status.ts) is a positive allowlist
+  // (the states that legally reach FailedPending, per domain/state_machine.py's
+  // TRANSITIONS, plus the failed_pending "adopt" path) rather than a terminal
+  // denylist that only excluded `importing`. `searching` has no edge to
+  // FailedPending (the backend would 409 an operator's mark-failed there), so
+  // the OLD denylist's fail-open behavior was itself a latent bug this
+  // allowlist fixes.
   it('hides fail actions for a status with no legal path to FailedPending (searching)', () => {
     h.queue = [queueItem({ status: 'searching' })]
 

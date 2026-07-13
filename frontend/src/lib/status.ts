@@ -143,6 +143,45 @@ export function isInFlightRequestStatus(status: string): boolean {
   return IN_FLIGHT_REQUEST_STATUSES.has(status)
 }
 
+/**
+ * The download states Mark failed / Blocklist & fail -- and the title modal's
+ * in-flight "report a problem", which drives the very same `mark_failed`
+ * mutation on a queue download -- can act on without a 409: every state that
+ * legally reaches `FailedPending` per the backend's `TRANSITIONS` graph
+ * (`domain/state_machine.py`) -- `downloading`, `metadata_fetching`,
+ * `import_pending`, `import_blocked`, `client_missing` -- PLUS `failed_pending`
+ * itself. That last one is not a `TRANSITIONS` edge (a state can't transition to
+ * itself there) but `queue_service.mark_failed` special-cases it as an "adopt":
+ * an operator call on an already-`failed_pending` row (a stranded prior attempt,
+ * or one a reconcile cycle just detected) re-stamps it with the fresh
+ * blocklist/remove_torrent flags instead of 409ing, so it is a genuinely legal,
+ * backend-accepted operator action -- omitting it here would violate "known
+ * legal actions remain available" for a real, reachable queue row. `searching`
+ * and `importing` have no such edge or adopt path (mid-search / mid-import
+ * can't be operator-failed) and are correctly excluded.
+ *
+ * Single source of truth for BOTH call sites (Queue.tsx's own Mark
+ * failed/Blocklist buttons and TitleDetailModal's report-a-problem dialog) so
+ * they can never drift onto two different gates for the identical mutation.
+ *
+ * Positive allowlist (issue #205), not a terminal denylist: a runtime-unknown
+ * status (a future backend state this bundle predates, or corrupt/legacy data)
+ * is absent from the set and fails CLOSED (no button/dialog shown), mirroring
+ * the authoritative backend guard rather than a denylist's fail-open default.
+ */
+export const MARK_FAILABLE_STATUSES = new Set<DownloadStateValue>([
+  'downloading',
+  'metadata_fetching',
+  'import_pending',
+  'import_blocked',
+  'client_missing',
+  'failed_pending',
+])
+
+export function isMarkFailableStatus(status: string): boolean {
+  return MARK_FAILABLE_STATUSES.has(status as DownloadStateValue)
+}
+
 /** Tailwind classes per intent (background tint + text + ring), used by StatusBadge. */
 export const INTENT_CLASSES: Record<StatusIntent, string> = {
   searching: 'bg-searching/15 text-searching ring-searching/30',
