@@ -219,7 +219,22 @@ class SqlUpdateCoordinationRepository:
 
     async def request_action(self, action: str, now: datetime) -> int | None:
         state = await self._lock()
+        # Refuse to clobber an update that is already in flight. Two windows both
+        # strand in-flight work if we bump ``action_generation`` here:
+        #   * an active lease phase - the sidecar is mid check/drain/install/
+        #     rollback and carries the current generation on its lease; and
+        #   * a public action already queued but not yet consumed by the sidecar
+        #     (``requested_action != "none"``), e.g. an install awaiting its claim
+        #     while the phase still reads ``available``, or a check awaiting its
+        #     first poll while the phase still reads ``idle``.
+        # In either window a later bump makes the eventual outcome fail its
+        # generation CAS in ``acknowledge_action``/``acknowledge_outcome``: a
+        # successfully replaced container can be left with an unacknowledgeable
+        # updater state file, and a queued install can be silently downgraded to a
+        # check. Reject instead; the service surfaces this as a 409 to the caller.
         if state.phase in {"checking", "draining", "installing", "rollback"}:
+            return None
+        if state.requested_action != "none":
             return None
         generation = state.action_generation + 1
         await self._session.execute(

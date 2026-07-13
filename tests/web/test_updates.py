@@ -276,6 +276,20 @@ async def test_stale_check_outcome_cannot_consume_newer_install_action(
     await client.post("/api/v1/updates/check-now", headers=_ADMIN)
     eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
     stale_generation = eligibility.json()["action_generation"]
+    # Finish the check (freeing the action slot) before queuing the install; a new
+    # public action is refused while the check is still pending. The sidecar may
+    # still redeliver the completed check's outcome at least once, so that late,
+    # stale-generation receipt must not consume the newer install action.
+    first = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "action_generation": stale_generation,
+        },
+    )
+    assert first.status_code == 200
     await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
 
     stale = await client.post(
@@ -293,6 +307,50 @@ async def test_stale_check_outcome_cannot_consume_newer_install_action(
     assert snapshot.requested_action == "install"
     assert snapshot.action_generation == stale_generation + 1
     assert snapshot.current_digest is None
+
+
+async def test_check_now_cannot_downgrade_a_queued_install(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    # A prefetch check leaves an update available, then the operator queues an
+    # install that the sidecar has not yet claimed (phase still "available").
+    assert await coordinator.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
+        current_digest="sha256:old",
+        available_digest="sha256:new",
+    )
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    queued = await client.post("/api/v1/updates/update-when-ready", headers=_ADMIN)
+    assert queued.status_code == 200
+    before = await coordinator.snapshot()
+    assert before.requested_action == "install"
+
+    # check-now arriving before the claim must be refused, not silently downgrade
+    # the queued install to another check and strand its generation.
+    blocked = await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "update_operation_in_progress"
+    after = await coordinator.snapshot()
+    assert after.requested_action == "install"
+    assert after.action_generation == before.action_generation
+
+    # The sidecar still claims and drives the original queued generation.
+    claim = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"expected_generation": after.action_generation},
+    )
+    assert claim.status_code == 200
+    assert claim.json()["lease_token"] is not None
+    assert claim.json()["action_generation"] == after.action_generation
 
 
 async def test_no_update_defensively_clears_false_availability(

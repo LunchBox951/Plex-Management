@@ -247,12 +247,85 @@ async def test_active_update_rejects_new_actions_without_invalidating_outcome(
         assert (await service.snapshot()).drain_owner is None
 
 
+async def test_queued_install_is_not_clobbered_by_a_later_public_action(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # A prefetch check found an update and left an install queued (phase
+    # "available", requested_action "install") awaiting the sidecar's claim.
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    assert await service.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
+        available_digest="sha256:new",
+    )
+    queued = await service.request_action(UpdateAction.install)
+    assert queued is not None
+    snapshot = await service.snapshot()
+    assert snapshot.phase == "available"
+    assert snapshot.requested_action == "install"
+
+    # A later check-now/update-when-ready must neither overwrite the queued
+    # install nor bump the generation: doing so strands the drain lease the
+    # sidecar is about to claim against ``queued``.
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.check)
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.install)
+    after = await service.snapshot()
+    assert after.requested_action == "install"
+    assert after.action_generation == queued
+
+    # The queued generation still claims cleanly and acknowledges its outcome.
+    claim = await service.claim_drain(ttl=timedelta(minutes=1), action_generation=queued)
+    assert claim is not None
+    assert await service.acknowledge_outcome(
+        claim.lease.token,
+        expected_generation=queued,
+        result=UpdateResult.success,
+    )
+
+
+async def test_queued_check_is_not_clobbered_before_the_sidecar_claims_it(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # A manual check is queued but not yet polled by the sidecar (phase "idle").
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    queued = await service.request_action(UpdateAction.check)
+    assert queued is not None
+    snapshot = await service.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.requested_action == "check"
+
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.install)
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.check)
+    after = await service.snapshot()
+    assert after.requested_action == "check"
+    assert after.action_generation == queued
+
+    # The original check still acknowledges against its own untouched generation.
+    assert await service.acknowledge_action(
+        expected_generation=queued,
+        result=UpdateResult.no_update,
+    )
+
+
 async def test_drain_claim_rejects_a_stale_action_generation(
     sessionmaker_: SessionMaker,
 ) -> None:
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
     stale = await service.request_action(UpdateAction.check)
+    assert stale is not None
+    # Complete the check so the action slot frees up; only then can a new install
+    # be requested. Stacking two un-acknowledged actions is now refused outright.
+    assert await service.acknowledge_action(
+        expected_generation=stale,
+        result=UpdateResult.no_update,
+    )
     current = await service.request_action(UpdateAction.install)
     assert current == stale + 1
 
