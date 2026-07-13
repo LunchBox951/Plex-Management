@@ -894,6 +894,271 @@ async def test_malformed_trusted_origin_degrades_to_closed_veto(
         await client.add("http://127.0.0.1:9696/file.torrent", "/downloads", "plex-manager")
 
 
+# --------------------------------------------------------------------------- #
+# Trusted source origin under a reverse-proxy path prefix
+# --------------------------------------------------------------------------- #
+PROWLARR_PREFIXED_ORIGIN = "http://127.0.0.1:9696/prowlarr"
+PROWLARR_PREFIXED_DOWNLOAD_URL = f"{PROWLARR_PREFIXED_ORIGIN}/1/download?apikey=x&file=y.torrent"
+
+
+async def test_add_torrent_from_configured_prowlarr_prefixed_origin_is_allowed() -> None:
+    """A reverse-proxied Prowlarr (a configured ``/prowlarr`` prefix) must stay
+    fetchable beneath its own prefix -- the prefix match is additive to the
+    origin match, never a narrowing that breaks the rootless case above."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    info_hash = (
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
+
+    assert info_hash == _TORRENT_HASH
+    assert any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_off_prefix_same_origin_direct_path_is_vetoed() -> None:
+    """Same scheme/host/port as the configured Prowlarr endpoint, but OUTSIDE
+    its reverse-proxy prefix, must re-enter the full SSRF veto -- otherwise a
+    downloadUrl that merely shares the origin could blind-GET a sibling admin
+    path behind the same proxy."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/admin", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch
+
+
+async def test_off_prefix_sibling_service_path_is_vetoed() -> None:
+    """A sibling reverse-proxy path (a different backend behind the same proxy)
+    must not inherit the Prowlarr trust just because it shares the origin."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/other-service", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_lookalike_prefix_is_vetoed_not_string_prefix_matched() -> None:
+    """``/prowlarr-evil`` starts with the string ``/prowlarr`` but is not
+    BENEATH it at a path-segment boundary -- a naive ``str.startswith`` match
+    would wrongly trust it; the segment-boundary match must not."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr-evil/1/download", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_redirect_off_prefix_same_origin_is_vetoed() -> None:
+    """A same-origin redirect from inside the configured prefix to a path
+    outside it must re-enter the veto on its next hop -- the trust is per-hop
+    AND per-prefix, never merely per-origin."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://127.0.0.1:9696/admin"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted hop was fetched; the off-prefix redirect target never was.
+    assert seen == [PROWLARR_PREFIXED_DOWNLOAD_URL]
+
+
+async def test_dot_segment_traversal_off_prefix_is_vetoed() -> None:
+    """A literal ``..`` segment must never be trusted, even when it would
+    textually resolve back inside the configured prefix -- ambiguous/dot forms
+    fall through to the full veto rather than being interpreted."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/prowlarr/../admin", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_percent_encoded_dot_segment_traversal_off_prefix_is_vetoed() -> None:
+    """A PERCENT-ENCODED ``%2e%2e`` segment must be treated exactly like the
+    literal ``..`` case above: a reverse proxy commonly decodes escapes before
+    routing, so an undecoded match here would let this reach the sibling
+    ``/admin`` backend behind the same proxy."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/%2e%2e/admin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_encoded_slash_traversal_off_prefix_is_vetoed() -> None:
+    """An encoded ``..%2f..%2fadmin`` segment hides an extra path boundary
+    from the raw ``/``-split entirely -- it must fall through to the full
+    veto rather than being read as one harmless path element beneath the
+    trusted prefix."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_trusted_source_fetch_forwards_no_stored_credential_headers() -> None:
+    """The dedicated source fetch must not carry the qBittorrent session cookie
+    or an Authorization header -- only the verbatim query credential Prowlarr
+    itself embedded in the downloadUrl travels; nothing this client stores is
+    added to the request."""
+    seen_headers: dict[str, httpx.Headers] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            seen_headers["source"] = request.headers
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert "source" in seen_headers
+    assert "cookie" not in seen_headers["source"]
+    assert "authorization" not in seen_headers["source"]
+
+
+def test_is_trusted_source_url_root_prefix_allows_any_path() -> None:
+    """A root-configured Prowlarr (no reverse-proxy prefix) keeps allowing
+    every same-origin path -- the prefix check is additive and must not
+    regress the no-prefix layout that most installs use."""
+    client = _client(trusted_source_origin=PROWLARR_ORIGIN)
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{PROWLARR_ORIGIN}/1/download?apikey=x"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{PROWLARR_ORIGIN}/anything/else"
+    )
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://10.0.0.5/1/download"
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (PROWLARR_PREFIXED_DOWNLOAD_URL, True),
+        (f"{PROWLARR_PREFIXED_ORIGIN}/", True),
+        (PROWLARR_PREFIXED_ORIGIN, True),
+        ("http://127.0.0.1:9696/admin", False),
+        ("http://127.0.0.1:9696/other-service", False),
+        ("http://127.0.0.1:9696/prowlarr-evil/1/download", False),
+        ("http://127.0.0.1:9696/prowlarrx", False),
+        ("http://127.0.0.1:9696", False),  # empty path under a set prefix
+        ("http://127.0.0.1:9696/prowlarr/../admin", False),  # dot-segment
+        # percent-encoded dot-segment: a reverse proxy commonly decodes this
+        # before routing, reaching the sibling "/admin" backend just like the
+        # literal ".." case above must not be allowed to.
+        ("http://127.0.0.1:9696/prowlarr/%2e%2e/admin", False),
+        ("http://127.0.0.1:9696/prowlarr/%2E%2E/admin", False),  # uppercase escape
+        # encoded traversal slash: an encoded "/" hides an extra path boundary
+        # from the segment split, so this must not be trusted either.
+        ("http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", False),
+        ("http://127.0.0.1:9697/prowlarr/1/download", False),  # different port
+        # userinfo before the authority is stripped by ``parsed.hostname``, so
+        # this resolves to host ``evil.example`` -- not the trusted host -- and
+        # must not be fooled into matching.
+        ("http://127.0.0.1:9696@evil.example/prowlarr/1/download", False),
+    ],
+)
+def test_is_trusted_source_url_prefix_matrix(url: str, expected: bool) -> None:
+    client = _client(trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    assert client._is_trusted_source_url(url) is expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_trusted_origin_idna_host_normalizes_symmetrically_with_candidates() -> None:
+    """The stored trusted origin and every per-hop candidate origin MUST be
+    derived through the same normalization. ``ServiceUrl.origin`` IDNA-decodes
+    the host to Unicode (via ``httpx.URL.host``), while every candidate hop is
+    normalized with plain ``urlparse`` (punycode ASCII, never decoded) -- had
+    the stored side been taken from ``ServiceUrl.origin`` directly, an
+    IDNA-hostname Prowlarr base would never again match its own downloadUrls."""
+    idna_origin = "http://xn--e1afmkfd.example:9696/prowlarr"
+    client = _client(trusted_source_origin=idna_origin)
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{idna_origin}/1/download?apikey=x"
+    )
+
+
 class _RecordingBackend(httpcore.AsyncNetworkBackend):
     def __init__(self) -> None:
         self.hosts: list[str] = []
