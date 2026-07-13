@@ -687,7 +687,8 @@ export interface paths {
          *     this one": a pinned title (or, for a show, every one of its seasons -- the
          *     pin lives on the parent) is never selected by ``domain/eviction.py``
          *     regardless of watch state or disk pressure. A 404 for an unknown id, never
-         *     a silent no-op.
+         *     a silent no-op. Open to the request's creator or an admin; a non-admin only
+         *     ever moves their own rows, never another user's eviction protection.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
         delete?: never;

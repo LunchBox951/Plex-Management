@@ -1270,7 +1270,12 @@ class SqlRequestRepository:
         await self._session.flush()
 
     async def set_keep_forever_for_title(
-        self, tmdb_id: int, media_type: str, keep_forever: bool
+        self,
+        tmdb_id: int,
+        media_type: str,
+        keep_forever: bool,
+        *,
+        restrict_to_user_id: int | None = None,
     ) -> None:
         """See ``RequestRepository.set_keep_forever_for_title``'s docstring: pins
         or unpins EVERY row sharing ``(tmdb_id, media_type)``, not just one.
@@ -1281,10 +1286,13 @@ class SqlRequestRepository:
         request's ``keep_forever`` protects (``eviction_service.
         _season_candidates`` reads the pin off each season's OWN parent, which
         may be a different, settled row than the one the operator toggled from
-        the UI). ``synchronize_session="fetch"`` keeps any already-loaded
-        identity-map instance for this title (e.g. the caller's own ``get``
-        moments earlier, in the SAME session/transaction) in sync with the
-        DB, mirroring ``set_status_if_in``'s same discipline.
+        the UI). When ``restrict_to_user_id`` is given, the update additionally
+        filters ``user_id = ?`` so a non-admin caller only ever touches their
+        OWN rows and can never flip another user's eviction protection.
+        ``synchronize_session="fetch"`` keeps any already-loaded identity-map
+        instance for this title (e.g. the caller's own ``get`` moments earlier,
+        in the SAME session/transaction) in sync with the DB, mirroring
+        ``set_status_if_in``'s same discipline.
         """
         stmt = (
             update(MediaRequest)
@@ -1295,5 +1303,7 @@ class SqlRequestRepository:
             .values(keep_forever=keep_forever)
             .execution_options(synchronize_session="fetch")
         )
+        if restrict_to_user_id is not None:
+            stmt = stmt.where(MediaRequest.user_id == restrict_to_user_id)
         await self._session.execute(stmt)
         await self._session.flush()

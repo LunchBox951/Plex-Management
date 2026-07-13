@@ -1321,7 +1321,11 @@ async def mark_available(session: AsyncSession, request_id: int) -> None:
 
 
 async def set_keep_forever(
-    session: AsyncSession, request_id: int, *, keep_forever: bool
+    session: AsyncSession,
+    request_id: int,
+    *,
+    keep_forever: bool,
+    restrict_to_user_id: int | None = None,
 ) -> RequestRecord | None:
     """Toggle the operator's "keep forever" pin (ADR-0012) for the WHOLE title.
 
@@ -1340,6 +1344,13 @@ async def set_keep_forever(
     :meth:`~plex_manager.ports.repositories.RequestRepository.
     set_keep_forever_for_title` -- symmetric for both pin and unpin.
 
+    ``restrict_to_user_id`` confines the title-wide sweep to rows owned by
+    that user. The endpoint is open to a request's creator (not just admins),
+    but a title's rows can belong to DIFFERENT users; a non-admin passes their
+    own ``user_id`` so they only ever pin/unpin their own rows and never flip
+    another user's eviction protection. ``None`` (the default) leaves the
+    sweep unrestricted for admin/operator use.
+
     Returns ``None`` when the request does not exist (the router surfaces
     404); otherwise commits and returns the freshly updated TARGET record so
     the endpoint can hand back the new state without a second round trip.
@@ -1348,6 +1359,11 @@ async def set_keep_forever(
     current = await repo.get(request_id)
     if current is None:
         return None
-    await repo.set_keep_forever_for_title(current.tmdb_id, current.media_type, keep_forever)
+    await repo.set_keep_forever_for_title(
+        current.tmdb_id,
+        current.media_type,
+        keep_forever,
+        restrict_to_user_id=restrict_to_user_id,
+    )
     await session.commit()
     return await repo.get(request_id)

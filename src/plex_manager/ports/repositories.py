@@ -523,7 +523,12 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_keep_forever_for_title(
-        self, tmdb_id: int, media_type: str, keep_forever: bool
+        self,
+        tmdb_id: int,
+        media_type: str,
+        keep_forever: bool,
+        *,
+        restrict_to_user_id: int | None = None,
     ) -> None:
         """Set the pin on EVERY ``MediaRequest`` row for this ``(tmdb_id,
         media_type)``, not just one (ADR-0012).
@@ -538,6 +543,13 @@ class RequestRepository(Protocol):
         believes they pinned the whole show. Keep-forever is a per-TITLE
         intent, so this updates every row sharing the key, symmetric for both
         pin and unpin.
+
+        ``restrict_to_user_id`` narrows the update to rows OWNED by that user.
+        The keep-forever endpoint is open to a request's creator (not just
+        admins), but a title's rows can belong to DIFFERENT users, so a
+        non-admin caller must never flip a row they do not own. Callers pass
+        their own ``user_id`` to confine the title-wide sweep to their rows;
+        ``None`` (the default) leaves it unrestricted for admin/operator use.
         """
         raise NotImplementedError
 

@@ -447,10 +447,19 @@ async def keep_forever_endpoint(
     this one": a pinned title (or, for a show, every one of its seasons -- the
     pin lives on the parent) is never selected by ``domain/eviction.py``
     regardless of watch state or disk pressure. A 404 for an unknown id, never
-    a silent no-op.
+    a silent no-op. Open to the request's creator or an admin; a non-admin only
+    ever moves their own rows, never another user's eviction protection.
     """
+    # ``_require_request_mutator`` already confirmed the caller owns this row (or
+    # is an admin). Keep-forever is a title-wide sweep and a title's rows can
+    # belong to DIFFERENT users, so confine a non-admin's sweep to their own
+    # rows -- toggling their row must never silently flip another user's pin.
+    # Admins keep the unrestricted, whole-title sweep.
     record = await request_service.set_keep_forever(
-        session, request_id, keep_forever=body.keep_forever
+        session,
+        request_id,
+        keep_forever=body.keep_forever,
+        restrict_to_user_id=None if auth.is_admin else auth.user_id,
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")

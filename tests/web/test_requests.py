@@ -200,6 +200,125 @@ async def test_subscriber_cannot_mutate_another_users_request(
     assert response.json()["detail"] == "request_not_found"
 
 
+async def _user_with_cookies(
+    app: FastAPI, *, tag: str
+) -> tuple[int, dict[str, str], dict[str, str]]:
+    """Create a non-admin user + session, returning ``(user_id, cookies, headers)``."""
+    token = f"{tag}-session-token"
+    csrf = f"{tag}-csrf-token"
+    async with app.state.sessionmaker() as session:
+        user = User(plex_id=None, username=f"{tag}-user", permissions=0)
+        session.add(user)
+        await session.flush()
+        user_id = user.id
+        session.add(
+            AuthSession(
+                user_id=user_id,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return user_id, {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
+
+
+async def test_keep_forever_by_non_admin_does_not_touch_another_users_row(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """A non-admin's keep-forever toggle is scoped to their OWN rows.
+
+    Keep-forever is title-wide (``set_keep_forever_for_title`` sweeps every row
+    sharing ``(tmdb_id, media_type)``), and a title can carry rows owned by
+    different users -- e.g. user A's older SETTLED request and user B's newer
+    ACTIVE one. Before this scoping, user B flipping their own row silently
+    pinned/unpinned user A's row too, changing A's eviction protection without
+    consent. A non-admin must only ever move their own rows.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    user_a, _, _ = await _user_with_cookies(app, tag="owner-a")
+    user_b, cookies_b, headers_b = await _user_with_cookies(app, tag="owner-b")
+
+    async with app.state.sessionmaker() as session:
+        settled = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            status=RequestStatus.available,
+            user_id=user_a,
+        )
+        active = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            status=RequestStatus.pending,
+            user_id=user_b,
+        )
+        session.add_all([settled, active])
+        await session.commit()
+        settled_id, active_id = settled.id, active.id
+
+    pinned = await client.post(
+        f"/api/v1/requests/{active_id}/keep-forever",
+        json={"keep_forever": True},
+        cookies=cookies_b,
+        headers=headers_b,
+    )
+    assert pinned.status_code == 200
+    assert pinned.json()["keep_forever"] is True
+
+    async with app.state.sessionmaker() as session:
+        a_row = await session.get(MediaRequest, settled_id)
+        b_row = await session.get(MediaRequest, active_id)
+    assert a_row is not None and b_row is not None
+    assert b_row.keep_forever is True  # the caller's own row moved
+    assert a_row.keep_forever is False  # another user's row is untouched
+
+
+async def test_keep_forever_by_admin_sweeps_the_whole_title(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """Admins retain the unrestricted, whole-title keep-forever sweep."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    user_a, _, _ = await _user_with_cookies(app, tag="admin-sweep-a")
+    user_b, _, _ = await _user_with_cookies(app, tag="admin-sweep-b")
+
+    async with app.state.sessionmaker() as session:
+        settled = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            status=RequestStatus.available,
+            user_id=user_a,
+        )
+        active = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="The Matrix",
+            status=RequestStatus.pending,
+            user_id=user_b,
+        )
+        session.add_all([settled, active])
+        await session.commit()
+        settled_id, active_id = settled.id, active.id
+
+    pinned = await client.post(
+        f"/api/v1/requests/{active_id}/keep-forever",
+        json={"keep_forever": True},
+        headers=_HEADERS,
+    )
+    assert pinned.status_code == 200
+
+    async with app.state.sessionmaker() as session:
+        a_row = await session.get(MediaRequest, settled_id)
+        b_row = await session.get(MediaRequest, active_id)
+    assert a_row is not None and b_row is not None
+    assert a_row.keep_forever is True
+    assert b_row.keep_forever is True
+
+
 async def test_shared_user_request_progress_is_filtered_with_their_records(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:

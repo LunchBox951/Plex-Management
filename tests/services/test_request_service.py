@@ -1619,6 +1619,50 @@ async def test_unset_keep_forever_clears_every_row_sharing_the_title(
     assert active_row.keep_forever is False
 
 
+async def test_set_keep_forever_restricted_to_user_leaves_other_rows_untouched(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """``restrict_to_user_id`` confines the title-wide sweep to the caller's own
+    rows: a non-admin toggling their row must never flip another user's row
+    sharing the same ``(tmdb_id, media_type)``."""
+    async with sessionmaker_() as session:
+        user_a = User(plex_id=None, username="user-a", permissions=0)
+        user_b = User(plex_id=None, username="user-b", permissions=0)
+        session.add_all([user_a, user_b])
+        await session.flush()
+        others = MediaRequest(
+            tmdb_id=9100,
+            media_type=MediaType.movie,
+            title="Shared Title",
+            status=RequestStatus.available,
+            user_id=user_a.id,
+        )
+        mine = MediaRequest(
+            tmdb_id=9100,
+            media_type=MediaType.movie,
+            title="Shared Title",
+            status=RequestStatus.pending,
+            user_id=user_b.id,
+        )
+        session.add_all([others, mine])
+        await session.commit()
+        others_id, mine_id, user_b_id = others.id, mine.id, user_b.id
+
+    async with sessionmaker_() as session:
+        updated = await request_service.set_keep_forever(
+            session=session, request_id=mine_id, keep_forever=True, restrict_to_user_id=user_b_id
+        )
+    assert updated is not None
+    assert updated.keep_forever is True
+
+    async with sessionmaker_() as session:
+        others_row = await session.get(MediaRequest, others_id)
+        mine_row = await session.get(MediaRequest, mine_id)
+    assert others_row is not None and mine_row is not None
+    assert mine_row.keep_forever is True
+    assert others_row.keep_forever is False  # another user's row untouched
+
+
 async def test_set_keep_forever_missing_request_returns_none(
     sessionmaker_: SessionMaker,
 ) -> None:

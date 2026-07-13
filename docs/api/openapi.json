@@ -4773,7 +4773,7 @@
     },
     "/api/v1/requests/{request_id}/keep-forever": {
       "post": {
-        "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op.",
+        "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op. Open to the request's creator or an admin; a non-admin only\never moves their own rows, never another user's eviction protection.",
         "operationId": "keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post",
         "parameters": [
           {

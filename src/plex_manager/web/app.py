@@ -272,6 +272,11 @@ async def _watchlist_sync_loop(app: FastAPI) -> None:
         try:
             await asyncio.wait_for(wake_event.wait(), timeout=interval * 60.0)
         except TimeoutError:
+            # Expected, not an error: the sync interval elapsed with no manual
+            # wake signal, which simply means it is time to run the next cycle.
+            # A fired wake_event (a settings change requesting an immediate
+            # re-sync) returns normally; both paths fall through to the next
+            # loop iteration, so there is nothing to log or surface here.
             pass
         finally:
             wake_event.clear()
