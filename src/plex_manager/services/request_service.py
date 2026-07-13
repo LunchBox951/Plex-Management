@@ -524,7 +524,12 @@ async def _subscribe_user(
     record: RequestRecord,
     user_id: int | None,
 ) -> RequestRecord:
-    """Persist shared visibility for an authenticated requester."""
+    """Persist shared visibility for an authenticated requester.
+
+    TODO(issue #58): richer subscriber control (withdrawal, collaborative
+    cancellation, per-user intent) belongs in the shared-request policy, not in
+    watchlist synchronization. Until then subscribers remain view-only.
+    """
     if user_id is None:
         return record
     await repo.add_subscriber(record.id, user_id)

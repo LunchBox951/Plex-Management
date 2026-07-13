@@ -96,6 +96,9 @@ async def sync_user(
     created = 0
     existing = 0
     for entry in entries:
+        # TODO(#199 follow-up): apply request quotas/approval policy here through
+        # the shared request-policy boundary once that policy exists. Do not put
+        # watchlist-only limits in this worker.
         result = await request_service.create_request_result(
             session,
             tmdb,
