@@ -399,6 +399,35 @@ def _section_scan_path(section: LibrarySection, path: str) -> str | None:
     return None
 
 
+def _section_relevant_to_queries(
+    section: LibrarySection, queries: Sequence[WatchStateQuery]
+) -> bool:
+    """Whether at least one query in the batch could ever read from ``section``.
+
+    Mirrors the per-query section filtering the non-batch helpers apply: a
+    path-correlated query (``library_path`` set) only ever touches a section whose
+    location covers that path -- :meth:`PlexLibrary._movie_watch_state` /
+    :meth:`PlexLibrary._tv_watch_state` do ``if scan_path is None: continue`` and
+    never page such a section -- while a ``library_path=None`` query scans sections
+    in order for the first tmdb match, so it can touch ANY section of its type and
+    makes every one of them relevant.
+
+    Building the batch index over ONLY relevant sections restores that failure
+    parity (issue: codex P2 on #306): an unrelated section whose ``/all`` errors is
+    never crawled, so its failure cannot abort a batch of otherwise-resolvable
+    candidates -- exactly as the per-candidate path, which never touched that
+    section, behaved. A section that at least one query DOES correlate with is still
+    crawled, so a genuine failure there propagates and aborts the sweep, unchanged
+    from the per-candidate path (which aborted the whole sweep on such a failure).
+    """
+    for query in queries:
+        if query.library_path is None:
+            return True
+        if _section_scan_path(section, query.library_path) is not None:
+            return True
+    return False
+
+
 def _find_season_entry_in(
     entries: Sequence[Mapping[str, object]], season: int
 ) -> Mapping[str, object] | None:
@@ -1379,10 +1408,23 @@ class PlexLibrary:
         if not queries:
             return []
         sections = await self.list_sections()
-        need_movie = any(q.media_type == "movie" for q in queries)
-        need_tv = any(q.media_type == "tv" for q in queries)
-        movie_index = await self._section_item_index(sections, "movie") if need_movie else []
-        show_index = await self._section_item_index(sections, "show") if need_tv else []
+        movie_queries = [q for q in queries if q.media_type == "movie"]
+        tv_queries = [q for q in queries if q.media_type == "tv"]
+        # Crawl ONLY the sections at least one query could actually read from
+        # (:func:`_section_relevant_to_queries`), matching the per-candidate
+        # ``watch_state`` path's section filtering: an unrelated section whose
+        # ``/all`` errors was never touched there and must not abort the batch here
+        # either (codex P2 on #306). A section a query DOES correlate with is still
+        # crawled up front, so a real failure there aborts the sweep exactly as
+        # before.
+        movie_index = (
+            await self._section_item_index(sections, "movie", movie_queries)
+            if movie_queries
+            else []
+        )
+        show_index = (
+            await self._section_item_index(sections, "show", tv_queries) if tv_queries else []
+        )
         # Per-batch memoization of the two ``/children`` reads the TV branch makes:
         # a show's season listing (keyed by the show's ratingKey) and a season's
         # episode listing (keyed by the season's ratingKey). Shared across every
@@ -1414,9 +1456,13 @@ class PlexLibrary:
         return results
 
     async def _section_item_index(
-        self, sections: Sequence[LibrarySection], section_type: Literal["movie", "show"]
+        self,
+        sections: Sequence[LibrarySection],
+        section_type: Literal["movie", "show"],
+        queries: Sequence[WatchStateQuery],
     ) -> list[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]]:
-        """Crawl each ``section_type`` section ONCE into a tmdb-id -> items index.
+        """Crawl each RELEVANT ``section_type`` section ONCE into a tmdb-id -> items
+        index.
 
         Preserves the same section iteration order :meth:`list_sections` returns and
         the same in-section page order the per-item :meth:`watch_state` helpers see,
@@ -1426,10 +1472,23 @@ class PlexLibrary:
         than re-paged per candidate. An item is indexed under EVERY tmdb id its
         guid(s) resolve to (:func:`_collect_item_tmdb_ids`), matching
         :func:`_item_matches_tmdb_id`.
+
+        Only sections at least one ``query`` could read from are crawled
+        (:func:`_section_relevant_to_queries`) -- a section no query correlates with
+        is skipped entirely, so a failure paging an UNRELATED section can never abort
+        a batch of otherwise-resolvable candidates (codex P2 on #306). This is
+        result-neutral: a path-correlated look-up re-checks
+        :func:`_section_scan_path` per section anyway (see
+        :func:`_resolve_movie_watch_state_from_index` /
+        :meth:`_resolve_tv_watch_state`) and a skipped section never contributes a
+        hit, while any ``library_path=None`` query keeps every section relevant so
+        its first-match scan still sees the full ordered list.
         """
         index: list[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]] = []
         for section in sections:
             if section.type != section_type:
+                continue
+            if not _section_relevant_to_queries(section, queries):
                 continue
             by_tmdb_id: dict[int, list[Mapping[str, object]]] = {}
             start = 0

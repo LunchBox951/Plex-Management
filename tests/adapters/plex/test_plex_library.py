@@ -2587,3 +2587,127 @@ async def test_resolve_watch_states_tv_requires_a_season() -> None:
     adapter = _adapter(_make_batch_tv_handler(1, {}), base_url="http://batch-tv-noseason:32400")
     with pytest.raises(ValueError, match="requires a season"):
         await adapter.resolve_watch_states([WatchStateQuery(tmdb_id=1399, media_type="tv")])
+
+
+# --------------------------------------------------------------------------- #
+# resolve_watch_states -- unrelated-section failure isolation (codex P2 on #306)
+#
+# The batch index must only crawl sections at least one query could read from,
+# matching the per-candidate ``watch_state`` path's ``if scan_path is None:
+# continue`` section filtering. An unrelated section whose ``/all`` errors was
+# never touched per-candidate and must not abort the batch here either; a section
+# a query DOES correlate with is still crawled, so a genuine failure there
+# propagates and aborts the sweep exactly as before.
+# --------------------------------------------------------------------------- #
+_TWO_MOVIE_SECTIONS: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "1", "title": "Movies A", "type": "movie", "Location": [{"path": "/a"}]},
+            {"key": "2", "title": "Movies B", "type": "movie", "Location": [{"path": "/b"}]},
+        ]
+    }
+}
+
+
+def _make_two_section_movie_handler(calls: dict[str, int]) -> Any:
+    """Two movie sections: healthy ``/a`` (key 1, holds watched tmdb 1000) and a
+    down ``/b`` (key 2, whose ``/all`` always 500s). The exact codex P2 shape: a
+    candidate under ``/a`` alongside an unrelated ``/b`` section that is failing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_TWO_MOVIE_SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [
+                            {
+                                "Guid": [{"id": "tmdb://1000"}],
+                                "Media": [{"Part": [{"file": "/a/Title1000/f.mkv"}]}],
+                                "viewCount": 2,
+                                "lastViewedAt": _WATCHED_EPOCH,
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/library/sections/2/all":
+            return httpx.Response(500, json={})
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_skips_a_section_no_query_can_use() -> None:
+    # A movie candidate lives under /a; an unrelated /b section is down (its /all
+    # 500s). The per-candidate ``watch_state`` skips /b (``_section_scan_path`` is
+    # None for a /a path), so the batch must not crawl it either -- the down /b
+    # section must never abort resolving an otherwise-resolvable /a candidate.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_two_section_movie_handler(calls), base_url="http://batch-skip-b:32400")
+    states = await adapter.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000")]
+    )
+    assert states == [WatchState(watched=True, last_viewed_at=_WATCHED_AT)]
+    # The healthy /a section was crawled; the unrelated down /b section was NEVER
+    # touched -- exactly the per-candidate path's behavior.
+    assert calls["/library/sections/1/all"] == 1
+    assert "/library/sections/2/all" not in calls
+
+
+async def test_resolve_watch_states_unrelated_failure_matches_per_candidate_result() -> None:
+    # Parity proof: the single per-candidate ``watch_state`` also resolves the /a
+    # candidate cleanly (never touching /b), so the batch result equals it.
+    per_item_calls: dict[str, int] = {}
+    per_item = _adapter(
+        _make_two_section_movie_handler(per_item_calls), base_url="http://per-item-skip-b:32400"
+    )
+    expected = await per_item.watch_state(1000, "movie", library_path="/a/Title1000")
+    assert "/library/sections/2/all" not in per_item_calls
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-skip-b-eq:32400")
+    assert await batch.resolve_watch_states(
+        [WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000")]
+    ) == [expected]
+
+
+async def test_resolve_watch_states_a_relevant_failing_section_aborts_like_per_candidate() -> None:
+    # When a query's own path IS under the failing /b section, the per-candidate
+    # ``watch_state`` paged /b and raised ``PlexLibraryError`` (aborting the whole
+    # sweep). The batch must behave identically -- a section a query correlates
+    # with is still crawled up front, and its failure still propagates. The fix
+    # only skips sections NO query can use; it must never swallow a failure in a
+    # section a query genuinely needs.
+    per_item = _adapter(
+        _make_two_section_movie_handler({}), base_url="http://per-item-b-fail:32400"
+    )
+    with pytest.raises(PlexLibraryError):
+        await per_item.watch_state(2000, "movie", library_path="/b/Title2000")
+
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-b-fail:32400")
+    with pytest.raises(PlexLibraryError):
+        await batch.resolve_watch_states(
+            [WatchStateQuery(tmdb_id=2000, media_type="movie", library_path="/b/Title2000")]
+        )
+
+
+async def test_resolve_watch_states_used_section_failure_aborts_amid_resolvable() -> None:
+    # A resolvable /a candidate batched with one whose path is under the down /b
+    # section: /b is relevant to that second query, so it is crawled and its
+    # failure aborts the batch -- exactly as the per-candidate path aborted the
+    # whole sweep the moment the /b candidate's ``watch_state`` ran. Isolation
+    # applies ONLY to sections no query needs, never to a genuinely-used one.
+    batch = _adapter(_make_two_section_movie_handler({}), base_url="http://batch-mixed-b:32400")
+    with pytest.raises(PlexLibraryError):
+        await batch.resolve_watch_states(
+            [
+                WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/a/Title1000"),
+                WatchStateQuery(tmdb_id=2000, media_type="movie", library_path="/b/Title2000"),
+            ]
+        )
