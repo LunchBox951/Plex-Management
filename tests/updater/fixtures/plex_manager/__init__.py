@@ -1,0 +1,1 @@
+"""Disposable updater integration fixture."""

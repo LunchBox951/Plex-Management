@@ -359,9 +359,16 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
           {/* Mount the details modal only once a title has been selected: it
               calls its full request/queue hook surface before its own null
               guard, which would otherwise fire hidden fetches (an admin /queue
-              GET among them) whenever the overlay is open. `selected` survives
-              a details close, so Radix stays mounted through the close and the
-              returnFocusTo handoff below still runs. */}
+              GET among them) whenever the overlay is open. `selected` used to
+              survive a details close indefinitely so Radix stayed mounted
+              through the close and the returnFocusTo handoff below still ran
+              — but that left the modal (and its polling) mounted until a
+              different title was opened or the overlay itself closed (issue
+              #271). `onClosed` fires once that handoff has actually finished
+              (see TitleDetailModal's `onClosed` doc), so clearing `selected`
+              there unmounts the modal right after focus returns, never before
+              — unmounting on `onOpenChange(false)` instead would tear down the
+              Radix root mid-exit-animation/handoff. */}
           {selected ? (
             <TitleDetailModal
               title={selected}
@@ -370,6 +377,10 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
               returnFocusTo={() =>
                 detailsTrigger?.isConnected ? detailsTrigger : inputRef.current
               }
+              onClosed={() => {
+                setSelected(null)
+                setDetailsTrigger(null)
+              }}
             />
           ) : null}
         </RadixDialog.Content>

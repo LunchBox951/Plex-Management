@@ -24,7 +24,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from plex_manager.db import get_sessionmaker
+from plex_manager.services.update_coordination_service import (
+    MaintenanceDrainingError,
+    MaintenanceLeaseLostError,
+)
 from plex_manager.web.deps import load_system_settings
+from plex_manager.web.update_coordinator import ensure_update_coordinator
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -32,8 +37,23 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from starlette.requests import Request
     from starlette.responses import Response
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["SETUP_ALLOWLIST_PATHS", "SETUP_ALLOWLIST_PREFIXES", "SetupGuardMiddleware"]
+__all__ = [
+    "SETUP_ALLOWLIST_PATHS",
+    "SETUP_ALLOWLIST_PREFIXES",
+    "CriticalMutationMiddleware",
+    "SetupGuardMiddleware",
+]
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_MAINTENANCE_EXCLUDED_PREFIXES = (
+    "/api/v1/auth",
+    "/api/v1/setup",
+    "/api/v1/updates",
+    "/api/v1/internal/updates",
+)
+_MAINTENANCE_READ_ONLY_POSTS = frozenset({"/api/v1/search-preview"})
 
 # Exact paths always reachable pre-init.
 SETUP_ALLOWLIST_PATHS: frozenset[str] = frozenset(
@@ -87,3 +107,78 @@ class SetupGuardMiddleware(BaseHTTPMiddleware):
         async with maker() as session:
             system = await load_system_settings(session)
             return system is not None and system.initialized
+
+
+class CriticalMutationMiddleware:
+    """Lease state-changing API work so an updater drain cannot race it.
+
+    The request-creation endpoint is deliberately excluded: requests remain
+    accepted during the short maintenance drain, while background auto-grab is
+    leased separately and therefore leaves the critical handoff queued.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        method = str(scope.get("method", "GET"))
+        if (
+            method in _SAFE_METHODS
+            or not path.startswith("/api/v1/")
+            or (method == "POST" and path.rstrip("/") == "/api/v1/requests")
+            or (method == "POST" and path.rstrip("/") in _MAINTENANCE_READ_ONLY_POSTS)
+            or any(path.startswith(prefix) for prefix in _MAINTENANCE_EXCLUDED_PREFIXES)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_app = scope["app"]
+        try:
+            coordinator = await ensure_update_coordinator(request_app)
+        except Exception:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_coordinator_unavailable",
+                    "message": "A safe mutation lease could not be established.",
+                },
+            )
+            await response(scope, receive, send)
+            return
+        response_started = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            async with coordinator.critical_operation(f"http_{method.lower()}"):
+                await self.app(scope, receive, tracking_send)
+        except MaintenanceDrainingError:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_in_progress",
+                    "message": "Container update maintenance is draining critical work.",
+                    "hint": "Try again after the update finishes.",
+                },
+            )
+            await response(scope, receive, send)
+        except MaintenanceLeaseLostError:
+            if response_started:
+                raise
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "maintenance_lease_lost",
+                    "message": "The mutation finished with uncertain maintenance ownership.",
+                    "hint": "Refresh the affected resource before retrying.",
+                },
+            )
+            await response(scope, receive, send)

@@ -20,6 +20,11 @@ services:
     image: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
     container_name: plex-manager
     restart: unless-stopped
+    labels:
+      # Both are required by the privileged sidecar. It will reject a name-only
+      # or label-only match and never accepts an arbitrary target over HTTP.
+      io.github.lunchbox951.plex-manager.update.target: "true"
+      io.github.lunchbox951.plex-manager.update.image-ref: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
     env_file: .env
     environment:
       # Keep the in-container app and healthcheck on 8000. Use
@@ -35,6 +40,9 @@ services:
       # setup ALSO demands this token; unset/empty boots tokenless and setup is
       # claimed by the first Plex server owner to sign in.
       PLEX_MANAGER_SETUP_TOKEN: ${PLEX_MANAGER_SETUP_TOKEN:-}
+      # Private app<->sidecar bearer credential. The value is file-mounted, never
+      # copied into an environment variable or Docker inspect output.
+      PLEX_MANAGER_UPDATER_SECRET_FILE: /run/secrets/plex_manager_updater
     ports:
       - "${PLEX_MANAGER_HOST_BIND:-127.0.0.1}:${PLEX_MANAGER_HOST_PORT:-8000}:8000"
     volumes:
@@ -43,6 +51,68 @@ services:
       # Required: paths selected in setup must be visible inside the container.
       - ${PLEX_MANAGER_MEDIA_ROOT:?set PLEX_MANAGER_MEDIA_ROOT in .env}:/media
       - ${PLEX_MANAGER_DOWNLOADS_ROOT:?set PLEX_MANAGER_DOWNLOADS_ROOT in .env}:/downloads
+    secrets:
+      - plex_manager_updater
+
+  # Opt in at install time with:
+  #   docker compose --profile auto-update up -d
+  # Policy remains disabled by default and is configured later in the browser.
+  # This is the ONLY service granted Docker authority; it has no published port
+  # and runs only its small outbound updater process from the promoted app image.
+  #
+  # Known limitation (#299): automatic updates replace ONLY the plex-manager
+  # container. The sidecar cannot recreate itself mid-operation — stopping
+  # itself would kill the very state machine driving the update — so after an
+  # update it keeps running the image it was started from, and later releases'
+  # updater-side fixes do not apply to it automatically. The app and sidecar
+  # share one image and the sidecar's own update pull already fetched the new
+  # bytes, so refreshing it after an update is one admin command on the install
+  # host (no re-download):
+  #   docker compose --profile auto-update up -d updater
+  updater:
+    profiles: ["auto-update"]
+    image: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
+    container_name: plex-manager-updater
+    entrypoint: ["python", "-m", "plex_manager.updater"]
+    user: "0:0"
+    restart: unless-stopped
+    read_only: true
+    environment:
+      PLEX_MANAGER_IMAGE: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
+      PLEX_MANAGER_CONTAINER_NAME: plex-manager
+      PLEX_MANAGER_UPDATER_DOCKER_SOCKET: /var/run/docker.sock
+      PLEX_MANAGER_UPDATER_COORDINATOR_URL: http://plex-manager:8000/api/v1/internal/updates
+      PLEX_MANAGER_UPDATER_SECRET_FILE: /run/secrets/plex_manager_updater
+      PLEX_MANAGER_UPDATER_STATE_FILE: /var/lib/plex-manager-updater/state.json
+      # 1-30s. The sidecar refuses to start above 30: the app treats a heartbeat
+      # older than 45s as "updater unavailable", so slower polling would falsely
+      # report a healthy sidecar as unavailable between polls.
+      PLEX_MANAGER_UPDATER_POLL_SECONDS: ${PLEX_MANAGER_UPDATER_POLL_SECONDS:-30}
+    volumes:
+      # Docker socket access is host-root-equivalent. A read-only bind flag would
+      # not restrict API methods, so the authority is disclosed honestly as rw.
+      - ${PLEX_MANAGER_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:rw
+      - plex-manager-updater-state:/var/lib/plex-manager-updater
+    secrets:
+      - plex_manager_updater
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      disable: true
+    depends_on:
+      plex-manager:
+        condition: service_healthy
 
 volumes:
   plex-manager-data:
+  plex-manager-updater-state:
+
+secrets:
+  plex_manager_updater:
+    # The committed placeholder is deliberately too short to authenticate. It
+    # keeps the default, updater-profile-off deployment bootable without granting
+    # Docker authority. Opt-in installs point this at their generated secret.
+    file: ${PLEX_MANAGER_UPDATER_SECRET_SOURCE:-./docker/updater-disabled-secret}

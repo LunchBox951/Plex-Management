@@ -8,8 +8,10 @@ Prowlarr / TMDB api keys, qBittorrent password) are represented by a masked
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -84,6 +86,15 @@ __all__ = [
     "SetupStatusResponse",
     "SubsystemHealthItem",
     "TmdbValidateRequest",
+    "UpdateActionRequest",
+    "UpdateClaimRequest",
+    "UpdateClaimResponse",
+    "UpdateEligibilityResponse",
+    "UpdateLeaseRequest",
+    "UpdateLeaseResponse",
+    "UpdateOutcomeRequest",
+    "UpdateResultItem",
+    "UpdateStatusResponse",
     "WatchlistStatusItem",
 ]
 
@@ -96,6 +107,15 @@ MediaTypeField = Literal["movie", "tv"]
 # sides of the wire. Default ``"none"`` on ``DiscoverResult`` models a missing/degraded
 # decoration honestly (no fabricated presence).
 LibraryStateField = Literal["none", "requested", "processing", "available", "partially_available"]
+UpdateWeekday = Literal[
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
 
 
 class ErrorDetail(BaseModel):
@@ -562,6 +582,14 @@ class SettingsResponse(BaseModel):
     # the default applies). Plain boolean config, same wire semantics as
     # ``eviction_enabled`` above.
     auto_grab_enabled: bool | None = None
+    # Container auto-update policy (ADR-0024). ``None`` means the persisted
+    # setting is absent/corrupt and the documented runtime default applies.
+    automatic_updates_enabled: bool | None = None
+    automatic_update_timezone: str | None = None
+    automatic_update_weekdays: list[UpdateWeekday] | None = None
+    automatic_update_window_start: str | None = None
+    automatic_update_window_end: str | None = None
+    automatic_update_idle_only: bool | None = None
     watchlist_sync_enabled: bool | None = None
     watchlist_sync_interval_minutes: float | None = None
 
@@ -672,6 +700,58 @@ class SettingsUpdate(BaseModel):
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
+    automatic_updates_enabled: bool | None = Field(default=None)
+    automatic_update_timezone: str | None = Field(default=None)
+    automatic_update_weekdays: list[UpdateWeekday] | None = Field(default=None, min_length=1)
+    automatic_update_window_start: str | None = Field(default=None)
+    automatic_update_window_end: str | None = Field(default=None)
+    automatic_update_idle_only: bool | None = Field(default=None)
+
+    @field_validator("automatic_update_timezone")
+    @classmethod
+    def _validate_update_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("automatic_update_timezone must be an IANA timezone")
+        try:
+            ZoneInfo(normalized)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("automatic_update_timezone must be an IANA timezone") from exc
+        return normalized
+
+    @field_validator("automatic_update_weekdays")
+    @classmethod
+    def _canonical_update_weekdays(
+        cls,
+        value: list[UpdateWeekday] | None,
+    ) -> list[UpdateWeekday] | None:
+        if value is None:
+            return None
+        if len(set(value)) != len(value):
+            raise ValueError("automatic_update_weekdays must not contain duplicates")
+        order = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        return sorted(value, key=order.__getitem__)
+
+    @field_validator("automatic_update_window_start", "automatic_update_window_end")
+    @classmethod
+    def _validate_update_time(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized) is None:
+            raise ValueError("automatic update times must use 24-hour HH:MM format")
+        return normalized
+
     watchlist_sync_enabled: bool | None = Field(default=None)
     watchlist_sync_interval_minutes: float | None = Field(
         default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
@@ -762,6 +842,166 @@ class SettingsUpdate(BaseModel):
                 "under 'pressure' with nothing to evict)"
             )
             raise ValueError(msg)
+        update_start = self.automatic_update_window_start
+        update_end = self.automatic_update_window_end
+        if update_start is not None and update_end is not None and update_start == update_end:
+            raise ValueError("automatic update window start and end must differ")
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Container automatic updates (ADR-0024)
+# --------------------------------------------------------------------------- #
+class UpdateResultItem(BaseModel):
+    """The last completed updater operation, with only bounded safe detail."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation: Literal["check", "install"]
+    outcome: Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
+    finished_at: datetime
+    from_build: str | None = None
+    to_build: str | None = None
+    detail_code: str | None = None
+
+
+class UpdateStatusResponse(BaseModel):
+    """Honest public status for the admin update controls."""
+
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal[
+        "disabled",
+        "unavailable",
+        "idle",
+        "checking",
+        "update_available",
+        "waiting_for_window",
+        "waiting_for_idle",
+        "draining",
+        "installing",
+        "rollback",
+        "succeeded",
+        "failed",
+    ]
+    updater_available: bool
+    current_build: str
+    current_digest: str | None = None
+    available_build: str | None = None
+    available_digest: str | None = None
+    channel: str
+    next_window_start: datetime | None = None
+    next_window_end: datetime | None = None
+    blocker: str | None = None
+    last_checked_at: datetime | None = None
+    last_result: UpdateResultItem | None = None
+
+
+class UpdateActionRequest(BaseModel):
+    """Bodyless public/internal action guard; arbitrary target fields are forbidden."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class UpdateEligibilityResponse(BaseModel):
+    """Policy/action snapshot returned to the authenticated sidecar heartbeat."""
+
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["none", "check", "install"]
+    action_generation: int = Field(ge=0)
+    automatic_enabled: bool
+    window_open: bool
+    idle_only: bool
+    blocker: str | None = None
+    poll_after_seconds: int = 15
+
+
+class UpdateClaimResponse(BaseModel):
+    """A newly-created drain claim, or a fail-closed busy response."""
+
+    model_config = ConfigDict(frozen=True)
+
+    lease_token: str | None = None
+    action_generation: int | None = None
+    ready: bool
+    lease_seconds: int
+    blocker: str | None = None
+
+
+class UpdateLeaseRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lease_token: str = Field(min_length=32, max_length=256)
+
+
+class UpdateRenewRequest(UpdateLeaseRequest):
+    """Lease renewal plus a bounded, token-owned active phase."""
+
+    phase: Literal["installing", "rollback"] | None = None
+
+
+class UpdateHeartbeatRequest(BaseModel):
+    """Unleased liveness for digest checks before a drain is claimed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: Literal["checking"]
+    action_generation: int = Field(ge=0)
+
+
+class UpdateClaimRequest(BaseModel):
+    """Recovery claims bind only to an existing action generation, never a target."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    recovery: bool = False
+    expected_generation: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _recovery_requires_generation(self) -> UpdateClaimRequest:
+        if self.recovery and self.expected_generation is None:
+            raise ValueError("recovery claims require expected_generation")
+        return self
+
+
+class UpdateLeaseResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    ready: bool
+    lease_seconds: int
+    blocker: str | None = None
+
+
+class UpdateOutcomeRequest(BaseModel):
+    """Sidecar acknowledgement. Targets/configuration are intentionally absent."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    operation: Literal["check", "install"]
+    action_generation: int = Field(ge=0)
+    lease_token: str | None = Field(default=None, min_length=32, max_length=256)
+    outcome: Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
+    current_digest: str | None = Field(default=None, max_length=255)
+    available_digest: str | None = Field(default=None, max_length=255)
+    current_build: str | None = Field(default=None, max_length=255)
+    available_build: str | None = Field(default=None, max_length=255)
+    from_build: str | None = Field(default=None, max_length=255)
+    to_build: str | None = Field(default=None, max_length=255)
+    detail_code: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
+
+    @model_validator(mode="after")
+    def _install_requires_lease(self) -> UpdateOutcomeRequest:
+        allowed = {
+            "check": {"no_update", "update_available", "failed"},
+            "install": {"succeeded", "failed", "rolled_back"},
+        }
+        if self.outcome not in allowed[self.operation]:
+            raise ValueError(f"{self.outcome} is not a valid {self.operation} outcome")
+        if self.operation == "install" and self.lease_token is None:
+            raise ValueError("install outcomes require a lease_token")
+        if self.operation == "check" and self.lease_token is not None:
+            raise ValueError("check outcomes must not include a lease_token")
         return self
 
 
