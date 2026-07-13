@@ -1521,10 +1521,17 @@ async def test_assert_safe_fetch_url_shape_never_resolves_dns(
 
     ``fake_getaddrinfo`` must return normally (not raise) so that ``calls``
     genuinely reflects whether the resolver was invoked -- a mock that raises
-    on any call would make the post-call ``assert calls == 0`` vacuously true
-    (unreachable otherwise), which is exactly what CodeQL's py/redundant-
-    comparison flagged (alert #339): the assertion could never actually catch
-    a regression that made the shape check resolve DNS.
+    on any call would make an ``assert calls == 0`` right after it vacuously
+    true (unreachable otherwise).
+
+    A single ``assert calls == 0`` covers both calls below rather than one
+    per call: the well-formed URL passes shape validation without needing
+    DNS, and the malformed-scheme URL is rejected by URL parsing before any
+    resolver call is even possible, so repeating the identical comparison
+    after each call adds no coverage -- CodeQL's py/redundant-comparison
+    correctly flagged the second occurrence as provably redundant given the
+    first (alert #339). Either call incrementing ``calls`` still fails this
+    single assertion, so the regression coverage is unchanged.
     """
     calls = 0
 
@@ -1537,12 +1544,12 @@ async def test_assert_safe_fetch_url_shape_never_resolves_dns(
 
     # A safe-looking, well-formed URL passes without ever touching the resolver.
     await _assert_safe_fetch_url_shape("http://indexer.example/download/1")
-    assert calls == 0
 
     # Malformed shape (bad scheme) is still vetoed -- entirely off URL parsing,
     # no resolver involved either.
     with pytest.raises(QbittorrentSourceError):
         await _assert_safe_fetch_url_shape("ftp://indexer.example/download/1")
+
     assert calls == 0
 
 
