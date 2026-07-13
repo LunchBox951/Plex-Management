@@ -7,7 +7,7 @@ snapshots the SQLite database (WAL-consistent, via :func:`sqlite3.Connection.bac
 the Fernet encryption key as **one recovery unit** into
 ``<data_dir>/backups/pre-migrate-<from-rev>-<timestamp>/``, alongside a
 human-readable ``MANIFEST.txt`` restore runbook. Backups are pruned to the
-most recent :data:`_KEEP_COUNT`, with two guards that both protect the same
+most recent :data:`_KEEP_COUNT`, with three guards that all protect the same
 thing -- the one genuinely clean pre-migration snapshot -- from
 ``restart: unless-stopped`` retry loops:
 
@@ -19,7 +19,15 @@ thing -- the one genuinely clean pre-migration snapshot -- from
    skipped (and skip pruning) rather than snapshotted -- so retry backups can
    neither masquerade as clean recovery units nor feed :func:`_prune` until
    it evicts the real one.
-2. **A defensive unknown-head backup never triggers a prune** (see
+2. **An upgrade-in-progress marker survives intermediate stamps** (see
+   :data:`_MARKER_NAME`): ``alembic upgrade head`` stamps after each revision
+   it applies, so a multi-revision upgrade ``A -> B -> C`` that fails in
+   ``B -> C`` retries with ``current == B`` -- a from-revision guard 1 has
+   never seen. The marker, written alongside the clean backup at ``A`` and
+   cleared only once a head is reached, tells such a retry that the database
+   is mid-upgrade (not a clean pre-migration state), so it takes nothing and
+   prunes nothing; the marked backup remains the recovery unit.
+3. **A defensive unknown-head backup never triggers a prune** (see
    :data:`_UNKNOWN_HEAD`): when the head itself cannot be determined, no
    pending migration is confirmed, so such a backup must not be able to evict
    a genuine one.
@@ -37,13 +45,14 @@ relying on Alembic downgrade scripts as a general rollback path.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import os
 import shutil
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, TypedDict, cast
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from sqlalchemy.engine import make_url
@@ -70,6 +79,82 @@ _MANIFEST_NAME: Final = "MANIFEST.txt"
 # multiple heads, or the scripts directory is unreadable) -- never matches a
 # real ``alembic_version`` row, so the "already at head" skip never fires.
 _UNKNOWN_HEAD: Final = "__unknown__"
+
+# Cross-restart record of an upgrade that has started but not yet reached its
+# target head. ``alembic upgrade head`` stamps the database after EACH revision
+# it applies, so a multi-revision upgrade A -> B -> C that fails in B -> C
+# leaves ``current == B`` on the retry -- a from-revision the same-from-rev
+# dedupe has never seen. Without this marker, the retry would publish a
+# "fresh" backup of the B-stamped database that already contains partial C
+# DDL, and that dirty-but-newer unit could be mistaken for the rollback point
+# (and its prune could evict the genuinely clean ``pre-migrate-A-*``). Lives
+# in the backups dir; a leading dot keeps it out of every backup glob.
+_MARKER_NAME: Final = ".upgrade-in-progress.json"
+
+
+class _UpgradeMarker(TypedDict):
+    """Persisted as ``backups/.upgrade-in-progress.json`` (see ``_MARKER_NAME``)."""
+
+    from_rev: str  # the from-label the clean backup was taken at ("base" or a rev)
+    head: str  # the target head of the upgrade the backup guards (may be _UNKNOWN_HEAD)
+    backup: str  # directory name of that clean backup
+    created: str  # ISO timestamp, for the operator reading the file
+
+
+def _read_marker(backups_root: Path) -> _UpgradeMarker | None:
+    """Load the in-progress-upgrade marker; a corrupt one reads as absent."""
+    marker_path = backups_root / _MARKER_NAME
+    try:
+        raw: object = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("marker is not a JSON object")
+        data = cast("dict[object, object]", raw)
+        return _UpgradeMarker(
+            from_rev=str(data["from_rev"]),
+            head=str(data["head"]),
+            backup=str(data["backup"]),
+            created=str(data.get("created", "")),
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError):
+        # A corrupt/unreadable marker must degrade to the pre-marker behaviour
+        # (fresh backup per new from-revision), never brick the backup path.
+        logger.warning(
+            "Could not read upgrade-in-progress marker %s; ignoring it.",
+            marker_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _write_marker(backups_root: Path, marker: _UpgradeMarker) -> None:
+    """Best-effort persist of the marker -- the backup itself matters more."""
+    try:
+        (backups_root / _MARKER_NAME).write_text(
+            json.dumps(marker, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        logger.warning(
+            "Could not write the upgrade-in-progress marker to %s; if this "
+            "upgrade fails after an intermediate revision stamp, a retry may "
+            "take an extra (partially-migrated) backup -- prefer the OLDEST "
+            "pre-migrate-* unit when rolling back.",
+            backups_root / _MARKER_NAME,
+            exc_info=True,
+        )
+
+
+def _clear_marker(backups_root: Path) -> None:
+    """Remove the marker (missing is fine; other failures are logged)."""
+    try:
+        (backups_root / _MARKER_NAME).unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Could not remove upgrade-in-progress marker %s",
+            backups_root / _MARKER_NAME,
+            exc_info=True,
+        )
 
 
 def _sqlite_file_path(settings: Settings) -> Path | None:
@@ -454,10 +539,11 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     """Snapshot the DB + Fernet key as one unit when a migration is pending.
 
     Returns the created backup directory, or ``None`` when no backup was
-    written (non-SQLite backend, no existing database, already at head, or a
-    backup for the same pending from-revision already exists and remains the
-    recovery unit -- every case is logged honestly so the operator knows why
-    nothing happened).
+    written (non-SQLite backend, no existing database, already at head, a
+    backup for the same pending from-revision already exists, or an upgrade is
+    still in flight past an intermediate revision stamp and the marked backup
+    remains the recovery unit -- every case is logged honestly so the operator
+    knows why nothing happened).
     """
     settings = settings or get_settings()
 
@@ -478,7 +564,13 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     current = _current_revision(db_path)
     head = _head_revision()
     is_defensive_unknown_head = head == _UNKNOWN_HEAD
+    backups_root = Path(settings.data_dir) / _BACKUP_SUBDIR
     if current == head:
+        # Any marked upgrade is over: either it completed (current advanced to
+        # its target) or the operator restored/rolled back to a matching image.
+        # Either way the marker's job -- suppressing dirty retry backups while
+        # an upgrade was in flight -- is done.
+        _clear_marker(backups_root)
         logger.info(
             "Database already at head revision %s; no migration pending, "
             "skipping pre-migration backup.",
@@ -510,7 +602,6 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
 
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     from_label = current or "base"
-    backups_root = Path(settings.data_dir) / _BACKUP_SUBDIR
 
     # At most ONE backup per from-revision. Under ``restart: unless-stopped``,
     # a migration that fails midway (some DDL applied, the version not yet
@@ -542,6 +633,47 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
             )
             return None
 
+    # An upgrade marker survives INTERMEDIATE revision stamps, which the
+    # same-from-rev dedupe above cannot see: ``alembic upgrade head`` stamps
+    # after each revision it applies, so a multi-revision upgrade A -> B -> C
+    # that fails in B -> C retries with ``current == B`` -- a from-revision with
+    # no existing backup. The marker (written when the clean backup at A was
+    # taken, cleared only once a head is reached) tells this retry that an
+    # upgrade is still in flight and the database state is NOT a clean
+    # pre-migration point: the marked backup remains the one honest recovery
+    # unit, so no fresh backup is taken and nothing is pruned.
+    marker = _read_marker(backups_root)
+    if marker is not None:
+        if marker["head"] == current:
+            # The marked upgrade reached its target; ``current != head`` means a
+            # NEWER image is now starting its own upgrade from here. The state
+            # at ``current`` is clean -- clear the marker and back it up fresh.
+            _clear_marker(backups_root)
+            marker = None
+        elif not (backups_root / marker["backup"]).is_dir():
+            # The marked backup was archived/removed (e.g. after a completed
+            # manual restore, per the MANIFEST's final step) -- the marker no
+            # longer guards anything real.
+            _clear_marker(backups_root)
+            marker = None
+        else:
+            logger.warning(
+                "An upgrade toward revision %s is already IN FLIGHT (it "
+                "previously stamped an intermediate revision and then failed; "
+                "the database is now at %s and may contain partially-applied "
+                "changes). The clean pre-upgrade backup is %s -- taking a "
+                "fresh snapshot now would capture the partially-migrated "
+                "database, so none is taken and nothing is pruned. If you "
+                "deliberately reset the database and want a fresh snapshot, "
+                "delete %s and archive the old pre-migrate-* directories "
+                "first.",
+                marker["head"],
+                from_label,
+                backups_root / marker["backup"],
+                backups_root / _MARKER_NAME,
+            )
+            return None
+
     final_name = f"{_PREFIX}{from_label}-{timestamp}"
     dest = backups_root / final_name
     # Build into a ``.tmp-`` staging dir and publish it via an atomic rename only
@@ -551,6 +683,20 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     # restore unit; the staging dir is removed on failure and swept by _prune.
     staging = backups_root / f"{_TMP_PREFIX}{final_name}"
     staging.mkdir(parents=True, exist_ok=True)
+    # Record the upgrade this backup guards BEFORE publishing it (see the
+    # marker rationale above). Deliberately written first: if the snapshot
+    # below crashes, the marker points at a nonexistent directory and is
+    # ignored-and-replaced on the next start -- whereas writing it after the
+    # publish would leave a crash window in which the backup exists unguarded.
+    _write_marker(
+        backups_root,
+        _UpgradeMarker(
+            from_rev=from_label,
+            head=head if head is not None else _UNKNOWN_HEAD,
+            backup=final_name,
+            created=datetime.now(UTC).isoformat(),
+        ),
+    )
     try:
         _snapshot_sqlite(db_path, staging / _DB_COPY_NAME)
         key_disposition = _copy_key(settings, staging)

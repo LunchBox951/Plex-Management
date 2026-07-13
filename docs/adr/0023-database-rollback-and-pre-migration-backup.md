@@ -95,6 +95,18 @@ database.
   evict. The `MANIFEST.txt` restore runbook therefore ends by telling the
   operator to archive a used backup directory out of `backups/`, so a future
   upgrade attempt from that same revision takes a fresh snapshot.
+- Records an **upgrade-in-progress marker**
+  (`backups/.upgrade-in-progress.json`) alongside each fresh backup, cleared
+  only once the database reaches a head. This closes the gap the
+  per-from-revision rule alone cannot see: `alembic upgrade head` stamps the
+  database after **each** revision it applies, so a multi-revision upgrade
+  A→B→C that fails in B→C retries with `current == B` — a from-revision with
+  no existing backup. The marker tells that retry the database is mid-upgrade
+  (B-stamped **plus partially-applied C changes** — not a clean pre-migration
+  state), so no new snapshot is taken and nothing is pruned; the marked
+  backup at A remains the one honest recovery unit. A marker whose backup
+  directory was archived, or whose target head the database has since
+  reached, is stale and is cleared automatically.
 - Prunes to the 5 most recent backup directories (sorted by modification time,
   not by directory name — the name embeds an arbitrary revision hash before
   the timestamp, which is not chronologically sortable). A defensive

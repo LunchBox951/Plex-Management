@@ -77,6 +77,32 @@ def _real_old_rev() -> str:
     return base
 
 
+def _real_intermediate_rev() -> str:
+    """A real, in-graph revision strictly between base and head.
+
+    Used to simulate ``alembic upgrade head`` stamping an INTERMEDIATE revision
+    partway through a multi-revision upgrade before failing.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    revisions = [r.revision for r in script.walk_revisions()]
+    assert len(revisions) >= 3, "need at least base, one intermediate, and head"
+    mid = revisions[len(revisions) // 2]
+    assert mid != _real_head() and mid != _real_old_rev()
+    return mid
+
+
+def _restamp_db(db_path: Path, revision: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE alembic_version SET version_num = ?", (revision,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_skips_when_database_file_missing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
@@ -825,6 +851,154 @@ def test_prune_protects_fresh_backup_against_newer_mtime_siblings(tmp_path: Path
     # ...and the prune still bounded the total to _KEEP_COUNT by evicting the
     # oldest EXISTING unit to make room, not the fresh one.
     assert len(remaining) == db_backup._KEEP_COUNT  # pyright: ignore[reportPrivateUsage]
+
+
+def test_intermediate_stamp_retry_takes_no_dirty_backup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding: a retry after an INTERMEDIATE revision stamp must not back up.
+
+    ``alembic upgrade head`` stamps after each revision it applies. If A -> B
+    succeeds (stamping B) and B -> C then fails midway, the retry enters with
+    ``current == B`` -- a from-revision the same-from-rev dedupe has never
+    seen -- while the database is B-stamped PLUS partially-applied C changes.
+    Without the upgrade marker, that retry publishes a dirty, newer-looking
+    backup that can be mistaken for the rollback unit and whose prune can evict
+    the genuinely clean ``pre-migrate-A-*``. The marker must suppress it.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    first = db_backup.create_pre_migration_backup(settings)
+    assert first is not None
+    first_snapshot = (first / "plex_manager.db").read_bytes()
+    marker_path = data_dir / "backups" / ".upgrade-in-progress.json"
+    assert marker_path.exists()
+
+    # Simulate the failed multi-revision upgrade: an intermediate revision got
+    # stamped, and some of the NEXT migration's DDL landed before the failure.
+    _restamp_db(db_path, _real_intermediate_rev())
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE partial_next_ddl (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with caplog.at_level(logging.WARNING, logger=db_backup.logger.name):
+        retry = db_backup.create_pre_migration_backup(settings)
+
+    assert retry is None
+    backups_root = data_dir / "backups"
+    remaining = sorted(p.name for p in backups_root.iterdir() if p.is_dir())
+    # Only the clean first backup exists -- no dirty intermediate-rev unit --
+    # and its snapshot bytes are untouched (nothing pruned, nothing rewritten).
+    assert remaining == [first.name]
+    assert (first / "plex_manager.db").read_bytes() == first_snapshot
+    assert any("IN FLIGHT" in record.message for record in caplog.records)
+    # The marker survives the retry: the upgrade is still incomplete.
+    assert marker_path.exists()
+
+
+def test_marker_cleared_after_completed_upgrade_allows_next_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished upgrade's marker must not suppress the NEXT upgrade's backup.
+
+    Fast-redeploy case: the upgrade to C completes, and an image with head D
+    starts before any successful boot cleared the marker. ``current`` now
+    equals the marker's target head, so the marker is stale -- the state at C
+    is clean and the C -> D upgrade deserves its own fresh backup.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    first = db_backup.create_pre_migration_backup(settings)
+    assert first is not None
+
+    # The upgrade completes (database reaches this image's real head)...
+    real_head = _real_head()
+    _restamp_db(db_path, real_head)
+    # ...and a NEWER image (head D, beyond this graph's head) starts next.
+    monkeypatch.setattr(db_backup, "_head_revision", lambda: "future-head-d")  # pyright: ignore[reportPrivateUsage]
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    # The stale marker was cleared and an honest fresh backup taken at C.
+    assert result is not None
+    assert result.name.startswith(f"pre-migrate-{real_head}-")
+    marker = (data_dir / "backups" / ".upgrade-in-progress.json").read_text(encoding="utf-8")
+    assert real_head in marker  # the marker now guards the NEW upgrade
+
+
+def test_already_at_head_clears_leftover_marker(tmp_path: Path) -> None:
+    """Reaching head retires the marker (the marked upgrade is over)."""
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    first = db_backup.create_pre_migration_backup(settings)
+    assert first is not None
+    marker_path = data_dir / "backups" / ".upgrade-in-progress.json"
+    assert marker_path.exists()
+
+    _restamp_db(db_path, _real_head())
+
+    assert db_backup.create_pre_migration_backup(settings) is None
+    assert not marker_path.exists()
+
+
+def test_marker_with_archived_backup_is_stale_and_fresh_backup_taken(
+    tmp_path: Path,
+) -> None:
+    """A marker whose backup dir was archived away no longer guards anything.
+
+    Per the MANIFEST's final step, an operator archives a used backup out of
+    ``backups/`` after restoring it. The leftover marker must then be cleared
+    so the retried upgrade gets a fresh, honest snapshot of the restored state.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+
+    first = db_backup.create_pre_migration_backup(settings)
+    assert first is not None
+    shutil.rmtree(first)  # operator archived the restored unit away
+
+    second = db_backup.create_pre_migration_backup(settings)
+
+    # A fresh backup was taken (the stale marker did not suppress it). Its name
+    # may equal the archived one's if both runs share a timestamp second -- the
+    # published directory itself is what matters.
+    assert second is not None
+    assert second.is_dir()
+    assert (second / "plex_manager.db").exists()
+
+
+def test_corrupt_marker_degrades_to_fresh_backup(tmp_path: Path) -> None:
+    """A corrupt marker must read as absent, never brick the backup path."""
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "plex_manager.db"
+    _stamp_db(db_path, _real_old_rev())
+    _write_key(data_dir)
+    backups_root = data_dir / "backups"
+    backups_root.mkdir(parents=True)
+    (backups_root / ".upgrade-in-progress.json").write_text("{not json", encoding="utf-8")
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
 
 
 def test_prune_sweeps_abandoned_temp_dirs(tmp_path: Path) -> None:
