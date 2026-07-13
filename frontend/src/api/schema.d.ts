@@ -117,7 +117,7 @@ export interface paths {
         };
         /**
          * Discover Home
-         * @description Return the server-composed Discover home (spotlight + ordered rows).
+         * @description Return the server-composed Discover home (spotlights + ordered rows).
          */
         get: operations["discover_home_api_v1_discover_home_get"];
         put?: never;
@@ -1404,12 +1404,13 @@ export interface components {
         };
         /**
          * DiscoverHomeResponse
-         * @description The composed Discover home: an optional spotlight + ordered rows.
+         * @description The composed Discover home: ordered spotlight candidates + rows.
          */
         DiscoverHomeResponse: {
             /** Rows */
             rows: components["schemas"]["DiscoverHomeRow"][];
-            spotlight?: components["schemas"]["DiscoverResult"] | null;
+            /** Spotlights */
+            spotlights: components["schemas"]["DiscoverResult"][];
         };
         /**
          * DiscoverHomeRow

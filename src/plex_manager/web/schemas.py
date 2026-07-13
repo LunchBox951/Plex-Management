@@ -782,11 +782,11 @@ class DiscoverHomeRow(BaseModel):
 
 
 class DiscoverHomeResponse(BaseModel):
-    """The composed Discover home: an optional spotlight + ordered rows."""
+    """The composed Discover home: ordered spotlight candidates + rows."""
 
     model_config = ConfigDict(frozen=True)
 
-    spotlight: DiscoverResult | None = None
+    spotlights: list[DiscoverResult]
     rows: list[DiscoverHomeRow]
 
 

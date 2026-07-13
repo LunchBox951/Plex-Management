@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useDiscoverHome,
   useRequests,
@@ -95,9 +96,9 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
   }
 }
 
-function mockHome(items: DiscoverResult[] = [MOVIE], spotlight: DiscoverResult | null = null) {
+function mockHome(items: DiscoverResult[] = [MOVIE], spotlights: DiscoverResult[] = []) {
   ;(useDiscoverHome as unknown as Mock).mockReturnValue({
-    data: { spotlight, rows: [{ row_type: 'trending', title: 'Trending', items }] },
+    data: { spotlights, rows: [{ row_type: 'trending', title: 'Trending', items }] },
     isLoading: false,
     isError: false,
     dataUpdatedAt: Date.now(),
@@ -122,6 +123,10 @@ beforeEach(() => {
   ;(useRequestsInvalidated as unknown as Mock).mockReturnValue(false)
 })
 
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe('Discover — hero-first home (issue #188)', () => {
   it('removes the page heading, subtitle, and inline search input', () => {
     render(<Discover />)
@@ -132,7 +137,7 @@ describe('Discover — hero-first home (issue #188)', () => {
   })
 
   it('renders Spotlight before the first home row on a successful response', () => {
-    mockHome([MOVIE], HERO)
+    mockHome([MOVIE], [HERO])
     render(<Discover />)
 
     const hero = screen.getByRole('heading', { name: HERO.title }).closest('section')
@@ -145,9 +150,37 @@ describe('Discover — hero-first home (issue #188)', () => {
   it('lets the first non-empty row lead when the server returns no spotlight', () => {
     const view = render(<Discover />)
 
-    expect(view.container.firstElementChild?.firstElementChild).toBe(
+    expect(view.container.firstElementChild?.firstElementChild?.firstElementChild).toBe(
       screen.getByRole('heading', { name: 'Trending' }).closest('section'),
     )
+  })
+
+  it('passes the header search-overlay state through to pause spotlight rotation', () => {
+    vi.useFakeTimers()
+    mockHome([MOVIE], [HERO, SHOW])
+    render(
+      <MemoryRouter>
+        <Routes>
+          <Route element={<Outlet context={{ searchOpen: true }} />}>
+            <Route index element={<Discover />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    act(() => vi.advanceTimersByTime(20_000))
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(HERO.title)
+  })
+
+  it('pauses rotation while the title modal is open', () => {
+    vi.useFakeTimers()
+    mockHome([MOVIE], [HERO, SHOW])
+    render(<Discover />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    act(() => vi.advanceTimersByTime(20_000))
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(HERO.title)
   })
 })
 

@@ -100,7 +100,7 @@ async def test_discovery_requires_api_key(client: httpx.AsyncClient, seed: SeedF
     assert response.status_code == 401
 
 
-async def test_home_composes_rows_and_picks_a_spotlight(
+async def test_home_composes_rows_and_returns_ordered_plural_spotlights(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -112,15 +112,67 @@ async def test_home_composes_rows_and_picks_a_spotlight(
             year=2024,
             backdrop_url="http://img/a.jpg",
         ),
+        MediaSearchResult(
+            tmdb_id=2,
+            media_type="movie",
+            title="Backdrop Two",
+            backdrop_url="http://img/b.jpg",
+        ),
+        MediaSearchResult(
+            tmdb_id=3,
+            media_type="movie",
+            title="Backdrop Three",
+            backdrop_url="http://img/c.jpg",
+        ),
     ]
-    popular = [MediaSearchResult(tmdb_id=2, media_type="movie", title="Popular Two", year=2023)]
-    override_adapters(app, tmdb=FakeTmdb(trending=trending, popular=popular, upcoming=[]))
+    popular = [MediaSearchResult(tmdb_id=20, media_type="movie", title="No Backdrop")]
+    shows = [
+        MediaSearchResult(
+            tmdb_id=11,
+            media_type="tv",
+            title="Show One",
+            backdrop_url="http://img/show-a.jpg",
+        ),
+        MediaSearchResult(
+            tmdb_id=12,
+            media_type="tv",
+            title="Show Two",
+            backdrop_url="http://img/show-b.jpg",
+        ),
+        MediaSearchResult(
+            tmdb_id=13,
+            media_type="tv",
+            title="Show Three",
+            backdrop_url="http://img/show-c.jpg",
+        ),
+    ]
+    library = FakeLibrary(available={2}, available_tv_seasons={12: frozenset({1})})
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            trending=trending,
+            popular=popular,
+            upcoming=[],
+            trending_tv_results=shows,
+            popular_tv_results=[shows[0]],  # duplicate row appearance collapses in hero only
+        ),
+        library=library,
+    )
 
     response = await client.get("/api/v1/discover/home", headers=_HEADERS)
     assert response.status_code == 200
     body = response.json()
-    # The first item with a backdrop becomes the spotlight.
-    assert body["spotlight"]["tmdb_id"] == 1
+    assert [(item["media_type"], item["tmdb_id"]) for item in body["spotlights"]] == [
+        ("movie", 1),
+        ("tv", 11),
+        ("movie", 2),
+        ("tv", 12),
+        ("movie", 3),
+        ("tv", 13),
+    ]
+    states = {item["tmdb_id"]: item["library_state"] for item in body["spotlights"]}
+    assert states[2] == "available"
+    assert states[12] == "available"
     assert [row["row_type"] for row in body["rows"]] == [
         "trending",
         "popular",
@@ -129,7 +181,11 @@ async def test_home_composes_rows_and_picks_a_spotlight(
         "popular_tv",
     ]
     assert body["rows"][0]["items"][0]["backdrop_url"] == "http://img/a.jpg"
+    assert [item["tmdb_id"] for item in body["rows"][0]["items"]] == [1, 2, 3]
+    assert [item["tmdb_id"] for item in body["rows"][3]["items"]] == [11, 12, 13]
+    assert [item["tmdb_id"] for item in body["rows"][4]["items"]] == [11]
     assert body["rows"][2]["items"] == []  # upcoming was empty — an honest empty row
+    assert library.present_ids_calls == 1
 
 
 async def test_category_returns_a_paginated_list(
@@ -373,10 +429,19 @@ async def test_home_scopes_request_badges_for_shared_sessions_too(
     await _seed_request(
         sessionmaker_, tmdb_id=31, media_type="movie", status="downloading", user_id=neighbor_id
     )
-    trending = [MediaSearchResult(tmdb_id=31, media_type="movie", title="Foreign Active")]
+    trending = [
+        MediaSearchResult(
+            tmdb_id=31,
+            media_type="movie",
+            title="Foreign Active",
+            backdrop_url="https://image/foreign.jpg",
+        )
+    ]
     override_adapters(app, tmdb=FakeTmdb(trending=trending, popular=[], upcoming=[]))
 
     response = await client.get("/api/v1/discover/home", cookies=cookies)
     assert response.status_code == 200
-    trending_row = next(r for r in response.json()["rows"] if r["row_type"] == "trending")
+    body = response.json()
+    trending_row = next(r for r in body["rows"] if r["row_type"] == "trending")
     assert trending_row["items"][0]["library_state"] == "none"  # no leak
+    assert body["spotlights"][0]["library_state"] == "none"  # no leak in hero either

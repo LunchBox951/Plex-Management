@@ -11,6 +11,11 @@ import { useDiscoverTilePresentation } from './useDiscoverTilePresentation'
 
 const SEARCH_DEBOUNCE_MS = 300
 
+interface SearchOverlayProps {
+  /** Lets the shell pause background motion while this full-screen dialog is open. */
+  onOpenChange?: (open: boolean) => void
+}
+
 function useDebounced<T>(value: T, delayMs: number): [T, (nextValue: T) => void] {
   const [debounced, setDebounced] = useState(value)
 
@@ -59,7 +64,7 @@ function popularTitles(home: ReturnType<typeof useDiscoverHome>['data']): Discov
 }
 
 /** Global, accessible TMDB search mounted in the authenticated app header. */
-export function SearchOverlay() {
+export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
@@ -88,6 +93,17 @@ export function SearchOverlay() {
   const { tileState, quickRequestable } = useDiscoverTilePresentation(activeDataUpdatedAt, {
     enabled: open,
   })
+
+  useEffect(() => {
+    onOpenChange?.(open)
+  }, [onOpenChange, open])
+
+  useEffect(
+    () => () => {
+      onOpenChange?.(false)
+    },
+    [onOpenChange],
+  )
 
   useEffect(() => {
     const openWithSlash = (event: KeyboardEvent) => {

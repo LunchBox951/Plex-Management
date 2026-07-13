@@ -62,3 +62,51 @@
     background: transparent;
   }
 }
+
+@keyframes spotlight-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes spotlight-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.spotlight-fade-in {
+  animation: spotlight-fade-in 300ms ease-out both;
+}
+
+.spotlight-fade-out {
+  animation: spotlight-fade-out 300ms ease-out both;
+}
+
+.spotlight-radial-scrim {
+  background: radial-gradient(
+    ellipse 72% 70% at 19% 78%,
+    rgb(0 0 0 / 72%) 0%,
+    rgb(0 0 0 / 30%) 48%,
+    transparent 76%
+  );
+}
+
+.spotlight-copy-shadow {
+  text-shadow:
+    0 1px 2px rgb(0 0 0 / 95%),
+    0 8px 30px rgb(0 0 0 / 72%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spotlight-fade-in,
+  .spotlight-fade-out {
+    animation: none;
+  }
+}

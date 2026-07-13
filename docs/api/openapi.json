@@ -484,7 +484,7 @@
         "type": "object"
       },
       "DiscoverHomeResponse": {
-        "description": "The composed Discover home: an optional spotlight + ordered rows.",
+        "description": "The composed Discover home: ordered spotlight candidates + rows.",
         "properties": {
           "rows": {
             "items": {
@@ -493,18 +493,16 @@
             "title": "Rows",
             "type": "array"
           },
-          "spotlight": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/DiscoverResult"
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "spotlights": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverResult"
+            },
+            "title": "Spotlights",
+            "type": "array"
           }
         },
         "required": [
+          "spotlights",
           "rows"
         ],
         "title": "DiscoverHomeResponse",
@@ -3293,7 +3291,7 @@
     },
     "/api/v1/discover/home": {
       "get": {
-        "description": "Return the server-composed Discover home (spotlight + ordered rows).",
+        "description": "Return the server-composed Discover home (spotlights + ordered rows).",
         "operationId": "discover_home_api_v1_discover_home_get",
         "responses": {
           "200": {

@@ -134,7 +134,7 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
 function setHome(overrides: Record<string, unknown> = {}) {
   ;(useDiscoverHome as unknown as Mock).mockReturnValue({
     data: {
-      spotlight: null,
+      spotlights: [],
       rows: [
         { row_type: 'popular', title: 'Popular movies', items: [POPULAR_MOVIE] },
         { row_type: 'trending', title: 'Trending', items: [TRENDING_MOVIE] },
@@ -211,6 +211,18 @@ afterEach(() => {
 })
 
 describe('SearchOverlay — trigger, keyboard, and focus', () => {
+  it('reports open state to the shell for background-motion pause', async () => {
+    const onOpenChange = vi.fn()
+    render(<SearchOverlay onOpenChange={onOpenChange} />)
+    onOpenChange.mockClear()
+
+    openOverlay()
+    await waitFor(() => expect(onOpenChange).toHaveBeenLastCalledWith(true))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close search' }))
+    await waitFor(() => expect(onOpenChange).toHaveBeenLastCalledWith(false))
+  })
+
   it('focuses the input on open and restores trigger focus after close button or Escape', async () => {
     render(<SearchOverlay />)
 

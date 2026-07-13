@@ -74,7 +74,7 @@ async def _resolve_states(
     """Compute the base library-state for a whole page's tiles in ONE query + ONE crawl.
 
     Collects the full ``(tmdb_id, media_type)`` key set across ALL supplied items (for
-    the home feed: spotlight + every row, so decoration is a single pass, never a
+    the home feed: spotlights + every row, so decoration is a single pass, never a
     per-row fan-out) and answers it with one batched request-status lookup plus one
     batched Plex presence read. When Plex is unconfigured (``library`` is ``None``) or
     the crawl fails, presence degrades to empty and the tiles fall back to the
@@ -143,19 +143,15 @@ async def discover_home(
     library: Annotated[LibraryPort | None, Depends(get_library_optional)],
     auth: Annotated[AuthContext, Depends(require_api_key)],
 ) -> DiscoverHomeResponse:
-    """Return the server-composed Discover home (spotlight + ordered rows)."""
+    """Return the server-composed Discover home (spotlights + ordered rows)."""
     feed = await discovery_service.home(tmdb)
     all_items: list[MediaSearchResult] = [
-        *([feed.spotlight] if feed.spotlight is not None else []),
+        *feed.spotlights,
         *(item for row in feed.rows for item in row.items),
     ]
     states = await _resolve_states(session, library, all_items, auth)
     return DiscoverHomeResponse(
-        spotlight=(
-            _to_result(feed.spotlight, _state_for(states, feed.spotlight))
-            if feed.spotlight is not None
-            else None
-        ),
+        spotlights=[_to_result(item, _state_for(states, item)) for item in feed.spotlights],
         rows=[
             DiscoverHomeRow(
                 row_type=row.row_type,
