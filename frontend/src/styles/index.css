@@ -97,49 +97,51 @@
  * https://larsenwork.com/easing-gradients/) across the FULL slide so the
  * darkening ramps smoothly from the opaque bottom/left edge all the way to
  * fully transparent, matching the simple, smooth fade already used on the
- * title-detail modal's backdrop.
+ * title-detail modal's backdrop. Each stop is derived from the --color-bg
+ * token via color-mix() (not a hardcoded rgb() triplet) so the fade tracks
+ * the token if it's ever retuned.
  */
 .spotlight-bottom-fade {
   background: linear-gradient(
     to top,
-    rgb(10 12 16 / 100%) 0%,
-    rgb(10 12 16 / 98.7%) 5.9%,
-    rgb(10 12 16 / 95.1%) 11.8%,
-    rgb(10 12 16 / 89.6%) 17.6%,
-    rgb(10 12 16 / 82.5%) 23.5%,
-    rgb(10 12 16 / 74.1%) 29.4%,
-    rgb(10 12 16 / 64.8%) 35.3%,
-    rgb(10 12 16 / 55%) 41.2%,
-    rgb(10 12 16 / 45%) 47.1%,
-    rgb(10 12 16 / 35.2%) 52.9%,
-    rgb(10 12 16 / 25.9%) 58.8%,
-    rgb(10 12 16 / 17.5%) 64.7%,
-    rgb(10 12 16 / 10.4%) 70.6%,
-    rgb(10 12 16 / 4.9%) 76.5%,
-    rgb(10 12 16 / 1.3%) 82.4%,
-    rgb(10 12 16 / 0%) 88.2%
+    color-mix(in srgb, var(--color-bg) 100%, transparent) 0%,
+    color-mix(in srgb, var(--color-bg) 98.7%, transparent) 5.9%,
+    color-mix(in srgb, var(--color-bg) 95.1%, transparent) 11.8%,
+    color-mix(in srgb, var(--color-bg) 89.6%, transparent) 17.6%,
+    color-mix(in srgb, var(--color-bg) 82.5%, transparent) 23.5%,
+    color-mix(in srgb, var(--color-bg) 74.1%, transparent) 29.4%,
+    color-mix(in srgb, var(--color-bg) 64.8%, transparent) 35.3%,
+    color-mix(in srgb, var(--color-bg) 55%, transparent) 41.2%,
+    color-mix(in srgb, var(--color-bg) 45%, transparent) 47.1%,
+    color-mix(in srgb, var(--color-bg) 35.2%, transparent) 52.9%,
+    color-mix(in srgb, var(--color-bg) 25.9%, transparent) 58.8%,
+    color-mix(in srgb, var(--color-bg) 17.5%, transparent) 64.7%,
+    color-mix(in srgb, var(--color-bg) 10.4%, transparent) 70.6%,
+    color-mix(in srgb, var(--color-bg) 4.9%, transparent) 76.5%,
+    color-mix(in srgb, var(--color-bg) 1.3%, transparent) 82.4%,
+    color-mix(in srgb, var(--color-bg) 0%, transparent) 88.2%
   );
 }
 
 .spotlight-side-fade {
   background: linear-gradient(
     to right,
-    rgb(10 12 16 / 100%) 0%,
-    rgb(10 12 16 / 98.7%) 5.9%,
-    rgb(10 12 16 / 95.1%) 11.8%,
-    rgb(10 12 16 / 89.6%) 17.6%,
-    rgb(10 12 16 / 82.5%) 23.5%,
-    rgb(10 12 16 / 74.1%) 29.4%,
-    rgb(10 12 16 / 64.8%) 35.3%,
-    rgb(10 12 16 / 55%) 41.2%,
-    rgb(10 12 16 / 45%) 47.1%,
-    rgb(10 12 16 / 35.2%) 52.9%,
-    rgb(10 12 16 / 25.9%) 58.8%,
-    rgb(10 12 16 / 17.5%) 64.7%,
-    rgb(10 12 16 / 10.4%) 70.6%,
-    rgb(10 12 16 / 4.9%) 76.5%,
-    rgb(10 12 16 / 1.3%) 82.4%,
-    rgb(10 12 16 / 0%) 88.2%
+    color-mix(in srgb, var(--color-bg) 100%, transparent) 0%,
+    color-mix(in srgb, var(--color-bg) 98.7%, transparent) 5.9%,
+    color-mix(in srgb, var(--color-bg) 95.1%, transparent) 11.8%,
+    color-mix(in srgb, var(--color-bg) 89.6%, transparent) 17.6%,
+    color-mix(in srgb, var(--color-bg) 82.5%, transparent) 23.5%,
+    color-mix(in srgb, var(--color-bg) 74.1%, transparent) 29.4%,
+    color-mix(in srgb, var(--color-bg) 64.8%, transparent) 35.3%,
+    color-mix(in srgb, var(--color-bg) 55%, transparent) 41.2%,
+    color-mix(in srgb, var(--color-bg) 45%, transparent) 47.1%,
+    color-mix(in srgb, var(--color-bg) 35.2%, transparent) 52.9%,
+    color-mix(in srgb, var(--color-bg) 25.9%, transparent) 58.8%,
+    color-mix(in srgb, var(--color-bg) 17.5%, transparent) 64.7%,
+    color-mix(in srgb, var(--color-bg) 10.4%, transparent) 70.6%,
+    color-mix(in srgb, var(--color-bg) 4.9%, transparent) 76.5%,
+    color-mix(in srgb, var(--color-bg) 1.3%, transparent) 82.4%,
+    color-mix(in srgb, var(--color-bg) 0%, transparent) 88.2%
   );
 }
 

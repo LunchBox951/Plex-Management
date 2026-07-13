@@ -449,4 +449,15 @@ describe('Spotlight — banner size and fade (#275, #276)', () => {
     expect(bottomFade.className).toMatch(/\babsolute\b/)
     expect(bottomFade.className).toMatch(/\binset-0\b/)
   })
+
+  it('fades the side section smoothly across the whole slide instead of a hard two-stop band', () => {
+    renderSpotlight()
+    const sideFade = screen.getAllByTestId('spotlight-side-fade')[0]!
+
+    // Same banding fix as the bottom fade, applied to the left-side vignette.
+    expect(sideFade.className).not.toMatch(/\bbg-gradient-to-r\b/)
+    expect(sideFade.className).toMatch(/\bspotlight-side-fade\b/)
+    expect(sideFade.className).toMatch(/\babsolute\b/)
+    expect(sideFade.className).toMatch(/\binset-0\b/)
+  })
 })
