@@ -47,7 +47,7 @@ import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.datastructures import State
@@ -70,7 +70,7 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.services import log_capture_service, path_visibility
+from plex_manager.services import log_capture_service, path_visibility, session_lifecycle
 from plex_manager.services.health_service import (
     AutograbStatus,
     ReconcileStatus,
@@ -903,6 +903,30 @@ def _normalize_dt(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+async def _maybe_refresh_last_seen(
+    session: AsyncSession, auth_session: AuthSession, now: datetime
+) -> None:
+    """Slide the session's idle window forward, throttled (issue #56).
+
+    Writes ``last_seen_at = now`` only when the stored value is older than
+    ``SESSION_LAST_SEEN_REFRESH_INTERVAL``, so ordinary request traffic costs at
+    most one small UPDATE per interval, not one per request. A targeted UPDATE
+    (not an ORM mutation) keeps this independent of whatever the request's own
+    unit of work later stages; the commit is safe because auth resolves as a
+    dependency BEFORE the endpoint body runs, so nothing else is pending yet.
+    Best-effort: this runs on both the pooled request session and the
+    open-and-close short session used by long-lived SSE streams — on the latter
+    the commit persists just as well since the session is still open here.
+    """
+    effective = session_lifecycle.session_effective_last_seen(auth_session)
+    if now - effective < session_lifecycle.SESSION_LAST_SEEN_REFRESH_INTERVAL:
+        return
+    await session.execute(
+        update(AuthSession).where(AuthSession.id == auth_session.id).values(last_seen_at=now)
+    )
+    await session.commit()
+
+
 async def _session_auth_context(
     request: Request,
     session: AsyncSession,
@@ -926,8 +950,19 @@ async def _session_auth_context(
     expires_at = _normalize_dt(auth_session.expires_at)
     if expires_at <= now:
         return None
+    # Sliding idle window (issue #56), enforced ON TOP of the absolute
+    # ``expires_at`` cap: a session that has not been seen within
+    # ``SESSION_IDLE_WINDOW`` is dead even if the 30-day cap has not passed. The
+    # cap still bounds the maximum lifetime; this bounds inactivity.
+    if session_lifecycle.session_is_idle_expired(auth_session, now=now):
+        return None
     if enforce_csrf:
         _require_csrf_for_session(request)
+    # Refresh ``last_seen_at`` on this authenticated activity, throttled so a busy
+    # tab writes at most once per ``SESSION_LAST_SEEN_REFRESH_INTERVAL`` rather
+    # than once per request. Done only after every validity + CSRF check passes,
+    # so a rejected request never slides the window forward.
+    await _maybe_refresh_last_seen(session, auth_session, now)
     if auth_session.user_id is None:
         # A recovery session: minted by exchanging a valid ``X-Api-Key`` for this
         # HTTP-only cookie (``POST /auth/api-key``, CodeQL #263). It carries the

@@ -21,8 +21,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, status
-from sqlalchemy import CursorResult, select, update
+from fastapi import APIRouter, Depends, FastAPI, Request, Response, status
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,7 @@ from plex_manager.adapters.plex.oauth import (
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
+from plex_manager.services import session_lifecycle
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
     PLEX_MACHINE_ID_SETTING,
@@ -52,11 +53,20 @@ from plex_manager.web.deps import (
     get_http_client,
     hash_session_token,
     load_system_settings,
+    require_admin,
     require_api_key,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams
-from plex_manager.web.schemas import AuthMeResponse, AuthUser, PlexSignInRequest
+from plex_manager.web.schemas import (
+    ActiveSessionsResponse,
+    ActiveSessionUser,
+    AuthMeResponse,
+    AuthUser,
+    PlexSignInRequest,
+    RevokeSessionsRequest,
+    RevokeSessionsResponse,
+)
 
 __all__ = ["router"]
 
@@ -113,7 +123,11 @@ async def plex_sign_in_endpoint(
         is_admin = await _post_init_access(session, account, resources, client=plex_tv)
 
     user = await _upsert_user(
-        session, account_id=account.plex_id, username=account.username, is_admin=is_admin
+        session,
+        app=request.app,
+        account_id=account.plex_id,
+        username=account.username,
+        is_admin=is_admin,
     )
     user.email = account.email
     user.avatar_url = account.avatar_url
@@ -265,6 +279,95 @@ async def logout_endpoint(
             auth_method=AuthMethod.api_key.value,
         )
     _clear_session_cookies(response, request=request)
+
+
+# --------------------------------------------------------------------------- #
+# Admin session management (issue #56)
+# --------------------------------------------------------------------------- #
+@router.get("/sessions")
+async def list_active_sessions_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(require_admin)],
+) -> ActiveSessionsResponse:
+    """List every Plex user holding an active browser session (admin-only).
+
+    ADR-0016 sessions validate LOCALLY (plex.tv is never on the per-request
+    path), so a removed or demoted user keeps access until their session is
+    revoked — this is the operator's web-operable view of who is currently signed
+    in, the companion to :func:`revoke_user_sessions_endpoint`. "Active" mirrors
+    the auth path exactly: not revoked, not past the absolute ``expires_at`` cap,
+    and not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Recovery
+    (``X-Api-Key``-exchange) sessions have no Plex identity and are governed by the
+    Access recovery key, so they are deliberately not listed.
+    """
+    now = datetime.now(UTC)
+    idle_cutoff = now - session_lifecycle.SESSION_IDLE_WINDOW
+    result = await session.execute(
+        select(
+            User.id,
+            User.plex_id,
+            User.username,
+            User.permissions,
+            func.count(AuthSession.id),
+            func.max(AuthSession.last_seen_at),
+        )
+        .join(AuthSession, AuthSession.user_id == User.id)
+        .where(
+            AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > now,
+            func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
+        )
+        .group_by(User.id, User.plex_id, User.username, User.permissions)
+        .order_by(User.username)
+    )
+    users = [
+        ActiveSessionUser(
+            user_id=user_id,
+            plex_id=plex_id,
+            username=username,
+            is_admin=permissions > 0,
+            session_count=count,
+            last_seen_at=session_lifecycle.ensure_utc(last_seen) if last_seen is not None else None,
+            is_current_user=context.user_id == user_id,
+        )
+        for user_id, plex_id, username, permissions, count, last_seen in result.all()
+    ]
+    return ActiveSessionsResponse(users=users)
+
+
+@router.post("/sessions/revoke")
+async def revoke_user_sessions_endpoint(
+    body: RevokeSessionsRequest,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(require_admin)],
+) -> RevokeSessionsResponse:
+    """Revoke every active session for one Plex user, on demand (admin-only).
+
+    The web-operable lever issue #56 asks for: today only the automatic
+    mass-revoke-on-verified-repoint exists, which is a different mechanism. This
+    stamps ``revoked_at`` on all of the target user's still-active sessions (the
+    auditable-revoke convention — the rows survive for the sweep to reclaim), then
+    closes that user's open realtime streams so a demoted admin's SSE cannot keep
+    delivering admin topics past revocation (same family as issue #183). Their
+    next request re-authenticates and 401s.
+
+    No self-lockout footgun by design: an admin MAY revoke their own account's
+    sessions (``is_current_user`` flags it in the list), which simply signs the
+    current operator out — never a permanent lockout, since Plex sign-in (and the
+    recovery key) can always mint a fresh session (north star #1). A re-revoke or a
+    user with no active sessions is a harmless ``revoked: 0``.
+    """
+    revoked = await session_lifecycle.revoke_user_sessions(session, body.user_id)
+    await session.commit()
+    if revoked:
+        close_realtime_streams(
+            request.app,
+            reason="sessions_revoked",
+            auth_method=AuthMethod.plex_session.value,
+            user_id=body.user_id,
+        )
+    return RevokeSessionsResponse(revoked=revoked)
 
 
 # --------------------------------------------------------------------------- #
@@ -473,6 +576,7 @@ async def find_user_by_plex_id(session: AsyncSession, plex_id: int) -> User | No
 async def _upsert_user(
     session: AsyncSession,
     *,
+    app: FastAPI,
     account_id: int,
     username: str,
     is_admin: bool,
@@ -495,10 +599,22 @@ async def _upsert_user(
     The refreshed fields (``username``/``permissions``) are applied to the
     winner's row too — recovery converges on the same state the plain update
     path would have written.
+
+    Permission DOWNGRADE closes realtime streams (issue #183). A sign-in that
+    demotes a previously-admin account (e.g. the owner unshared the server, so
+    this account no longer owns it) revokes admin authority for every FUTURE
+    request via the ``permissions`` write, but an already-open admin SSE stream
+    captured its admin subscription at connect time and would keep delivering
+    admin-only invalidation topics until it disconnected. Mirroring the
+    logout/rotate/repoint call sites, we close that user's plex-session streams
+    the moment the demotion is observed so no still-open stream outlives the
+    authority it was granted under. A brand-NEW user (the create path) has no
+    prior authority to lose, so it never triggers this.
     """
+    new_permissions = 1 if is_admin else 0
     user = await find_user_by_plex_id(session, account_id)
     if user is None:
-        created = User(plex_id=account_id, username=username, permissions=1 if is_admin else 0)
+        created = User(plex_id=account_id, username=username, permissions=new_permissions)
         session.add(created)
         try:
             await session.flush()
@@ -509,8 +625,16 @@ async def _upsert_user(
                 raise
         else:
             return created
+    previous_permissions = user.permissions
     user.username = username
-    user.permissions = 1 if is_admin else 0
+    user.permissions = new_permissions
+    if new_permissions < previous_permissions:
+        close_realtime_streams(
+            app,
+            reason="permission_downgraded",
+            auth_method=AuthMethod.plex_session.value,
+            user_id=user.id,
+        )
     return user
 
 

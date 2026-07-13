@@ -362,6 +362,53 @@ class AuthMeResponse(BaseModel):
     user: AuthUser | None = None
 
 
+class ActiveSessionUser(BaseModel):
+    """One Plex user with at least one active browser session (admin view).
+
+    Aggregated per user, not per session: the admin revokes a *user's* access,
+    and a raw list of opaque session rows carries no operable meaning. Recovery
+    (``X-Api-Key``-exchange) sessions have no Plex identity and are governed by
+    the Access recovery key instead, so they are not listed here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    user_id: int
+    plex_id: int | None
+    username: str
+    is_admin: bool
+    session_count: int
+    last_seen_at: datetime | None
+    # Whether this row is the calling admin's OWN account — so the UI can flag
+    # that revoking it signs the current operator out (never a hidden lockout;
+    # sign-in is always available again, north star #1).
+    is_current_user: bool
+
+
+class ActiveSessionsResponse(BaseModel):
+    """Every Plex user holding an active browser session (admin view)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    users: list[ActiveSessionUser]
+
+
+class RevokeSessionsRequest(BaseModel):
+    """Target a single user whose active sessions an admin wants revoked."""
+
+    model_config = ConfigDict(frozen=True)
+
+    user_id: int
+
+
+class RevokeSessionsResponse(BaseModel):
+    """How many active sessions the revoke actually cut."""
+
+    model_config = ConfigDict(frozen=True)
+
+    revoked: int
+
+
 # --------------------------------------------------------------------------- #
 # Setup completion + status
 # --------------------------------------------------------------------------- #

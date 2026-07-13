@@ -104,6 +104,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Active Sessions Endpoint
+         * @description List every Plex user holding an active browser session (admin-only).
+         *
+         *     ADR-0016 sessions validate LOCALLY (plex.tv is never on the per-request
+         *     path), so a removed or demoted user keeps access until their session is
+         *     revoked — this is the operator's web-operable view of who is currently signed
+         *     in, the companion to :func:`revoke_user_sessions_endpoint`. "Active" mirrors
+         *     the auth path exactly: not revoked, not past the absolute ``expires_at`` cap,
+         *     and not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Recovery
+         *     (``X-Api-Key``-exchange) sessions have no Plex identity and are governed by the
+         *     Access recovery key, so they are deliberately not listed.
+         */
+        get: operations["list_active_sessions_endpoint_api_v1_auth_sessions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/sessions/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke User Sessions Endpoint
+         * @description Revoke every active session for one Plex user, on demand (admin-only).
+         *
+         *     The web-operable lever issue #56 asks for: today only the automatic
+         *     mass-revoke-on-verified-repoint exists, which is a different mechanism. This
+         *     stamps ``revoked_at`` on all of the target user's still-active sessions (the
+         *     auditable-revoke convention — the rows survive for the sweep to reclaim), then
+         *     closes that user's open realtime streams so a demoted admin's SSE cannot keep
+         *     delivering admin topics past revocation (same family as issue #183). Their
+         *     next request re-authenticates and 401s.
+         *
+         *     No self-lockout footgun by design: an admin MAY revoke their own account's
+         *     sessions (``is_current_user`` flags it in the list), which simply signs the
+         *     current operator out — never a permanent lockout, since Plex sign-in (and the
+         *     recovery key) can always mint a fresh session (north star #1). A re-revoke or a
+         *     user with no active sessions is a harmless ``revoked: 0``.
+         */
+        post: operations["revoke_user_sessions_endpoint_api_v1_auth_sessions_revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/blocklist": {
         parameters: {
             query?: never;
@@ -1452,6 +1515,39 @@ export interface components {
             waste_seasons: number[];
         };
         /**
+         * ActiveSessionUser
+         * @description One Plex user with at least one active browser session (admin view).
+         *
+         *     Aggregated per user, not per session: the admin revokes a *user's* access,
+         *     and a raw list of opaque session rows carries no operable meaning. Recovery
+         *     (``X-Api-Key``-exchange) sessions have no Plex identity and are governed by
+         *     the Access recovery key instead, so they are not listed here.
+         */
+        ActiveSessionUser: {
+            /** Is Admin */
+            is_admin: boolean;
+            /** Is Current User */
+            is_current_user: boolean;
+            /** Last Seen At */
+            last_seen_at: string | null;
+            /** Plex Id */
+            plex_id: number | null;
+            /** Session Count */
+            session_count: number;
+            /** User Id */
+            user_id: number;
+            /** Username */
+            username: string;
+        };
+        /**
+         * ActiveSessionsResponse
+         * @description Every Plex user holding an active browser session (admin view).
+         */
+        ActiveSessionsResponse: {
+            /** Users */
+            users: components["schemas"]["ActiveSessionUser"][];
+        };
+        /**
          * AppApiKeyResponse
          * @description The current (reveal) or freshly-minted (generate/rotate) app ``X-Api-Key``.
          *
@@ -2330,6 +2426,22 @@ export interface components {
          */
         RequestStatus: "pending" | "searching" | "no_acceptable_release" | "waiting_for_air_date" | "downloading" | "completed" | "available" | "partially_available" | "failed" | "import_blocked" | "evicted" | "cancelled";
         /**
+         * RevokeSessionsRequest
+         * @description Target a single user whose active sessions an admin wants revoked.
+         */
+        RevokeSessionsRequest: {
+            /** User Id */
+            user_id: number;
+        };
+        /**
+         * RevokeSessionsResponse
+         * @description How many active sessions the revoke actually cut.
+         */
+        RevokeSessionsResponse: {
+            /** Revoked */
+            revoked: number;
+        };
+        /**
          * SearchPreviewRequest
          * @description Preview by ``request_id`` OR by an explicit media descriptor.
          *
@@ -3040,6 +3152,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_active_sessions_endpoint_api_v1_auth_sessions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActiveSessionsResponse"];
+                };
+            };
+        };
+    };
+    revoke_user_sessions_endpoint_api_v1_auth_sessions_revoke_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeSessionsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevokeSessionsResponse"];
                 };
             };
             /** @description Validation Error */

@@ -8,6 +8,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
 import type {
+  ActiveSessionsResponse,
   AppApiKeyResponse,
   AppApiKeyStatusResponse,
   AuthMeResponse,
@@ -322,6 +323,42 @@ export function useRevokeAppKey() {
     mutationFn: async (): Promise<void> => ensureOk(await client.DELETE('/api/v1/settings/app-key')),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
+    },
+  })
+}
+
+/**
+ * Every Plex user holding an active browser session (admin-only). ADR-0016
+ * sessions validate locally, so a removed/demoted user keeps access until
+ * revoked — this is the operator's view of who is currently signed in.
+ */
+export function useActiveSessions(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.activeSessions,
+    enabled,
+    retry: false,
+    queryFn: async (): Promise<ActiveSessionsResponse> =>
+      unwrap(await client.GET('/api/v1/auth/sessions')),
+  })
+}
+
+/**
+ * Revoke every active session for one Plex user on demand (admin-only). Their
+ * open realtime streams are closed server-side and their next request
+ * re-authenticates. Invalidates the session list so the row updates; if the
+ * admin revoked their OWN account, `/auth/me` is invalidated too so the app
+ * re-renders signed-out.
+ */
+export function useRevokeUserSessions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (userId: number): Promise<void> =>
+      ensureOk(
+        await client.POST('/api/v1/auth/sessions/revoke', { body: { user_id: userId } }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.activeSessions })
+      void qc.invalidateQueries({ queryKey: queryKeys.authMe })
     },
   })
 }

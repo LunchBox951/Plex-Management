@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.config import get_settings
 from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
+from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers import auth as auth_module
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -391,6 +392,68 @@ async def test_post_init_shared_gets_limited_session(
     async with sessionmaker_() as db:
         user = (await db.execute(select(User).where(User.plex_id == 99))).scalars().one()
     assert user.permissions == 0
+
+
+async def test_sign_in_demotion_closes_that_users_realtime_streams(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #183: a sign-in that DEMOTES an account closes its open streams.
+
+    An admin SSE stream captures its admin subscription at connect time and would
+    keep delivering admin-only topics until disconnect. When the same account
+    signs in again but no longer owns the server (admin -> non-admin), the open
+    stream must be closed the moment ``_upsert_user`` observes the downgrade.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    # First sign-in: the owner is an admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    first = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert first.status_code == 200
+    assert first.json()["user"]["is_admin"] is True
+    user_id = first.json()["user"]["id"]
+
+    # An admin SSE stream is open for this user.
+    subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=user_id)
+    assert subscription.closed is False
+
+    # The SAME account signs in again but now only has SHARED (not owned) access:
+    # admin -> non-admin. The open stream must be closed.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_shared_server()]))
+    second = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert second.status_code == 200
+    assert second.json()["user"]["is_admin"] is False
+    assert subscription.closed is True
+
+
+async def test_sign_in_without_demotion_keeps_streams_open(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A re-sign-in that does NOT lower permissions leaves open streams alone.
+
+    The guard is a permission DECREASE, not any write: an owner signing in again
+    (still admin) must not tear down their own live stream.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    first = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert first.status_code == 200
+    user_id = first.json()["user"]["id"]
+
+    subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=user_id)
+    # Still an owner on the second sign-in — admin stays admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    second = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert second.status_code == 200
+    assert second.json()["user"]["is_admin"] is True
+    assert subscription.closed is False
 
 
 async def test_post_init_no_access_rejected(
