@@ -136,7 +136,7 @@ flowchart TD
     Any -->|yes| Pick["Pick top candidate"]
 
     Pick --> Disk{"Enough disk space?"}
-    Disk -->|no| Evict["Evict oldest seeding torrents<br/>to free space + headroom"]
+    Disk -->|no| Evict["Evict watched, past-grace, unpinned<br/>library titles to free space + headroom"]
     Evict --> Disk
     Disk -->|yes| Grab["Send to download client (qBittorrent)<br/>Status: DOWNLOADING"]
 
@@ -169,7 +169,7 @@ Searching`. The exact states/transitions are finalized when v1 is planned.
 |---|---|
 | **Discovery** | TMDB browse/search/detail; resolve canonical metadata; expand shows → seasons/episodes. |
 | **Decision engine** | Borrowed parser → **ordered quality profile with a hard cutoff** (CAM/TS rejected, not merely down-ranked) → blocklist filter → scoring (incl. anime audio preference). |
-| **Download orchestration** | `DownloadClientPort` (qBittorrent adapter); the **reconciler** keeps client ↔ DB ↔ FS ↔ Plex consistent; disk-pressure eviction (oldest *seeding* first). |
+| **Download orchestration** | `DownloadClientPort` (qBittorrent adapter); the **reconciler** keeps client ↔ DB ↔ FS ↔ Plex consistent; watch-aware disk-pressure eviction (evicts fully-watched, past-grace, unpinned library titles/seasons, not seeding torrents; see ADR-0012). |
 | **Import** | Validate the file matches the expected media → rename to Plex conventions → route to Movies / TV / **Anime** root → trigger Plex scan. |
 | **Correction & recovery** | Report-issue flow; manual re-search / force-grab / cancel / delete; blocklist management; automatic state-drift healing. |
 | **Operability** | Web first-run **setup wizard**, **Settings UI** (no magic numbers), **health dashboard**, in-app **console/log viewer**. |
@@ -254,14 +254,15 @@ Plex scan · **correction UI** (report-issue, re-search, force-grab, cancel,
 delete, blocklist mgmt) · disk-full eviction · **Settings UI** · **health +
 console** · Alembic · Docker/GHCR · edge/stable channels.
 
-**Deferred to v1.1+:** policy-based retention (age/watch cleanup) · notifications ·
+**Deferred to v1.1+:** policy-based retention BEYOND watch/grace disk-pressure
+eviction (e.g. pure age cleanup, anime-specific policy) · notifications ·
 auto-upgrade (1080p→4K, JP→dual-audio) · multi-user roles/approvals/quotas ·
 calendar · watchlist sync · subtitles · additional download-client adapters ·
 Postgres.
 
-> **Open (parked) decision:** whether *policy-based retention* — a flagship
-> prototype feature — must ship in v1 or can wait for v1.1. Disk-pressure eviction
-> is in v1 regardless because the download path needs it.
+> **Open (parked) decision:** Watch-aware disk-pressure eviction (fully-watched +
+> grace + pin) ships in v1 (see ADR-0012); a broader policy-based retention layer
+> (arbitrary age/quota rules) remains parked for v1.1.
 
 ## 10. Non-goals (for now)
 

@@ -281,6 +281,13 @@ async def _reuse_terminal_row(
     ``timeout_at`` is reset alongside ``added_at`` for the same reason: a
     resurrected row gets a fresh, honest metadata-fetch deadline matching its
     reset stall-detection anchor (observability only — never read for control).
+
+    ``retry_count`` (issue #180's probe-outage retry bound) is likewise reset
+    to 0: without this, a row resurrected for a fresh grab would inherit
+    whatever probe-outage retry count accumulated during a PRIOR, unrelated
+    life of this same torrent-hash row, and could escalate to
+    ``import_blocked`` on the very next outage instead of getting its own
+    honest bound.
     """
     # #206: refuse to resurrect a terminal row whose torrent is being removed right
     # now (a concurrent cancel's post-commit delete, a reconcile-driven removal, or an
@@ -324,6 +331,7 @@ async def _reuse_terminal_row(
         release_title=release_title,
         added_at=now,
         timeout_at=now + METADATA_STALL_WINDOW,
+        retry_count=0,
     )
     if not claimed:
         await session.rollback()

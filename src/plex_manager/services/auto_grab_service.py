@@ -105,11 +105,13 @@ if TYPE_CHECKING:
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.indexer import IndexerPort
+    from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.parser import ParserPort
 
 __all__ = [
     "AIRING_REFRESH_MAX_PER_CYCLE",
+    "AIR_DATE_WAKE_MAX_PER_CYCLE",
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE",
     "BACKOFF_SCHEDULE",
     "COOLDOWN_SCHEDULE",
@@ -189,6 +191,15 @@ MAX_GRAB_ATTEMPTS_PER_SCOPE: int = 3
 # module constant mirroring :data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`, protecting
 # the single TMDB budget from a large install with many finished shows.
 AIRING_REFRESH_MAX_PER_CYCLE: int = 5
+
+# At most this many ``waiting_for_air_date`` seasons get re-checked against TMDB
+# per cycle by the air-date wake pass (issue #210,
+# :func:`plex_manager.services.season_request_service.wake_waiting_for_air_date`)
+# -- a module constant mirroring :data:`AIRING_REFRESH_MAX_PER_CYCLE`, protecting
+# the single TMDB budget. The waiting-season candidate set is tiny relative to an
+# install's whole library and shrinks permanently as rows wake, so this bound is
+# generous, not tight.
+AIR_DATE_WAKE_MAX_PER_CYCLE: int = 5
 
 # --------------------------------------------------------------------------- #
 # In-process grab-pipeline cooldown (Codex PR #31 round-3 #2)
@@ -306,6 +317,17 @@ class AutograbCycleResult:
     by the Pass-2 episode-level fallback rather than a Pass-1 season-pack grab --
     included in ``grabbed`` too, broken out here for observability into how often
     the fallback path (vs. a clean pack grab) is what actually completes a season.
+
+    ``air_date_woken`` (issue #210) counts ``waiting_for_air_date`` seasons THIS
+    cycle's air-date wake pass (:func:`plex_manager.services.
+    season_request_service.wake_waiting_for_air_date`) transitioned into the
+    searchable pipeline after TMDB began reporting them. A woken season is
+    collected by the SAME cycle's due-scope scan (it runs before
+    :func:`_collect_due_scopes`), so a season woken to ``pending`` can be
+    searched/grabbed in this very cycle; one woken straight to ``available``
+    (already in Plex) never enters the search loop at all -- this counter is the
+    caller's only signal that the transition happened, hence the realtime
+    invalidation gate in ``web/app.py``'s ``_autograb_once`` also checks it.
     """
 
     searched: int = 0
@@ -316,6 +338,7 @@ class AutograbCycleResult:
     last_grab_error: GrabError | None = None
     cooled_down: int = 0
     season_episode_fallback_grabs: int = 0
+    air_date_woken: int = 0
 
 
 @dataclass(frozen=True)
@@ -586,15 +609,33 @@ async def _attempt_episode_fallback(
             target
             and await download_repo.find_active_for_request(scope.request_id, season=season) is None
         ):
-            await season_request_service.mark_completed(
-                session, media_request_id=scope.request_id, season_number=season
+            # CAS-guarded (issue #229): a concurrent cancel/correction landing
+            # between ``_collect_due_scopes``' snapshot and this branch must
+            # never be resurrected as ``completed`` -- ``allowed_from`` is
+            # exactly the set of statuses this scope was legitimately due from.
+            completed = await season_request_service.mark_completed_if_in(
+                session,
+                media_request_id=scope.request_id,
+                season_number=season,
+                allowed_from=DUE_SEARCH_STATUSES,
             )
             await session.commit()
-            cooldowns.pop(scope_key, None)
+            if completed:
+                cooldowns.pop(scope_key, None)
+                _logger.info(
+                    "auto-grab: episode-fallback found the aired target fully imported "
+                    "(target shrank to the imported set); completing the season instead "
+                    "of parking it",
+                    extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
+                )
+                return _EpisodeFallbackOutcome(settled=True)
+            # Lost the CAS: a concurrent cancel/correction moved the season out
+            # of a due status. Don't resurrect it as completed; leave it as the
+            # other actor left it -- settled=True so the caller does not also
+            # park it (there is nothing due left to park).
             _logger.info(
-                "auto-grab: episode-fallback found the aired target fully imported "
-                "(target shrank to the imported set); completing the season instead "
-                "of parking it",
+                "auto-grab: episode-fallback completion skipped -- season no longer in a "
+                "due status (concurrent cancel/correction won); leaving as-is",
                 extra={"request_id": safe_int(scope.request_id), "season": safe_int(season)},
             )
             return _EpisodeFallbackOutcome(settled=True)
@@ -843,6 +884,7 @@ async def run_grab_cycle(
     profile: QualityProfile,
     qbt: DownloadClientPort,
     metadata: MetadataPort | None = None,
+    library: LibraryPort | None = None,
     max_searches: int = AUTO_GRAB_MAX_SEARCHES_PER_CYCLE,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -913,6 +955,16 @@ async def run_grab_cycle(
     :func:`_attempt_episode_fallback`). ``None`` (the default -- an unconfigured
     TMDB) disables both cleanly: Pass 1 behaves exactly as before this feature
     existed, and a scope with nothing acceptable still parks honestly.
+
+    ``metadata`` also powers a THIRD pre-pass (issue #210): a bounded, rotated
+    re-check of ``waiting_for_air_date`` seasons against TMDB
+    (:func:`plex_manager.services.season_request_service.
+    wake_waiting_for_air_date`, :data:`AIR_DATE_WAKE_MAX_PER_CYCLE`), run
+    immediately AFTER the airing pre-pass above and before due-scope collection --
+    so a season TMDB now reports is woken and searched/grabbed in this SAME
+    cycle. ``library`` (optional, mirrors ``metadata``) powers that wake's
+    Plex-present->``available`` short-circuit; ``None`` (unconfigured Plex) wakes
+    a season straight to the honest ``pending`` fallback instead.
     """
     now = now or datetime.now(UTC)
     # Park + cooldown scheduling read the clock FRESH at each event (round-3 #3); the
@@ -932,9 +984,21 @@ async def run_grab_cycle(
     # re-enters ``DUE_SEARCH_STATUSES`` in time to be collected THIS cycle. Bounded
     # and best-effort per season (a TMDB error for one season is logged and
     # skipped, never aborting the pass); a no-op when TMDB is unconfigured.
+    #
+    # The air-date wake pass (issue #210) runs SECOND, sharing the same
+    # ``metadata is not None`` guard: it must follow ``reconcile_airing``, not
+    # precede it, so a season this wake transitions to ``available`` this cycle is
+    # never ALSO picked up by ``reconcile_airing``'s own candidate query in the
+    # same pass (``reconcile_airing`` already selected its candidates before the
+    # wake runs) -- a benign but confusing double-touch this ordering avoids. Both
+    # writes land in the ONE commit below so the pre-pass stays a single unit.
+    air_date_woken = 0
     if metadata is not None:
         await season_episode_service.reconcile_airing(
-            session, metadata, now=now, max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
+            session, metadata, parser=parser, now=now, max_refresh=AIRING_REFRESH_MAX_PER_CYCLE
+        )
+        air_date_woken = await season_request_service.wake_waiting_for_air_date(
+            session, metadata, library, now=now, max_refresh=AIR_DATE_WAKE_MAX_PER_CYCLE
         )
         await session.commit()
 
@@ -1354,7 +1418,8 @@ async def run_grab_cycle(
     cooled_down = sum(1 for cd in cooldowns.values() if cd.not_before > now)
     _telemetry_logger.info(
         "auto-grab cycle: searched=%d grabbed=%d no_acceptable=%d skipped_active=%d "
-        "grab_errors=%d cooled_down=%d source_failures=%d season_episode_fallback_grabs=%d",
+        "grab_errors=%d cooled_down=%d source_failures=%d season_episode_fallback_grabs=%d "
+        "air_date_woken=%d",
         searched,
         grabbed,
         no_acceptable,
@@ -1363,9 +1428,11 @@ async def run_grab_cycle(
         cooled_down,
         source_failures,
         season_episode_fallback_grabs,
+        air_date_woken,
         extra={
             "source_failures": source_failures,
             "season_episode_fallback_grabs": season_episode_fallback_grabs,
+            "air_date_woken": air_date_woken,
         },
     )
     return AutograbCycleResult(
@@ -1377,4 +1444,5 @@ async def run_grab_cycle(
         last_grab_error=last_grab_error,
         cooled_down=cooled_down,
         season_episode_fallback_grabs=season_episode_fallback_grabs,
+        air_date_woken=air_date_woken,
     )

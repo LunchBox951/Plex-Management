@@ -171,6 +171,7 @@ class FakeTmdb:
         popular_tv_results: list[MediaSearchResult] | None = None,
         season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
         season_episodes_error: Exception | None = None,
+        get_tv_show_error: Exception | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -197,6 +198,12 @@ class FakeTmdb:
         # Call log (issue #178 pack-first-precedence test): proves the port was
         # NEVER even consulted when Pass 1 alone settled a scope.
         self.season_episodes_calls: list[tuple[int, int]] = []
+        # ``get_tv_show_error`` (issue #210, mirrors ``season_episodes_error``): when
+        # set, raised on every ``get_tv_show`` call -- the "TMDB outage / show state
+        # unknown" test double for the air-date wake pass.
+        self.get_tv_show_error = get_tv_show_error
+        # Call log (issue #210 "resolved once per distinct show" assertion).
+        self.get_tv_show_calls: list[int] = []
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -205,6 +212,9 @@ class FakeTmdb:
         return self.movies.get(tmdb_id)
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
+        self.get_tv_show_calls.append(tmdb_id)
+        if self.get_tv_show_error is not None:
+            raise self.get_tv_show_error
         return self.shows.get(tmdb_id)
 
     @staticmethod
@@ -344,6 +354,19 @@ class FakeLibrary:
     asserts this stays EMPTY, proving the sweep never pays for a Plex round-trip
     when there is no disk pressure to relieve.
 
+    ``watch_states_by_path`` (issue #207) models the real adapter's path-correlated
+    branch: when SET and a call passes a non-``None`` ``library_path``, the lookup
+    is keyed on ``library_path`` alone -- answering ``WatchState(watched=False,
+    last_viewed_at=None)`` for any path with no entry (the adapter's fail-closed
+    default for an unresolvable/ambiguous correlation) -- instead of falling
+    through to the ``watch_states`` tmdb-keyed map. ``None`` (the default) leaves
+    every existing test's behavior byte-for-byte unchanged: calls fall back to
+    ``watch_states`` regardless of ``library_path``. ``watch_state_path_calls``
+    records the ``library_path`` passed to every :meth:`watch_state` call
+    (including ``None``) -- kept SEPARATE from ``watch_state_calls`` (still a
+    3-tuple) so existing ``== []`` / ``len()`` assertions against the latter keep
+    holding.
+
     Call counters (issue #136 -- batched availability reconcile): ``is_available_calls``
     counts every :meth:`is_available` call, ``present_ids_calls`` every
     :meth:`present_ids` call (``present_ids_refresh_absent_calls`` records the
@@ -373,6 +396,7 @@ class FakeLibrary:
         available_tv_seasons: dict[int, frozenset[int]] | None = None,
         sections: list[LibrarySection] | None = None,
         watch_states: dict[tuple[int, str, int | None], WatchState] | None = None,
+        watch_states_by_path: dict[str, WatchState] | None = None,
         raises: Exception | None = None,
         raises_for_shows: dict[int, Exception] | None = None,
         season_presence_raises: Exception | None = None,
@@ -399,7 +423,9 @@ class FakeLibrary:
         self.scanned: list[str] = []
         self.scan_calls: list[tuple[str, str]] = []
         self.watch_states = watch_states or {}
+        self.watch_states_by_path = watch_states_by_path
         self.watch_state_calls: list[tuple[int, str, int | None]] = []
+        self.watch_state_path_calls: list[str | None] = []
         # When set, ``is_available``/``present_seasons``/``present_ids``/
         # ``season_presence`` raise this instead of returning -- lets a caller
         # exercise the best-effort "log and treat as not-present" error path (see
@@ -536,8 +562,14 @@ class FakeLibrary:
         media_type: Literal["movie", "tv"],
         *,
         season: int | None = None,
+        library_path: str | None = None,
     ) -> WatchState:
         self.watch_state_calls.append((tmdb_id, media_type, season))
+        self.watch_state_path_calls.append(library_path)
+        if self.watch_states_by_path is not None and library_path is not None:
+            return self.watch_states_by_path.get(
+                library_path, WatchState(watched=False, last_viewed_at=None)
+            )
         return self.watch_states.get(
             (tmdb_id, media_type, season), WatchState(watched=False, last_viewed_at=None)
         )

@@ -19,10 +19,12 @@ from plex_manager.adapters.prowlarr import IndexerError
 from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
-from plex_manager.ports.metadata import EpisodeInfo, MetadataPort
+from plex_manager.ports.library import LibraryPort
+from plex_manager.ports.metadata import EpisodeInfo, MetadataPort, TvMetadata
 from plex_manager.services.health_service import AutograbStatus
 from plex_manager.web import app as app_module
 from tests.web.fakes import (
+    FakeLibrary,
     FakeProwlarr,
     FakeQbittorrent,
     FakeTmdb,
@@ -294,6 +296,134 @@ async def test_autograb_unconfigured_tmdb_disables_fallback_cleanly(
         request = await session.get(MediaRequest, request_id)
         assert request is not None
         assert request.status == RequestStatus.no_acceptable_release
+    status = app.state.autograb_status
+    assert status.last_ok_at is not None
+    assert status.last_error_type is None
+
+
+async def _seed_waiting_tv_season(
+    sessionmaker_: SessionMaker, tmdb_id: int, *, season_number: int = 2
+) -> tuple[int, int]:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title="Some Show",
+            status=RequestStatus.waiting_for_air_date,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(
+            media_request_id=request.id,
+            season_number=season_number,
+            status=RequestStatus.waiting_for_air_date,
+        )
+        session.add(season)
+        await session.commit()
+        return request.id, season.id
+
+
+async def test_autograb_once_wakes_waiting_season_end_to_end(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loop resolves TMDB (and optionally Plex) and threads both into
+    ``run_grab_cycle``'s air-date wake pre-pass (issue #210): a waiting season
+    TMDB now reports aired is woken and searched/grabbed in the SAME tick, and
+    the transition fires a realtime invalidation."""
+    tmdb_id = 613
+    request_id, season_id = await _seed_waiting_tv_season(sessionmaker_, tmdb_id)
+    prowlarr = FakeProwlarr(
+        [candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="aa" * 20)]
+    )
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+
+    tmdb: MetadataPort = FakeTmdb(
+        shows={tmdb_id: TvMetadata(tmdb_id=tmdb_id, title="Some Show", season_count=2)}
+    )
+
+    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+        return tmdb
+
+    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+
+    published: list[tuple[tuple[str, ...], str]] = []
+
+    def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
+        published.append((topics, reason))
+
+    monkeypatch.setattr(app_module, "publish_realtime", _publish)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status != RequestStatus.waiting_for_air_date
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status != RequestStatus.waiting_for_air_date
+    assert published != []
+    status = app.state.autograb_status
+    assert status.last_ok_at is not None
+    assert status.last_error_type is None
+
+
+async def test_autograb_once_publishes_on_air_date_woken_even_without_grab(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A season woken straight to ``available`` (already in Plex) grabs nothing
+    this cycle -- the ``or result.air_date_woken`` realtime-publish term must
+    still fire so the frontend's stale 'waiting' view is invalidated."""
+    tmdb_id = 614
+    request_id, season_id = await _seed_waiting_tv_season(sessionmaker_, tmdb_id)
+    prowlarr = FakeProwlarr([])
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+
+    tmdb: MetadataPort = FakeTmdb(
+        shows={tmdb_id: TvMetadata(tmdb_id=tmdb_id, title="Some Show", season_count=2)}
+    )
+
+    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+        return tmdb
+
+    library: LibraryPort = FakeLibrary(available_tv_seasons={tmdb_id: frozenset({2})})
+
+    async def _get_library(
+        _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+    monkeypatch.setattr(app_module, "get_library_optional", _get_library)
+
+    published: list[tuple[tuple[str, ...], str]] = []
+
+    def _publish(_app: FastAPI, topics: tuple[str, ...], *, reason: str) -> None:
+        published.append((topics, reason))
+
+    monkeypatch.setattr(app_module, "publish_realtime", _publish)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert prowlarr.searched == []
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.available
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status != RequestStatus.waiting_for_air_date
+    assert published != []
     status = app.state.autograb_status
     assert status.last_ok_at is not None
     assert status.last_error_type is None

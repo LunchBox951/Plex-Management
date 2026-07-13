@@ -406,6 +406,69 @@ describe('SetupWizard — service validation flow', () => {
     expect(screen.getByText('0/3 verified')).toBeInTheDocument()
   })
 
+  it('re-enables Test connection immediately when a field is edited during an in-flight validation', async () => {
+    // Issue #140: editing a field mid-validation must free the button right
+    // away — it must not stay disabled until the now-obsolete request settles.
+    const pending = deferred<ServiceValidateResponse>()
+    h.validate.mockReturnValueOnce(pending.promise)
+    await reachServices()
+
+    const testButton = screen.getAllByRole('button', { name: /test connection/i })[0]!
+    fireEvent.click(testButton)
+    await waitFor(() => expect(testButton).toBeDisabled())
+
+    fireEvent.change(screen.getAllByLabelText('URL')[0]!, {
+      target: { value: 'http://new-prowlarr:9696' },
+    })
+
+    // Re-enabled synchronously on edit — no waiting for the stale request.
+    expect(testButton).toBeEnabled()
+
+    // The stale request settling afterward must not corrupt state: no result
+    // surfaces, the verified count stays put, and the button is not re-disabled.
+    await act(async () => {
+      pending.resolve({ ok: true, message: 'prowlarr ok' })
+      await pending.promise
+    })
+    expect(testButton).toBeEnabled()
+    expect(screen.queryByText('prowlarr ok')).not.toBeInTheDocument()
+    expect(screen.getByText('0/3 verified')).toBeInTheDocument()
+  })
+
+  it('does not let a stale validation finally-clause clobber a newer in-flight one', async () => {
+    const first = deferred<ServiceValidateResponse>()
+    const second = deferred<ServiceValidateResponse>()
+    h.validate.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    await reachServices()
+
+    const testButton = screen.getAllByRole('button', { name: /test connection/i })[0]!
+    fireEvent.click(testButton) // gen 1 (first)
+    await waitFor(() => expect(testButton).toBeDisabled())
+
+    fireEvent.change(screen.getAllByLabelText('URL')[0]!, {
+      target: { value: 'http://new-prowlarr:9696' },
+    })
+    fireEvent.click(testButton) // gen 2 (second)
+    await waitFor(() => expect(h.validate).toHaveBeenCalledTimes(2))
+
+    // The stale gen-1 request resolves — it must not clear the pending flag
+    // for the fresh gen-2 request, nor surface its (stale) result.
+    await act(async () => {
+      first.resolve({ ok: true, message: 'stale prowlarr ok' })
+      await first.promise
+    })
+    expect(testButton).toBeDisabled()
+    expect(screen.queryByText('stale prowlarr ok')).not.toBeInTheDocument()
+
+    // The fresh gen-2 request settling completes normally.
+    await act(async () => {
+      second.resolve({ ok: true, message: 'prowlarr ok' })
+      await second.promise
+    })
+    expect(testButton).toBeEnabled()
+    expect(await screen.findByText('prowlarr ok')).toBeInTheDocument()
+  })
+
   it('normalizes a non-envelope service-test throw so the card shows a real message, never blank', async () => {
     // A bare, non-envelope throw (a bug/network failure with no `.message`) must
     // be routed through toApiError, or the bare `error as ApiError` cast would

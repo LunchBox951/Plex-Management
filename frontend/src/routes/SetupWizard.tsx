@@ -261,8 +261,12 @@ export function SetupWizard() {
 
   const setField = (key: ServicesFormKey, value: string, service: ServiceKey) => {
     setForm((prev) => ({ ...prev, [key]: value }))
-    // Editing a field invalidates that service's prior test result + any in-flight one.
+    // Editing a field invalidates that service's prior test result + any in-flight
+    // one — clear BOTH the result and the pending flag now, synchronously, so the
+    // Test connection button re-enables immediately rather than waiting on a
+    // request that's about to be discarded as stale.
     setResults((prev) => ({ ...prev, [service]: null }))
+    setTesting((prev) => ({ ...prev, [service]: false }))
     validationGen.current[service] += 1
   }
 
@@ -283,7 +287,12 @@ export function SetupWizard() {
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      setTesting((prev) => ({ ...prev, [service]: false }))
+      // Generation-gated: a stale request settling after a newer edit/retest must
+      // not clear the pending flag out from under that newer, still-in-flight
+      // request (which would let its Test button appear enabled mid-request).
+      if (validationGen.current[service] === gen) {
+        setTesting((prev) => ({ ...prev, [service]: false }))
+      }
     }
   }
 
