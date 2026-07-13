@@ -982,12 +982,16 @@ class UpdateOutcomeRequest(BaseModel):
     action_generation: int = Field(ge=0)
     lease_token: str | None = Field(default=None, min_length=32, max_length=256)
     outcome: Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
-    current_digest: str | None = Field(default=None, max_length=255)
-    available_digest: str | None = Field(default=None, max_length=255)
-    current_build: str | None = Field(default=None, max_length=255)
-    available_build: str | None = Field(default=None, max_length=255)
-    from_build: str | None = Field(default=None, max_length=255)
-    to_build: str | None = Field(default=None, max_length=255)
+    # 400 covers a 255-char image reference plus the fixed 72-char
+    # ``@sha256:<64 hex>`` RepoDigest suffix (327), so a long private-registry
+    # digest round-trips instead of failing closed at 422. Mirrors the
+    # ``_bounded_text`` service limit and the ``String(400)`` storage columns.
+    current_digest: str | None = Field(default=None, max_length=400)
+    available_digest: str | None = Field(default=None, max_length=400)
+    current_build: str | None = Field(default=None, max_length=400)
+    available_build: str | None = Field(default=None, max_length=400)
+    from_build: str | None = Field(default=None, max_length=400)
+    to_build: str | None = Field(default=None, max_length=400)
     detail_code: str | None = Field(default=None, pattern=r"^[a-z0-9_]{1,64}$")
 
     @model_validator(mode="after")

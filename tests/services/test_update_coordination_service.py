@@ -183,6 +183,42 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
     assert await service.release(drain.lease.token) is False
 
 
+async def test_outcome_round_trips_long_private_registry_repo_digest(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A digest for a >183-char repo path exceeds 255 but must still round-trip.
+
+    Docker reports a pulled image as ``<repository>@sha256:<64 hex>``. The updater
+    accepts image references up to 255 chars, so a long private-registry repo
+    path yields a RepoDigest longer than the old 255-char digest bounds. It must
+    reach durable storage instead of failing closed (issue #298).
+    """
+    long_repo = "registry.internal.example.com/" + "team/" * 40 + "plex-manager"
+    assert len(long_repo) > 183
+    long_digest = f"{long_repo}@sha256:{'a' * 64}"
+    # The digest exceeds the historical 255-char bound but stays within the new one.
+    assert 255 < len(long_digest) <= 400
+
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    drain = await service.claim_drain(ttl=timedelta(minutes=1), action_generation=generation)
+    assert drain is not None
+
+    assert await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="build-old",
+        to_build="build-new",
+        current_build=long_digest,
+        current_digest=long_digest,
+    )
+    snapshot = await service.snapshot()
+    assert snapshot.current_build == long_digest
+    assert snapshot.current_digest == long_digest
+
+
 @pytest.mark.parametrize(
     "phase",
     [UpdatePhase.checking, UpdatePhase.draining, UpdatePhase.installing, UpdatePhase.rollback],
