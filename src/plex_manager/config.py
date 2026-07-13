@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    # The HOST-namespace TCP port docker-compose publishes this container's
+    # ``port`` under (docker-compose.yml's ``PLEX_MANAGER_HOST_PORT``, default
+    # 8000, mapped via ``ports: ["...:${PLEX_MANAGER_HOST_PORT:-8000}:8000"]``).
+    # The compose file ALSO hands the same variable to the container's own
+    # ``environment:`` block (mirroring ``downloads_root`` below), so this is
+    # populated for every documented docker-compose install -- never guessed.
+    # ``None`` means "not running under that compose file" (bare metal, or a
+    # hand-rolled ``docker run``/other orchestrator with no equivalent env var
+    # set): the startup setup-URL hint (issue #65) then falls back to ``port``
+    # and says so explicitly, since a custom port mapping it cannot see would
+    # otherwise make that printed link silently wrong.
+    host_port: int | None = None
+
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync
     # URL from this for migrations — see ``migrations/env.py``.
     database_url: str = "sqlite+aiosqlite:///./data/plex_manager.db"

@@ -28,18 +28,47 @@ import { useToast } from '../components/ui/toast'
  */
 type WizardStep = 'signin' | 'server' | 'services' | 'libraries' | 'done'
 
-// The query param the startup log line's ready-to-click URL carries (issue #65):
-// `Setup: http://<host>:<port>/setup?setup_token=<token>`. Reading it here lets
+// The param name the startup log line's ready-to-click URL carries (issue #65):
+// `Setup: http://<host>:<port>/setup#setup_token=<token>`. Reading it here lets
 // an operator follow that ONE link from `docker logs` straight into a filled-in
 // token field, instead of hunting `PLEX_MANAGER_SETUP_TOKEN` across
 // env/compose/scrollback and hand-typing it.
-const SETUP_TOKEN_QUERY_PARAM = 'setup_token'
+//
+// It is carried in the URL FRAGMENT (`#setup_token=...`), not the query string:
+// a fragment is never sent to the server by the browser, so it can never land in
+// uvicorn's (or a reverse proxy's) access log the moment the operator clicks the
+// link — unlike a query parameter, which rides along in the logged request line.
+const SETUP_TOKEN_PARAM = 'setup_token'
 
-/** The trimmed `?setup_token=` value from the current URL, or `null` if absent/blank. */
+/**
+ * The trimmed setup token from the current URL, or `null` if absent/blank.
+ * Prefers the fragment (`#setup_token=...`, what the server now prints); falls
+ * back to the query string (`?setup_token=...`) for a stale/bookmarked pre-fix
+ * link so an operator who saved an old link is not stranded.
+ */
 function setupTokenFromLocation(): string | null {
-  const raw = new URLSearchParams(window.location.search).get(SETUP_TOKEN_QUERY_PARAM)
+  const fromHash = new URLSearchParams(window.location.hash.replace(/^#/, '')).get(
+    SETUP_TOKEN_PARAM,
+  )
+  const fromQuery = new URLSearchParams(window.location.search).get(SETUP_TOKEN_PARAM)
+  const raw = fromHash ?? fromQuery
   const trimmed = raw?.trim()
   return trimmed ? trimmed : null
+}
+
+/**
+ * Strip the setup token from both the fragment and the query string of the
+ * current address bar entry, leaving everything else (path, other params)
+ * untouched — a bootstrap secret has no business lingering in browser
+ * history or a copy-pasted URL once the wizard has consumed it.
+ */
+function stripSetupTokenFromLocation(): void {
+  const url = new URL(window.location.href)
+  url.searchParams.delete(SETUP_TOKEN_PARAM)
+  const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''))
+  hashParams.delete(SETUP_TOKEN_PARAM)
+  url.hash = hashParams.toString()
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
 }
 
 /** Ordered setup copy used by both the shell and its contract tests. */
@@ -237,26 +266,32 @@ export function SetupWizard() {
   // transmitted, and the token section (rendered on every step below) still lets a
   // fresh tab, whose per-tab sessionStorage is empty, (re)enter it.
   //
-  // A `?setup_token=` in THIS load's URL (issue #65's logged link) wins over the
-  // persisted value: it's what the operator just clicked, and is the freshest
-  // source of truth for a fresh tab that has no sessionStorage entry yet.
-  const [setupTokenInput, setSetupTokenInput] = useState(
-    () => setupTokenFromLocation() ?? getSetupToken() ?? '',
-  )
-
-  // Persist a URL-supplied token (mirrors the manual-entry path below) and strip
-  // it from the visible address bar once consumed — a bootstrap secret has no
-  // business lingering in browser history / a copy-pasted URL, and the field
-  // above already carries it forward for the rest of the wizard. Runs once on
-  // mount; nothing reactive is read besides stable imports.
-  useEffect(() => {
+  // A URL-supplied token (issue #65's logged link, `#setup_token=...`) wins over
+  // the persisted value: it's what the operator just clicked, and is the freshest
+  // source of truth for a fresh tab that has no sessionStorage entry yet. It is
+  // ALSO persisted (mirrors the manual-entry path below) and stripped from the
+  // visible address bar RIGHT HERE, synchronously, in this lazy initializer —
+  // deliberately NOT in a `useEffect` (the previous shape). `getSetupToken()`
+  // (sessionStorage) is the SAME source `ServerPicker`'s `useSetupPlexServers`
+  // query reads from (via the API client's auth middleware, at actual fetch
+  // time) to attach `X-Setup-Token`; that child query is enabled as soon as this
+  // component mounts (`setupTokenReady` below, derived from this very state) and
+  // React fires a MOUNTING CHILD's effects before its parent's own effects run —
+  // so persisting in a `useEffect` here raced the child's fetch: the query could
+  // enable and fire before sessionStorage ever saw the token, sending a
+  // token-less request that 401s and (with `retry: false`) stays cached,
+  // stranding the server picker for an already-authenticated operator opening a
+  // fresh tab. A lazy `useState` initializer runs during THIS component's
+  // render, strictly before ANY effect (of this component OR any descendant)
+  // can fire, so sessionStorage is guaranteed populated before a single
+  // token-gated query is ever enabled — no reliance on effect ordering.
+  const [setupTokenInput, setSetupTokenInput] = useState(() => {
     const fromUrl = setupTokenFromLocation()
-    if (!fromUrl) return
+    if (!fromUrl) return getSetupToken() ?? ''
     setSetupToken(fromUrl)
-    const url = new URL(window.location.href)
-    url.searchParams.delete(SETUP_TOKEN_QUERY_PARAM)
-    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
-  }, [])
+    stripSetupTokenFromLocation()
+    return fromUrl
+  })
 
   // Reveal a typed override instead of the Plex pick-list (split-mount / odd layout).
   const [manualPath, setManualPath] = useState(false)
@@ -772,7 +807,7 @@ function SetupTokenField({ value, onChange }: { value: string; onChange: (value:
             <>
               Set as <code>PLEX_MANAGER_SETUP_TOKEN</code> on the server (your{' '}
               <code>.env</code> / compose environment). On startup, the server also prints a
-              ready-to-click <code>Setup: http://…/setup?setup_token=…</code> line to{' '}
+              ready-to-click <code>Setup: http://…/setup#setup_token=…</code> line to{' '}
               <code>docker logs</code> — following that link fills this field in for you.
             </>
           }

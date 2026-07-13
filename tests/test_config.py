@@ -110,6 +110,35 @@ def test_downloads_root_blank_env_var_falls_back_to_none(
     assert settings.downloads_root is None
 
 
+def test_host_port_unset_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_HOST_PORT", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port is None
+
+
+def test_host_port_reads_the_shared_compose_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The startup setup-URL hint (issue #65) needs the PUBLISHED host port, not
+    the in-container one -- ``docker-compose.yml`` hands the container's own
+    ``PLEX_MANAGER_HOST_PORT`` the SAME value its ``ports:`` mapping publishes it
+    under (mirroring the ``downloads_root``/``PLEX_MANAGER_DOWNLOADS_ROOT``
+    precedent above), so the app must read it, not guess."""
+    monkeypatch.setenv("PLEX_MANAGER_HOST_PORT", "9443")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port == 9443
+
+
+def test_host_port_blank_env_var_falls_back_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_HOST_PORT", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port is None
+
+
 def test_trusted_proxy_hops_defaults_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", raising=False)
 
