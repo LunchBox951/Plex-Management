@@ -6,6 +6,7 @@ match the spec, and a minimal fake satisfies each runtime-checkable Protocol.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Literal
 
 import pytest
 
+import plex_manager.ports as ports_pkg
 from plex_manager.domain.release import (
     CandidateRelease,
     IndexerSearchRequest,
@@ -314,3 +316,81 @@ async def test_library_port_trigger_scan_default_raises_not_implemented() -> Non
     library = _LibraryMissingTriggerScan()  # pyright: ignore[reportAbstractUsage]
     with pytest.raises(NotImplementedError):
         await library.trigger_scan("/movies/Some.Movie", "movie")
+
+
+# --------------------------------------------------------------------------- #
+# Every port Protocol method must fail loudly, never silently no-op (#204)
+# --------------------------------------------------------------------------- #
+# The one intentional exception: ``DownloadClientPort.get_failure_detail`` is
+# explicitly documented "MUST NOT raise" -- a best-effort diagnostic enrichment
+# called only for an already-failed torrent, where a missing override degrading
+# to "nothing more specific to say" (``None``) is the correct, documented
+# behaviour, not a silent trap like the other 16 methods issue #204 fixed.
+_ALLOWED_SILENT_PROTOCOL_DEFAULTS: frozenset[tuple[str, str]] = frozenset(
+    {("DownloadClientPort", "get_failure_detail")}
+)
+
+
+def _protocol_methods_with_silent_default(module_path: Path) -> list[tuple[str, str, int]]:
+    """Return ``(class_name, method_name, lineno)`` for every ``Protocol``
+    method defined in ``module_path`` whose body has no explicit ``raise`` --
+    i.e. a subclass that omits an override falls through to Python's IMPLICIT
+    ``return None`` instead of failing loudly at call time."""
+    tree = ast.parse(module_path.read_text())
+    found: list[tuple[str, str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        is_protocol = any(
+            (isinstance(base, ast.Name) and base.id == "Protocol")
+            or (isinstance(base, ast.Attribute) and base.attr == "Protocol")
+            for base in node.bases
+        )
+        if not is_protocol:
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            body = item.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]  # strip the docstring; it is not a statement
+            if not any(isinstance(stmt, ast.Raise) for stmt in body):
+                found.append((node.name, item.name, item.lineno))
+    return found
+
+
+def test_no_protocol_method_has_a_silent_docstring_only_body() -> None:
+    """Guard for issues #80/#81/#204: EVERY port ``Protocol`` method must fail
+    loudly (``raise NotImplementedError``) by default when a subclass omits an
+    override — never silently fall through to Python's implicit ``return
+    None``. A silent ``None`` default can turn missing adapter/repository
+    behaviour into a FALSE SUCCESS (e.g. ``purge_service.remove_torrent``
+    reporting a removal that never ran when ``DownloadClientPort.remove`` was
+    never overridden — see
+    ``test_missing_remove_implementation_can_never_report_purge_success`` in
+    ``tests/services/test_purge_service.py``).
+
+    This statically scans every ``ports/*.py`` module's source rather than
+    exercising each method at runtime, so a FUTURE Protocol method added
+    without an explicit ``raise`` fails this test immediately — the same
+    silent trap issue #204 fixed for the other 16 methods can never be
+    reintroduced unnoticed.
+    """
+    ports_dir = Path(ports_pkg.__file__).parent
+    violations: list[str] = []
+    for module_file in sorted(ports_dir.glob("*.py")):
+        if module_file.name == "__init__.py":
+            continue
+        for class_name, method_name, lineno in _protocol_methods_with_silent_default(module_file):
+            if (class_name, method_name) in _ALLOWED_SILENT_PROTOCOL_DEFAULTS:
+                continue
+            violations.append(f"{module_file.name}:{lineno} {class_name}.{method_name}")
+    assert violations == [], (
+        "Protocol method(s) with a silent docstring-only default body (must "
+        f"`raise NotImplementedError` instead): {violations}"
+    )

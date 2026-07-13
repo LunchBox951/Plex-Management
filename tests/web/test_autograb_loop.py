@@ -77,7 +77,9 @@ def _patch_adapters(
     qbt: DownloadClientPort,
     enabled: bool,
 ) -> None:
-    async def _prowlarr(_session: AsyncSession, _client: httpx.AsyncClient) -> IndexerPort:
+    async def _prowlarr(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> IndexerPort:
         return prowlarr
 
     async def _qbt(
@@ -88,7 +90,7 @@ def _patch_adapters(
     async def _enabled(_session: AsyncSession) -> bool:
         return enabled
 
-    monkeypatch.setattr(app_module, "get_prowlarr", _prowlarr)
+    monkeypatch.setattr(app_module, "resolve_prowlarr", _prowlarr)
     monkeypatch.setattr(app_module, "resolve_qbittorrent", _qbt)
     monkeypatch.setattr(app_module, "get_auto_grab_enabled", _enabled)
 
@@ -286,10 +288,12 @@ async def test_autograb_wires_tmdb_into_the_episode_fallback(
         season_episodes={(tmdb_id, 1): [EpisodeInfo(episode_number=1, air_date=date(2020, 1, 1))]}
     )
 
-    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+    async def _get_tmdb(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> MetadataPort:
         return tmdb
 
-    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+    monkeypatch.setattr(app_module, "resolve_tmdb", _get_tmdb)
 
     app = _build_app(sessionmaker_)
     try:
@@ -383,10 +387,12 @@ async def test_autograb_once_wakes_waiting_season_end_to_end(
         shows={tmdb_id: TvMetadata(tmdb_id=tmdb_id, title="Some Show", season_count=2)}
     )
 
-    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+    async def _get_tmdb(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> MetadataPort:
         return tmdb
 
-    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+    monkeypatch.setattr(app_module, "resolve_tmdb", _get_tmdb)
 
     published: list[tuple[tuple[str, ...], str]] = []
 
@@ -430,7 +436,9 @@ async def test_autograb_once_publishes_on_air_date_woken_even_without_grab(
         shows={tmdb_id: TvMetadata(tmdb_id=tmdb_id, title="Some Show", season_count=2)}
     )
 
-    async def _get_tmdb(_session: AsyncSession, _client: httpx.AsyncClient) -> MetadataPort:
+    async def _get_tmdb(
+        _state: object, _session: AsyncSession, _client: httpx.AsyncClient
+    ) -> MetadataPort:
         return tmdb
 
     library: LibraryPort = FakeLibrary(available_tv_seasons={tmdb_id: frozenset({2})})
@@ -440,7 +448,7 @@ async def test_autograb_once_publishes_on_air_date_woken_even_without_grab(
     ) -> LibraryPort | None:
         return library
 
-    monkeypatch.setattr(app_module, "get_tmdb", _get_tmdb)
+    monkeypatch.setattr(app_module, "resolve_tmdb", _get_tmdb)
     monkeypatch.setattr(app_module, "get_library_optional", _get_library)
 
     published: list[tuple[tuple[str, ...], str]] = []

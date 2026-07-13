@@ -19,10 +19,16 @@ Wiring rules:
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
   usernames) go to plaintext ``value``. The redacted view never exposes a secret.
-* ``get_tmdb`` / ``get_prowlarr`` / ``get_qbittorrent`` build a configured adapter
-  from the decrypted settings plus the shared ``httpx.AsyncClient``. A missing
-  required setting raises :class:`ServiceNotConfiguredError` (HTTP 409), never a
-  crash.
+* ``get_tmdb`` / ``get_prowlarr`` / ``get_qbittorrent`` build (or reuse a cached)
+  configured adapter from the decrypted settings plus the shared
+  ``httpx.AsyncClient``. A missing required setting raises
+  :class:`ServiceNotConfiguredError` (HTTP 409), never a crash. Each caches ONE
+  adapter instance on ``app.state``, keyed on its effective settings PLUS the
+  ``httpx.AsyncClient`` identity (see :func:`resolve_qbittorrent`'s docstring for
+  the full rationale) — issue #214 fixed ``get_tmdb``/``get_prowlarr`` building a
+  brand-new instance on every call, which discarded their instance-local TTL
+  caches (TMDB: one-hour movie/TV/search/page caches; Prowlarr: five-minute
+  indexer-priority cache) between requests and background ticks.
 """
 
 from __future__ import annotations
@@ -175,7 +181,9 @@ __all__ = [
     "resolve_eviction_interval_minutes",
     "resolve_log_max_rows",
     "resolve_log_retention_days",
+    "resolve_prowlarr",
     "resolve_qbittorrent",
+    "resolve_tmdb",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -962,28 +970,112 @@ async def require_setup_admin(
 # --------------------------------------------------------------------------- #
 # Adapter factories (decrypt creds + share the AsyncClient)
 # --------------------------------------------------------------------------- #
-async def get_tmdb(
-    session: Annotated[AsyncSession, Depends(get_session)],
-    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+@dataclass(frozen=True)
+class _CachedTmdb:
+    """One cached :class:`TmdbMetadata` plus the key (settings + the
+    ``httpx.AsyncClient`` it was built against) it was built from -- the exact
+    same shape as :class:`_CachedQbittorrent` (issue #214)."""
+
+    key: tuple[str, httpx.AsyncClient]
+    client: TmdbMetadata
+
+
+async def resolve_tmdb(
+    state: State,
+    session: AsyncSession,
+    client: httpx.AsyncClient,
 ) -> MetadataPort:
-    """Build a configured :class:`MetadataPort` (TMDB), or 409 if unconfigured."""
+    """Build (or reuse) the configured TMDB adapter, else raise 409 (issue #214).
+
+    Caches ONE :class:`TmdbMetadata` on ``state.tmdb_client``, keyed on the
+    effective ``tmdb_api_key`` PLUS the ``httpx.AsyncClient`` instance passed in
+    this call -- the identical settings-or-client-identity invalidation rule
+    :func:`resolve_qbittorrent` uses (see its docstring for the full ASGI-
+    lifespan-restart rationale: a new ``http_client`` generation must invalidate
+    the cache exactly like a settings change, so a stale adapter is never left
+    wrapping a closed client).
+
+    Before this cache, every caller — including ``Depends(get_tmdb)`` on every
+    discovery/request route AND the auto-grab loop's per-tick call — built a
+    brand-new ``TmdbMetadata`` with EMPTY movie/TV/search/page/recommendation
+    caches, discarding the whole point of the adapter's instance-local one-hour
+    TTL caching (``TmdbMetadata.__init__``'s ``_movie_cache`` /  ``_tv_cache`` /
+    ``_search_cache`` / ``_page_cache`` / recommendation caches) between
+    requests and ticks — every lookup re-hit TMDB even for a title just resolved
+    moments earlier.
+    """
     api_key = await SettingsStore(session).get("tmdb_api_key")
     if not api_key:
         raise ServiceNotConfiguredError("tmdb")
-    return TmdbMetadata(client, api_key)
+    key = (api_key, client)
+    cached = getattr(state, "tmdb_client", None)
+    if isinstance(cached, _CachedTmdb) and cached.key == key:
+        return cached.client
+    tmdb = TmdbMetadata(client, api_key)
+    state.tmdb_client = _CachedTmdb(key, tmdb)
+    return tmdb
 
 
-async def get_prowlarr(
+async def get_tmdb(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> MetadataPort:
+    """Build (or reuse the cached) configured :class:`MetadataPort` (TMDB), or
+    409 if unconfigured. See :func:`resolve_tmdb`."""
+    return await resolve_tmdb(request.app.state, session, client)
+
+
+@dataclass(frozen=True)
+class _CachedProwlarr:
+    """One cached :class:`ProwlarrIndexer` plus the key (settings + the
+    ``httpx.AsyncClient`` it was built against) it was built from -- the exact
+    same shape as :class:`_CachedQbittorrent` (issue #214)."""
+
+    key: tuple[str, str, httpx.AsyncClient]
+    client: ProwlarrIndexer
+
+
+async def resolve_prowlarr(
+    state: State,
+    session: AsyncSession,
+    client: httpx.AsyncClient,
 ) -> IndexerPort:
-    """Build a configured :class:`IndexerPort` (Prowlarr), or 409 if unconfigured."""
+    """Build (or reuse) the configured Prowlarr adapter, else raise 409 (issue #214).
+
+    Caches ONE :class:`ProwlarrIndexer` on ``state.prowlarr_client``, keyed on
+    the effective ``(prowlarr_url, prowlarr_api_key)`` PLUS the
+    ``httpx.AsyncClient`` instance passed in this call — see :func:`resolve_tmdb`
+    / :func:`resolve_qbittorrent` for the shared invalidation rationale.
+
+    Before this cache, every caller built a brand-new ``ProwlarrIndexer`` with an
+    EMPTY ``_priority_cache``, discarding the adapter's instance-local five-
+    minute indexer-priority TTL cache between requests and the auto-grab loop's
+    per-tick call — every search re-fetched ``/api/v1/indexer`` to resolve
+    priorities that had not changed.
+    """
     store = SettingsStore(session)
     url = await store.get("prowlarr_url")
     api_key = await store.get("prowlarr_api_key")
     if not url or not api_key:
         raise ServiceNotConfiguredError("prowlarr")
-    return ProwlarrIndexer(client, url, api_key)
+    key = (url, api_key, client)
+    cached = getattr(state, "prowlarr_client", None)
+    if isinstance(cached, _CachedProwlarr) and cached.key == key:
+        return cached.client
+    prowlarr = ProwlarrIndexer(client, url, api_key)
+    state.prowlarr_client = _CachedProwlarr(key, prowlarr)
+    return prowlarr
+
+
+async def get_prowlarr(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> IndexerPort:
+    """Build (or reuse the cached) configured :class:`IndexerPort` (Prowlarr),
+    or 409 if unconfigured. See :func:`resolve_prowlarr`."""
+    return await resolve_prowlarr(request.app.state, session, client)
 
 
 @dataclass(frozen=True)
