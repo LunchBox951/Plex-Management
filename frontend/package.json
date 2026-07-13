@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Plex Manager v2 — typed React SPA (ADR-0009). Built to src/plex_manager/web/static.",
+  "engines": {
+    "node": "^22.13.0 || >=24.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

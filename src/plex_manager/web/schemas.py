@@ -76,6 +76,7 @@ __all__ = [
     "SearchPreviewRequest",
     "SearchPreviewResponse",
     "SeasonStatus",
+    "ServiceNotConfiguredErrorDetail",
     "ServiceValidateResponse",
     "SettingsResponse",
     "SettingsUpdate",
@@ -102,6 +103,25 @@ class ErrorDetail(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     detail: str
+
+
+class ServiceNotConfiguredErrorDetail(BaseModel):
+    """Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).
+
+    The app-wide handler (``app._service_not_configured_handler``) always
+    renders ``{"detail": "service_not_configured", "service": "<name>"}`` --
+    a REQUIRED ``service`` field, not the bare ``{"detail": ...}`` of
+    :class:`ErrorDetail`. Endpoints that can raise this error must reference
+    this model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the
+    generated client type carries ``service`` and callers can route the
+    operator straight to that service's setup step instead of losing the
+    field to the generic shape.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: Literal["service_not_configured"] = "service_not_configured"
+    service: str
 
 
 class ErrorEnvelope(BaseModel):

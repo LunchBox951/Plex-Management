@@ -291,13 +291,27 @@ class LibraryPort(Protocol):
 
         ``library_path`` (issue #207) is the ADR-0012 deletion-target breadcrumb
         stored on the request/season row. When PROVIDED, the implementation MUST
-        resolve watch state ONLY from the Plex item whose reported media file path
-        corresponds to ``library_path``, and MUST FAIL CLOSED --
-        ``WatchState(watched=False, last_viewed_at=None)`` -- when the target
-        cannot be UNIQUELY correlated (absent, or ambiguous across duplicate
-        items sharing the same ``tmdb_id``, e.g. the same title imported into two
-        sections). It MUST NEVER union "watched anywhere" across duplicate items:
-        a watched duplicate must never authorize evicting an unwatched one.
+        resolve watch state ONLY from the Plex item(s) whose reported media file
+        path corresponds to ``library_path``, and MUST FAIL CLOSED --
+        ``WatchState(watched=False, last_viewed_at=None)`` -- when the target is
+        absent, or ambiguous across items that report DIFFERENT underlying media
+        file paths (e.g. the same title imported into two sections as genuinely
+        distinct copies on disk). It MUST NEVER union "watched anywhere" across
+        such genuinely distinct duplicates: a watched duplicate must never
+        authorize evicting an unwatched one.
+
+        Issue #239: more than one correlated item that all report the IDENTICAL
+        set of underlying media file paths is NOT the ambiguous case above -- it
+        is the SAME physical copy merely indexed by more than one Plex section
+        (e.g. a broad section plus a nested section both covering the same
+        files), and the implementation MUST treat it as one logical item rather
+        than failing closed: merged ``watched`` is ``True`` if ANY such hit is
+        watched, and the merged ``last_viewed_at`` is the NEWEST watched
+        timestamp among them -- never the oldest, so a section that is slow to
+        reflect a rewatch can never make a recent rewatch look stale enough to
+        fall inside eviction's grace-window deletion criteria. Only hits whose
+        reported file paths genuinely differ stay fail-closed.
+
         ``library_path=None`` keeps the legacy UNCORRELATED first-match read --
         only for callers with no known target, e.g. a row predating the
         breadcrumb.
