@@ -33,6 +33,7 @@ Wiring rules:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -133,6 +134,7 @@ __all__ = [
     "DiskPressurePercents",
     "ServiceNotConfiguredError",
     "SettingsStore",
+    "api_key_header",
     "api_key_matches",
     "authenticate_request",
     "configured_setup_token",
@@ -215,6 +217,25 @@ CSRF_HEADER_NAME = "X-CSRF-Token"
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+# Public alias so routers OUTSIDE this module (the recovery-key exchange endpoint,
+# ``POST /api/v1/auth/api-key``) can source the header through the SAME
+# ``APIKeyHeader`` dependency rather than a raw ``Request.headers.get`` — so the
+# security scheme + per-route requirement land in the exported OpenAPI (issue #293
+# finding 5). Reusing the one instance keeps a single ``X-Api-Key`` scheme in the
+# document instead of minting a duplicate.
+api_key_header = _api_key_header
+
+# Serializes the app-key critical section across router modules. The rotate/revoke
+# endpoints (``settings`` router) do a read-modify-write on ``SystemSettings.app_api_key``
+# under this lock; the recovery-key EXCHANGE (``POST /api/v1/auth/api-key``, ``auth``
+# router) re-validates the key and mints its recovery session under the SAME lock so a
+# key change cannot interleave with an in-flight exchange (issue #293). Living in
+# ``deps`` (a module both routers already import) lets them share ONE lock instance
+# rather than importing a private name across sibling routers. Like the settings-update
+# lock, this is a deliberate SINGLE-PROCESS guard: the supported uvicorn deployment runs
+# one worker. A future multi-worker deployment must replace it with a database-level
+# version/CAS or advisory lock spanning the same critical section.
+app_key_rotate_lock = asyncio.Lock()
 
 
 class AuthMethod(StrEnum):
@@ -231,6 +252,18 @@ class AuthContext:
 
     ``user_*`` is populated only for Plex session auth. The legacy app API key has
     no user identity and remains a recovery/automation credential.
+
+    ``via_api_key_header`` records WHICH credential actually authenticated when
+    ``method`` is ``api_key``: ``True`` iff the presented ``X-Api-Key`` header
+    matched the stored key; ``False`` for a recovery-cookie session (which reports
+    ``api_key`` authority but authenticated by the httpOnly session cookie). The two
+    must be distinguishable by the app-key CAS and the rotate self-exemption, and the
+    header's mere PRESENCE is not a safe discriminator (issue #293 round 2): a client
+    or proxy can send a stale/empty ``X-Api-Key`` alongside a valid recovery cookie —
+    ``authenticate_request`` rejects the header, falls back to the cookie, and still
+    reports ``api_key``, so sniffing the raw header would misattribute the REJECTED
+    value to the authenticated context. Set only at the construction sites that KNOW
+    which credential matched; always ``False`` for ``plex_session``/``dev_bypass``.
     """
 
     method: AuthMethod
@@ -241,6 +274,7 @@ class AuthContext:
     avatar_url: str | None = None
     is_admin: bool = False
     session_expires_at: datetime | None = None
+    via_api_key_header: bool = False
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -902,11 +936,14 @@ async def _session_auth_context(
         # ``/auth/me`` answer and every gate see one consistent api-key context
         # whether the key rode the header or was exchanged for the cookie. CSRF is
         # still enforced above because this IS a cookie credential, unlike the
-        # header path.
+        # header path. ``via_api_key_header=False``: the COOKIE authenticated this
+        # request — any ``X-Api-Key`` header that rode along was already rejected
+        # upstream and must not be mistaken for the credential (issue #293 round 2).
         return AuthContext(
             method=AuthMethod.api_key,
             is_admin=True,
             session_expires_at=expires_at,
+            via_api_key_header=False,
         )
     user = await session.get(User, auth_session.user_id)
     if user is None:
@@ -943,7 +980,11 @@ async def authenticate_request(
     system = await load_system_settings(session)
     expected = system.app_api_key if system is not None else None
     if api_key_matches(provided_api_key, expected):
-        return AuthContext(method=AuthMethod.api_key, is_admin=True)
+        # The header credential itself authenticated — record that explicitly. A
+        # REJECTED header (stale/empty, e.g. sent by a proxy alongside a valid
+        # recovery cookie) falls through to the session path below, whose recovery
+        # branch reports ``api_key`` with ``via_api_key_header=False``.
+        return AuthContext(method=AuthMethod.api_key, is_admin=True, via_api_key_header=True)
     return await _session_auth_context(request, session, enforce_csrf=enforce_csrf)
 
 
