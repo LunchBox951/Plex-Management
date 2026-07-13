@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { purgeLegacyApiKey } from './legacyCleanup'
+import { client } from '../api/client'
+
+// No network: the typed client is replaced with a controllable POST mock, same
+// pattern as api/hooks.test.tsx.
+vi.mock('../api/client', () => ({
+  client: { POST: vi.fn() },
+}))
 
 // localStorage isn't provided by this jsdom config (see plexOAuth.test.ts), so
 // each test stubs a real in-memory store to pin the exact key names being scrubbed.
@@ -17,45 +24,91 @@ function stubStore(initial: Record<string, string> = {}): Record<string, string>
   return store
 }
 
+beforeEach(() => {
+  vi.mocked(client.POST).mockReset()
+})
+
 afterEach(() => {
   vi.unstubAllGlobals()
 })
 
 describe('purgeLegacyApiKey', () => {
-  it('removes the cleartext recovery key and its active flag left by the old flow', () => {
+  it('exchanges a present legacy key for a session cookie before scrubbing it', async () => {
     const store = stubStore({
       'plexmgr.apiKey': 'super-secret-recovery-key',
       'plexmgr.apiKeyActive': 'true',
     })
+    vi.mocked(client.POST).mockResolvedValue({
+      data: { authenticated: true },
+      response: new Response(null, { status: 200 }),
+    })
 
-    purgeLegacyApiKey()
+    await purgeLegacyApiKey()
 
+    expect(client.POST).toHaveBeenCalledWith('/api/v1/auth/api-key', {
+      headers: { 'X-Api-Key': 'super-secret-recovery-key' },
+    })
     expect(store['plexmgr.apiKey']).toBeUndefined()
     expect(store['plexmgr.apiKeyActive']).toBeUndefined()
   })
 
-  it('leaves unrelated keys untouched', () => {
-    const store = stubStore({ 'plexmgr.plexClientId': 'client-123' })
+  it('does not touch storage when the exchange is rejected (a browser stays recoverable)', async () => {
+    const store = stubStore({
+      'plexmgr.apiKey': 'super-secret-recovery-key',
+      'plexmgr.apiKeyActive': 'true',
+    })
+    vi.mocked(client.POST).mockResolvedValue({
+      error: { detail: 'invalid_api_key' },
+      response: new Response(null, { status: 401 }),
+    })
 
-    purgeLegacyApiKey()
+    await purgeLegacyApiKey()
+
+    expect(store['plexmgr.apiKey']).toBe('super-secret-recovery-key')
+    expect(store['plexmgr.apiKeyActive']).toBe('true')
+  })
+
+  it('does not touch storage when the exchange call throws (network drop)', async () => {
+    const store = stubStore({ 'plexmgr.apiKey': 'super-secret-recovery-key' })
+    vi.mocked(client.POST).mockRejectedValue(new TypeError('network error'))
+
+    await purgeLegacyApiKey()
+
+    expect(store['plexmgr.apiKey']).toBe('super-secret-recovery-key')
+  })
+
+  it('leaves unrelated keys untouched', async () => {
+    const store = stubStore({
+      'plexmgr.plexClientId': 'client-123',
+      'plexmgr.apiKey': 'super-secret-recovery-key',
+    })
+    vi.mocked(client.POST).mockResolvedValue({
+      data: { authenticated: true },
+      response: new Response(null, { status: 200 }),
+    })
+
+    await purgeLegacyApiKey()
 
     expect(store['plexmgr.plexClientId']).toBe('client-123')
   })
 
-  it('is a no-op when nothing was stored', () => {
+  it('is a no-op — and never calls the exchange — when nothing was stored', async () => {
     const store = stubStore()
 
-    expect(() => purgeLegacyApiKey()).not.toThrow()
+    await expect(purgeLegacyApiKey()).resolves.toBeUndefined()
+
+    expect(client.POST).not.toHaveBeenCalled()
     expect(store['plexmgr.apiKey']).toBeUndefined()
   })
 
-  it('swallows a storage-disabled failure (private mode) without throwing', () => {
+  it('swallows a storage-disabled failure (private mode) without throwing', async () => {
     vi.stubGlobal('localStorage', {
-      removeItem: () => {
+      getItem: () => {
         throw new Error('storage disabled')
       },
     })
 
-    expect(() => purgeLegacyApiKey()).not.toThrow()
+    await expect(purgeLegacyApiKey()).resolves.toBeUndefined()
+    expect(client.POST).not.toHaveBeenCalled()
   })
 })

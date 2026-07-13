@@ -9,9 +9,11 @@ import { router } from './router'
 import './fonts'
 import './styles/index.css'
 
-// Scrub the pre-session recovery-key remnants left in localStorage by the old
-// break-glass flow (CodeQL #263) before anything else runs.
-purgeLegacyApiKey()
+// Migrate the pre-session recovery-key remnant left in localStorage by the old
+// break-glass flow onto the current cookie session, then scrub it (CodeQL
+// #263). Awaited before mount so the app's first auth check already sees the
+// freshly-minted cookie instead of racing it.
+await purgeLegacyApiKey()
 
 const rootEl = document.getElementById('root')
 if (!rootEl) throw new Error('#root not found')
