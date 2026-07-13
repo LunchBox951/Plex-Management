@@ -413,6 +413,14 @@ export function TitleDetailModal({
   // modal instance should now be bound to — and reset alongside the rest of the
   // per-title state below so a newly opened title starts unbound again.
   const [reboundRequestId, setReboundRequestId] = useState<number | null>(null)
+  // Whether the just-created `requestId` is still grabbable. Tracked separately from
+  // the id because POST /requests can return a TERMINAL row, and Grab must not arm
+  // for it in the window before the /requests poll reveals the live status.
+  const [createdGrabbable, setCreatedGrabbable] = useState(false)
+  // tv only: the just-created request's own per-season rollup, shown before the
+  // next /requests poll lands — mirrors `createdGrabbable`'s create-then-poll gap.
+  const [createdSeasons, setCreatedSeasons] = useState<SeasonStatus[] | null>(null)
+  const [createdCanMutate, setCreatedCanMutate] = useState(false)
   // issue #287 senior review: `reboundRequestId` above must not outlive the
   // click that made it stale. The modal can stay MOUNTED across a close (issue
   // #271, separate/still-open) with `titleKey` unchanged, so the effect below
@@ -431,16 +439,25 @@ export function TitleDetailModal({
     if (boundRequestId !== previousBoundRequestId.current) {
       previousBoundRequestId.current = boundRequestId
       setReboundRequestId(null)
+      // issue #295: `reboundRequestId` isn't the only state a prior "Request
+      // again"/Re-acquire can leave behind. `requestId` (and the created-row
+      // trio above, set alongside it in `onRequest`/`onReacquire`) still points
+      // at whatever row that EARLIER click created — a row that belongs to the
+      // row the caller had bound before, not the one just clicked. Left in
+      // place, `effectiveRequestId`/`pinTracksFreshRequest`/`grabRequestId`/
+      // `effectiveSeasons` all prefer this stale `requestId` over the newly
+      // bound row's own (fresher) `liveRequest` until `titleKey` changes —
+      // steering pin/report/re-search/grab at the wrong row exactly like the
+      // `reboundRequestId` bug this effect already guards against. Reset the
+      // whole created-row bundle here too, mirroring the `titleKey` reset
+      // effect below (this is the same state, just also invalidated by a new
+      // bound row for the SAME title, which never touches `titleKey`).
+      setRequestId(null)
+      setCreatedGrabbable(false)
+      setCreatedSeasons(null)
+      setCreatedCanMutate(false)
     }
   }, [boundRequestId])
-  // Whether the just-created `requestId` is still grabbable. Tracked separately from
-  // the id because POST /requests can return a TERMINAL row, and Grab must not arm
-  // for it in the window before the /requests poll reveals the live status.
-  const [createdGrabbable, setCreatedGrabbable] = useState(false)
-  // tv only: the just-created request's own per-season rollup, shown before the
-  // next /requests poll lands — mirrors `createdGrabbable`'s create-then-poll gap.
-  const [createdSeasons, setCreatedSeasons] = useState<SeasonStatus[] | null>(null)
-  const [createdCanMutate, setCreatedCanMutate] = useState(false)
   // tv only, read at Request time: track the whole aired series (default) or just
   // the one season named below. Irrelevant once a request exists.
   const [wholeSeries, setWholeSeries] = useState(true)
