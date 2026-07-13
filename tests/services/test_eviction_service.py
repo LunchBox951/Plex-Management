@@ -23,9 +23,14 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.plex.library import PlexLibraryError
@@ -464,6 +469,144 @@ async def test_assemble_candidates_sizes_each_distinct_path_once(
     assert sized_paths.count(other) == 1
     by_title = {c.title: c for c in candidates}
     assert by_title["Twin A"].size_percent == by_title["Twin B"].size_percent
+
+
+async def _capture_statements_touching(
+    engine: AsyncEngine, needles: tuple[str, ...]
+) -> tuple[list[str], Callable[[], None]]:
+    """Start capturing every executed statement mentioning any of ``needles``
+    (case-insensitive substring match); returns the accumulating list and a
+    ``stop()`` callback to detach the listener."""
+    statements: list[str] = []
+
+    def _capture(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        lowered = statement.lower()
+        if any(needle in lowered for needle in needles):
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+
+    def _stop() -> None:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    return statements, _stop
+
+
+async def test_assemble_candidates_batches_active_download_checks_for_movies(
+    sessionmaker_: SessionMaker, engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Issue #138: candidate assembly used to issue one ``find_active_for_request``
+    SELECT per movie candidate. The batched replacement must cost exactly two
+    queries (one over ``downloads``, one over ``download_scopes``) for the WHOLE
+    pool, never one pair per candidate."""
+    ids = []
+    for i in range(5):
+        path = _movie_file(tmp_path, f"Movie {i}.mkv")
+        ids.append(
+            await _movie(sessionmaker_, tmdb_id=940 + i, title=f"Movie {i}", library_path=path)
+        )
+    # Exactly one candidate has a live in-flight download.
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="active",
+                status="downloading",
+                media_request_id=ids[0],
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+    library = FakeLibrary()
+
+    statements, stop = await _capture_statements_touching(engine, ("downloads", "download_scopes"))
+    try:
+        async with sessionmaker_() as session:
+            candidates = await eviction_service.assemble_candidates(
+                session=session,
+                library=library,
+                media_type="movie",
+                root_path=str(tmp_path / "movies"),
+                root_total_bytes=0,
+            )
+    finally:
+        stop()
+
+    assert len(candidates) == 5
+    by_tmdb = {c.request_id: c for c in candidates}
+    assert by_tmdb[ids[0]].in_flight is True
+    assert all(not c.in_flight for c in candidates if c.request_id != ids[0])
+    # Not one pair of queries per candidate (which would be 10 for 5 candidates).
+    assert len(statements) == 2
+
+
+async def test_assemble_candidates_batches_parent_lookups_for_seasons(
+    sessionmaker_: SessionMaker, engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Issue #137/#138: candidate assembly used to ``get()`` one PARENT show per
+    distinct show and ``find_active_for_request`` once per season row. The
+    batched replacements must cost ONE ``media_requests`` parent query and TWO
+    ``downloads``/``download_scopes`` queries for the WHOLE pool of several shows
+    and several seasons each, never one query per distinct show/season."""
+    show_ids = []
+    for show_index in range(3):
+        seasons: dict[int, str | None] = {}
+        for season in range(1, 3):
+            path = tmp_path / "tv" / f"Show {show_index}" / f"Season 0{season}"
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "e01.mkv").write_bytes(b"0" * 512)
+            seasons[season] = str(path)
+        show_ids.append(
+            await _show_with_seasons(
+                sessionmaker_, tmdb_id=950 + show_index, title=f"Show {show_index}", seasons=seasons
+            )
+        )
+    # Exactly one season has a live in-flight download.
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="active-season",
+                status="downloading",
+                media_request_id=show_ids[0],
+                season=1,
+                media_type=MediaType.tv,
+            )
+        )
+        await session.commit()
+    library = FakeLibrary()
+
+    parent_statements, stop_parents = await _capture_statements_touching(
+        engine, ("from media_requests",)
+    )
+    download_statements, stop_downloads = await _capture_statements_touching(
+        engine, ("downloads", "download_scopes")
+    )
+    try:
+        async with sessionmaker_() as session:
+            candidates = await eviction_service.assemble_candidates(
+                session=session,
+                library=library,
+                media_type="tv",
+                root_path=str(tmp_path / "tv"),
+                root_total_bytes=0,
+            )
+    finally:
+        stop_parents()
+        stop_downloads()
+
+    assert len(candidates) == 6  # 3 shows x 2 seasons
+    assert sum(1 for c in candidates if c.in_flight) == 1
+    # ONE query resolves every distinct parent show, not one per show (3 shows).
+    assert len(parent_statements) == 1
+    # ONE pair of queries answers the whole in-flight probe, not one pair per
+    # season row (which would be 12 for 6 seasons).
+    assert len(download_statements) == 2
 
 
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:

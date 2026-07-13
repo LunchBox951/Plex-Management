@@ -6,9 +6,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.models import Download, DownloadScope, MediaRequest, MediaType, RequestStatus
@@ -514,6 +519,140 @@ async def test_find_active_for_request_default_season_matches_movie_null_season(
     active = await repo.find_active_for_request(mr.id)
     assert active is not None
     assert active.torrent_hash == "movie_active"
+
+
+async def test_find_active_for_requests_matches_individual_calls_exactly(
+    session: AsyncSession,
+) -> None:
+    """Issue #138: the batch membership check must report EXACTLY what a
+    per-key ``find_active_for_request(request_id, season=season) is not None``
+    call would report -- covering the legacy scalar shape, the logical scope
+    shape, terminal exclusion, and an absent/no-match key."""
+    legacy_owner = MediaRequest(
+        tmdb_id=200,
+        media_type=MediaType.movie,
+        title="Legacy Movie",
+        status=RequestStatus.downloading,
+    )
+    scoped_show = MediaRequest(
+        tmdb_id=201, media_type=MediaType.tv, title="Scoped Show", status=RequestStatus.downloading
+    )
+    idle_show = MediaRequest(
+        tmdb_id=202, media_type=MediaType.tv, title="Idle Show", status=RequestStatus.available
+    )
+    pack_show = MediaRequest(
+        tmdb_id=203, media_type=MediaType.tv, title="Pack Show", status=RequestStatus.downloading
+    )
+    session.add_all([legacy_owner, scoped_show, idle_show, pack_show])
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    # Legacy scalar match: no DownloadScope row at all.
+    await repo.create(torrent_hash="legacy", status="downloading", media_request_id=legacy_owner.id)
+    # Logical scope match for season 1.
+    await repo.create(
+        torrent_hash="scoped-s1", status="downloading", media_request_id=scoped_show.id, season=1
+    )
+    # A TERMINAL download for season 2 of the same show must not count as active.
+    await repo.create(
+        torrent_hash="scoped-s2-done",
+        status="imported",
+        media_request_id=scoped_show.id,
+        season=2,
+    )
+    # A single physical (non-terminal) download covering TWO logical scopes of the
+    # same show: the legacy scalar (season 1, matching ``Download.season``) has
+    # ALREADY imported -- its own scope for that EXACT key is terminal, so the
+    # legacy match is negated (a scope for the key exists) but not re-qualified
+    # (that scope isn't active-status) -- while a SIBLING scope (season 2) is
+    # still active, keeping the physical row's overall status non-terminal. This
+    # pins the subtlest branch: a same-key scope can negate the legacy match
+    # WITHOUT re-qualifying it, distinct from ``scoped-s1`` above where the
+    # same-key scope both negates AND re-qualifies.
+    pack_download = await repo.create(
+        torrent_hash="pack-multi-season",
+        status="downloading",
+        media_request_id=pack_show.id,
+        season=1,
+    )
+    await repo.ensure_scope(pack_download.id, media_request_id=pack_show.id, season=2)
+    pack_season_1_scope = next(
+        scope for scope in (await repo.list_scopes(pack_download.id)) if scope.season == 1
+    )
+    updated = await repo.update_scope_status_if_in(
+        pack_season_1_scope.id, "imported", frozenset({"active", "import_blocked"})
+    )
+    assert updated
+
+    keys = [
+        (legacy_owner.id, None),
+        (scoped_show.id, 1),
+        (scoped_show.id, 2),
+        (scoped_show.id, 3),  # no download at all for this season
+        (idle_show.id, 1),  # not even a candidate key referenced anywhere
+        (pack_show.id, 1),  # legacy-negating scope is terminal -> must NOT re-qualify
+        (pack_show.id, 2),  # sibling scope is still active -> must match
+    ]
+    batched = await repo.find_active_for_requests(keys)
+
+    expected: set[tuple[int, int | None]] = set()
+    for request_id, season in keys:
+        if await repo.find_active_for_request(request_id, season=season) is not None:
+            expected.add((request_id, season))
+    assert batched == expected
+    assert batched == {(legacy_owner.id, None), (scoped_show.id, 1), (pack_show.id, 2)}
+
+
+async def test_find_active_for_requests_empty_keys_returns_empty_set(
+    session: AsyncSession,
+) -> None:
+    assert await SqlDownloadRepository(session).find_active_for_requests([]) == frozenset()
+
+
+async def test_find_active_for_requests_issues_two_queries_regardless_of_pool_size(
+    session: AsyncSession, engine: AsyncEngine
+) -> None:
+    """Issue #138: candidate assembly used to issue one ``find_active_for_request``
+    SELECT per candidate. The batched replacement must cost the SAME two queries
+    (one over ``downloads``, one over ``download_scopes``) whether the pool holds
+    one candidate or many -- never one pair per candidate."""
+    requests = []
+    for i in range(5):
+        mr = MediaRequest(
+            tmdb_id=300 + i, media_type=MediaType.movie, title=f"Movie {i}", status="available"
+        )
+        session.add(mr)
+        requests.append(mr)
+    await session.flush()
+    repo = SqlDownloadRepository(session)
+    # Exactly one candidate actually has a live download -- this still must not
+    # cost more round trips than a pool where every candidate did.
+    await repo.create(torrent_hash="active", status="downloading", media_request_id=requests[0].id)
+
+    statements: list[str] = []
+
+    def _capture(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        lowered = statement.lower()
+        if "downloads" in lowered or "download_scopes" in lowered:
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        active_keys = await repo.find_active_for_requests([(mr.id, None) for mr in requests])
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert active_keys == {(requests[0].id, None)}
+    # One SELECT against ``downloads``, one against ``download_scopes`` -- NOT
+    # one pair per candidate (which would be 10 for 5 candidates).
+    assert len(statements) == 2
 
 
 async def test_create_stores_and_round_trips_episodes_json(session: AsyncSession) -> None:

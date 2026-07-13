@@ -322,6 +322,19 @@ class RequestRepository(Protocol):
         """List requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def get_many(self, request_ids: Sequence[int]) -> dict[int, RequestRecord]:
+        """Batch :meth:`get` over MULTIPLE ids in a single query.
+
+        Returns ``{request_id: RequestRecord}``; an id with no matching row (never
+        existed, or was deleted) is simply ABSENT from the mapping rather than
+        mapped to a fabricated/default record -- the same "absent, not empty"
+        contract as :meth:`SeasonRequestRepository.list_for_requests`. Lets a
+        caller resolve MANY distinct parent shows in one round trip instead of one
+        :meth:`get` per distinct id (issue #138's eviction candidate-assembly
+        parent-fan-out).
+        """
+        raise NotImplementedError
+
     async def list_personalization_history(self, user_id: int) -> list[RequestRecord]:
         """List one user's non-cancelled, display-deduplicated request history.
 
@@ -583,6 +596,22 @@ class DownloadRepository(Protocol):
         ``media_request_id``), while a second release for the SAME season still
         collides. Movies always pass ``season=None``, which matches ``season IS
         NULL`` -- their existing (unscoped) behaviour is unchanged.
+        """
+        raise NotImplementedError
+
+    async def find_active_for_requests(
+        self, keys: Sequence[tuple[int, int | None]]
+    ) -> frozenset[tuple[int, int | None]]:
+        """Batch :meth:`find_active_for_request` membership over MANY
+        ``(media_request_id, season)`` keys in one round trip.
+
+        Returns the SUBSET of ``keys`` that currently has a non-terminal (active)
+        download -- for each key ``(request_id, season)`` in the result, calling
+        ``find_active_for_request(request_id, season=season) is not None``
+        individually would report ``True``; a key absent from the result would
+        report ``False``. Lets a caller with a whole candidate pool (eviction
+        candidate assembly, issue #138) probe the in-flight guard once instead of
+        once per candidate.
         """
         raise NotImplementedError
 
