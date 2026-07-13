@@ -31,6 +31,11 @@ services:
       # actually resolves from the operator's browser instead of always
       # assuming the in-container port.
       PLEX_MANAGER_HOST_PORT: ${PLEX_MANAGER_HOST_PORT:-8000}
+      # Same value the ports mapping below publishes this container's socket
+      # under -- handed to the container itself (not just used for the
+      # mapping) so the startup setup-URL hint can reflect a LAN/non-default
+      # published bind instead of always assuming localhost (issue #294).
+      PLEX_MANAGER_HOST_BIND: ${PLEX_MANAGER_HOST_BIND:-127.0.0.1}
       # Optional hardening — never required. When set (here or via .env), first-run
       # setup ALSO demands this token; unset/empty boots tokenless and setup is
       # claimed by the first Plex server owner to sign in.

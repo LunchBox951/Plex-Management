@@ -55,6 +55,20 @@ class Settings(BaseSettings):
     # otherwise make that printed link silently wrong.
     host_port: int | None = None
 
+    # The HOST-namespace bind address docker-compose PUBLISHES this container's
+    # port under (docker-compose.yml's ``PLEX_MANAGER_HOST_BIND``, default
+    # ``127.0.0.1`` -- loopback-only until an operator deliberately widens it for
+    # LAN/reverse-proxy access). Mirrored into the container's own
+    # ``environment:`` block exactly like ``host_port`` above, so the app itself
+    # can see what was actually published rather than always guessing. ``None``
+    # means "not running under that compose file" (issue #294): the startup
+    # setup-URL hint then falls back to substituting ``localhost`` for an
+    # undialable in-process bind, unchanged from before this field existed.
+    # Without this, a Compose install deliberately published under a LAN IP
+    # would still print a ``localhost``-only link that never resolves off the
+    # container host, silently defeating the "click this exact link" promise.
+    host_bind: str | None = None
+
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync
     # URL from this for migrations — see ``migrations/env.py``.
     database_url: str = "sqlite+aiosqlite:///./data/plex_manager.db"

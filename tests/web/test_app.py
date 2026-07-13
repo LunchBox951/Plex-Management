@@ -6,13 +6,27 @@ import httpx
 import pytest
 
 from plex_manager.config import Settings, get_settings
+from plex_manager.services import path_visibility
 from plex_manager.web.app import (
+    _BARE_METAL_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _UNCONFIRMED_HOST_PORT_NOTE,  # pyright: ignore[reportPrivateUsage]
     _emit_setup_ready_hint,  # pyright: ignore[reportPrivateUsage]
     _setup_ready_url,  # pyright: ignore[reportPrivateUsage]
     _warn_if_multi_process,  # pyright: ignore[reportPrivateUsage]
     create_upstream_http_client,
 )
+
+
+def _always_a_live_mount(_path: str) -> bool:
+    """A ``path_visibility.is_live_mount`` stand-in simulating the documented
+    compose topology's required bind mounts always being live."""
+    return True
+
+
+def _never_a_live_mount(_path: str) -> bool:
+    """A ``path_visibility.is_live_mount`` stand-in simulating a bare-metal
+    install with neither of the compose-required bind mounts present."""
+    return False
 
 
 async def test_upstream_http_client_ignores_proxy_environment(
@@ -49,17 +63,40 @@ class TestSetupReadyUrl:
     in-container one, and must never carry the bootstrap token as a query string
     (which uvicorn's default access log would otherwise record verbatim)."""
 
-    def test_uses_host_port_when_the_compose_env_var_is_known(self) -> None:
+    def test_uses_host_port_when_running_under_the_documented_compose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Simulate the documented compose topology's required bind mounts (see
+        # `_running_under_documented_compose`) -- a real docker-compose install
+        # always has one of these live; a bare-metal test process never does.
+        monkeypatch.setattr(path_visibility, "is_live_mount", _always_a_live_mount)
         settings = Settings(host="0.0.0.0", port=8000, host_port=9443)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:9443/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE not in url
+        assert _BARE_METAL_HOST_PORT_NOTE not in url
 
     def test_falls_back_to_the_in_container_port_and_says_so_when_unknown(self) -> None:
         settings = Settings(host="0.0.0.0", port=8000, host_port=None)  # noqa: S104
         url = _setup_ready_url(settings)
         assert url.startswith("http://localhost:8000/setup")
         assert _UNCONFIRMED_HOST_PORT_NOTE in url
+
+    def test_ignores_a_compose_only_host_port_default_on_bare_metal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #294, finding 3: a bare-metal install that copies
+        ``.env.example`` verbatim inherits its compose-only
+        ``PLEX_MANAGER_HOST_PORT=8000`` default even though no port mapping was
+        ever applied. Without the compose-topology gate, that guessed port
+        would print unchallenged; with it, the app falls back to the
+        in-container port and says so honestly."""
+        monkeypatch.setattr(path_visibility, "is_live_mount", _never_a_live_mount)
+        settings = Settings(host="0.0.0.0", port=9000, host_port=8000)  # noqa: S104
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:9000/setup")
+        assert _BARE_METAL_HOST_PORT_NOTE in url
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url
 
     def test_substitutes_localhost_for_an_undialable_bind_host(self) -> None:
         settings = Settings(host="::", port=8000, host_port=8000)
@@ -82,6 +119,55 @@ class TestSetupReadyUrl:
         settings = Settings(host="127.0.0.1", port=8000, host_port=8000)
         url = _setup_ready_url(settings)
         assert "setup_token" not in url
+
+    def test_keeps_the_port_note_outside_the_setup_token_fragment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #294, finding 1: the explanatory port-guessed note must never
+        land AFTER the ``#setup_token=`` fragment -- copying "the whole printed
+        line" must never risk appending trailing prose onto the token value."""
+        monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "boot-token")
+        get_settings.cache_clear()
+        settings = get_settings()
+
+        url = _setup_ready_url(settings)
+
+        assert url.endswith("#setup_token=boot-token")
+        fragment_index = url.index("#setup_token=")
+        assert _UNCONFIRMED_HOST_PORT_NOTE not in url[fragment_index:]
+
+    def test_uses_the_published_host_bind_over_the_in_process_listen_address(
+        self,
+    ) -> None:
+        """Issue #294, finding 4: a Compose install deliberately published
+        under a LAN IP must get that IP in the printed link, not an
+        unconditional ``localhost`` that never resolves off the container
+        host."""
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=8000,
+            host_bind="192.168.1.50",
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://192.168.1.50:8000/setup")
+
+    def test_substitutes_localhost_when_the_published_host_bind_is_also_undialable(
+        self,
+    ) -> None:
+        settings = Settings(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            host_port=8000,
+            host_bind="0.0.0.0",  # noqa: S104
+        )
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://localhost:8000/setup")
+
+    def test_falls_back_to_settings_host_when_host_bind_is_unset(self) -> None:
+        settings = Settings(host="127.0.0.1", port=8000, host_port=8000, host_bind=None)
+        url = _setup_ready_url(settings)
+        assert url.startswith("http://127.0.0.1:8000/setup")
 
 
 def test_emit_setup_ready_hint_writes_the_real_unredacted_url_to_stderr(

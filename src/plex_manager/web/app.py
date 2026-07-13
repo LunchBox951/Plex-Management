@@ -43,6 +43,7 @@ from plex_manager.services import (
     eviction_service,
     import_service,
     log_capture_service,
+    path_visibility,
     queue_service,
     retention_telemetry_service,
     watchlist_service,
@@ -993,6 +994,52 @@ _UNCONFIRMED_HOST_PORT_NOTE: Final = (
     " to fix this link)"
 )
 
+#: Appended instead of :data:`_UNCONFIRMED_HOST_PORT_NOTE` when
+#: ``settings.host_port`` IS set but :func:`_running_under_documented_compose`
+#: says this process is not actually running under that compose file (issue
+#: #294, finding 3) -- a bare-metal install that copies ``.env.example``
+#: verbatim inherits its compose-only ``PLEX_MANAGER_HOST_PORT=8000`` default
+#: even though no port mapping was ever applied, so trusting the value would
+#: silently print a link the operator's own process isn't actually listening
+#: on that "published" port for. Honesty over silence: say explicitly that the
+#: value is being ignored and why, rather than asserting a possibly-wrong link.
+_BARE_METAL_HOST_PORT_NOTE: Final = (
+    " (PLEX_MANAGER_HOST_PORT is set, but this process does not look like it is"
+    " running under docker-compose.yml's documented volumes -- ignoring it and"
+    " using the in-container port instead; remove the variable on a bare-metal"
+    " install, or fix the port here if this really is a remapped container)"
+)
+
+
+def _running_under_documented_compose() -> bool:
+    """Whether this process looks like it is actually running under the
+    documented ``docker-compose.yml`` topology (issue #294, finding 3).
+
+    ``docker-compose.yml`` REQUIRES both the ``/media`` and ``/downloads``
+    bind mounts (``:?set ... in .env`` -- compose refuses to start without
+    them), so a live mount at either name is a reliable, environment-derived
+    signal that this process is the documented container, not a bare-metal
+    install or a hand-rolled ``docker run`` with no equivalent mounts. Reuses
+    :func:`~plex_manager.services.path_visibility.is_live_mount` -- the same
+    check that module already uses to distinguish the compose deployment from
+    a bare-metal host for library/download path remapping -- rather than
+    inventing a second, possibly-drifting detection rule. Module-qualified
+    (``path_visibility.is_live_mount`` / ``.KNOWN_CONTAINER_MOUNTS``) so tests
+    can ``monkeypatch.setattr(path_visibility, "is_live_mount", ...)`` exactly
+    like that module's own test suite already does.
+
+    Without this gate, a bare-metal install that copies ``.env.example``
+    verbatim (which ships the compose-only ``PLEX_MANAGER_HOST_PORT=8000``
+    default so Compose users don't have to add it themselves) would have
+    ``settings.host_port`` set even though no port mapping was ever applied --
+    :func:`_setup_ready_url` would then trust and print that guessed port
+    unconditionally, which happens to be right only by coincidence (the
+    in-container default also being 8000).
+    """
+    return any(
+        path_visibility.is_live_mount(mount) for mount in path_visibility.KNOWN_CONTAINER_MOUNTS
+    )
+
 
 def _setup_ready_url(settings: Settings) -> str:
     """Build the Jupyter-notebook-style "click to finish setup" URL (issue #65).
@@ -1004,13 +1051,27 @@ def _setup_ready_url(settings: Settings) -> str:
     ``window.location.hash`` before that redirect fires (see ``SetupWizard.tsx``),
     so the token still survives it.
 
-    Prefers ``settings.host_port`` (the container's PUBLISHED host port, see that
-    field's docstring) over ``settings.port`` (the in-container port) -- a Docker
-    install commonly remaps these, and only the host port is ever reachable from
-    the operator's browser. Falls back to ``settings.port`` with an explicit
-    caveat (:data:`_UNCONFIRMED_HOST_PORT_NOTE`) when the host port genuinely
-    cannot be confirmed from inside the container, rather than asserting a link
-    that may silently be wrong.
+    The HOST component prefers ``settings.host_bind`` (issue #294, finding 4 --
+    the Compose-PUBLISHED bind address, see that field's docstring) over
+    ``settings.host`` (the in-process listen address, commonly the undialable
+    ``0.0.0.0``), substituting ``localhost`` for either when it is itself one
+    of :data:`_UNDIALABLE_BIND_HOSTS` (an operator who deliberately widens the
+    published bind to a real LAN IP gets a link that actually resolves off the
+    container host, instead of always asserting ``localhost``).
+
+    The PORT prefers ``settings.host_port`` (the container's PUBLISHED host
+    port, see that field's docstring) over ``settings.port`` (the in-container
+    port) -- a Docker install commonly remaps these, and only the host port is
+    ever reachable from the operator's browser -- but ONLY when
+    :func:`_running_under_documented_compose` actually confirms this process
+    is running under that compose file (issue #294, finding 3); otherwise it
+    falls back to ``settings.port`` with an explicit caveat
+    (:data:`_BARE_METAL_HOST_PORT_NOTE`). With no ``host_port`` configured at
+    all, the fallback caveat is :data:`_UNCONFIRMED_HOST_PORT_NOTE` instead.
+    Either caveat is appended to the URL BEFORE any ``#setup_token=`` fragment
+    (issue #294, finding 1) -- never after -- so the fragment, when present,
+    is always the last thing in the printed line and copying "the whole line"
+    can never append trailing prose onto the token value itself.
 
     ``#setup_token=`` -- a URL FRAGMENT, never a query parameter -- is appended
     ONLY when a token is both configured and actually enforced
@@ -1023,19 +1084,24 @@ def _setup_ready_url(settings: Settings) -> str:
     browser. This is a discoverability aid only (ADR-0005's install-time
     exception).
     """
-    host = settings.host if settings.host not in _UNDIALABLE_BIND_HOSTS else "localhost"
-    if settings.host_port is not None:
+    host = settings.host_bind or settings.host
+    if host in _UNDIALABLE_BIND_HOSTS:
+        host = "localhost"
+    if settings.host_port is not None and _running_under_documented_compose():
         port: int = settings.host_port
         note = ""
+    elif settings.host_port is not None:
+        port = settings.port
+        note = _BARE_METAL_HOST_PORT_NOTE
     else:
         port = settings.port
         note = _UNCONFIRMED_HOST_PORT_NOTE
-    url = f"http://{host}:{port}/setup"
+    url = f"http://{host}:{port}/setup{note}"
     if is_setup_token_required():
         token = configured_setup_token()
         if token:
             url = f"{url}#setup_token={quote(token, safe='')}"
-    return f"{url}{note}"
+    return url
 
 
 def _emit_setup_ready_hint(url: str) -> None:
