@@ -7,8 +7,6 @@ import { useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
-import { disableApiKeyAuth, setApiKey } from '../lib/apiKey'
-import { beginApiKeyRotation } from '../lib/apiKeyRotation'
 import type {
   AppApiKeyResponse,
   AppApiKeyStatusResponse,
@@ -65,8 +63,8 @@ export function useAuthMe(enabled = true) {
  * Verify a browser-obtained plex.tv token and mint a session. The browser ran
  * the plex.tv PIN flow itself (see `lib/plexOAuth`); this posts the resulting
  * `auth_token` for the backend to re-derive identity + ownership and set the
- * session cookie. On success the api-key path is dropped and the fresh
- * `/auth/me` answer is seeded so the gate re-renders authenticated at once.
+ * session cookie. On success the fresh `/auth/me` answer is seeded so the gate
+ * re-renders authenticated at once.
  */
 export function usePlexSignIn() {
   const qc = useQueryClient()
@@ -74,7 +72,29 @@ export function usePlexSignIn() {
     mutationFn: async (body: PlexSignInRequest): Promise<AuthMeResponse> =>
       unwrap(await client.POST('/api/v1/auth/plex', { body })),
     onSuccess: (data) => {
-      disableApiKeyAuth()
+      qc.setQueryData(queryKeys.authMe, data)
+      void qc.invalidateQueries()
+    },
+  })
+}
+
+/**
+ * Break-glass sign-in: exchange the recovery key for the SAME HTTP-only session
+ * cookie the Plex flow issues (`POST /api/v1/auth/api-key`, CodeQL #263). The key
+ * rides the `X-Api-Key` header of this ONE request and is never stored in the
+ * browser — the returned cookie carries every later request. On success the
+ * `/auth/me` answer is seeded so the gate re-renders authenticated at once.
+ */
+export function useExchangeApiKey() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (key: string): Promise<AuthMeResponse> =>
+      unwrap(
+        await client.POST('/api/v1/auth/api-key', {
+          headers: { 'X-Api-Key': key },
+        }),
+      ),
+    onSuccess: (data) => {
       qc.setQueryData(queryKeys.authMe, data)
       void qc.invalidateQueries()
     },
@@ -86,7 +106,6 @@ export function useLogout() {
   return useMutation({
     mutationFn: async (): Promise<void> => ensureOk(await client.POST('/api/v1/auth/logout')),
     onSuccess: () => {
-      disableApiKeyAuth()
       void qc.invalidateQueries()
     },
   })
@@ -259,26 +278,22 @@ export function useAppKeyStatus() {
 /**
  * Mint the app X-Api-Key — GENERATE the first one, or ROTATE an existing key
  * (the single POST does both; setup mints nothing, ADR-0016). The plaintext is
- * returned exactly once. The CALLER'S own stored key is updated immediately
- * (via setApiKey) so the current session survives its own rotation — every
- * OTHER device holding the old key is, correctly, locked out until re-paired.
- * The status query is invalidated so the Access card flips to Rotate/Revoke.
+ * returned exactly once for the operator to copy into a new device or automation.
+ *
+ * The current browser is UNAFFECTED by its own rotation: it authenticates by the
+ * HTTP-only session cookie, not the raw key (CodeQL #263), and rotating the
+ * shared key does not revoke live sessions — so there is no own-credential window
+ * to coordinate anymore. Every OTHER device holding the old key is, correctly,
+ * locked out until re-paired. The status query is invalidated so the Access card
+ * flips to Rotate/Revoke.
  */
 export function useRotateAppKey() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (): Promise<AppApiKeyResponse> =>
       unwrap(await client.POST('/api/v1/settings/app-key/rotate')),
-    onMutate: () => beginApiKeyRotation(),
-    onSuccess: (data) => {
-      // Store the replacement BEFORE onSettled releases the old-key barrier.
-      // Any SSE or REST 401 that raced the server-side stream close can then see
-      // that its credential is stale instead of disabling the rotation winner.
-      setApiKey(data.app_api_key)
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
-    },
-    onSettled: (_data, _error, _variables, finishRotation) => {
-      finishRotation?.()
     },
   })
 }

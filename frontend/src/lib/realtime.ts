@@ -1,7 +1,5 @@
 import type { QueryClient } from '@tanstack/react-query'
-import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
-import { clearApiKey, getApiKey, isApiKeyAuthEnabled } from './apiKey'
-import { getPendingApiKeyRotation } from './apiKeyRotation'
+import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
 import { setRealtimeReloadRequired } from './realtimeReload'
@@ -203,42 +201,21 @@ export function startRealtimeStream({
   async function run(): Promise<void> {
     let attempt = 0
     while (!stopped) {
-      // Match the typed REST client's credential selection exactly: the recovery
-      // key is opt-in per tab; otherwise this same-origin request relies on the
-      // normal HTTP-only Plex session cookie.
-      const key = isApiKeyAuthEnabled() ? getApiKey() : null
-
       controller = new AbortController()
       let connectedAt: number | null = null
       try {
+        // The browser authenticates SOLELY by the HTTP-only session cookie (Plex
+        // sign-in or a recovery-key exchange), carried by the same-origin
+        // credentials — never a JS-attached X-Api-Key header (CodeQL #263).
         const response = await fetchImpl('/api/v1/events', {
           credentials: 'same-origin',
-          ...(key ? { headers: { 'X-Api-Key': key } } : {}),
           signal: controller.signal,
         })
         if (response.status === 401) {
-          if (key === null) {
-            window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
-            return
-          }
-          // Rotation commits before its HTTP response can hand this tab the new
-          // key, and the commit deliberately closes old-key streams. If that EOF
-          // reconnects quickly, defer judging its 401 until the local rotation
-          // settles. Success stores the replacement before releasing the barrier;
-          // failure leaves the old key current and therefore genuinely invalid.
-          let rotation = getPendingApiKeyRotation(key)
-          while (rotation !== null) {
-            await rotation
-            rotation = getPendingApiKeyRotation(key)
-          }
-          if (isApiKeyAuthEnabled() && key === getApiKey()) {
-            clearApiKey()
-            window.dispatchEvent(new Event(AUTH_INVALID_EVENT))
-            return
-          }
-          // A slow 401 for an old/disabled key says nothing about the current
-          // credential. Reconnect using the now-current auth after backoff.
-          throw new Error('stale realtime credential rejected')
+          // The session cookie is missing/expired/revoked: send the gate back to
+          // the login instead of hammering a stream that can never authenticate.
+          window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
+          return
         }
         if (response.status === 403) {
           // Realtime is admin-only so coarse queue/blocklist/activity signals
