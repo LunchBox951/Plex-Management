@@ -357,8 +357,8 @@ class RequestRepository(Protocol):
         (claimable) one, then anyone else's; newest-by-id within each rank. This
         is the per-user visibility rule for shared (non-admin) sessions — without
         it, another user's NEWER terminal row shadows the caller's own older one
-        and turns their re-request into a spurious ``requested_by_another_user``
-        rejection. ``None`` (the default; admins and API-key automation) returns
+        and collapses their re-request onto a less precise foreign match. ``None``
+        (the default; admins and API-key automation) returns
         the newest row unconditionally, the pre-preference behavior.
         """
         raise NotImplementedError

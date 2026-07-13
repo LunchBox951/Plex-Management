@@ -1912,6 +1912,11 @@
             ],
             "title": "Backdrop Url"
           },
+          "can_mutate": {
+            "default": false,
+            "title": "Can Mutate",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -3118,6 +3123,18 @@
             "title": "Fetched",
             "type": "integer"
           },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
           "last_error_type": {
             "anyOf": [
               {
@@ -3152,8 +3169,23 @@
               }
             ],
             "title": "Last Run At"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "ok",
+              "degraded",
+              "disabled",
+              "not_configured",
+              "error"
+            ],
+            "title": "State",
+            "type": "string"
           }
         },
+        "required": [
+          "state"
+        ],
         "title": "WatchlistStatusItem",
         "type": "object"
       }

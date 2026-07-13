@@ -51,6 +51,7 @@ function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse
     status: 'downloading',
     is_anime: false,
     keep_forever: false,
+    can_mutate: false,
     ...overrides,
   }
 }
@@ -64,6 +65,7 @@ function tvRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
     status: 'partially_available',
     is_anime: false,
     keep_forever: false,
+    can_mutate: false,
     seasons: [
       { season_number: 1, status: 'available' },
       { season_number: 2, status: 'downloading' },

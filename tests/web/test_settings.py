@@ -37,6 +37,7 @@ from plex_manager.web.deps import (
     LOG_RETENTION_DAYS_MAX,
     PLEX_MACHINE_ID_SETTING,
     SECRET_SETTING_KEYS,
+    WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -53,6 +54,7 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
+    get_watchlist_sync_interval_minutes,
     hash_session_token,
     load_system_settings,
     require_api_key,
@@ -1419,6 +1421,8 @@ async def test_put_round_trips_operability_settings(
         "eviction_enabled": False,
         "eviction_proactive_enabled": True,
         "eviction_interval_minutes": 45,
+        "watchlist_sync_enabled": False,
+        "watchlist_sync_interval_minutes": 20,
         "log_retention_days": 3,
         "log_max_rows": 50_000,
     }
@@ -1431,6 +1435,8 @@ async def test_put_round_trips_operability_settings(
     assert body["eviction_enabled"] is False
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
+    assert body["watchlist_sync_enabled"] is False
+    assert body["watchlist_sync_interval_minutes"] == 20.0
     assert body["log_retention_days"] == 3
     assert body["log_max_rows"] == 50_000
 
@@ -1448,6 +1454,7 @@ async def test_put_round_trips_operability_settings(
         assert await get_eviction_enabled(session) is False
         assert await get_eviction_proactive_enabled(session) is True
         assert await get_eviction_interval_minutes(session) == 45.0
+        assert await get_watchlist_sync_interval_minutes(session) == 20.0
         assert await get_log_retention_days(session) == 3
         assert await get_log_max_rows(session) == 50_000
 
@@ -1471,6 +1478,13 @@ async def test_put_rejects_out_of_range_operability_settings(
         headers=headers,
     )
     assert zero_interval.status_code == 422
+
+    zero_watchlist_interval = await client.put(
+        "/api/v1/settings",
+        json={"watchlist_sync_interval_minutes": 0},
+        headers=headers,
+    )
+    assert zero_watchlist_interval.status_code == 422
 
     negative_days = await client.put(
         "/api/v1/settings",
@@ -1566,6 +1580,11 @@ def test_settings_update_rejects_non_finite_interval() -> None:
             SettingsUpdate(eviction_interval_minutes=bad)
     SettingsUpdate(eviction_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)  # boundary, inclusive
     SettingsUpdate(eviction_interval_minutes=45.0)  # an ordinary value still works
+    for bad in (float("inf"), float("nan"), float("-inf"), EVICTION_INTERVAL_MAX_MINUTES + 1):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(watchlist_sync_interval_minutes=bad)
+    SettingsUpdate(watchlist_sync_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)
+    SettingsUpdate(watchlist_sync_interval_minutes=WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT)
 
 
 @pytest.mark.parametrize(
@@ -1574,6 +1593,9 @@ def test_settings_update_rejects_non_finite_interval() -> None:
         ("eviction_interval_minutes", float("inf")),
         ("eviction_interval_minutes", float("nan")),
         ("eviction_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
+        ("watchlist_sync_interval_minutes", float("inf")),
+        ("watchlist_sync_interval_minutes", float("nan")),
+        ("watchlist_sync_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
         ("disk_pressure_threshold_percent", float("inf")),
         ("disk_pressure_threshold_percent", float("nan")),
         ("eviction_grace_days", EVICTION_GRACE_DAYS_MAX + 1),
@@ -1648,6 +1670,7 @@ async def test_put_accepts_upper_bound_operability_settings(
     headers = {"X-Api-Key": _API_KEY}
     update = {
         "eviction_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
+        "watchlist_sync_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
         "eviction_grace_days": EVICTION_GRACE_DAYS_MAX,
         "log_retention_days": LOG_RETENTION_DAYS_MAX,
         "log_max_rows": LOG_MAX_ROWS_MAX,
@@ -1657,6 +1680,7 @@ async def test_put_accepts_upper_bound_operability_settings(
     assert put.status_code == 200
     body = put.json()
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["watchlist_sync_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
     assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
@@ -1666,6 +1690,7 @@ async def test_put_accepts_upper_bound_operability_settings(
 
     async with sessionmaker_() as session:
         assert await get_eviction_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
+        assert await get_watchlist_sync_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
         assert await get_eviction_grace_days(session) == EVICTION_GRACE_DAYS_MAX
         assert await get_log_retention_days(session) == LOG_RETENTION_DAYS_MAX
         assert await get_log_max_rows(session) == LOG_MAX_ROWS_MAX
@@ -1839,6 +1864,7 @@ async def test_get_settings_does_not_500_on_non_finite_stored_interval(
         ("log_max_rows", "abc"),
         ("eviction_enabled", "maybe"),
         ("eviction_interval_minutes", "inf"),
+        ("watchlist_sync_interval_minutes", "inf"),
     ],
 )
 async def test_get_settings_tolerates_corrupt_stored_typed_values(
@@ -1876,6 +1902,7 @@ async def test_get_settings_preserves_valid_typed_values(
         "eviction_enabled": "false",
         "eviction_proactive_enabled": "true",
         "eviction_interval_minutes": "45.0",
+        "watchlist_sync_interval_minutes": "20.0",
         "log_retention_days": "3",
         "log_max_rows": "50000",
     }
@@ -1894,6 +1921,7 @@ async def test_get_settings_preserves_valid_typed_values(
     assert body["eviction_enabled"] is False
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
+    assert body["watchlist_sync_interval_minutes"] == 20.0
     assert body["log_retention_days"] == 3
     assert body["log_max_rows"] == 50000
 
@@ -1915,6 +1943,12 @@ async def test_get_settings_preserves_valid_typed_values(
             EVICTION_INTERVAL_MAX_MINUTES,
         ),
         ("eviction_interval_minutes", "0", None),  # gt=0 -- exclusive bound, no floor to clamp to
+        (
+            "watchlist_sync_interval_minutes",
+            str(EVICTION_INTERVAL_MAX_MINUTES + 1),
+            EVICTION_INTERVAL_MAX_MINUTES,
+        ),
+        ("watchlist_sync_interval_minutes", "0", None),
         ("disk_pressure_threshold_percent", "150", 100.0),  # clamp: stored >100 meant "never trip"
         ("disk_pressure_target_percent", "-1", None),  # default 80 (<= default threshold 90)
         ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX),
@@ -1961,6 +1995,7 @@ async def test_get_settings_preserves_boundary_typed_values(
         "disk_pressure_threshold_percent": "100",  # le=100, inclusive
         "disk_pressure_target_percent": "0",  # ge=0, inclusive
         "eviction_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),  # le, inclusive
+        "watchlist_sync_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),
         "eviction_grace_days": str(EVICTION_GRACE_DAYS_MAX),
         "log_retention_days": str(LOG_RETENTION_DAYS_MAX),
         "log_max_rows": str(LOG_MAX_ROWS_MAX),
@@ -1977,6 +2012,7 @@ async def test_get_settings_preserves_boundary_typed_values(
     assert body["disk_pressure_threshold_percent"] == 100.0
     assert body["disk_pressure_target_percent"] == 0.0
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["watchlist_sync_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
     assert body["log_max_rows"] == LOG_MAX_ROWS_MAX

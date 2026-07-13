@@ -4804,6 +4804,8 @@ async def test_heal_owned_candidate_adopts_ownerless_sibling_then_collapses(
     assert sibling_row is not None
     assert sibling_row.user_id == owner_a_id  # adopted FIRST so the owner keeps visibility
     assert sibling_row.library_path == "/movies/ownerless"
+    async with sessionmaker_() as session:
+        assert await SqlRequestRepository(session).is_subscriber(sibling_id, owner_a_id)
     assert any("adopted an ownerless sibling" in r.getMessage() for r in caplog.records)
 
 

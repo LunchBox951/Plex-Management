@@ -906,6 +906,9 @@ class RequestResponse(BaseModel):
     # select this title (or, for a show, any of its seasons) regardless of watch
     # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.
     keep_forever: bool = False
+    # Capability is computed for the current caller. Request creators and admins
+    # may pin, report, or cancel; subscribers may observe the shared request only.
+    can_mutate: bool = False
 
 
 class RequestListResponse(BaseModel):
@@ -1220,9 +1223,11 @@ class AutograbStatusItem(BaseModel):
 class WatchlistStatusItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
     last_run_at: datetime | None = None
     last_ok_at: datetime | None = None
     last_error_type: str | None = None
+    last_error_at: datetime | None = None
     fetched: int = 0
     created: int = 0
     existing: int = 0

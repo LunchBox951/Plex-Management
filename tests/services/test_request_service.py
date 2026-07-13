@@ -1640,9 +1640,8 @@ async def test_non_admin_dedup_onto_foreign_owned_tv_request_subscribes_without_
     sessionmaker_: SessionMaker,
 ) -> None:
     """A non-admin user POSTing a title already actively requested by a DIFFERENT
-    user gets an honest 409 (``RequestOwnedByAnotherUserError``) — and the other
-    user's request is NOT mutated: its tracked TV season set is unchanged, never
-    grown with the intruder's requested season."""
+    user subscribes to the shared row without mutating the owner's tracked TV
+    season set with the second user's manual season selection."""
     owner_id = await _make_user(sessionmaker_, username="owner")
     intruder_id = await _make_user(sessionmaker_, username="intruder")
     tmdb = FakeTmdb(shows={7001: TvMetadata(tmdb_id=7001, title="Show", year=2020, season_count=5)})
@@ -1882,8 +1881,8 @@ async def test_non_admin_tv_all_present_dedup_onto_foreign_row_subscribes_unmuta
     sessionmaker_: SessionMaker,
 ) -> None:
     """The TV terminal-row bypass: every requested season is already in Plex and the
-    existing available request belongs to ANOTHER user — rejected BEFORE
-    ensure_seasons, so the owner's tracked season set is never grown."""
+    existing available request belongs to ANOTHER user — the viewer subscribes,
+    while the owner's tracked season set is never grown by manual intent."""
     owner_id = await _make_user(sessionmaker_, username="tv-owner")
     intruder_id = await _make_user(sessionmaker_, username="tv-intruder")
     tmdb = FakeTmdb(
@@ -2138,8 +2137,7 @@ async def test_non_admin_claims_ownerless_tv_all_present_row_on_dedup(
 # In-library dedup winner PREFERENCE (issue #58): with SEVERAL terminal rows    #
 # for one media, a non-admin's own row — then an ownerless claimable one —      #
 # must win over a foreign row. Newest-global-row-wins alone made user B's       #
-# newer row shadow user A's older visible row, turning A's re-request into a    #
-# spurious requested_by_another_user 409.                                       #
+# newer row shadow user A's older, more precise visible row.                    #
 # --------------------------------------------------------------------------- #
 
 
@@ -2311,14 +2309,11 @@ async def test_non_admin_tv_all_present_dedup_prefers_their_own_older_row(
 # --------------------------------------------------------------------------- #
 
 
-async def test_lost_claim_race_loser_gets_foreign_owner_rejection(
+async def test_lost_claim_race_loser_subscribes_to_concurrent_winner(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-admin deduping onto an OWNERLESS active request whose adoption UPDATE
-    LOSES a concurrent race (0 rows claimed — another user took it first) must get
-    the SAME honest 409 as a row that was already foreign at read time, never a
-    success on a row now owned by someone else that their own /requests list hides."""
+    """A lost ownerless-claim race converges on the winner and subscribes the loser."""
     other_id = await _make_user(sessionmaker_, username="race-victor")
     claimer_id = await _make_user(sessionmaker_, username="race-loser")
     tmdb = FakeTmdb(movies={7108: MovieMetadata(tmdb_id=7108, title="Race", year=2020)})
@@ -2345,15 +2340,15 @@ async def test_lost_claim_race_loser_gets_foreign_owner_rejection(
             return False
 
         monkeypatch.setattr(SqlRequestRepository, "claim_if_unowned", losing_claim)
-        with pytest.raises(request_service.RequestOwnedByAnotherUserError):
-            await request_service.create_request(
-                session,
-                tmdb,
-                tmdb_id=7108,
-                media_type="movie",
-                user_id=claimer_id,
-                actor_is_admin=False,
-            )
+        result = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=7108,
+            media_type="movie",
+            user_id=claimer_id,
+            actor_is_admin=False,
+        )
+    assert result.id == ownerless.id
 
     async with sessionmaker_() as session:
         rows = (
@@ -2362,7 +2357,8 @@ async def test_lost_claim_race_loser_gets_foreign_owner_rejection(
             .all()
         )
     assert len(rows) == 1  # a dedup path — the loser never minted a duplicate row
-    assert rows[0].user_id is None  # the lost-race UPDATE rolled back with the 409
+    assert rows[0].user_id == other_id
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
 async def test_integrity_race_recovery_claims_ownerless_movie_winner(
@@ -2523,6 +2519,7 @@ async def test_available_race_collapse_claims_ownerless_winner(
     assert len(rows) == 1  # the user's duplicate was collapsed away
     assert rows[0].user_id == claimer_id  # winner ADOPTED, not left ownerless-and-hidden
     assert rows[0].status is RequestStatus.available
+    assert await _is_subscriber(sessionmaker_, ownerless.id, claimer_id)
 
 
 # --------------------------------------------------------------------------- #

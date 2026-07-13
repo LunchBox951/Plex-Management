@@ -118,6 +118,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
       status: createdStatus,
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       year: 2021,
     }
     const createMutation = mutation(created)
@@ -192,6 +193,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
       id: 7,
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       media_type: 'movie',
       status: 'downloading',
       title: 'Test Movie',
@@ -271,6 +273,7 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
       status: 'pending',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({
@@ -332,6 +335,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'pending',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [{ season_number: 2, status: 'pending' }],
     }
     const createRequestMock = mutation(created)
@@ -381,6 +385,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'partially_available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'failed' },
@@ -439,6 +444,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'partially_available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -517,6 +523,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'partially_available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -550,6 +557,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'partially_available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -585,6 +593,7 @@ describe('TitleDetailModal — tv season selector', () => {
       status: 'downloading',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'downloading' },
@@ -632,6 +641,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
       status: 'available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       ...overrides,
     }
   }
@@ -767,6 +777,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       status: 'available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       ...overrides,
     }
   }
@@ -837,6 +848,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       status: 'waiting_for_air_date',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
     }
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
@@ -907,6 +919,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
             status: 'downloading',
             is_anime: false,
             keep_forever: false,
+            can_mutate: true,
             seasons: [
               { season_number: 1, status: 'available' },
               { season_number: 2, status: 'downloading' },
@@ -930,6 +943,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
       status: 'available',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       ...overrides,
     }
   }
@@ -984,24 +998,48 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     expect(useQueue).toHaveBeenCalledWith({ poll: true, enabled: false })
   })
 
-  it('hides keep-forever, report and cancel from a shared user across states', () => {
+  it('shows creator mutations to a shared user while keeping operator actions hidden', () => {
     asSharedUser()
-    // An available request (would offer keep-forever + report-issue to an admin).
+    // The API capability, not the account's global role, grants creator actions.
     ;(useRequests as unknown as Mock).mockReturnValue({
-      data: { requests: [movieRequest({ status: 'available' })] },
+      data: { requests: [movieRequest({ status: 'available', can_mutate: true })] },
     })
     const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByText(/in your library/i)).toBeInTheDocument() // honest status stays
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /keep forever/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+    unmount()
+
+    // Cancel is creator-capable, while re-search remains an admin-only release action.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'searching', can_mutate: true })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /cancel request/i })).toBeInTheDocument()
+  })
+
+  it('keeps a shared subscriber read-only when the request denies mutation capability', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [movieRequest({ status: 'available', can_mutate: false })],
+      },
+    })
+    const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
     expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
     unmount()
 
-    // A searching request (would offer Re-search + Cancel to an admin).
     ;(useRequests as unknown as Mock).mockReturnValue({
-      data: { requests: [movieRequest({ status: 'searching' })] },
+      data: {
+        requests: [movieRequest({ status: 'searching', can_mutate: false })],
+      },
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByText(/searching/i)).toBeInTheDocument() // honest status stays
+    expect(screen.getByText(/searching/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
   })
@@ -1034,6 +1072,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
       status: 'pending',
       is_anime: false,
       keep_forever: false,
+      can_mutate: true,
       ...overrides,
     }
   }
@@ -1137,6 +1176,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
             status: 'available',
             is_anime: false,
             keep_forever: false,
+            can_mutate: true,
             seasons: [{ season_number: 1, status: 'available' }],
           } satisfies RequestResponse,
         ],

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import delete, select
 
@@ -29,9 +29,13 @@ __all__ = [
 
 @dataclass
 class WatchlistWorkerStatus:
+    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"] = field(
+        default="starting"
+    )
     last_run_at: datetime | None = field(default=None)
     last_ok_at: datetime | None = field(default=None)
     last_error_type: str | None = field(default=None)
+    last_error_at: datetime | None = field(default=None)
     fetched: int = field(default=0)
     created: int = field(default=0)
     existing: int = field(default=0)
@@ -40,15 +44,29 @@ class WatchlistWorkerStatus:
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
 
+    def mark_skipped(self, state: Literal["disabled", "not_configured"]) -> None:
+        self.state = state
+        self.last_error_type = None
+        self.last_error_at = None
+        self.fetched = self.created = self.existing = self.failed_users = 0
+
     def mark_completed(
         self, *, fetched: int, created: int, existing: int, failed_users: int, error: str | None
     ) -> None:
-        self.last_ok_at = datetime.now(UTC)
+        self.state = "degraded" if failed_users else "ok"
+        if not failed_users:
+            self.last_ok_at = datetime.now(UTC)
         self.fetched = fetched
         self.created = created
         self.existing = existing
         self.failed_users = failed_users
         self.last_error_type = error
+        self.last_error_at = datetime.now(UTC) if error is not None else None
+
+    def mark_error(self, exc: BaseException) -> None:
+        self.state = "error"
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -56,6 +74,7 @@ class WatchlistSyncResult:
     fetched: int
     created: int
     existing: int
+    failed: int
 
 
 async def list_sync_users(session: AsyncSession) -> list[User]:
@@ -95,19 +114,28 @@ async def sync_user(
 
     created = 0
     existing = 0
+    failed = 0
     for entry in entries:
         # TODO(#199 follow-up): apply request quotas/approval policy here through
         # the shared request-policy boundary once that policy exists. Do not put
         # watchlist-only limits in this worker.
-        result = await request_service.create_request_result(
-            session,
-            tmdb,
-            tmdb_id=entry.tmdb_id,
-            media_type=entry.media_type,
-            user_id=user_id,
-            actor_is_admin=False,
-            library=library,
-        )
+        try:
+            result = await request_service.create_request_result(
+                session,
+                tmdb,
+                tmdb_id=entry.tmdb_id,
+                media_type=entry.media_type,
+                user_id=user_id,
+                actor_is_admin=False,
+                library=library,
+                expand_shared_tv=True,
+            )
+        except Exception:
+            await session.rollback()
+            failed += 1
+            continue
         created += int(result.created)
         existing += int(not result.created)
-    return WatchlistSyncResult(fetched=len(entries), created=created, existing=existing)
+    return WatchlistSyncResult(
+        fetched=len(entries), created=created, existing=existing, failed=failed
+    )

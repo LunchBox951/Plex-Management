@@ -43,6 +43,7 @@ const LOG_MAX_ROWS_DEFAULT = 100000
 const AUTO_GRAB_ENABLED_DEFAULT = true
 const WATCHLIST_SYNC_ENABLED_DEFAULT = true
 const WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT = 15
+const WATCHLIST_SYNC_INTERVAL_MINUTES_MAX = 10_080
 
 interface FormState {
   plex_url: string
@@ -682,6 +683,15 @@ export function Settings() {
         return
       }
     }
+    const watchlistInterval = Number(form.watchlist_sync_interval_minutes)
+    if (watchlistInterval <= 0 || watchlistInterval > WATCHLIST_SYNC_INTERVAL_MINUTES_MAX) {
+      toast({
+        title: 'Save failed',
+        description: `Watchlist sync interval must be greater than 0 and at most ${WATCHLIST_SYNC_INTERVAL_MINUTES_MAX} minutes.`,
+        intent: 'error',
+      })
+      return
+    }
 
     // A library folder is discovered against a *specific* Plex server. If the
     // operator just changed the Plex connection (URL or a freshly typed token)
@@ -1150,7 +1160,7 @@ export function Settings() {
             {numberField(
               'watchlist_sync_interval_minutes',
               'Watchlist sync interval (minutes)',
-              { min: 0.1, step: 0.1 },
+              { min: 0.1, max: WATCHLIST_SYNC_INTERVAL_MINUTES_MAX, step: 0.1 },
             )}
           </div>
         </section>

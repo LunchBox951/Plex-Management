@@ -34,7 +34,6 @@ __all__ = [
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
-    "RequestOwnedByAnotherUserError",
     "create_request",
     "create_request_result",
     "fold_requests_for_display",
@@ -178,26 +177,6 @@ class MediaTypeDeferredError(Exception):
     def __init__(self, media_type: str) -> None:
         self.media_type = media_type
         super().__init__(f"{media_type} requests are deferred")
-
-
-class RequestOwnedByAnotherUserError(Exception):
-    """A non-admin user tried to dedup onto an active request owned by someone else.
-
-    Until shared ownership is modeled (issue #58), a non-admin authenticated
-    caller must NOT dedup onto an existing active request that belongs to a
-    DIFFERENT user: doing so would (a) for tv mutate the other user's request by
-    adding the caller's seasons (via ``ensure_seasons``), and (b) hand back a
-    record the caller's own per-user list/get immediately hide. Surfaced as HTTP
-    409 with a stable ``requested_by_another_user`` detail — an honest rejection,
-    not a silent mutation of someone else's request. Admins and API-key
-    automation (no user identity) keep the shared dedup behavior, since they can
-    already see every request.
-    """
-
-    def __init__(self, tmdb_id: int, media_type: str) -> None:
-        self.tmdb_id = tmdb_id
-        self.media_type = media_type
-        super().__init__(f"{media_type} tmdb_id={tmdb_id} is already requested by another user")
 
 
 class _Detail(NamedTuple):
@@ -450,17 +429,15 @@ def _owned_by_another_user(
 def _dedup_preference_user_id(user_id: int | None, actor_is_admin: bool) -> int | None:
     """The ``prefer_user_id`` scope for a terminal in-library dedup lookup.
 
-    Exactly the actors :func:`_owned_by_another_user` can REJECT — a non-admin
-    authenticated user — get the owner-preference lookup (their own terminal row,
+    Non-admin authenticated users get the owner-preference lookup (their own terminal row,
     then an ownerless claimable one, before a foreign row; see
     :meth:`~plex_manager.ports.repositories.RequestRepository.find_in_library`).
     Without it, multiple terminal rows for one media (a legitimate state — the
     remove-then-reacquire flow, or the per-user keep-own-row race collapse) make
     the dedup check only the newest GLOBAL row: user A, who owns an older visible
-    ``available`` row, would be 409-rejected because user B's newer row shadows
-    it. Admins and API-key automation (``user_id`` ``None``) return ``None`` —
-    they are never ownership-rejected, so they keep the unscoped newest-row-wins
-    lookup unchanged.
+    ``available`` row, would otherwise be collapsed onto user B's newer row even
+    though their own row is the more precise match. Admins and API-key automation
+    (``user_id`` ``None``) keep the unscoped newest-row-wins lookup unchanged.
     """
     return user_id if user_id is not None and not actor_is_admin else None
 
@@ -486,21 +463,16 @@ async def _claim_dedup_winner_if_unowned(
 
     A no-op — the record is returned untouched — when there is nothing to claim:
     an admin / API-key caller (``user_id`` None) or a row that already has an
-    owner. (Foreign rows are rejected by the caller's ``_owned_by_another_user``
-    guard BEFORE this runs; an already-owned-by-us row needs no claim.)
+    owner. Foreign rows are handled by subscriber membership before this runs;
+    an already-owned-by-us row needs no claim.
 
     LOST CLAIM RACE — honesty over a silent success: the ``UPDATE`` can touch 0
     rows because a concurrent writer took ownership between this caller's
     ownerless read and the claim. The winner is now a DIFFERENT user's row, so
     returning it would re-introduce the exact silent-vanish bug. So re-read PAST
     this session's stale identity-map copy (:meth:`get_fresh`) and RE-RUN the
-    ownership decision: a now-foreign winner raises
-    :class:`RequestOwnedByAnotherUserError` -- the IDENTICAL outcome as a row that
-    was already foreign at read time -- routing the lost-race loser through the
-    same honest 409, never a vanishing success. (The post-commit available-race
-    collapse cannot raise -- its own row is already committed -- so it adopts
-    inline and KEEPS its own row on a lost race instead; see
-    :func:`_collapse_available_race`, which upholds the same invariant.)
+    ownership decision. A now-foreign winner is subscribed for the loser before
+    returning, so the successful dedup remains visible without changing ownership.
 
     This is the shared adoption path for every PRE-RETURN dedup winner: the active
     ``find_active`` dedup, both terminal ``find_in_library`` short-circuits, and
@@ -514,7 +486,8 @@ async def _claim_dedup_winner_if_unowned(
         return await repo.get(record.id) or record
     refreshed = await repo.get_fresh(record.id) or record
     if _owned_by_another_user(refreshed, user_id, actor_is_admin):
-        raise RequestOwnedByAnotherUserError(refreshed.tmdb_id, refreshed.media_type)
+        await repo.add_subscriber(refreshed.id, user_id)
+        await session.commit()
     return refreshed
 
 
@@ -559,22 +532,15 @@ async def _collapse_available_race(
 
     Ownership (issue #58) — the same invariant as :func:`_claim_dedup_winner_if_unowned`
     (never hand back a row the caller's per-user list/get hide): when the earlier
-    winner belongs to a DIFFERENT user and the caller is a non-admin, the collapse
-    is SKIPPED and the caller's own row is kept — deleting it would hand back a
-    record the caller's per-user list/get immediately hide (their just-created
-    request would silently vanish). A 409 is wrong here too: unlike the pre-insert
-    guards, the caller's row is already committed, so rejecting after the fact
-    would report failure for a create that happened. Two terminal ``available``
-    rows for the same media is already an accepted state (see the
-    remove-then-reacquire flow); each stays visible to its own requester.
+    winner belongs to a DIFFERENT user and the caller is a non-admin, the caller is
+    subscribed to that winner before its duplicate row is removed. The display
+    remains singular and visibility survives without reassigning ownership.
 
     An OWNERLESS winner (e.g. an ``X-Api-Key`` automation create) is likewise
     ADOPTED for this user BEFORE the collapse, so the surviving row lands in their
     own list rather than vanishing behind the per-user filter. On a LOST adoption
-    race the winner is now foreign: the caller's own row is kept (the same
-    keep-our-row outcome as the foreign-winner branch above), never deleted to
-    return a hidden row — this path never raises, since our row is already
-    committed.
+    race the winner is now foreign: the caller is subscribed before the duplicate
+    is deleted, so this path also converges without returning a hidden row.
     """
     winner = await repo.find_earliest_available(tmdb_id, media_type)
     if winner is not None and winner.id != record.id:
@@ -593,7 +559,12 @@ async def _collapse_available_race(
             # if the winner is now another user's row, keep our OWN committed row.
             refreshed = await repo.get_fresh(winner.id) or winner
             if _owned_by_another_user(refreshed, user_id, actor_is_admin):
-                return record
+                await repo.add_subscriber(refreshed.id, user_id)
+                await repo.delete(record.id)
+                await session.commit()
+                return await repo.get(refreshed.id) or refreshed
+        if user_id is not None:
+            await repo.add_subscriber(winner.id, user_id)
         await repo.delete(record.id)
         await session.commit()
         return await repo.get(winner.id) or winner
@@ -632,6 +603,7 @@ async def create_request(
     seasons: list[int] | None = None,
     episodes: dict[int, list[int]] | None = None,
     force: bool = False,
+    expand_shared_tv: bool = False,
 ) -> RequestRecord:
     """Create a request and return only the request read model."""
     result = await create_request_result(
@@ -645,6 +617,7 @@ async def create_request(
         seasons=seasons,
         episodes=episodes,
         force=force,
+        expand_shared_tv=expand_shared_tv,
     )
     return result.record
 
@@ -661,6 +634,7 @@ async def create_request_result(
     seasons: list[int] | None = None,
     episodes: dict[int, list[int]] | None = None,
     force: bool = False,
+    expand_shared_tv: bool = False,
 ) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
 
@@ -688,7 +662,7 @@ async def create_request_result(
     ``available`` row with no grab. Every OTHER guard is preserved: the
     ``find_active`` active-request dedup (and its ownership / ownerless-claim
     decisions) runs unchanged before ``force`` is even consulted, so a foreign
-    active request is still 409'd and a duplicate active row for this media is
+    active request is shared through subscriber membership and a duplicate row is
     impossible (``uq_media_requests_active`` still applies to the inserted
     ``pending`` row). The forced path ALSO takes the same per-media lock and does
     the same under-lock ``find_active`` re-read as the normal short-circuit before
@@ -714,22 +688,11 @@ async def create_request_result(
     this: an existing request resolving no NEW seasons there just means "nothing
     to add" to an already-viable request, not a dead end.
 
-    Raises :class:`RequestOwnedByAnotherUserError` (surfaced as 409) when a
-    non-admin authenticated caller (``user_id`` set, ``actor_is_admin`` False)
-    dedups onto a request owned by a DIFFERENT user -- on EVERY dedup path: the
-    initial ``find_active`` dedup, both terminal ``find_in_library``
-    short-circuits (movie in-library and tv all-seasons-present), and the
-    ``IntegrityError`` race recovery. Each rejects before any claim/season
-    mutation, so another user's request is never silently grown or returned
-    behind the caller's per-user filter; the post-commit available-race collapse
-    instead KEEPS the caller's own row (see :func:`_collapse_available_race`).
-    Admins and API-key automation (``user_id`` None) keep the shared dedup
-    behavior (issue #58). The terminal ``find_in_library`` lookups are
-    owner-preferring for exactly the actors this can reject (see
-    :func:`_dedup_preference_user_id`): with several terminal rows for one media,
-    the caller's OWN row — then an ownerless claimable one — wins over a foreign
-    row, so the 409 fires only when every candidate truly belongs to someone else,
-    never because another user's newer row shadows the caller's own.
+    When a non-admin authenticated caller dedups onto another user's row, the
+    caller becomes a subscriber and receives that shared row without ownership
+    reassignment. Ordinary manual TV dedup does not grow a foreign owner's season
+    intent; watchlist sync may explicitly request whole-show expansion through
+    ``expand_shared_tv`` because a Plex watchlist represents that complete intent.
     """
     if media_type not in {"movie", "tv"}:
         raise MediaTypeDeferredError(media_type)
@@ -741,21 +704,24 @@ async def create_request_result(
         # request OWNED BY A DIFFERENT USER. Falling through would (a) for tv mutate
         # the other user's request by adding this caller's seasons via
         # ensure_seasons below, and (b) return a record the caller's own per-user
-        # list/get immediately hide. Reject honestly (409) BEFORE any claim/mutation.
+        # list/get immediately hid before subscriber membership was introduced.
         # The SAME decision guards the terminal find_in_library short-circuits and
         # the IntegrityError race recovery below — every path that can hand back a
         # dedup winner (see _owned_by_another_user).
-        if _owned_by_another_user(existing, user_id, actor_is_admin):
+        foreign = _owned_by_another_user(existing, user_id, actor_is_admin)
+        if foreign:
             existing = await _subscribe_user(session, repo, existing, user_id)
-            return CreateRequestResult(record=existing, created=False)
+            if media_type != "tv" or not expand_shared_tv:
+                return CreateRequestResult(record=existing, created=False)
         # The deduped active request may have no owner (e.g. it was created via the
         # API-key automation path, which carries no user identity). Adopt it for the
         # requesting user so the dedup result appears in THEIR request list instead
         # of succeeding yet vanishing behind the per-user list filter. Never
         # reassigns a request that already belongs to another user.
-        existing = await _claim_dedup_winner_if_unowned(
-            session, repo, existing, user_id, actor_is_admin
-        )
+        if not foreign:
+            existing = await _claim_dedup_winner_if_unowned(
+                session, repo, existing, user_id, actor_is_admin
+            )
         existing = await _subscribe_user(session, repo, existing, user_id)
         if media_type == "tv":
             season_plan = await _resolve_tv_season_plan(
@@ -886,13 +852,16 @@ async def create_request_result(
             # newest row is now that concurrent 'pending' one.
             existing_active = await repo.find_active(tmdb_id, media_type)
             if existing_active is not None:
-                if _owned_by_another_user(existing_active, user_id, actor_is_admin):
+                foreign = _owned_by_another_user(existing_active, user_id, actor_is_admin)
+                if foreign:
                     await session.rollback()
                     existing_active = await _subscribe_user(session, repo, existing_active, user_id)
-                    return CreateRequestResult(record=existing_active, created=False)
-                existing_active = await _claim_dedup_winner_if_unowned(
-                    session, repo, existing_active, user_id, actor_is_admin
-                )
+                    if not expand_shared_tv:
+                        return CreateRequestResult(record=existing_active, created=False)
+                else:
+                    existing_active = await _claim_dedup_winner_if_unowned(
+                        session, repo, existing_active, user_id, actor_is_admin
+                    )
                 return CreateRequestResult(record=existing_active, created=False)
         if not force:
             # ``force`` never consults the eviction guard nor dedups onto a terminal
@@ -933,12 +902,11 @@ async def create_request_result(
                     prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin),
                 )
                 if in_library is not None:
-                    # Issue #58: same ownership decision as the find_active dedup above -
-                    # a terminal in-library row owned by ANOTHER user must not be handed to
-                    # a non-admin (their list/get hide it: a success that instantly vanishes).
+                    # Issue #58: same ownership decision as the find_active dedup above.
+                    # A terminal row owned by another user is shared by subscription.
                     # The owner-preference lookup already picked the caller's OWN row (or an
                     # ownerless claimable one) over a foreign row when several terminal rows
-                    # exist, so this rejection now fires only when EVERY candidate is foreign.
+                    # exist, so sharing a foreign row is the final fallback.
                     if _owned_by_another_user(in_library, user_id, actor_is_admin):
                         await session.rollback()
                         in_library = await _subscribe_user(session, repo, in_library, user_id)
@@ -1054,22 +1022,23 @@ async def create_request_result(
                 prefer_user_id=_dedup_preference_user_id(user_id, actor_is_admin),
             )
             if in_library is not None:
-                # Issue #58: same ownership decision as the movie short-circuit -
-                # rejected BEFORE ensure_seasons, so another user's terminal request
-                # is never grown with this caller's seasons nor returned to them.
-                # As in the movie path, the owner-preference lookup means a foreign
-                # row is only rejected when the caller has NO own/ownerless candidate.
-                if _owned_by_another_user(in_library, user_id, actor_is_admin):
+                # Issue #58: same ownership decision as the movie short-circuit.
+                # Manual callers subscribe without growing the owner's seasons;
+                # watchlist sync may opt into complete-show expansion below.
+                foreign = _owned_by_another_user(in_library, user_id, actor_is_admin)
+                if foreign:
                     await session.rollback()
                     in_library = await _subscribe_user(session, repo, in_library, user_id)
-                    return CreateRequestResult(record=in_library, created=False)
+                    if not expand_shared_tv:
+                        return CreateRequestResult(record=in_library, created=False)
                 # Adopt an OWNERLESS in-library row for this requester before growing
                 # + returning it, mirroring the movie short-circuit and the active
                 # dedup path - else the shared user's own per-user filter hides the
                 # very row this returns (issue #58's silent-vanish).
-                in_library = await _claim_dedup_winner_if_unowned(
-                    session, repo, in_library, user_id, actor_is_admin
-                )
+                if not foreign:
+                    in_library = await _claim_dedup_winner_if_unowned(
+                        session, repo, in_library, user_id, actor_is_admin
+                    )
                 # Release the media lock BEFORE ensure_seasons -- the same
                 # discipline as the existing_active branch above: ensure_seasons
                 # crawls Plex, and the lock's write transaction (SQLite:
@@ -1197,10 +1166,9 @@ async def create_request_result(
         winner = await repo.find_active(tmdb_id, media_type)
         if winner is None:  # pragma: no cover - the conflicting active row must exist
             raise
-        # Issue #58: same ownership decision as the find_active dedup — a non-admin
-        # who LOST the insert race to another user's request gets the honest 409,
-        # not the other user's row (and never mutates its season set below). Our own
-        # insert was already rolled back, so nothing is left behind.
+        # Issue #58: same ownership decision as the find_active dedup. A non-admin
+        # who lost the insert race subscribes to the winner without changing its
+        # ownership or ordinary manual TV season intent.
         if _owned_by_another_user(winner, user_id, actor_is_admin):
             winner = await _subscribe_user(session, repo, winner, user_id)
             return CreateRequestResult(record=winner, created=False)
@@ -1209,8 +1177,8 @@ async def create_request_result(
         # user BEFORE returning/mutating it, exactly like the find_active dedup —
         # else the ownerless winner is returned (tv: grown with this caller's
         # seasons below) yet hidden behind their own per-user filter (issue #58).
-        # A lost adoption race raises the same honest 409; our insert was already
-        # rolled back above, so nothing is stranded.
+        # A lost adoption race subscribes to the concurrent winner; our insert was
+        # already rolled back above, so nothing is stranded.
         winner = await _claim_dedup_winner_if_unowned(
             session, repo, winner, user_id, actor_is_admin
         )
@@ -1273,7 +1241,9 @@ async def is_request_visible_to_user(session: AsyncSession, request_id: int, use
     return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
 
 
-def fold_requests_for_display(records: list[RequestRecord]) -> list[RequestRecord]:
+def fold_requests_for_display(
+    records: list[RequestRecord], *, subscriber_scoped: bool = False
+) -> list[RequestRecord]:
     """Collapse duplicate rows per media so the requests list shows ONE row.
 
     The already-in-library short-circuit (``create_request_result``) can leave
@@ -1302,7 +1272,11 @@ def fold_requests_for_display(records: list[RequestRecord]) -> list[RequestRecor
     groups: dict[tuple[int | None, int, str], list[RequestRecord]] = {}
     order: list[tuple[int | None, int, str]] = []
     for record in records:
-        key = (record.user_id, record.tmdb_id, record.media_type)
+        key = (
+            (None, record.tmdb_id, record.media_type)
+            if subscriber_scoped
+            else (record.user_id, record.tmdb_id, record.media_type)
+        )
         if key not in groups:
             order.append(key)
         groups.setdefault(key, []).append(record)

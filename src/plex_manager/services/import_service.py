@@ -2711,6 +2711,7 @@ async def _heal_false_available_movies(
                 extra={"tmdb_id": safe_int(row.tmdb_id), "request_id": safe_int(row.id)},
             )
             return
+        await repo.add_subscriber(winner.id, owner)
         await _commit_collapse(row, winner, reason=reason)
 
     async def _rearm(row: RequestRecord) -> bool:

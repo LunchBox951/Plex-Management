@@ -195,10 +195,20 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
 }
 
 function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] }) {
-  const hasRun = watchlist.last_run_at !== null
-  const healthy = hasRun && watchlist.failed_users === 0
-  const tone: DotTone = !hasRun ? 'neutral' : healthy ? 'ok' : 'warn'
-  const label = !hasRun ? 'starting up' : healthy ? 'running clean' : 'degraded'
+  const tone: DotTone =
+    watchlist.state === 'ok'
+      ? 'ok'
+      : watchlist.state === 'degraded'
+        ? 'warn'
+        : watchlist.state === 'error'
+          ? 'error'
+          : 'neutral'
+  const label =
+    watchlist.state === 'starting'
+      ? 'starting up'
+      : watchlist.state === 'ok'
+        ? 'running clean'
+        : watchlist.state.replace('_', ' ')
   return (
     <div className="rounded-xl border border-hairline bg-surface p-4">
       <div className="flex items-center justify-between gap-3">
@@ -208,10 +218,14 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
       <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
         <dt>Last run</dt>
         <dd className="text-right">{formatTimestamp(watchlist.last_run_at)}</dd>
+        <dt>Last success</dt>
+        <dd className="text-right">{formatTimestamp(watchlist.last_ok_at)}</dd>
         <dt>Fetched</dt>
         <dd className="text-right">{watchlist.fetched}</dd>
         <dt>New requests</dt>
         <dd className="text-right">{watchlist.created}</dd>
+        <dt>Existing requests</dt>
+        <dd className="text-right">{watchlist.existing}</dd>
         <dt>Failed users</dt>
         <dd className={cn('text-right', watchlist.failed_users > 0 ? 'text-searching' : '')}>
           {watchlist.failed_users}
@@ -219,7 +233,9 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
         {watchlist.last_error_type ? (
           <>
             <dt>Last error</dt>
-            <dd className="text-right text-searching">{watchlist.last_error_type}</dd>
+            <dd className="text-right text-searching">
+              {watchlist.last_error_type} · {formatTimestamp(watchlist.last_error_at)}
+            </dd>
           </>
         ) : null}
       </dl>

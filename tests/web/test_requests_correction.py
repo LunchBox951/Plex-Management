@@ -9,6 +9,7 @@ runs against a genuine root-guarded filesystem.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -17,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import (
+    AuthSession,
     Blocklist,
     Download,
     DownloadHistory,
@@ -25,8 +27,9 @@ from plex_manager.models import (
     MediaType,
     RequestStatus,
     Setting,
+    User,
 )
-from plex_manager.web.deps import get_downloads_host_root
+from plex_manager.web.deps import get_downloads_host_root, hash_session_token
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -39,6 +42,26 @@ _CULPRIT = "3" * 40
 _ALT = "a" * 40
 
 
+async def _creator_session(app: FastAPI, *, tag: str) -> tuple[int, dict[str, str], dict[str, str]]:
+    token = f"{tag}-session-token"
+    csrf = f"{tag}-csrf-token"
+    async with app.state.sessionmaker() as session:
+        user = User(username=f"{tag}-user", permissions=0)
+        session.add(user)
+        await session.flush()
+        user_id = user.id
+        session.add(
+            AuthSession(
+                user_id=user_id,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return user_id, {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
+
+
 async def _set_setting(sm: SessionMaker, key: str, value: str) -> None:
     async with sm() as session:
         session.add(Setting(key=key, value=value))
@@ -46,7 +69,11 @@ async def _set_setting(sm: SessionMaker, key: str, value: str) -> None:
 
 
 async def _seed_available_movie(
-    sm: SessionMaker, *, library_path: str, is_anime: bool = False
+    sm: SessionMaker,
+    *,
+    library_path: str,
+    is_anime: bool = False,
+    user_id: int | None = None,
 ) -> int:
     async with sm() as session:
         request = MediaRequest(
@@ -57,6 +84,7 @@ async def _seed_available_movie(
             status=RequestStatus.available,
             library_path=library_path,
             is_anime=is_anime,
+            user_id=user_id,
         )
         session.add(request)
         await session.flush()
@@ -90,12 +118,15 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
     tmp_path: Path,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    user_id, cookies, headers = await _creator_session(app, tag="report-creator")
     root = tmp_path / "movies"
     root.mkdir()
     movie_file = root / "Some Movie (2020).mkv"
     movie_file.write_bytes(b"x" * 4096)
     await _set_setting(sessionmaker_, "movies_root", str(root))
-    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+    request_id = await _seed_available_movie(
+        sessionmaker_, library_path=str(movie_file), user_id=user_id
+    )
 
     qbt = FakeQbittorrent()
     override_adapters(
@@ -114,10 +145,12 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
     response = await client.post(
         f"/api/v1/requests/{request_id}/report-issue",
         json={"reason": "bad_quality"},
-        headers=_HEADERS,
+        cookies=cookies,
+        headers=headers,
     )
     assert response.status_code == 200
     assert response.json()["status"] == "downloading"
+    assert response.json()["can_mutate"] is True
     assert not movie_file.exists()
     assert (_CULPRIT, True) in qbt.removed
 
@@ -299,12 +332,14 @@ async def test_cancel_endpoint_settles_cancelled(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
+    user_id, cookies, headers = await _creator_session(app, tag="cancel-creator")
     async with sessionmaker_() as session:
         request = MediaRequest(
             tmdb_id=_TMDB,
             media_type=MediaType.movie,
             title="Some Movie",
             status=RequestStatus.downloading,
+            user_id=user_id,
         )
         session.add(request)
         await session.flush()
@@ -321,9 +356,12 @@ async def test_cancel_endpoint_settles_cancelled(
 
     qbt = FakeQbittorrent()
     override_adapters(app, qbt=qbt)
-    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=_HEADERS)
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/cancel", cookies=cookies, headers=headers
+    )
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
+    assert response.json()["can_mutate"] is True
     assert (_CULPRIT, True) in qbt.removed
 
 

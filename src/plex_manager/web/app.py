@@ -144,12 +144,12 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
     status.mark_started()
     async with maker() as session:
         if not await get_watchlist_sync_enabled(session):
-            status.mark_completed(fetched=0, created=0, existing=0, failed_users=0, error=None)
+            status.mark_skipped("disabled")
             return 0
         try:
             tmdb = await get_tmdb(session, client)
         except ServiceNotConfiguredError:
-            status.mark_completed(fetched=0, created=0, existing=0, failed_users=0, error=None)
+            status.mark_skipped("not_configured")
             return 0
         library = await get_library_optional(session, client)
         users = await watchlist_service.list_sync_users(session)
@@ -175,6 +175,9 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 created += result.created
                 fetched += result.fetched
                 existing += result.existing
+                if result.failed:
+                    failed_users += 1
+                    last_error = "WatchlistEntryError"
         except Exception as exc:
             failed_users += 1
             last_error = type(exc).__name__
@@ -200,7 +203,10 @@ async def _watchlist_sync_loop(app: FastAPI) -> None:
     while True:
         try:
             await _watchlist_sync_once(app)
-        except Exception:
+        except Exception as exc:
+            status = getattr(app.state, "watchlist_status", None)
+            if isinstance(status, watchlist_service.WatchlistWorkerStatus):
+                status.mark_error(exc)
             _logger.exception("watchlist sync tick failed; continuing")
         try:
             async with app.state.sessionmaker() as session:

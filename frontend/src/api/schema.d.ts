@@ -2060,6 +2060,11 @@ export interface components {
         RequestResponse: {
             /** Backdrop Url */
             backdrop_url?: string | null;
+            /**
+             * Can Mutate
+             * @default false
+             */
+            can_mutate: boolean;
             /** Id */
             id: number;
             /**
@@ -2464,12 +2469,19 @@ export interface components {
              * @default 0
              */
             fetched: number;
+            /** Last Error At */
+            last_error_at?: string | null;
             /** Last Error Type */
             last_error_type?: string | null;
             /** Last Ok At */
             last_ok_at?: string | null;
             /** Last Run At */
             last_run_at?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
         };
     };
     responses: never;

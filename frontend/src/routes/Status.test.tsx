@@ -48,9 +48,11 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       cooled_down_scopes: 0,
     },
     watchlist: {
+      state: 'ok',
       last_run_at: '2026-01-01T00:00:00Z',
       last_ok_at: '2026-01-01T00:00:00Z',
       last_error_type: null,
+      last_error_at: null,
       fetched: 0,
       created: 0,
       existing: 0,
@@ -387,9 +389,11 @@ describe('Status', () => {
         reconcile: freshLoop,
         autograb: freshLoop,
         watchlist: {
+          state: 'starting',
           last_run_at: null,
           last_ok_at: null,
           last_error_type: null,
+          last_error_at: null,
           fetched: 0,
           created: 0,
           existing: 0,
@@ -473,6 +477,52 @@ describe('Status', () => {
       'text-searching',
     )
     expect(autograbStats.getByText(/GrabPipelineUnavailable/)).toHaveClass('text-error')
+  })
+
+  it('renders a degraded watchlist cycle without overwriting its last successful run', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        watchlist: {
+          state: 'degraded',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'WatchlistEntryError',
+          last_error_at: '2026-01-02T00:00:01Z',
+          fetched: 7,
+          created: 2,
+          existing: 4,
+          failed_users: 1,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const heading = screen.getByRole('heading', { name: 'Watchlist sync' })
+    const panel = heading.closest('.rounded-xl')
+    expect(panel).not.toBeNull()
+    const watchlist = within(panel as HTMLElement)
+    expect(watchlist.getByText('degraded')).toBeInTheDocument()
+    expect(watchlist.getByText('Existing requests')).toBeInTheDocument()
+    expect(watchlist.getByText('4')).toBeInTheDocument()
+    expect(watchlist.getByText('1')).toBeInTheDocument()
+    expect(watchlist.getByText(/WatchlistEntryError/)).toBeInTheDocument()
+
+    const lastRun = watchlist.getByText('Last run').nextElementSibling
+    const lastSuccess = watchlist.getByText('Last success').nextElementSibling
+    expect(lastRun).not.toBeNull()
+    expect(lastSuccess).not.toBeNull()
+    expect(lastRun).not.toHaveTextContent('never')
+    expect(lastSuccess).not.toHaveTextContent('never')
+    expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {

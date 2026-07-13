@@ -223,11 +223,9 @@ export function TitleDetailModal({
   returnFocusTo,
 }: TitleDetailModalProps) {
   const { toast } = useToast()
-  // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
-  // correction / keep-forever verbs all sit behind `require_admin` server-side,
-  // so exposing them would only manufacture 403 `admin_required` failures.
-  // Defaults to the restricted view until /auth/me resolves (fail closed) —
-  // mirrors AdminGate's read of the same cached query.
+  // Preview, queue, and grab remain operator tools. Request correction and pin
+  // capabilities are supplied per request by the API, so creators can manage
+  // their own rows while subscribers retain a read-only shared view.
   const auth = useAuthMe()
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const createRequest = useCreateRequest()
@@ -253,6 +251,7 @@ export function TitleDetailModal({
   // tv only: the just-created request's own per-season rollup, shown before the
   // next /requests poll lands — mirrors `createdGrabbable`'s create-then-poll gap.
   const [createdSeasons, setCreatedSeasons] = useState<SeasonStatus[] | null>(null)
+  const [createdCanMutate, setCreatedCanMutate] = useState(false)
   // tv only, read at Request time: track the whole aired series (default) or just
   // the one season named below. Irrelevant once a request exists.
   const [wholeSeries, setWholeSeries] = useState(true)
@@ -290,6 +289,7 @@ export function TitleDetailModal({
     setRequestId(null)
     setCreatedGrabbable(false)
     setCreatedSeasons(null)
+    setCreatedCanMutate(false)
     setWholeSeries(true)
     setActiveSeason(null)
     setPreview(null)
@@ -350,6 +350,9 @@ export function TitleDetailModal({
   const pinTracksFreshRequest = requestId !== null && liveRequest?.id !== requestId
   const pinRequestId = pinTracksFreshRequest ? requestId : (liveRequest?.id ?? requestId)
   const keepForever = pinTracksFreshRequest ? false : (liveRequest?.keep_forever ?? false)
+  const canMutateRequest = pinTracksFreshRequest
+    ? createdCanMutate
+    : (liveRequest?.can_mutate ?? false)
 
   // tv only: this show's per-season rollup — the live poll once it lands, else the
   // just-created request's own list (the same create-then-poll gap as
@@ -481,6 +484,7 @@ export function TitleDetailModal({
       if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
       setRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
+      setCreatedCanMutate(created.can_mutate)
       // tv only: resolve the season against `created.seasons` — the BRAND NEW list —
       // rather than `currentSeason`, which still reflects the season list from
       // BEFORE this request existed. For a whole-series request that's `null`
@@ -529,6 +533,7 @@ export function TitleDetailModal({
       if (latestTitleKey.current !== startedKey) return
       setRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
+      setCreatedCanMutate(created.can_mutate)
       const grabbable = isSeasonGrabbable(created, null)
       setCreatedGrabbable(grabbable)
       setReacquireOpen(false)
@@ -751,9 +756,7 @@ export function TitleDetailModal({
   // ImportBlocked, so a mark-failed there always 409s (invalid_state_transition).
   // Don't offer an action that can't succeed — once the import lands the title
   // re-renders as completed or import_blocked, where the correction paths reappear.
-  // Every correction verb below is admin-only server-side (`require_admin`), so
-  // each button is built only for admins — a shared user gets the request-only
-  // experience (Request / Request again + honest status), never a 403 machine.
+  // Queue mark-failed remains admin-only because GET /queue is admin-only.
   const canReport = isAdmin && queueItem !== null && queueItem.status !== 'importing'
   const reportButton =
     canReport && queueItem ? (
@@ -773,7 +776,7 @@ export function TitleDetailModal({
   // (queue mark-failed): there is no active download here, so it acts on the
   // request + selected season via the report-issue endpoint. Needs a known request.
   const reportIssueButton =
-    isAdmin && effectiveRequestId !== null ? (
+    canMutateRequest && effectiveRequestId !== null ? (
       <Button
         variant="danger"
         onClick={() =>
@@ -808,7 +811,7 @@ export function TitleDetailModal({
     (s) => s.status === 'available' || s.status === 'completed',
   )
   const canCancel =
-    isAdmin &&
+    canMutateRequest &&
     liveRequest != null &&
     CANCELLABLE_STATUSES.has(liveRequest.status) &&
     !anySeasonImported
@@ -978,10 +981,10 @@ export function TitleDetailModal({
               ✓ In your library
             </span>
           </div>
-          {/* Re-acquire (issue #131) sits beside report-issue for a movie: a shared
-              user sees only Re-acquire (report-issue is admin-only), an admin sees
-              both; tv shows only report-issue (reacquireButton is null for tv —
-              per-season re-acquisition is the report-issue verb's job). */}
+          {/* Re-acquire (issue #131) sits beside report-issue for a movie. The
+              request creator (or an admin) can report; a subscriber sees only
+              Re-acquire. TV shows only report-issue because re-acquisition there
+              is season-scoped. */}
           {reportIssueButton || reacquireButton ? (
             <div className="flex flex-wrap gap-2">
               {reacquireButton}
@@ -1072,8 +1075,8 @@ export function TitleDetailModal({
               </p>
             ) : null}
             {seasonSelector}
-            {/* Keep-forever is an admin-only endpoint: hidden for shared users. */}
-            {isAdmin && pinRequestId != null ? (
+            {/* Creators and admins may pin; subscribers keep a read-only view. */}
+            {canMutateRequest && pinRequestId != null ? (
               <label className="mt-3 flex items-center gap-2 text-xs text-muted">
                 <input
                   type="checkbox"

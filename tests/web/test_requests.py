@@ -8,10 +8,12 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import select
 
 from plex_manager.models import AuthSession, MediaRequest, MediaType, RequestStatus, User
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.web.deps import hash_session_token
 from tests.web.fakes import FakeLibrary, FakeTmdb, override_adapters
@@ -35,11 +37,17 @@ def _tmdb() -> FakeTmdb:
     )
 
 
-async def _shared_user_cookies(app: FastAPI) -> tuple[dict[str, str], dict[str, str]]:
-    token = "shared-session-token"  # noqa: S105 - fake cookie token for test auth
-    csrf = "shared-csrf-token"
+async def _shared_user_cookies(
+    app: FastAPI, *, tag: str = "shared"
+) -> tuple[dict[str, str], dict[str, str]]:
+    token = f"{tag}-session-token"
+    csrf = f"{tag}-csrf-token"
     async with app.state.sessionmaker() as session:
-        user = User(plex_id=5001, username="shared-user", permissions=0)
+        user = User(
+            plex_id=5001 if tag == "shared" else None,
+            username=f"{tag}-user",
+            permissions=0,
+        )
         session.add(user)
         await session.flush()
         session.add(
@@ -116,6 +124,7 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
         headers=shared_headers,
     )
     assert own.status_code == 201
+    assert own.json()["can_mutate"] is True
 
     admin = await client.post(
         "/api/v1/requests",
@@ -127,6 +136,7 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
     listed = await client.get("/api/v1/requests", cookies=shared_cookies)
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == [own.json()["id"]]
+    assert listed.json()["requests"][0]["can_mutate"] is True
 
     hidden = await client.get(f"/api/v1/requests/{admin.json()['id']}", cookies=shared_cookies)
     assert hidden.status_code == 404
@@ -137,8 +147,56 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
         cookies=shared_cookies,
         headers=shared_headers,
     )
-    assert pin.status_code == 403
-    assert pin.json()["detail"] == "admin_required"
+    assert pin.status_code == 200
+    assert pin.json()["keep_forever"] is True
+    assert pin.json()["can_mutate"] is True
+
+
+@pytest.mark.parametrize(
+    ("suffix", "json_body"),
+    [
+        ("keep-forever", {"keep_forever": True}),
+        ("report-issue", {"reason": "bad_quality"}),
+        ("cancel", None),
+    ],
+)
+async def test_subscriber_cannot_mutate_another_users_request(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    suffix: str,
+    json_body: dict[str, object] | None,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(app, tmdb=_tmdb())
+    owner_cookies, owner_headers = await _shared_user_cookies(app, tag=f"owner-{suffix}")
+    subscriber_cookies, subscriber_headers = await _shared_user_cookies(
+        app, tag=f"subscriber-{suffix}"
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=owner_cookies,
+        headers=owner_headers,
+    )
+    assert created.status_code == 201
+    subscribed = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 603, "media_type": "movie"},
+        cookies=subscriber_cookies,
+        headers=subscriber_headers,
+    )
+    assert subscribed.status_code == 200
+    assert subscribed.json()["can_mutate"] is False
+
+    response = await client.post(
+        f"/api/v1/requests/{created.json()['id']}/{suffix}",
+        json=json_body,
+        cookies=subscriber_cookies,
+        headers=subscriber_headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "request_not_found"
 
 
 async def test_shared_user_dedup_claims_unowned_request_into_their_list(
@@ -533,6 +591,32 @@ async def test_list_does_not_fold_distinct_users(
     listed = await client.get("/api/v1/requests", headers=_HEADERS)
     assert listed.status_code == 200
     assert {item["id"] for item in listed.json()["requests"]} == {id_a, id_b}
+
+
+async def test_subscriber_scoped_list_folds_cross_owner_duplicates(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    viewer_cookies, _viewer_headers = await _shared_user_cookies(app, tag="fold-viewer")
+    user_a = await _insert_user(app, username="fold-owner-a")
+    user_b = await _insert_user(app, username="fold-owner-b")
+    older_id = await _insert_request(
+        app, tmdb_id=603, status=RequestStatus.available, user_id=user_a
+    )
+    newer_id = await _insert_request(app, tmdb_id=603, status=RequestStatus.failed, user_id=user_b)
+    async with app.state.sessionmaker() as session:
+        viewer_id = (
+            await session.execute(select(User.id).where(User.username == "fold-viewer-user"))
+        ).scalar_one()
+        repo = SqlRequestRepository(session)
+        await repo.add_subscriber(older_id, viewer_id)
+        await repo.add_subscriber(newer_id, viewer_id)
+        await session.commit()
+
+    listed = await client.get("/api/v1/requests", cookies=viewer_cookies)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["requests"]] == [newer_id]
+    assert listed.json()["requests"][0]["can_mutate"] is False
 
 
 async def test_list_leaves_underlying_rows_untouched(

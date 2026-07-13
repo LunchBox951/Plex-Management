@@ -51,6 +51,7 @@ function requestRow(id: number, status: string): RequestResponse {
     status,
     is_anime: false,
     keep_forever: false,
+    can_mutate: false,
   }
 }
 

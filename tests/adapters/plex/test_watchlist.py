@@ -81,3 +81,51 @@ async def test_paginates_until_total_size() -> None:
         entries = await PlexWatchlist(client, TOKEN).list_entries()
     assert len(entries) == 101
     assert starts == [0, 100]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"MediaContainer": {}},
+        {"MediaContainer": {"totalSize": 0, "Metadata": {}}},
+    ],
+)
+async def test_rejects_malformed_container_shapes(payload: object) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(PlexWatchlistError):
+            await PlexWatchlist(client, TOKEN).list_entries()
+
+
+async def test_rejects_empty_page_before_declared_total() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200, json={"MediaContainer": {"totalSize": 1, "Metadata": []}}
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(PlexWatchlistError):
+            await PlexWatchlist(client, TOKEN).list_entries()
+
+
+async def test_short_page_continues_until_declared_total() -> None:
+    starts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start = int(request.url.params["X-Plex-Container-Start"])
+        starts.append(start)
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "totalSize": 2,
+                    "Metadata": [{"type": "movie", "Guid": [{"id": f"tmdb://{start + 1}"}]}],
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        entries = await PlexWatchlist(client, TOKEN).list_entries()
+    assert len(entries) == 2
+    assert starts == [0, 1]

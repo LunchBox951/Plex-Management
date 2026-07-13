@@ -763,6 +763,8 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       eviction_interval_minutes: null,
       log_retention_days: null,
       log_max_rows: null,
+      watchlist_sync_enabled: null,
+      watchlist_sync_interval_minutes: null,
     }
     render(<Settings />, { wrapper: Wrapper })
 
@@ -772,8 +774,14 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(screen.getByLabelText('Eviction check interval (minutes)')).toHaveValue(30)
     expect(screen.getByLabelText('Log retention (days)')).toHaveValue(7)
     expect(screen.getByLabelText('Log retention (max rows)')).toHaveValue(100000)
+    expect(screen.getByLabelText('Watchlist sync interval (minutes)')).toHaveValue(15)
+    expect(screen.getByLabelText('Watchlist sync interval (minutes)')).toHaveAttribute(
+      'max',
+      '10080',
+    )
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /^Enable Plex watchlist sync/i })).toBeChecked()
 
     // Edit every knob, including flipping both checkboxes.
     fireEvent.change(screen.getByLabelText('Pressure threshold (%)'), {
@@ -790,8 +798,12 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     fireEvent.change(screen.getByLabelText('Log retention (max rows)'), {
       target: { value: '50000' },
     })
+    fireEvent.change(screen.getByLabelText('Watchlist sync interval (minutes)'), {
+      target: { value: '60' },
+    })
     fireEvent.click(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i }))
     fireEvent.click(screen.getByRole('checkbox', { name: /^Proactive eviction/i }))
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Enable Plex watchlist sync/i }))
 
     fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
     await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
@@ -805,6 +817,8 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(body.log_max_rows).toBe(50000)
     expect(body.eviction_enabled).toBe(false)
     expect(body.eviction_proactive_enabled).toBe(true)
+    expect(body.watchlist_sync_enabled).toBe(false)
+    expect(body.watchlist_sync_interval_minutes).toBe(60)
   })
 
   it('surfaces the backend 422 (target above threshold) instead of swallowing it', async () => {
@@ -914,6 +928,45 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(h.toast).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Settings saved', intent: 'success' }),
     )
+  })
+
+  it('rejects a watchlist sync interval above the backend weekly maximum', async () => {
+    h.settingsData = {
+      plex_url: 'http://plex:32400',
+      plex_token: '***',
+      prowlarr_url: 'http://prowlarr:9696',
+      prowlarr_api_key: '***',
+      qbittorrent_url: 'http://qb:8080',
+      qbittorrent_username: 'admin',
+      qbittorrent_password: '***',
+      tmdb_api_key: '***',
+      movies_root: '/plex/movies',
+      disk_pressure_threshold_percent: 90,
+      disk_pressure_target_percent: 80,
+      eviction_grace_days: 30,
+      eviction_enabled: true,
+      eviction_proactive_enabled: false,
+      eviction_interval_minutes: 30,
+      log_retention_days: 7,
+      watchlist_sync_enabled: true,
+      watchlist_sync_interval_minutes: 15,
+    }
+
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Watchlist sync interval (minutes)'), {
+      target: { value: '10081' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => expect(h.toast).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Save failed',
+        description: expect.stringMatching(/watchlist sync interval.*10080/i),
+        intent: 'error',
+      }),
+    )
+    expect(h.mutateAsync).not.toHaveBeenCalled()
   })
 })
 

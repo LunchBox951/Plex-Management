@@ -219,9 +219,11 @@ async def health_endpoint(
             cooled_down_scopes=snapshot.autograb.cooled_down_scopes,
         ),
         watchlist=WatchlistStatusItem(
+            state=watchlist_status.state,
             last_run_at=watchlist_status.last_run_at,
             last_ok_at=watchlist_status.last_ok_at,
             last_error_type=watchlist_status.last_error_type,
+            last_error_at=watchlist_status.last_error_at,
             fetched=watchlist_status.fetched,
             created=watchlist_status.created,
             existing=watchlist_status.existing,

@@ -89,8 +89,18 @@ class PlexWatchlist:
                 payload = cast(object, response.json())
             except (json.JSONDecodeError, ValueError) as exc:
                 raise PlexWatchlistError("Plex watchlist returned invalid JSON") from exc
-            container = _mapping(_mapping(payload).get("MediaContainer"))
-            raw_items = _sequence(container.get("Metadata"))
+            root = _mapping(payload)
+            raw_container = root.get("MediaContainer")
+            if not isinstance(raw_container, Mapping):
+                raise PlexWatchlistError("Plex watchlist response is missing MediaContainer")
+            container = cast("Mapping[str, object]", raw_container)
+            raw_metadata = container.get("Metadata")
+            if not isinstance(raw_metadata, (list, tuple)):
+                raise PlexWatchlistError("Plex watchlist response has invalid Metadata")
+            raw_items = cast("Sequence[object]", raw_metadata)
+            total = container.get("totalSize")
+            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                raise PlexWatchlistError("Plex watchlist response has invalid totalSize")
             for raw in raw_items:
                 item = _mapping(raw)
                 wire_type = item.get("type")
@@ -106,10 +116,13 @@ class PlexWatchlist:
                 entry = WatchlistEntry(tmdb_id=tmdb_id, media_type=media_type)
                 entries[(tmdb_id, media_type)] = entry
             size = len(raw_items)
-            total = container.get("totalSize")
-            if size < _PAGE_SIZE or (isinstance(total, int) and start + size >= total):
-                break
-            if size == 0:
+            next_start = start + size
+            if next_start < total and size == 0:
                 raise PlexWatchlistError("Plex watchlist pagination did not advance")
-            start += size
+            if next_start < total:
+                start = next_start
+                continue
+            if next_start > total:
+                raise PlexWatchlistError("Plex watchlist page exceeds declared totalSize")
+            break
         return tuple(entries.values())
