@@ -74,7 +74,7 @@ function mockMotion(initial = false): MotionMock {
   }
 }
 
-function requestResponse(status = 'pending'): RequestResponse {
+function requestResponse(status: RequestResponse['status'] = 'pending'): RequestResponse {
   return {
     id: 91,
     tmdb_id: MOVIE.tmdb_id,

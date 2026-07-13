@@ -1606,7 +1606,7 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
   }
 
   function request(
-    status: string,
+    status: RequestStatusValue,
     overrides: Partial<RequestResponse> = {},
   ): RequestResponse {
     return {
@@ -1713,13 +1713,13 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
   })
 
   const stateCases: Array<{
-    status: string | null
+    status: RequestStatusValue | null
     mediaType?: 'movie' | 'tv'
     badge: string
     sentence: string
     actions: string[]
     primary: string | null
-    queueStatus?: string
+    queueStatus?: DownloadStateValue
   }> = [
     {
       status: null,
@@ -1793,7 +1793,13 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       status: 'failed',
       badge: 'Failed',
       sentence: 'The request failed. Request it again to restart.',
-      actions: ['Request again', 'Report a problem'],
+      // No 'Report a problem' here (issue #205): the failed zone's report button
+      // drives the QUEUE mark-failed mutation, and a terminal `failed` download
+      // has no legal edge to FailedPending (domain/state_machine.py TRANSITIONS)
+      // and no adopt path -- the backend 409s it unconditionally. The pre-#205
+      // `!== 'importing'` denylist offered that guaranteed-dead-end button;
+      // `isMarkFailableStatus` fails closed. "Request again" IS the correction.
+      actions: ['Request again'],
       primary: 'Request again',
       queueStatus: 'failed',
     },
@@ -1813,7 +1819,9 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       primary: 'Request again',
     },
     {
-      status: 'mystery_state',
+      // A runtime-unknown status is reachable only via a cast, exactly like the
+      // real untyped-JSON boundary (see UNKNOWN_STATUS in the #205 block above).
+      status: 'mystery_state' as RequestStatusValue,
       badge: 'Mystery state',
       sentence:
         'Plex Manager reported “Mystery state”; no additional detail is available.',
@@ -1931,7 +1939,7 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       'The download finished, but import is blocked: codec validation failed',
     ],
     ['failed', 'failed', 'client removed torrent', 'The request failed: client removed torrent'],
-  ])('surfaces the real queue reason for %s', (status, queueStatus, reason, sentence) => {
+  ] as const)('surfaces the real queue reason for %s', (status, queueStatus, reason, sentence) => {
     setBaseMocks(
       [request(status)],
       [queueItem({ status: queueStatus, failed_reason: reason })],
