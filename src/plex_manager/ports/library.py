@@ -13,7 +13,7 @@ from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-__all__ = ["LibraryPort", "LibrarySection", "WatchState"]
+__all__ = ["LibraryPort", "LibrarySection", "WatchState", "WatchStateQuery"]
 
 
 class LibrarySection(BaseModel):
@@ -64,6 +64,28 @@ class WatchState(BaseModel):
         if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
+
+
+class WatchStateQuery(BaseModel):
+    """One item's watch-state lookup within a :meth:`LibraryPort.resolve_watch_states`
+    batch (ADR-0012 eviction candidate assembly, issues #213/#238).
+
+    Carries exactly the same three positional/keyword inputs a single
+    :meth:`LibraryPort.watch_state` call takes -- ``tmdb_id``, ``media_type``, and
+    (TV-only) ``season`` -- plus the ``library_path`` deletion-target breadcrumb
+    (issue #207) the path-correlated read resolves against. ``season`` is REQUIRED
+    for ``media_type='tv'`` (eviction is always per-season) and ignored for movies,
+    mirroring :meth:`LibraryPort.watch_state`'s own contract; an implementation
+    raises ``ValueError`` for a TV query with ``season=None`` exactly as the
+    single-item method does.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tmdb_id: int
+    media_type: Literal["movie", "tv"]
+    season: int | None = None
+    library_path: str | None = None
 
 
 @runtime_checkable
@@ -315,5 +337,45 @@ class LibraryPort(Protocol):
         ``library_path=None`` keeps the legacy UNCORRELATED first-match read --
         only for callers with no known target, e.g. a row predating the
         breadcrumb.
+        """
+        raise NotImplementedError
+
+    async def resolve_watch_states(self, queries: Sequence[WatchStateQuery]) -> list[WatchState]:
+        """Resolve MANY watch-state lookups from AT MOST one crawl of each section
+        any query actually reads (issues #213/#238) -- the batch counterpart of
+        :meth:`watch_state`.
+
+        Returns a list aligned 1:1 with ``queries`` (same length, same order): the
+        Nth :class:`WatchState` is exactly what :meth:`watch_state` would return for
+        the Nth :class:`WatchStateQuery`'s ``tmdb_id``/``media_type``/``season``/
+        ``library_path``. Each result is byte-for-byte identical to the per-item
+        method's -- this method changes only HOW MANY server round-trips the whole
+        set costs, never WHAT any one lookup resolves to (the merge-correctness
+        contract in :meth:`watch_state`'s docstring, incl. issue #239, is preserved
+        verbatim). An empty ``queries`` touches no network and returns ``[]``.
+
+        Cost model (the whole reason this exists): eviction candidate assembly used
+        to call :meth:`watch_state` once PER candidate, and each such call re-paged
+        the whole Plex section from offset zero (``Theta(candidates * section size)``,
+        going quadratic as the tracked set scales with the library -- issue #213).
+        This pages each section AT MOST once for the whole batch (a shared,
+        demand-paged tmdb-id index: only the sections/pages some query's own
+        per-item :meth:`watch_state` call would have read are ever fetched, so the
+        batch's failure surface is exactly the per-item method's -- a failing
+        section no query reaches can never abort the batch), reads each distinct
+        show's ``/children`` season listing at most ONCE (not once per candidate
+        season -- issue #213), and reads each distinct season's episode
+        ``/children`` at most once (folding in issue #238's path-correlated
+        per-candidate re-crawl). Net: ``O(sections + distinct shows + distinct
+        seasons)`` round-trips, independent of the candidate count.
+
+        Like :meth:`watch_state`, it reads FRESH every call (deliberately uncached):
+        the snapshot is consistent WITHIN one assembly pass -- exactly the "one
+        fresh section crawl per media type per candidate-assembly pass" issue #213
+        specifies -- while separate sweeps still each observe fresh Plex state. The
+        pre-claim re-read in ``eviction_service._evict_one`` stays a per-candidate
+        :meth:`watch_state` call, so the rewatch-during-sweep guard (issue #209) is
+        untouched. A ``media_type='tv'`` query with ``season=None`` raises
+        ``ValueError``, exactly as :meth:`watch_state` does.
         """
         raise NotImplementedError

@@ -103,6 +103,7 @@ describe('applyRealtimeEvent', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsDisk })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.updateStatus })
   })
 
   it('invalidates Discover when a settings event arrives without a request topic', () => {
@@ -115,6 +116,16 @@ describe('applyRealtimeEvent', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.plexLibraries })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.requests })
+  })
+
+  it('invalidates update status for updater lifecycle events', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    applyRealtimeEvent(qc, { seq: 11, topics: ['updates'], reason: 'update_check_requested' })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.updateStatus })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth })
   })
 })
 

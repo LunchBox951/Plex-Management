@@ -8,7 +8,12 @@ import {
   useSettings,
   useUpdateSettings,
 } from '../api/hooks'
-import type { SettingsResponse, SettingsUpdate, SubsystemHealthItem } from '../api/types'
+import type {
+  AutomaticUpdateWeekday,
+  SettingsResponse,
+  SettingsUpdate,
+  SubsystemHealthItem,
+} from '../api/types'
 import { libraryOptionNote, libraryOptionValue } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { AuthErrorCard } from '../components/AuthErrorCard'
@@ -41,6 +46,45 @@ const LOG_RETENTION_DAYS_DEFAULT = 7
 const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
+// Automatic container updates (ADR-0024) are opt-in. The scheduling defaults
+// mirror the backend except for timezone: a fresh browser contributes its IANA
+// zone when the operator first saves, with UTC as the fail-closed fallback.
+const AUTOMATIC_UPDATES_ENABLED_DEFAULT = false
+const AUTOMATIC_UPDATE_WINDOW_START_DEFAULT = '03:00'
+const AUTOMATIC_UPDATE_WINDOW_END_DEFAULT = '05:00'
+const AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT = true
+const UPDATE_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
+const UPDATE_WEEKDAYS: readonly {
+  value: AutomaticUpdateWeekday
+  label: string
+}[] = [
+  { value: 'monday', label: 'Mon' },
+  { value: 'tuesday', label: 'Tue' },
+  { value: 'wednesday', label: 'Wed' },
+  { value: 'thursday', label: 'Thu' },
+  { value: 'friday', label: 'Fri' },
+  { value: 'saturday', label: 'Sat' },
+  { value: 'sunday', label: 'Sun' },
+]
+
+function isIanaTimezone(value: string): boolean {
+  if (value.trim() === '') return false
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: value }).format()
+    return true
+  } catch {
+    return false
+  }
+}
+
+function browserTimezone(): string {
+  try {
+    const value = Intl.DateTimeFormat().resolvedOptions().timeZone
+    return typeof value === 'string' && isIanaTimezone(value) ? value : 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
 const WATCHLIST_SYNC_ENABLED_DEFAULT = true
 const WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT = 15
 const WATCHLIST_SYNC_INTERVAL_MINUTES_MAX = 10_080
@@ -73,6 +117,12 @@ interface FormState {
   log_max_rows: string
   // Auto-grab worker (ADR-0013) — the master on/off switch.
   auto_grab_enabled: boolean
+  automatic_updates_enabled: boolean
+  automatic_update_timezone: string
+  automatic_update_weekdays: AutomaticUpdateWeekday[]
+  automatic_update_window_start: string
+  automatic_update_window_end: string
+  automatic_update_idle_only: boolean
   watchlist_sync_enabled: boolean
   watchlist_sync_interval_minutes: string
 }
@@ -108,6 +158,17 @@ function initialForm(data: SettingsResponse): FormState {
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
     log_max_rows: String(data.log_max_rows ?? LOG_MAX_ROWS_DEFAULT),
     auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
+    automatic_updates_enabled:
+      data.automatic_updates_enabled ?? AUTOMATIC_UPDATES_ENABLED_DEFAULT,
+    automatic_update_timezone: data.automatic_update_timezone ?? browserTimezone(),
+    automatic_update_weekdays:
+      data.automatic_update_weekdays ?? UPDATE_WEEKDAYS.map(({ value }) => value),
+    automatic_update_window_start:
+      data.automatic_update_window_start ?? AUTOMATIC_UPDATE_WINDOW_START_DEFAULT,
+    automatic_update_window_end:
+      data.automatic_update_window_end ?? AUTOMATIC_UPDATE_WINDOW_END_DEFAULT,
+    automatic_update_idle_only:
+      data.automatic_update_idle_only ?? AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
     watchlist_sync_enabled: data.watchlist_sync_enabled ?? WATCHLIST_SYNC_ENABLED_DEFAULT,
     watchlist_sync_interval_minutes: String(
       data.watchlist_sync_interval_minutes ?? WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
@@ -124,6 +185,9 @@ type TextKey =
   | 'tv_root'
   | 'anime_movie_root'
   | 'anime_tv_root'
+  | 'automatic_update_timezone'
+  | 'automatic_update_window_start'
+  | 'automatic_update_window_end'
 type SecretKey = 'plex_token' | 'prowlarr_api_key' | 'qbittorrent_password' | 'tmdb_api_key'
 type NumberKey =
   | 'disk_pressure_threshold_percent'
@@ -137,6 +201,8 @@ type BoolKey =
   | 'eviction_enabled'
   | 'eviction_proactive_enabled'
   | 'auto_grab_enabled'
+  | 'automatic_updates_enabled'
+  | 'automatic_update_idle_only'
   | 'watchlist_sync_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
@@ -648,6 +714,20 @@ export function Settings() {
     </label>
   )
 
+  const toggleUpdateWeekday = (weekday: AutomaticUpdateWeekday, selected: boolean) =>
+    setForm((prev) => {
+      if (!prev) return prev
+      const selectedDays = new Set(prev.automatic_update_weekdays)
+      if (selected) selectedDays.add(weekday)
+      else selectedDays.delete(weekday)
+      return {
+        ...prev,
+        automatic_update_weekdays: UPDATE_WEEKDAYS.map(({ value }) => value).filter((value) =>
+          selectedDays.has(value),
+        ),
+      }
+    })
+
   const handleSave = async () => {
     // A stored credential may be reused only on the exact canonical service
     // base. Fail locally with the same correction the backend would return,
@@ -688,6 +768,42 @@ export function Settings() {
       toast({
         title: 'Save failed',
         description: `Watchlist sync interval must be greater than 0 and at most ${WATCHLIST_SYNC_INTERVAL_MINUTES_MAX} minutes.`,
+        intent: 'error',
+      })
+      return
+    }
+
+    if (!isIanaTimezone(form.automatic_update_timezone)) {
+      toast({
+        title: 'Save failed',
+        description: 'Enter a valid IANA timezone, such as America/Toronto or UTC.',
+        intent: 'error',
+      })
+      return
+    }
+    if (form.automatic_update_weekdays.length === 0) {
+      toast({
+        title: 'Save failed',
+        description: 'Select at least one automatic update weekday.',
+        intent: 'error',
+      })
+      return
+    }
+    if (
+      !UPDATE_TIME_PATTERN.test(form.automatic_update_window_start) ||
+      !UPDATE_TIME_PATTERN.test(form.automatic_update_window_end)
+    ) {
+      toast({
+        title: 'Save failed',
+        description: 'Enter automatic update times in 24-hour HH:MM format.',
+        intent: 'error',
+      })
+      return
+    }
+    if (form.automatic_update_window_start === form.automatic_update_window_end) {
+      toast({
+        title: 'Save failed',
+        description: 'Automatic update window start and end must differ.',
         intent: 'error',
       })
       return
@@ -743,6 +859,12 @@ export function Settings() {
       log_retention_days: Number(form.log_retention_days),
       log_max_rows: Number(form.log_max_rows),
       auto_grab_enabled: form.auto_grab_enabled,
+      automatic_updates_enabled: form.automatic_updates_enabled,
+      automatic_update_timezone: form.automatic_update_timezone.trim(),
+      automatic_update_weekdays: form.automatic_update_weekdays,
+      automatic_update_window_start: form.automatic_update_window_start,
+      automatic_update_window_end: form.automatic_update_window_end,
+      automatic_update_idle_only: form.automatic_update_idle_only,
       watchlist_sync_enabled: form.watchlist_sync_enabled,
       watchlist_sync_interval_minutes: Number(form.watchlist_sync_interval_minutes),
     }
@@ -1162,6 +1284,85 @@ export function Settings() {
               'Watchlist sync interval (minutes)',
               { min: 0.1, max: WATCHLIST_SYNC_INTERVAL_MINUTES_MAX, step: 0.1 },
             )}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-hairline bg-surface p-5">
+          <h2 className="font-display text-sm font-semibold text-ink">Automatic updates</h2>
+          <p className="mt-1 text-xs text-faint">
+            Opt in to first-party container updates. The updater honors this local-time window and
+            coordinates a short maintenance drain before replacing Plex Manager.
+          </p>
+          <div className="mt-4 flex flex-col gap-4">
+            {checkboxField(
+              'automatic_updates_enabled',
+              'Enable automatic updates',
+              'Disabled by default. Manual Check and Update actions still require the updater sidecar.',
+            )}
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="sm:col-span-3">
+                <Field
+                  appearance="admin"
+                  label="IANA timezone"
+                  value={form.automatic_update_timezone}
+                  onChange={(e) => setField('automatic_update_timezone', e.target.value)}
+                  placeholder="America/Toronto"
+                  hint="Schedule calculations use this timezone, including daylight-saving changes."
+                />
+              </div>
+              <Field
+                appearance="admin"
+                label="Window start"
+                type="time"
+                value={form.automatic_update_window_start}
+                onChange={(e) => setField('automatic_update_window_start', e.target.value)}
+              />
+              <Field
+                appearance="admin"
+                label="Window end"
+                type="time"
+                value={form.automatic_update_window_end}
+                onChange={(e) => setField('automatic_update_window_end', e.target.value)}
+              />
+            </div>
+
+            <fieldset>
+              <legend className="font-mono text-[10.5px] leading-none font-semibold uppercase tracking-[0.12em] text-faint">
+                Starting weekdays
+              </legend>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {UPDATE_WEEKDAYS.map(({ value, label }) => (
+                  <label
+                    key={value}
+                    className="flex items-center gap-1.5 rounded-lg bg-surface-deep px-2.5 py-2 font-mono text-xs text-ink ring-1 ring-inset ring-white/10"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.automatic_update_weekdays.includes(value)}
+                      onChange={(e) => toggleUpdateWeekday(value, e.target.checked)}
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-faint">
+                An overnight window belongs to the weekday on which it starts. Select at least one
+                day.
+              </p>
+            </fieldset>
+
+            {checkboxField(
+              'automatic_update_idle_only',
+              'Wait for critical work to become idle',
+              'Playback and active downloads do not block an update. Import, move, scan, correction, purge, eviction, and administrative mutations do.',
+            )}
+
+            <p className="rounded-lg border border-hairline bg-bg px-3 py-2 text-xs text-faint">
+              The update channel and image repository/tag are controlled exclusively by{' '}
+              <code>PLEX_MANAGER_IMAGE</code>. These controls never switch channels or target a
+              different container.
+            </p>
           </div>
         </section>
 

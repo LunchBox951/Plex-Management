@@ -15,7 +15,8 @@ single app — with two differences that define the project:
 > operability (health/logs/retention/eviction), auto-grab, and in-app correction
 > surfaces. A 7-day live beta run is set to begin gathering real-world data ahead
 > of a v1 stable promotion. Browser Plex sign-in/session auth is built; the
-> bundled host updater is still deferred.
+> bundled first-party container updater is available as an opt-in Compose
+> profile.
 
 ## What works now (beta)
 
@@ -42,13 +43,12 @@ single app — with two differences that define the project:
 - **Operability tools**: health checks, live logs, disk usage, retention
   settings, and automatic watched-media eviction (default-on, disk-pressure-
   triggered; see Deploying).
+- **Container update controls**: an opt-in, digest-aware updater sidecar with
+  app-owned scheduling, idle/drain coordination, health-gated replacement, and
+  automatic rollback to the previous application image on failed startup.
 
 The typed contract for all of this is published at
 [`docs/api/openapi.json`](docs/api/openapi.json) (regenerate with `make openapi`).
-
-**Deferred**: a bundled host auto-updater. The release workflow can promote an
-already-built image to `:stable`, but the host-side pull/restart mechanism is
-still operator-managed.
 
 ## Why
 
@@ -100,6 +100,100 @@ set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
 (`X-Setup-Token`). Use an SSH tunnel or reverse proxy for first setup; only set
 `PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
 
+### Optional automatic container updates
+
+Automatic updates require two separate opt-ins: deploy the `auto-update`
+Compose profile once, then enable the policy under **Settings → Automatic
+updates**. Deploying the sidecar alone does not enable automatic installation.
+
+Generate its private app-to-updater credential once and keep the source path in
+`.env` so later Compose recreations use the same secret:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))" > .plex-manager-updater-token
+chmod 600 .plex-manager-updater-token
+```
+
+Then uncomment this existing line in `.env`:
+
+```dotenv
+PLEX_MANAGER_UPDATER_SECRET_SOURCE=.plex-manager-updater-token
+```
+
+Start the profile. Use the same command whenever you intentionally recreate or
+restart the Compose application; Docker's `unless-stopped` policy also restarts
+both containers after a normal Docker-host reboot.
+
+```bash
+docker compose --profile auto-update up -d
+```
+
+The updater is the only service that mounts the Docker socket. That socket gives
+the sidecar effective control of the Docker host; it is mounted read/write
+because a read-only bind flag does not limit Docker API methods. The public Plex
+Manager process never receives the socket. The updater publishes no host port,
+uses only the private Compose network and file-mounted bearer secret, and is
+restricted to the fixed, labeled `plex-manager` container and configured image
+reference. Rootless Docker and NAS installations whose socket is elsewhere can
+set `PLEX_MANAGER_DOCKER_SOCKET` in `.env` before starting the profile.
+
+The executor negotiates Docker Engine API 1.41–1.47. Dynamic host ports
+(`HostPort: 0` and publish-all) are materialized before replacement so they do
+not silently change. Per-network MAC preservation on a multi-network container
+requires Engine API 1.44 or newer; an older daemon fails the update before
+stopping Plex Manager rather than recreating it inaccurately. A configured
+Compose `stop_grace_period` is honored up to 300 seconds. Negative, indefinite,
+or longer values are rejected before cutover so a sidecar request cannot hang
+without a bounded recovery window.
+
+The initial policy is disabled and preselects every weekday, 03:00–05:00, and
+idle-only operation. Choose an explicit IANA timezone such as
+`America/Toronto`; daylight-saving changes are calculated in that local zone.
+Start and end must differ, and at least one starting weekday must remain
+selected. A window that crosses midnight belongs to the weekday on which it
+starts.
+
+Idle means Plex Manager is not performing a critical mutation: grab handoff,
+import/move/scan, correction/purge, eviction, or an administrative write. Plex
+playback and qBittorrent transfers do not block an update. New requests remain
+accepted during the short maintenance drain, while their critical work queues
+until the lease ends. **Status → Container updater** shows the current and
+available builds, channel, next window, blockers, updater availability, and the
+last result. **Check now** and **Update when ready** are manual actions; the
+latter bypasses the automatic schedule but still honors idle-only coordination.
+
+`PLEX_MANAGER_IMAGE` is the only image repository/tag and release-channel
+selector. The browser controls cannot switch between `:edge` and `:stable` or
+target another container.
+
+The updater retains the previous image and effective container configuration
+until the candidate is healthy. A failed candidate is replaced by a clone using
+the previous image/configuration, with the old image's migration entrypoint
+bypassed so it does not reject the newer Alembic revision. Rollback never runs
+`alembic downgrade`; releases offered for automatic installation must keep the
+post-migration schema compatible with the immediately previous application
+release. The mounted application data and updater state volumes persist across
+replacement and sidecar restarts.
+
+If the candidate's migration is partially applied or the advertised N/N-1
+compatibility guarantee is wrong, the rollback clone may also fail its health
+gate. In that case the updater leaves its durable state and retained previous
+container intact; it does not report a successful rollback or delete recovery
+evidence. Restore the pre-migration recovery unit using **Backup & recovery**
+below, then restart the pinned older image.
+
+If Docker-socket authority is unacceptable, leave the profile disabled and use
+the ordinary manual Compose flow instead:
+
+```bash
+docker compose pull plex-manager
+docker compose up -d plex-manager
+```
+
+The manual flow does not provide app-owned scheduling, drain coordination, or
+automatic rollback; pin and restore a known image tag yourself if recovery is
+needed.
+
 > **Heads-up — automatic watched-media eviction is ON by default.** To keep a
 > library disk from filling, Plex Manager runs a background eviction sweep
 > (default every 30 min). When a configured movie/TV/anime root crosses **90%**
@@ -119,14 +213,17 @@ set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
 > pin that exempts it from eviction. See
 > [ADR-0012](docs/adr/0012-operability-health-logs-eviction.md).
 
-Each host is *designed* to auto-pull its release channel (the updater mechanism —
-Watchtower vs. a systemd timer — is an open decision and is not bundled in the
-compose file yet). Your config and database live in a **mounted volume, which
-persists them across restarts and updates — but the volume is not a backup.**
-Every container start runs `alembic upgrade head` (startup migrations) before
-serving traffic. See
+The opt-in first-party sidecar can automatically pull the configured release
+channel as described above. Your config and database live in a **mounted
+volume, which persists them across restarts and container replacement — but the
+volume is not a backup.** Every ordinary container start runs the pre-migration
+backup hook and then `alembic upgrade head` before serving traffic. See
 [ADR-0003](docs/adr/0003-docker-ghcr-packaging.md) and
-[ADR-0004](docs/adr/0004-edge-stable-release-channels.md).
+[ADR-0004](docs/adr/0004-edge-stable-release-channels.md), with the general
+database recovery policy in
+[ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) and the
+automatic-update boundary in
+[ADR-0024](docs/adr/0024-first-party-container-auto-updater.md).
 
 **Rollback:** if no migration ran between the two versions (same schema),
 rollback is simply re-pointing the older image tag. If a migration *did* run,
@@ -136,6 +233,14 @@ restoring the pre-migration backup (below), then running the older tag. See
 [ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) for the
 full policy and why Alembic's `downgrade` scripts are not treated as a general,
 non-destructive rollback path.
+
+The opt-in automatic-update train is a deliberately narrower exception recorded
+by ADR-0024: only moving-tag releases certified to keep the post-migration
+schema usable by N-1 are eligible. For those releases, the sidecar can restore
+the retained N-1 image/configuration without running Alembic downgrade or
+restoring database bytes. The pre-migration backup is still created and remains
+the manual recovery unit if a migration is only partially applied, the
+compatibility assertion is wrong, or the rollback clone cannot become healthy.
 
 ### Backup & recovery
 

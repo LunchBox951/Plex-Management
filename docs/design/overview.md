@@ -178,11 +178,13 @@ Searching`. The exact states/transitions are finalized when v1 is planned.
 ## 6. Delivery: packaging, channels, deployment
 
 Shipped as a **Docker image to GitHub Container Registry (GHCR)**; installed with
-`docker compose up -d`. Each host is *designed* to auto-pull its channel; the
-updater mechanism (Watchtower vs. a systemd timer running `compose pull`) is an
-open decision — see §11 — and is **not** bundled in the compose file yet. See
-[ADR-0003](../adr/0003-docker-ghcr-packaging.md) and
-[ADR-0004](../adr/0004-edge-stable-release-channels.md).
+`docker compose up -d`. Automatic updates are an opt-in Compose profile backed
+by a first-party updater sidecar. Plex Manager owns schedule/idle policy and a
+database-backed drain lease; only the private, internally authenticated sidecar
+receives Docker authority. See
+[ADR-0003](../adr/0003-docker-ghcr-packaging.md),
+[ADR-0004](../adr/0004-edge-stable-release-channels.md), and
+[ADR-0024](../adr/0024-first-party-container-auto-updater.md).
 
 Two channels, by image **tag**, with a **promotion gate**: the canary (beta)
 fleet rides `:edge`; once a build proves itself, *you promote it by re-tagging the
@@ -214,6 +216,14 @@ versions, rollback is re-pointing a tag; across a migration, rollback instead
 means restoring the pre-migration backup (database + encryption key), then
 running the older tag — see
 [ADR-0023](../adr/0023-database-rollback-and-pre-migration-backup.md).
+
+The opt-in updater keeps the previous image/container configuration until its
+replacement is healthy. Moving tags offered to that updater have the stricter
+ADR-0024 release contract: migrations must leave N-1 able to run against the
+post-migration schema, so a failed startup can restore the retained N-1
+image/configuration without Alembic downgrade. The pre-migration backup remains
+the manual recovery unit for partially applied or incorrectly certified
+migrations; the sidecar never claims to restore database bytes.
 
 ## 7. Technology stack
 
@@ -282,7 +292,6 @@ non-Plex media servers.
 3. Frontend approach (server-rendered vs light SPA).
 4. State-machine states/transitions, finalized.
 5. Quality-profile data model and defaults (resolutions, sources, cutoff).
-6. Auto-updater choice on each host (Watchtower vs systemd timer running compose pull).
 
 ## 12. Lessons carried from the prototype
 
