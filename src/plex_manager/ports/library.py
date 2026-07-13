@@ -341,8 +341,9 @@ class LibraryPort(Protocol):
         raise NotImplementedError
 
     async def resolve_watch_states(self, queries: Sequence[WatchStateQuery]) -> list[WatchState]:
-        """Resolve MANY watch-state lookups from ONE crawl of each relevant section
-        (issues #213/#238) -- the batch counterpart of :meth:`watch_state`.
+        """Resolve MANY watch-state lookups from AT MOST one crawl of each section
+        any query actually reads (issues #213/#238) -- the batch counterpart of
+        :meth:`watch_state`.
 
         Returns a list aligned 1:1 with ``queries`` (same length, same order): the
         Nth :class:`WatchState` is exactly what :meth:`watch_state` would return for
@@ -357,12 +358,16 @@ class LibraryPort(Protocol):
         to call :meth:`watch_state` once PER candidate, and each such call re-paged
         the whole Plex section from offset zero (``Theta(candidates * section size)``,
         going quadratic as the tracked set scales with the library -- issue #213).
-        This crawls each relevant section ONCE for the whole batch (a memoized
-        tmdb-id index), reads each distinct show's ``/children`` season listing at
-        most ONCE (not once per candidate season -- issue #213), and reads each
-        distinct season's episode ``/children`` at most once (folding in issue
-        #238's path-correlated per-candidate re-crawl). Net: ``O(sections + distinct
-        shows + distinct seasons)`` round-trips, independent of the candidate count.
+        This pages each section AT MOST once for the whole batch (a shared,
+        demand-paged tmdb-id index: only the sections/pages some query's own
+        per-item :meth:`watch_state` call would have read are ever fetched, so the
+        batch's failure surface is exactly the per-item method's -- a failing
+        section no query reaches can never abort the batch), reads each distinct
+        show's ``/children`` season listing at most ONCE (not once per candidate
+        season -- issue #213), and reads each distinct season's episode
+        ``/children`` at most once (folding in issue #238's path-correlated
+        per-candidate re-crawl). Net: ``O(sections + distinct shows + distinct
+        seasons)`` round-trips, independent of the candidate count.
 
         Like :meth:`watch_state`, it reads FRESH every call (deliberately uncached):
         the snapshot is consistent WITHIN one assembly pass -- exactly the "one
