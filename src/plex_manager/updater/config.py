@@ -14,6 +14,13 @@ OPERATION_LABEL = "io.github.lunchbox951.plex-manager.update.operation"
 ROLE_LABEL = "io.github.lunchbox951.plex-manager.update.role"
 
 _DEFAULT_IMAGE = "ghcr.io/lunchbox951/plex-manager:stable"
+# The app declares the sidecar unavailable once its last liveness signal is
+# older than 45 seconds (web/routers/updates.py). An idle sidecar only signals
+# on each eligibility poll, so the poll interval must stay comfortably inside
+# that window; otherwise the Status page reports ``updater_unavailable`` for
+# most of every interval and manual actions are refused while the sidecar is in
+# fact healthy. 30s (the default) leaves a 15s margin for request latency.
+_MAX_POLL_SECONDS = 30.0
 _IMAGE_RE = re.compile(
     r"(?=.{1,255}\Z)(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?"
     r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
@@ -110,7 +117,12 @@ class UpdaterConfig:
             coordinator_url=coordinator_url,
             secret_file=secret_file,
             state_file=state_file,
-            poll_seconds=_positive_float("PLEX_MANAGER_UPDATER_POLL_SECONDS", 30.0, minimum=1.0),
+            poll_seconds=_positive_float(
+                "PLEX_MANAGER_UPDATER_POLL_SECONDS",
+                30.0,
+                minimum=1.0,
+                maximum=_MAX_POLL_SECONDS,
+            ),
             request_timeout_seconds=_positive_float(
                 "PLEX_MANAGER_UPDATER_REQUEST_TIMEOUT_SECONDS", 10.0
             ),

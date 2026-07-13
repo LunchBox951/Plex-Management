@@ -70,6 +70,12 @@ def test_from_env_loads_a_fixed_authority_envelope(
         ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "0.999"),
         ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "NaN"),
         ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "-NaN"),
+        # Above the cap the idle sidecar would outlive the app's 45s heartbeat
+        # window and the Status page would report updater_unavailable between
+        # polls despite a healthy sidecar. Fail closed at startup instead.
+        ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "30.001"),
+        ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "45"),
+        ("PLEX_MANAGER_UPDATER_POLL_SECONDS", "3600"),
         ("PLEX_MANAGER_UPDATER_REQUEST_TIMEOUT_SECONDS", "NaN"),
         ("PLEX_MANAGER_UPDATER_HEALTH_TIMEOUT_SECONDS", "NaN"),
         ("PLEX_MANAGER_UPDATER_DRAIN_TIMEOUT_SECONDS", "NaN"),
@@ -92,6 +98,18 @@ def test_from_env_accepts_minimum_poll_interval(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("PLEX_MANAGER_UPDATER_POLL_SECONDS", "1")
 
     assert UpdaterConfig.from_env().poll_seconds == 1.0
+
+
+def test_poll_interval_is_capped_inside_the_heartbeat_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The maximum poll interval keeps idle heartbeats fresher than the app's 45s expiry."""
+    _clean_updater_env(monkeypatch)
+    monkeypatch.setenv("PLEX_MANAGER_UPDATER_POLL_SECONDS", "30")
+    assert UpdaterConfig.from_env().poll_seconds == 30.0
+    # The default itself must sit at or below the cap.
+    _clean_updater_env(monkeypatch)
+    assert UpdaterConfig.from_env().poll_seconds <= 30.0 < 45.0
 
 
 def test_read_secret_accepts_a_private_file_without_exposing_its_value(
