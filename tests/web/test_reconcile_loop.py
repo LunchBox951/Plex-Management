@@ -12,6 +12,7 @@ dependency injection), so they are monkeypatched on the app module.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import httpx
 import pytest
@@ -39,7 +40,7 @@ class _OutageQbittorrent(FakeQbittorrent):
         super().__init__()
         self._exc = exc
 
-    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
         raise self._exc
 
 
@@ -83,6 +84,21 @@ async def test_reconcile_runs_availability_when_qbittorrent_is_down(
     outage: QbittorrentError,
 ) -> None:
     request_id = await _seed_finalizing(sessionmaker_)
+    # An unrelated ACTIVE (non-terminal) row so reconcile_and_list's empty-rows
+    # fast path (issue #216) does not skip the client call outright -- this test
+    # is specifically about an outage occurring DURING that call, not about the
+    # fast path (which has its own coverage in test_queue_service.py). The
+    # "Finalizing" row above is already terminal (``imported``), so alone it
+    # would never reach the client at all.
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="deadbeef99",
+                status=DownloadState.Downloading.value,
+                tmdb_id=999999,
+            )
+        )
+        await session.commit()
     library = FakeLibrary(available={_TMDB_ID})
 
     app = FastAPI()

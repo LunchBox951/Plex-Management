@@ -223,7 +223,7 @@ async def _reconcile_once(app: FastAPI) -> None:
         if qbt is not None:
             # A qBittorrent outage / auth-failure must not abort the cycle before the
             # Plex-only availability pass below. reconcile_and_list ->
-            # qbt.get_all_statuses() raises QbittorrentError when the client is
+            # qbt.get_statuses_for_hashes() raises QbittorrentError when the client is
             # unreachable or rejects the login (QbittorrentAuthError is a subclass, so
             # it is covered too); the adapter wraps every httpx transport/status error
             # into QbittorrentError, so that one type is the whole surface. Surface it
