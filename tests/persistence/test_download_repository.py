@@ -540,7 +540,10 @@ async def test_find_active_for_requests_matches_individual_calls_exactly(
     idle_show = MediaRequest(
         tmdb_id=202, media_type=MediaType.tv, title="Idle Show", status=RequestStatus.available
     )
-    session.add_all([legacy_owner, scoped_show, idle_show])
+    pack_show = MediaRequest(
+        tmdb_id=203, media_type=MediaType.tv, title="Pack Show", status=RequestStatus.downloading
+    )
+    session.add_all([legacy_owner, scoped_show, idle_show, pack_show])
     await session.flush()
 
     repo = SqlDownloadRepository(session)
@@ -557,6 +560,29 @@ async def test_find_active_for_requests_matches_individual_calls_exactly(
         media_request_id=scoped_show.id,
         season=2,
     )
+    # A single physical (non-terminal) download covering TWO logical scopes of the
+    # same show: the legacy scalar (season 1, matching ``Download.season``) has
+    # ALREADY imported -- its own scope for that EXACT key is terminal, so the
+    # legacy match is negated (a scope for the key exists) but not re-qualified
+    # (that scope isn't active-status) -- while a SIBLING scope (season 2) is
+    # still active, keeping the physical row's overall status non-terminal. This
+    # pins the subtlest branch: a same-key scope can negate the legacy match
+    # WITHOUT re-qualifying it, distinct from ``scoped-s1`` above where the
+    # same-key scope both negates AND re-qualifies.
+    pack_download = await repo.create(
+        torrent_hash="pack-multi-season",
+        status="downloading",
+        media_request_id=pack_show.id,
+        season=1,
+    )
+    await repo.ensure_scope(pack_download.id, media_request_id=pack_show.id, season=2)
+    pack_season_1_scope = next(
+        scope for scope in (await repo.list_scopes(pack_download.id)) if scope.season == 1
+    )
+    updated = await repo.update_scope_status_if_in(
+        pack_season_1_scope.id, "imported", frozenset({"active", "import_blocked"})
+    )
+    assert updated
 
     keys = [
         (legacy_owner.id, None),
@@ -564,6 +590,8 @@ async def test_find_active_for_requests_matches_individual_calls_exactly(
         (scoped_show.id, 2),
         (scoped_show.id, 3),  # no download at all for this season
         (idle_show.id, 1),  # not even a candidate key referenced anywhere
+        (pack_show.id, 1),  # legacy-negating scope is terminal -> must NOT re-qualify
+        (pack_show.id, 2),  # sibling scope is still active -> must match
     ]
     batched = await repo.find_active_for_requests(keys)
 
@@ -572,7 +600,7 @@ async def test_find_active_for_requests_matches_individual_calls_exactly(
         if await repo.find_active_for_request(request_id, season=season) is not None:
             expected.add((request_id, season))
     assert batched == expected
-    assert batched == {(legacy_owner.id, None), (scoped_show.id, 1)}
+    assert batched == {(legacy_owner.id, None), (scoped_show.id, 1), (pack_show.id, 2)}
 
 
 async def test_find_active_for_requests_empty_keys_returns_empty_set(

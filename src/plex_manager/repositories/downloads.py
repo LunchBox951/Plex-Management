@@ -256,6 +256,14 @@ class SqlDownloadRepository:
         if not keys:
             return frozenset()
         key_set = frozenset(keys)
+        # ``request_ids`` bounds two ``IN (...)`` clauses below (and a third against
+        # ``download_ids``, sized by however many rows the first query returns). A
+        # single disk-pressure sweep's candidate pool is this app's whole "available"
+        # movie/season set for one root -- large but, like every other batch reader in
+        # this module (``list_for_requests``, ``get_many``), unchunked; SQLite's
+        # historical 999-bound-parameter ceiling is a latent limit shared with those,
+        # not a regression introduced here. Chunk all of them together if a real
+        # library ever grows large enough to hit it.
         request_ids = list({media_request_id for media_request_id, _season in key_set})
 
         scope_exists_for_requests = exists().where(
