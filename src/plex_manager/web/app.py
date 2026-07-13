@@ -71,11 +71,11 @@ from plex_manager.web.deps import (
     get_media_probe,
     get_movies_root_optional,
     get_parser,
-    get_prowlarr,
     get_quality_profile,
-    get_tmdb,
     get_tv_root_optional,
+    resolve_prowlarr,
     resolve_qbittorrent,
+    resolve_tmdb,
 )
 from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
@@ -395,7 +395,7 @@ async def _autograb_once(app: FastAPI) -> None:
         # unconfigured the worker is a clean no-op until setup completes (honest,
         # not an error -- exactly the reconcile loop's posture for a missing qBt).
         try:
-            prowlarr = await get_prowlarr(session, client)
+            prowlarr = await resolve_prowlarr(app.state, session, client)
             qbt = await resolve_qbittorrent(app.state, session, client)
         except ServiceNotConfiguredError:
             status.mark_ok()
@@ -406,7 +406,7 @@ async def _autograb_once(app: FastAPI) -> None:
         # behaves exactly as before this feature existed -- rather than blocking
         # the whole cycle the way a missing Prowlarr/qBittorrent does.
         try:
-            metadata = await get_tmdb(session, client)
+            metadata = await resolve_tmdb(app.state, session, client)
         except ServiceNotConfiguredError:
             metadata = None
         # Plex is OPTIONAL here too (issue #210): it only powers the air-date wake

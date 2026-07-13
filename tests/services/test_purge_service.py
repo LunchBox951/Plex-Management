@@ -9,12 +9,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
-from plex_manager.ports.download_client import DownloadClientPort, DownloadedFile, DownloadStatus
+from plex_manager.ports.download_client import (
+    AddResult,
+    DownloadClientPort,
+    DownloadedFile,
+    DownloadStatus,
+    FailureDetail,
+)
 from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
@@ -388,6 +395,74 @@ async def test_visible_content_path_tolerates_a_failed_file_list_fetch() -> None
         qbt, "a" * 40, "/srv/downloads/gone.mkv", "/srv/downloads"
     )
     assert result is None
+
+
+class _MissingRemoveQbt(DownloadClientPort):
+    """A ``DownloadClientPort`` implementation that overrides every method
+    EXCEPT ``remove`` -- proving issue #204's fix: the Protocol's own default
+    body for ``remove`` now raises ``NotImplementedError`` (never a silent
+    implicit ``return None``) when a subclass forgets to override it."""
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        return AddResult(torrent_hash="hash", created=True)
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        return None
+
+    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        return []
+
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        return []
+
+    async def pause(self, info_hash: str) -> None:
+        return None
+
+    async def resume(self, info_hash: str) -> None:
+        return None
+
+    # ``remove`` deliberately NOT overridden -- the Protocol's own default runs.
+
+    async def set_category(self, info_hash: str, category: str) -> None:
+        return None
+
+    async def get_save_path(self, info_hash: str) -> str | None:
+        return None
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        return []
+
+    async def get_default_save_path(self) -> str | None:
+        return None
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        return None
+
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
+        return None
+
+
+async def test_missing_remove_implementation_can_never_report_purge_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #204's load-bearing regression: before the fix, a
+    ``DownloadClientPort`` implementation that forgot to override ``remove``
+    fell through to the Protocol's docstring-only default -- Python's implicit
+    ``return None`` -- so ``qbt.remove(...)`` would appear to SUCCEED for a
+    torrent that was never actually removed, and ``purge_service.remove_torrent``
+    would report ``True``: a blocklisted/cancelled torrent silently kept
+    seeding forever with no visible failure anywhere.
+
+    Now the default raises ``NotImplementedError``, which ``remove_torrent``'s
+    best-effort ``except Exception`` catches, logs, and reports as ``False`` --
+    the caller (``queue_service``) then correctly keeps the durable "removal
+    still owed" marker instead of persisting a false "removed" outcome.
+    """
+    qbt: DownloadClientPort = _MissingRemoveQbt()  # pyright: ignore[reportAbstractUsage]
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        result = await purge_service.remove_torrent(qbt, "c" * 40, context="a test")
+    assert result is False
+    assert "failed to remove torrent" in caplog.text
 
 
 async def test_trigger_library_scan_records_the_scan() -> None:
