@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -116,6 +116,31 @@ class Settings(BaseSettings):
     allowed_hosts: Annotated[tuple[str, ...], NoDecode] = ()
 
     log_level: str = "INFO"
+
+    # Read WITHOUT the ``PLEX_MANAGER_`` prefix (``validation_alias``): this is the
+    # widely-used process-manager convention (gunicorn's ``uvicorn.workers``
+    # image, Heroku, etc.) an operator scaling this app would set to run more
+    # than one worker process. The app itself never reads this to size a worker
+    # pool (``__main__.py`` always calls ``uvicorn.run`` with no ``workers=``,
+    # i.e. one process) — it exists PURELY so ``web.app.lifespan`` can warn
+    # loudly at startup when an operator's own process manager (a
+    # ``uvicorn --workers>1`` wrapper, or a multi-container/multi-replica
+    # deployment that sets this by convention) is about to violate the
+    # single-process assumption several in-process registries depend on for
+    # correctness (issue #240): ``services.queue_service``'s removal-physics
+    # guards (``_removals_in_flight`` / ``_operator_fail_claims``) and
+    # ``services.purge_service``'s purge-vs-import path serialization are
+    # plain in-process dicts coordinated with no ``await`` between check and
+    # register, exactly like ``web.routers.settings``'s ``_rotate_lock`` /
+    # ``_settings_update_lock`` already document. A second worker process (or
+    # container replica) would silently reopen every race those registries
+    # close, because each process/container gets its OWN copy with no
+    # cross-process coordination. Deliberately NOT a hard failure: the app
+    # remains fully usable single-process without this variable ever being
+    # set, and building real multi-process coordination (a DB-level lock/CAS
+    # spanning every one of these registries) is out of scope for this fix —
+    # the goal is making the violated assumption LOUD at startup, not silent.
+    web_concurrency: int = Field(default=1, validation_alias="WEB_CONCURRENCY")
 
     @field_validator("allowed_hosts", mode="before")
     @classmethod

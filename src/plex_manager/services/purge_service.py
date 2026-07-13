@@ -33,9 +33,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -57,6 +58,17 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+# Bounded poll for qBittorrent's own server-side, ASYNCHRONOUS on-disk file
+# deletion to actually finish after a ``/torrents/delete?deleteFiles=true`` call
+# has already ACKed (issue #240, residual left by PR #235's same-hash cancel-race
+# guard). See :func:`_wait_for_content_path_gone`. Bounded rather than unbounded:
+# this runs inline in an operator-facing request (cancel / mark-failed / report-
+# issue) as well as the reconcile poll loop, so it must never block either
+# indefinitely -- a still-present path after the bound is logged (honesty over
+# silence) and the caller proceeds; the DB state change already committed.
+_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS: Final = 5.0
+_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS: Final = 0.25
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -305,7 +317,36 @@ async def remove_torrent(
     interpolated request-derived string — log-injection convention); the
     torrent hash and any correlation ids go via ``extra``. A torrent hash is not a
     secret; the grab source (which embeds a Prowlarr api key) is never logged here.
+
+    Post-ack disk-deletion residual (issue #240): qBittorrent's own file removal
+    for ``delete_files=True`` is ASYNCHRONOUS server-side — the ``/torrents/delete``
+    call returns as soon as the delete is *accepted*, not once it has finished
+    walking the content path. Every caller of this function releases its own
+    removal-physics guard (``queue_service``'s ``_removals_in_flight`` /
+    ``_operator_fail_claims``) once this call returns, on the assumption the data
+    is actually gone by then — a same-hash re-grab (the exact same release
+    re-requested) landing in the narrow window between the ACK and the real
+    on-disk finish can have its freshly-written data clobbered by the TAIL of the
+    old deletion still walking the same path. Before returning success, this
+    function therefore snapshots the torrent's ``content_path`` BEFORE removing it
+    (the client no longer reports it once the torrent itself is gone) and, if one
+    was reported, polls (:func:`_wait_for_content_path_gone`) for that path to
+    actually disappear from disk, bounded so this best-effort call can never block
+    a caller indefinitely. A ``content_path`` that merely restates ``save_path``
+    (the adapter nulls it in that case — see ``adapters/qbittorrent/adapter.py``)
+    has nothing distinct to poll (``save_path`` is shared by other torrents) and
+    is skipped honestly rather than polling the wrong thing.
     """
+    content_path: str | None = None
+    try:
+        status = await qbt.get_status(torrent_hash)
+    except Exception:
+        # Best-effort snapshot only: a failure here just means the post-delete
+        # poll below is skipped (nothing distinct to verify), never a reason to
+        # abort the removal itself.
+        status = None
+    if status is not None and status.content_path:
+        content_path = status.content_path
     try:
         await qbt.remove(torrent_hash, delete_files=True)
     except Exception:
@@ -320,4 +361,50 @@ async def remove_torrent(
             extra=extra,
         )
         return False
+    if content_path is not None:
+        await _wait_for_content_path_gone(content_path, context=context, extra=extra)
     return True
+
+
+async def _wait_for_content_path_gone(
+    content_path: str, *, context: str, extra: dict[str, object] | None
+) -> None:
+    """Bounded poll for a just-removed torrent's ``content_path`` to leave disk.
+
+    Closes the post-ack residual documented on :func:`remove_torrent`: qBittorrent
+    ACKs ``/torrents/delete`` before its own server-side file removal necessarily
+    finishes, so a same-hash re-grab landing right after the ACK can start writing
+    fresh data at ``content_path`` while the OLD deletion is still tearing it down
+    — the tail of that deletion can then clobber the new data. Polls
+    ``os.path.exists`` off the event loop (mirrors every other blocking FS probe in
+    this module/``import_service``), bounded by
+    ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` so this best-effort check can never
+    hang a caller indefinitely (it runs inline in operator-facing correction
+    endpoints, not just the reconcile background loop). A path still present once
+    the bound elapses is logged (honesty over silence) and left as-is — the
+    caller's DB state change already committed, and every actor's removal-physics
+    guard release proceeds regardless; a client this slow to finish its own
+    deletion is a pre-existing risk this poll narrows, not a new one it must fully
+    eliminate.
+    """
+    deadline = time.monotonic() + _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS
+    while True:
+        try:
+            still_present = await asyncio.to_thread(os.path.exists, content_path)
+        except OSError:
+            # An unreadable path (e.g. a parent directory removed out from under
+            # it) is as good as gone for this best-effort check.
+            still_present = False
+        if not still_present:
+            return
+        if time.monotonic() >= deadline:
+            _logger.warning(
+                "content path still present %.1fs after %s's torrent removal "
+                "was acknowledged; a fast same-hash re-grab could still race the "
+                "client's own asynchronous file deletion",
+                _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+                context,
+                extra=extra,
+            )
+            return
+        await asyncio.sleep(_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS)

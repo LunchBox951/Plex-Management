@@ -114,6 +114,40 @@ class _RejectAllResponseCookies(DefaultCookiePolicy):
 
 _logger = logging.getLogger(__name__)
 
+
+def _warn_if_multi_process() -> None:
+    """Warn loudly, once per process, if ``WEB_CONCURRENCY`` implies >1 worker.
+
+    Several in-process registries assume a SINGLE Python process (issue #240):
+    ``services.queue_service``'s removal-physics guards (``_removals_in_flight`` /
+    ``_operator_fail_claims`` -- the same-hash grab/cancel/mark-failed race
+    closer), ``services.purge_service``'s purge-vs-import path serialization, and
+    ``web.routers.settings``'s ``_rotate_lock`` / ``_settings_update_lock`` are
+    all plain in-process ``dict``/``asyncio.Lock`` state with no cross-process
+    coordination -- each additional worker process (``uvicorn --workers>1``) or
+    container replica gets its OWN independent copy, silently REOPENING every
+    race those registries exist to close, with no error and no log line to say
+    so. This app deliberately does not build real multi-process coordination
+    (a DB-level lock/CAS) for that -- see this repo's CLAUDE.md north star
+    "honesty over silence": the fix here is making the violated assumption
+    LOUD at startup instead of leaving it silent, not adding the coordination
+    itself. Runs in EVERY worker process's own ``lifespan`` (never just the
+    first), so a multi-worker launch logs once per worker -- exactly the
+    operator-visible signal an install running more than one worker needs.
+    """
+    concurrency = get_settings().web_concurrency
+    if concurrency > 1:
+        _logger.warning(
+            "WEB_CONCURRENCY=%d: this app assumes a SINGLE process. Its "
+            "in-process removal/settings-rotation guards (queue_service, "
+            "purge_service, web.routers.settings) do not coordinate across "
+            "worker processes or container replicas, so running more than one "
+            "silently reopens the same-hash download races those guards exist "
+            "to close. Run exactly one worker/replica of this app.",
+            concurrency,
+        )
+
+
 # How often the background reconciler reconciles the client, drains imports, and
 # confirms availability. A constant for the beta (a configurable interval / a
 # dedicated worker are noted follow-ups).
@@ -821,7 +855,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     (``config.log_level`` applied to the root logger here, for the first time —
     previously defined but unused), and its sibling drain/eviction background
     tasks — each on its OWN interval, never the 15s reconcile tick.
+
+    Also asserts the single-process assumption (issue #240): see
+    :func:`_warn_if_multi_process`. First, so it fires before anything else --
+    including a slow encryption/DB step -- ever gets a chance to run.
     """
+    _warn_if_multi_process()
     maker = get_sessionmaker()
     app.state.sessionmaker = maker
     async with maker() as session:

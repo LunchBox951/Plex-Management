@@ -261,6 +261,58 @@ def _season_watch_state_from_entry(entry: Mapping[str, object]) -> WatchState:
     return WatchState(watched=watched, last_viewed_at=last_viewed_at)
 
 
+def _resolve_correlated_watch_state(
+    hits: Sequence[tuple[frozenset[str], WatchState]],
+) -> WatchState:
+    """Resolve :meth:`PlexLibrary.watch_state`'s path-correlated ``hits`` to ONE
+    :class:`WatchState` (issue #239).
+
+    Each hit pairs the CANDIDATE's own reported media-file path(s) (a movie's
+    ``Media[].Part[].file`` set, or a TV season's episode file-path set) with the
+    :class:`WatchState` read off that same Plex item/season row.
+
+    * Zero hits -- the target could not be correlated at all -- fails closed
+      exactly as before: ``WatchState(watched=False, last_viewed_at=None)``.
+    * Exactly one hit resolves directly to that hit's own state.
+    * More than one hit was issue #207's original fail-closed case (any
+      ambiguity at all), which turned out to be too blunt: the SAME physical
+      copy indexed by more than one Plex section (e.g. a broad ``/media``
+      section AND a nested ``/media/anime`` section both covering the same
+      files) produces more than one correlated hit for a candidate that is
+      genuinely ONE item on disk -- permanently exempting it from disk-pressure
+      eviction with no operator-visible explanation. So: hits are merged into
+      ONE logical item ONLY when EVERY hit reports the IDENTICAL set of
+      underlying file paths -- genuinely different underlying files (distinct
+      copies on disk, a true duplicate) still fail closed, unchanged from
+      before.
+
+    The merge itself: watched if ANY correlated hit is watched -- a section
+    whose own watch-state sync lags behind (or that a user happens to browse
+    less) must never mask a real watch recorded via another section indexing
+    the identical file. The timestamp is the OLDEST (most-conservative)
+    ``last_viewed_at`` among the WATCHED hits, never the newest -- a section
+    that is slow to reflect a rewatch must never push the eviction grace
+    window later than what the earliest section already confirmed.
+    """
+    if len(hits) == 1:
+        return hits[0][1]
+    if not hits:
+        return WatchState(watched=False, last_viewed_at=None)
+    distinct_path_sets = {file_paths for file_paths, _ in hits}
+    if len(distinct_path_sets) != 1:
+        # Genuinely ambiguous: the hits do not all agree on the same underlying
+        # file(s) -- fail closed, exactly as issue #207 originally specified.
+        return WatchState(watched=False, last_viewed_at=None)
+    watched_timestamps = [
+        state.last_viewed_at
+        for _, state in hits
+        if state.watched and state.last_viewed_at is not None
+    ]
+    if not watched_timestamps:
+        return WatchState(watched=False, last_viewed_at=None)
+    return WatchState(watched=True, last_viewed_at=min(watched_timestamps))
+
+
 def _is_path_prefix(prefix: str, path: str) -> bool:
     """True if ``prefix`` is ``path`` or a parent directory of it (segment-aware).
 
@@ -1076,15 +1128,22 @@ class PlexLibrary:
 
         ``library_path`` (issue #207) path-correlates the read: when given, EVERY
         ``tmdb_id``-matching item across every section is collected (not just the
-        first), and only the one whose reported media file path sits at/under the
+        first), and only the ones whose reported media file path sits at/under the
         reverse-mapped ``library_path`` (:func:`_section_scan_path` +
-        :func:`_is_path_prefix`, the same machinery :meth:`confirm_paths` uses) is
-        read. Zero or more-than-one such correlated item FAILS CLOSED (see the
-        port docstring) -- legitimate duplicates (the same title in two sections,
-        distinct copies on disk) must never let one copy's watched state authorize
-        deleting the other. The TV branch pays one extra per-season ``/children``
-        (episode) fetch per candidate show to read the season's own episode file
-        paths.
+        :func:`_is_path_prefix`, the same machinery :meth:`confirm_paths` uses) are
+        read. Zero correlated items still FAILS CLOSED (see the port docstring).
+        More than one correlated item is resolved by
+        :func:`_resolve_correlated_watch_state` (issue #239): hits that all report
+        the IDENTICAL underlying media-file path(s) are the SAME physical copy
+        merely indexed by more than one Plex section (e.g. a broad ``/media``
+        section plus a nested ``/media/anime`` section covering the same files)
+        and are merged into one logical item -- watched if ANY hit is watched, at
+        the OLDEST (most-conservative) watched timestamp. Hits whose file paths
+        genuinely DIFFER remain ambiguous and still FAIL CLOSED, exactly as
+        before -- a legitimate duplicate (distinct copies on disk) must never let
+        one copy's watched state authorize deleting the other. The TV branch pays
+        one extra per-season ``/children`` (episode) fetch per candidate show to
+        read the season's own episode file paths.
         """
         if media_type == "tv":
             if season is None:
@@ -1103,7 +1162,7 @@ class PlexLibrary:
                     return _movie_watch_state_from_item(item)
             return WatchState(watched=False, last_viewed_at=None)
 
-        hits: list[WatchState] = []
+        hits: list[tuple[frozenset[str], WatchState]] = []
         for section in await self.list_sections():
             if section.type != "movie":
                 continue
@@ -1113,10 +1172,8 @@ class PlexLibrary:
             for item in await self._find_section_items(section.key, tmdb_id):
                 file_paths = _extract_file_paths(item)
                 if any(_is_path_prefix(scan_path, fp) for fp in file_paths):
-                    hits.append(_movie_watch_state_from_item(item))
-        if len(hits) == 1:
-            return hits[0]
-        return WatchState(watched=False, last_viewed_at=None)
+                    hits.append((frozenset(file_paths), _movie_watch_state_from_item(item)))
+        return _resolve_correlated_watch_state(hits)
 
     async def _tv_watch_state(
         self, tmdb_id: int, season: int, library_path: str | None
@@ -1138,7 +1195,7 @@ class PlexLibrary:
                 return _season_watch_state_from_entry(season_entry)
             return WatchState(watched=False, last_viewed_at=None)
 
-        hits: list[WatchState] = []
+        hits: list[tuple[frozenset[str], WatchState]] = []
         for section in await self.list_sections():
             if section.type != "show":
                 continue
@@ -1157,10 +1214,10 @@ class PlexLibrary:
                     continue
                 episode_paths = await self._fetch_children_file_paths(season_rating_key)
                 if any(_is_path_prefix(scan_path, fp) for fp in episode_paths):
-                    hits.append(_season_watch_state_from_entry(season_entry))
-        if len(hits) == 1:
-            return hits[0]
-        return WatchState(watched=False, last_viewed_at=None)
+                    hits.append(
+                        (frozenset(episode_paths), _season_watch_state_from_entry(season_entry))
+                    )
+        return _resolve_correlated_watch_state(hits)
 
     async def _find_section_item(self, key: str, tmdb_id: int) -> Mapping[str, object] | None:
         """Page one section's items, returning the raw entry matching ``tmdb_id``.
