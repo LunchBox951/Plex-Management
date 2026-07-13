@@ -62,6 +62,45 @@ describe('ReleaseList', () => {
     expect(screen.getByText(/request this title to grab/i)).toBeInTheDocument()
   })
 
+  it('renders compact admin rows without turning Grab into a solid primary', () => {
+    const onGrab = vi.fn()
+    const preview: SearchPreviewResponse = {
+      accepted: [
+        accepted({ guid: 'g1', title: 'Top.Release', indexer: 'Indexer A' }),
+        accepted({ guid: 'g2', title: 'Second.Release', indexer: 'Indexer B' }),
+      ],
+      rejected: [{ title: 'Rejected.CAM', reason: 'quality_not_wanted' }],
+      no_acceptable_release: false,
+    }
+    render(
+      <ReleaseList
+        preview={preview}
+        onGrab={onGrab}
+        grabbingGuid={null}
+        canGrab
+        variant="admin"
+      />,
+    )
+
+    expect(screen.getByTitle('Top.Release')).toHaveClass('font-mono', 'truncate')
+    expect(screen.getAllByText('WEBDL-1080p')).toHaveLength(2)
+    expect(screen.getAllByText('1080p')).toHaveLength(2)
+    expect(screen.getAllByText('WEBDL')).toHaveLength(2)
+    expect(screen.getAllByText('42 seeders')).toHaveLength(2)
+    expect(screen.getByText('Indexer A')).toBeInTheDocument()
+
+    const grabButtons = screen.getAllByRole('button', { name: 'Grab' })
+    expect(grabButtons).toHaveLength(2)
+    for (const button of grabButtons) {
+      expect(button).not.toHaveClass('bg-gold')
+      expect(button).toHaveClass('text-gold', 'ring-gold/30')
+    }
+    expect(screen.getByText('Quality not in profile')).toHaveClass('bg-error/10')
+
+    fireEvent.click(grabButtons[1]!)
+    expect(onGrab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'g2' }))
+  })
+
   describe('season/episode chip (best-effort, parsed from the title)', () => {
     it('shows "S02E05" for a single-episode release', () => {
       const preview: SearchPreviewResponse = {

@@ -1,5 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { StrictMode, type ReactNode } from 'react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import {
+  StrictMode,
+  type ButtonHTMLAttributes,
+  type HTMLAttributes,
+  type ReactNode,
+} from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useCancelRequest,
@@ -60,11 +65,27 @@ beforeEach(() => {
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 
 vi.mock('./ui/Dialog', () => ({
-  Dialog: ({ title, children }: { title: string; children: ReactNode }) => (
-    <div>
-      <h2>{title}</h2>
+  Dialog: ({
+    title,
+    children,
+    customChrome = false,
+  }: {
+    title: string
+    children: ReactNode
+    customChrome?: boolean
+  }) => (
+    <div role="dialog">
+      {customChrome ? null : <h2>{title}</h2>}
       {children}
     </div>
+  ),
+  DialogTitle: ({ children, ...props }: HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 {...props}>{children}</h2>
+  ),
+  DialogClose: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>
+      {children}
+    </button>
   ),
 }))
 
@@ -140,11 +161,13 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
 
   it('skips preview when POST /requests returns a terminal row (available)', async () => {
     const { createMutation, previewMutation } = setup('available')
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
     await waitFor(() => {
       expect(createMutation.mutateAsync).toHaveBeenCalled()
     })
-    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(
+      screen.getByText('Your request is queued and will be searched automatically.'),
+    ).toBeInTheDocument()
     expect(previewMutation.mutateAsync).not.toHaveBeenCalled()
     // Terminal create -> not grabbable -> no release list / Grab button is generated.
     expect(screen.queryByRole('button', { name: /grab/i })).not.toBeInTheDocument()
@@ -152,7 +175,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
 
   it('arms Grab when POST /requests returns a non-terminal row (pending)', async () => {
     setup('pending')
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
   })
@@ -181,8 +204,8 @@ describe('TitleDetailModal TV request actions', () => {
     )
 
     expect(screen.queryByText(/TV requests are deferred/i)).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /preview releases/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^\+ request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search releases/i })).toBeInTheDocument()
   })
 })
 
@@ -294,7 +317,7 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
     expect(screen.queryByLabelText('Season')).not.toBeInTheDocument()
     expect(screen.queryByLabelText(/season to search/i)).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
 
     // The exact payloads below prove no `season`/`seasons` field snuck in.
     await waitFor(() =>
@@ -354,7 +377,7 @@ describe('TitleDetailModal — tv season selector', () => {
     // Uncheck "whole series" and pick season 2 before requesting.
     fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
     fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
 
     await waitFor(() =>
       expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
@@ -420,7 +443,7 @@ describe('TitleDetailModal — tv season selector', () => {
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
     fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
     fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
 
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
@@ -478,7 +501,14 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: /^request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+
+    await waitFor(() =>
+      expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
+        tmdb_id: 100,
+        media_type: 'tv',
+      }),
+    )
 
     // The preview must search season 2 (the season the create resolved to) —
     // NEVER season 1, the stale click-time default.
@@ -568,12 +598,16 @@ describe('TitleDetailModal — tv season selector', () => {
 
     // Defaults to the first ACTIONABLE tracked season (season 2, still pending) —
     // never season 1 (already terminal/available).
-    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(
+      screen.getByText('Your request is queued and will be searched automatically.'),
+    ).toBeInTheDocument()
 
     // Switching to season 1 reveals ITS real state — already in the library —
     // rather than the show's 'partially_available' rollup leaking through.
     fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
-    expect(await screen.findByText(/in your library/i)).toBeInTheDocument()
+    expect(
+      await screen.findByText('This season is imported and visible in Plex.'),
+    ).toBeInTheDocument()
   })
 
   it('matches queue rows by attached scope when the legacy season differs', () => {
@@ -694,7 +728,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
     expect(screen.queryByRole('button', { name: /^grab/i })).not.toBeInTheDocument()
   })
 
-  it('pins the NEW request after "Request again", never the stale settled one it replaced', async () => {
+  it('pins the NEW request once available, never the stale settled one it replaced', async () => {
     // R4-5: the OLD request (id 7) is evicted AND was left pinned; it is what
     // /requests still returns -- the poll has NOT yet caught up to the fresh
     // re-request (mirrors G3's create-then-poll gap above, applied to the pin
@@ -707,25 +741,37 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
       data: { requests: [movieRequest({ id: 7, status: 'evicted', keep_forever: true })] },
     })
     const created = movieRequest({ id: 9, status: 'pending', keep_forever: false })
-    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation(created))
+    const createRequestMock = mutation(created)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
     ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
     const setKeepForeverMock = mutation(undefined)
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(setKeepForeverMock)
-    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    const view = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
 
-    // Before "Request again": the checkbox reflects the OLD (pinned) request.
-    expect(screen.getByRole('checkbox', { name: /keep forever/i })).toBeChecked()
+    // Pins are offered only for a watchable selected scope, never for evicted or
+    // in-flight content.
+    expect(screen.queryByRole('checkbox', { name: /keep forever/i })).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /request again/i }))
 
-    // The create resolves, requestId updates to 9 -- the pin target must follow
-    // it immediately, NOT wait for /requests to catch up: a fresh request
-    // always starts unpinned, so the checkbox flips to unchecked right away.
-    await waitFor(() =>
-      expect(screen.getByRole('checkbox', { name: /keep forever/i })).not.toBeChecked(),
-    )
+    await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
+    expect(screen.queryByRole('checkbox', { name: /keep forever/i })).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('checkbox', { name: /keep forever/i }))
+    // Once polling confirms the fresh request is available, the checkbox must
+    // target id 9 rather than the stale evicted id 7 that preceded it.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 7, status: 'evicted', keep_forever: true }),
+          movieRequest({ id: 9, status: 'available', keep_forever: false }),
+        ],
+      },
+    })
+    view.rerender(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    const freshPin = await screen.findByRole('checkbox', { name: /keep forever/i })
+    expect(freshPin).not.toBeChecked()
+    fireEvent.click(freshPin)
     await waitFor(() =>
       expect(setKeepForeverMock.mutateAsync).toHaveBeenCalledWith({
         requestId: 9,
@@ -752,7 +798,9 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
     })
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByText(/searching/i)).toBeInTheDocument()
+    expect(
+      screen.getByText('Your request is queued and will be searched automatically.'),
+    ).toBeInTheDocument()
     expect(screen.queryByText(/^evicted$/i)).not.toBeInTheDocument()
   })
 })
@@ -844,7 +892,11 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
 
-    expect(screen.getAllByText(/waiting for air date/i)).toHaveLength(2)
+    expect(
+      screen.getByText(
+        "This season hasn't aired yet. It will be searched automatically after its air date.",
+      ),
+    ).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
     const confirms = screen.getAllByRole('button', { name: /cancel request/i })
     fireEvent.click(confirms[confirms.length - 1]!)
@@ -965,16 +1017,16 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
   it('shows Request but hides Preview releases for a shared user (admin keeps both)', () => {
     asSharedUser()
     const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^\+ request$/i })).toBeInTheDocument()
     // Preview drives the admin-only /search-preview: hidden, not a 403 machine.
-    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /search releases/i })).not.toBeInTheDocument()
     unmount()
 
     // Same render as an admin: both verbs are offered.
     authState.current = authState.admin
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByRole('button', { name: /^request$/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /preview releases/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^\+ request$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /search releases/i })).toBeInTheDocument()
   })
 
   it('keeps the admin-only queue query disabled for a shared user', () => {
@@ -984,6 +1036,36 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     expect(useQueue).toHaveBeenCalledWith({ poll: true, enabled: false })
   })
 
+  it('ignores admin-only queue data cached before a shared-user role transition', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'import_blocked' })] },
+    })
+    ;(useQueue as unknown as Mock).mockReturnValue({
+      data: {
+        queue: [
+          {
+            id: 11,
+            media_request_id: 7,
+            progress: 1,
+            seed_ratio: 0,
+            status: 'import_blocked',
+            torrent_hash: 'cached-admin-row',
+            failed_reason: 'Operator-only filesystem detail',
+          } satisfies QueueItem,
+        ],
+      },
+    })
+
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    expect(
+      screen.getByText('The download finished, but import needs operator attention.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/operator-only filesystem detail/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /report a problem|retry import/i })).not.toBeInTheDocument()
+  })
+
   it('hides keep-forever, report and cancel from a shared user across states', () => {
     asSharedUser()
     // An available request (would offer keep-forever + report-issue to an admin).
@@ -991,7 +1073,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
       data: { requests: [movieRequest({ status: 'available' })] },
     })
     const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByText(/in your library/i)).toBeInTheDocument() // honest status stays
+    expect(screen.getByText('This title is imported and visible in Plex.')).toBeInTheDocument()
     expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
     unmount()
@@ -1001,7 +1083,9 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
       data: { requests: [movieRequest({ status: 'searching' })] },
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
-    expect(screen.getByText(/searching/i)).toBeInTheDocument() // honest status stays
+    expect(
+      screen.getByText('Scanning configured indexers for an acceptable release.'),
+    ).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
   })
@@ -1325,7 +1409,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
     )
 
     expect(screen.getByRole('button', { name: /^re-acquire$/i })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /^request$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^\+ request$/i })).not.toBeInTheDocument()
 
     await confirmReacquire()
     await waitFor(() =>
@@ -1355,7 +1439,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
     )
 
     // The available zone shows both verbs for an admin.
-    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.getByText('This title is imported and visible in Plex.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
 
     await confirmReacquire()
@@ -1402,8 +1486,620 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
       />,
     )
 
-    expect(screen.getByText(/in your library/i)).toBeInTheDocument()
+    expect(screen.getByText('This season is imported and visible in Plex.')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^re-acquire$/i })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /report a problem/i })).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
+  const MOVIE: DiscoverResult = {
+    media_type: 'movie',
+    tmdb_id: 42,
+    title: 'Test Movie',
+    year: 2021,
+    library_state: 'none',
+  }
+
+  const TV: DiscoverResult = {
+    media_type: 'tv',
+    tmdb_id: 100,
+    title: 'Test Show',
+    year: 2022,
+    library_state: 'none',
+  }
+
+  function request(
+    status: string,
+    overrides: Partial<RequestResponse> = {},
+  ): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status,
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  function queueItem(overrides: Partial<QueueItem> = {}): QueueItem {
+    return {
+      id: 11,
+      media_request_id: 7,
+      progress: 0.63,
+      seed_ratio: 0,
+      status: 'downloading',
+      torrent_hash: 'hash-11',
+      ...overrides,
+    }
+  }
+
+  function setBaseMocks(
+    requests: RequestResponse[] = [],
+    queue: QueueItem[] = [],
+  ): void {
+    // vi.mocked(...) (the Layout.test.tsx idiom) instead of leading-semicolon
+    // `;(x as Mock)` statements: no statement starts with `(`, so none relies
+    // on automatic semicolon insertion (CodeQL js/automatic-semicolon-insertion).
+    vi.mocked(useCreateRequest).mockReturnValue(idle() as never)
+    vi.mocked(useSearchPreview).mockReturnValue(
+      mutation({ accepted: [], rejected: [], no_acceptable_release: true }) as never,
+    )
+    vi.mocked(useGrab).mockReturnValue(idle() as never)
+    vi.mocked(useMarkFailed).mockReturnValue(idle() as never)
+    vi.mocked(useImportDownload).mockReturnValue(idle() as never)
+    vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
+    vi.mocked(useReportIssue).mockReturnValue(idle() as never)
+    vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
+    vi.mocked(useRequests).mockReturnValue({ data: { requests } } as never)
+    vi.mocked(useQueue).mockReturnValue({ data: { queue } } as never)
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setBaseMocks()
+  })
+
+  it('renders contract-backed identity, decorative artwork, one H2, and labelled close', async () => {
+    const title: DiscoverResult = {
+      ...MOVIE,
+      overview: 'A contract-backed overview.',
+      backdrop_url: 'https://image.tmdb.org/backdrop.jpg',
+      poster_url: 'https://image.tmdb.org/poster.jpg',
+    }
+    const { container } = render(
+      <TitleDetailModal title={title} open onOpenChange={() => {}} />,
+    )
+
+    expect(screen.getAllByRole('heading', { level: 2 })).toHaveLength(1)
+    expect(screen.getByRole('heading', { level: 2, name: 'Test Movie' })).toBeInTheDocument()
+    expect(screen.getByText('2021 · Movie')).toBeInTheDocument()
+    expect(screen.getByText('A contract-backed overview.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Close' })).toHaveClass('focus-visible:ring-2')
+
+    const backdrop = container.querySelector<HTMLImageElement>(
+      'img[src="https://image.tmdb.org/backdrop.jpg"]',
+    )
+    const poster = container.querySelector<HTMLImageElement>(
+      'img[src="https://image.tmdb.org/poster.jpg"]',
+    )
+    for (const artwork of [backdrop, poster]) {
+      expect(artwork).toHaveAttribute('alt', '')
+      expect(artwork).toHaveAttribute('aria-hidden', 'true')
+    }
+
+    fireEvent.error(backdrop!)
+    fireEvent.error(poster!)
+    await waitFor(() => {
+      expect(
+        container.querySelector('img[src="https://image.tmdb.org/backdrop.jpg"]'),
+      ).not.toBeInTheDocument()
+      expect(
+        container.querySelector('img[src="https://image.tmdb.org/poster.jpg"]'),
+      ).not.toBeInTheDocument()
+    })
+    expect(screen.getByTestId('title-backdrop')).toHaveClass('bg-poster')
+    expect(screen.getByTestId('title-poster')).toHaveClass('bg-gradient-to-b')
+    expect(screen.queryByText(/rating|runtime|genres|indexers/i)).not.toBeInTheDocument()
+  })
+
+  it('uses quiet artwork fallbacks and omits a missing overview cleanly', () => {
+    const { container } = render(
+      <TitleDetailModal title={{ ...TV, overview: null }} open onOpenChange={() => {}} />,
+    )
+    expect(container.querySelectorAll('img')).toHaveLength(0)
+    expect(screen.getByText('2022 · TV')).toBeInTheDocument()
+    expect(screen.queryByText('A contract-backed overview.')).not.toBeInTheDocument()
+    expect(screen.getByTestId('title-backdrop')).toHaveClass('h-[180px]')
+  })
+
+  const stateCases: Array<{
+    status: string | null
+    mediaType?: 'movie' | 'tv'
+    badge: string
+    sentence: string
+    actions: string[]
+    primary: string | null
+    queueStatus?: string
+  }> = [
+    {
+      status: null,
+      badge: 'Not requested',
+      sentence: 'Not in the library and not requested.',
+      actions: ['+ Request'],
+      primary: '+ Request',
+    },
+    {
+      status: 'pending',
+      badge: 'Requested',
+      sentence: 'Your request is queued and will be searched automatically.',
+      actions: ['Cancel request'],
+      primary: null,
+    },
+    {
+      status: 'searching',
+      badge: 'Searching',
+      sentence: 'Scanning configured indexers for an acceptable release.',
+      actions: ['Cancel request'],
+      primary: null,
+    },
+    {
+      status: 'downloading',
+      badge: 'Downloading',
+      sentence: 'A release was grabbed and is transferring.',
+      actions: ['Report a problem', 'Cancel request'],
+      primary: null,
+      queueStatus: 'downloading',
+    },
+    {
+      status: 'no_acceptable_release',
+      badge: 'No release',
+      sentence:
+        'No acceptable release was found. Nothing was grabbed; automatic retries will continue.',
+      actions: ['Re-search now', 'Cancel request'],
+      primary: 'Re-search now',
+    },
+    {
+      status: 'waiting_for_air_date',
+      mediaType: 'tv',
+      badge: 'Waiting for air date',
+      sentence:
+        "This season hasn't aired yet. It will be searched automatically after its air date.",
+      actions: ['Cancel request'],
+      primary: null,
+    },
+    {
+      status: 'import_blocked',
+      badge: 'Import blocked',
+      sentence: 'The download finished, but import needs operator attention.',
+      actions: ['Report a problem'],
+      primary: null,
+      queueStatus: 'import_blocked',
+    },
+    {
+      status: 'completed',
+      badge: 'Finalizing',
+      sentence: 'Imported and awaiting Plex confirmation.',
+      actions: ['Report a problem'],
+      primary: null,
+    },
+    {
+      status: 'available',
+      badge: 'In library',
+      sentence: 'This title is imported and visible in Plex.',
+      actions: ['Open in Plex', 'Report a problem', 'Re-acquire'],
+      primary: 'Open in Plex',
+    },
+    {
+      status: 'failed',
+      badge: 'Failed',
+      sentence: 'The request failed. Request it again to restart.',
+      actions: ['Request again', 'Report a problem'],
+      primary: 'Request again',
+      queueStatus: 'failed',
+    },
+    {
+      status: 'evicted',
+      badge: 'Evicted',
+      sentence:
+        'The disk-pressure sweep reclaimed this file. Deliberate space management — request again any time.',
+      actions: ['Request again'],
+      primary: 'Request again',
+    },
+    {
+      status: 'cancelled',
+      badge: 'Cancelled',
+      sentence: 'This request was cancelled. Request it again any time.',
+      actions: ['Request again'],
+      primary: 'Request again',
+    },
+    {
+      status: 'mystery_state',
+      badge: 'Mystery state',
+      sentence:
+        'Plex Manager reported “Mystery state”; no additional detail is available.',
+      actions: [],
+      primary: null,
+    },
+  ]
+
+  it.each(stateCases)(
+    'renders exact state copy and legal actions for $status',
+    ({ status, mediaType = 'movie', badge, sentence, actions, primary, queueStatus }) => {
+      const title = mediaType === 'tv' ? TV : MOVIE
+      const seasons =
+        mediaType === 'tv' && status !== null
+          ? [{ season_number: 2, status }]
+          : undefined
+      const requests =
+        status === null
+          ? []
+          : [
+              request(status, {
+                tmdb_id: title.tmdb_id,
+                media_type: mediaType,
+                title: title.title,
+                ...(seasons ? { seasons } : {}),
+              }),
+            ]
+      const queue = queueStatus
+        ? [
+            queueItem({
+              status: queueStatus,
+              tmdb_id: title.tmdb_id,
+              ...(mediaType === 'tv'
+                ? {
+                    scopes: [
+                      {
+                        media_request_id: 7,
+                        season: 2,
+                        episodes: null,
+                        status: 'active',
+                      },
+                    ],
+                  }
+                : {}),
+            }),
+          ]
+        : []
+      setBaseMocks(requests, queue)
+
+      const { container } = render(
+        <TitleDetailModal title={title} open onOpenChange={() => {}} />,
+      )
+      const stateRegion = screen.getByRole('region', { name: 'State' })
+      expect(within(stateRegion).getAllByText(badge, { exact: true })[0]).toBeInTheDocument()
+      expect(within(stateRegion).getByText(sentence, { exact: true })).toBeInTheDocument()
+
+      const actionsRegion = screen.queryByRole('region', { name: 'Actions' })
+      if (actions.length === 0) {
+        expect(actionsRegion).not.toBeInTheDocument()
+      } else {
+        expect(actionsRegion).toBeInTheDocument()
+        expect(actionsRegion!.querySelectorAll('button, a')).toHaveLength(actions.length)
+        for (const actionName of actions) {
+          expect(
+            within(actionsRegion!).getByRole(actionName === 'Open in Plex' ? 'link' : 'button', {
+              name: actionName === 'Open in Plex' ? /open in plex/i : actionName,
+            }),
+          ).toBeInTheDocument()
+        }
+      }
+
+      const goldControls = container.querySelectorAll('button.bg-gold, a.bg-gold')
+      expect(goldControls).toHaveLength(primary ? 1 : 0)
+      if (primary) expect(goldControls[0]).toHaveTextContent(primary)
+    },
+  )
+
+  it('uses TV-specific downloading and availability sentences', () => {
+    const tvRequest = request('downloading', {
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      seasons: [{ season_number: 3, status: 'downloading' }],
+    })
+    setBaseMocks(
+      [tvRequest],
+      [
+        queueItem({
+          scopes: [
+            { media_request_id: 7, season: 3, episodes: null, status: 'active' },
+          ],
+        }),
+      ],
+    )
+    const view = render(<TitleDetailModal title={TV} open onOpenChange={() => {}} />)
+    expect(screen.getByText('Season 3 is downloading.')).toBeInTheDocument()
+
+    setBaseMocks([
+      request('available', {
+        tmdb_id: 100,
+        media_type: 'tv',
+        title: 'Test Show',
+        seasons: [{ season_number: 3, status: 'available' }],
+      }),
+    ])
+    view.rerender(<TitleDetailModal title={TV} open onOpenChange={() => {}} />)
+    expect(screen.getByText('This season is imported and visible in Plex.')).toBeInTheDocument()
+  })
+
+  it.each([
+    [
+      'import_blocked',
+      'import_blocked',
+      'codec validation failed',
+      'The download finished, but import is blocked: codec validation failed',
+    ],
+    ['failed', 'failed', 'client removed torrent', 'The request failed: client removed torrent'],
+  ])('surfaces the real queue reason for %s', (status, queueStatus, reason, sentence) => {
+    setBaseMocks(
+      [request(status)],
+      [queueItem({ status: queueStatus, failed_reason: reason })],
+    )
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(sentence, { exact: true })).toBeInTheDocument()
+  })
+
+  it.each([
+    [0, '0%'],
+    [0.63, '63%'],
+  ])('renders real matching movie queue progress %s as %s', (progress, percent) => {
+    setBaseMocks(
+      [request('downloading')],
+      [queueItem({ progress })],
+    )
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(
+      screen.getByRole('progressbar', { name: 'Download progress for Test Movie' }),
+    ).toHaveAttribute('aria-valuenow', percent.replace('%', ''))
+    expect(screen.getByText(percent, { exact: true })).toBeInTheDocument()
+  })
+
+  it('omits progress while the queue row is missing or loading', () => {
+    setBaseMocks([request('downloading')])
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: undefined, isLoading: true })
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.queryByText('0%', { exact: true })).not.toBeInTheDocument()
+  })
+
+  it('omits stale progress when the queue query is errored', () => {
+    setBaseMocks([request('downloading')], [queueItem({ progress: 0.63 })])
+    ;(useQueue as unknown as Mock).mockReturnValue({
+      data: { queue: [queueItem({ progress: 0.63 })] },
+      isError: true,
+    })
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.queryByText('63%', { exact: true })).not.toBeInTheDocument()
+  })
+
+  it('matches TV progress to the selected scope and never a sibling season', () => {
+    setBaseMocks(
+      [
+        request('downloading', {
+          tmdb_id: 100,
+          media_type: 'tv',
+          title: 'Test Show',
+          seasons: [
+            { season_number: 1, status: 'available' },
+            { season_number: 2, status: 'downloading' },
+          ],
+        }),
+      ],
+      [
+        queueItem({
+          id: 10,
+          progress: 0.12,
+          scopes: [
+            { media_request_id: 7, season: 1, episodes: null, status: 'active' },
+          ],
+        }),
+        queueItem({
+          id: 12,
+          progress: 0.63,
+          scopes: [
+            { media_request_id: 7, season: 2, episodes: null, status: 'active' },
+          ],
+        }),
+      ],
+    )
+    render(<TitleDetailModal title={TV} open onOpenChange={() => {}} />)
+    expect(
+      screen.getByRole('progressbar', {
+        name: 'Download progress for Test Show, season 2',
+      }),
+    ).toHaveAttribute('aria-valuenow', '63')
+    expect(screen.getByText('63%', { exact: true })).toBeInTheDocument()
+    expect(screen.queryByText('12%', { exact: true })).not.toBeInTheDocument()
+  })
+
+  it('shows honest season N/M chips and omits unknown 0/0', () => {
+    setBaseMocks([
+      request('downloading', {
+        tmdb_id: 100,
+        media_type: 'tv',
+        title: 'Test Show',
+        seasons: [
+          {
+            season_number: 1,
+            status: 'searching',
+            imported_episode_count: 3,
+            target_episode_count: 8,
+          },
+          {
+            season_number: 2,
+            status: 'pending',
+            imported_episode_count: 0,
+            target_episode_count: 0,
+          },
+          { season_number: 3, status: 'downloading' },
+        ],
+      }),
+    ])
+    render(<TitleDetailModal title={TV} open onOpenChange={() => {}} />)
+    const list = screen.getByRole('list', { name: 'Season states' })
+    expect(within(list).getByText(/S1 3\/8/)).toBeInTheDocument()
+    expect(within(list).getByText(/S2$/)).toBeInTheDocument()
+    expect(within(list).getByText(/S3$/)).toBeInTheDocument()
+    expect(within(list).queryByText(/0\/0/)).not.toBeInTheDocument()
+  })
+
+  it('clears stale release rows when the selected TV season changes', async () => {
+    const preview: SearchPreviewResponse = {
+      accepted: [
+        {
+          guid: 'season-2-guid',
+          indexer: 'Indexer A',
+          quality_name: 'WEBDL-1080p',
+          resolution: '1080p',
+          score: 1000,
+          source: 'WEBDL',
+          title: 'Test.Show.S02.1080p.WEB-DL',
+          seeders: 10,
+          info_hash: 'hash-season-2',
+          covered_seasons: [],
+          target_seasons: [],
+          upgrade_seasons: [],
+          waste_seasons: [],
+          ignored_seasons: [],
+          skipped_seasons: [],
+        },
+      ],
+      rejected: [],
+      no_acceptable_release: false,
+    }
+    setBaseMocks([
+      request('searching', {
+        tmdb_id: 100,
+        media_type: 'tv',
+        title: 'Test Show',
+        seasons: [
+          { season_number: 1, status: 'searching' },
+          { season_number: 2, status: 'searching' },
+        ],
+      }),
+    ])
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(mutation(preview))
+    render(<TitleDetailModal title={TV} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+    expect(await screen.findByText('Test.Show.S02.1080p.WEB-DL')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Season'), { target: { value: '2' } })
+    expect(screen.queryByText('Test.Show.S02.1080p.WEB-DL')).not.toBeInTheDocument()
+  })
+
+  it('renders only the safe hosted Plex link for available titles', () => {
+    setBaseMocks([request('available')])
+    const view = render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    const link = screen.getByRole('link', { name: /open in plex.*opens in a new tab/i })
+    expect(link).toHaveAttribute('href', 'https://app.plex.tv/desktop/')
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+    expect(link.getAttribute('href')).not.toMatch(/token|ratingKey|#\/server/i)
+
+    setBaseMocks([request('completed')])
+    view.rerender(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('link', { name: /open in plex/i })).not.toBeInTheDocument()
+  })
+
+  it('hides the entire Admin zone and byte progress from a shared user', () => {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+    setBaseMocks(
+      [request('downloading')],
+      [queueItem({ release_title: 'Secret.Release.Name' })],
+    )
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+
+    expect(screen.queryByRole('region', { name: /admin.*releases/i })).not.toBeInTheDocument()
+    expect(screen.queryByText('Secret.Release.Name')).not.toBeInTheDocument()
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(useQueue).toHaveBeenCalledWith({ poll: true, enabled: false })
+    expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
+  })
+
+  it('never says a presence-only owned movie is "not in the library"', () => {
+    // Owned per Plex with no request row (the Re-acquire path, issue #131):
+    // the State sentence must agree with the Re-acquire action the modal
+    // simultaneously offers, not claim the title is absent from the library.
+    setBaseMocks()
+    render(
+      <TitleDetailModal
+        title={{ ...MOVIE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+    const stateRegion = screen.getByRole('region', { name: 'State' })
+    expect(
+      within(stateRegion).getByText(
+        'In the library, but not tracked by a request. Re-acquire it if its file is missing or was replaced.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Not in the library and not requested.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Re-acquire' })).toBeInTheDocument()
+  })
+
+  it('describes partial presence honestly for an untracked TV title', () => {
+    // No Re-acquire mention for tv (the verb is movie-only); presence is still
+    // stated truthfully, and "+ Request" remains the offered action.
+    setBaseMocks()
+    render(
+      <TitleDetailModal
+        title={{ ...TV, library_state: 'partially_available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+    expect(
+      screen.getByText('Partly in the library, but not tracked by a request.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/not in the library and not requested/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '+ Request' })).toBeInTheDocument()
+  })
+
+  it('never claims "no search run yet" while release search is closed', () => {
+    // Downloading: a search DID run (its grab is why we're downloading) and the
+    // browser is deliberately shut — the copy must say that, not "no search yet".
+    setBaseMocks([request('downloading')], [queueItem()])
+    const view = render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    const admin = screen.getByRole('region', { name: 'ADMIN · RELEASES' })
+    expect(
+      within(admin).getByText("Release search isn't available in this state."),
+    ).toBeInTheDocument()
+    expect(within(admin).queryByText(/no release search run yet/i)).not.toBeInTheDocument()
+
+    // Searchable state with no preview yet: the original placeholder is the truth.
+    setBaseMocks([request('searching')])
+    view.rerender(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/no release search run yet for this title\./i)).toBeInTheDocument()
+    expect(
+      screen.queryByText("Release search isn't available in this state."),
+    ).not.toBeInTheDocument()
+  })
+
+  it('keeps Search releases and Retry import in the Admin header', async () => {
+    setBaseMocks([request('import_blocked')], [queueItem({ status: 'import_blocked' })])
+    const importMutation = mutation(undefined)
+    ;(useImportDownload as unknown as Mock).mockReturnValue(importMutation)
+    render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+
+    const admin = screen.getByRole('region', { name: 'ADMIN · RELEASES' })
+    const retry = within(admin).getByRole('button', { name: 'Retry import' })
+    expect(screen.queryByRole('button', { name: /search releases/i })).not.toBeInTheDocument()
+    fireEvent.click(retry)
+    await waitFor(() => expect(importMutation.mutateAsync).toHaveBeenCalledWith(11))
   })
 })
