@@ -1886,6 +1886,65 @@ async def test_grab_refuses_an_already_cancelled_season_before_adding_anything(
     assert qbt.added == []  # refused BEFORE anything reached the client
 
 
+async def test_grab_ignores_the_parent_rollups_terminal_status_for_tv(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Senior-review regression (issues #265/#272): a TV parent's ``status`` is
+    a COMPUTED rollup (``domain/season_rollup.py``) over every tracked season,
+    never a real state of its own. A still-``completed`` ("Finalizing") season
+    wins that rollup outright over a due sibling (issue #265's precedence), and
+    ``completed`` is ALSO a member of ``TERMINAL_REQUEST_STATUS_VALUES`` -- but
+    the up-front gate must key off the SEASON being grabbed, not the folded
+    parent value, or a genuinely due sibling season is refused with a
+    confusing ``RequestNotActiveError`` the whole time its sibling finalizes."""
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=712,
+            media_type=MediaType.tv,
+            title="Finalizing Sibling Show",
+            status=RequestStatus.completed,  # the parent ROLLUP, not a real state
+        )
+        session.add(show)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=show.id, season_number=1, status=RequestStatus.completed
+        )
+        season_2 = SeasonRequest(
+            media_request_id=show.id, season_number=2, status=RequestStatus.pending
+        )
+        session.add_all([season_1, season_2])
+        await session.commit()
+        show_id = show.id
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            qbt,
+            session,
+            scored=_scored_tv(_HASH, "Finalizing.Sibling.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=show_id,
+            tmdb_id=712,
+            season=2,
+        )
+    assert record.status == "downloading"
+    assert record.season == 2
+    assert qbt.added != []  # the grab actually reached the client
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    by_season = {s.season_number: s.status for s in seasons}
+    assert by_season[1] is RequestStatus.completed  # untouched
+    assert by_season[2] is RequestStatus.downloading  # the due sibling actually moved
+
+
 # --------------------------------------------------------------------------- #
 # Codex round-8 finding 2: the lost-grab cleanup removes ONLY torrents this
 # grab genuinely created. qbt.add's 409-already-present branch resolves to a

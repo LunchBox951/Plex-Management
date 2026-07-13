@@ -29,6 +29,7 @@ from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.services import season_request_service
 from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.web.deps import SettingsStore, get_downloads_host_root
 from tests.web.fakes import (
@@ -1069,6 +1070,75 @@ async def test_grab_evicted_request_returns_409_and_adds_nothing(
     async with sessionmaker_() as session:
         rows = (await session.execute(select(Download))).scalars().all()
     assert rows == []
+
+
+async def test_grab_reaches_a_pending_season_while_a_sibling_finalizes(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Senior-review regression (issues #265/#272): a still-``completed``
+    ("Finalizing") sibling season wins the TV parent's rollup outright
+    (``domain/season_rollup.py``'s precedence, issue #265) -- and ``completed``
+    is ALSO a member of ``TERMINAL_REQUEST_STATUS_VALUES`` (the movie-level
+    "nothing left to grab" set). Before this fix, that coarse parent-level
+    rollup 409'd a grab of a genuinely-due SIBLING season with a confusing
+    ``request_not_active`` -- breaking the correction button for season 2 for
+    the entire time season 1 sits finalizing. The endpoint must gate a TV grab
+    on the SEASON's own status, never the folded parent one."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [1, 2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = created.json()["id"]
+
+    # Season 1 finalizes (imported, awaiting Plex's availability confirmation).
+    # The parent rollup now reads the in-flight `completed`, outranking season
+    # 2's still-`pending` status even though season 2 is genuinely due.
+    async with sessionmaker_() as session:
+        await season_request_service.mark_completed(
+            session, media_request_id=request_id, season_number=1
+        )
+        await session.commit()
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.completed  # sanity: precedence won
+
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr(
+            [candidate("Some.Show.S02.1080p.WEB-DL.x264-GROUP", info_hash="8" * 40)]
+        ),
+        qbt=FakeQbittorrent(),
+    )
+    response = await client.post(
+        "/api/v1/queue/grab",
+        json={"request_id": request_id, "season": 2},
+        headers=_HEADERS,
+    )
+    assert response.status_code == 201  # NOT 409 request_not_active
+    assert response.json()["season"] == 2
+
+    async with sessionmaker_() as session:
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    by_season = {s.season_number: s.status for s in seasons}
+    assert by_season[1] is RequestStatus.completed  # untouched by the sibling grab
+    assert by_season[2] is RequestStatus.downloading  # the due season actually moved
 
 
 async def test_grab_terminal_request_with_empty_preview_stays_terminal(

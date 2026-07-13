@@ -45,14 +45,24 @@ __all__ = ["rollup_status"]
 # sibling that is actually blocked/downloading/searching/exhausted -- those four
 # are still real problems or real activity; ``completed`` is neither.
 #
-# This intentionally accepts the same coarse-grained trade-off the rollup already
-# has for ``failed``/``evicted``/``cancelled`` (see the module docstring and
-# ``test_cancelled_mixed_with_failed_and_no_done_season_is_failed``): the PARENT
-# status is a single fold over every season, so a request-level consumer that
-# switches on it (e.g. ``grab_service``'s up-front
-# ``TERMINAL_REQUEST_STATUS_VALUES`` gate) sees one value for the whole show, not
-# a per-season one. That has never been season-precise for TV, and this change
-# does not make it any less precise than it already was.
+# CAUTION for downstream consumers: the PARENT status this function returns is a
+# single fold over every season, so a request-level consumer that switches on it
+# sees one value for the whole show, never a per-season one. That was already true
+# for ``failed``/``evicted``/``cancelled`` before ``completed`` joined this set,
+# but harmlessly so -- none of those three is ALSO a member of
+# ``request_service.TERMINAL_REQUEST_STATUS_VALUES`` while a due sibling can still
+# be present (mixing any of them with a ``pending`` season folds to the
+# non-terminal ``"pending"`` two branches down, never to the settled status
+# itself). ``completed`` breaks that coincidence: it IS both a
+# :data:`_PRECEDENCE_STATUSES` winner and a ``TERMINAL_REQUEST_STATUS_VALUES``
+# member, so ``[completed, pending]`` folds to the terminal-looking ``completed``
+# while a sibling season is genuinely still due. A consumer that naïvely gates a
+# per-season action (grab, retry) on this PARENT value being non-terminal would
+# refuse that due sibling outright -- exactly the hazard this comment used to
+# (wrongly) wave away as "no less precise than it already was". ``grab_service.grab``
+# and the ``/queue/grab`` endpoint both key off the SEASON's own observed status
+# for a TV request instead, never this rollup, precisely to avoid it -- see their
+# up-front gates for the full rationale.
 _PRECEDENCE_STATUSES: tuple[str, ...] = (
     "import_blocked",
     "downloading",

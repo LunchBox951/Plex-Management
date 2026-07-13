@@ -605,10 +605,25 @@ async def grab(
     # owns the ``uq_media_requests_active`` slot, so re-arming this row to
     # ``downloading`` would be rejected by that index — but only AFTER qbt.add had
     # already created an untracked torrent. Refuse up front so nothing is added.
+    #
+    # MOVIE-ONLY. ``request.status`` for a TV request is not a real state of its
+    # own -- it is ``season_rollup.rollup_status``'s COMPUTED fold over every
+    # tracked season, a single value standing in for the whole show. That fold's
+    # precedence (issue #265) lets a still-in-flight ``completed`` ("Finalizing")
+    # season win the parent status outright over a genuinely due sibling (e.g.
+    # ``[completed, pending]`` rolls up to ``completed``), and ``completed`` is
+    # ALSO a member of ``TERMINAL_REQUEST_STATUS_VALUES`` (the movie-level "nothing
+    # left to grab" set). Gating a TV grab on that coarse rollup would refuse the
+    # pending sibling's grab with a confusing 409 (issue #272 review) and make
+    # auto-grab silently settle the scope with no visible park -- exactly the
+    # honesty-over-silence and correction-without-a-terminal violations the north
+    # stars forbid. TV instead gates on the SEASON's own observed status just
+    # below (``cancelled`` / ``waiting_for_air_date`` / a stale caller premise),
+    # which is season-precise where the parent rollup never was.
     if request_id is not None:
         request = await SqlRequestRepository(session).get(request_id)
         if request is not None:
-            if request.status in TERMINAL_REQUEST_STATUS_VALUES:
+            if request.media_type != "tv" and request.status in TERMINAL_REQUEST_STATUS_VALUES:
                 raise RequestNotActiveError(request_id)
             observed_request_status = request.status
             request_media_type = request.media_type

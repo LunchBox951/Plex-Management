@@ -188,7 +188,10 @@ async def grab_endpoint(
     if request is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
 
-    if request.status in request_service.TERMINAL_REQUEST_STATUS_VALUES:
+    if (
+        request.media_type != "tv"
+        and request.status in request_service.TERMINAL_REQUEST_STATUS_VALUES
+    ):
         # A stale TERMINAL request id (completed / available / failed) is not
         # grabbable: a newer ACTIVE request for the same media owns the
         # uq_media_requests_active slot. Reject up front — BEFORE run_preview can
@@ -196,6 +199,17 @@ async def grab_endpoint(
         # non-terminal dead-end no_acceptable_release (which would resurrect it as
         # a dedup-blocking ghost), and before grab can hand anything to the client.
         # Mirrors grab_service's RequestNotActiveError guard so both paths agree.
+        #
+        # MOVIE-ONLY: for a TV request, ``request.status`` is not this request's
+        # own state -- it is ``season_rollup.rollup_status``'s COMPUTED fold over
+        # every tracked season (see grab_service.grab's matching guard for the
+        # full rationale). A still-finalizing season (``completed``, issue #265)
+        # wins that fold outright over a genuinely due sibling, and ``completed``
+        # is ALSO in ``TERMINAL_REQUEST_STATUS_VALUES`` -- gating here on the
+        # coarse rollup would 409 a legitimate per-season grab (issue #272
+        # review). grab_service's own season-scoped guard (cancelled /
+        # waiting_for_air_date / a stale caller premise) is season-precise where
+        # this coarse check never was, and still runs for every tv grab below.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
     # Branch on the request's ACTUAL media type, never on whether ``body.season``
