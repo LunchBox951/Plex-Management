@@ -11,6 +11,7 @@ contract the reconciler can depend on without importing an adapter.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -107,6 +108,25 @@ class DownloadClientPort(Protocol):
 
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         """Return statuses for all torrents, optionally filtered by category."""
+        raise NotImplementedError
+
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        """Return statuses for exactly the given info-hashes (issue #216).
+
+        The SCOPED counterpart of :meth:`get_all_statuses`: cost is bounded by
+        ``len(hashes)``, not by the client's total torrent count, so the frequent
+        reconcile poll can stay cheap on a shared qBittorrent instance with a
+        large unrelated inventory. Category filtering is deliberately NOT an
+        alternative here — an operator recategorizing a tracked torrent, or an
+        imported/terminal torrent lingering under the app category, must never
+        make a still-tracked hash silently disappear from the snapshot.
+
+        An empty ``hashes`` means nothing to ask about and returns ``[]`` with
+        NO client round-trip. A hash the client does not recognize is simply
+        absent from the result (never an error) — the reconciler already treats
+        a hash missing from the snapshot as the honest ``ClientMissing`` signal,
+        so implementations must not raise for an unknown/stale hash.
+        """
         raise NotImplementedError
 
     async def pause(self, info_hash: str) -> None:

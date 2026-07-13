@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { downloadStatus, glyphKind, requestStatus } from './status'
+import { downloadStatus, glyphKind, isInFlightRequestStatus, requestStatus } from './status'
 
 describe('requestStatus', () => {
   it('maps known request statuses to labels + intents', () => {
@@ -33,6 +33,52 @@ describe('downloadStatus', () => {
 
   it('never throws on an unrecognized state', () => {
     expect(downloadStatus('weird').intent).toBe('neutral')
+  })
+})
+
+describe('isInFlightRequestStatus', () => {
+  it('counts the actively-worked statuses that drive the Requests nav badge', () => {
+    for (const status of ['searching', 'downloading', 'no_acceptable_release']) {
+      expect(isInFlightRequestStatus(status)).toBe(true)
+    }
+  })
+
+  it('counts finalizing (completed) and import_blocked — non-terminal in the backend', () => {
+    // `completed` is the in-flight "Finalizing" state (imported, before Plex
+    // confirms availability; repositories/requests.py) and `import_blocked`
+    // awaits the operator's retry/reject (models.py). Both are still active on
+    // the Requests page, so the badge must not read zero while a request sits
+    // in either (Codex P2 on #249).
+    expect(isInFlightRequestStatus('completed')).toBe(true)
+    expect(isInFlightRequestStatus('import_blocked')).toBe(true)
+  })
+
+  it('excludes not-yet-started and settled statuses', () => {
+    for (const status of [
+      'pending',
+      'waiting_for_air_date',
+      'available',
+      'failed',
+      'cancelled',
+      'evicted',
+    ]) {
+      expect(isInFlightRequestStatus(status)).toBe(false)
+    }
+  })
+
+  it('excludes partially_available — it never coexists with an in-flight season', () => {
+    // Parent-only TV rollup (domain/season_rollup.py): any in-flight season
+    // (import_blocked/downloading/searching/no_acceptable_release) wins the
+    // parent status outright, so a partially_available parent's non-done
+    // seasons are only ever dormant (pending/waiting_for_air_date) or settled
+    // (failed/evicted/cancelled). A settled-partial show (one season evicted
+    // after being watched, ADR-0012) holds this status indefinitely — counting
+    // it would keep the badge permanently lit with zero activity.
+    expect(isInFlightRequestStatus('partially_available')).toBe(false)
+  })
+
+  it('treats an unknown status as not in flight rather than throwing', () => {
+    expect(isInFlightRequestStatus('some_new_state')).toBe(false)
   })
 })
 

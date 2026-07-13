@@ -86,10 +86,12 @@ export function ServerPicker({
   onVerified,
   setupTokenReady = true,
   setupToken = '',
+  embedded = false,
 }: {
   onVerified: (server: VerifiedServer) => void
   setupTokenReady?: boolean
   setupToken?: string
+  embedded?: boolean
 }) {
   const serversQuery = useSetupPlexServers(setupTokenReady, setupToken)
   const validate = useValidatePlex()
@@ -146,19 +148,14 @@ export function ServerPicker({
       ? customUrl.trim() === '' || customToken.trim() === ''
       : effectiveUri === '')
 
-  return (
-    <section className="rounded-2xl border border-hairline bg-surface p-5">
-      <h2 className="font-display text-lg font-bold text-ink">Pick your Plex server</h2>
-      <p className="mt-1 text-sm text-muted">
-        These are the Plex Media Servers your account owns. Choose the one this app should manage.
-      </p>
-
+  const controls = (
+    <>
       {serversQuery.isLoading ? (
-        <div className="mt-4">
+        <div>
           <CenteredSpinner label="Finding your servers…" />
         </div>
       ) : (
-        <div className="mt-4 flex flex-col gap-4">
+        <div className="flex flex-col gap-4">
           {/* An ERROR (a 409 plex_account_required, a 5xx) is NOT "you own no
               servers": surface the honest failure rather than silently rendering
               the empty-state hint below, which would misattribute the outage to
@@ -170,7 +167,7 @@ export function ServerPicker({
           {hasServers && !inCustom ? (
             <select
               aria-label="Plex server"
-              className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+              className="h-11 w-full min-w-0 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
               value={effectiveUri}
               onChange={(e) => setSelectedUri(e.target.value)}
             >
@@ -224,15 +221,39 @@ export function ServerPicker({
             </p>
           )}
 
-          <div className="flex items-center gap-3">
-            <Button loading={validate.isPending} disabled={verifyDisabled} onClick={() => void verify()}>
+          {embedded && error ? <AuthErrorCard error={error} /> : null}
+
+          <div
+            className={
+              embedded
+                ? 'flex border-t border-hairline pt-5 sm:justify-end'
+                : 'flex items-center gap-3'
+            }
+          >
+            <Button
+              className={embedded ? 'w-full sm:w-auto' : undefined}
+              loading={validate.isPending}
+              disabled={verifyDisabled}
+              onClick={() => void verify()}
+            >
               Verify server
             </Button>
           </div>
-
-          {error ? <AuthErrorCard error={error} /> : null}
+          {!embedded && error ? <AuthErrorCard error={error} /> : null}
         </div>
       )}
+    </>
+  )
+
+  if (embedded) return <div className="mt-6 break-words">{controls}</div>
+
+  return (
+    <section className="rounded-2xl border border-hairline bg-surface p-5">
+      <h2 className="font-display text-lg font-bold text-ink">Pick your Plex server</h2>
+      <p className="mt-1 text-sm text-muted">
+        These are the Plex Media Servers your account owns. Choose the one this app should manage.
+      </p>
+      <div className="mt-4">{controls}</div>
     </section>
   )
 }

@@ -19,16 +19,18 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0011](0011-tv-season-episode-support.md) | TV support — per-season lifecycle with a computed rollup | Accepted |
 | [0012](0012-operability-health-logs-eviction.md) | Operability — health surface, log store, watch-aware eviction | Accepted |
 | [0013](0013-auto-grab-worker.md) | Auto-grab worker — background request→search→grab spine | Accepted |
-| [0014](0014-correction-verbs.md) | Correction verbs — report-issue (blocklist + purge + re-search) and cancel | Accepted |
+| [0014](0014-correction-verbs.md) | Correction verbs — report-issue (blocklist + purge + re-search) and cancel | Accepted — ordering superseded in part by [0022](0022-claim-before-purge-correction-order.md) |
 | [0015](0015-anime-library-routing.md) | Anime library routing (optional anime roots, routing only) | Accepted |
 | [0016](0016-plex-oauth-owner-sessions.md) | Plex-first setup + browser-side Plex sign-in (single verify endpoint, session cookie) | Accepted |
 | [0017](0017-plex-video-download-validation.md) | Positive Plex-video validation before library import | Accepted |
 | [0018](0018-origin-confined-service-urls.md) | Origin-confined service URLs and explicit changed-destination credential consent | Accepted |
 | [0019](0019-realtime-sse-invalidations-over-polling-floor.md) | Realtime admin SSE invalidations over a permanent polling floor | Accepted |
 | [0020](0020-episode-level-fallback-whole-season.md) | Episode-level fallback for whole-season TV requests | Accepted |
+| [0022](0022-claim-before-purge-correction-order.md) | report-issue claims the active slot before the irreversible purge (supersedes ADR-0014's ordering) | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
 first frontend-alpha session; 0010–0020 across the subsequent beta feature
-sessions (each ADR's own header carries its date). Full context:
+sessions (each ADR's own header carries its date); 0022 during the post-beta
+documentation-audit session (2026-07-12). Full context:
 [`docs/design/overview.md`](../design/overview.md).

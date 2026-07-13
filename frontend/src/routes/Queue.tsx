@@ -216,7 +216,7 @@ export function Queue() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto w-full max-w-[1160px] space-y-6 px-5 py-8 sm:px-8">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex items-baseline gap-3">
           <h1 className="font-display text-2xl font-extrabold">Queue</h1>

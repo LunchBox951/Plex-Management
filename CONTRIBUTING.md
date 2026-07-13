@@ -44,6 +44,11 @@ python -c "import secrets; print('PLEX_MANAGER_SETUP_TOKEN=' + secrets.token_url
 PLEX_MANAGER_DEV_AUTH_BYPASS=true make run
 ```
 
+`PLEX_MANAGER_DEV_AUTH_BYPASS=true` is anonymous-admin, not just a token skip: it
+bypasses browser sessions, CSRF, the setup-token, and role/ownership checks, and
+setup completion skips the Plex-owner identity assertion. Keep it on the loopback
+default (`make run` binds 127.0.0.1); never expose that process to the network.
+
 After completing setup, the `/api/v1/setup/complete` response reveals the
 install status only. Setup mints no app key. Browser access uses Plex sign-in
 plus session cookies; generate the optional recovery/automation `X-Api-Key` from

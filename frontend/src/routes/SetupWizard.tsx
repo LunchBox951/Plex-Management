@@ -1,4 +1,4 @@
-import { type ReactNode, useRef, useState } from 'react'
+import { type ReactNode, type Ref, useEffect, useRef, useState } from 'react'
 import { Navigate, useNavigate } from 'react-router-dom'
 import {
   useAuthMe,
@@ -19,15 +19,60 @@ import { CenteredSpinner } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
 
 /**
- * The wizard is a three-step, derived state machine: sign in with Plex → pick the
- * server your account owns → configure the remaining services. A plex.tv-listed
- * server reuses the signed-in session credential; a custom URL requires an
- * explicit Plex token in the picker. Setup mints nothing to disclose (ADR-0016),
- * and the URL/token/machine-identifier all come from the verified server.
+ * The wizard is a five-step presentation over prerequisite-derived state: sign
+ * in with Plex → pick an owned server → validate services → choose library roots
+ * → finish. Authentication and server verification still derive the visible
+ * step; only the services/libraries split and this tab's successful completion
+ * are local presentation state. Setup mints nothing to disclose (ADR-0016), and
+ * the URL/token/machine-identifier all come from the verified server.
  */
-type WizardStep = 'signin' | 'server' | 'services'
+type WizardStep = 'signin' | 'server' | 'services' | 'libraries' | 'done'
 
-// The three service cards on the final step — Plex is NOT one of them (its
+/** Ordered setup copy used by both the shell and its contract tests. */
+// eslint-disable-next-line react-refresh/only-export-components -- tests import the canonical step contract.
+export const WIZARD_STEPS: ReadonlyArray<{
+  id: WizardStep
+  label: string
+  heading: string
+  description: string
+}> = [
+  {
+    id: 'signin',
+    label: 'Sign in',
+    heading: 'Sign in with Plex',
+    description:
+      'Plex is the identity provider, so the server owner administers Plex Manager and shared users get request access automatically.',
+  },
+  {
+    id: 'server',
+    label: 'Server',
+    heading: 'Pick your server',
+    description:
+      'Choose one of the servers your Plex account can reach, with local connections preferred.',
+  },
+  {
+    id: 'services',
+    label: 'Services',
+    heading: 'Connect services',
+    description:
+      'Prowlarr finds releases and qBittorrent downloads them, so both must be validated before you continue.',
+  },
+  {
+    id: 'libraries',
+    label: 'Libraries',
+    heading: 'Confirm library roots',
+    description:
+      'Choose where finished files land, using roots that are writable from inside the container.',
+  },
+  {
+    id: 'done',
+    label: 'Done',
+    heading: "You're set",
+    description: 'Setup is complete.',
+  },
+]
+
+// The three service panels on the services step — Plex is NOT one of them (its
 // connection is chosen + verified on the `server` step).
 type ServiceKey = 'prowlarr' | 'qbittorrent' | 'tmdb'
 
@@ -161,6 +206,10 @@ export function SetupWizard() {
   const complete = useCompleteSetup()
 
   const [server, setServer] = useState<VerifiedServer | null>(null)
+  const [configurationStep, setConfigurationStep] = useState<'services' | 'libraries'>(
+    'services',
+  )
+  const [completedHere, setCompletedHere] = useState(false)
   const [form, setForm] = useState<ServicesForm>(EMPTY_SERVICES_FORM)
   const [roots, setRoots] = useState<LibraryRoots>(EMPTY_ROOTS)
   const [results, setResults] = useState<ResultsState>(EMPTY_RESULTS)
@@ -171,7 +220,7 @@ export function SetupWizard() {
   // in sight — a dead end where Test/Complete are disabled but the token is still
   // sent from sessionStorage (north-star-#1 violation). Restoring the input from
   // getSetupToken() keeps the gate's source of truth aligned with what is actually
-  // transmitted, and the token card (rendered on every step below) still lets a
+  // transmitted, and the token section (rendered on every step below) still lets a
   // fresh tab, whose per-tab sessionStorage is empty, (re)enter it.
   const [setupTokenInput, setSetupTokenInput] = useState(() => getSetupToken() ?? '')
   // Reveal a typed override instead of the Plex pick-list (split-mount / odd layout).
@@ -186,83 +235,102 @@ export function SetupWizard() {
     qbittorrent: 0,
     tmdb: 0,
   })
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  const previousStep = useRef<WizardStep | null>(null)
+
+  const authed = authMe.data?.authenticated === true
+  const step: WizardStep = !authed
+    ? 'signin'
+    : completedHere
+      ? 'done'
+      : server === null
+        ? 'server'
+        : configurationStep
+
+  // Focus only real step transitions. Query updates, field edits, and validation
+  // results keep focus where the operator left it.
+  useEffect(() => {
+    if (status.isLoading || (status.data?.initialized && !completedHere)) return
+    if (previousStep.current !== null && previousStep.current !== step) {
+      headingRef.current?.focus()
+    }
+    previousStep.current = step
+  }, [completedHere, status.data?.initialized, status.isLoading, step])
 
   if (status.isLoading) return <CenteredSpinner label="Loading…" />
 
-  // Already configured -> the wizard has nothing to do.
-  if (status.data?.initialized) return <Navigate to="/" replace />
-
-  const authed = authMe.data?.authenticated === true
-  const step: WizardStep = !authed ? 'signin' : server === null ? 'server' : 'services'
+  // A successful completion in this tab gets to show Done. Direct visits and
+  // reloads after initialization still leave the one-shot wizard immediately.
+  if (status.data?.initialized && !completedHere) return <Navigate to="/" replace />
 
   const setupTokenReady =
     status.data?.setup_token_required !== true || setupTokenInput.trim().length > 0
 
-  // Rendered on EVERY step while required (not only sign-in): a post-reload or
+  // Rendered on EVERY pre-completion step while required: a post-reload or
   // fresh-tab operator lands on the server/services step already authed, and
   // without a reachable token field here they could neither re-enter the token
   // nor run Test/Complete — a terminal-only recovery (north star #1).
-  const tokenCard = status.data?.setup_token_required ? (
-    <section className="mb-4 rounded-2xl border border-hairline bg-surface p-5">
-      <h2 className="font-display text-lg font-bold text-ink">Setup token</h2>
-      <p className="mt-1 text-sm text-muted">
-        Enter the one-time bootstrap token from your server's environment to continue setup.
-      </p>
-      <div className="mt-4">
-        <Field
-          label="Setup token"
-          type="password"
-          autoComplete="off"
-          value={setupTokenInput}
-          onChange={(e) => {
-            const value = e.target.value
-            setSetupTokenInput(value)
-            if (value.trim()) {
-              setSetupToken(value.trim())
-            } else {
-              clearSetupToken()
-            }
-          }}
-        />
-      </div>
-    </section>
+  const tokenField = status.data?.setup_token_required ? (
+    <SetupTokenField
+      value={setupTokenInput}
+      onChange={(value) => {
+        setSetupTokenInput(value)
+        if (value.trim()) {
+          setSetupToken(value.trim())
+        } else {
+          clearSetupToken()
+        }
+      }}
+    />
   ) : null
 
   if (step === 'signin') {
     return (
-      <Shell>
-        {tokenCard}
-        <PlexLogin onSignedIn={() => void authMe.refetch()} />
-      </Shell>
+      <WizardShell step={step}>
+        <StepCard step={step} headingRef={headingRef}>
+          {tokenField}
+          <PlexLogin embedded onSignedIn={() => void authMe.refetch()} />
+        </StepCard>
+      </WizardShell>
     )
   }
 
   if (step === 'server' || server === null) {
     return (
-      <Shell>
-        {tokenCard}
-        <ServerPicker
-          onVerified={(verified) => setServer(verified)}
-          // Gate + key the owned-servers discovery on the setup token: a fresh
-          // tab lands here already authed but with an empty per-tab token, so
-          // firing discovery now would 401 and cache (retry:false). `setupTokenReady`
-          // is false until the token is (re)entered; passing the trimmed value keys
-          // the query so entering/correcting it triggers a fresh fetch, not a reload.
-          setupTokenReady={setupTokenReady}
-          setupToken={setupTokenInput.trim()}
-        />
-      </Shell>
+      <WizardShell step="server">
+        <StepCard step="server" headingRef={headingRef}>
+          {tokenField}
+          <ServerPicker
+            embedded
+            onVerified={(verified) => {
+              setConfigurationStep('services')
+              setServer(verified)
+            }}
+            // Gate + key the owned-servers discovery on the setup token: a fresh
+            // tab lands here already authed but with an empty per-tab token, so
+            // firing discovery now would 401 and cache (retry:false). `setupTokenReady`
+            // is false until the token is (re)entered; passing the trimmed value keys
+            // the query so entering/correcting it triggers a fresh fetch, not a reload.
+            setupTokenReady={setupTokenReady}
+            setupToken={setupTokenInput.trim()}
+          />
+        </StepCard>
+      </WizardShell>
     )
   }
 
-  // --- services step ---------------------------------------------------------
+  // --- post-server setup -----------------------------------------------------
   const movieLibraries = server.libraries.filter((l) => l.section_type === 'movie')
   const tvLibraries = server.libraries.filter((l) => l.section_type === 'tv')
 
   const setField = (key: ServicesFormKey, value: string, service: ServiceKey) => {
     setForm((prev) => ({ ...prev, [key]: value }))
-    // Editing a field invalidates that service's prior test result + any in-flight one.
+    // Editing a field invalidates that service's prior test result + any in-flight
+    // one — clear BOTH the result and the pending flag now, synchronously, so the
+    // Test connection button re-enables immediately rather than waiting on a
+    // request that's about to be discarded as stale.
     setResults((prev) => ({ ...prev, [service]: null }))
+    setTesting((prev) => ({ ...prev, [service]: false }))
     validationGen.current[service] += 1
   }
 
@@ -283,7 +351,12 @@ export function SetupWizard() {
         [service]: { ok: false, message: asApiError(error).message },
       }))
     } finally {
-      setTesting((prev) => ({ ...prev, [service]: false }))
+      // Generation-gated: a stale request settling after a newer edit/retest must
+      // not clear the pending flag out from under that newer, still-in-flight
+      // request (which would let its Test button appear enabled mid-request).
+      if (validationGen.current[service] === gen) {
+        setTesting((prev) => ({ ...prev, [service]: false }))
+      }
     }
   }
 
@@ -323,10 +396,10 @@ export function SetupWizard() {
         anime_tv_root: roots.anime_tv_root,
       }
       await complete.mutateAsync(body)
-      // The bootstrap token is consumed; nothing is minted to reveal (ADR-0016) —
-      // go straight to the app on the freshly-authenticated session.
+      // The bootstrap token is consumed; nothing is minted to reveal (ADR-0016).
+      // Keep this successful tab in the wizard long enough to show the Done step.
       clearSetupToken()
-      navigate('/', { replace: true })
+      setCompletedHere(true)
     } catch (error) {
       toast({ title: 'Setup failed', description: asApiError(error).message, intent: 'error' })
     }
@@ -338,6 +411,7 @@ export function SetupWizard() {
   // They must be re-picked from the NEW server's validate response, so also reset
   // the manual-path toggles back to the pick-list (ADR-0015 roots).
   const changeServer = () => {
+    setConfigurationStep('services')
     setServer(null)
     setRoots(EMPTY_ROOTS)
     setManualPath(false)
@@ -346,182 +420,322 @@ export function SetupWizard() {
     setManualAnimeTvPath(false)
   }
 
-  return (
-    <Shell>
-      {tokenCard}
-      <section className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-available/40 bg-surface p-4">
-        <span className="min-w-0 truncate text-sm text-ink">
-          Plex: {server.url} — verified ✓
-        </span>
-        <button
-          type="button"
-          className="shrink-0 text-xs text-gold hover:underline"
-          onClick={changeServer}
-        >
-          Change
-        </button>
-      </section>
+  if (step === 'done') {
+    return (
+      <WizardShell step={step}>
+        <StepCard step={step} headingRef={headingRef}>
+          <div className="py-5 text-center" aria-hidden="true">
+            <span className="inline-flex size-13 items-center justify-center rounded-full bg-available/15 text-2xl font-bold text-available">
+              ✓
+            </span>
+          </div>
+          <div className="mt-2 flex justify-end border-t border-hairline pt-5">
+            <Button className="w-full sm:w-auto" onClick={() => navigate('/', { replace: true })}>
+              Open Discover
+            </Button>
+          </div>
+        </StepCard>
+      </WizardShell>
+    )
+  }
 
-      <div className="flex flex-col gap-4">
-        {SERVICES.map((service) => {
-          const result = results[service.key]
-          return (
-            <section
-              key={service.key}
-              className={cn(
-                'rounded-2xl border bg-surface p-5 transition-colors',
-                result?.ok ? 'border-available/40' : 'border-hairline',
-              )}
-            >
-              <div className="flex items-baseline justify-between gap-3">
-                <h2 className="font-display text-lg font-bold text-ink">{service.label}</h2>
-                {result?.ok ? (
-                  <span className="font-mono text-xs text-available">✓ verified</span>
-                ) : null}
-              </div>
-              <p className="mt-1 text-sm text-muted">{service.blurb}</p>
+  if (step === 'services') {
+    return (
+      <WizardShell step={step}>
+        <StepCard step={step} headingRef={headingRef}>
+          {tokenField}
+          <div className="mt-6 rounded-xl border border-available/40 bg-bg/40 p-4">
+            <span className="block text-sm text-ink">Plex server verified ✓</span>
+          </div>
 
-              <div className="mt-4 flex flex-col gap-4">
-                {service.fields.map((field) => (
-                  <Field
-                    key={field.key}
-                    label={field.label}
-                    type={field.type}
-                    {...(field.type === 'password' ? { autoComplete: 'off' } : {})}
-                    {...(field.placeholder ? { placeholder: field.placeholder } : {})}
-                    value={form[field.key]}
-                    onChange={(e) => setField(field.key, e.target.value, service.key)}
-                  />
-                ))}
-              </div>
-
-              <div className="mt-4 flex items-center gap-3">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  loading={testing[service.key]}
-                  disabled={!setupTokenReady}
-                  onClick={() => void test(service.key)}
+          <div className="mt-4 flex flex-col gap-4">
+            {SERVICES.map((service) => {
+              const result = results[service.key]
+              return (
+                <section
+                  key={service.key}
+                  className={cn(
+                    'rounded-xl border bg-bg/40 p-5',
+                    result?.ok ? 'border-available/40' : 'border-hairline',
+                  )}
                 >
-                  Test connection
-                </Button>
-                {result && !result.ok ? (
-                  <span className="text-sm text-error">{result.message}</span>
-                ) : result?.ok ? (
-                  <span className="text-sm text-available">{result.message}</span>
-                ) : null}
-              </div>
-              {result?.note ? (
-                // Non-blocking, informational — this never gates `allVerified`
-                // (the check above only ever reads `result.ok`).
-                <p className="mt-2 text-xs text-searching">⚠ {result.note}</p>
-              ) : null}
-            </section>
-          )
-        })}
-      </div>
+                  <div className="flex flex-wrap items-baseline justify-between gap-3">
+                    <h2 className="font-display text-lg font-bold text-ink">{service.label}</h2>
+                    {result?.ok ? (
+                      <span className="font-mono text-xs text-available">✓ verified</span>
+                    ) : null}
+                  </div>
+                  <p className="mt-1 text-sm text-muted">{service.blurb}</p>
 
-      <p className="mt-4 text-xs text-faint">
-        Folders must be visible to <strong>this</strong> Plex Manager server. If it runs in
-        Docker, pick a path under a mounted volume (usually <code>/media/…</code>).
-      </p>
+                  <div className="mt-4 flex flex-col gap-4">
+                    {service.fields.map((field) => (
+                      <Field
+                        key={field.key}
+                        label={field.label}
+                        type={field.type}
+                        {...(field.type === 'password' ? { autoComplete: 'off' } : {})}
+                        {...(field.placeholder ? { placeholder: field.placeholder } : {})}
+                        value={form[field.key]}
+                        onChange={(e) => setField(field.key, e.target.value, service.key)}
+                      />
+                    ))}
+                  </div>
 
-      <LibrarySection
-        title="Library"
-        blurb="Where imported movies are placed — pick a folder Plex already watches."
-        ariaLabel="Movies library folder"
-        placeholder="/library/movies"
-        chooseLabel="Choose a movie library folder…"
-        emptyHint="Plex reports no movie library — leave this unset if you don't request movies, or enter a writable folder the app places movies into."
-        value={roots.movies_root}
-        onChange={(value) => setRoots((prev) => ({ ...prev, movies_root: value }))}
-        libraries={movieLibraries}
-        manual={manualPath}
-        setManual={setManualPath}
-        chosenBadge="✓ chosen"
-      />
+                  <div className="mt-4 flex flex-col items-start gap-3 sm:flex-row sm:items-center">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      loading={testing[service.key]}
+                      disabled={!setupTokenReady}
+                      onClick={() => void test(service.key)}
+                    >
+                      Test connection
+                    </Button>
+                    {result && !result.ok ? (
+                      <span className="min-w-0 break-words text-sm text-error">{result.message}</span>
+                    ) : result?.ok ? (
+                      <span className="min-w-0 break-words text-sm text-available">
+                        {result.message}
+                      </span>
+                    ) : null}
+                  </div>
+                  {result?.note ? (
+                    // Non-blocking, informational — this never gates `allVerified`
+                    // (the check above only ever reads `result.ok`).
+                    <p className="mt-2 break-words text-xs text-searching">⚠ {result.note}</p>
+                  ) : null}
+                </section>
+              )
+            })}
+          </div>
 
-      <LibrarySection
-        title="TV Library"
-        blurb="Where imported tv seasons are placed — pick a folder Plex already watches. Leave unset if you don't request tv shows."
-        ariaLabel="TV library folder"
-        placeholder="/library/tv"
-        chooseLabel="Skip TV for now…"
-        emptyHint="Plex reports no tv library — enter the folder the app writes tv into (it must be writable), or leave blank to skip TV."
-        value={roots.tv_root}
-        onChange={(value) => setRoots((prev) => ({ ...prev, tv_root: value }))}
-        libraries={tvLibraries}
-        manual={manualTvPath}
-        setManual={setManualTvPath}
-        optional
-      />
+          <div className="mt-6 border-t border-hairline pt-5 sm:flex sm:items-center sm:justify-between sm:gap-4">
+            <span className="block font-mono text-xs text-faint">
+              {verifiedCount}/{SERVICES.length} verified
+            </span>
+            <div className="mt-4 flex flex-col-reverse gap-3 sm:mt-0 sm:flex-row">
+              <Button className="w-full sm:w-auto" variant="secondary" onClick={changeServer}>
+                Back
+              </Button>
+              <Button
+                className="w-full sm:w-auto"
+                disabled={!servicesVerified || !setupTokenReady}
+                onClick={() => setConfigurationStep('libraries')}
+              >
+                Continue
+              </Button>
+            </div>
+          </div>
+        </StepCard>
+      </WizardShell>
+    )
+  }
 
-      {/* Anime library routing (ADR-0015) — both roots OPTIONAL and never gate
-          completion: unset, anime imports fall back to the Movies/TV roots. */}
-      <section className="mt-4 rounded-2xl border border-hairline bg-surface p-5 transition-colors">
-        <div className="flex items-baseline justify-between gap-3">
-          <h2 className="font-display text-lg font-bold text-ink">Anime library</h2>
-          <span className="font-mono text-xs text-faint">optional</span>
-        </div>
-        <p className="mt-1 text-sm text-muted">
-          Route anime movies/episodes to a separate Plex library instead of the Movies/TV folders
-          above. Leave unset to keep anime in the normal libraries.
+  return (
+    <WizardShell step="libraries">
+      <StepCard step="libraries" headingRef={headingRef}>
+        {tokenField}
+        <p className="mt-6 break-words text-xs text-faint">
+          Folders must be visible to <strong>this</strong> Plex Manager server. If it runs in
+          Docker, pick a path under a mounted volume (usually <code>/media/…</code>).
         </p>
-        <div className="mt-4 flex flex-col gap-4">
-          <RootPicker
-            ariaLabel="Anime movies library folder"
-            placeholder="/library/anime-movies"
-            chooseLabel="No anime movies library folder…"
-            value={roots.anime_movie_root}
-            onChange={(value) => setRoots((prev) => ({ ...prev, anime_movie_root: value }))}
-            libraries={movieLibraries}
-            manual={manualAnimeMoviePath}
-            setManual={setManualAnimeMoviePath}
-          />
-          <RootPicker
-            ariaLabel="Anime TV library folder"
-            placeholder="/library/anime-tv"
-            chooseLabel="No anime TV library folder…"
-            value={roots.anime_tv_root}
-            onChange={(value) => setRoots((prev) => ({ ...prev, anime_tv_root: value }))}
-            libraries={tvLibraries}
-            manual={manualAnimeTvPath}
-            setManual={setManualAnimeTvPath}
-          />
-        </div>
-      </section>
 
-      <div className="sticky bottom-0 mt-6 flex items-center justify-between gap-4 rounded-2xl border border-hairline bg-bg/90 p-4 backdrop-blur">
-        <span className="font-mono text-xs text-faint">
-          {verifiedCount}/{SERVICES.length} verified
-        </span>
-        <Button
-          disabled={!allVerified}
-          loading={complete.isPending}
-          onClick={() => void onComplete()}
-        >
-          Complete setup
-        </Button>
-      </div>
-    </Shell>
+        <LibrarySection
+          title="Library"
+          blurb="Where imported movies are placed — pick a folder Plex already watches."
+          ariaLabel="Movies library folder"
+          placeholder="/library/movies"
+          chooseLabel="Choose a movie library folder…"
+          emptyHint="Plex reports no movie library — leave this unset if you don't request movies, or enter a writable folder the app places movies into."
+          value={roots.movies_root}
+          onChange={(value) => setRoots((prev) => ({ ...prev, movies_root: value }))}
+          libraries={movieLibraries}
+          manual={manualPath}
+          setManual={setManualPath}
+          chosenBadge="✓ chosen"
+        />
+
+        <LibrarySection
+          title="TV Library"
+          blurb="Where imported tv seasons are placed — pick a folder Plex already watches. Leave unset if you don't request tv shows."
+          ariaLabel="TV library folder"
+          placeholder="/library/tv"
+          chooseLabel="Skip TV for now…"
+          emptyHint="Plex reports no tv library — enter the folder the app writes tv into (it must be writable), or leave blank to skip TV."
+          value={roots.tv_root}
+          onChange={(value) => setRoots((prev) => ({ ...prev, tv_root: value }))}
+          libraries={tvLibraries}
+          manual={manualTvPath}
+          setManual={setManualTvPath}
+          optional
+        />
+
+        {/* Anime library routing (ADR-0015) — both roots OPTIONAL and never gate
+            completion: unset, anime imports fall back to the Movies/TV roots. */}
+        <section className="mt-4 rounded-xl border border-hairline bg-bg/40 p-5">
+          <div className="flex flex-wrap items-baseline justify-between gap-3">
+            <h2 className="font-display text-lg font-bold text-ink">Anime library</h2>
+            <span className="font-mono text-xs text-faint">optional</span>
+          </div>
+          <p className="mt-1 text-sm text-muted">
+            Route anime movies/episodes to a separate Plex library instead of the Movies/TV folders
+            above. Leave unset to keep anime in the normal libraries.
+          </p>
+          <div className="mt-4 flex flex-col gap-4">
+            <RootPicker
+              ariaLabel="Anime movies library folder"
+              placeholder="/library/anime-movies"
+              chooseLabel="No anime movies library folder…"
+              value={roots.anime_movie_root}
+              onChange={(value) => setRoots((prev) => ({ ...prev, anime_movie_root: value }))}
+              libraries={movieLibraries}
+              manual={manualAnimeMoviePath}
+              setManual={setManualAnimeMoviePath}
+            />
+            <RootPicker
+              ariaLabel="Anime TV library folder"
+              placeholder="/library/anime-tv"
+              chooseLabel="No anime TV library folder…"
+              value={roots.anime_tv_root}
+              onChange={(value) => setRoots((prev) => ({ ...prev, anime_tv_root: value }))}
+              libraries={tvLibraries}
+              manual={manualAnimeTvPath}
+              setManual={setManualAnimeTvPath}
+            />
+          </div>
+        </section>
+
+        <div className="mt-6 flex flex-col-reverse gap-3 border-t border-hairline pt-5 sm:flex-row sm:justify-between">
+          <Button
+            className="w-full sm:w-auto"
+            variant="secondary"
+            onClick={() => setConfigurationStep('services')}
+          >
+            Back
+          </Button>
+          <Button
+            className="w-full sm:w-auto"
+            disabled={!allVerified}
+            loading={complete.isPending}
+            onClick={() => void onComplete()}
+          >
+            Complete setup
+          </Button>
+        </div>
+      </StepCard>
+    </WizardShell>
   )
 }
 
-/** The shared wizard chrome (logo + heading) wrapping every step's body. */
-function Shell({ children }: { children: ReactNode }) {
+function WizardShell({ step, children }: { step: WizardStep; children: ReactNode }) {
   return (
-    <div className="mx-auto max-w-2xl px-5 py-12">
-      <header className="mb-8 text-center">
-        <div className="font-display text-2xl font-extrabold tracking-wide">
-          PLEX<span className="text-gold">MGR</span>
-        </div>
-        <h1 className="mt-4 font-display text-3xl font-extrabold">Welcome — let's connect things</h1>
-        <p className="mt-2 text-muted">
-          Sign in with Plex, pick your server, then connect the rest. You never touch a terminal.
-        </p>
-      </header>
-      {children}
+    <main className="flex min-h-dvh items-center justify-center bg-bg bg-[radial-gradient(ellipse_900px_500px_at_50%_-10%,rgba(231,194,125,0.07),transparent)] px-4 py-8 sm:px-6 sm:py-10">
+      <div className="w-full max-w-[640px]">
+        <header className="mb-7 text-center">
+          <div className="font-display text-[22px] font-extrabold tracking-wide text-ink">
+            PLEX<span className="text-gold">MGR</span>
+          </div>
+          <div className="mt-2 text-[13px] text-faint">First-run setup</div>
+        </header>
+        <StepIndicator step={step} />
+        {children}
+      </div>
+    </main>
+  )
+}
+
+function StepIndicator({ step }: { step: WizardStep }) {
+  const currentIndex = WIZARD_STEPS.findIndex((item) => item.id === step)
+  return (
+    <div className="mb-6 overflow-x-auto pb-1">
+      <ol aria-label="Setup progress" className="flex w-max min-w-full gap-1.5 sm:justify-center">
+        {WIZARD_STEPS.map((item, index) => {
+          const completed = index < currentIndex
+          const current = index === currentIndex
+          return (
+            <li
+              key={item.id}
+              aria-current={current ? 'step' : undefined}
+              aria-label={completed ? `${item.label}, completed` : undefined}
+              className={cn(
+                'flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-2 text-xs font-semibold',
+                current && 'bg-gold/10 text-gold ring-1 ring-inset ring-gold/30',
+                completed && 'text-available',
+                !current && !completed && 'text-faint',
+              )}
+            >
+              <span
+                aria-hidden={completed ? true : undefined}
+                className={cn(
+                  'inline-flex size-[18px] items-center justify-center rounded-full font-mono text-[10px] font-bold',
+                  current && 'bg-gold text-gold-ink',
+                  completed && 'bg-available/20 text-available',
+                  !current && !completed && 'bg-white/8 text-muted',
+                )}
+              >
+                {completed ? '✓' : index + 1}
+              </span>
+              <span>{item.label}</span>
+            </li>
+          )
+        })}
+      </ol>
     </div>
+  )
+}
+
+function StepCard({
+  step,
+  headingRef,
+  children,
+}: {
+  step: WizardStep
+  headingRef: Ref<HTMLHeadingElement>
+  children: ReactNode
+}) {
+  const metadata = WIZARD_STEPS.find((item) => item.id === step)
+  if (!metadata) return null
+  const headingId = `setup-${step}-heading`
+  const descriptionId = `setup-${step}-description`
+  return (
+    <section
+      className="rounded-[14px] border border-hairline bg-surface p-5 shadow-2xl shadow-black/20 sm:p-[30px]"
+      aria-labelledby={headingId}
+      aria-describedby={descriptionId}
+    >
+      <h1
+        ref={headingRef}
+        id={headingId}
+        tabIndex={-1}
+        className="font-display text-xl font-extrabold text-ink outline-none"
+      >
+        {metadata.heading}
+      </h1>
+      <p id={descriptionId} className="mt-1.5 text-sm leading-6 text-muted">
+        {metadata.description}
+      </p>
+      {children}
+    </section>
+  )
+}
+
+function SetupTokenField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <section className="mt-6 rounded-xl border border-hairline bg-bg/40 p-4">
+      <h2 className="font-display text-base font-bold text-ink">Setup token</h2>
+      <p className="mt-1 text-sm text-muted">
+        Enter the one-time bootstrap token from your server's environment to continue setup.
+      </p>
+      <div className="mt-4">
+        <Field
+          label="Setup token"
+          type="password"
+          autoComplete="off"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
+    </section>
   )
 }
 
@@ -556,7 +770,7 @@ function RootPicker({
       <div className="flex flex-col gap-2">
         <select
           aria-label={ariaLabel}
-          className="h-11 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
+          className="h-11 w-full min-w-0 rounded-xl bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
           value={value}
           onChange={(e) => onChange(e.target.value)}
         >
@@ -613,7 +827,7 @@ interface LibrarySectionProps extends RootPickerProps {
   chosenBadge?: string
 }
 
-/** A titled card wrapping a {@link RootPicker} — the Movies + TV sections. */
+/** A titled inset panel wrapping a {@link RootPicker} — the Movies + TV sections. */
 function LibrarySection({
   title,
   blurb,
@@ -626,7 +840,7 @@ function LibrarySection({
   return (
     <section
       className={cn(
-        'mt-4 rounded-2xl border bg-surface p-5 transition-colors',
+        'mt-4 rounded-xl border bg-bg/40 p-5',
         chosen ? 'border-available/40' : 'border-hairline',
       )}
     >

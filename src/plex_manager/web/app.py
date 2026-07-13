@@ -223,7 +223,7 @@ async def _reconcile_once(app: FastAPI) -> None:
         if qbt is not None:
             # A qBittorrent outage / auth-failure must not abort the cycle before the
             # Plex-only availability pass below. reconcile_and_list ->
-            # qbt.get_all_statuses() raises QbittorrentError when the client is
+            # qbt.get_statuses_for_hashes() raises QbittorrentError when the client is
             # unreachable or rejects the login (QbittorrentAuthError is a subclass, so
             # it is covered too); the adapter wraps every httpx transport/status error
             # into QbittorrentError, so that one type is the whole surface. Surface it
@@ -363,6 +363,13 @@ async def _autograb_once(app: FastAPI) -> None:
             metadata = await get_tmdb(session, client)
         except ServiceNotConfiguredError:
             metadata = None
+        # Plex is OPTIONAL here too (issue #210): it only powers the air-date wake
+        # pass's Plex-present->``available`` short-circuit inside
+        # ``season_request_service.wake_waiting_for_air_date``. An unconfigured
+        # Plex cleanly falls back to waking a season to the honest ``pending``
+        # state instead (a duplicate download can never happen for content that
+        # isn't in Plex) -- mirrors ``_eviction_tick``'s own optional resolution.
+        library = await get_library_optional(session, client)
         result = await auto_grab_service.run_grab_cycle(
             session,
             prowlarr=prowlarr,
@@ -370,6 +377,7 @@ async def _autograb_once(app: FastAPI) -> None:
             profile=get_quality_profile(),
             qbt=qbt,
             metadata=metadata,
+            library=library,
             cooldowns=_get_autograb_cooldowns(app),
             save_path=get_downloads_host_root(),
         )
@@ -379,7 +387,11 @@ async def _autograb_once(app: FastAPI) -> None:
     # eager scopes that keep hitting ``GrabError`` are being cooled so they don't
     # starve the search budget, rather than silently never reaching ``downloading``.
     status.cooled_down_scopes = result.cooled_down
-    if result.grabbed or result.no_acceptable:
+    # ``or result.air_date_woken`` (issue #210): a season woken straight to
+    # ``available`` (already in Plex) grabs nothing this cycle and would
+    # otherwise leave the frontend's cached "waiting" view stale until some
+    # unrelated event invalidated it.
+    if result.grabbed or result.no_acceptable or result.air_date_woken:
         publish_realtime(
             app,
             ("requests", "queue", "discover"),

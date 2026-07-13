@@ -1621,3 +1621,95 @@ async def test_reimport_after_eviction_restores_download_evidence(
         show = await session.get(MediaRequest, show_id)
         assert show is not None
         assert show.completed_at == restamp
+
+
+async def test_mark_completed_if_in_completes_when_status_is_due(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #229: the CAS variant behaves exactly like ``mark_completed`` when
+    the season's CURRENT status is still in ``allowed_from`` -- the ordinary,
+    uncontested completion path."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=738)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=738, seasons=[1]
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await season_request_service.set_status(
+            session, media_request_id=show_id, season_number=1, status="searching"
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        completed = await season_request_service.mark_completed_if_in(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            allowed_from=frozenset({"pending", "no_acceptable_release", "searching"}),
+        )
+        await session.commit()
+
+    assert completed is True
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
+                )
+            )
+        ).scalar_one()
+        assert season.status is RequestStatus.completed
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.status is RequestStatus.completed
+        assert show.completed_at is not None
+
+
+async def test_mark_completed_if_in_skips_when_status_moved_out_of_due(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #229: a concurrent cancel/correction that moved the season to a
+    non-due status BETWEEN the caller's snapshot and this CAS write must never
+    be resurrected as ``completed`` -- the CAS loses, the season keeps its
+    current status untouched, and the parent rollup is never recomputed off a
+    row this call did not actually move."""
+    show_id = await _make_show(sessionmaker_, tmdb_id=739)
+    async with sessionmaker_() as session:
+        await season_request_service.ensure_seasons(
+            session, None, media_request_id=show_id, tmdb_id=739, seasons=[1]
+        )
+        await session.commit()
+
+    # Simulate the concurrent actor: the season is already settled 'available'
+    # (outside DUE_SEARCH_STATUSES) by the time this call runs.
+    async with sessionmaker_() as session:
+        await season_request_service.mark_available(
+            session, media_request_id=show_id, season_number=1
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        completed = await season_request_service.mark_completed_if_in(
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            allowed_from=frozenset({"pending", "no_acceptable_release", "searching"}),
+        )
+        await session.commit()
+
+    assert completed is False
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == show_id, SeasonRequest.season_number == 1
+                )
+            )
+        ).scalar_one()
+        # UNCHANGED -- not resurrected to completed.
+        assert season.status is RequestStatus.available
+        show = await session.get(MediaRequest, show_id)
+        assert show is not None
+        assert show.status is RequestStatus.available

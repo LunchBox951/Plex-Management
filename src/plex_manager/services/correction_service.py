@@ -93,6 +93,7 @@ from plex_manager.services import (
     decision_service,
     grab_service,
     purge_service,
+    queue_service,
     request_service,
     season_request_service,
 )
@@ -213,7 +214,12 @@ _GRAB_OPERATIONAL_ERRORS: Final = (grab_service.GrabError,)
 # ``grab_service``). Unlike the per-release failures, these apply to the whole SCOPE,
 # not this one release, so trying a lower-ranked candidate cannot help: the scope now
 # has an active download (``AlreadyDownloadingError``), or is terminal / mis-shaped
-# (``RequestNotActiveError`` / ``SeasonRequiredError``). Mirrors auto-grab's
+# (``RequestNotActiveError`` / ``SeasonRequiredError``), or the replacement resolved
+# to a hash whose terminal row is being removed RIGHT NOW by a racing cancel /
+# reconcile / operator delete (``TorrentRemovalInFlightError``, #206). The last is
+# transient -- by the auto-grab worker's next tick the removal has settled -- so like
+# the others it must LEAVE the scope at the ``searching`` committed at (b) for retry,
+# not surface an unhandled 500 out of the requests router. Mirrors auto-grab's
 # settle-and-leave: discard the partial write and LEAVE the scope's committed
 # ``searching`` as-is -- never a ``no_acceptable_release`` park (that would LIE:
 # releases exist; the grab was refused for a scope reason, not exhaustion).
@@ -221,6 +227,7 @@ _GRAB_SCOPE_REFUSALS: Final = (
     grab_service.AlreadyDownloadingError,
     grab_service.RequestNotActiveError,
     grab_service.SeasonRequiredError,
+    grab_service.TorrentRemovalInFlightError,
 )
 
 # The indexer failures the inline RE-SEARCH (``decision_service.preview`` ->
@@ -1289,66 +1296,88 @@ async def cancel_request(
     # NOT go through the reconciler's failed_download_events, so it triggers no
     # blocklist/re-search (cancel must never re-grab).
     hashes_to_remove: list[str] = []
-    for row in active:
-        moved = await download_repo.update_status_if_in(
-            row.id,
-            DownloadState.Failed.value,
-            _CANCELLABLE_DOWNLOAD_STATE_VALUES,
-            failed_reason="cancelled by operator",
-        )
-        if not moved:
-            # The row left the cancellable set underneath us (an import claimed it
-            # ``importing`` during the ``list_active`` -> here gap). Abort the whole
-            # cancel: roll back the swaps done so far and surface a retryable refusal
-            # rather than half-cancelling around a finalizing import.
-            await session.rollback()
-            raise ImportInProgressError(request_id)
-        await _mark_download_scopes_terminal(session, row.id, RequestStatus.cancelled.value)
-        hashes_to_remove.append(row.torrent_hash)
-
-    if request.media_type == "tv":
-        # Settle every tracked season to cancelled; the parent rollup then folds to
-        # cancelled (season_rollup handles all-cancelled). Unconditional (a failed
-        # season is cancelled too) -- the per-season guard above already refused if
-        # any season was available/completed or still owned an imported torrent, so
-        # nothing done is being dishonestly settled or orphaned here. Reuses the
-        # ``seasons`` fetched by that guard.
-        for srec in seasons:
-            await season_request_service.set_status(
-                session,
-                media_request_id=request_id,
-                season_number=srec.season_number,
-                status=RequestStatus.cancelled.value,
+    removal_ids: list[int] = []
+    try:
+        for row in active:
+            moved = await download_repo.update_status_if_in(
+                row.id,
+                DownloadState.Failed.value,
+                _CANCELLABLE_DOWNLOAD_STATE_VALUES,
+                failed_reason="cancelled by operator",
             )
-    else:
-        await request_repo.set_status(request_id, RequestStatus.cancelled.value)
+            if not moved:
+                # The row left the cancellable set underneath us (an import claimed it
+                # ``importing`` during the ``list_active`` -> here gap). Abort the whole
+                # cancel: roll back the swaps done so far and surface a retryable refusal
+                # rather than half-cancelling around a finalizing import.
+                await session.rollback()
+                raise ImportInProgressError(request_id)
+            await _mark_download_scopes_terminal(session, row.id, RequestStatus.cancelled.value)
+            hashes_to_remove.append(row.torrent_hash)
+            # #206: claim the removal as in-flight BEFORE the terminal commit below.
+            # cancel commits the row to terminal ``Failed`` and only THEN removes the
+            # torrent; terminality is itself what makes the row reusable, so a
+            # concurrent grab's terminal-row reuse could re-own this hash in the
+            # commit->delete window. Registering here (not just before the delete
+            # await, as reconcile's non-terminal Phase-B does) means the instant the
+            # row becomes reusably-terminal to another session it is already claimed,
+            # and grab_service._reuse_terminal_row refuses. Released in the finally
+            # once removal settles (or on any abort).
+            queue_service.register_removal_in_flight(row.id)
+            removal_ids.append(row.id)
 
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=None,
-            event_type=DownloadHistoryEvent.cancelled,
-            source_title=request.title,
-            message="cancelled by operator: removed any active torrent, settled cancelled",
-        )
-    )
-    await session.commit()
+        if request.media_type == "tv":
+            # Settle every tracked season to cancelled; the parent rollup then folds to
+            # cancelled (season_rollup handles all-cancelled). Unconditional (a failed
+            # season is cancelled too) -- the per-season guard above already refused if
+            # any season was available/completed or still owned an imported torrent, so
+            # nothing done is being dishonestly settled or orphaned here. Reuses the
+            # ``seasons`` fetched by that guard.
+            for srec in seasons:
+                await season_request_service.set_status(
+                    session,
+                    media_request_id=request_id,
+                    season_number=srec.season_number,
+                    status=RequestStatus.cancelled.value,
+                )
+        else:
+            await request_repo.set_status(request_id, RequestStatus.cancelled.value)
 
-    # Remove each cancelled torrent + its data AFTER the DB cancel has committed, so a
-    # client hiccup never undoes the committed settle (mirrors queue_service.mark_failed).
-    # Best-effort + already-gone-is-a-no-op (see purge_service.remove_torrent).
-    # ``qbt is not None`` is GUARANTEED whenever ``hashes_to_remove`` is non-empty (the
-    # active-rows-without-a-client guard above refused that combination); the explicit
-    # check narrows the optional type for the checker and is a no-op for the empty
-    # pure-DB-settle case (nothing to remove, and qbt may legitimately be None).
-    if qbt is not None:
-        for torrent_hash in hashes_to_remove:
-            await purge_service.remove_torrent(
-                qbt,
-                torrent_hash,
-                context="a cancel",
-                extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.cancelled,
+                source_title=request.title,
+                message="cancelled by operator: removed any active torrent, settled cancelled",
             )
+        )
+        await session.commit()
+
+        # Remove each cancelled torrent + its data AFTER the DB cancel has committed,
+        # so a client hiccup never undoes the committed settle (mirrors
+        # queue_service.mark_failed). Best-effort + already-gone-is-a-no-op (see
+        # purge_service.remove_torrent). ``qbt is not None`` is GUARANTEED whenever
+        # ``hashes_to_remove`` is non-empty (the active-rows-without-a-client guard
+        # above refused that combination); the explicit check narrows the optional
+        # type for the checker and is a no-op for the empty pure-DB-settle case
+        # (nothing to remove, and qbt may legitimately be None). The in-flight claim
+        # registered above keeps the now-terminal row un-reusable across this I/O.
+        if qbt is not None:
+            for torrent_hash in hashes_to_remove:
+                await purge_service.remove_torrent(
+                    qbt,
+                    torrent_hash,
+                    context="a cancel",
+                    extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
+                )
+    finally:
+        # Removal has settled (or the cancel aborted): the row is either gone from the
+        # client (a later grab creates a fresh torrent) or, on a removal failure, its
+        # data is intact and reuse is safe again. Release every claim we registered,
+        # including any registered before an ImportInProgressError abort above.
+        for download_id in removal_ids:
+            queue_service.release_removal_in_flight(download_id)
 
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
