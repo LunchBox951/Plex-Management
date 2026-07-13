@@ -567,6 +567,176 @@ async def test_list_active_excludes_terminal_states(session: AsyncSession) -> No
     assert {d.torrent_hash for d in active} == {"h_dl", "h_search"}
 
 
+async def test_list_active_for_requests_batches_legacy_and_scope_ownership(
+    session: AsyncSession,
+) -> None:
+    """One physical TV pack can belong through both the legacy scalar link and
+    logical scopes, but it appears exactly once in each request's group."""
+    primary = MediaRequest(
+        tmdb_id=100,
+        media_type=MediaType.tv,
+        title="Primary Show",
+        status=RequestStatus.downloading,
+    )
+    sibling = MediaRequest(
+        tmdb_id=101,
+        media_type=MediaType.tv,
+        title="Sibling Show",
+        status=RequestStatus.downloading,
+    )
+    legacy_only = MediaRequest(
+        tmdb_id=102,
+        media_type=MediaType.movie,
+        title="Legacy Movie",
+        status=RequestStatus.downloading,
+    )
+    session.add_all([primary, sibling, legacy_only])
+    await session.flush()
+
+    shared = Download(
+        torrent_hash="shared-pack",
+        status="downloading",
+        media_request_id=primary.id,
+        media_type=MediaType.tv,
+        season=1,
+        progress=0.42,
+    )
+    legacy = Download(
+        torrent_hash="legacy-only",
+        status="downloading",
+        media_request_id=legacy_only.id,
+        media_type=MediaType.movie,
+        progress=0.0,
+    )
+    session.add_all([shared, legacy])
+    await session.flush()
+    session.add_all(
+        [
+            # The primary id is intentionally present through BOTH ownership
+            # shapes; grouping must not duplicate the physical row.
+            DownloadScope(
+                download_id=shared.id,
+                media_request_id=primary.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="active",
+            ),
+            DownloadScope(
+                download_id=shared.id,
+                media_request_id=sibling.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="active",
+            ),
+        ]
+    )
+    await session.flush()
+
+    grouped = await SqlDownloadRepository(session).list_active_for_requests(
+        [primary.id, sibling.id, legacy_only.id, primary.id]
+    )
+
+    assert list(grouped) == [primary.id, sibling.id, legacy_only.id]
+    assert [row.torrent_hash for row in grouped[primary.id]] == ["shared-pack"]
+    assert [row.torrent_hash for row in grouped[sibling.id]] == ["shared-pack"]
+    assert [row.torrent_hash for row in grouped[legacy_only.id]] == ["legacy-only"]
+    assert grouped[primary.id][0].progress == 0.42
+    assert grouped[legacy_only.id][0].progress == 0.0
+
+
+async def test_list_active_for_requests_excludes_terminal_physical_rows(
+    session: AsyncSession,
+) -> None:
+    request = MediaRequest(
+        tmdb_id=103,
+        media_type=MediaType.tv,
+        title="Finished Show",
+        status=RequestStatus.downloading,
+    )
+    session.add(request)
+    await session.flush()
+    terminal = Download(
+        torrent_hash="finished-pack",
+        status="imported",
+        media_request_id=request.id,
+        media_type=MediaType.tv,
+        season=1,
+        progress=1.0,
+    )
+    session.add(terminal)
+    await session.flush()
+    session.add(
+        DownloadScope(
+            download_id=terminal.id,
+            media_request_id=request.id,
+            season_number=1,
+            scope_key="season:1|episodes:*",
+            status="imported",
+        )
+    )
+    await session.flush()
+
+    repo = SqlDownloadRepository(session)
+    assert await repo.list_active_for_requests([]) == {}
+    assert await repo.list_active_for_requests([request.id]) == {request.id: []}
+
+
+async def test_list_active_for_requests_prefers_scope_state_over_legacy_owner(
+    session: AsyncSession,
+) -> None:
+    """A settled scope is not made active again by the scalar compatibility link."""
+    settled_owner = MediaRequest(
+        tmdb_id=104,
+        media_type=MediaType.tv,
+        title="Settled Scope",
+        status=RequestStatus.downloading,
+    )
+    active_owner = MediaRequest(
+        tmdb_id=105,
+        media_type=MediaType.tv,
+        title="Active Scope",
+        status=RequestStatus.downloading,
+    )
+    session.add_all([settled_owner, active_owner])
+    await session.flush()
+    shared = Download(
+        torrent_hash="partially-settled-pack",
+        status="import_blocked",
+        media_request_id=settled_owner.id,
+        media_type=MediaType.tv,
+        season=2,
+        progress=1.0,
+    )
+    session.add(shared)
+    await session.flush()
+    session.add_all(
+        [
+            DownloadScope(
+                download_id=shared.id,
+                media_request_id=settled_owner.id,
+                season_number=1,
+                scope_key="season:1|episodes:*",
+                status="imported",
+            ),
+            DownloadScope(
+                download_id=shared.id,
+                media_request_id=active_owner.id,
+                season_number=2,
+                scope_key="season:2|episodes:*",
+                status="import_blocked",
+            ),
+        ]
+    )
+    await session.flush()
+
+    grouped = await SqlDownloadRepository(session).list_active_for_requests(
+        [settled_owner.id, active_owner.id]
+    )
+
+    assert grouped[settled_owner.id] == []
+    assert [row.torrent_hash for row in grouped[active_owner.id]] == ["partially-settled-pack"]
+
+
 async def test_create_persists_release_title(session: AsyncSession) -> None:
     """``release_title`` (issue #134) round-trips through ``create``/``get_by_hash``
     exactly like every other grab-time field."""

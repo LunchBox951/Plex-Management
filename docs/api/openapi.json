@@ -1908,6 +1908,17 @@
             ],
             "title": "Backdrop Url"
           },
+          "download_progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Progress"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
