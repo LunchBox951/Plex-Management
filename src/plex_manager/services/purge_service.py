@@ -33,12 +33,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.services import path_visibility
 
 if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
@@ -57,6 +59,17 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+# Bounded poll for qBittorrent's own server-side, ASYNCHRONOUS on-disk file
+# deletion to actually finish after a ``/torrents/delete?deleteFiles=true`` call
+# has already ACKed (issue #240, residual left by PR #235's same-hash cancel-race
+# guard). See :func:`_wait_for_content_path_gone`. Bounded rather than unbounded:
+# this runs inline in an operator-facing request (cancel / mark-failed / report-
+# issue) as well as the reconcile poll loop, so it must never block either
+# indefinitely -- a still-present path after the bound is logged (honesty over
+# silence) and the caller proceeds; the DB state change already committed.
+_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS: Final = 5.0
+_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS: Final = 0.25
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -305,7 +318,49 @@ async def remove_torrent(
     interpolated request-derived string — log-injection convention); the
     torrent hash and any correlation ids go via ``extra``. A torrent hash is not a
     secret; the grab source (which embeds a Prowlarr api key) is never logged here.
+
+    Post-ack disk-deletion residual (issue #240): qBittorrent's own file removal
+    for ``delete_files=True`` is ASYNCHRONOUS server-side — the ``/torrents/delete``
+    call returns as soon as the delete is *accepted*, not once it has finished
+    walking the content path. Every caller of this function releases its own
+    removal-physics guard (``queue_service``'s ``_removals_in_flight`` /
+    ``_operator_fail_claims``) once this call returns, on the assumption the data
+    is actually gone by then — a same-hash re-grab (the exact same release
+    re-requested) landing in the narrow window between the ACK and the real
+    on-disk finish can have its freshly-written data clobbered by the TAIL of the
+    old deletion still walking the same path. Before returning success, this
+    function therefore snapshots the torrent's ``content_path`` BEFORE removing it
+    (the client no longer reports it once the torrent itself is gone) and, if one
+    was reported, polls (:func:`_wait_for_content_path_gone`) for that path to
+    actually disappear from disk, bounded so this best-effort call can never block
+    a caller indefinitely. A ``content_path`` that merely restates ``save_path``
+    (the adapter nulls it in that case — see ``adapters/qbittorrent/adapter.py``)
+    has nothing distinct to poll (``save_path`` is shared by other torrents) and
+    is skipped honestly rather than polling the wrong thing.
+
+    Container-visible remap (issue #240 residual, Codex review on PR #281): qBittorrent
+    runs on the HOST, so the snapshotted ``content_path`` can be a HOST-namespace
+    path (e.g. ``/srv/downloads/...``) this process only sees through the
+    ``/downloads`` bind mount — polling the raw path would find it already
+    "gone" (``os.path.exists`` on a path that never existed HERE) and release
+    the guard immediately while qBittorrent may still be deleting the real,
+    container-visible file. :func:`_visible_content_path` (called BEFORE the
+    torrent is removed, since the remap's proof needs the client's own file
+    list, which is unavailable once the torrent is gone) applies the exact same
+    remap ``import_service._resolve_visible_content`` uses for imports.
     """
+    content_path: str | None = None
+    try:
+        status = await qbt.get_status(torrent_hash)
+    except Exception:
+        # Best-effort snapshot only: a failure here just means the post-delete
+        # poll below is skipped (nothing distinct to verify), never a reason to
+        # abort the removal itself.
+        status = None
+    if status is not None and status.content_path:
+        content_path = await _visible_content_path(
+            qbt, torrent_hash, status.content_path, status.save_path
+        )
     try:
         await qbt.remove(torrent_hash, delete_files=True)
     except Exception:
@@ -320,4 +375,95 @@ async def remove_torrent(
             extra=extra,
         )
         return False
+    if content_path is not None:
+        await _wait_for_content_path_gone(content_path, context=context, extra=extra)
     return True
+
+
+async def _visible_content_path(
+    qbt: DownloadClientPort, torrent_hash: str, content_path: str, save_path: str
+) -> str | None:
+    """Container-visible remap of a just-snapshotted torrent ``content_path``.
+
+    Mirrors ``import_service._resolve_visible_content`` (issue #133): qBittorrent
+    runs on the HOST, so a client-reported ``content_path`` can be a
+    HOST-namespace path this container cannot see even though the file sits
+    right there, one bind mount away (e.g. host ``/srv/downloads/...`` vs. this
+    container's ``/downloads/...``). Returns ``content_path`` unchanged when it
+    already exists here (the common same-namespace fast path — no client call
+    needed); otherwise anchors the remap on ``save_path`` and demands the
+    torrent's OWN file list (:meth:`DownloadClientPort.list_files`) prove the
+    remapped candidate exhibits that exact payload at the exact relative
+    location and size — never an existence-only guess — via
+    :func:`~plex_manager.services.path_visibility.remap_download_content`.
+
+    Called BEFORE the torrent is removed (unlike the poll itself): the proof
+    needs the client's own file list, which ``list_files`` can no longer answer
+    once the torrent is gone. Returns ``None`` — the caller then skips the poll
+    rather than checking the wrong path — when there is no live ``save_path``
+    anchor, when ``list_files`` itself fails (a client hiccup here must not
+    block the removal that's about to happen regardless), or when no candidate
+    is proven.
+    """
+    if await asyncio.to_thread(os.path.exists, content_path):
+        return content_path
+    if not save_path:
+        # No live anchor to remap against (a torrent status with no save path):
+        # only the verbatim path counts, exactly as ``_resolve_visible_content``
+        # documents — a free suffix search would reintroduce the stale-match
+        # hazard :func:`path_visibility.remap_download_content` exists to close.
+        return None
+    try:
+        files = await qbt.list_files(torrent_hash)
+    except Exception:
+        # Best-effort: a failed file-list fetch just means there's nothing safely
+        # provable to poll — never a reason to hold up the torrent removal itself.
+        return None
+    expected = [(entry.name, entry.size_bytes) for entry in files]
+    return await asyncio.to_thread(
+        path_visibility.remap_download_content, content_path, save_path, expected
+    )
+
+
+async def _wait_for_content_path_gone(
+    content_path: str, *, context: str, extra: dict[str, object] | None
+) -> None:
+    """Bounded poll for a just-removed torrent's ``content_path`` to leave disk.
+
+    Closes the post-ack residual documented on :func:`remove_torrent`: qBittorrent
+    ACKs ``/torrents/delete`` before its own server-side file removal necessarily
+    finishes, so a same-hash re-grab landing right after the ACK can start writing
+    fresh data at ``content_path`` while the OLD deletion is still tearing it down
+    — the tail of that deletion can then clobber the new data. Polls
+    ``os.path.exists`` off the event loop (mirrors every other blocking FS probe in
+    this module/``import_service``), bounded by
+    ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` so this best-effort check can never
+    hang a caller indefinitely (it runs inline in operator-facing correction
+    endpoints, not just the reconcile background loop). A path still present once
+    the bound elapses is logged (honesty over silence) and left as-is — the
+    caller's DB state change already committed, and every actor's removal-physics
+    guard release proceeds regardless; a client this slow to finish its own
+    deletion is a pre-existing risk this poll narrows, not a new one it must fully
+    eliminate.
+    """
+    deadline = time.monotonic() + _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS
+    while True:
+        try:
+            still_present = await asyncio.to_thread(os.path.exists, content_path)
+        except OSError:
+            # An unreadable path (e.g. a parent directory removed out from under
+            # it) is as good as gone for this best-effort check.
+            still_present = False
+        if not still_present:
+            return
+        if time.monotonic() >= deadline:
+            _logger.warning(
+                "content path still present %.1fs after %s's torrent removal "
+                "was acknowledged; a fast same-hash re-grab could still race the "
+                "client's own asynchronous file deletion",
+                _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+                context,
+                extra=extra,
+            )
+            return
+        await asyncio.sleep(_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS)

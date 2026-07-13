@@ -136,6 +136,50 @@ def test_trusted_proxy_hops_set_env_var_parses(monkeypatch: pytest.MonkeyPatch) 
     assert settings.trusted_proxy_hops == 1
 
 
+def test_web_concurrency_defaults_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
+def test_web_concurrency_reads_the_unprefixed_convention_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Issue #240: the industry-convention name, deliberately WITHOUT the
+    # PLEX_MANAGER_ prefix every other setting uses -- see the field's docstring.
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 4
+
+
+def test_web_concurrency_blank_env_var_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_CONCURRENCY", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
+def test_web_concurrency_malformed_convention_value_does_not_crash_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex review (PR #281): this is a purely advisory field (a best-effort
+    # startup warning) fed by a THIRD-PARTY process manager's own convention --
+    # some set non-integer sentinels like gunicorn's "auto". A malformed value
+    # must fall back to the default, never raise and take the whole app down.
+    monkeypatch.setenv("WEB_CONCURRENCY", "auto")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
 def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: a fresh install boots with ZERO auth env vars.
 
