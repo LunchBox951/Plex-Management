@@ -97,6 +97,7 @@ from plex_manager.web.routers import search_preview as search_preview_router
 from plex_manager.web.routers import settings as settings_router
 from plex_manager.web.routers import setup as setup_router
 from plex_manager.web.spa import mount_spa
+from plex_manager.web.trusted_host import TrustedHostMiddleware
 
 router = APIRouter()
 
@@ -932,6 +933,10 @@ def create_app() -> FastAPI:
     warn_if_multiworker()
     app.state.realtime_hub = EventHub(app_version=current_build_id())
     app.add_middleware(SetupGuardMiddleware)
+    # Starlette applies middleware in reverse of add order, so this is the
+    # OUTERMOST layer: every request's Host is validated before SetupGuard (or
+    # any route) ever runs -- see web/trusted_host.py for the threat this closes.
+    app.add_middleware(TrustedHostMiddleware)
     app.add_exception_handler(ServiceNotConfiguredError, _service_not_configured_handler)
     for adapter_error in _ADAPTER_ERROR_RESPONSES:
         app.add_exception_handler(adapter_error, _adapter_error_handler)
