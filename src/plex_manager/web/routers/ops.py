@@ -26,6 +26,17 @@ this build wrote through ``log_capture_service``, so a pre-upgrade row or a
 direct repository write is masked consistently at BOTH read boundaries, not just
 on export. (``GET /logs/tail`` reads the in-memory ring buffer, which is written
 only by the already-redacting capture path, so it needs no second pass.)
+
+Both boundaries ALSO re-apply ``logsafe.redact_known_secrets`` (issue #268), the
+value-based pass, against this INSTANT's decrypted secret values (``SettingsStore.
+secret_values()``) — never the possibly-stale set the capture-time handler was
+last refreshed with (see ``log_capture_service``'s module docstring): a secret
+rotated AFTER a row was captured is still masked on every subsequent read, and a
+pre-upgrade row that predates this pass entirely is covered too. Applied FIRST,
+before ``redact_secrets`` — the same order ``log_capture_service._capture`` uses
+and for the same reason: the shape grammar's own masking can mangle a secret
+(e.g. a basic-auth password containing a raw ``@``, issue #270) before the
+value-based exact-match search ever sees it whole.
 """
 
 from __future__ import annotations
@@ -43,7 +54,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
-from plex_manager.logsafe import redact_secrets
+from plex_manager.logsafe import redact_known_secrets, redact_secrets
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service, watchlist_service
@@ -257,6 +268,10 @@ async def list_logs_endpoint(
         limit=limit,
         offset=offset,
     )
+    # Fetched once per request, reused for every row below (issue #268) --
+    # this instant's decrypted secret values, not the capture-time handler's
+    # possibly-stale snapshot (see the module docstring).
+    secret_values = await SettingsStore(session).secret_values()
     return LogsResponse(
         total=page.total,
         events=[
@@ -265,11 +280,19 @@ async def list_logs_endpoint(
                 created_at=r.created_at,
                 level=r.level,
                 logger=r.logger,
-                # Second redaction pass on the durable read (issue #153): capture-
-                # time redaction only covers rows THIS build wrote; a pre-upgrade
-                # row or a direct repository write is masked here just as it is on
-                # /logs/export, so both durable-read boundaries are secret-safe.
-                message=redact_secrets(r.message),
+                # Value-based pass FIRST, then shape (issues #268/#153) --
+                # matching ``log_capture_service._capture``'s own order: the
+                # shape grammar's masking can otherwise mangle a secret (e.g.
+                # a basic-auth password containing ``@``, issue #270) before
+                # the value-based exact-match search ever sees it whole. See
+                # that function's docstring for the concrete failure this
+                # ordering prevents. Capture-time redaction only covers rows
+                # THIS build wrote through log_capture_service, and only with
+                # the secret values known AT CAPTURE TIME; a pre-upgrade row, a
+                # direct repository write, or a since-rotated secret is still
+                # masked here, just as on /logs/export, so both durable-read
+                # boundaries are secret-safe.
+                message=redact_secrets(redact_known_secrets(r.message, secret_values)),
                 context=r.context,
             )
             for r in page.results
@@ -347,14 +370,23 @@ async def export_logs_endpoint(
     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
 
     Every message is passed through :func:`~plex_manager.logsafe.
-    redact_secrets` again here (issue #153) as a SECOND, independent line of
-    defense on top of the capture-time pass (``log_capture_service._capture``)
-    -- this is the boundary the blueprint explicitly calls out ("the log store
-    never records a secret"), and a row written before this redaction pass
+    redact_known_secrets` (issue #268), against THIS instant's decrypted
+    secret values -- catching a since-rotated secret and the shape-grammar
+    gaps (cookie-jar/mapping dumps, basic-auth passwords containing ``@``)
+    issue #270 documents -- and THEN through :func:`~plex_manager.logsafe.
+    redact_secrets` (issue #153) as a SECOND, independent line of defense on
+    top of the capture-time passes (``log_capture_service._capture``) -- this
+    is the boundary the blueprint explicitly calls out ("the log store never
+    records a secret"), and a row written before these redaction passes
     existed, or by any future path that bypasses the capture pipeline, must
-    still never leave this endpoint carrying one.
+    still never leave this endpoint carrying one. Value-based FIRST,
+    deliberately: see ``log_capture_service._capture``'s docstring for why
+    running the shape grammar first can mangle a secret (a basic-auth password
+    containing ``@``, concretely) before the value-based exact-match search
+    ever sees it whole.
     """
     repo = SqlLogEventRepository(session)
+    secret_values = await SettingsStore(session).secret_values()
     if correlation_id is not None:
         page = await repo.list_events(
             correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS, oldest_first=True
@@ -380,7 +412,7 @@ async def export_logs_endpoint(
                     created_at=e.created_at,
                     level=e.level,
                     logger=e.logger,
-                    message=redact_secrets(e.message),
+                    message=redact_secrets(redact_known_secrets(e.message, secret_values)),
                     context=e.context,
                 )
                 for e in events
@@ -389,7 +421,8 @@ async def export_logs_endpoint(
         return JSONResponse(content=body.model_dump(mode="json"), headers=headers)
 
     lines = [
-        f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {redact_secrets(e.message)}"
+        f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: "
+        f"{redact_secrets(redact_known_secrets(e.message, secret_values))}"
         for e in events
     ]
     if truncated:

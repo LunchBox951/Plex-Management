@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   PlexLibraryOption,
   PlexServersResponse,
@@ -52,7 +52,7 @@ vi.mock('../api/hooks', () => ({
   usePlexSignIn: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }))
 
-vi.mock('../lib/apiKey', () => ({
+vi.mock('../lib/setupToken', () => ({
   getSetupToken: () => h.storedSetupToken,
   setSetupToken: h.setSetupToken,
   clearSetupToken: h.clearSetupToken,
@@ -834,5 +834,92 @@ describe('SetupWizard — setup token (pre-init hardening)', () => {
     expect(field).toHaveValue('')
     fireEvent.change(field, { target: { value: 'boot-token' } })
     expect(h.setSetupToken).toHaveBeenCalledWith('boot-token')
+  })
+
+  describe('a #setup_token= URL fragment (issue #65 — the logged ready-to-click link)', () => {
+    afterEach(() => {
+      // Every test in this block seeds the address bar itself; leave it clean
+      // for whatever test runs next.
+      window.history.pushState(null, '', '/')
+    })
+
+    it('seeds the field, persists it, and strips the token from the address bar', () => {
+      h.setupTokenRequired = true
+      window.history.pushState(null, '', '/setup#setup_token=url-token')
+
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByLabelText('Setup token')).toHaveValue('url-token')
+      expect(h.setSetupToken).toHaveBeenCalledWith('url-token')
+      // The bootstrap secret must not linger in browser history / a shareable URL
+      // once the field has consumed it.
+      expect(window.location.hash).toBe('')
+      expect(window.location.search).toBe('')
+      expect(window.location.pathname).toBe('/setup')
+    })
+
+    it('persists the token synchronously, before the component finishes its initial render', () => {
+      // Regression guard: persistence must happen in the SAME synchronous pass
+      // that decides whether token-gated queries (ServerPicker's
+      // useSetupPlexServers) are enabled — not in a later effect a child's own
+      // query-triggering effect could race and fire ahead of. `render()` (via
+      // React Testing Library) flushes effects internally, so the only way to
+      // prove this ran during the synchronous render — not merely "before
+      // render() returns" — is that it already happened despite every query
+      // hook in this file being mocked to never itself call setSetupToken.
+      h.setupTokenRequired = true
+      window.history.pushState(null, '', '/setup#setup_token=sync-token')
+
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(h.setSetupToken).toHaveBeenCalledWith('sync-token')
+      expect(h.setSetupToken).toHaveBeenCalledTimes(1)
+    })
+
+    it('falls back to a legacy ?setup_token= query param for an old bookmarked link', () => {
+      h.setupTokenRequired = true
+      window.history.pushState(null, '', '/setup?setup_token=legacy-token')
+
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByLabelText('Setup token')).toHaveValue('legacy-token')
+      expect(h.setSetupToken).toHaveBeenCalledWith('legacy-token')
+      expect(window.location.search).toBe('')
+    })
+
+    it('prefers the fragment token over a legacy query-param token when both are present', () => {
+      h.setupTokenRequired = true
+      window.history.pushState(null, '', '/setup?setup_token=legacy-token#setup_token=fresh-token')
+
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByLabelText('Setup token')).toHaveValue('fresh-token')
+    })
+
+    it('mentions the printed docker-logs link and env var in the field hint', () => {
+      h.setupTokenRequired = true
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByText(/PLEX_MANAGER_SETUP_TOKEN/)).toBeInTheDocument()
+      expect(screen.getByText(/docker logs/)).toBeInTheDocument()
+    })
+
+    it('prefers the URL token over a stale persisted one for this load', () => {
+      h.setupTokenRequired = true
+      h.storedSetupToken = 'stale-stored-token'
+      window.history.pushState(null, '', '/setup#setup_token=fresh-url-token')
+
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByLabelText('Setup token')).toHaveValue('fresh-url-token')
+    })
+
+    it('leaves the field empty and the address bar untouched with no token param', () => {
+      h.setupTokenRequired = true
+      render(<SetupWizard />, { wrapper: Wrapper })
+
+      expect(screen.getByLabelText('Setup token')).toHaveValue('')
+      expect(h.setSetupToken).not.toHaveBeenCalled()
+    })
   })
 })

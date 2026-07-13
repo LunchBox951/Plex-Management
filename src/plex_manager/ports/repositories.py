@@ -309,7 +309,14 @@ class RequestRepository(Protocol):
     """Persistence for media requests."""
 
     async def get(self, request_id: int) -> RequestRecord | None:
-        """Return the request by id, or ``None``."""
+        """Return the request by id, or ``None``.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "not found"
+        answer, silently hiding a forgotten override -- must fail loudly at
+        call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def list_by_status(self, status: str | None = None) -> list[RequestRecord]:
         """List requests, optionally filtered by ``status``."""
@@ -349,7 +356,15 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def find_active(self, tmdb_id: int, media_type: str) -> RequestRecord | None:
-        """Return an existing non-terminal request for this media, for dedup."""
+        """Return an existing non-terminal request for this media, for dedup.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "no active
+        request" answer, silently hiding a forgotten override -- a caller
+        relying on this for the create-request dedup guard must fail loudly at
+        call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def find_in_library(
         self, tmdb_id: int, media_type: str, *, prefer_user_id: int | None = None
@@ -443,7 +458,14 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_status(self, request_id: int, status: str) -> None:
-        """Update a request's status."""
+        """Update a request's status.
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let a caller believe a status transition committed when
+        nothing happened -- must fail loudly at call time instead, mirroring
+        #80/#81.
+        """
+        raise NotImplementedError
 
     async def set_status_if_in(
         self,
@@ -525,7 +547,14 @@ class DownloadRepository(Protocol):
     """Persistence for tracked downloads."""
 
     async def get_by_hash(self, torrent_hash: str) -> DownloadRecord | None:
-        """Return the download for ``torrent_hash``, or ``None``."""
+        """Return the download for ``torrent_hash``, or ``None``.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "not tracked"
+        answer, silently hiding a forgotten override -- must fail loudly at
+        call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def find_active_for_request(
         self, media_request_id: int, *, season: int | None = None
@@ -622,7 +651,13 @@ class DownloadRepository(Protocol):
         ``clear_failed_reason`` wipes a stale failure reason when a terminal row is
         reused for a fresh grab; ``media_request_id`` (when not ``None``) re-owns
         the reused row to the current request. Both are no-ops otherwise.
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let the reconciler believe a status/progress write
+        committed when nothing happened -- must fail loudly at call time
+        instead, mirroring #80/#81.
         """
+        raise NotImplementedError
 
 
 @runtime_checkable
@@ -942,7 +977,14 @@ class BlocklistRepository(Protocol):
         raise NotImplementedError
 
     async def delete(self, blocklist_id: int) -> None:
-        """Remove a blocklist entry (operator un-blocklist)."""
+        """Remove a blocklist entry (operator un-blocklist).
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let the un-blocklist button report success while the
+        entry still blocks re-search -- must fail loudly at call time instead,
+        mirroring #80/#81.
+        """
+        raise NotImplementedError
 
 
 # Correlation keys a log record's ``context_json`` may carry (ADR-0012). Shared

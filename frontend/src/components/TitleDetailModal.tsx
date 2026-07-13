@@ -65,6 +65,13 @@ interface TitleDetailModalProps {
    * cancel/pin targets — to the FIRST matching row, which can be a DIFFERENT
    * user's request than the one that was clicked. Omitted (Discover), the
    * correlation behaves exactly as before.
+   *
+   * A fixed prop, not itself reactive: it never changes for the lifetime of one
+   * clicked-open modal. When the clicked row is SETTLED (failed/evicted/
+   * cancelled) and the operator fires "Request again"/"Re-acquire", the modal
+   * internally rebinds past this prop to the freshly created row (issue #272) —
+   * see `reboundRequestId` — rather than staying pinned to the dead row this
+   * prop still names.
    */
   boundRequestId?: number | null
 }
@@ -124,10 +131,24 @@ function queueItemCoversSeason(item: QueueItem, season: number | null): boolean 
   return item.season === season
 }
 
-/** The first non-terminal tracked season, else the first tracked season. */
+/**
+ * The first non-terminal tracked season, else the first tracked season.
+ *
+ * A `failed` season counts as actionable too when ANOTHER season in the list
+ * is `completed` ("Finalizing"): that combination only ever arises from
+ * issue #265's rollup precedence (a finalizing season always wins the parent
+ * fold outright), the exact case `isSeasonGrabbable` below carves out for its
+ * failed-season retry action. Without this, the plain `isGrabbableStatus`
+ * check sees neither `completed` nor `failed` as actionable and defaults the
+ * picker to the finalizing season instead of the one that actually needs a
+ * retry.
+ */
 function firstActionableSeason(seasons: SeasonStatus[] | null): number | null {
   if (!seasons || seasons.length === 0) return null
-  const active = seasons.find((s) => isGrabbableStatus(s.status))
+  const hasFinalizingSibling = seasons.some((s) => s.status === 'completed')
+  const active = seasons.find(
+    (s) => isGrabbableStatus(s.status) || (hasFinalizingSibling && s.status === 'failed'),
+  )
   return (active ?? seasons[0])!.season_number
 }
 
@@ -224,18 +245,35 @@ function isGrabbableStatus(status: string): boolean {
 /**
  * Whether the Grab button should be live for the SELECTED season (or, for a movie,
  * the request itself). A season is grabbable when its own status is non-terminal —
- * OR when it is `failed` but the PARENT request is still non-terminal. The backend
- * gates /queue/grab on the parent, so a failed season under an active (e.g.
- * `partially_available`) show can be re-searched from the UI; without this it would
- * dead-end into "Request again", which dedups straight back to the same failed
- * season (an active show is never re-created), leaving the user unable to retry it.
- * A movie (`season == null` → `seasonStatusFor` returns `request.status`) never
- * enters the failed branch: its failed status equals the parent's terminal one.
+ * OR when it is `failed` but the PARENT request is still non-terminal (or reads
+ * `completed` only because a DIFFERENT season is finalizing, see below). The
+ * backend gates /queue/grab on the parent, so a failed season under an active
+ * (e.g. `partially_available`) show can be re-searched from the UI; without this
+ * it would dead-end into "Request again", which dedups straight back to the same
+ * failed season (an active show is never re-created), leaving the user unable to
+ * retry it. A movie (`season == null` → `seasonStatusFor` returns `request.status`)
+ * never enters the failed branch: its failed status equals the parent's terminal one.
+ *
+ * `request.status === 'completed'` is included alongside `isGrabbableStatus`
+ * (issue #287 senior review, #265/#272 follow-up): a `completed` PARENT rollup
+ * can ONLY arise because a DIFFERENT season is still finalizing (season_rollup's
+ * precedence always lets `completed` win the fold outright) — a genuinely,
+ * wholly-settled show never reads `completed` at the parent level (that fold
+ * only happens per-season). So THIS season being `failed` while the parent is
+ * `completed` still means a sibling is finalizing, never that every season
+ * (this one included) is done; the backend's matching carve-out
+ * (`grab_service.grab`) accepts exactly this shape. Every OTHER terminal parent
+ * value (`available`/`failed`/`evicted`/`cancelled`) is reached only when EVERY
+ * season already settled that way, so those correctly stay excluded.
  */
 function isSeasonGrabbable(request: RequestResponse, season: number | null): boolean {
   const seasonStatus = seasonStatusFor(request, season)
   if (isGrabbableStatus(seasonStatus)) return true
-  return season != null && seasonStatus === 'failed' && isGrabbableStatus(request.status)
+  return (
+    season != null &&
+    seasonStatus === 'failed' &&
+    (isGrabbableStatus(request.status) || request.status === 'completed')
+  )
 }
 
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
@@ -351,6 +389,38 @@ export function TitleDetailModal({
   const queueQuery = useQueue({ poll: open, enabled: isAdmin })
 
   const [requestId, setRequestId] = useState<number | null>(null)
+  // issue #272: overrides the caller-supplied `boundRequestId` once a mutation
+  // response tells us the row it should ACTUALLY be pinned to now. `boundRequestId`
+  // is a plain prop, fixed at the moment the caller clicked a row — it never
+  // updates on its own, so without this a "Request again" fired on a SETTLED
+  // bound row (failed/evicted/cancelled) would create a fresh, active request yet
+  // leave `liveRequest` (see below) resolving to the dead old row forever, even
+  // after a LATER poll brings the fresh one back too (a literal id match always
+  // wins there). Set directly from `created.id` in `onRequest`/`onReacquire` —
+  // the mutation response IS the freshest possible signal for what this exact
+  // modal instance should now be bound to — and reset alongside the rest of the
+  // per-title state below so a newly opened title starts unbound again.
+  const [reboundRequestId, setReboundRequestId] = useState<number | null>(null)
+  // issue #287 senior review: `reboundRequestId` above must not outlive the
+  // click that made it stale. The modal can stay MOUNTED across a close (issue
+  // #271, separate/still-open) with `titleKey` unchanged, so the effect below
+  // (keyed on `titleKey`) never fires between two clicks on the SAME title's
+  // DIFFERENT duplicate rows -- e.g. rebind from "Request again" on row A (sets
+  // `reboundRequestId` to the fresh row), then the operator opens row C (a
+  // different existing row for the same title, possibly a different user's).
+  // Without this, `liveRequest` above keeps preferring the stale rebind over
+  // the just-clicked `boundRequestId`, misdirecting preview/grab/cancel/pin at
+  // the WRONG row. Tracks the previous PROP value (not the resolved
+  // `effectiveBoundRequestId`) so setting `reboundRequestId` ourselves from a
+  // mutation response never trips this — only a genuinely new `boundRequestId`
+  // supplied by the caller (a new row click) does.
+  const previousBoundRequestId = useRef(boundRequestId)
+  useEffect(() => {
+    if (boundRequestId !== previousBoundRequestId.current) {
+      previousBoundRequestId.current = boundRequestId
+      setReboundRequestId(null)
+    }
+  }, [boundRequestId])
   // Whether the just-created `requestId` is still grabbable. Tracked separately from
   // the id because POST /requests can return a TERMINAL row, and Grab must not arm
   // for it in the window before the /requests poll reveals the live status.
@@ -395,6 +465,7 @@ export function TitleDetailModal({
   latestTitleKey.current = titleKey
   useEffect(() => {
     setRequestId(null)
+    setReboundRequestId(null)
     setCreatedGrabbable(false)
     setCreatedSeasons(null)
     setCreatedCanMutate(false)
@@ -427,9 +498,14 @@ export function TitleDetailModal({
     // state (even a settled one) is what the modal must present and act on. The
     // title-match filter above still applies: a bound id that no longer matches
     // this title (or vanished from the poll) falls through to normal resolution
-    // rather than binding the modal to a foreign title's request.
-    if (boundRequestId != null) {
-      const bound = matches.find((r) => r.id === boundRequestId)
+    // rather than binding the modal to a foreign title's request. `reboundRequestId`
+    // (issue #272) takes priority over the raw prop: once a "Request again"/
+    // "Re-acquire" mutation has told us the fresh row's id, THAT is the row the
+    // operator's last action actually targeted, so it must win over the original
+    // (now-settled) clicked row once the poll brings it into `matches` too.
+    const effectiveBoundRequestId = reboundRequestId ?? boundRequestId
+    if (effectiveBoundRequestId != null) {
+      const bound = matches.find((r) => r.id === effectiveBoundRequestId)
       if (bound) return bound
     }
     const active = matches.find(
@@ -443,7 +519,7 @@ export function TitleDetailModal({
         r.status !== 'cancelled',
     )
     return active ?? matches[matches.length - 1] ?? null
-  }, [requestsQuery.data, title, boundRequestId])
+  }, [requestsQuery.data, title, boundRequestId, reboundRequestId])
 
   // A just-created request shows immediately even before the next poll lands. Used
   // for preview + queue correlation (a terminal request still owns its old download).
@@ -603,6 +679,11 @@ export function TitleDetailModal({
       const created = await createRequest.mutateAsync(body)
       if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
       setRequestId(created.id)
+      // issue #272: this exact click just produced (or dedup-resolved to) the row
+      // the modal must now track — rebind `liveRequest`'s pin to it so a
+      // "Request again" fired on a settled `boundRequestId` row never keeps
+      // resolving to that dead row once the poll brings the fresh one back too.
+      setReboundRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
       setCreatedCanMutate(created.can_mutate)
       // tv only: resolve the season against `created.seasons` — the BRAND NEW list —
@@ -652,6 +733,9 @@ export function TitleDetailModal({
       })
       if (latestTitleKey.current !== startedKey) return
       setRequestId(created.id)
+      // issue #272: same rebind as `onRequest` above — Re-acquire is the movie-only
+      // force-create equivalent of "Request again".
+      setReboundRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
       setCreatedCanMutate(created.can_mutate)
       const grabbable = isSeasonGrabbable(created, null)

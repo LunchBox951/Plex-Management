@@ -1,10 +1,8 @@
 import { QueryClient } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
+import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { applyRealtimeEvent, parseSseStream, startRealtimeStream } from './realtime'
 import { queryKeys } from './queryClient'
-import * as apiKeyLib from './apiKey'
-import * as apiKeyRotationLib from './apiKeyRotation'
 import { getRealtimeReloadRequired, setRealtimeReloadRequired } from './realtimeReload'
 
 function streamFrom(text: string): ReadableStream<Uint8Array> {
@@ -28,7 +26,6 @@ function streamFromChunks(...chunks: string[]): ReadableStream<Uint8Array> {
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
-  apiKeyLib.clearApiKey()
   setRealtimeReloadRequired(false)
 })
 
@@ -128,10 +125,8 @@ function syncBody(version: string): ReadableStream<Uint8Array> {
 }
 
 describe('startRealtimeStream authentication', () => {
-  it('uses the same-origin session cookie when no recovery key is active', async () => {
+  it('relies on the same-origin session cookie and attaches no X-Api-Key header', async () => {
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
-    const getKey = vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue(null)
     const fetchImpl = vi.fn(
       async () => ({ status: 403, ok: false, body: null }) as unknown as Response,
     )
@@ -147,69 +142,18 @@ describe('startRealtimeStream authentication', () => {
       '/api/v1/events',
       expect.objectContaining({ credentials: 'same-origin' }),
     )
+    // The browser is cookie-only now (CodeQL #263): no request carries a header.
     expect(fetchImpl).toHaveBeenCalledWith(
       '/api/v1/events',
       expect.not.objectContaining({ headers: expect.anything() }),
     )
-    expect(getKey).not.toHaveBeenCalled()
 
     stop()
     qc.clear()
   })
 
-  it('does not send a stored recovery key while key auth is inactive', async () => {
+  it('signals an expired session on a 401 and stops reconnecting', async () => {
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
-    const getKey = vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('stored-but-inactive')
-    const fetchImpl = vi.fn(
-      async () => ({ status: 403, ok: false, body: null }) as unknown as Response,
-    )
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-    const stop = startRealtimeStream({
-      queryClient: qc,
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-    })
-    await vi.advanceTimersByTimeAsync(0)
-
-    expect(fetchImpl).toHaveBeenCalledWith(
-      '/api/v1/events',
-      expect.not.objectContaining({ headers: expect.anything() }),
-    )
-    expect(getKey).not.toHaveBeenCalled()
-
-    stop()
-    qc.clear()
-  })
-
-  it('sends the recovery key when key auth is active', async () => {
-    vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(true)
-    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('active-key')
-    const fetchImpl = vi.fn(
-      async () => ({ status: 403, ok: false, body: null }) as unknown as Response,
-    )
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-    const stop = startRealtimeStream({
-      queryClient: qc,
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-    })
-    await vi.advanceTimersByTimeAsync(0)
-
-    expect(fetchImpl).toHaveBeenCalledWith(
-      '/api/v1/events',
-      expect.objectContaining({ headers: { 'X-Api-Key': 'active-key' } }),
-    )
-
-    stop()
-    qc.clear()
-  })
-
-  it('signals an expired Plex session for a keyless 401', async () => {
-    vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
-    const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey').mockImplementation(() => undefined)
     const dispatch = vi.spyOn(window, 'dispatchEvent')
     const fetchImpl = vi.fn(
       async () => ({ status: 401, ok: false, body: null }) as unknown as Response,
@@ -219,127 +163,22 @@ describe('startRealtimeStream authentication', () => {
     const stop = startRealtimeStream({
       queryClient: qc,
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
     })
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(100)
 
     const eventTypes = dispatch.mock.calls.map(([event]) => event.type)
     expect(eventTypes).toContain(AUTH_EXPIRED_EVENT)
-    expect(eventTypes).not.toContain(AUTH_INVALID_EVENT)
-    expect(clearKey).not.toHaveBeenCalled()
-
-    stop()
-    qc.clear()
-  })
-
-  it('clears and reports the current recovery key for an active-key 401', async () => {
-    vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(true)
-    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValue('current-key')
-    const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey').mockImplementation(() => undefined)
-    const dispatch = vi.spyOn(window, 'dispatchEvent')
-    const fetchImpl = vi.fn(
-      async () => ({ status: 401, ok: false, body: null }) as unknown as Response,
-    )
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-    const stop = startRealtimeStream({
-      queryClient: qc,
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-    })
-    await vi.advanceTimersByTimeAsync(0)
-
-    const eventTypes = dispatch.mock.calls.map(([event]) => event.type)
-    expect(clearKey).toHaveBeenCalledTimes(1)
-    expect(eventTypes).toContain(AUTH_INVALID_EVENT)
-    expect(eventTypes).not.toContain(AUTH_EXPIRED_EVENT)
-
-    stop()
-    qc.clear()
-  })
-
-  it('preserves a replacement key and reconnects after a stale-key 401', async () => {
-    vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(true)
-    vi.spyOn(apiKeyLib, 'getApiKey').mockReturnValueOnce('old-key').mockReturnValue('new-key')
-    const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey').mockImplementation(() => undefined)
-    const dispatch = vi.spyOn(window, 'dispatchEvent')
-    const fetchImpl = vi
-      .fn(async () => ({ status: 403, ok: false, body: null }) as unknown as Response)
-      .mockResolvedValueOnce(({ status: 401, ok: false, body: null }) as unknown as Response)
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-    const stop = startRealtimeStream({
-      queryClient: qc,
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      baseDelayMs: 1,
-      maxDelayMs: 1,
-    })
-    await vi.advanceTimersByTimeAsync(0)
-    await vi.advanceTimersByTimeAsync(5)
-
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
-    expect(fetchImpl).toHaveBeenNthCalledWith(
-      2,
-      '/api/v1/events',
-      expect.objectContaining({ headers: { 'X-Api-Key': 'new-key' } }),
-    )
-    expect(clearKey).not.toHaveBeenCalled()
-    const eventTypes = dispatch.mock.calls.map(([event]) => event.type)
-    expect(eventTypes).not.toContain(AUTH_INVALID_EVENT)
-    expect(eventTypes).not.toContain(AUTH_EXPIRED_EVENT)
-
-    stop()
-    qc.clear()
-  })
-
-  it('waits for an in-flight rotation before judging an old-key 401', async () => {
-    vi.useFakeTimers()
-    apiKeyLib.setApiKey('old-key')
-    apiKeyLib.enableApiKeyAuth()
-    const finishRotation = apiKeyRotationLib.beginApiKeyRotation()
-    const clearKey = vi.spyOn(apiKeyLib, 'clearApiKey')
-    const dispatch = vi.spyOn(window, 'dispatchEvent')
-    const fetchImpl = vi
-      .fn(async () => ({ status: 403, ok: false, body: null }) as unknown as Response)
-      .mockResolvedValueOnce(({ status: 401, ok: false, body: null }) as unknown as Response)
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-    const stop = startRealtimeStream({
-      queryClient: qc,
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      baseDelayMs: 1,
-      maxDelayMs: 1,
-    })
-    await vi.advanceTimersByTimeAsync(0)
-
-    // The reconnect was rejected after the server committed, but the rotate
-    // response has not delivered its replacement yet. The old key remains intact.
+    // A 401 stops the loop — it never reconnects into an unauthenticated retry storm.
     expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(clearKey).not.toHaveBeenCalled()
-    expect(dispatch.mock.calls.map(([event]) => event.type)).not.toContain(AUTH_INVALID_EVENT)
-
-    // The rotation winner stores the new key before releasing the barrier. The
-    // deferred 401 is now stale and the next reconnect uses the replacement.
-    apiKeyLib.setApiKey('new-key')
-    finishRotation()
-    await vi.advanceTimersByTimeAsync(5)
-
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
-    expect(fetchImpl).toHaveBeenNthCalledWith(
-      2,
-      '/api/v1/events',
-      expect.objectContaining({ headers: { 'X-Api-Key': 'new-key' } }),
-    )
-    expect(clearKey).not.toHaveBeenCalled()
-    expect(dispatch.mock.calls.map(([event]) => event.type)).not.toContain(AUTH_INVALID_EVENT)
 
     stop()
     qc.clear()
   })
 
-  it('stops without auth churn or reconnecting when realtime is forbidden', async () => {
+  it('stops without reconnecting when realtime is forbidden (non-admin session)', async () => {
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
     const dispatch = vi.spyOn(window, 'dispatchEvent')
     const fetchImpl = vi.fn(
       async () => ({ status: 403, ok: false, body: null }) as unknown as Response,
@@ -356,7 +195,6 @@ describe('startRealtimeStream authentication', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1)
     const eventTypes = dispatch.mock.calls.map(([event]) => event.type)
-    expect(eventTypes).not.toContain(AUTH_INVALID_EVENT)
     expect(eventTypes).not.toContain(AUTH_EXPIRED_EVENT)
 
     stop()
@@ -367,7 +205,6 @@ describe('startRealtimeStream authentication', () => {
 describe('startRealtimeStream version awareness', () => {
   it('prompts a reload when the server build changes across a reconnect', async () => {
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
     const versions = ['1.0.0', '2.0.0'] as const
     let call = 0
     const fetchImpl = vi.fn(async () => {
@@ -404,7 +241,6 @@ describe('startRealtimeStream backoff', () => {
     // pin the reconnect loop at the base delay: backoff resets only after a
     // connection outlives the stability window, so this flap escalates instead.
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
     let clock = 0
     const fetchTimes: number[] = []
     const fetchImpl = vi.fn(async () => {
@@ -446,7 +282,6 @@ describe('startRealtimeStream backoff', () => {
 describe('startRealtimeStream watchdog', () => {
   it('aborts and reconnects when the stream goes silent past the threshold', async () => {
     vi.useFakeTimers()
-    vi.spyOn(apiKeyLib, 'isApiKeyAuthEnabled').mockReturnValue(false)
     let clock = 0
     const fetchImpl = vi.fn(async (_url: unknown, opts: { signal: AbortSignal }) => {
       let streamController: ReadableStreamDefaultController<Uint8Array> | null = null

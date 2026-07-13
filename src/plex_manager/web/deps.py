@@ -19,10 +19,16 @@ Wiring rules:
   values (Plex token, Prowlarr / TMDB api keys, qBittorrent password) go to the
   Fernet-encrypted ``encrypted_value`` column; non-secret values (urls,
   usernames) go to plaintext ``value``. The redacted view never exposes a secret.
-* ``get_tmdb`` / ``get_prowlarr`` / ``get_qbittorrent`` build a configured adapter
-  from the decrypted settings plus the shared ``httpx.AsyncClient``. A missing
-  required setting raises :class:`ServiceNotConfiguredError` (HTTP 409), never a
-  crash.
+* ``get_tmdb`` / ``get_prowlarr`` / ``get_qbittorrent`` build (or reuse a cached)
+  configured adapter from the decrypted settings plus the shared
+  ``httpx.AsyncClient``. A missing required setting raises
+  :class:`ServiceNotConfiguredError` (HTTP 409), never a crash. Each caches ONE
+  adapter instance on ``app.state``, keyed on its effective settings PLUS the
+  ``httpx.AsyncClient`` identity (see :func:`resolve_qbittorrent`'s docstring for
+  the full rationale) — issue #214 fixed ``get_tmdb``/``get_prowlarr`` building a
+  brand-new instance on every call, which discarded their instance-local TTL
+  caches (TMDB: one-hour movie/TV/search/page caches; Prowlarr: five-minute
+  indexer-priority cache) between requests and background ticks.
 """
 
 from __future__ import annotations
@@ -115,6 +121,7 @@ __all__ = [
     "SettingsStore",
     "api_key_matches",
     "authenticate_request",
+    "configured_setup_token",
     "enforce_pre_init_setup_token",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
@@ -167,7 +174,9 @@ __all__ = [
     "resolve_eviction_interval_minutes",
     "resolve_log_max_rows",
     "resolve_log_retention_days",
+    "resolve_prowlarr",
     "resolve_qbittorrent",
+    "resolve_tmdb",
     "resolve_watchlist_sync_interval_minutes",
 ]
 
@@ -545,6 +554,42 @@ class SettingsStore:
                 out[key] = row.value
         return out
 
+    async def secret_values(self) -> frozenset[str]:
+        """Every currently-configured secret's DECRYPTED value (issue #268) --
+        the input to :func:`~plex_manager.logsafe.redact_known_secrets`'s
+        value-based redaction pass, never returned over the API (unlike
+        :meth:`redacted`, this is for in-process consumption only: the
+        log-capture handler and the ``/ops/logs*`` read boundaries, never a
+        response body).
+
+        One query across all of :data:`SECRET_SETTING_KEYS` rather than one
+        ``get()`` per key -- this is called on every log-capture drain tick
+        (see ``web/app.py``'s ``_log_drain_loop``) and every ``/ops/logs*``
+        read, so it stays a single round trip. An unset secret contributes
+        nothing (never an empty string -- ``redact_known_secrets`` would skip
+        it anyway via its length guard, but there is no reason to hand it one).
+
+        Also folds in ``SystemSettings.app_api_key`` -- the recovery/automation
+        break-glass ``X-Api-Key`` credential (see :func:`authenticate_request`).
+        It lives in a SEPARATE table from the generic ``settings`` key/value
+        store this method otherwise reads (:class:`SystemSettings` is a
+        singleton row, not a ``Setting`` row keyed by :data:`SECRET_SETTING_KEYS`),
+        so without this second query a bare occurrence of the break-glass key in
+        a log line -- e.g. echoed back in an error message, or pasted into a
+        support request -- would sail past this redaction pass entirely. A
+        second query (rather than folding it into the query above) is
+        unavoidable: it is a different table with no ``key`` column to join on,
+        and this is still only two round trips total, not N.
+        """
+        result = await self._session.execute(
+            select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
+        )
+        values = {value for value in result.scalars().all() if value}
+        system = await load_system_settings(self._session)
+        if system is not None and system.app_api_key:
+            values.add(system.app_api_key)
+        return frozenset(values)
+
 
 # --------------------------------------------------------------------------- #
 # Shared HTTP client
@@ -682,6 +727,21 @@ def _configured_setup_token() -> str | None:
     return value or None
 
 
+def configured_setup_token() -> str | None:
+    """Return the configured pre-init hardening token, or ``None`` if unset.
+
+    Public counterpart to :func:`_configured_setup_token`, for the ONE caller
+    outside this module allowed to see the raw value: the startup log line
+    (issue #65) that prints a ready-to-click ``Setup: http://host:port/setup?
+    setup_token=...`` URL so an operator can follow one link from ``docker logs``
+    instead of hunting ``PLEX_MANAGER_SETUP_TOKEN`` across env/compose/scrollback.
+    Callers should gate on :func:`is_setup_token_required` first, so the token is
+    only ever embedded when it is actually enforced — this stays a discoverability
+    aid (ADR-0005's install-time exception), never a new auth surface.
+    """
+    return _configured_setup_token()
+
+
 def is_setup_token_required(request: Request | None = None) -> bool:
     """Whether this request requires ``X-Setup-Token`` before initialization.
 
@@ -770,22 +830,38 @@ async def _session_auth_context(
     token_hash = hash_session_token(token)
     now = datetime.now(UTC)
     result = await session.execute(
-        select(AuthSession, User)
-        .join(User, User.id == AuthSession.user_id)
-        .where(
+        select(AuthSession).where(
             AuthSession.token_hash == token_hash,
             AuthSession.revoked_at.is_(None),
         )
     )
-    row = result.first()
-    if row is None:
+    auth_session = result.scalars().first()
+    if auth_session is None:
         return None
-    auth_session, user = row
     expires_at = _normalize_dt(auth_session.expires_at)
     if expires_at <= now:
         return None
     if enforce_csrf:
         _require_csrf_for_session(request)
+    if auth_session.user_id is None:
+        # A recovery session: minted by exchanging a valid ``X-Api-Key`` for this
+        # HTTP-only cookie (``POST /auth/api-key``, CodeQL #263). It carries the
+        # recovery key's admin authority with no Plex identity — reported exactly
+        # like direct ``X-Api-Key`` auth (``authenticate_request`` above), so the
+        # ``/auth/me`` answer and every gate see one consistent api-key context
+        # whether the key rode the header or was exchanged for the cookie. CSRF is
+        # still enforced above because this IS a cookie credential, unlike the
+        # header path.
+        return AuthContext(
+            method=AuthMethod.api_key,
+            is_admin=True,
+            session_expires_at=expires_at,
+        )
+    user = await session.get(User, auth_session.user_id)
+    if user is None:
+        # The owning user row was deleted out from under a still-live session
+        # (ondelete=CASCADE normally removes both together; this guards the race).
+        return None
     return AuthContext(
         method=AuthMethod.plex_session,
         user_id=user.id,
@@ -957,28 +1033,112 @@ async def require_setup_admin(
 # --------------------------------------------------------------------------- #
 # Adapter factories (decrypt creds + share the AsyncClient)
 # --------------------------------------------------------------------------- #
-async def get_tmdb(
-    session: Annotated[AsyncSession, Depends(get_session)],
-    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+@dataclass(frozen=True)
+class _CachedTmdb:
+    """One cached :class:`TmdbMetadata` plus the key (settings + the
+    ``httpx.AsyncClient`` it was built against) it was built from -- the exact
+    same shape as :class:`_CachedQbittorrent` (issue #214)."""
+
+    key: tuple[str, httpx.AsyncClient]
+    client: TmdbMetadata
+
+
+async def resolve_tmdb(
+    state: State,
+    session: AsyncSession,
+    client: httpx.AsyncClient,
 ) -> MetadataPort:
-    """Build a configured :class:`MetadataPort` (TMDB), or 409 if unconfigured."""
+    """Build (or reuse) the configured TMDB adapter, else raise 409 (issue #214).
+
+    Caches ONE :class:`TmdbMetadata` on ``state.tmdb_client``, keyed on the
+    effective ``tmdb_api_key`` PLUS the ``httpx.AsyncClient`` instance passed in
+    this call -- the identical settings-or-client-identity invalidation rule
+    :func:`resolve_qbittorrent` uses (see its docstring for the full ASGI-
+    lifespan-restart rationale: a new ``http_client`` generation must invalidate
+    the cache exactly like a settings change, so a stale adapter is never left
+    wrapping a closed client).
+
+    Before this cache, every caller — including ``Depends(get_tmdb)`` on every
+    discovery/request route AND the auto-grab loop's per-tick call — built a
+    brand-new ``TmdbMetadata`` with EMPTY movie/TV/search/page/recommendation
+    caches, discarding the whole point of the adapter's instance-local one-hour
+    TTL caching (``TmdbMetadata.__init__``'s ``_movie_cache`` /  ``_tv_cache`` /
+    ``_search_cache`` / ``_page_cache`` / recommendation caches) between
+    requests and ticks — every lookup re-hit TMDB even for a title just resolved
+    moments earlier.
+    """
     api_key = await SettingsStore(session).get("tmdb_api_key")
     if not api_key:
         raise ServiceNotConfiguredError("tmdb")
-    return TmdbMetadata(client, api_key)
+    key = (api_key, client)
+    cached = getattr(state, "tmdb_client", None)
+    if isinstance(cached, _CachedTmdb) and cached.key == key:
+        return cached.client
+    tmdb = TmdbMetadata(client, api_key)
+    state.tmdb_client = _CachedTmdb(key, tmdb)
+    return tmdb
 
 
-async def get_prowlarr(
+async def get_tmdb(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> MetadataPort:
+    """Build (or reuse the cached) configured :class:`MetadataPort` (TMDB), or
+    409 if unconfigured. See :func:`resolve_tmdb`."""
+    return await resolve_tmdb(request.app.state, session, client)
+
+
+@dataclass(frozen=True)
+class _CachedProwlarr:
+    """One cached :class:`ProwlarrIndexer` plus the key (settings + the
+    ``httpx.AsyncClient`` it was built against) it was built from -- the exact
+    same shape as :class:`_CachedQbittorrent` (issue #214)."""
+
+    key: tuple[str, str, httpx.AsyncClient]
+    client: ProwlarrIndexer
+
+
+async def resolve_prowlarr(
+    state: State,
+    session: AsyncSession,
+    client: httpx.AsyncClient,
 ) -> IndexerPort:
-    """Build a configured :class:`IndexerPort` (Prowlarr), or 409 if unconfigured."""
+    """Build (or reuse) the configured Prowlarr adapter, else raise 409 (issue #214).
+
+    Caches ONE :class:`ProwlarrIndexer` on ``state.prowlarr_client``, keyed on
+    the effective ``(prowlarr_url, prowlarr_api_key)`` PLUS the
+    ``httpx.AsyncClient`` instance passed in this call — see :func:`resolve_tmdb`
+    / :func:`resolve_qbittorrent` for the shared invalidation rationale.
+
+    Before this cache, every caller built a brand-new ``ProwlarrIndexer`` with an
+    EMPTY ``_priority_cache``, discarding the adapter's instance-local five-
+    minute indexer-priority TTL cache between requests and the auto-grab loop's
+    per-tick call — every search re-fetched ``/api/v1/indexer`` to resolve
+    priorities that had not changed.
+    """
     store = SettingsStore(session)
     url = await store.get("prowlarr_url")
     api_key = await store.get("prowlarr_api_key")
     if not url or not api_key:
         raise ServiceNotConfiguredError("prowlarr")
-    return ProwlarrIndexer(client, url, api_key)
+    key = (url, api_key, client)
+    cached = getattr(state, "prowlarr_client", None)
+    if isinstance(cached, _CachedProwlarr) and cached.key == key:
+        return cached.client
+    prowlarr = ProwlarrIndexer(client, url, api_key)
+    state.prowlarr_client = _CachedProwlarr(key, prowlarr)
+    return prowlarr
+
+
+async def get_prowlarr(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> IndexerPort:
+    """Build (or reuse the cached) configured :class:`IndexerPort` (Prowlarr),
+    or 409 if unconfigured. See :func:`resolve_prowlarr`."""
+    return await resolve_prowlarr(request.app.state, session, client)
 
 
 @dataclass(frozen=True)

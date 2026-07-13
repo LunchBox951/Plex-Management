@@ -110,6 +110,35 @@ def test_downloads_root_blank_env_var_falls_back_to_none(
     assert settings.downloads_root is None
 
 
+def test_host_port_unset_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_HOST_PORT", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port is None
+
+
+def test_host_port_reads_the_shared_compose_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The startup setup-URL hint (issue #65) needs the PUBLISHED host port, not
+    the in-container one -- ``docker-compose.yml`` hands the container's own
+    ``PLEX_MANAGER_HOST_PORT`` the SAME value its ``ports:`` mapping publishes it
+    under (mirroring the ``downloads_root``/``PLEX_MANAGER_DOWNLOADS_ROOT``
+    precedent above), so the app must read it, not guess."""
+    monkeypatch.setenv("PLEX_MANAGER_HOST_PORT", "9443")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port == 9443
+
+
+def test_host_port_blank_env_var_falls_back_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_HOST_PORT", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.host_port is None
+
+
 def test_trusted_proxy_hops_defaults_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PLEX_MANAGER_TRUSTED_PROXY_HOPS", raising=False)
 
@@ -134,6 +163,50 @@ def test_trusted_proxy_hops_set_env_var_parses(monkeypatch: pytest.MonkeyPatch) 
     settings = _settings_no_dotenv()
 
     assert settings.trusted_proxy_hops == 1
+
+
+def test_web_concurrency_defaults_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
+def test_web_concurrency_reads_the_unprefixed_convention_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Issue #240: the industry-convention name, deliberately WITHOUT the
+    # PLEX_MANAGER_ prefix every other setting uses -- see the field's docstring.
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 4
+
+
+def test_web_concurrency_blank_env_var_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEB_CONCURRENCY", "")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
+def test_web_concurrency_malformed_convention_value_does_not_crash_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex review (PR #281): this is a purely advisory field (a best-effort
+    # startup warning) fed by a THIRD-PARTY process manager's own convention --
+    # some set non-integer sentinels like gunicorn's "auto". A malformed value
+    # must fall back to the default, never raise and take the whole app down.
+    monkeypatch.setenv("WEB_CONCURRENCY", "auto")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
 
 
 def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:

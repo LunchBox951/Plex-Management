@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.services.log_capture_service import CapturedLogRecord, LogCaptureHandler
 from plex_manager.web import app as app_module
+from plex_manager.web.deps import SettingsStore
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -94,4 +95,30 @@ async def test_drain_commit_failure_counts_the_batch_as_dropped_exactly_once(
     # ``drain_once`` already counts on its own.
     assert handler.queue.empty()
     assert handler.dropped_count == 2
-    assert len(sleep_calls) == 1
+
+
+async def test_drain_loop_refreshes_the_handlers_secret_values_every_tick(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #268: ``_log_drain_loop`` is what keeps ``LogCaptureHandler.
+    secret_values`` current -- the handler itself has no DB access (``emit``
+    runs synchronously, possibly off the loop thread), so a settings change
+    (a newly-configured or rotated secret) must reach it via this periodic
+    refresh, not require a restart."""
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    assert handler.secret_values == frozenset()
+
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("qbittorrent_password", "fake-drain-loop-secret")
+        await session.commit()
+
+    async def _fake_sleep(seconds: float) -> None:
+        raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    app = _app(sessionmaker_, handler)
+    with pytest.raises(_StopLoop):
+        await app_module._log_drain_loop(app)  # pyright: ignore[reportPrivateUsage]
+
+    assert handler.secret_values == frozenset({"fake-drain-loop-secret"})

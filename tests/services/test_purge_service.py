@@ -6,14 +6,23 @@ guard is genuinely exercised (the same posture as ``test_eviction_service``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
-from plex_manager.ports.download_client import DownloadClientPort
-from plex_manager.services import purge_service
+from plex_manager.ports.download_client import (
+    AddResult,
+    DownloadClientPort,
+    DownloadedFile,
+    DownloadStatus,
+    FailureDetail,
+)
+from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
@@ -194,6 +203,265 @@ async def test_remove_torrent_is_best_effort_and_never_raises(
     qbt: DownloadClientPort = _RaisingRemoveQbt()
     with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
         await purge_service.remove_torrent(qbt, "b" * 40, context="a test")
+    assert "failed to remove torrent" in caplog.text
+
+
+async def test_remove_torrent_skips_the_poll_when_content_path_is_unknown() -> None:
+    # No content_path reported at all (e.g. a metadata-only torrent) -- nothing
+    # distinct to verify, so remove_torrent returns immediately.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(info_hash="a" * 40, name="x", raw_state="downloading", content_path=None)
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+    assert qbt.removed == [("a" * 40, True)]
+
+
+async def test_remove_torrent_returns_immediately_when_content_path_already_gone(
+    tmp_path: Path,
+) -> None:
+    # Issue #240: the common case -- the client's own deletion already finished
+    # (or the path never existed) -- must not pay the poll's sleep interval.
+    content = tmp_path / "already-gone"
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40, name="x", raw_state="downloading", content_path=str(content)
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+
+
+async def test_remove_torrent_polls_until_content_path_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #240: qBittorrent's own file deletion is ASYNCHRONOUS after its ACK
+    # -- remove_torrent must poll for the content path to actually leave disk
+    # before returning, so a caller's guard release genuinely means "gone".
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.05)
+    content = tmp_path / "still-here.mkv"
+    content.write_bytes(b"x")
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40, name="x", raw_state="downloading", content_path=str(content)
+            )
+        ]
+    )
+
+    async def _delete_shortly_after() -> None:
+        await asyncio.sleep(0.15)
+        content.unlink()
+
+    deleter = asyncio.create_task(_delete_shortly_after())
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    await asyncio.gather(deleter)  # reap the helper task cleanly before the test ends
+    assert ok is True
+    assert not content.exists()
+
+
+async def test_remove_torrent_logs_and_proceeds_when_the_poll_bound_elapses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A client so slow to finish its own deletion that the bound elapses is
+    # LOGGED (honesty over silence), not silently swallowed -- but the
+    # best-effort call still reports the removal itself as successful (the
+    # client DID ack the delete) rather than blocking forever.
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.02)
+    content = tmp_path / "never-goes-away.mkv"
+    content.write_bytes(b"x")
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40, name="x", raw_state="downloading", content_path=str(content)
+            )
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+
+    assert ok is True
+    assert "content path still present" in caplog.text
+    assert content.exists()  # untouched -- this function never deletes anything itself
+
+
+class _RaisingStatusQbt(FakeQbittorrent):
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        raise RuntimeError("qbt is down")
+
+
+async def test_remove_torrent_tolerates_a_failed_status_snapshot() -> None:
+    # A best-effort SNAPSHOT failure must not abort the removal itself -- it just
+    # means there is nothing distinct to poll afterwards.
+    qbt: DownloadClientPort = _RaisingStatusQbt()
+    ok = await purge_service.remove_torrent(qbt, "c" * 40, context="a test")
+    assert ok is True
+
+
+async def test_remove_torrent_remaps_a_host_namespace_content_path_before_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex review (PR #281): qBittorrent runs on the HOST, so the reported
+    # content_path (e.g. /srv/downloads/...) usually does not exist inside this
+    # container -- polling it raw would find it "already gone" and release the
+    # guard immediately even while qBittorrent is still deleting the real,
+    # container-visible file under the /downloads bind mount. Prove the remap
+    # happens: the visible file is still on disk under the remapped mount, so
+    # the poll must actually run against IT, not the never-existing host path.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    video = mount / "Some.Movie.2020.1080p-GRP.mkv"
+    video.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.05)
+    host_save_path = "/srv/downloads"
+    host_content_path = f"{host_save_path}/{video.name}"
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name=video.name,
+                raw_state="stalledUP",
+                save_path=host_save_path,
+                content_path=host_content_path,
+            )
+        ],
+        files={("a" * 40): [DownloadedFile(name=video.name, size_bytes=1024)]},
+    )
+
+    async def _delete_shortly_after() -> None:
+        await asyncio.sleep(0.15)
+        video.unlink()
+
+    deleter = asyncio.create_task(_delete_shortly_after())
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    await asyncio.gather(deleter)
+
+    assert ok is True
+    assert not video.exists()  # the poll genuinely waited on the REMAPPED path
+
+
+async def test_remove_torrent_skips_the_poll_when_the_host_path_cannot_be_remapped(
+    tmp_path: Path,
+) -> None:
+    # No live download mount matches, and the torrent's own file list can't prove
+    # any candidate -- an honest "not visible" skip, never a guess that would
+    # release the guard against the wrong (or a stale) path.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="x",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path="/srv/downloads/Some.Movie.2020.1080p-GRP.mkv",
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+
+
+async def test_visible_content_path_returns_none_when_save_path_is_empty() -> None:
+    # No live save-path anchor (a torrent status with no save path reported) --
+    # only the verbatim content path counts; a free suffix search is never
+    # attempted (mirrors import_service._resolve_visible_content).
+    qbt = FakeQbittorrent()
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/gone.mkv", ""
+    )
+    assert result is None
+
+
+class _RaisingListFilesQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise RuntimeError("qbt is down")
+
+
+async def test_visible_content_path_tolerates_a_failed_file_list_fetch() -> None:
+    # A best-effort remap: a client hiccup fetching the file list must not raise
+    # -- it just means there's nothing safely provable to poll.
+    qbt: DownloadClientPort = _RaisingListFilesQbt()
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/gone.mkv", "/srv/downloads"
+    )
+    assert result is None
+
+
+class _MissingRemoveQbt(DownloadClientPort):
+    """A ``DownloadClientPort`` implementation that overrides every method
+    EXCEPT ``remove`` -- proving issue #204's fix: the Protocol's own default
+    body for ``remove`` now raises ``NotImplementedError`` (never a silent
+    implicit ``return None``) when a subclass forgets to override it."""
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        return AddResult(torrent_hash="hash", created=True)
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        return None
+
+    async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
+        return []
+
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        return []
+
+    async def pause(self, info_hash: str) -> None:
+        return None
+
+    async def resume(self, info_hash: str) -> None:
+        return None
+
+    # ``remove`` deliberately NOT overridden -- the Protocol's own default runs.
+
+    async def set_category(self, info_hash: str, category: str) -> None:
+        return None
+
+    async def get_save_path(self, info_hash: str) -> str | None:
+        return None
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        return []
+
+    async def get_default_save_path(self) -> str | None:
+        return None
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        return None
+
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
+        return None
+
+
+async def test_missing_remove_implementation_can_never_report_purge_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #204's load-bearing regression: before the fix, a
+    ``DownloadClientPort`` implementation that forgot to override ``remove``
+    fell through to the Protocol's docstring-only default -- Python's implicit
+    ``return None`` -- so ``qbt.remove(...)`` would appear to SUCCEED for a
+    torrent that was never actually removed, and ``purge_service.remove_torrent``
+    would report ``True``: a blocklisted/cancelled torrent silently kept
+    seeding forever with no visible failure anywhere.
+
+    Now the default raises ``NotImplementedError``, which ``remove_torrent``'s
+    best-effort ``except Exception`` catches, logs, and reports as ``False`` --
+    the caller (``queue_service``) then correctly keeps the durable "removal
+    still owed" marker instead of persisting a false "removed" outcome.
+    """
+    qbt: DownloadClientPort = _MissingRemoveQbt()  # pyright: ignore[reportAbstractUsage]
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        result = await purge_service.remove_torrent(qbt, "c" * 40, context="a test")
+    assert result is False
     assert "failed to remove torrent" in caplog.text
 
 
