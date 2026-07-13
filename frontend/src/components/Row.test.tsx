@@ -360,8 +360,15 @@ describe('Row looping track (issue #190)', () => {
     for (const copyIndex of [0, 1, 2]) {
       expect(document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)).toHaveLength(20)
     }
+    // Slot 4 is a padding REPEAT of SHOW (4 % 3 === 1) — its poster art is present
+    // for the loop runway, but as an inert clone it exposes no interactive control.
+    const paddingRepeat = loopTile(1, 4)
+    expect(paddingRepeat).toHaveTextContent('Already Requested Show')
+    expect(paddingRepeat).toHaveAttribute('inert')
+    expect(within(paddingRepeat).queryByRole('button')).not.toBeInTheDocument()
+    // The single real SHOW tile (first, un-padded occurrence) keeps its control.
     expect(
-      within(loopTile(1, 4)).getByRole('button', {
+      within(loopTile(1, 1)).getByRole('button', {
         name: 'View details for Already Requested Show (2019)',
       }),
     ).toBeInTheDocument()
@@ -541,5 +548,105 @@ describe('Row looping track (issue #190)', () => {
 
     rerender(<Row title="Home row" items={[]} onSelect={() => {}} />)
     expect(container).toBeEmptyDOMElement()
+  })
+})
+
+describe('Row loop-clone inertness and screen-reader honesty (issue #190)', () => {
+  const REQUEST_MOVIE = 'Request Unbadged Movie'
+
+  it('leaves only the middle copy of an already-long source in the tab order and a11y tree', () => {
+    // 21 unique items => no padding; each copy is a faithful 21-tile mirror.
+    const longItems = Array.from({ length: 21 }, (_, index) => item(index))
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={longItems} onSelect={() => {}} tileState={() => null} />)
+
+    // 63 tiles are rendered for the visual loop, but exactly the 21 real ones (the
+    // middle copy) are non-inert and in the accessibility tree.
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(63)
+    expect(document.querySelectorAll('[data-loop-real]')).toHaveLength(21)
+    for (const copyIndex of [0, 2]) {
+      for (const el of document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)) {
+        expect(el).toHaveAttribute('inert')
+        expect(el).toHaveAttribute('aria-hidden', 'true')
+      }
+    }
+    for (const el of document.querySelectorAll('[data-loop-copy="1"]')) {
+      expect(el).not.toHaveAttribute('inert')
+      expect(el).not.toHaveAttribute('aria-hidden')
+    }
+
+    // Screen-reader honesty: one details button + one request action per real item,
+    // never one-per-clone. getAllByRole ignores inert/aria-hidden subtrees.
+    expect(screen.getAllByRole('button', { name: /^View details for/ })).toHaveLength(21)
+    expect(screen.getAllByRole('button', { name: /^Request / })).toHaveLength(21)
+  })
+
+  it('announces a padded short source by its real item count, not the padded/cloned count', () => {
+    // 3 unique items padded to 20 logical slots, tripled to 60 tiles — yet a screen
+    // reader must hear three titles, once each.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row
+        title="Home row"
+        items={[MOVIE, SHOW, item(2)]}
+        onSelect={() => {}}
+        tileState={() => null}
+      />,
+    )
+
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(60)
+    expect(document.querySelectorAll('[data-loop-real]')).toHaveLength(3)
+    // Exactly the three unique titles are reachable as details triggers.
+    const detailNames = screen
+      .getAllByRole('button', { name: /^View details for/ })
+      .map((el) => el.getAttribute('aria-label'))
+    expect(detailNames).toHaveLength(3)
+    expect(new Set(detailNames).size).toBe(3)
+    // And exactly the three request actions, one per real unbadged tile.
+    expect(screen.getAllByRole('button', { name: /^Request / })).toHaveLength(3)
+  })
+
+  it('offers the request action only from a real tile, and it targets the real source item', () => {
+    const createMutation = mutation({ id: 1 })
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    // The padded clone at copy 1, slot 1 carries no request control at all.
+    expect(within(loopTile(1, 1)).queryByRole('button')).not.toBeInTheDocument()
+    expect(loopTile(1, 1)).toHaveAttribute('inert')
+
+    // The lone reachable request action belongs to the real tile and POSTs the
+    // real item's identity — clones can never source a request.
+    const action = screen.getByRole('button', { name: REQUEST_MOVIE })
+    expect(action.closest('[data-loop-copy]')).toBe(loopTile(1, 0))
+    fireEvent.click(action)
+    expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+      tmdb_id: MOVIE.tmdb_id,
+      media_type: MOVIE.media_type,
+    } satisfies CreateRequestBody)
+  })
+
+  it('pads deterministically by modular repetition (no randomness, stable across renders)', () => {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    const source = [MOVIE, SHOW, item(2)]
+    const readSlotTitles = () =>
+      Array.from({ length: 20 }, (_, slotIndex) =>
+        loopTile(1, slotIndex).querySelector('.font-display')?.textContent,
+      )
+
+    const { rerender } = render(
+      <Row title="Home row" items={source} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    const firstPass = readSlotTitles()
+    // Each padded slot is source[slot % source.length] — pure, index-driven.
+    for (let slotIndex = 0; slotIndex < 20; slotIndex += 1) {
+      expect(firstPass[slotIndex]).toBe(source[slotIndex % source.length]!.title)
+    }
+
+    // Re-rendering the same source yields byte-identical padding (no Math.random).
+    rerender(
+      <Row title="Home row" items={source} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    expect(readSlotTitles()).toEqual(firstPass)
   })
 })

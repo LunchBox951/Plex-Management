@@ -228,7 +228,9 @@ describe('Discover — quick-request freshness gate (Codex P2)', () => {
     // so the one-click Request is safe to offer.
     mockRequests([])
     render(<Discover />)
-    expect(screen.getAllByRole('button', { name: REQUEST_MOVIE })).not.toHaveLength(0)
+    // getByRole (singular) doubles as a honesty check: the looping row exposes the
+    // quick-request action exactly once, not one-per-clone.
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
   })
 })
 
@@ -246,10 +248,9 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       ])
       render(<Discover />)
       expect(screen.queryByRole('button', { name: REQUEST_SHOW })).not.toBeInTheDocument()
-      // The tile itself still opens the detail modal — the correction path.
-      fireEvent.click(
-        screen.getAllByRole('button', { name: 'View details for Fresh Show (2021)' })[0]!,
-      )
+      // The tile itself still opens the detail modal — the correction path. The
+      // real tile is the single reachable details trigger (clones are inert).
+      fireEvent.click(screen.getByRole('button', { name: 'View details for Fresh Show (2021)' }))
       expect(screen.getByRole('heading', { name: 'Fresh Show' })).toBeInTheDocument()
     },
   )
@@ -263,7 +264,7 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       requestRow({ tmdb_id: SHOW.tmdb_id, media_type: 'movie', title: 'Same-id Movie', status: 'failed' }),
     ])
     render(<Discover />)
-    expect(screen.getAllByRole('button', { name: REQUEST_SHOW })).not.toHaveLength(0)
+    expect(screen.getByRole('button', { name: REQUEST_SHOW })).toBeInTheDocument()
   })
 
   it('keeps the quick-request action for a MOVIE with settled request history', () => {
@@ -274,6 +275,6 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       requestRow({ tmdb_id: MOVIE.tmdb_id, media_type: 'movie', title: 'Fresh Movie', status: 'cancelled' }),
     ])
     render(<Discover />)
-    expect(screen.getAllByRole('button', { name: REQUEST_MOVIE })).not.toHaveLength(0)
+    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
   })
 })

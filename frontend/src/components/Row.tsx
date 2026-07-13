@@ -30,6 +30,15 @@ interface RowProps {
 
 const LOOP_ITEM_TARGET = 20
 const LOOP_COPY_COUNT = 3
+/**
+ * The one copy whose original (un-padded) tiles are the real, operable set: they
+ * carry the interactive controls and are the only tiles left in the accessibility
+ * tree. Everything else — the other two copies plus any padding repeats — is inert
+ * decorative runway (see `isRealTile`). The middle copy is chosen because the track
+ * initializes scrolled to its start, so the real set is exactly what's on screen and
+ * in reach the moment the row mounts.
+ */
+const REAL_COPY_INDEX = 1
 const WRAP_EPSILON = 5
 /** How far each chevron scrolls — a little under one viewport of posters. */
 const SCROLL_STEP = 600
@@ -68,7 +77,11 @@ function wrapAtEdge(track: HTMLDivElement, setWidth: number): void {
 
 /**
  * A titled, horizontally-scrollable poster strip. Three content-identical copies
- * make native scrolling and chevron navigation appear continuous in either direction.
+ * make native scrolling and chevron navigation appear continuous in either
+ * direction; only the middle copy's original tiles are real (focusable,
+ * accessible, interactive) — the rest are inert decorative runway (see the tile
+ * map's `isRealTile`), so the loop illusion never leaks duplicate tiles into the
+ * tab order or the accessibility tree.
  */
 export function Row({
   title,
@@ -177,12 +190,27 @@ export function Row({
               ))
             : loopTiles.map(({ item, slotIndex, copyIndex }) => {
                 const state = tileState?.(item) ?? null
+                // Exactly one copy of each source item is a real, operable tile:
+                // the un-padded slots of the middle copy. Every other rendered tile
+                // — the two mirror copies and any padding repeats — is inert
+                // decorative runway: it makes the loop look continuous but is removed
+                // from the tab order AND the accessibility tree, so a keyboard user
+                // never tabs through phantom clones and a screen reader hears each
+                // title (and the row's item count) exactly once, not padded/tripled.
+                // `inert` also blocks pointer targeting, so a stray request can only
+                // ever originate from the single real tile.
+                const isRealTile = copyIndex === REAL_COPY_INDEX && slotIndex < items.length
                 return (
                   <div
                     key={`${item.media_type}-${item.tmdb_id}-slot-${slotIndex}-copy-${copyIndex}`}
                     data-loop-copy={copyIndex}
                     data-loop-slot={slotIndex}
                     data-loop-copy-start={slotIndex === 0 ? copyIndex : undefined}
+                    data-loop-real={isRealTile ? '' : undefined}
+                    aria-hidden={isRealTile ? undefined : true}
+                    // React 19 renders the boolean `inert` attribute; spread it only
+                    // when set so real tiles carry no `inert=""` at all.
+                    {...(isRealTile ? {} : { inert: true })}
                     className="w-[150px] shrink-0 snap-start"
                   >
                     <PosterCard
@@ -190,10 +218,13 @@ export function Row({
                       year={item.year ?? null}
                       posterUrl={item.poster_url ?? null}
                       seed={item.tmdb_id}
-                      onClick={() => onSelect(item)}
+                      // Omit onClick entirely on inert clones (under
+                      // exactOptionalPropertyTypes a bare `undefined` is a type
+                      // error): a clone renders no details trigger button at all.
+                      {...(isRealTile ? { onClick: () => onSelect(item) } : {})}
                       badge={state ? <TileStatusGlyph status={state} /> : undefined}
                       action={
-                        state === null && (quickRequestable?.(item) ?? true) ? (
+                        isRealTile && state === null && (quickRequestable?.(item) ?? true) ? (
                           <QuickRequestButton item={item} />
                         ) : undefined
                       }
