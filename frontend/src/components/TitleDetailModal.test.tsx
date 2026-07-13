@@ -2027,6 +2027,26 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
     expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
   })
 
+  it('never claims "no search run yet" while release search is closed', () => {
+    // Downloading: a search DID run (its grab is why we're downloading) and the
+    // browser is deliberately shut — the copy must say that, not "no search yet".
+    setBaseMocks([request('downloading')], [queueItem()])
+    const view = render(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    const admin = screen.getByRole('region', { name: 'ADMIN · RELEASES' })
+    expect(
+      within(admin).getByText("Release search isn't available in this state."),
+    ).toBeInTheDocument()
+    expect(within(admin).queryByText(/no release search run yet/i)).not.toBeInTheDocument()
+
+    // Searchable state with no preview yet: the original placeholder is the truth.
+    setBaseMocks([request('searching')])
+    view.rerender(<TitleDetailModal title={MOVIE} open onOpenChange={() => {}} />)
+    expect(screen.getByText(/no release search run yet for this title\./i)).toBeInTheDocument()
+    expect(
+      screen.queryByText("Release search isn't available in this state."),
+    ).not.toBeInTheDocument()
+  })
+
   it('keeps Search releases and Retry import in the Admin header', async () => {
     setBaseMocks([request('import_blocked')], [queueItem({ status: 'import_blocked' })])
     const importMutation = mutation(undefined)

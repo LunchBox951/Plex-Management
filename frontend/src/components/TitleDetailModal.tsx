@@ -1239,10 +1239,18 @@ export function TitleDetailModal({
                 canGrab={canGrab}
                 variant="admin"
               />
-            ) : (
+            ) : showReleaseSearch ? (
               <p className="text-sm text-faint">
                 No release search run yet for this title.
                 {title.media_type === 'tv' ? ` Season ${currentSeason ?? 1}.` : ''}
+              </p>
+            ) : (
+              // Honest in the states where searching is deliberately closed
+              // (downloading/blocked/finalizing/available/settled): a search may
+              // well have run — its grab is why we're here — so never claim
+              // "no search run yet"; say why the browser is shut instead.
+              <p className="text-sm text-faint">
+                Release search isn&apos;t available in this state.
               </p>
             )}
           </div>
