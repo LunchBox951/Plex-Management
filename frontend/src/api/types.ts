@@ -46,6 +46,11 @@ export type QualityProfileItemResponse = Schemas['QualityProfileItemResponse']
 
 export type SettingsResponse = Schemas['SettingsResponse']
 export type SettingsUpdate = Schemas['SettingsUpdate']
+export type AutomaticUpdateWeekday = NonNullable<
+  SettingsResponse['automatic_update_weekdays']
+>[number]
+export type UpdateResultItem = Schemas['UpdateResultItem']
+export type UpdateStatusResponse = Schemas['UpdateStatusResponse']
 export type AuthMeResponse = Schemas['AuthMeResponse']
 export type AuthUser = Schemas['AuthUser']
 export type PlexSignInRequest = Schemas['PlexSignInRequest']

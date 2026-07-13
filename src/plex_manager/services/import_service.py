@@ -417,8 +417,9 @@ async def _resolve_visible_content(
     :func:`_resolve_content`) can be a HOST-namespace path this container cannot
     see (issue #133) -- e.g. ``/home/lunchbox/Downloads/.plex_manager/...`` when
     the real, mounted location is ``/downloads/...``. Returns the path unchanged
-    when it already exists here (the same-namespace fast path -- no client call
-    needed); else ANCHORS the remap on ``resolved.save_path`` and demands PROOF:
+    when it already exists here AND genuinely sits under a live download mount
+    (the same-namespace fast path -- no client call needed); else ANCHORS the
+    remap on ``resolved.save_path`` and demands PROOF:
     the torrent's OWN file list is fetched from the client
     (:meth:`~plex_manager.ports.download_client.DownloadClientPort.list_files`,
     each entry a save-path-relative path + exact byte size) and the remapped
@@ -431,14 +432,30 @@ async def _resolve_visible_content(
     client failure fetching the file list raises the adapter's typed error and is
     handled exactly like a ``get_status`` failure (retry next cycle / surfaced on
     the operator's manual retry). Stat probes offload via ``asyncio.to_thread``.
+
+    The fast path is MOUNT-GATED, exactly like ``purge_service``'s counterpart
+    (issue #290, finding #2): a HOST-namespace ``resolved.path`` can
+    coincidentally exist in this container as a stale/phantom tree OUTSIDE every
+    live download mount (the old importer ``os.makedirs``-ed host-shaped trees),
+    and short-circuiting to it would import -- and PLACE -- the stale twin while
+    the real file sits under the mount. So an existing-but-outside-mount path
+    falls through to the proof-gated remap, which prefers the proven mounted
+    candidate and keeps
+    :func:`~plex_manager.services.path_visibility.remap_download_content`'s
+    verbatim last-resort for an operator's legitimate extra volume (only when NO
+    mounted candidate resolves at all). The no-anchor breadcrumb keeps its
+    verbatim-existence semantics -- the same steps-1/3-only behaviour the shared
+    helper documents for an anchorless ``content``.
     """
-    if await asyncio.to_thread(os.path.exists, resolved.path):
+    exists = await asyncio.to_thread(os.path.exists, resolved.path)
+    if exists and await asyncio.to_thread(path_visibility.content_is_mounted, resolved.path):
         return resolved.path
     if not resolved.save_path:
         # A stored crash-resume breadcrumb has no anchor to remap against: only
         # the verbatim path counts (a free suffix search would reintroduce the
-        # stale-match hazard).
-        return None
+        # stale-match hazard) -- exactly remap_download_content's own no-anchor
+        # semantics (its steps 1/3), just without a needless list_files call.
+        return resolved.path if exists else None
     files = await qbt.list_files(torrent_hash)
     expected = [(f.name, f.size_bytes) for f in files]
     return await asyncio.to_thread(

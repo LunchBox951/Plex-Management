@@ -394,14 +394,30 @@ def _snapshot_content_path(status: DownloadStatus) -> str | None:
     torrents, leaving the issue #240 same-hash race open for them (issue #290,
     finding #1).
 
-    Returns ``None`` when nothing distinct is known, or when ``name`` is absolute
-    (it must never escape ``save_path`` -- mirrors ``_resolve_content``'s guard),
-    so the caller honestly skips the poll rather than watching the wrong tree.
+    Returns ``None`` when nothing distinct is known, or when ``name`` would
+    escape ``save_path`` -- an absolute ``name``, or a relative one whose ``..``
+    components (or symlinks) resolve the join OUTSIDE ``save_path`` (e.g.
+    ``save_path=/downloads/foo`` + ``name=../bar`` -> ``/downloads/bar``). Both
+    mirror ``import_service._resolve_content``'s realpath containment guard, so
+    the caller honestly skips the poll rather than watching an unrelated tree --
+    which could release (or needlessly delay) the same-hash guard based on the
+    wrong file. Strictly UNDER, not equal: a join that resolves back to
+    ``save_path`` itself (e.g. a ``.`` name) is the shared save directory again,
+    which must never be polled.
     """
     if status.content_path:
         return status.content_path
     if status.save_path and status.name and not os.path.isabs(status.name):
-        return os.path.join(status.save_path, status.name)
+        candidate = os.path.join(status.save_path, status.name)
+        # Realpath containment, exactly as import_service._ensure_under_save_path
+        # (kept local for the same reason that helper keeps _is_within local: the
+        # two services fail differently -- import raises a typed error, this
+        # snapshot degrades to an honest "nothing distinct to poll").
+        root_real = os.path.realpath(status.save_path)
+        candidate_real = os.path.realpath(candidate)
+        if candidate_real.startswith(root_real + os.sep):
+            return candidate
+        return None
     return None
 
 

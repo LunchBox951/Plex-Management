@@ -2,8 +2,22 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { useEvict, useOpsDisk, useOpsHealth, useSettings } from '../api/hooks'
-import type { DiskResponse, EvictResponse, HealthResponse, SettingsResponse } from '../api/types'
+import {
+  useCheckForUpdate,
+  useEvict,
+  useOpsDisk,
+  useOpsHealth,
+  useSettings,
+  useUpdateStatus,
+  useUpdateWhenReady,
+} from '../api/hooks'
+import type {
+  DiskResponse,
+  EvictResponse,
+  HealthResponse,
+  SettingsResponse,
+  UpdateStatusResponse,
+} from '../api/types'
 import { Status } from './Status'
 
 // Status's disk-root error branch renders a LinkButton (a react-router <Link>),
@@ -16,6 +30,9 @@ vi.mock('../api/hooks', () => ({
   useOpsHealth: vi.fn(),
   useOpsDisk: vi.fn(),
   useEvict: vi.fn(),
+  useUpdateStatus: vi.fn(),
+  useCheckForUpdate: vi.fn(),
+  useUpdateWhenReady: vi.fn(),
   // Most tests don't care about settings; default to "not loaded yet" so the
   // disk-threshold fallback constants kick in unless a test overrides this.
   useSettings: vi.fn(() => ({ data: undefined, isLoading: false, isError: false })),
@@ -100,6 +117,28 @@ function disk(overrides: Partial<DiskResponse> = {}): DiskResponse {
   }
 }
 
+function updateStatus(overrides: Partial<UpdateStatusResponse> = {}): UpdateStatusResponse {
+  return {
+    state: 'idle',
+    updater_available: true,
+    current_build: '1.4.0',
+    current_digest: 'sha256:current',
+    available_build: null,
+    available_digest: null,
+    channel: 'stable',
+    next_window_start: '2026-07-13T07:00:00Z',
+    next_window_end: '2026-07-13T09:00:00Z',
+    blocker: null,
+    last_checked_at: null,
+    last_result: null,
+    ...overrides,
+  }
+}
+
+const checkMutateAsync = vi.fn()
+const updateMutateAsync = vi.fn()
+const updatesRefetch = vi.fn()
+
 describe('Status', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -107,6 +146,23 @@ describe('Status', () => {
     // `mockReturnValue` — re-seed the default explicitly so one test's
     // settings override can't leak into the next.
     ;(useSettings as unknown as Mock).mockReturnValue({ data: undefined, isLoading: false, isError: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus(),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    ;(useCheckForUpdate as unknown as Mock).mockReturnValue({
+      mutateAsync: checkMutateAsync,
+      isPending: false,
+    })
+    ;(useUpdateWhenReady as unknown as Mock).mockReturnValue({
+      mutateAsync: updateMutateAsync,
+      isPending: false,
+    })
+    checkMutateAsync.mockResolvedValue(updateStatus({ state: 'checking' }))
+    updateMutateAsync.mockResolvedValue(updateStatus({ state: 'waiting_for_window' }))
   })
 
   it('uses the shared heading hierarchy and canonical dense card grammar', () => {
@@ -126,6 +182,7 @@ describe('Status', () => {
     )
     expect(screen.getByRole('button', { name: 'Free space now' })).toHaveClass('h-8')
     expect(screen.getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      'Updates',
       'Subsystems',
       'Background loops',
       'Disk',
@@ -135,7 +192,7 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(7)
+    expect(cards).toHaveLength(8)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',
@@ -146,6 +203,181 @@ describe('Status', () => {
       )
       expect(card).not.toHaveClass('p-4')
     }
+  })
+
+  it('renders updater availability, build/channel/window/blocker, and the last reported outcome', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'waiting_for_idle',
+        available_build: '1.5.0',
+        last_checked_at: '2026-07-12T12:00:00Z',
+        blocker: 'active_critical_work',
+        last_result: {
+          operation: 'check',
+          outcome: 'update_available',
+          finished_at: '2026-07-12T12:00:00Z',
+          from_build: '1.4.0',
+          to_build: '1.5.0',
+          detail_code: null,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Waiting for critical work')).toBeInTheDocument()
+    expect(screen.getByText('Sidecar connected')).toBeInTheDocument()
+    expect(screen.getByText('1.4.0')).toBeInTheDocument()
+    expect(screen.getAllByText('1.5.0').length).toBeGreaterThan(0)
+    expect(screen.getByText('stable')).toBeInTheDocument()
+    expect(screen.getByText('active critical work')).toBeInTheDocument()
+    expect(screen.getByText(/check · update available/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Update queued' })).toBeDisabled()
+  })
+
+  it.each([
+    ['installing', 'Installing update'],
+    ['rollback', 'Rolling back'],
+  ] as const)('renders the active %s phase and disables update actions', (state, label) => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText(label)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+  })
+
+  it('keeps the manual update action available outside the automatic schedule window', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'waiting_for_window',
+        available_build: '1.5.0',
+        blocker: 'outside_update_window',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Waiting for update window')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeEnabled()
+  })
+
+  it('keeps manual actions available when automatic updates are disabled', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'disabled',
+        blocker: 'automatic_updates_disabled',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Automatic updates disabled')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeEnabled()
+  })
+
+  it('renders queued install preflight honestly and prevents duplicate actions', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state: 'checking', blocker: 'checking_for_update' }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Checking for an update')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+  })
+
+  it('disables actions when the sidecar is unavailable', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'unavailable',
+        updater_available: false,
+        blocker: 'updater_unavailable',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.getByText('Sidecar not connected')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+    expect(screen.getByText(/Enable the automatic-update Compose profile/)).toBeInTheDocument()
+  })
+
+  it('describes action acceptance without claiming the check or installation completed', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check now' }))
+    await waitFor(() => expect(checkMutateAsync).toHaveBeenCalledTimes(1))
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Update check requested',
+        description: expect.stringContaining('when the check finishes'),
+      }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Update when ready' }))
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1))
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Update requested',
+        description: expect.stringContaining('does not wait for the automatic schedule window'),
+      }),
+    )
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: expect.stringMatching(/complete|installed/i) }),
+    )
   })
 
   it('renders a card per subsystem with its honest status label', () => {

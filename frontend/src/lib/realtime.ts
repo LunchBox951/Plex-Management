@@ -100,6 +100,7 @@ export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload)
     void qc.invalidateQueries({ queryKey: queryKeys.appKeyStatus })
     void qc.invalidateQueries({ queryKey: queryKeys.opsDisk })
     void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
+    void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
   }
   if (topics.has('requests')) {
     void qc.invalidateQueries({ queryKey: queryKeys.requests })
@@ -126,6 +127,9 @@ export function applyRealtimeEvent(qc: QueryClient, event: RealtimeEventPayload)
   }
   if (topics.has('ops:health')) {
     void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
+  }
+  if (topics.has('updates')) {
+    void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
   }
 }
 

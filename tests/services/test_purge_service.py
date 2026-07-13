@@ -432,6 +432,77 @@ async def test_remove_torrent_skips_the_poll_when_name_is_absolute() -> None:
     assert qbt.removed == [("a" * 40, True)]
 
 
+def test_snapshot_content_path_rejects_a_relative_name_that_escapes_save_path() -> None:
+    # PR #309 codex finding: a RELATIVE name can still escape save_path via ``..``
+    # components (save_path=/srv/downloads + name=../escape.mkv resolves to
+    # /srv/escape.mkv). Mirrors _resolve_content's realpath containment guard:
+    # nothing safe to poll, so the snapshot is None -- the post-delete poll must
+    # never watch an unrelated path and release/delay the same-hash guard on the
+    # wrong file.
+    status = DownloadStatus(
+        info_hash="a" * 40,
+        name="../escape.mkv",
+        raw_state="stalledUP",
+        save_path="/srv/downloads",
+        content_path=None,
+    )
+    assert purge_service._snapshot_content_path(status) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_snapshot_content_path_rejects_a_nested_dotdot_escape_and_a_dot_name() -> None:
+    # ``sub/../../escape`` sneaks the same escape past a naive startswith check on
+    # the unresolved join; a ``.`` name resolves back to save_path ITSELF, which is
+    # shared by sibling torrents and must never be polled.
+    for name in ("sub/../../escape.mkv", "."):
+        status = DownloadStatus(
+            info_hash="a" * 40,
+            name=name,
+            raw_state="stalledUP",
+            save_path="/srv/downloads",
+            content_path=None,
+        )
+        assert (
+            purge_service._snapshot_content_path(status)  # pyright: ignore[reportPrivateUsage]
+            is None
+        )
+
+
+def test_snapshot_content_path_joins_a_normal_relative_name() -> None:
+    # The guard must not disturb the normal fallback: a plain (even nested)
+    # relative name still joins onto save_path unchanged.
+    status = DownloadStatus(
+        info_hash="a" * 40,
+        name="Some.Movie.2020.1080p-GRP/Some.Movie.2020.1080p-GRP.mkv",
+        raw_state="stalledUP",
+        save_path="/srv/downloads",
+        content_path=None,
+    )
+    assert (
+        purge_service._snapshot_content_path(status)  # pyright: ignore[reportPrivateUsage]
+        == "/srv/downloads/Some.Movie.2020.1080p-GRP/Some.Movie.2020.1080p-GRP.mkv"
+    )
+
+
+async def test_remove_torrent_skips_the_poll_when_name_escapes_save_path() -> None:
+    # End-to-end shape of the guard above: with content_path absent and a
+    # ``..``-bearing name, there is nothing distinct AND contained to poll -- the
+    # removal still succeeds, the poll is honestly skipped.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="../escape.mkv",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path=None,
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+    assert qbt.removed == [("a" * 40, True)]
+
+
 async def test_remove_torrent_prefers_the_mounted_file_over_an_outside_mount_phantom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

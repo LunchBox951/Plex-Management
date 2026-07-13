@@ -1,6 +1,19 @@
 import { cn } from '../lib/cn'
-import { useEvict, useOpsDisk, useOpsHealth, useSettings } from '../api/hooks'
-import type { DiskRootItem, HealthResponse, SubsystemHealthItem } from '../api/types'
+import {
+  useCheckForUpdate,
+  useEvict,
+  useOpsDisk,
+  useOpsHealth,
+  useSettings,
+  useUpdateStatus,
+  useUpdateWhenReady,
+} from '../api/hooks'
+import type {
+  DiskRootItem,
+  HealthResponse,
+  SubsystemHealthItem,
+  UpdateStatusResponse,
+} from '../api/types'
 import { AdminEmptyState } from '../components/ui/AdminEmptyState'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
@@ -17,6 +30,174 @@ import { formatBytes, formatTimestamp } from '../lib/format'
 // only when settings haven't loaded yet, never in place of a real value.
 const DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT = 90
 const DISK_PRESSURE_TARGET_PERCENT_DEFAULT = 80
+
+type UpdateState = UpdateStatusResponse['state']
+
+const UPDATE_STATE: Record<UpdateState, { label: string; tone: DotTone }> = {
+  disabled: { label: 'Automatic updates disabled', tone: 'neutral' },
+  unavailable: { label: 'Updater unavailable', tone: 'error' },
+  idle: { label: 'Ready', tone: 'ok' },
+  checking: { label: 'Checking for an update', tone: 'warn' },
+  update_available: { label: 'Update available', tone: 'warn' },
+  waiting_for_window: { label: 'Waiting for update window', tone: 'warn' },
+  waiting_for_idle: { label: 'Waiting for critical work', tone: 'warn' },
+  draining: { label: 'Draining critical work', tone: 'warn' },
+  installing: { label: 'Installing update', tone: 'warn' },
+  rollback: { label: 'Rolling back', tone: 'warn' },
+  succeeded: { label: 'Last update succeeded', tone: 'ok' },
+  failed: { label: 'Update operation failed', tone: 'error' },
+}
+
+function readableCode(value: string): string {
+  return value.replaceAll('_', ' ')
+}
+
+function UpdatePanel({
+  status,
+  checkPending,
+  updatePending,
+  onCheck,
+  onUpdate,
+}: {
+  status: UpdateStatusResponse
+  checkPending: boolean
+  updatePending: boolean
+  onCheck: () => void
+  onUpdate: () => void
+}) {
+  const state = UPDATE_STATE[status.state]
+  const operationActive = ['checking', 'draining', 'installing', 'rollback'].includes(status.state)
+  // waiting_for_window describes the AUTOMATIC policy. Keep the explicit
+  // manual action available there because it intentionally bypasses that
+  // window. waiting_for_idle means an install is already queued.
+  const updateQueued = status.state === 'waiting_for_idle'
+  const availableBuild =
+    status.available_build ??
+    (status.last_checked_at === null || status.last_checked_at === undefined
+      ? 'Not checked yet'
+      : 'No newer build reported')
+  const nextWindow =
+    status.next_window_start && status.next_window_end
+      ? `${formatTimestamp(status.next_window_start)} – ${formatTimestamp(status.next_window_end)}`
+      : 'No upcoming automatic window'
+
+  return (
+    <article
+      aria-live="polite"
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="font-display text-sm font-semibold text-ink">Container updater</h3>
+          <div className="mt-1">
+            <Dot tone={state.tone} label={state.label} />
+          </div>
+        </div>
+        <Dot
+          tone={status.updater_available ? 'ok' : 'error'}
+          label={status.updater_available ? 'Sidecar connected' : 'Sidecar not connected'}
+        />
+      </div>
+
+      <dl className="mt-4 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-x-4 gap-y-2 font-mono text-xs">
+        <dt className="text-faint">Current build</dt>
+        <dd className="min-w-0 text-right break-words text-ink tabular-nums [overflow-wrap:anywhere]">
+          {status.current_build}
+        </dd>
+        <dt className="text-faint">Available build</dt>
+        <dd className="min-w-0 text-right break-words text-ink tabular-nums [overflow-wrap:anywhere]">
+          {availableBuild}
+        </dd>
+        <dt className="text-faint">Channel</dt>
+        <dd className="min-w-0 text-right break-words text-ink tabular-nums [overflow-wrap:anywhere]">
+          {status.channel}
+        </dd>
+        <dt className="text-faint">Last checked</dt>
+        <dd className="min-w-0 text-right break-words text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(status.last_checked_at)}
+        </dd>
+        <dt className="text-faint">Next window</dt>
+        <dd className="min-w-0 text-right break-words text-ink tabular-nums [overflow-wrap:anywhere]">
+          {nextWindow}
+        </dd>
+        <dt className="text-faint">Blocker</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right break-words tabular-nums [overflow-wrap:anywhere]',
+            status.blocker ? 'text-searching' : 'text-ink',
+          )}
+        >
+          {status.blocker ? readableCode(status.blocker) : 'None reported'}
+        </dd>
+      </dl>
+
+      {status.last_result ? (
+        <div className="mt-4 rounded-lg border border-hairline bg-bg px-3 py-2 text-xs text-muted">
+          <p className="font-semibold text-ink">Last completed operation</p>
+          <p className="mt-1 font-mono [overflow-wrap:anywhere]">
+            {readableCode(status.last_result.operation)} ·{' '}
+            {readableCode(status.last_result.outcome)} ·{' '}
+            {formatTimestamp(status.last_result.finished_at)}
+          </p>
+          {status.last_result.from_build || status.last_result.to_build ? (
+            <p className="mt-1 font-mono [overflow-wrap:anywhere]">
+              {status.last_result.from_build ?? 'unknown'} →{' '}
+              {status.last_result.to_build ?? 'unknown'}
+            </p>
+          ) : null}
+          {status.last_result.detail_code ? (
+            <p className="mt-1 font-mono text-searching [overflow-wrap:anywhere]">
+              {readableCode(status.last_result.detail_code)}
+            </p>
+          ) : null}
+        </div>
+      ) : (
+        <p className="mt-4 text-xs text-faint">No completed updater operation has been reported.</p>
+      )}
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          loading={checkPending}
+          disabled={
+            !status.updater_available ||
+            operationActive ||
+            updateQueued ||
+            status.state === 'waiting_for_window' ||
+            checkPending ||
+            updatePending
+          }
+          onClick={onCheck}
+        >
+          Check now
+        </Button>
+        <Button
+          size="sm"
+          loading={updatePending}
+          disabled={
+            !status.updater_available ||
+            operationActive ||
+            updateQueued ||
+            checkPending ||
+            updatePending
+          }
+          onClick={onUpdate}
+        >
+          {updateQueued ? 'Update queued' : 'Update when ready'}
+        </Button>
+      </div>
+      {!status.updater_available ? (
+        <p className="mt-3 text-xs text-faint">
+          Enable the automatic-update Compose profile to connect the scoped updater sidecar.
+        </p>
+      ) : null}
+    </article>
+  )
+}
 
 const SUBSYSTEM_TONE: Record<SubsystemHealthItem['status'], DotTone> = {
   ok: 'ok',
@@ -423,6 +604,9 @@ export function Status() {
   const disk = useOpsDisk()
   const evict = useEvict()
   const settings = useSettings()
+  const updates = useUpdateStatus()
+  const checkForUpdate = useCheckForUpdate()
+  const updateWhenReady = useUpdateWhenReady()
   const { toast } = useToast()
 
   // Same two settings the pressure sweep itself reads (web/deps.py) — falls
@@ -473,6 +657,41 @@ export function Status() {
     }
   }
 
+  const onCheckForUpdate = async () => {
+    try {
+      await checkForUpdate.mutateAsync()
+      toast({
+        title: 'Update check requested',
+        description: 'The sidecar will report the result here when the check finishes.',
+        intent: 'success',
+      })
+    } catch (error) {
+      toast({
+        title: 'Update check failed',
+        description: (error as ApiError).message,
+        intent: 'error',
+      })
+    }
+  }
+
+  const onUpdateWhenReady = async () => {
+    try {
+      await updateWhenReady.mutateAsync()
+      toast({
+        title: 'Update requested',
+        description:
+          'The sidecar will install when critical work is idle; this manual action does not wait for the automatic schedule window.',
+        intent: 'success',
+      })
+    } catch (error) {
+      toast({
+        title: 'Update request failed',
+        description: (error as ApiError).message,
+        intent: 'error',
+      })
+    }
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8 lg:px-11">
       <AdminPageHeader
@@ -488,6 +707,41 @@ export function Status() {
           </Button>
         }
       />
+
+      <section className="flex flex-col gap-[10px]">
+        <SectionHeader>Updates</SectionHeader>
+        {updates.data ? (
+          <>
+            {updates.isError ? (
+              <RefreshFailedNotice
+                what="update status"
+                {...(updates.error ? { message: updates.error.message } : {})}
+                onRetry={() => void updates.refetch()}
+              />
+            ) : null}
+            <UpdatePanel
+              status={updates.data}
+              checkPending={checkForUpdate.isPending}
+              updatePending={updateWhenReady.isPending}
+              onCheck={() => void onCheckForUpdate()}
+              onUpdate={() => void onUpdateWhenReady()}
+            />
+          </>
+        ) : updates.isLoading ? (
+          <CenteredSpinner label="Checking updater…" />
+        ) : (
+          <StateMessage
+            tone="error"
+            title="Couldn't load update status"
+            {...(updates.error ? { message: updates.error.message } : {})}
+            action={
+              <Button variant="secondary" onClick={() => void updates.refetch()}>
+                Retry
+              </Button>
+            }
+          />
+        )}
+      </section>
 
       <section className="flex flex-col gap-[10px]">
         <SectionHeader>Subsystems</SectionHeader>

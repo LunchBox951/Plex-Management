@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .PHONY: help install lint format type test check run migrate openapi docker-build \
-	ui-install gen-client ui-check ui-build
+	ui-install gen-client ui-check ui-build test-updater-docker
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -43,6 +43,9 @@ openapi: ## Export the OpenAPI document to docs/api/openapi.json
 
 docker-build: ## Build the container image locally
 	docker build -t plex-manager:dev .
+
+test-updater-docker: ## Run disposable-Docker updater integration tests
+	PLEX_MANAGER_RUN_DOCKER_TESTS=1 pytest -m docker tests/updater
 
 ui-install: ## Install frontend dependencies (npm ci)
 	npm --prefix frontend ci

@@ -82,6 +82,7 @@ _INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "log_max_rows",
 )
 _BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
+_COLLECTION_TYPED_SETTING_KEYS: tuple[str, ...] = ("automatic_update_weekdays",)
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -120,6 +121,29 @@ def test_settings_update_rejects_target_above_threshold() -> None:
     # equal and below the threshold are both fine.
     SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=80.0)
     SettingsUpdate(disk_pressure_threshold_percent=80.0, disk_pressure_target_percent=70.0)
+
+
+def test_settings_update_validates_automatic_update_policy() -> None:
+    valid = SettingsUpdate(
+        automatic_update_timezone="America/Toronto",
+        automatic_update_weekdays=["friday", "monday"],
+        automatic_update_window_start="23:00",
+        automatic_update_window_end="02:00",
+    )
+    assert valid.automatic_update_weekdays == ["monday", "friday"]
+
+    for body in (
+        {"automatic_update_timezone": "not/a-zone"},
+        {"automatic_update_weekdays": []},
+        {"automatic_update_weekdays": ["monday", "monday"]},
+        {"automatic_update_window_start": "3am"},
+        {
+            "automatic_update_window_start": "03:00",
+            "automatic_update_window_end": "03:00",
+        },
+    ):
+        with pytest.raises(ValidationError):
+            SettingsUpdate.model_validate(body)
 
 
 @pytest.mark.parametrize("field", ["plex_token", "prowlarr_api_key"])
@@ -1461,6 +1485,114 @@ async def test_put_round_trips_operability_settings(
         assert await get_log_max_rows(session) == 50_000
 
 
+async def test_put_round_trips_automatic_update_policy(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "automatic_updates_enabled": True,
+        "automatic_update_timezone": "America/Toronto",
+        "automatic_update_weekdays": ["friday", "monday"],
+        "automatic_update_window_start": "23:00",
+        "automatic_update_window_end": "02:00",
+        "automatic_update_idle_only": False,
+    }
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["automatic_updates_enabled"] is True
+    assert body["automatic_update_timezone"] == "America/Toronto"
+    assert body["automatic_update_weekdays"] == ["monday", "friday"]
+    assert body["automatic_update_window_start"] == "23:00"
+    assert body["automatic_update_window_end"] == "02:00"
+    assert body["automatic_update_idle_only"] is False
+
+    got = await client.get("/api/v1/settings", headers=headers)
+    assert got.status_code == 200
+    assert got.json() == body
+    async with sessionmaker_() as session:
+        stored = await SettingsStore(session).get("automatic_update_weekdays")
+    assert stored == '["monday","friday"]'
+
+
+async def test_put_rejects_effectively_equal_partial_update_window(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("automatic_update_window_end", "04:30")
+        await session.commit()
+
+    response = await client.put(
+        "/api/v1/settings",
+        json={"automatic_update_window_start": "04:30"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert response.status_code == 422
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("automatic_update_window_start") is None
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt"),
+    [
+        ("automatic_update_timezone", "not/a-zone"),
+        ("automatic_update_weekdays", "['monday']"),
+        ("automatic_update_weekdays", '["monday","monday"]'),
+        ("automatic_update_window_start", "25:00"),
+    ],
+)
+async def test_get_settings_degrades_corrupt_automatic_update_policy(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    corrupt: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set(field, corrupt)
+        await session.commit()
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    expected = "UTC" if field == "automatic_update_timezone" else None
+    assert response.json()[field] == expected
+
+
+async def test_partial_update_policy_displays_the_effective_utc_timezone(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("automatic_updates_enabled", "true")
+        await session.commit()
+
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json()["automatic_update_timezone"] == "UTC"
+
+
+async def test_get_settings_degrades_equal_automatic_update_window(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("automatic_update_window_start", "04:30")
+        await store.set("automatic_update_window_end", "04:30")
+        await session.commit()
+
+    response = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert response.status_code == 200
+    assert response.json()["automatic_update_window_start"] is None
+    assert response.json()["automatic_update_window_end"] is None
+
+
 async def test_put_rejects_out_of_range_operability_settings(
     client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
@@ -2317,9 +2449,9 @@ async def test_bool_getter_honors_explicit_stored_false(sessionmaker_: SessionMa
 def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:
     """Parity guard (mirrors ``test_every_known_setting_key_has_a_response_and_
     update_field`` above): the union of the three ``_*_TYPED_SETTING_KEYS``
-    tuples the sanitizer walks must equal every ``KNOWN_SETTING_KEYS`` entry
-    whose ``SettingsResponse`` field is NOT a plain ``str`` -- i.e. every
-    numeric/bool typed setting -- and none of them may be a secret. Otherwise a
+    tuples plus the collection group the sanitizer walks must equal every
+    ``KNOWN_SETTING_KEYS`` entry whose ``SettingsResponse`` field is NOT a plain
+    ``str`` -- i.e. every numeric/bool/collection setting -- and none may be a secret. Otherwise a
     future typed field could be added to the response without ever being
     routed through ``_sanitize_typed_settings``, silently reopening the 500."""
     from typing import get_args
@@ -2328,6 +2460,7 @@ def test_typed_setting_key_groups_cover_all_typed_response_fields() -> None:
         set(_FLOAT_TYPED_SETTING_KEYS)
         | set(_INT_TYPED_SETTING_KEYS)
         | set(_BOOL_TYPED_SETTING_KEYS)
+        | set(_COLLECTION_TYPED_SETTING_KEYS)
     )
     expected = {
         key
@@ -2619,6 +2752,17 @@ async def test_rotate_app_key_lock_serializes_two_concurrent_rotations(
         return row
 
     monkeypatch.setattr(settings_router, "ensure_system_settings", rendezvous_ensure)
+
+    from plex_manager.web import middleware as middleware_module
+
+    monkeypatch.setattr(
+        middleware_module,
+        "_MAINTENANCE_EXCLUDED_PREFIXES",
+        (
+            *middleware_module._MAINTENANCE_EXCLUDED_PREFIXES,  # pyright: ignore[reportPrivateUsage]
+            "/api/v1/settings/app-key",
+        ),
+    )
 
     first, second = await asyncio.gather(
         client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}),
@@ -3117,6 +3261,17 @@ async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
     # contended it (the api-key barrier test above); this test runs in its own
     # loop, so give it a fresh, loop-local lock — same serialization semantics.
     monkeypatch.setattr(settings_router, "_rotate_lock", asyncio.Lock())
+
+    from plex_manager.web import middleware as middleware_module
+
+    monkeypatch.setattr(
+        middleware_module,
+        "_MAINTENANCE_EXCLUDED_PREFIXES",
+        (
+            *middleware_module._MAINTENANCE_EXCLUDED_PREFIXES,  # pyright: ignore[reportPrivateUsage]
+            "/api/v1/settings/app-key",
+        ),
+    )
 
     first, second = await asyncio.gather(
         client.post("/api/v1/settings/app-key/rotate", cookies=cookies_a, headers=headers_a),
