@@ -67,6 +67,7 @@ from plex_manager.web.schemas import (
     RequestListResponse,
     RequestResponse,
     SeasonStatus,
+    ServiceNotConfiguredErrorDetail,
 )
 
 if TYPE_CHECKING:
@@ -147,15 +148,23 @@ _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 # The cancel endpoint's manually-raised statuses (ADR-0014 correction verb):
-# 404 ``request_not_found``, 409 ``not_cancellable``/``import_in_progress``, and
-# ``ServiceNotConfiguredError``'s 409 ``service_not_configured`` (rendered by the
-# app-wide handler, not a plain ``HTTPException`` -- same ``ErrorDetail`` wire shape
-# as the other 409 producers, mirroring how ``_QUEUE_ERROR_RESPONSES`` documents
-# mark-failed's identical ``service_not_configured`` 409).
+# 404 ``request_not_found``, 409 ``not_cancellable``/``import_in_progress`` (plain
+# ``HTTPException`` -- ``ErrorDetail`` wire shape), and ``ServiceNotConfiguredError``'s
+# 409 ``service_not_configured`` (rendered by the app-wide handler, NOT a plain
+# ``HTTPException``). That handler's body ALWAYS carries a ``service`` field
+# (``{"detail": "service_not_configured", "service": "qbittorrent"}``) that
+# ``ErrorDetail`` has no field for, so this status is documented across BOTH
+# shapes via a union "model" (FastAPI expands ``X | Y`` into an anyOf AND
+# registers both members' component schemas -- a raw ``content``/``schema``
+# dict with a hand-written ``$ref`` does NOT register a schema that isn't
+# ALSO used as a bare "model" somewhere else, which would leave
+# ``ServiceNotConfiguredErrorDetail`` a dangling ref). This documents
+# ``service`` on the generated client type, so callers can route the operator
+# straight to qBittorrent setup instead of losing the field to the generic shape.
 _CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Request not found"},
     409: {
-        "model": ErrorDetail,
+        "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
         "description": (
             "Not cancellable in its current state, an import is in progress, or "
             "qBittorrent is required but not configured"

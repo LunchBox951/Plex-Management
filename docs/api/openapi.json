@@ -2279,6 +2279,26 @@
         "title": "SeasonStatus",
         "type": "object"
       },
+      "ServiceNotConfiguredErrorDetail": {
+        "description": "Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).\n\nThe app-wide handler (``app._service_not_configured_handler``) always\nrenders ``{\"detail\": \"service_not_configured\", \"service\": \"<name>\"}`` --\na REQUIRED ``service`` field, not the bare ``{\"detail\": ...}`` of\n:class:`ErrorDetail`. Endpoints that can raise this error must reference\nthis model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the\ngenerated client type carries ``service`` and callers can route the\noperator straight to that service's setup step instead of losing the\nfield to the generic shape.",
+        "properties": {
+          "detail": {
+            "const": "service_not_configured",
+            "default": "service_not_configured",
+            "title": "Detail",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service"
+        ],
+        "title": "ServiceNotConfiguredErrorDetail",
+        "type": "object"
+      },
       "ServiceValidateResponse": {
         "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.\n\nFor Plex, ``libraries`` carries the movie AND tv library folders (each tagged\nby ``section_type``) so the UI can offer pick-lists for ``movies_root`` /\n``tv_root`` instead of a typed path. ``None`` for every other service (and for\na failed Plex check). ``machine_identifier`` is the probed Plex server's\n``machineIdentifier`` (from its ``/identity``) \u2014 set only when the caller asked\nfor the ownership-verifying variant of the Plex probe, so setup can assert\nownership and store the id; ``None`` otherwise.\n\n``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,\ninformational message: set only on an ``ok=True`` qBittorrent check whose\nclient-reported default save path is NOT visible inside this container. It never\nflips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``\nexplicitly (never relies on this default), so the mismatch is honestly\nsurfaced but does not block setup/health. ``None`` for every other service, and\nfor qBittorrent whenever the default path IS visible or could not be read.",
         "properties": {
@@ -4551,7 +4571,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Cancel Request Endpoint Api V1 Requests  Request Id  Cancel Post"
                 }
               }
             },
