@@ -328,15 +328,24 @@ export function useRevokeAppKey() {
 }
 
 /**
- * Every Plex user holding an active browser session (admin-only). ADR-0016
+ * Every active browser session an admin can see and revoke (admin-only). ADR-0016
  * sessions validate locally, so a removed/demoted user keeps access until
- * revoked — this is the operator's view of who is currently signed in.
+ * revoked — this is the operator's view of who is currently signed in, including
+ * the recovery-key group (`data.recovery`) which has no Plex identity.
+ *
+ * The list has no realtime topic and window-focus refetch is disabled globally,
+ * so another tab or a second admin changing sessions would otherwise leave this
+ * stale. While the Settings sessions panel is mounted (`enabled`), poll on a
+ * modest cadence and refetch on window focus so the view heals without a manual
+ * reload. Same-tab revokes still update instantly via the mutation invalidation.
  */
 export function useActiveSessions(enabled = true) {
   return useQuery({
     queryKey: queryKeys.activeSessions,
     enabled,
     retry: false,
+    refetchInterval: enabled ? 30_000 : false,
+    refetchOnWindowFocus: true,
     queryFn: async (): Promise<ActiveSessionsResponse> =>
       unwrap(await client.GET('/api/v1/auth/sessions')),
   })
@@ -354,7 +363,30 @@ export function useRevokeUserSessions() {
   return useMutation({
     mutationFn: async (userId: number): Promise<void> =>
       ensureOk(
-        await client.POST('/api/v1/auth/sessions/revoke', { body: { user_id: userId } }),
+        await client.POST('/api/v1/auth/sessions/revoke', {
+          body: { kind: 'user', user_id: userId },
+        }),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.activeSessions })
+      void qc.invalidateQueries({ queryKey: queryKeys.authMe })
+    },
+  })
+}
+
+/**
+ * Revoke every active recovery session on demand (admin-only). Recovery sessions
+ * are the `POST /auth/api-key` cookies — admin authority, no Plex identity — so
+ * they are cut as a group. Their `api_key` realtime streams are closed
+ * server-side. Invalidates the session list, and `/auth/me` too since the admin
+ * may be riding a recovery session themselves (revoking signs them out).
+ */
+export function useRevokeRecoverySessions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<void> =>
+      ensureOk(
+        await client.POST('/api/v1/auth/sessions/revoke', { body: { kind: 'recovery' } }),
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.activeSessions })

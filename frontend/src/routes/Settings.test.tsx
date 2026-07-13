@@ -6,6 +6,7 @@ import type {
   ActiveSessionUser,
   HealthResponse,
   PlexLibraryOption,
+  RecoverySessionGroup,
   SettingsResponse,
   SettingsUpdate,
 } from '../api/types'
@@ -31,12 +32,15 @@ const h = vi.hoisted(() => ({
   // Settings → Signed-in sessions (issue #56). Empty active-session list by
   // default; a test can populate it to exercise the revoke control.
   activeSessions: [] as ActiveSessionUser[],
+  recoverySessions: null as RecoverySessionGroup | null,
   sessionsLoading: false,
   sessionsIsError: false,
   sessionsError: null as ApiError | null,
   sessionsRefetch: vi.fn(),
   revokeSessionsMutateAsync: vi.fn(),
   revokeSessionsPending: false,
+  revokeRecoveryMutateAsync: vi.fn(),
+  revokeRecoveryPending: false,
   // Settings → Access recovery-key status ({ exists }). A mutable flag so a
   // generate/revoke mock can flip it; the ensuing re-render reflects the new
   // state (the status endpoint only ever reports existence, never the key).
@@ -85,7 +89,10 @@ vi.mock('../api/hooks', () => ({
   useRotateAppKey: () => ({ mutateAsync: h.rotateMutateAsync, isPending: h.rotatePending }),
   useRevokeAppKey: () => ({ mutateAsync: h.revokeMutateAsync, isPending: h.revokePending }),
   useActiveSessions: () => ({
-    data: h.sessionsLoading || h.sessionsIsError ? undefined : { users: h.activeSessions },
+    data:
+      h.sessionsLoading || h.sessionsIsError
+        ? undefined
+        : { users: h.activeSessions, recovery: h.recoverySessions },
     isLoading: h.sessionsLoading,
     isError: h.sessionsIsError,
     error: h.sessionsError,
@@ -94,6 +101,10 @@ vi.mock('../api/hooks', () => ({
   useRevokeUserSessions: () => ({
     mutateAsync: h.revokeSessionsMutateAsync,
     isPending: h.revokeSessionsPending,
+  }),
+  useRevokeRecoverySessions: () => ({
+    mutateAsync: h.revokeRecoveryMutateAsync,
+    isPending: h.revokeRecoveryPending,
   }),
 }))
 
@@ -113,12 +124,15 @@ beforeEach(() => {
   h.healthFetching = false
   h.healthRefetch.mockReset()
   h.activeSessions = []
+  h.recoverySessions = null
   h.sessionsLoading = false
   h.sessionsIsError = false
   h.sessionsError = null
   h.sessionsRefetch.mockReset()
   h.revokeSessionsMutateAsync.mockReset()
   h.revokeSessionsPending = false
+  h.revokeRecoveryMutateAsync.mockReset()
+  h.revokeRecoveryPending = false
 })
 
 function lastBody(): SettingsUpdate {
@@ -1407,5 +1421,29 @@ describe('Settings — Signed-in sessions (issue #56)', () => {
     render(<Settings />, { wrapper: Wrapper })
     fireEvent.click(sessionsSection().getByRole('button', { name: 'Revoke' }))
     expect(screen.getByText(/signs you out of this browser/)).toBeInTheDocument()
+  })
+
+  it('renders the recovery-session group with no Plex identity', () => {
+    h.activeSessions = []
+    h.recoverySessions = { session_count: 2, last_seen_at: '2026-07-13T10:00:00Z' }
+    render(<Settings />, { wrapper: Wrapper })
+    const section = sessionsSection()
+    expect(section.getByText('Recovery key')).toBeInTheDocument()
+    expect(section.getByText('no Plex identity')).toBeInTheDocument()
+    expect(section.getByText(/2 active sessions/)).toBeInTheDocument()
+    // Not the empty state — the recovery group counts as signed-in.
+    expect(section.queryByText(/No one is signed in/)).not.toBeInTheDocument()
+  })
+
+  it('confirms then revokes the recovery group, and toasts success', async () => {
+    h.revokeRecoveryMutateAsync.mockResolvedValue(undefined)
+    h.recoverySessions = { session_count: 1, last_seen_at: null }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(sessionsSection().getByRole('button', { name: 'Revoke' }))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText(/Revoke recovery sessions\?/i)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke sessions' }))
+    await waitFor(() => expect(h.revokeRecoveryMutateAsync).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(expect.objectContaining({ intent: 'success' }))
   })
 })

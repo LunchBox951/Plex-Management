@@ -429,6 +429,61 @@ async def test_sign_in_demotion_closes_that_users_realtime_streams(
     assert subscription.closed is True
 
 
+async def test_sign_in_demotion_closes_streams_after_commit(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The demotion close must run AFTER the demotion commits (issue #56).
+
+    ``_upsert_user`` only stages the ``permissions`` write; ``_issue_browser_session``
+    commits it. If the stream close fired before that commit, a fast reconnect
+    could re-read the old admin permissions and resubscribe to admin topics with
+    no second close. We assert the ordering directly: the commit happens strictly
+    before the close, so no admin stream can survive the downgrade.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    first = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert first.status_code == 200
+    user_id = first.json()["user"]["id"]
+
+    subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=user_id)
+
+    order: list[str] = []
+    real_issue = auth_module._issue_browser_session  # pyright: ignore[reportPrivateUsage]
+
+    async def spy_issue(*args: object, **kwargs: object) -> None:
+        await real_issue(*args, **kwargs)  # type: ignore[arg-type]
+        order.append("commit")
+
+    real_close = auth_module.close_realtime_streams
+
+    def spy_close(*args: object, **kwargs: object) -> None:
+        order.append("close")
+        real_close(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(auth_module, "_issue_browser_session", spy_issue)
+    monkeypatch.setattr(auth_module, "close_realtime_streams", spy_close)
+
+    # The SAME account signs in again with only SHARED access: admin -> non-admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_shared_server()]))
+    second = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert second.status_code == 200
+    assert second.json()["user"]["is_admin"] is False
+    assert subscription.closed is True
+    # Commit-before-close: the demotion is persisted before any stream is torn down.
+    assert order == ["commit", "close"]
+
+    # And the demotion is durably committed (a fresh session reads permissions 0).
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalars().one()
+    assert user.permissions == 0
+
+
 async def test_sign_in_without_demotion_keeps_streams_open(
     client: httpx.AsyncClient,
     app: FastAPI,

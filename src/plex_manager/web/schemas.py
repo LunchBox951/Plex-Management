@@ -385,20 +385,60 @@ class ActiveSessionUser(BaseModel):
     is_current_user: bool
 
 
+class RecoverySessionGroup(BaseModel):
+    """The active recovery (``X-Api-Key``-exchange) sessions, aggregated.
+
+    Recovery sessions carry the recovery key's admin authority with NO Plex
+    identity (``auth_sessions.user_id`` NULL), so they cannot be a per-user row.
+    They are surfaced as one group — count + most-recent activity — and revoked as
+    a group, mirroring the per-user aggregate (an admin revokes recovery *access*,
+    not an individual opaque cookie). Present only when at least one is active.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    session_count: int
+    last_seen_at: datetime | None
+
+
 class ActiveSessionsResponse(BaseModel):
-    """Every Plex user holding an active browser session (admin view)."""
+    """Every active browser session an admin can see and revoke (admin view).
+
+    ``users`` is the per-Plex-user aggregate; ``recovery`` is the recovery-session
+    group (``POST /auth/api-key`` cookies with no Plex identity), non-null only
+    when at least one recovery session is active. Both are independently revocable
+    via ``POST /auth/sessions/revoke``.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     users: list[ActiveSessionUser]
+    recovery: RecoverySessionGroup | None = None
 
 
 class RevokeSessionsRequest(BaseModel):
-    """Target a single user whose active sessions an admin wants revoked."""
+    """Target the active sessions an admin wants revoked.
+
+    Two revoke targets, discriminated by ``kind``:
+
+    * ``kind="user"`` (default, back-compatible with the original ``user_id``-only
+      body) revokes every active session for the Plex user ``user_id``.
+    * ``kind="recovery"`` revokes every active recovery session (the ``user_id``
+      field must be omitted — recovery sessions have no Plex identity).
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    user_id: int
+    kind: Literal["user", "recovery"] = "user"
+    user_id: int | None = None
+
+    @model_validator(mode="after")
+    def _check_target(self) -> RevokeSessionsRequest:
+        if self.kind == "user" and self.user_id is None:
+            raise ValueError("user_id is required when kind is 'user'")
+        if self.kind == "recovery" and self.user_id is not None:
+            raise ValueError("user_id must be omitted when kind is 'recovery'")
+        return self
 
 
 class RevokeSessionsResponse(BaseModel):

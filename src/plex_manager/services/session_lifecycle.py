@@ -42,6 +42,7 @@ __all__ = [
     "SESSION_SWEEP_INTERVAL_SECONDS",
     "SESSION_SWEEP_RETENTION",
     "ensure_utc",
+    "revoke_recovery_sessions",
     "revoke_user_sessions",
     "session_effective_last_seen",
     "session_idle_deadline",
@@ -124,10 +125,38 @@ async def revoke_user_sessions(
     """
     stamp = now if now is not None else datetime.now(UTC)
     result = cast(
-        "CursorResult[Any]",
+        CursorResult[Any],
         await session.execute(
             update(AuthSession)
             .where(AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=stamp)
+        ),
+    )
+    return result.rowcount
+
+
+async def revoke_recovery_sessions(
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Stamp ``revoked_at`` on every ACTIVE recovery session; return the count.
+
+    The recovery-session counterpart to :func:`revoke_user_sessions` (issue #56).
+    Recovery sessions are the cookies minted by ``POST /auth/api-key`` — admin
+    authority, no Plex identity (``AuthSession.user_id IS NULL``) — so they cannot
+    be targeted by ``user_id`` and are revoked as a single group instead. Only
+    still-active (``revoked_at`` NULL) rows are touched, so a re-revoke is a
+    harmless no-op reporting 0. Rotation of the recovery KEY is a separate concern
+    (PR #319); this is the on-demand admin lever to cut existing recovery cookies.
+    The caller owns the commit.
+    """
+    stamp = now if now is not None else datetime.now(UTC)
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(AuthSession)
+            .where(AuthSession.user_id.is_(None), AuthSession.revoked_at.is_(None))
             .values(revoked_at=stamp)
         ),
     )
@@ -153,7 +182,7 @@ async def sweep_dead_sessions(
     retention_cutoff = moment - SESSION_SWEEP_RETENTION
     idle_death_cutoff = retention_cutoff - SESSION_IDLE_WINDOW
     result = cast(
-        "CursorResult[Any]",
+        CursorResult[Any],
         await session.execute(
             delete(AuthSession).where(
                 or_(

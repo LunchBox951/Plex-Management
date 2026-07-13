@@ -48,10 +48,25 @@ async def events_endpoint(
         auth_method=auth.method.value,
         user_id=auth.user_id,
     )
+    # Cap the stream's lifetime at the SESSION's own deadline so an open SSE
+    # stream never outlives the session behind it (issue #56). Two bounds apply,
+    # both fixed at connect time: the absolute ``session_expires_at`` (30-day cap)
+    # AND the idle deadline (effective ``last_seen`` + ``SESSION_IDLE_WINDOW``).
+    # REST requests die at the idle window; without the idle bound here a stream
+    # would keep delivering admin topics until the 30-day cap even though every
+    # REST call from the same session already 401s. Connect counts as activity
+    # (the auth dependency just slid ``last_seen`` forward, throttled), so a
+    # continuously-open stream re-leases on each reconnect. The tighter bound wins.
     loop = asyncio.get_running_loop()
+    now = datetime.now(UTC)
+    session_deadlines = [
+        deadline
+        for deadline in (auth.session_expires_at, auth.session_idle_deadline)
+        if deadline is not None
+    ]
     lease_deadline: float | None = None
-    if auth.session_expires_at is not None:
-        remaining = (auth.session_expires_at - datetime.now(UTC)).total_seconds()
+    if session_deadlines:
+        remaining = (min(session_deadlines) - now).total_seconds()
         lease_deadline = loop.time() + max(0.0, remaining)
     getter: asyncio.Task[RealtimeEvent] | None = None
     try:

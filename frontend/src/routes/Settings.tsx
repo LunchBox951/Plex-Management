@@ -4,6 +4,7 @@ import {
   useAppKeyStatus,
   useOpsHealth,
   useRevokeAppKey,
+  useRevokeRecoverySessions,
   useRevokeUserSessions,
   useRotateAppKey,
   usePlexLibraries,
@@ -572,8 +573,10 @@ function formatLastSeen(value: string | null): string {
 function SessionsSection() {
   const sessions = useActiveSessions()
   const revoke = useRevokeUserSessions()
+  const revokeRecovery = useRevokeRecoverySessions()
   const { toast } = useToast()
   const [confirmUser, setConfirmUser] = useState<ActiveSessionUser | null>(null)
+  const [confirmRecovery, setConfirmRecovery] = useState(false)
 
   const handleRevoke = async (user: ActiveSessionUser) => {
     try {
@@ -585,7 +588,18 @@ function SessionsSection() {
     }
   }
 
+  const handleRevokeRecovery = async () => {
+    try {
+      await revokeRecovery.mutateAsync()
+      setConfirmRecovery(false)
+      toast({ title: 'Revoked recovery sessions', intent: 'success' })
+    } catch (err) {
+      toast({ title: 'Revoke failed', description: (err as ApiError).message, intent: 'error' })
+    }
+  }
+
   const users = sessions.data?.users ?? []
+  const recovery = sessions.data?.recovery ?? null
 
   return (
     <section className="rounded-xl border border-hairline bg-surface p-5">
@@ -607,8 +621,8 @@ function SessionsSection() {
               </Button>
             </div>
           </div>
-        ) : users.length === 0 ? (
-          <p className="text-xs text-faint">No one is signed in with a Plex session right now.</p>
+        ) : users.length === 0 && recovery === null ? (
+          <p className="text-xs text-faint">No one is signed in right now.</p>
         ) : (
           <ul className="flex flex-col divide-y divide-hairline">
             {users.map((user) => (
@@ -640,6 +654,29 @@ function SessionsSection() {
                 </Button>
               </li>
             ))}
+            {recovery !== null ? (
+              <li className="flex flex-wrap items-center justify-between gap-3 py-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-ink">Recovery key</span>
+                    <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                      admin
+                    </span>
+                    <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                      no Plex identity
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-xs text-faint">
+                    {recovery.session_count} active{' '}
+                    {recovery.session_count === 1 ? 'session' : 'sessions'} · last seen{' '}
+                    {formatLastSeen(recovery.last_seen_at)}
+                  </div>
+                </div>
+                <Button variant="secondary" size="sm" onClick={() => setConfirmRecovery(true)}>
+                  Revoke
+                </Button>
+              </li>
+            ) : null}
           </ul>
         )}
       </div>
@@ -666,6 +703,30 @@ function SessionsSection() {
             onClick={() => {
               if (confirmUser !== null) void handleRevoke(confirmUser)
             }}
+          >
+            Revoke sessions
+          </Button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={confirmRecovery}
+        onOpenChange={setConfirmRecovery}
+        title="Revoke recovery sessions?"
+      >
+        <p className="text-sm text-muted">
+          Every active recovery session (from exchanging the recovery key) is cut immediately. If
+          you are signed in with the recovery key yourself, this signs you out. Exchange the
+          recovery key again to get back in.
+        </p>
+        <div className="mt-6 flex justify-end gap-3">
+          <Button variant="secondary" onClick={() => setConfirmRecovery(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            loading={revokeRecovery.isPending}
+            onClick={() => void handleRevokeRecovery()}
           >
             Revoke sessions
           </Button>

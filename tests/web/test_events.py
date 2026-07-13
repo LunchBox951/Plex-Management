@@ -531,6 +531,44 @@ async def test_events_stream_closes_at_browser_session_expiry(
     await _wait_subscribers_zero(app)
 
 
+async def test_events_stream_closes_at_idle_deadline(
+    app: FastAPI,
+    seed: SeedFn,
+) -> None:
+    """The SSE lease is also capped at the session's IDLE deadline (issue #56).
+
+    REST requests die at the idle window, but a long-lived stream that only
+    enforced the 30-day absolute cap would keep delivering admin topics for weeks
+    past when the session stopped authenticating for REST. Here the idle deadline
+    is much nearer than the absolute expiry, so the stream must close at the idle
+    deadline, not wait for the absolute cap.
+    """
+    await seed(initialized=True)
+
+    async def _idle_soon_admin() -> AuthContext:
+        now = datetime.now(UTC)
+        return AuthContext(
+            method=AuthMethod.plex_session,
+            user_id=78,
+            is_admin=True,
+            session_expires_at=now + timedelta(days=30),
+            session_idle_deadline=now + timedelta(seconds=0.5),
+        )
+
+    app.dependency_overrides[require_admin_short_session] = _idle_soon_admin
+    try:
+        async with _AsgiStream(app, {}) as stream:
+            assert stream.status == 200
+            sync = _data_json(await stream.next_frame())
+            assert sync["reason"] == "connected"
+
+            await stream.expect_body_end(timeout=2.0)
+    finally:
+        app.dependency_overrides.pop(require_admin_short_session, None)
+
+    await _wait_subscribers_zero(app)
+
+
 async def test_events_stream_closes_on_app_key_rotation(
     app: FastAPI,
     client: httpx.AsyncClient,

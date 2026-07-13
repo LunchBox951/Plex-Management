@@ -140,6 +140,65 @@ async def test_revoke_user_sessions_revokes_only_active_rows(
         assert await sl.revoke_user_sessions(session, user.id, now=_NOW) == 0
 
 
+async def test_revoke_recovery_sessions_targets_only_null_user_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        user = await _make_user(session, plex_id=42)
+        session.add_all(
+            [
+                # Two live recovery sessions (no Plex identity) — both revoked.
+                _session(
+                    user_id=None,
+                    tag="recovery-1",
+                    created_at=_NOW,
+                    expires_at=_NOW + timedelta(days=30),
+                    last_seen_at=_NOW,
+                ),
+                _session(
+                    user_id=None,
+                    tag="recovery-2",
+                    created_at=_NOW,
+                    expires_at=_NOW + timedelta(days=30),
+                    last_seen_at=_NOW,
+                ),
+                # An already-revoked recovery session — untouched.
+                _session(
+                    user_id=None,
+                    tag="recovery-dead",
+                    created_at=_NOW,
+                    expires_at=_NOW + timedelta(days=30),
+                    last_seen_at=_NOW,
+                    revoked_at=_NOW,
+                ),
+                # A Plex-user session — must NOT be revoked.
+                _session(
+                    user_id=user.id,
+                    tag="user-live",
+                    created_at=_NOW,
+                    expires_at=_NOW + timedelta(days=30),
+                    last_seen_at=_NOW,
+                ),
+            ]
+        )
+        await session.commit()
+
+        revoked = await sl.revoke_recovery_sessions(session, now=_NOW)
+        await session.commit()
+        assert revoked == 2
+
+        # The Plex-user session is untouched.
+        remaining = await session.execute(
+            select(func.count())
+            .select_from(AuthSession)
+            .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+        )
+        assert remaining.scalar_one() == 1
+
+        # Re-revoking is a harmless no-op.
+        assert await sl.revoke_recovery_sessions(session, now=_NOW) == 0
+
+
 # --------------------------------------------------------------------------- #
 # Dead-row sweep
 # --------------------------------------------------------------------------- #

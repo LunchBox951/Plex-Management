@@ -175,8 +175,18 @@
         "type": "object"
       },
       "ActiveSessionsResponse": {
-        "description": "Every Plex user holding an active browser session (admin view).",
+        "description": "Every active browser session an admin can see and revoke (admin view).\n\n``users`` is the per-Plex-user aggregate; ``recovery`` is the recovery-session\ngroup (``POST /auth/api-key`` cookies with no Plex identity), non-null only\nwhen at least one recovery session is active. Both are independently revocable\nvia ``POST /auth/sessions/revoke``.",
         "properties": {
+          "recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecoverySessionGroup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "users": {
             "items": {
               "$ref": "#/components/schemas/ActiveSessionUser"
@@ -1948,6 +1958,33 @@
         "title": "ReconcileStatusItem",
         "type": "object"
       },
+      "RecoverySessionGroup": {
+        "description": "The active recovery (``X-Api-Key``-exchange) sessions, aggregated.\n\nRecovery sessions carry the recovery key's admin authority with NO Plex\nidentity (``auth_sessions.user_id`` NULL), so they cannot be a per-user row.\nThey are surfaced as one group \u2014 count + most-recent activity \u2014 and revoked as\na group, mirroring the per-user aggregate (an admin revokes recovery *access*,\nnot an individual opaque cookie). Present only when at least one is active.",
+        "properties": {
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "session_count": {
+            "title": "Session Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_count",
+          "last_seen_at"
+        ],
+        "title": "RecoverySessionGroup",
+        "type": "object"
+      },
       "RejectedRelease": {
         "description": "A discarded release paired with its surfaced rejection reason.",
         "properties": {
@@ -2182,16 +2219,29 @@
         "type": "string"
       },
       "RevokeSessionsRequest": {
-        "description": "Target a single user whose active sessions an admin wants revoked.",
+        "description": "Target the active sessions an admin wants revoked.\n\nTwo revoke targets, discriminated by ``kind``:\n\n* ``kind=\"user\"`` (default, back-compatible with the original ``user_id``-only\n  body) revokes every active session for the Plex user ``user_id``.\n* ``kind=\"recovery\"`` revokes every active recovery session (the ``user_id``\n  field must be omitted \u2014 recovery sessions have no Plex identity).",
         "properties": {
+          "kind": {
+            "default": "user",
+            "enum": [
+              "user",
+              "recovery"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "user_id": {
-            "title": "User Id",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
           }
         },
-        "required": [
-          "user_id"
-        ],
         "title": "RevokeSessionsRequest",
         "type": "object"
       },
@@ -4264,7 +4314,7 @@
     },
     "/api/v1/auth/sessions": {
       "get": {
-        "description": "List every Plex user holding an active browser session (admin-only).\n\nADR-0016 sessions validate LOCALLY (plex.tv is never on the per-request\npath), so a removed or demoted user keeps access until their session is\nrevoked \u2014 this is the operator's web-operable view of who is currently signed\nin, the companion to :func:`revoke_user_sessions_endpoint`. \"Active\" mirrors\nthe auth path exactly: not revoked, not past the absolute ``expires_at`` cap,\nand not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Recovery\n(``X-Api-Key``-exchange) sessions have no Plex identity and are governed by the\nAccess recovery key, so they are deliberately not listed.",
+        "description": "List every active browser session an admin can see and revoke (admin-only).\n\nADR-0016 sessions validate LOCALLY (plex.tv is never on the per-request\npath), so a removed or demoted user keeps access until their session is\nrevoked \u2014 this is the operator's web-operable view of who is currently signed\nin, the companion to :func:`revoke_user_sessions_endpoint`. \"Active\" mirrors\nthe auth path exactly: not revoked, not past the absolute ``expires_at`` cap,\nand not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`.\n\nRecovery (``X-Api-Key``-exchange) sessions have no Plex identity\n(``user_id`` NULL), so they cannot appear as a per-user row; they are\nsurfaced as a single aggregated ``recovery`` group instead, and are equally\nrevocable (issue #56). This keeps the list honest: a break-glass admin cookie\nis visible and cuttable, not an invisible standing grant.",
         "operationId": "list_active_sessions_endpoint_api_v1_auth_sessions_get",
         "responses": {
           "200": {
@@ -4294,7 +4344,7 @@
     },
     "/api/v1/auth/sessions/revoke": {
       "post": {
-        "description": "Revoke every active session for one Plex user, on demand (admin-only).\n\nThe web-operable lever issue #56 asks for: today only the automatic\nmass-revoke-on-verified-repoint exists, which is a different mechanism. This\nstamps ``revoked_at`` on all of the target user's still-active sessions (the\nauditable-revoke convention \u2014 the rows survive for the sweep to reclaim), then\ncloses that user's open realtime streams so a demoted admin's SSE cannot keep\ndelivering admin topics past revocation (same family as issue #183). Their\nnext request re-authenticates and 401s.\n\nNo self-lockout footgun by design: an admin MAY revoke their own account's\nsessions (``is_current_user`` flags it in the list), which simply signs the\ncurrent operator out \u2014 never a permanent lockout, since Plex sign-in (and the\nrecovery key) can always mint a fresh session (north star #1). A re-revoke or a\nuser with no active sessions is a harmless ``revoked: 0``.",
+        "description": "Revoke a batch of active sessions on demand (admin-only).\n\nThe web-operable lever issue #56 asks for: today only the automatic\nmass-revoke-on-verified-repoint exists, which is a different mechanism. Two\ntargets, discriminated by ``body.kind``:\n\n* ``\"user\"`` stamps ``revoked_at`` on all of ``body.user_id``'s still-active\n  sessions, then closes that user's open realtime streams so a demoted admin's\n  SSE cannot keep delivering admin topics past revocation (same family as\n  issue #183). Their next request re-authenticates and 401s.\n* ``\"recovery\"`` does the same for every active recovery session (the\n  ``POST /auth/api-key`` cookies with no Plex identity), closing the matching\n  ``api_key`` realtime streams. Rotation of the recovery KEY is a separate\n  mechanism (PR #319); this only cuts existing recovery cookies.\n\nBoth use the auditable-revoke convention (rows survive for the sweep to\nreclaim). No self-lockout footgun by design: an admin MAY revoke their own\naccount's sessions (``is_current_user`` flags it in the list), or the recovery\nsession they are riding \u2014 either simply signs the current operator out, never a\npermanent lockout, since Plex sign-in (and the recovery key) can always mint a\nfresh session (north star #1). A re-revoke or an empty target is a harmless\n``revoked: 0``.",
         "operationId": "revoke_user_sessions_endpoint_api_v1_auth_sessions_revoke_post",
         "requestBody": {
           "content": {

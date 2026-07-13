@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, cast
 
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,7 @@ from plex_manager.web.schemas import (
     AuthMeResponse,
     AuthUser,
     PlexSignInRequest,
+    RecoverySessionGroup,
     RevokeSessionsRequest,
     RevokeSessionsResponse,
 )
@@ -122,9 +123,8 @@ async def plex_sign_in_endpoint(
     else:
         is_admin = await _post_init_access(session, account, resources, client=plex_tv)
 
-    user = await _upsert_user(
+    user, demoted = await _upsert_user(
         session,
-        app=request.app,
         account_id=account.plex_id,
         username=account.username,
         is_admin=is_admin,
@@ -134,7 +134,20 @@ async def plex_sign_in_endpoint(
     user.encrypted_plex_token = body.auth_token
     user.last_login = datetime.now(UTC)
 
+    # ``_issue_browser_session`` commits the staged user-row writes (including any
+    # demotion) alongside the new session. Only AFTER that commit persists the
+    # downgrade do we close the demoted user's realtime streams (issue #183): a
+    # close before the commit would race a reconnect that re-reads the old admin
+    # permissions and resubscribes to admin topics. Post-commit, any reconnect
+    # reads the demoted permissions, so no admin stream can survive the downgrade.
     await _issue_browser_session(session, response, request=request, user_id=user.id)
+    if demoted:
+        close_realtime_streams(
+            request.app,
+            reason="permission_downgraded",
+            auth_method=AuthMethod.plex_session.value,
+            user_id=user.id,
+        )
     return _me_response(
         AuthContext(
             method=AuthMethod.plex_session,
@@ -289,19 +302,28 @@ async def list_active_sessions_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(require_admin)],
 ) -> ActiveSessionsResponse:
-    """List every Plex user holding an active browser session (admin-only).
+    """List every active browser session an admin can see and revoke (admin-only).
 
     ADR-0016 sessions validate LOCALLY (plex.tv is never on the per-request
     path), so a removed or demoted user keeps access until their session is
     revoked — this is the operator's web-operable view of who is currently signed
     in, the companion to :func:`revoke_user_sessions_endpoint`. "Active" mirrors
     the auth path exactly: not revoked, not past the absolute ``expires_at`` cap,
-    and not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Recovery
-    (``X-Api-Key``-exchange) sessions have no Plex identity and are governed by the
-    Access recovery key, so they are deliberately not listed.
+    and not idled out past :data:`session_lifecycle.SESSION_IDLE_WINDOW`.
+
+    Recovery (``X-Api-Key``-exchange) sessions have no Plex identity
+    (``user_id`` NULL), so they cannot appear as a per-user row; they are
+    surfaced as a single aggregated ``recovery`` group instead, and are equally
+    revocable (issue #56). This keeps the list honest: a break-glass admin cookie
+    is visible and cuttable, not an invisible standing grant.
     """
     now = datetime.now(UTC)
     idle_cutoff = now - session_lifecycle.SESSION_IDLE_WINDOW
+    active_session = (
+        AuthSession.revoked_at.is_(None),
+        AuthSession.expires_at > now,
+        func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
+    )
     result = await session.execute(
         select(
             User.id,
@@ -312,11 +334,7 @@ async def list_active_sessions_endpoint(
             func.max(AuthSession.last_seen_at),
         )
         .join(AuthSession, AuthSession.user_id == User.id)
-        .where(
-            AuthSession.revoked_at.is_(None),
-            AuthSession.expires_at > now,
-            func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
-        )
+        .where(*active_session)
         .group_by(User.id, User.plex_id, User.username, User.permissions)
         .order_by(User.username)
     )
@@ -332,7 +350,28 @@ async def list_active_sessions_endpoint(
         )
         for user_id, plex_id, username, permissions, count, last_seen in result.all()
     ]
-    return ActiveSessionsResponse(users=users)
+    recovery_row = (
+        await session.execute(
+            select(
+                func.count(AuthSession.id),
+                func.max(AuthSession.last_seen_at),
+            ).where(AuthSession.user_id.is_(None), *active_session)
+        )
+    ).one()
+    recovery_count, recovery_last_seen = recovery_row
+    recovery = (
+        RecoverySessionGroup(
+            session_count=recovery_count,
+            last_seen_at=(
+                session_lifecycle.ensure_utc(recovery_last_seen)
+                if recovery_last_seen is not None
+                else None
+            ),
+        )
+        if recovery_count
+        else None
+    )
+    return ActiveSessionsResponse(users=users, recovery=recovery)
 
 
 @router.post("/sessions/revoke")
@@ -342,23 +381,49 @@ async def revoke_user_sessions_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(require_admin)],
 ) -> RevokeSessionsResponse:
-    """Revoke every active session for one Plex user, on demand (admin-only).
+    """Revoke a batch of active sessions on demand (admin-only).
 
     The web-operable lever issue #56 asks for: today only the automatic
-    mass-revoke-on-verified-repoint exists, which is a different mechanism. This
-    stamps ``revoked_at`` on all of the target user's still-active sessions (the
-    auditable-revoke convention — the rows survive for the sweep to reclaim), then
-    closes that user's open realtime streams so a demoted admin's SSE cannot keep
-    delivering admin topics past revocation (same family as issue #183). Their
-    next request re-authenticates and 401s.
+    mass-revoke-on-verified-repoint exists, which is a different mechanism. Two
+    targets, discriminated by ``body.kind``:
 
-    No self-lockout footgun by design: an admin MAY revoke their own account's
-    sessions (``is_current_user`` flags it in the list), which simply signs the
-    current operator out — never a permanent lockout, since Plex sign-in (and the
-    recovery key) can always mint a fresh session (north star #1). A re-revoke or a
-    user with no active sessions is a harmless ``revoked: 0``.
+    * ``"user"`` stamps ``revoked_at`` on all of ``body.user_id``'s still-active
+      sessions, then closes that user's open realtime streams so a demoted admin's
+      SSE cannot keep delivering admin topics past revocation (same family as
+      issue #183). Their next request re-authenticates and 401s.
+    * ``"recovery"`` does the same for every active recovery session (the
+      ``POST /auth/api-key`` cookies with no Plex identity), closing the matching
+      ``api_key`` realtime streams. Rotation of the recovery KEY is a separate
+      mechanism (PR #319); this only cuts existing recovery cookies.
+
+    Both use the auditable-revoke convention (rows survive for the sweep to
+    reclaim). No self-lockout footgun by design: an admin MAY revoke their own
+    account's sessions (``is_current_user`` flags it in the list), or the recovery
+    session they are riding — either simply signs the current operator out, never a
+    permanent lockout, since Plex sign-in (and the recovery key) can always mint a
+    fresh session (north star #1). A re-revoke or an empty target is a harmless
+    ``revoked: 0``.
     """
-    revoked = await session_lifecycle.revoke_user_sessions(session, body.user_id)
+    if body.kind == "recovery":
+        revoked = await session_lifecycle.revoke_recovery_sessions(session)
+        await session.commit()
+        if revoked:
+            close_realtime_streams(
+                request.app,
+                reason="sessions_revoked",
+                auth_method=AuthMethod.api_key.value,
+            )
+        return RevokeSessionsResponse(revoked=revoked)
+    # kind == "user": the request validator guarantees user_id is set. Re-narrow
+    # for the type checker with an honest guard rather than an assert.
+    user_id = body.user_id
+    if user_id is None:  # pragma: no cover - guaranteed by RevokeSessionsRequest
+        raise AppError(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="invalid_revoke_target",
+            message="A user-session revoke needs a user_id.",
+        )
+    revoked = await session_lifecycle.revoke_user_sessions(session, user_id)
     await session.commit()
     if revoked:
         close_realtime_streams(
@@ -576,12 +641,16 @@ async def find_user_by_plex_id(session: AsyncSession, plex_id: int) -> User | No
 async def _upsert_user(
     session: AsyncSession,
     *,
-    app: FastAPI,
     account_id: int,
     username: str,
     is_admin: bool,
-) -> User:
+) -> tuple[User, bool]:
     """Create-or-update the ``User`` row for this verified Plex account.
+
+    Returns the row and whether this sign-in DEMOTED the account (its permissions
+    dropped). The demotion write is only *staged* here; the caller commits it (via
+    the session mint) and is responsible for closing the demoted user's realtime
+    streams AFTER that commit — see the ordering note below.
 
     Concurrency-safe on the FIRST sign-in: two simultaneous first-time sign-ins
     for the SAME Plex account can both pass the no-row lookup and both INSERT;
@@ -600,16 +669,15 @@ async def _upsert_user(
     winner's row too — recovery converges on the same state the plain update
     path would have written.
 
-    Permission DOWNGRADE closes realtime streams (issue #183). A sign-in that
-    demotes a previously-admin account (e.g. the owner unshared the server, so
-    this account no longer owns it) revokes admin authority for every FUTURE
-    request via the ``permissions`` write, but an already-open admin SSE stream
-    captured its admin subscription at connect time and would keep delivering
-    admin-only invalidation topics until it disconnected. Mirroring the
-    logout/rotate/repoint call sites, we close that user's plex-session streams
-    the moment the demotion is observed so no still-open stream outlives the
-    authority it was granted under. A brand-NEW user (the create path) has no
-    prior authority to lose, so it never triggers this.
+    Permission DOWNGRADE closes realtime streams (issue #183), but the close must
+    run AFTER the demotion commits, not here: this function only stages the
+    ``permissions`` write, which is not persisted until the caller's session mint
+    commits. Closing streams before that commit leaves a window where a fast
+    reconnect re-reads the OLD (still-admin) permissions and resubscribes to admin
+    topics with no second close to catch it. So we report the demotion and let the
+    caller close post-commit, guaranteeing no admin stream survives the downgrade.
+    A brand-NEW user (the create path) has no prior authority to lose, so it never
+    reports a demotion.
     """
     new_permissions = 1 if is_admin else 0
     user = await find_user_by_plex_id(session, account_id)
@@ -624,18 +692,11 @@ async def _upsert_user(
             if user is None:  # pragma: no cover - the conflicting row must exist
                 raise
         else:
-            return created
+            return created, False
     previous_permissions = user.permissions
     user.username = username
     user.permissions = new_permissions
-    if new_permissions < previous_permissions:
-        close_realtime_streams(
-            app,
-            reason="permission_downgraded",
-            auth_method=AuthMethod.plex_session.value,
-            user_id=user.id,
-        )
-    return user
+    return user, new_permissions < previous_permissions
 
 
 def _me_response(context: AuthContext | None) -> AuthMeResponse:

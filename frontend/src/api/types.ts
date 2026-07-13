@@ -56,6 +56,7 @@ export type AuthUser = Schemas['AuthUser']
 export type PlexSignInRequest = Schemas['PlexSignInRequest']
 export type ActiveSessionsResponse = Schemas['ActiveSessionsResponse']
 export type ActiveSessionUser = Schemas['ActiveSessionUser']
+export type RecoverySessionGroup = Schemas['RecoverySessionGroup']
 export type RevokeSessionsResponse = Schemas['RevokeSessionsResponse']
 
 export type SetupStatusResponse = Schemas['SetupStatusResponse']
