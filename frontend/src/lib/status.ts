@@ -72,27 +72,38 @@ export function downloadStatus(status: string): StatusPresentation {
 }
 
 /**
- * The `RequestStatus` values that count as "in flight" — a request the pipeline
- * is actively working right now: hunting a release (`searching`), pulling one
- * (`downloading`), or between retries after finding none acceptable
- * (`no_acceptable_release`, which is non-terminal and re-searches on a schedule).
+ * The `RequestStatus` values that count as "in flight" — a request that is mid-
+ * pipeline and not yet settled: hunting a release (`searching`), pulling one
+ * (`downloading`), between retries after finding none acceptable
+ * (`no_acceptable_release`, non-terminal, re-searches on a schedule), imported
+ * and awaiting Plex's availability confirmation (`completed` — the backend's
+ * in-flight "Finalizing" state; see `_SETTLED_REQUEST_STATUSES` in
+ * `repositories/requests.py`, which deliberately excludes it), or stuck
+ * mid-import awaiting the operator's retry/reject (`import_blocked` —
+ * non-terminal; see `RequestStatus` in `models.py`). Omitting either of the
+ * last two would let the badge read zero while the request is still visibly
+ * active on the Requests page — dishonest silence.
  *
  * Deliberately EXCLUDES:
- *   - not-yet-started intents (`pending`, `waiting_for_air_date`);
- *   - settled/terminal states (`available`, `partially_available`, `completed`,
- *     `failed`, `import_blocked`, `cancelled`, `evicted`).
+ *   - not-yet-started states with no pipeline activity to report (`pending`,
+ *     and `waiting_for_air_date`, which is dormant by design until its wake);
+ *   - settled states (`available`, `partially_available`, `failed`,
+ *     `cancelled`, `evicted`).
  *
- * This is the single source of truth for "something is happening now" so the
- * shell's Requests nav badge (issue #187) can't silently desync from the status
- * vocabulary above — the same reason `glyphKind` reads canonical labels rather
- * than hardcoding strings. The badge count is only ever as truthful as the
- * actor-scoped `/requests` payload it is derived from (own requests for a shared
- * user; every request for an admin — matching what that actor sees on the page).
+ * This is the single source of truth for "this request is still being worked"
+ * so the shell's Requests nav badge (issue #187) can't silently desync from the
+ * status vocabulary above — the same reason `glyphKind` reads canonical labels
+ * rather than hardcoding strings. The badge count is only ever as truthful as
+ * the actor-scoped `/requests` payload it is derived from (own requests for a
+ * shared user; every request for an admin — matching what that actor sees on
+ * the page).
  */
 export const IN_FLIGHT_REQUEST_STATUSES: ReadonlySet<string> = new Set([
   'searching',
   'downloading',
   'no_acceptable_release',
+  'completed',
+  'import_blocked',
 ])
 
 export function isInFlightRequestStatus(status: string): boolean {

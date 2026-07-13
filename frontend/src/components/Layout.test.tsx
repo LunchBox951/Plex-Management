@@ -123,17 +123,23 @@ describe('Layout', () => {
     expect(screen.getByText('Health').closest('a')).toBeNull()
   })
 
-  it('counts only request statuses that need attention and keeps stale data visible on error', () => {
+  it('counts only in-flight request statuses and keeps stale data visible on error', () => {
+    // In flight: searching / downloading / no_acceptable_release, plus the two
+    // non-terminal states Codex flagged on #249 — completed ("Finalizing":
+    // imported, before Plex confirms availability) and import_blocked (awaiting
+    // the operator's retry/reject). Not started (pending, waiting_for_air_date)
+    // and settled (available, partially_available, failed, cancelled, evicted)
+    // stay out of the count.
     setRequests(
       {
         requests: [
           requestRow(1, 'searching'),
           requestRow(2, 'downloading'),
           requestRow(3, 'no_acceptable_release'),
-          requestRow(4, 'pending'),
-          requestRow(5, 'waiting_for_air_date'),
-          requestRow(6, 'completed'),
-          requestRow(7, 'import_blocked'),
+          requestRow(4, 'completed'),
+          requestRow(5, 'import_blocked'),
+          requestRow(6, 'pending'),
+          requestRow(7, 'waiting_for_air_date'),
           requestRow(8, 'available'),
           requestRow(9, 'partially_available'),
           requestRow(10, 'failed'),
@@ -147,9 +153,9 @@ describe('Layout', () => {
     renderAt('/requests')
 
     const requestsLink = screen.getByRole('link', {
-      name: 'Requests, 3 active requests',
+      name: 'Requests, 5 active requests',
     })
-    expect(within(requestsLink).getByText('3').parentElement).toHaveClass(
+    expect(within(requestsLink).getByText('5').parentElement).toHaveClass(
       'bg-gold',
       'text-gold-ink',
     )

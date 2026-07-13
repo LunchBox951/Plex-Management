@@ -43,14 +43,22 @@ describe('isInFlightRequestStatus', () => {
     }
   })
 
-  it('excludes not-yet-started, settled, and terminal-error statuses', () => {
+  it('counts finalizing (completed) and import_blocked — non-terminal in the backend', () => {
+    // `completed` is the in-flight "Finalizing" state (imported, before Plex
+    // confirms availability; repositories/requests.py) and `import_blocked`
+    // awaits the operator's retry/reject (models.py). Both are still active on
+    // the Requests page, so the badge must not read zero while a request sits
+    // in either (Codex P2 on #249).
+    expect(isInFlightRequestStatus('completed')).toBe(true)
+    expect(isInFlightRequestStatus('import_blocked')).toBe(true)
+  })
+
+  it('excludes not-yet-started and settled statuses', () => {
     for (const status of [
       'pending',
       'waiting_for_air_date',
-      'completed',
       'available',
       'partially_available',
-      'import_blocked',
       'failed',
       'cancelled',
       'evicted',
