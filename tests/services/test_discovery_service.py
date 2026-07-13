@@ -248,6 +248,30 @@ async def test_personalized_selection_is_stable_for_same_user_and_load_id() -> N
     assert len({row.row_type.rsplit(":", 1)[-1] for row in first_personalized}) == 2
 
 
+async def test_facetless_history_bounds_profile_fan_out_for_one_load() -> None:
+    # Every seed resolves to a facetless profile, so no row is ever built and the
+    # loop would otherwise probe the whole history. A single home load must still
+    # make at most a constant number of upstream detail calls.
+    seeds = [_seed(index) for index in range(1, 40)]
+    tmdb = FakeTmdb(
+        trending=[],
+        popular=[],
+        upcoming=[],
+        recommendation_profiles={
+            (seed.tmdb_id, "movie"): RecommendationProfile(facets=()) for seed in seeds
+        },
+    )
+
+    feed = await discovery_service.home(tmdb, history=seeds, user_id=7, load_id=UUID(int=1))
+
+    assert not any(row.row_type.startswith("personalized:") for row in feed.rows)
+    # Bounded to the probe prefix (_PERSONALIZED_ROW_LIMIT * 4 = 8), never the
+    # full 39-row history — the amplification the cap exists to prevent.
+    assert len(tmdb.recommendation_profile_calls) == 8
+    assert len(tmdb.recommendation_profile_calls) < len(seeds)
+    assert tmdb.recommendation_calls == []
+
+
 async def test_different_fixed_load_ids_select_different_seed_sets() -> None:
     seeds = [_seed(index) for index in range(1, 5)]
     tmdb = FakeTmdb(

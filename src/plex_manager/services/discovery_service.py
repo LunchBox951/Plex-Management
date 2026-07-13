@@ -50,6 +50,14 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _PERSONALIZED_ROW_LIMIT = 2
+# Bound the TMDB detail fan-out for ONE home load: without a cap a heavy user
+# whose early-shuffled seeds happen to lack usable facets (or transiently fail)
+# would drive one uncached ``recommendation_profile`` call per history row before
+# giving up. Probing a shuffled prefix keeps worst-case upstream calls constant
+# while leaving generous headroom to still fill both rows (nearly every title
+# yields at least a genre facet); a fresh load_id reshuffles which seeds a
+# subsequent load probes, so the whole history still participates over time.
+_PERSONALIZATION_PROBE_LIMIT = _PERSONALIZED_ROW_LIMIT * 4
 _METRIC_ORDER: tuple[RecommendationMetric, ...] = ("genre", "director", "cast", "anime")
 _ANIME_LIBRARY_STATUSES: frozenset[str] = frozenset(
     {"completed", "available", "partially_available"}
@@ -337,7 +345,7 @@ async def _personalized_rows(
     rng = _stable_random(user_id, load_id)
     rng.shuffle(distinct)
     rows: list[HomeRow] = []
-    for seed in distinct:
+    for seed in distinct[:_PERSONALIZATION_PROBE_LIMIT]:
         if len(rows) >= _PERSONALIZED_ROW_LIMIT:
             break
         try:
