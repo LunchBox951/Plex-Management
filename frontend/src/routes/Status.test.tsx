@@ -135,7 +135,7 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(6)
+    expect(cards).toHaveLength(7)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',
@@ -510,7 +510,7 @@ describe('Status', () => {
     render(<Status />, { wrapper: Wrapper })
 
     const heading = screen.getByRole('heading', { name: 'Watchlist sync' })
-    const panel = heading.closest('.rounded-xl')
+    const panel = heading.closest('article')
     expect(panel).not.toBeNull()
     const watchlist = within(panel as HTMLElement)
     expect(watchlist.getByText('degraded')).toBeInTheDocument()

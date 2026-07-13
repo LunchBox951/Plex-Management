@@ -117,6 +117,14 @@ function healthResponse(
     disks: [],
     reconcile: { consecutive_failures: 0 },
     autograb: { consecutive_failures: 0, cooled_down_scopes: 0 },
+    watchlist: {
+      state: 'starting',
+      fetched: 0,
+      created: 0,
+      existing: 0,
+      failed_users: 0,
+      failed_entries: 0,
+    },
   }
 }
 

@@ -210,40 +210,67 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
         ? 'running clean'
         : watchlist.state.replace('_', ' ')
   return (
-    <div className="rounded-xl border border-hairline bg-surface p-4">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="font-display text-sm font-semibold text-ink">Watchlist sync</h3>
-        <Dot tone={tone} label={label} />
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 font-display text-sm font-semibold text-ink">Watchlist sync</h3>
+        <div className="shrink-0">
+          <Dot tone={tone} label={label} />
+        </div>
       </div>
-      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
-        <dt>Last run</dt>
-        <dd className="text-right">{formatTimestamp(watchlist.last_run_at)}</dd>
-        <dt>Last success</dt>
-        <dd className="text-right">{formatTimestamp(watchlist.last_ok_at)}</dd>
-        <dt>Fetched</dt>
-        <dd className="text-right">{watchlist.fetched}</dd>
-        <dt>New requests</dt>
-        <dd className="text-right">{watchlist.created}</dd>
-        <dt>Existing requests</dt>
-        <dd className="text-right">{watchlist.existing}</dd>
-        <dt>Failed users</dt>
-        <dd className={cn('text-right', watchlist.failed_users > 0 ? 'text-searching' : '')}>
+      <dl className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-1.5 font-mono text-xs">
+        <dt className="min-w-0 text-faint">Last run</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(watchlist.last_run_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Last success</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(watchlist.last_ok_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Fetched</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {watchlist.fetched}
+        </dd>
+        <dt className="min-w-0 text-faint">New requests</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {watchlist.created}
+        </dd>
+        <dt className="min-w-0 text-faint">Existing requests</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {watchlist.existing}
+        </dd>
+        <dt className="min-w-0 text-faint">Failed users</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            watchlist.failed_users > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
           {watchlist.failed_users}
         </dd>
-        <dt>Failed entries</dt>
-        <dd className={cn('text-right', watchlist.failed_entries > 0 ? 'text-searching' : '')}>
+        <dt className="min-w-0 text-faint">Failed entries</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            watchlist.failed_entries > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
           {watchlist.failed_entries}
         </dd>
         {watchlist.last_error_type ? (
           <>
-            <dt>Last error</dt>
-            <dd className="text-right text-searching">
+            <dt className="min-w-0 text-faint">Last error</dt>
+            <dd className="min-w-0 text-right text-error tabular-nums [overflow-wrap:anywhere]">
               {watchlist.last_error_type} · {formatTimestamp(watchlist.last_error_at)}
             </dd>
           </>
         ) : null}
       </dl>
-    </div>
+    </article>
   )
 }
 
