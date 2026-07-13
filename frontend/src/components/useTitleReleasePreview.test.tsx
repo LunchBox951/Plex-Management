@@ -91,6 +91,66 @@ describe('useTitleReleasePreview', () => {
     expect(hook.result.current.preview).toBeNull()
   })
 
+  it('drops a run started on a PREVIOUS visit to the same title', async () => {
+    // The guard must be an epoch, not a title-key comparison: navigating
+    // A -> B -> back to A restores the key, so a response from A's FIRST visit
+    // would pass a key guard and resurface as if it were fresh — after the
+    // render-time clear had already wiped it.
+    let resolvePreview: ((value: SearchPreviewResponse) => void) | undefined
+    mocks.mutateAsync.mockReturnValue(
+      new Promise<SearchPreviewResponse>((resolve) => {
+        resolvePreview = resolve
+      }),
+    )
+    const other: DiscoverResult = {
+      ...MOVIE,
+      tmdb_id: 43,
+      title: 'Other Movie',
+    }
+    const hook = renderHook(
+      ({ title }: { title: DiscoverResult }) => useTitleReleasePreview(title, null),
+      { initialProps: { title: MOVIE } },
+    )
+
+    let pending: Promise<void> | undefined
+    act(() => {
+      pending = hook.result.current.runPreview(7)
+    })
+    hook.rerender({ title: other })
+    hook.rerender({ title: MOVIE })
+    await act(async () => {
+      resolvePreview?.(PREVIEW)
+      await pending
+    })
+
+    expect(hook.result.current.preview).toBeNull()
+  })
+
+  it('drops an in-flight run when the preview is manually cleared', async () => {
+    // The modal clears the preview on season changes; a still-resolving run for
+    // the OLD season landing afterwards would show releases the grab path would
+    // then send under the NEW season's context.
+    let resolvePreview: ((value: SearchPreviewResponse) => void) | undefined
+    mocks.mutateAsync.mockReturnValue(
+      new Promise<SearchPreviewResponse>((resolve) => {
+        resolvePreview = resolve
+      }),
+    )
+    const hook = renderHook(() => useTitleReleasePreview(MOVIE, null))
+
+    let pending: Promise<void> | undefined
+    act(() => {
+      pending = hook.result.current.runPreview(7)
+    })
+    act(() => hook.result.current.clearPreview())
+    await act(async () => {
+      resolvePreview?.(PREVIEW)
+      await pending
+    })
+
+    expect(hook.result.current.preview).toBeNull()
+  })
+
   it('drops a result that resolves after the modal moves to another title', async () => {
     let resolvePreview: ((value: SearchPreviewResponse) => void) | undefined
     mocks.mutateAsync.mockReturnValue(

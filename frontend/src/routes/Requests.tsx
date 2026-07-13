@@ -196,11 +196,18 @@ export function Requests() {
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const [modalAction, setModalAction] = useState<TitleDetailModalAction | null>(null)
+  // Pin the modal to the EXACT row that was clicked. An admin's list can show
+  // two different users' rows for the same title (the display fold keys on
+  // user_id), and the modal's own title-based correlation would otherwise
+  // resolve every verb — preview/grab/report/cancel/pin — to the FIRST match,
+  // not necessarily the clicked one.
+  const [boundRequestId, setBoundRequestId] = useState<number | null>(null)
   const nextActionToken = useRef(0)
 
   const openRequest = (request: RequestResponse) => {
     setModalAction(null)
     setSelected(requestToDiscoverResult(request))
+    setBoundRequestId(request.id)
     setModalOpen(true)
   }
 
@@ -218,6 +225,7 @@ export function Requests() {
           null)
         : null
     setSelected(requestToDiscoverResult(request))
+    setBoundRequestId(request.id)
     setModalAction({
       kind: 're-search',
       requestId: request.id,
@@ -229,7 +237,10 @@ export function Requests() {
 
   const changeModalOpen = (open: boolean) => {
     setModalOpen(open)
-    if (!open) setModalAction(null)
+    if (!open) {
+      setModalAction(null)
+      setBoundRequestId(null)
+    }
   }
 
   let body: ReactNode
@@ -292,6 +303,7 @@ export function Requests() {
           open={modalOpen}
           onOpenChange={changeModalOpen}
           action={modalAction}
+          boundRequestId={boundRequestId}
         />
       ) : null}
     </div>

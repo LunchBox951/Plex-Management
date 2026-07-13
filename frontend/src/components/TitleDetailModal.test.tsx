@@ -1207,6 +1207,62 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
   })
 })
 
+describe('TitleDetailModal — bound request row (duplicate same-title rows)', () => {
+  it('presents and acts on the CLICKED row, not the first title match', async () => {
+    // An admin's Requests list legitimately shows TWO users' rows for the same
+    // title (the display fold keys on user_id). Without an explicit binding the
+    // modal's title-based correlation resolves to the FIRST non-settled match —
+    // here another user's `downloading` row — so previewing/grabbing from the
+    // clicked no-release row would target a different user's request.
+    const otherUsersRow: RequestResponse = {
+      id: 80,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const clickedRow: RequestResponse = {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const previewMutation = mutation({
+      accepted: [],
+      rejected: [],
+      no_acceptable_release: true,
+    })
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(previewMutation)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [otherUsersRow, clickedRow] },
+    })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    // The action zone reflects the BOUND row's no-release state (Re-search),
+    // not the unbound first match's `downloading` state…
+    const reSearch = await screen.findByRole('button', { name: /re-search/i })
+    fireEvent.click(reSearch)
+    // …and the preview runs against the bound row's id.
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 81 }),
+    )
+  })
+})
+
 describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
   const EMPTY_PREVIEW: SearchPreviewResponse = {
     accepted: [],

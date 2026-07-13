@@ -53,6 +53,17 @@ interface TitleDetailModalProps {
   onOpenChange: (open: boolean) => void
   returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
   action?: TitleDetailModalAction | null
+  /**
+   * Pin the modal's request correlation to ONE specific row. The Requests list
+   * passes the clicked row's id: an admin's list legitimately shows two
+   * different users' rows for the same title (the display fold keys on user_id
+   * too), and the modal's own `(tmdb_id, media_type)` correlation would
+   * otherwise resolve `liveRequest` — and with it the preview/grab/report/
+   * cancel/pin targets — to the FIRST matching row, which can be a DIFFERENT
+   * user's request than the one that was clicked. Omitted (Discover), the
+   * correlation behaves exactly as before.
+   */
+  boundRequestId?: number | null
 }
 
 function asApiError(error: unknown): ApiError {
@@ -236,6 +247,7 @@ export function TitleDetailModal({
   onOpenChange,
   returnFocusTo,
   action,
+  boundRequestId,
 }: TitleDetailModalProps) {
   const { toast } = useToast()
   // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
@@ -326,6 +338,15 @@ export function TitleDetailModal({
     const matches = (requestsQuery.data?.requests ?? []).filter(
       (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
+    // A caller-pinned row wins outright — the operator clicked THAT row, so its
+    // state (even a settled one) is what the modal must present and act on. The
+    // title-match filter above still applies: a bound id that no longer matches
+    // this title (or vanished from the poll) falls through to normal resolution
+    // rather than binding the modal to a foreign title's request.
+    if (boundRequestId != null) {
+      const bound = matches.find((r) => r.id === boundRequestId)
+      if (bound) return bound
+    }
     const active = matches.find(
       (r) =>
         r.status !== 'available' &&
@@ -337,7 +358,7 @@ export function TitleDetailModal({
         r.status !== 'cancelled',
     )
     return active ?? matches[matches.length - 1] ?? null
-  }, [requestsQuery.data, title])
+  }, [requestsQuery.data, title, boundRequestId])
 
   // A just-created request shows immediately even before the next poll lands. Used
   // for preview + queue correlation (a terminal request still owns its old download).

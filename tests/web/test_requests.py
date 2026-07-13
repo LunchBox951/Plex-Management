@@ -532,9 +532,11 @@ async def test_request_download_progress_is_truthful_or_null(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
     """Known zero/42% survive, while missing, ambiguous, non-downloading, and
-    client-missing projections remain null rather than fabricating an
-    aggregate/default/stale value — and one live transfer beside a
-    client-missing sibling still projects its own honest number."""
+    non-transferring (client-missing / metadata-fetching / import-pending)
+    projections remain null rather than fabricating an aggregate, a default, a
+    stale value, or a live-looking bar for a phase that isn't a transfer — and
+    one live transfer beside a non-transferring sibling still projects its own
+    honest number."""
     await seed(initialized=True, app_api_key=_API_KEY)
 
     async with app.state.sessionmaker() as session:
@@ -580,6 +582,18 @@ async def test_request_download_progress_is_truthful_or_null(
             title="One Live One Missing",
             status=RequestStatus.downloading,
         )
+        fetching_metadata = MediaRequest(
+            tmdb_id=617,
+            media_type=MediaType.movie,
+            title="Fetching Metadata",
+            status=RequestStatus.downloading,
+        )
+        awaiting_import = MediaRequest(
+            tmdb_id=618,
+            media_type=MediaType.movie,
+            title="Awaiting Import",
+            status=RequestStatus.downloading,
+        )
         session.add_all(
             [
                 known_zero,
@@ -589,6 +603,8 @@ async def test_request_download_progress_is_truthful_or_null(
                 not_downloading,
                 vanished,
                 one_live_one_missing,
+                fetching_metadata,
+                awaiting_import,
             ]
         )
         await session.flush()
@@ -660,6 +676,24 @@ async def test_request_download_progress_is_truthful_or_null(
                     season=2,
                     progress=0.66,
                 ),
+                # Non-terminal but NOT transferring: no payload transfer exists yet
+                # (metadata) / the transfer is already over (import wait). Queue
+                # shows these as honest state labels with no progress bar; the
+                # Requests projection must not turn them into a live-looking one.
+                Download(
+                    torrent_hash="metadata-row",
+                    status="metadata_fetching",
+                    media_request_id=fetching_metadata.id,
+                    media_type=MediaType.movie,
+                    progress=0.0,
+                ),
+                Download(
+                    torrent_hash="import-pending-row",
+                    status="import_pending",
+                    media_request_id=awaiting_import.id,
+                    media_type=MediaType.movie,
+                    progress=1.0,
+                ),
             ]
         )
         await session.commit()
@@ -675,6 +709,8 @@ async def test_request_download_progress_is_truthful_or_null(
         "Still Searching": None,
         "Vanished From Client": None,
         "One Live One Missing": 0.33,
+        "Fetching Metadata": None,
+        "Awaiting Import": None,
     }
 
     # Single-record responses use the same one-request projection semantics.

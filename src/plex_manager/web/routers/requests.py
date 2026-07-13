@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
-from plex_manager.domain.state_machine import ACTIVE_STATES, DownloadState
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
@@ -88,17 +88,17 @@ _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     409: {"model": ErrorDetail, "description": "Already requested by another user"},
 }
 
-# Download states whose ``progress`` is a LIVE value: the reconciler refreshes
-# these every cycle against a torrent actually present in qBittorrent. A
-# ``client_missing`` row is deliberately excluded even though it is non-terminal
-# (it stays in ``list_active_for_requests``' batch for ownership purposes): its
-# torrent has vanished from the client, so its stored progress is the frozen
-# last-known value — projecting it while the request sits out the grace window
-# still reading ``downloading`` would show a live-looking bar for a dead
-# transfer (Queue honestly shows "Client missing" with no progress there).
-_LIVE_PROGRESS_DOWNLOAD_STATUSES: frozenset[str] = frozenset(
-    state.value for state in ACTIVE_STATES - {DownloadState.ClientMissing}
-)
+# The ONE download state whose ``progress`` is a live transfer percentage. Every
+# other non-terminal state stays in ``list_active_for_requests``' batch for
+# ownership purposes but is deliberately excluded from the projection:
+# ``client_missing`` (the torrent vanished from qBittorrent, so its stored
+# progress is a frozen last-known value while the request rides out the grace
+# window), ``metadata_fetching`` (no payload transfer exists yet to have a
+# truthful percentage), and ``import_pending`` (the transfer is over -- the wait
+# is for import, which a percent bar would misreport as still-downloading).
+# Mirrors the Queue UI, which shows transfer progress ONLY for
+# ``status === 'downloading'`` and an honest state label for everything else.
+_LIVE_PROGRESS_DOWNLOAD_STATUSES: frozenset[str] = frozenset({DownloadState.Downloading.value})
 
 _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Request or season not found"},
@@ -159,8 +159,8 @@ async def _to_response(
     progress. The list endpoint supplies one actor-filtered batch; single-record
     and mutation responses perform one corresponding request-id read. Progress is
     truthful only for a displayed ``downloading`` request with exactly one
-    live-progress physical download (``_LIVE_PROGRESS_DOWNLOAD_STATUSES`` — a
-    ``client_missing`` row's frozen last-known value never drives the bar).
+    physical download actually transferring (``_LIVE_PROGRESS_DOWNLOAD_STATUSES``
+    -- client-missing/metadata/import-pending rows never drive the bar).
     Multiple concurrent live TV-season downloads are intentionally ambiguous --
     never averaged, summed, or selected arbitrarily.
     """
@@ -180,12 +180,12 @@ async def _to_response(
         active_downloads = await SqlDownloadRepository(session).list_active_for_requests(
             [record.id]
         )
-    # Only downloads in a live-progress state may drive the bar: a non-terminal
-    # ``client_missing`` row still belongs to the request (and stays in the
-    # batch), but its progress is a stale last-known value, not a live transfer
-    # (see ``_LIVE_PROGRESS_DOWNLOAD_STATUSES``). The exact-one rule is applied
-    # AFTER this filter: one live transfer next to a client-missing sibling is
-    # still one honest number, while two live transfers remain ambiguous.
+    # Only ``downloading`` rows may drive the bar: every other non-terminal row
+    # still belongs to the request (and stays in the batch) but has no truthful
+    # transfer percentage to show (see ``_LIVE_PROGRESS_DOWNLOAD_STATUSES``).
+    # The exact-one rule is applied AFTER this filter: one live transfer next to
+    # a client-missing/metadata/import-pending sibling is still one honest
+    # number, while two live transfers remain ambiguous.
     live_downloads = [
         download
         for download in active_downloads.get(record.id, [])
