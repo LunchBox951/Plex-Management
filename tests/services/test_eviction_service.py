@@ -374,6 +374,98 @@ async def test_assemble_candidates_assigns_nested_root_content_to_the_child_only
     assert [c.title for c in child] == ["Nested"]
 
 
+async def test_assemble_candidates_batches_watch_state_into_one_call(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #213/#238: candidate assembly resolves the WHOLE pool's watch state
+    in ONE batch call, never one lookup per candidate. The real per-section
+    crawl saving is proved against the ``PlexLibrary`` adapter; here we prove the
+    SERVICE hands the adapter the whole set at once."""
+    for i in range(3):
+        path = _movie_file(tmp_path, f"Movie {i}.mkv")
+        await _movie(sessionmaker_, tmdb_id=910 + i, title=f"Movie {i}", library_path=path)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(tmp_path / "movies"),
+            root_total_bytes=0,
+        )
+
+    assert len(candidates) == 3
+    # ONE batch for the three candidates, not three separate round-trips.
+    assert library.resolve_watch_states_calls == 1
+    assert library.resolve_watch_states_batch_sizes == [3]
+
+
+async def test_assemble_candidates_batches_season_watch_state_into_one_call(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The TV twin: five seasons of ONE show resolve their watch state in ONE
+    batch (folding in the per-season ``/children`` re-crawl of issue #238)."""
+    seasons: dict[int, str | None] = {}
+    for season in range(1, 6):
+        path = tmp_path / "tv" / "Show" / f"Season 0{season}"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "e01.mkv").write_bytes(b"0" * 512)
+        seasons[season] = str(path)
+    await _show_with_seasons(sessionmaker_, tmdb_id=920, title="Show", seasons=seasons)
+    library = FakeLibrary()
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="tv",
+            root_path=str(tmp_path / "tv"),
+            root_total_bytes=0,
+        )
+
+    assert len(candidates) == 5
+    assert library.resolve_watch_states_calls == 1
+    assert library.resolve_watch_states_batch_sizes == [5]
+
+
+async def test_assemble_candidates_sizes_each_distinct_path_once(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #213: two rows legitimately sharing ONE ``library_path`` (the #155
+    shared-breadcrumb twins) must walk that directory tree ONCE, not once per
+    row. Both candidates still report the identical size."""
+    shared = _movie_file(tmp_path, "Shared.mkv")
+    other = _movie_file(tmp_path, "Other.mkv")
+    await _movie(sessionmaker_, tmdb_id=930, title="Twin A", library_path=shared)
+    await _movie(sessionmaker_, tmdb_id=931, title="Twin B", library_path=shared)
+    await _movie(sessionmaker_, tmdb_id=932, title="Solo", library_path=other)
+    library = FakeLibrary()
+
+    sized_paths: list[str] = []
+
+    def _counting_size_bytes(path: str) -> int | None:
+        sized_paths.append(path)
+        return 4096
+
+    monkeypatch.setattr(eviction_service, "_size_bytes", _counting_size_bytes)
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(tmp_path / "movies"),
+            root_total_bytes=1_000_000,
+        )
+
+    # The shared path is walked exactly once despite backing two candidates.
+    assert sized_paths.count(shared) == 1
+    assert sized_paths.count(other) == 1
+    by_title = {c.title: c for c in candidates}
+    assert by_title["Twin A"].size_percent == by_title["Twin B"].size_percent
+
+
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:
     library_path = _movie_file(tmp_path, "Unwatched.mkv")
     await _movie(sessionmaker_, tmdb_id=2, title="Unwatched", library_path=library_path)

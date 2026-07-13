@@ -26,7 +26,7 @@ from plex_manager.ports.download_client import (
     FailureDetail,
 )
 from plex_manager.ports.indexer import IndexerPort
-from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
+from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState, WatchStateQuery
 from plex_manager.ports.media_probe import (
     MediaProbeError,
     MediaProbePort,
@@ -474,6 +474,12 @@ class FakeLibrary:
         self.watch_states_by_path = watch_states_by_path
         self.watch_state_calls: list[tuple[int, str, int | None]] = []
         self.watch_state_path_calls: list[str | None] = []
+        # Batch watch-state discovery (issues #213/#238): counts every
+        # ``resolve_watch_states`` call and records each batch's size, so a service
+        # test can prove candidate assembly makes ONE batch call for the whole pool
+        # rather than one ``watch_state`` round-trip per candidate.
+        self.resolve_watch_states_calls = 0
+        self.resolve_watch_states_batch_sizes: list[int] = []
         # When set, ``is_available``/``present_seasons``/``present_ids``/
         # ``season_presence`` raise this instead of returning -- lets a caller
         # exercise the best-effort "log and treat as not-present" error path (see
@@ -621,6 +627,26 @@ class FakeLibrary:
         return self.watch_states.get(
             (tmdb_id, media_type, season), WatchState(watched=False, last_viewed_at=None)
         )
+
+    async def resolve_watch_states(self, queries: Sequence[WatchStateQuery]) -> list[WatchState]:
+        # Behaviour-equivalent to N :meth:`watch_state` calls (each recorded in
+        # ``watch_state_calls``/``watch_state_path_calls`` exactly as before), so
+        # every existing per-candidate call-count assertion still holds; the real
+        # section-crawl batching is exercised against the ``PlexLibrary`` adapter
+        # in ``tests/adapters/plex/test_plex_library.py``. ``resolve_watch_states_calls``
+        # additionally counts the BATCH calls, so a service test can assert one
+        # batch per candidate-assembly pass rather than one lookup per candidate.
+        self.resolve_watch_states_calls += 1
+        self.resolve_watch_states_batch_sizes.append(len(queries))
+        return [
+            await self.watch_state(
+                query.tmdb_id,
+                query.media_type,
+                season=query.season,
+                library_path=query.library_path,
+            )
+            for query in queries
+        ]
 
 
 def override_adapters(
