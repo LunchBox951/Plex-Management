@@ -2134,15 +2134,19 @@ def test_resolve_correlated_watch_state_identical_paths_merge_watched_if_any() -
     )
 
 
-def test_resolve_correlated_watch_state_identical_paths_use_oldest_watched_timestamp() -> None:
-    # Both copies watched, with DIFFERENT lastViewedAt -- merge to the OLDEST
-    # (most-conservative), never the newest.
+def test_resolve_correlated_watch_state_identical_paths_use_newest_watched_timestamp() -> None:
+    # Both copies watched, with DIFFERENT lastViewedAt -- merge to the NEWEST,
+    # never the oldest: eviction treats last_viewed_at < grace_cutoff as
+    # eligible and sorts stalest-first, so keeping a stale timestamp from a
+    # section that hasn't caught up with a recent rewatch another section
+    # already recorded would make the item eligible for deletion during the
+    # grace window right after that rewatch (Codex review, PR #281).
     hits = [
         (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_NEWER_AT)),
         (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
     ]
     assert _resolve_correlated_watch_state(hits) == WatchState(
-        watched=True, last_viewed_at=_WATCHED_AT
+        watched=True, last_viewed_at=_NEWER_AT
     )
 
 

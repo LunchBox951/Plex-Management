@@ -166,6 +166,20 @@ def test_web_concurrency_blank_env_var_falls_back_to_default(
     assert settings.web_concurrency == 1
 
 
+def test_web_concurrency_malformed_convention_value_does_not_crash_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex review (PR #281): this is a purely advisory field (a best-effort
+    # startup warning) fed by a THIRD-PARTY process manager's own convention --
+    # some set non-integer sentinels like gunicorn's "auto". A malformed value
+    # must fall back to the default, never raise and take the whole app down.
+    monkeypatch.setenv("WEB_CONCURRENCY", "auto")
+
+    settings = _settings_no_dotenv()
+
+    assert settings.web_concurrency == 1
+
+
 def test_uninitialized_boot_needs_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1: a fresh install boots with ZERO auth env vars.
 

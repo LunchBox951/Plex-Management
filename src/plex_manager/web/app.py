@@ -81,6 +81,7 @@ from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
     EventHub,
     current_build_id,
+    detect_multiworker_signals,
     get_event_hub,
     publish_realtime,
     warn_if_multiworker,
@@ -116,7 +117,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _warn_if_multi_process() -> None:
-    """Warn loudly, once per process, if ``WEB_CONCURRENCY`` implies >1 worker.
+    """Warn loudly, once per process, if the environment implies >1 worker.
 
     Several in-process registries assume a SINGLE Python process (issue #240):
     ``services.queue_service``'s removal-physics guards (``_removals_in_flight`` /
@@ -134,17 +135,26 @@ def _warn_if_multi_process() -> None:
     itself. Runs in EVERY worker process's own ``lifespan`` (never just the
     first), so a multi-worker launch logs once per worker -- exactly the
     operator-visible signal an install running more than one worker needs.
+
+    Uses :func:`~plex_manager.web.events.detect_multiworker_signals` -- the SAME
+    detection ``warn_if_multiworker`` uses for the realtime SSE hub's own
+    single-process invariant -- rather than looking at ``WEB_CONCURRENCY``
+    alone: a deployment that scales out via ``WORKERS``, ``UVICORN_WORKERS``, or
+    gunicorn's ``GUNICORN_CMD_ARGS`` breaks these registries exactly the same
+    way, and checking only one of the four signals would silently miss the
+    other three.
     """
-    concurrency = get_settings().web_concurrency
-    if concurrency > 1:
+    signals = detect_multiworker_signals()
+    if signals:
         _logger.warning(
-            "WEB_CONCURRENCY=%d: this app assumes a SINGLE process. Its "
-            "in-process removal/settings-rotation guards (queue_service, "
-            "purge_service, web.routers.settings) do not coordinate across "
-            "worker processes or container replicas, so running more than one "
-            "silently reopens the same-hash download races those guards exist "
-            "to close. Run exactly one worker/replica of this app.",
-            concurrency,
+            "multi-worker configuration detected (%s): this app assumes a "
+            "SINGLE process. Its in-process removal/settings-rotation guards "
+            "(queue_service, purge_service, web.routers.settings) do not "
+            "coordinate across worker processes or container replicas, so "
+            "running more than one silently reopens the same-hash download "
+            "races those guards exist to close. Run exactly one worker/replica "
+            "of this app.",
+            ", ".join(sorted(signals)),
         )
 
 

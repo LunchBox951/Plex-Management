@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.services import path_visibility
 
 if TYPE_CHECKING:
     from plex_manager.ports.download_client import DownloadClientPort
@@ -336,6 +337,17 @@ async def remove_torrent(
     (the adapter nulls it in that case — see ``adapters/qbittorrent/adapter.py``)
     has nothing distinct to poll (``save_path`` is shared by other torrents) and
     is skipped honestly rather than polling the wrong thing.
+
+    Container-visible remap (issue #240 residual, Codex review on PR #281): qBittorrent
+    runs on the HOST, so the snapshotted ``content_path`` can be a HOST-namespace
+    path (e.g. ``/srv/downloads/...``) this process only sees through the
+    ``/downloads`` bind mount — polling the raw path would find it already
+    "gone" (``os.path.exists`` on a path that never existed HERE) and release
+    the guard immediately while qBittorrent may still be deleting the real,
+    container-visible file. :func:`_visible_content_path` (called BEFORE the
+    torrent is removed, since the remap's proof needs the client's own file
+    list, which is unavailable once the torrent is gone) applies the exact same
+    remap ``import_service._resolve_visible_content`` uses for imports.
     """
     content_path: str | None = None
     try:
@@ -346,7 +358,9 @@ async def remove_torrent(
         # abort the removal itself.
         status = None
     if status is not None and status.content_path:
-        content_path = status.content_path
+        content_path = await _visible_content_path(
+            qbt, torrent_hash, status.content_path, status.save_path
+        )
     try:
         await qbt.remove(torrent_hash, delete_files=True)
     except Exception:
@@ -364,6 +378,51 @@ async def remove_torrent(
     if content_path is not None:
         await _wait_for_content_path_gone(content_path, context=context, extra=extra)
     return True
+
+
+async def _visible_content_path(
+    qbt: DownloadClientPort, torrent_hash: str, content_path: str, save_path: str
+) -> str | None:
+    """Container-visible remap of a just-snapshotted torrent ``content_path``.
+
+    Mirrors ``import_service._resolve_visible_content`` (issue #133): qBittorrent
+    runs on the HOST, so a client-reported ``content_path`` can be a
+    HOST-namespace path this container cannot see even though the file sits
+    right there, one bind mount away (e.g. host ``/srv/downloads/...`` vs. this
+    container's ``/downloads/...``). Returns ``content_path`` unchanged when it
+    already exists here (the common same-namespace fast path — no client call
+    needed); otherwise anchors the remap on ``save_path`` and demands the
+    torrent's OWN file list (:meth:`DownloadClientPort.list_files`) prove the
+    remapped candidate exhibits that exact payload at the exact relative
+    location and size — never an existence-only guess — via
+    :func:`~plex_manager.services.path_visibility.remap_download_content`.
+
+    Called BEFORE the torrent is removed (unlike the poll itself): the proof
+    needs the client's own file list, which ``list_files`` can no longer answer
+    once the torrent is gone. Returns ``None`` — the caller then skips the poll
+    rather than checking the wrong path — when there is no live ``save_path``
+    anchor, when ``list_files`` itself fails (a client hiccup here must not
+    block the removal that's about to happen regardless), or when no candidate
+    is proven.
+    """
+    if await asyncio.to_thread(os.path.exists, content_path):
+        return content_path
+    if not save_path:
+        # No live anchor to remap against (a torrent status with no save path):
+        # only the verbatim path counts, exactly as ``_resolve_visible_content``
+        # documents — a free suffix search would reintroduce the stale-match
+        # hazard :func:`path_visibility.remap_download_content` exists to close.
+        return None
+    try:
+        files = await qbt.list_files(torrent_hash)
+    except Exception:
+        # Best-effort: a failed file-list fetch just means there's nothing safely
+        # provable to poll — never a reason to hold up the torrent removal itself.
+        return None
+    expected = [(entry.name, entry.size_bytes) for entry in files]
+    return await asyncio.to_thread(
+        path_visibility.remap_download_content, content_path, save_path, expected
+    )
 
 
 async def _wait_for_content_path_gone(

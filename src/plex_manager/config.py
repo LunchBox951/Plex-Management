@@ -122,8 +122,11 @@ class Settings(BaseSettings):
     # image, Heroku, etc.) an operator scaling this app would set to run more
     # than one worker process. The app itself never reads this to size a worker
     # pool (``__main__.py`` always calls ``uvicorn.run`` with no ``workers=``,
-    # i.e. one process) — it exists PURELY so ``web.app.lifespan`` can warn
-    # loudly at startup when an operator's own process manager (a
+    # i.e. one process) — it exists so this convention var is a documented,
+    # typed setting (see ``.env.example``) rather than a magic string, feeding
+    # the same "warn loudly, never silently" purpose as
+    # ``web.app._warn_if_multi_process``/``web.events.warn_if_multiworker``:
+    # surfacing when an operator's own process manager (a
     # ``uvicorn --workers>1`` wrapper, or a multi-container/multi-replica
     # deployment that sets this by convention) is about to violate the
     # single-process assumption several in-process registries depend on for
@@ -140,7 +143,42 @@ class Settings(BaseSettings):
     # set, and building real multi-process coordination (a DB-level lock/CAS
     # spanning every one of these registries) is out of scope for this fix —
     # the goal is making the violated assumption LOUD at startup, not silent.
+    # NOTE: the startup warnings themselves detect this (and its sibling
+    # signals WORKERS/UVICORN_WORKERS/GUNICORN_CMD_ARGS) straight from
+    # ``os.environ`` via ``web.events.detect_multiworker_signals`` — ONE shared
+    # detection both warnings call, rather than each re-deriving its own
+    # partial view — so this field's parsed value isn't itself read by that
+    # path; it must still never crash ``Settings()`` on a process manager's
+    # own non-integer convention (e.g. gunicorn's ``"auto"``), hence the
+    # lenient validator below.
     web_concurrency: int = Field(default=1, validation_alias="WEB_CONCURRENCY")
+
+    @field_validator("web_concurrency", mode="before")
+    @classmethod
+    def _parse_web_concurrency(cls, value: object) -> object:
+        """Tolerate a malformed ``WEB_CONCURRENCY`` instead of crashing startup.
+
+        This is purely an ADVISORY field (see its docstring above): the app
+        itself never reads it to size anything, it only feeds a best-effort
+        startup warning (``web.app._warn_if_multi_process``). Process managers
+        set this variable by differing conventions and some use non-integer
+        sentinels (e.g. gunicorn's own ``"auto"``) -- a strict ``int`` field
+        would make ``Settings()`` raise and take the whole app down over a
+        value nothing here actually depends on. Falls back to the default (1,
+        "assume single worker") on anything that doesn't parse, mirroring
+        ``web.events.warn_if_multiworker()``'s own tolerant ``int(raw)`` +
+        ``except ValueError`` parse of the very same variable. A value that IS
+        already an ``int`` (e.g. a programmatic ``Settings(web_concurrency=3)``
+        in a test) passes through unchanged.
+        """
+        if isinstance(value, int):
+            return value
+        if value is None:
+            return 1
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return 1
 
     @field_validator("allowed_hosts", mode="before")
     @classmethod

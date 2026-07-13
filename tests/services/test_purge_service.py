@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
-from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
-from plex_manager.services import purge_service
+from plex_manager.ports.download_client import DownloadClientPort, DownloadedFile, DownloadStatus
+from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
@@ -252,7 +253,7 @@ async def test_remove_torrent_polls_until_content_path_disappears(
 
     deleter = asyncio.create_task(_delete_shortly_after())
     ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
-    await deleter
+    await asyncio.gather(deleter)  # reap the helper task cleanly before the test ends
     assert ok is True
     assert not content.exists()
 
@@ -295,6 +296,98 @@ async def test_remove_torrent_tolerates_a_failed_status_snapshot() -> None:
     qbt: DownloadClientPort = _RaisingStatusQbt()
     ok = await purge_service.remove_torrent(qbt, "c" * 40, context="a test")
     assert ok is True
+
+
+async def test_remove_torrent_remaps_a_host_namespace_content_path_before_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex review (PR #281): qBittorrent runs on the HOST, so the reported
+    # content_path (e.g. /srv/downloads/...) usually does not exist inside this
+    # container -- polling it raw would find it "already gone" and release the
+    # guard immediately even while qBittorrent is still deleting the real,
+    # container-visible file under the /downloads bind mount. Prove the remap
+    # happens: the visible file is still on disk under the remapped mount, so
+    # the poll must actually run against IT, not the never-existing host path.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    video = mount / "Some.Movie.2020.1080p-GRP.mkv"
+    video.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.05)
+    host_save_path = "/srv/downloads"
+    host_content_path = f"{host_save_path}/{video.name}"
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name=video.name,
+                raw_state="stalledUP",
+                save_path=host_save_path,
+                content_path=host_content_path,
+            )
+        ],
+        files={("a" * 40): [DownloadedFile(name=video.name, size_bytes=1024)]},
+    )
+
+    async def _delete_shortly_after() -> None:
+        await asyncio.sleep(0.15)
+        video.unlink()
+
+    deleter = asyncio.create_task(_delete_shortly_after())
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    await asyncio.gather(deleter)
+
+    assert ok is True
+    assert not video.exists()  # the poll genuinely waited on the REMAPPED path
+
+
+async def test_remove_torrent_skips_the_poll_when_the_host_path_cannot_be_remapped(
+    tmp_path: Path,
+) -> None:
+    # No live download mount matches, and the torrent's own file list can't prove
+    # any candidate -- an honest "not visible" skip, never a guess that would
+    # release the guard against the wrong (or a stale) path.
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="x",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path="/srv/downloads/Some.Movie.2020.1080p-GRP.mkv",
+            )
+        ]
+    )
+    ok = await purge_service.remove_torrent(qbt, "a" * 40, context="a test")
+    assert ok is True
+
+
+async def test_visible_content_path_returns_none_when_save_path_is_empty() -> None:
+    # No live save-path anchor (a torrent status with no save path reported) --
+    # only the verbatim content path counts; a free suffix search is never
+    # attempted (mirrors import_service._resolve_visible_content).
+    qbt = FakeQbittorrent()
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/gone.mkv", ""
+    )
+    assert result is None
+
+
+class _RaisingListFilesQbt(FakeQbittorrent):
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        raise RuntimeError("qbt is down")
+
+
+async def test_visible_content_path_tolerates_a_failed_file_list_fetch() -> None:
+    # A best-effort remap: a client hiccup fetching the file list must not raise
+    # -- it just means there's nothing safely provable to poll.
+    qbt: DownloadClientPort = _RaisingListFilesQbt()
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/gone.mkv", "/srv/downloads"
+    )
+    assert result is None
 
 
 async def test_trigger_library_scan_records_the_scan() -> None:

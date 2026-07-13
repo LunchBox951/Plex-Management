@@ -289,10 +289,14 @@ def _resolve_correlated_watch_state(
     The merge itself: watched if ANY correlated hit is watched -- a section
     whose own watch-state sync lags behind (or that a user happens to browse
     less) must never mask a real watch recorded via another section indexing
-    the identical file. The timestamp is the OLDEST (most-conservative)
-    ``last_viewed_at`` among the WATCHED hits, never the newest -- a section
-    that is slow to reflect a rewatch must never push the eviction grace
-    window later than what the earliest section already confirmed.
+    the identical file. The timestamp is the NEWEST ``last_viewed_at`` among
+    the WATCHED hits, never the oldest -- eviction treats
+    ``last_viewed_at < grace_cutoff`` as eligible and sorts stalest-first, so
+    keeping a STALE timestamp from a section that hasn't caught up with a
+    recent rewatch another section already recorded would make the item
+    eligible for deletion during the grace window right after that rewatch.
+    Deletion safety requires the most-recent watch evidence to win, not the
+    most-conservative one.
     """
     if len(hits) == 1:
         return hits[0][1]
@@ -310,7 +314,7 @@ def _resolve_correlated_watch_state(
     ]
     if not watched_timestamps:
         return WatchState(watched=False, last_viewed_at=None)
-    return WatchState(watched=True, last_viewed_at=min(watched_timestamps))
+    return WatchState(watched=True, last_viewed_at=max(watched_timestamps))
 
 
 def _is_path_prefix(prefix: str, path: str) -> bool:
@@ -1138,8 +1142,10 @@ class PlexLibrary:
         merely indexed by more than one Plex section (e.g. a broad ``/media``
         section plus a nested ``/media/anime`` section covering the same files)
         and are merged into one logical item -- watched if ANY hit is watched, at
-        the OLDEST (most-conservative) watched timestamp. Hits whose file paths
-        genuinely DIFFER remain ambiguous and still FAIL CLOSED, exactly as
+        the NEWEST watched timestamp (deletion safety: a stale timestamp from a
+        section that hasn't caught up with a recent rewatch another section
+        already recorded must never make the item look grace-window-eligible).
+        Hits whose file paths genuinely DIFFER remain ambiguous and still FAIL CLOSED, exactly as
         before -- a legitimate duplicate (distinct copies on disk) must never let
         one copy's watched state authorize deleting the other. The TV branch pays
         one extra per-season ``/children`` (episode) fetch per candidate show to

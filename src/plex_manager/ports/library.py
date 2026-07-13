@@ -306,11 +306,11 @@ class LibraryPort(Protocol):
         (e.g. a broad section plus a nested section both covering the same
         files), and the implementation MUST treat it as one logical item rather
         than failing closed: merged ``watched`` is ``True`` if ANY such hit is
-        watched, and the merged ``last_viewed_at`` is the OLDEST (most
-        conservative) watched timestamp among them -- never the newest, so a
-        section that is slow to reflect a rewatch can never push the eviction
-        grace window later than what another section already confirmed. Only
-        hits whose reported file paths genuinely differ stay fail-closed.
+        watched, and the merged ``last_viewed_at`` is the NEWEST watched
+        timestamp among them -- never the oldest, so a section that is slow to
+        reflect a rewatch can never make a recent rewatch look stale enough to
+        fall inside eviction's grace-window deletion criteria. Only hits whose
+        reported file paths genuinely differ stay fail-closed.
 
         ``library_path=None`` keeps the legacy UNCORRELATED first-match read --
         only for callers with no known target, e.g. a row predating the
