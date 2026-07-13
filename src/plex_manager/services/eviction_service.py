@@ -243,14 +243,15 @@ async def _sized_path(library_path: str | None, cache: dict[str, int | None]) ->
     once per candidate-assembly pass (issue #213, "size only once per distinct
     physical path").
 
-    ``None`` breadcrumb -> ``None`` (unknown share), exactly as before. Two rows
+    A falsy breadcrumb (``None`` or empty) -> ``None`` (unknown share), exactly as
+    the replaced ``... if row.library_path else None`` did. Two rows
     legitimately sharing one ``library_path`` (the #155 shared-breadcrumb "twins"
     shape) would otherwise each ``os.walk`` the same tree; ``cache`` memoizes the
     (identical) result so the tree is walked once. The walk itself is unchanged --
     still offloaded via ``asyncio.to_thread`` because it is real, potentially slow
     disk I/O (see :func:`_size_bytes`).
     """
-    if library_path is None:
+    if not library_path:
         return None
     if library_path in cache:
         return cache[library_path]
