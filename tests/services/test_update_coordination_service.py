@@ -517,13 +517,30 @@ async def test_plaintext_lease_token_is_never_persisted(
 
 async def test_renewable_context_holds_no_work_transaction_and_releases(
     sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
 
+    # The lease TTL is generous relative to renew_every and to the body's sleep
+    # so a stalled renew task under a loaded CI runner cannot let the TTL expire
+    # mid-body (see #311). Renewal actually firing is asserted via observed
+    # events below, not inferred from wall-clock survival alone.
+    original_renew = service.renew
+    renewals = 0
+
+    async def counting_renew(token: str, *, ttl: timedelta) -> bool:
+        nonlocal renewals
+        renewed = await original_renew(token, ttl=ttl)
+        if renewed:
+            renewals += 1
+        return renewed
+
+    monkeypatch.setattr(service, "renew", counting_renew)
+
     async with service.critical_operation(
         "import",
-        ttl=timedelta(milliseconds=180),
+        ttl=timedelta(seconds=5),
         renew_every=timedelta(milliseconds=40),
     ):
         # This independent write proves the context did not retain its acquisition
@@ -533,6 +550,7 @@ async def test_renewable_context_holds_no_work_transaction_and_releases(
         snapshot = await service.snapshot()
         assert snapshot.active_critical_operations == 1
 
+    assert renewals >= 1
     assert (await service.snapshot()).active_critical_operations == 0
 
 
