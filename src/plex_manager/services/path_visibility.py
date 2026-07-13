@@ -32,6 +32,7 @@ __all__ = [
     "KNOWN_CONTAINER_MOUNTS",
     "KNOWN_DOWNLOAD_MOUNTS",
     "KNOWN_LIBRARY_MOUNTS",
+    "content_is_mounted",
     "is_live_mount",
     "remap_download_content",
     "remap_library_root",
@@ -115,6 +116,36 @@ def _is_under(norm_path: str, mount: str) -> bool:
     """Whether normalized ``norm_path`` lexically equals or sits under ``mount``."""
     norm_mount = os.path.normpath(mount)
     return norm_path == norm_mount or norm_path.startswith(norm_mount + os.sep)
+
+
+def content_is_mounted(path: str, mounts: Sequence[str] | None = None) -> bool:
+    """Whether ``path`` is verbatim-trustworthy download content (issue #290).
+
+    A qBittorrent-reported ``content_path`` arrives in the HOST namespace and can
+    coincidentally ALSO exist inside this container as a stale/phantom tree OUTSIDE
+    every live ``/downloads`` mount (the old importer ``os.makedirs``-ed host-shaped
+    trees). Trusting bare ``os.path.exists`` then short-circuits to that phantom
+    instead of remapping to the real mounted file -- so the post-ack same-hash poll
+    would watch the wrong location, and an import would place from it. This is the
+    lexical half of the guard callers pair with their OWN existence probe:
+
+    * ``True`` when ``path`` lexically sits under a LIVE download mount -- a
+      genuinely container-visible location, safe to use verbatim.
+    * ``True`` when NO download mount is live (bare-metal / no host-container
+      split): there is no phantom hazard, so a verbatim path stands unchanged.
+    * ``False`` for a path that lies OUTSIDE every live download mount, so the
+      caller prefers a proof-gated mounted remap over trusting it.
+
+    ``mounts`` defaults to :data:`KNOWN_DOWNLOAD_MOUNTS`, read at CALL time so a
+    test's ``monkeypatch.setattr`` on the module global (or ``is_live_mount``)
+    takes effect -- this module's documented call-site convention.
+    """
+    resolved = KNOWN_DOWNLOAD_MOUNTS if mounts is None else mounts
+    live = [os.path.normpath(m) for m in resolved if m and is_live_mount(m)]
+    if not live:
+        return True
+    norm = os.path.normpath(path)
+    return any(_is_under(norm, m) for m in live)
 
 
 def remap_to_visible(
@@ -335,41 +366,63 @@ def remap_download_content(
     """
     if not content:
         return None
-    if os.path.exists(content):
-        return content
-    if not save_path:
-        return None
-    remainder = _relative_components(content, save_path)
-    if not remainder:
-        # ``content`` is not strictly under ``save_path`` (equal to it, or an
-        # escape): refuse to remap rather than resolve a torrent onto the bare
-        # mount tree or an unrelated location.
-        return None
     # Read the module global at CALL time (never a def-time default) so a test's
     # ``monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", ...)`` takes
     # effect, matching this module's documented call-site convention.
     mounts = KNOWN_DOWNLOAD_MOUNTS if candidate_mounts is None else candidate_mounts
-    # Remap the save DIRECTORY once: the deepest suffix that is a real directory
-    # under a live mount. allow_mount_root stays OFF -- the bind-root case is the
-    # separate, proof-gated interpretation below, so a bare torrent tree can never
-    # be the direct answer of this search.
-    save_dir = remap_to_visible(save_path, mounts, predicate=os.path.isdir, probe_original=False)
-    if save_dir is not None:
-        # The deepest-directory interpretation is the ONLY one tried when it
-        # exists -- no fallthrough to the bind-root guess on a failed proof, so a
-        # same-named (even same-sized) stray at the mount root can never shadow a
-        # genuinely-missing file under the real category directory.
-        if _proves_content(save_dir, remainder, expected_files):
-            return os.path.join(save_dir, *remainder)
-        return None
-    # No suffix of ``save_path`` is a real directory under a live mount: the one
-    # remaining legitimate topology is that ``save_path`` IS the download
-    # bind-source root (mapped to the mount root, zero suffix below it). That
-    # interpretation must PROVE itself via the torrent's own file list -- never
-    # mere existence of a same-named file (the round-3 finding).
-    for mount in mounts:
-        if mount and is_live_mount(mount) and _proves_content(mount, remainder, expected_files):
-            return os.path.join(mount, *remainder)
+    content_exists = os.path.exists(content)
+    # Same-namespace fast path -- but ONLY when ``content`` genuinely sits under a
+    # live download mount (or none is live, the bare-metal case). A HOST-namespace
+    # ``content`` that merely PHANTOMS in this container OUTSIDE the mount must not
+    # short-circuit here: we prefer the proof-gated mounted remap below so the real
+    # mounted file wins over the stale phantom (issue #290, finding #2).
+    if content_exists and content_is_mounted(content, mounts):
+        return content
+    if save_path:
+        remainder = _relative_components(content, save_path)
+        if remainder:
+            # Remap the save DIRECTORY once: the deepest suffix that is a real
+            # directory under a live mount. allow_mount_root stays OFF -- the
+            # bind-root case is the separate, proof-gated interpretation below, so a
+            # bare torrent tree can never be the direct answer of this search.
+            save_dir = remap_to_visible(
+                save_path, mounts, predicate=os.path.isdir, probe_original=False
+            )
+            if save_dir is not None:
+                # The deepest-directory interpretation is the ONLY one tried when it
+                # exists -- no fallthrough to the bind-root guess (nor to the phantom
+                # fallback below) on a failed proof, so a same-named (even
+                # same-sized) stray can never shadow a genuinely-missing real file.
+                if _proves_content(save_dir, remainder, expected_files):
+                    return os.path.join(save_dir, *remainder)
+                return None
+            # No suffix of ``save_path`` is a real directory under a live mount: the
+            # one remaining legitimate topology is that ``save_path`` IS the download
+            # bind-source root (mapped to the mount root, zero suffix below it). That
+            # interpretation must PROVE itself via the torrent's own file list --
+            # never mere existence of a same-named file (the round-3 finding).
+            for mount in mounts:
+                if (
+                    mount
+                    and is_live_mount(mount)
+                    and _proves_content(mount, remainder, expected_files)
+                ):
+                    return os.path.join(mount, *remainder)
+            # No mount matched at all (neither a real save-dir suffix nor the
+            # bind-root): fall through to the verbatim fallback below so an
+            # operator's legitimate EXTRA volume outside the mounts is still
+            # honored. (A save-dir that DID exist but failed proof already returned
+            # None above -- that stays a hard mismatch, never a phantom fallback.)
+        # ``content`` not strictly under ``save_path`` (equal to it, or an escape)
+        # also falls through: no mounted remap is possible, so the verbatim path is
+        # the only honest answer -- never a resolution onto the bare mount tree.
+    # No mounted candidate was resolvable: accept a genuinely-existing verbatim
+    # ``content`` (a no-``save_path`` crash-resume breadcrumb, or an operator's
+    # legitimate EXTRA volume at a custom path outside the known mounts). Mirrors
+    # :func:`remap_to_visible`'s "outside-mount original returned only when no
+    # mounted candidate exists" -- never a guess, only a path that actually exists.
+    if content_exists:
+        return content
     return None
 
 

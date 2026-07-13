@@ -43,7 +43,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.services import path_visibility
 
 if TYPE_CHECKING:
-    from plex_manager.ports.download_client import DownloadClientPort
+    from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
 
@@ -357,10 +357,12 @@ async def remove_torrent(
         # poll below is skipped (nothing distinct to verify), never a reason to
         # abort the removal itself.
         status = None
-    if status is not None and status.content_path:
-        content_path = await _visible_content_path(
-            qbt, torrent_hash, status.content_path, status.save_path
-        )
+    if status is not None:
+        raw_content = _snapshot_content_path(status)
+        if raw_content is not None:
+            content_path = await _visible_content_path(
+                qbt, torrent_hash, raw_content, status.save_path
+            )
     try:
         await qbt.remove(torrent_hash, delete_files=True)
     except Exception:
@@ -380,6 +382,29 @@ async def remove_torrent(
     return True
 
 
+def _snapshot_content_path(status: DownloadStatus) -> str | None:
+    """The distinct on-disk content path to poll for a just-removed torrent.
+
+    Prefer the client's ``content_path``. The adapter nulls it when it merely
+    echoed ``save_path`` (a not-yet-resolved torrent); in that case
+    ``save_path`` + ``name`` is the live content location the importer's
+    ``import_service._resolve_content`` already uses, and it IS distinct --
+    ``save_path`` ALONE is shared by sibling torrents and must never be polled.
+    Without this fallback the post-ack poll is skipped entirely for that class of
+    torrents, leaving the issue #240 same-hash race open for them (issue #290,
+    finding #1).
+
+    Returns ``None`` when nothing distinct is known, or when ``name`` is absolute
+    (it must never escape ``save_path`` -- mirrors ``_resolve_content``'s guard),
+    so the caller honestly skips the poll rather than watching the wrong tree.
+    """
+    if status.content_path:
+        return status.content_path
+    if status.save_path and status.name and not os.path.isabs(status.name):
+        return os.path.join(status.save_path, status.name)
+    return None
+
+
 async def _visible_content_path(
     qbt: DownloadClientPort, torrent_hash: str, content_path: str, save_path: str
 ) -> str | None:
@@ -390,12 +415,21 @@ async def _visible_content_path(
     HOST-namespace path this container cannot see even though the file sits
     right there, one bind mount away (e.g. host ``/srv/downloads/...`` vs. this
     container's ``/downloads/...``). Returns ``content_path`` unchanged when it
-    already exists here (the common same-namespace fast path — no client call
-    needed); otherwise anchors the remap on ``save_path`` and demands the
-    torrent's OWN file list (:meth:`DownloadClientPort.list_files`) prove the
-    remapped candidate exhibits that exact payload at the exact relative
-    location and size — never an existence-only guess — via
+    already exists here AND genuinely sits under a live ``/downloads`` mount (the
+    common same-namespace fast path — no client call needed); otherwise anchors
+    the remap on ``save_path`` and demands the torrent's OWN file list
+    (:meth:`DownloadClientPort.list_files`) prove the remapped candidate exhibits
+    that exact payload at the exact relative location and size — never an
+    existence-only guess — via
     :func:`~plex_manager.services.path_visibility.remap_download_content`.
+
+    The mount-aware fast path matters (issue #290, finding #2): a HOST-namespace
+    ``content_path`` can coincidentally exist in this container as a stale/phantom
+    tree OUTSIDE the ``/downloads`` mount, and short-circuiting to it would make
+    the post-ack poll watch the WRONG location — releasing the same-hash guard
+    while qBittorrent is still deleting the real, mounted file. So a phantom
+    verbatim path falls through to the proof-gated remap, which prefers the real
+    mounted path.
 
     Called BEFORE the torrent is removed (unlike the poll itself): the proof
     needs the client's own file list, which ``list_files`` can no longer answer
@@ -405,7 +439,9 @@ async def _visible_content_path(
     block the removal that's about to happen regardless), or when no candidate
     is proven.
     """
-    if await asyncio.to_thread(os.path.exists, content_path):
+    if await asyncio.to_thread(os.path.exists, content_path) and await asyncio.to_thread(
+        path_visibility.content_is_mounted, content_path
+    ):
         return content_path
     if not save_path:
         # No live anchor to remap against (a torrent status with no save path):

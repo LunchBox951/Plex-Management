@@ -2169,6 +2169,54 @@ def test_resolve_correlated_watch_state_three_way_split_still_fails_closed() -> 
     assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
 
 
+def test_resolve_correlated_watch_state_mid_rewatch_uses_recent_in_progress_timestamp() -> None:
+    # Issue #290, the FAIL-OPEN: the SAME physical file is indexed by two Plex
+    # sections. Section A recorded a completed watch long past the grace cutoff
+    # (watched=True, STALE lastViewedAt). Section B is mid-rewatch -- its
+    # viewCount/viewedLeafCount hasn't incremented yet, so watched=False, but its
+    # lastViewedAt is RECENT. Merging only the WATCHED timestamps would keep A's
+    # stale one and make the file eviction-eligible DURING the active rewatch.
+    # The merge must take the NEWEST across ALL hits (including the in-progress
+    # one), so the recent view protects the file: eviction stays fail-CLOSED.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_NEWER_AT
+    )
+
+
+def test_resolve_correlated_watch_state_partial_view_timestamp_wins_over_stale_watched() -> None:
+    # Issue #290, finding #3 (TV season manifestation): a same-file season hit
+    # that is only partially watched (viewedLeafCount != leafCount => watched=False)
+    # still carries a recent lastViewedAt from the in-progress binge. A different
+    # section reporting the season fully watched long ago (watched=True, stale)
+    # must NOT let its stale timestamp win over the more-recent partial view.
+    season_files = frozenset({"/s1e1.mkv", "/s1e2.mkv"})
+    hits = [
+        (season_files, WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+        (season_files, WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_NEWER_AT
+    )
+
+
+def test_resolve_correlated_watch_state_all_in_progress_stays_unwatched() -> None:
+    # Every hit is in-progress (watched=False) but carries a recent timestamp:
+    # with NO section reporting a completed watch, the merge stays watched=False
+    # (and last_viewed_at=None) -- an in-progress-only item is not "watched", and
+    # eviction ignores it regardless of timestamp. The in-progress timestamps
+    # only ever RAISE protection when SOME section is watched; they never
+    # manufacture a watched verdict on their own.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_NEWER_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=_WATCHED_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
+
+
 # A broad section ("Movies" at /data/movies) and a NESTED section ("Anime
 # Movies" at /data/movies/Anime) both index the exact same physical file --
 # the issue #239 scenario a real Plex library produces. Section keys are
@@ -2240,6 +2288,64 @@ async def test_watch_state_movie_merges_identical_path_across_sections() -> None
     adapter = _adapter(_movie_overlap_handler, base_url="http://watch-overlap-movie:32400")
     state = await adapter.watch_state(42, "movie", library_path="/data/movies/Anime/Show/ep.mkv")
     assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+# Issue #290 fail-open: the SAME file across two sections, section A watched long
+# ago (stale timestamp), section B mid-rewatch (viewCount not yet incremented, so
+# unwatched, but a RECENT lastViewedAt). The end-to-end adapter read must merge to
+# the RECENT timestamp so eviction's grace window protects the active rewatch.
+MOVIES_REWATCH_SECTION_5: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://77"}],
+                "viewCount": 2,  # a completed watch...
+                "lastViewedAt": _WATCHED_EPOCH,  # ...but long past the grace cutoff
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/rewatch.mkv"}]}],
+            },
+        ],
+    }
+}
+
+MOVIES_REWATCH_SECTION_55: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://77"}],
+                # Mid-rewatch via THIS section: its own viewCount hasn't ticked
+                # over yet (unwatched), but Plex already stamped a RECENT view.
+                "viewCount": 0,
+                "lastViewedAt": _NEWER_EPOCH,
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/rewatch.mkv"}]}],
+            },
+        ],
+    }
+}
+
+
+def _movie_rewatch_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_OVERLAP)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_REWATCH_SECTION_5)
+    if path == "/library/sections/11/all":
+        return httpx.Response(200, json=MOVIES_REWATCH_SECTION_55)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_mid_rewatch_across_sections_keeps_recent_timestamp() -> None:
+    # The fail-open guarded against (issue #290): a disk-pressure sweep landing
+    # mid-rewatch must NOT get a stale watched timestamp that makes the file
+    # eviction-eligible. The recent in-progress view from the other section wins.
+    adapter = _adapter(_movie_rewatch_handler, base_url="http://watch-rewatch-movie:32400")
+    state = await adapter.watch_state(
+        77, "movie", library_path="/data/movies/Anime/Show/rewatch.mkv"
+    )
+    assert state == WatchState(watched=True, last_viewed_at=_NEWER_AT)
 
 
 SHOWS_OVERLAP_SECTION_2: dict[str, Any] = {
