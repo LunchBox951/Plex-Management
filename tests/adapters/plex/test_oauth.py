@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from plex_manager.adapters.plex.oauth import (
+    _ARRAY_BODY_KEY,  # pyright: ignore[reportPrivateUsage]
     PlexAccount,
     PlexResource,
     PlexTvClient,
@@ -172,8 +173,11 @@ async def test_fetch_resources_valid_empty_array_returns_empty_list() -> None:
     assert resources == []
 
 
-@pytest.mark.parametrize("body", [{}, {"error": "nope"}, {"resources": []}])
+@pytest.mark.parametrize("body", [{}, {"error": "nope"}, {"resources": []}, {"items": []}])
 async def test_fetch_resources_non_array_shape_is_bad_response(body: object) -> None:
+    # NOTE the {"items": []} case: an OBJECT body carrying a public "items" list
+    # must not impersonate the array wrapper (parse_resources keys off the private
+    # _ARRAY_BODY_KEY sentinel only _request_json can synthesize).
     # A 2xx body that is NOT the expected JSON array (an error object, a wrapped
     # shape, HTML that still parsed) is MALFORMED, not "zero resources". It must
     # raise bad_response rather than silently collapse to [] -- otherwise watchlist
@@ -445,14 +449,16 @@ def test_parse_resources_owned_boolean_tolerance(raw_owned: object, expected: bo
     encodings (int/str) and fail CLOSED on anything unexpected — the owner check
     must never mis-grant ownership."""
     payload = {
-        "items": [{"name": "S", "clientIdentifier": "id", "provides": "server", "owned": raw_owned}]
+        _ARRAY_BODY_KEY: [
+            {"name": "S", "clientIdentifier": "id", "provides": "server", "owned": raw_owned}
+        ]
     }
     parsed = PlexTvClient.parse_resources(payload)
     assert parsed[0].owned is expected
 
 
 def test_parse_resources_owned_missing_defaults_false() -> None:
-    payload = {"items": [{"name": "S", "clientIdentifier": "id", "provides": "server"}]}
+    payload = {_ARRAY_BODY_KEY: [{"name": "S", "clientIdentifier": "id", "provides": "server"}]}
     parsed = PlexTvClient.parse_resources(payload)
     assert parsed[0].owned is False
 
@@ -460,7 +466,7 @@ def test_parse_resources_owned_missing_defaults_false() -> None:
 def test_parse_connections_skips_entries_without_uri() -> None:
     """Connections must carry a ``uri`` to be usable; entries lacking one are dropped."""
     payload = {
-        "items": [
+        _ARRAY_BODY_KEY: [
             {
                 "name": "S",
                 "clientIdentifier": "id",

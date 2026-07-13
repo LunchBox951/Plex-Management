@@ -357,6 +357,31 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             status.mark_skipped("not_configured")
             return 0
         library = await get_library_optional(session, client)
+        # Final identity re-check before the sync pass: ``authorized`` was vetted
+        # against ``machine_identifier``, and an admin repoint since then means
+        # those tokens were authorized for the WRONG server. Unlike snapshot rows
+        # (which a later tick can clear), requests created from the old server's
+        # watchlists cannot be undone by the next tick -- so skip the pass
+        # entirely. The repoint itself wakes this worker, so re-authorization
+        # against the new identity is imminent, and the skipped users keep the
+        # tick honestly "degraded" rather than silently ok.
+        current_identity = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+    if authorized and current_identity != machine_identifier:
+        _logger.info(
+            "configured Plex server changed mid-tick (%s users authorized against "
+            "the previous identity); skipping this sync pass for re-evaluation",
+            len(authorized),
+        )
+        status.mark_completed(
+            fetched=0,
+            created=0,
+            existing=0,
+            failed_users=0,
+            failed_entries=0,
+            error=None,
+            skipped_users=skipped_users + len(authorized),
+        )
+        return 0
 
     created = 0
     fetched = 0

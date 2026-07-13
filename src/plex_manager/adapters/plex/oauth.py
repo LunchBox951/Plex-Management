@@ -45,6 +45,13 @@ _HTTP_FORBIDDEN: Final = 403
 # Stable, user-facing error identifiers (see the web error taxonomy).
 _CODE_PLEX_TV_UNREACHABLE: Final = "plex_tv_unreachable_server"
 _CODE_PLEX_TV_BAD_RESPONSE: Final = "plex_tv_bad_response"
+
+# Private wrapper key ``_request_json`` uses to carry a top-level JSON ARRAY body.
+# Deliberately not a plausible public wire key: ``parse_resources`` keys off it to
+# distinguish "the body was a real array" from an object body that merely contains
+# an array under a public name like "items" (#296 — a malformed object must never
+# read as an empty resource list, which callers treat as an authorization signal).
+_ARRAY_BODY_KEY: Final = "__plex_manager_array_body__"
 # Public: consumers (e.g. watchlist revalidation) key STALE-vs-UNKNOWN off this
 # exact code, so it must be shared -- not hand-copied -- to stay coupled at
 # import time.
@@ -344,7 +351,7 @@ class PlexTvClient:
                 diagnostics={"host": host},
             ) from exc
         if isinstance(payload, list):
-            return {"items": cast("list[object]", payload)}
+            return {_ARRAY_BODY_KEY: cast("list[object]", payload)}
         return _as_mapping(payload)
 
     def _client_headers(self) -> dict[str, str]:
@@ -379,17 +386,19 @@ class PlexTvClient:
 
     @classmethod
     def parse_resources(cls, payload: Mapping[str, object]) -> list[PlexResource]:
-        # v2 /resources is a JSON array; ``_request_json`` wraps it as {"items": [...]}.
-        # A 2xx body that is NOT that array shape (an error object, an HTML page that
-        # still parsed as JSON, a truncated payload) is a MALFORMED response, not "an
-        # account with zero resources". The distinction is load-bearing: callers treat
-        # a genuinely-empty resource list as an authorization signal (revalidation maps
-        # it to STALE and DELETES the user's eviction-protection snapshot), so a
-        # malformed shape silently collapsing to ``[]`` would destroy state on a
-        # transient plex.tv hiccup (#296). ``_request_json`` only synthesizes the
-        # "items" key when the body was a JSON array, so its absence (or a non-list
-        # value) means the shape was unexpected -- fail fatal instead of guessing.
-        raw_items = payload.get("items")
+        # v2 /resources is a JSON array; ``_request_json`` wraps it under the PRIVATE
+        # ``_ARRAY_BODY_KEY`` sentinel. A 2xx body that is NOT that array shape (an
+        # error object, an HTML page that still parsed as JSON, a truncated payload)
+        # is a MALFORMED response, not "an account with zero resources". The
+        # distinction is load-bearing: callers treat a genuinely-empty resource list
+        # as an authorization signal (revalidation maps it to STALE and DELETES the
+        # user's eviction-protection snapshot), so a malformed shape silently
+        # collapsing to ``[]`` would destroy state on a transient plex.tv hiccup
+        # (#296). The sentinel is deliberately not a public wire key: only
+        # ``_request_json`` can synthesize it (exclusively for array bodies), so an
+        # object body that happens to carry a public "items" list can never
+        # impersonate the array wrapper -- fail fatal instead of guessing.
+        raw_items = payload.get(_ARRAY_BODY_KEY)
         if not isinstance(raw_items, list):
             raise PlexVerifyError(
                 _CODE_PLEX_TV_BAD_RESPONSE,

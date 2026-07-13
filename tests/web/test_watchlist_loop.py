@@ -244,6 +244,46 @@ async def test_stale_delete_skipped_when_server_repointed_mid_tick(
     assert len(remaining) == 1
 
 
+async def test_sync_pass_skipped_when_server_repointed_after_authorization(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """Repoint race, AUTHORIZED branch: tokens vetted against the tick-start
+    identity must not drive a sync pass once the admin repoints -- unlike snapshot
+    rows, requests created from the old server's watchlists cannot be undone by
+    the next tick. The pass is skipped wholesale (users counted as skipped, tick
+    degraded); the repoint's own wake re-authorizes imminently (#296)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", "tmdb-key")
+        await store.set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+        user = User(username="old-server-watcher", encrypted_plex_token="a-token")  # noqa: S106
+        session.add(user)
+        await session.commit()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/resources":
+            # AUTHORIZED for the tick-start identity -- then the admin repoints
+            # before the sync pass runs (the settings router's verified-repoint
+            # path). Any later watchlist fetch would hit the non-JSON fallthrough
+            # below and fail the test loudly if the guard regressed.
+            async with app.state.sessionmaker() as session:
+                await SettingsStore(session).set(PLEX_MACHINE_ID_SETTING, "repointed-post-auth")
+                await session.commit()
+            return httpx.Response(200, json=[_server_resource(_MACHINE_ID)])
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "degraded"
+    assert status.skipped_users == 1
+    assert status.fetched == 0
+    assert status.created == 0
+
+
 async def test_watchlist_loop_wakes_immediately_when_settings_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
