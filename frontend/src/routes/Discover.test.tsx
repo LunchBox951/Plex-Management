@@ -108,6 +108,7 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
     status: 'failed',
     is_anime: false,
     keep_forever: false,
+    can_mutate: false,
     ...overrides,
   }
 }

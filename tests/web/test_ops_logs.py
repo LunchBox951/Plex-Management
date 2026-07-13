@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import LogEvent
 from plex_manager.services import log_capture_service
+from plex_manager.web.deps import SettingsStore
 from plex_manager.web.routers import ops as ops_router
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -337,3 +338,163 @@ async def test_export_json_redacts_a_secret_shaped_stored_message(
     assert "FAKEEXPORTPW1" not in message
     assert "'password': '<redacted>'" in message
     assert response.text.count("FAKEEXPORTPW1") == 0  # never in the raw response body either
+
+
+# --------------------------------------------------------------------------- #
+# Secret redaction (issues #268/#270) on GET /logs and GET /logs/export -- both
+# read boundaries chain a SHAPE-based pass (``redact_secrets``, #153) and a
+# VALUE-based pass (``redact_known_secrets``, #268) against the app's own
+# CURRENTLY-CONFIGURED secret values (fetched fresh from the settings store on
+# every read, per ``SettingsStore.secret_values``). ``_insert_event`` bypasses
+# the capture pipeline entirely (see the #153 section above), so these prove
+# the READ boundary's own pipeline closes each gap regardless of how the row
+# got into the store.
+# --------------------------------------------------------------------------- #
+_QBT_PASSWORD_WITH_AT = "p@ssw0rd0123456789"  # noqa: S105 -- fixture, not a real credential
+# A REAL cookie-shaped session token -- deliberately NEVER written to any
+# settings row anywhere in this test module. In production this credential is
+# never a settings value either: ``plexmgr.session`` persists only a HASH
+# (:class:`~plex_manager.models.AuthSession`), and qBittorrent's ``SID``
+# cookie lives only in the adapter's in-memory jar. Any test that wants to
+# prove this shape is actually closed must NOT configure an unrelated setting
+# to this same value -- doing so would only prove the (already-covered)
+# value-based pass, not the shape rule this class of credential actually
+# depends on.
+_SESSION_VALUE = "sFAKESESSIONVALUE1234567890abcdef"
+
+
+async def _configure_qbittorrent_password(sessionmaker_: SessionMaker, password: str) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("qbittorrent_password", password)
+        await session.commit()
+
+
+async def test_export_text_catches_the_cookie_jar_shape_grammar_gap(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A cookie logged as a dict/mapping repr is now recognized directly by
+    the shape grammar's ``_COOKIE_JAR_RE`` (issue #270 follow-up) -- proven
+    here with a REAL cookie-shaped value that is NEVER configured as any
+    setting, so the (unrelated) value-based pass cannot be the thing catching
+    it. This is the credential's actual production shape: the real
+    ``plexmgr.session``/qBittorrent ``SID`` tokens are never settings-store
+    values at all, so only a shape rule can ever mask them."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # Deliberately NOT configuring any setting to `_SESSION_VALUE` -- the
+    # settings-derived `secret_values` set handed to the value-based pass is
+    # empty of it, so only the shape rule can close this.
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=f"outgoing cookies: {{'plexmgr.session': '{_SESSION_VALUE}'}}",
+        created_at=_NOW,
+    )
+
+    response = await client.get("/api/v1/ops/logs/export", headers=_HEADERS)
+    assert response.status_code == 200
+    assert _SESSION_VALUE not in response.text
+    assert "<redacted>" in response.text
+    assert "plexmgr.session" in response.text  # the cookie NAME survives
+
+
+async def test_logs_catches_the_qbittorrent_sid_jar_shape_grammar_gap(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The same shape rule covers qBittorrent's ``SID``/``QBT_SID_<port>``
+    cookie in a mapping-repr dump -- again with a value that is never
+    configured as a setting, proving the READ boundary's shape pass (not the
+    value-based pass) is what closes this."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sid_value = "qBTUpstreamSIDValue0123456789ABCDEF"
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=f"cookies={{'QBT_SID_8080': '{sid_value}'}}",
+        created_at=_NOW,
+    )
+
+    response = await client.get("/api/v1/ops/logs", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    message = body["events"][0]["message"]
+    assert sid_value not in message
+    assert "<redacted>" in message
+    assert "QBT_SID_8080" in message  # the cookie NAME survives
+
+
+async def test_logs_catches_the_basic_auth_raw_at_sign_shape_grammar_gap_via_value_pass(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A basic-auth password containing its own raw ``@`` defeats the #153
+    shape grammar's password-boundary heuristic (it stops at the FIRST ``@``
+    after the colon) -- the value-based pass, given the actual configured
+    password, masks it whole regardless."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure_qbittorrent_password(sessionmaker_, _QBT_PASSWORD_WITH_AT)
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=(
+            f"connecting to https://tracker_user:{_QBT_PASSWORD_WITH_AT}"
+            "@tracker.example.com/announce"
+        ),
+        created_at=_NOW,
+    )
+
+    response = await client.get("/api/v1/ops/logs", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    message = body["events"][0]["message"]
+    assert _QBT_PASSWORD_WITH_AT not in message
+    # No fragment of the password survives either -- guards against exactly
+    # the partial-match failure mode #270 describes.
+    assert "ssw0rd0123456789" not in message
+    assert "tracker.example.com" in message  # host stays diagnosable
+
+
+async def test_export_json_value_based_pass_reuses_the_current_secret_not_a_stale_one(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The export boundary fetches secret values FRESH on every read (never a
+    capture-time snapshot) -- a row captured before a rotation, or written
+    directly to the store, is still masked against whatever is configured
+    RIGHT NOW."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure_qbittorrent_password(sessionmaker_, _QBT_PASSWORD_WITH_AT)
+    # Written directly (never through log_capture_service), simulating either
+    # a pre-upgrade row or a direct repository write.
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=f"qbittorrent reported: {_QBT_PASSWORD_WITH_AT} was rejected",
+        created_at=_NOW,
+    )
+
+    response = await client.get(
+        "/api/v1/ops/logs/export", params={"format": "json"}, headers=_HEADERS
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert _QBT_PASSWORD_WITH_AT not in body["events"][0]["message"]
+
+
+async def test_logs_min_length_guard_does_not_over_redact_a_short_configured_value(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """A short configured secret (below the value-based pass's minimum-length
+    floor) must not blow away ordinary prose containing that same short
+    substring -- this is #268's over-redaction guard, exercised through the
+    real endpoint rather than just the pure ``logsafe`` unit test."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure_qbittorrent_password(sessionmaker_, "ab")  # far below the floor
+    plain_message = "grab this from the tab, then label it"
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=plain_message,
+        created_at=_NOW,
+    )
+
+    response = await client.get("/api/v1/ops/logs", headers=_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["events"][0]["message"] == plain_message

@@ -64,6 +64,15 @@ def _recommendation(
     return MediaSearchResult(tmdb_id=tmdb_id, media_type=media_type, title=f"Rec {tmdb_id}")
 
 
+def _shelf(
+    base_tmdb_id: int, media_type: Literal["movie", "tv"] = "movie"
+) -> list[MediaSearchResult]:
+    """A recommendation page meeting ``_MIN_SHELF_TITLES`` (issue #277): three
+    distinct titles offset from ``base_tmdb_id``, so a caller wanting a specific
+    id to survive at the front of the shelf still finds it at ``[0]``."""
+    return [_recommendation(base_tmdb_id + offset, media_type) for offset in range(3)]
+
+
 class _CountingFailingTvTmdb(FakeTmdb):
     """Records the normal five home calls while simulating a failed TV pool."""
 
@@ -110,9 +119,10 @@ async def test_list_category_popular_tv_returns_the_tv_page() -> None:
     assert [item.title for item in page.results] == ["Popular Show"]
 
 
-async def test_home_appends_tv_rows_after_the_movie_rows() -> None:
-    # The existing three movie rows keep their order; the tv rows are ADDITIVE,
-    # appended after them -- an established home feed's row order is unchanged.
+async def test_home_orders_standard_rows_in_the_fixed_issue_278_sequence() -> None:
+    # Fixed order (issue #278): Trending this week, Trending TV this week,
+    # Popular TV, Popular Movies, [personalized...], Coming Soon -- never a
+    # load-to-load-varying interleave.
     tmdb = FakeTmdb(
         trending=[],
         popular=[],
@@ -124,10 +134,10 @@ async def test_home_appends_tv_rows_after_the_movie_rows() -> None:
 
     assert [row.row_type for row in feed.rows] == [
         "trending",
-        "popular",
-        "upcoming",
         "trending_tv",
         "popular_tv",
+        "popular",
+        "upcoming",
     ]
     by_type = {row.row_type: row.items for row in feed.rows}
     assert [item.title for item in by_type["trending_tv"]] == ["Trending Show"]
@@ -208,10 +218,10 @@ async def test_home_backfills_failed_tv_rows_without_extra_tmdb_calls() -> None:
     assert [item.tmdb_id for item in feed.spotlights] == [1, 2, 3, 4, 5, 6]
     assert tmdb.discover_calls == [
         "trending",
-        "popular",
-        "upcoming",
         "trending_tv",
         "popular_tv",
+        "popular",
+        "upcoming",
     ]
 
 
@@ -223,10 +233,7 @@ async def test_personalized_selection_is_stable_for_same_user_and_load_id() -> N
     }
     recommendations: dict[
         tuple[Literal["movie", "tv"], str, int | None], list[MediaSearchResult]
-    ] = {
-        ("movie", "genre", 100 + seed.tmdb_id): [_recommendation(1000 + seed.tmdb_id)]
-        for seed in seeds
-    }
+    ] = {("movie", "genre", 100 + seed.tmdb_id): _shelf(1000 + seed.tmdb_id) for seed in seeds}
     tmdb = FakeTmdb(
         trending=[],
         popular=[],
@@ -283,8 +290,7 @@ async def test_different_fixed_load_ids_select_different_seed_sets() -> None:
             for seed in seeds
         },
         recommendations={
-            ("movie", "genre", 100 + seed.tmdb_id): [_recommendation(1000 + seed.tmdb_id)]
-            for seed in seeds
+            ("movie", "genre", 100 + seed.tmdb_id): _shelf(1000 + seed.tmdb_id) for seed in seeds
         },
     )
 
@@ -334,7 +340,7 @@ async def test_tv_seed_rejects_people_facets_and_uses_genre() -> None:
         popular=[],
         upcoming=[],
         recommendation_profiles={(20, "tv"): RecommendationProfile(facets=(cast, genre))},
-        recommendations={("tv", "genre", 18): [_recommendation(200, "tv")]},
+        recommendations={("tv", "genre", 18): _shelf(200, "tv")},
     )
 
     feed = await discovery_service.home(
@@ -377,7 +383,7 @@ async def test_completed_anime_request_never_claims_library_membership() -> None
         popular=[],
         upcoming=[],
         recommendation_profiles={(90, "movie"): RecommendationProfile(facets=(anime,))},
-        recommendations={("movie", "anime", None): [_recommendation(900)]},
+        recommendations={("movie", "anime", None): _shelf(900)},
     )
 
     feed = await discovery_service.home(
@@ -392,7 +398,7 @@ async def test_completed_anime_request_never_claims_library_membership() -> None
     assert personalized[0].subtitle == "because you requested Seed 90"
 
 
-async def test_seed_is_removed_and_successful_rows_compact_into_positions_two_and_four() -> None:
+async def test_personalized_rows_land_as_a_fixed_block_before_coming_soon() -> None:
     first_seed = _seed(30)
     second_seed = _seed(40, is_anime=True, status="available")
     anime = RecommendationFacet(metric="anime", value_id=None, label="anime")
@@ -409,9 +415,9 @@ async def test_seed_is_removed_and_successful_rows_compact_into_positions_two_an
         recommendations={
             ("movie", "genre", 27): [
                 _recommendation(30),  # the seed itself must never be recommended
-                _recommendation(300),
+                *_shelf(300),
             ],
-            ("movie", "anime", None): [_recommendation(400)],
+            ("movie", "anime", None): _shelf(400),
         },
     )
 
@@ -422,23 +428,35 @@ async def test_seed_is_removed_and_successful_rows_compact_into_positions_two_an
         load_id=UUID(int=1),
     )
 
+    # Fixed order (issue #278): the four category rows, THEN both personalized
+    # rows as one block, THEN "Coming Soon" -- never interleaved between them.
     assert [row.row_type for row in feed.rows] == [
         "trending",
-        "personalized:genre:movie:30",
-        "popular",
-        "personalized:anime:movie:40",
-        "upcoming",
         "trending_tv",
         "popular_tv",
+        "popular",
+        "personalized:genre:movie:30",
+        "personalized:anime:movie:40",
+        "upcoming",
     ]
     personalized = [row for row in feed.rows if row.row_type.startswith("personalized:")]
-    assert [item.tmdb_id for row in personalized for item in row.items] == [300, 400]
+    assert [item.tmdb_id for row in personalized for item in row.items] == [
+        300,
+        301,
+        302,
+        400,
+        401,
+        402,
+    ]
     assert personalized[1].title == "Because you watch anime"
     assert personalized[1].subtitle == "Seed 40 is in your library"
     assert [item.tmdb_id for item in feed.spotlights] == []  # standard rows lack backdrops
 
 
-async def test_empty_recommendation_omits_candidate_and_one_success_uses_position_two() -> None:
+async def test_empty_recommendation_omits_candidate_and_thin_shelf_omits_the_other() -> None:
+    # Genre 50 returns nothing; genre 60 returns a page too thin to clear
+    # ``_MIN_SHELF_TITLES`` (issue #277) -- both candidates are omitted, so no
+    # personalized row is built at all.
     tmdb = FakeTmdb(
         trending=[],
         popular=[],
@@ -460,12 +478,48 @@ async def test_empty_recommendation_omits_candidate_and_one_success_uses_positio
         load_id=UUID(int=1),
     )
 
-    assert [row.row_type for row in feed.rows[:3]] == [
+    assert [row.row_type for row in feed.rows] == [
         "trending",
-        "personalized:genre:movie:60",
+        "trending_tv",
+        "popular_tv",
         "popular",
+        "upcoming",
     ]
-    assert sum(row.row_type.startswith("personalized:") for row in feed.rows) == 1
+    assert sum(row.row_type.startswith("personalized:") for row in feed.rows) == 0
+
+
+async def test_a_shelf_one_title_short_of_the_minimum_is_omitted() -> None:
+    # issue #277: an obscure seed ("Obsession"-shaped) whose facet round-trips a
+    # TMDB discover page one title short of `_MIN_SHELF_TITLES` must never
+    # surface — it would otherwise stand in for its whole genre almost alone.
+    assert discovery_service._MIN_SHELF_TITLES == 3  # pyright: ignore[reportPrivateUsage]
+    tmdb = FakeTmdb(
+        trending=[],
+        popular=[],
+        upcoming=[],
+        recommendation_profiles={(95, "movie"): RecommendationProfile(facets=(_genre(95),))},
+        recommendations={("movie", "genre", 95): [_recommendation(950), _recommendation(951)]},
+    )
+
+    feed = await discovery_service.home(tmdb, history=[_seed(95)], user_id=7, load_id=UUID(int=1))
+
+    assert not any(row.row_type.startswith("personalized:") for row in feed.rows)
+
+
+async def test_a_shelf_meeting_the_minimum_is_shown() -> None:
+    tmdb = FakeTmdb(
+        trending=[],
+        popular=[],
+        upcoming=[],
+        recommendation_profiles={(96, "movie"): RecommendationProfile(facets=(_genre(96),))},
+        recommendations={("movie", "genre", 96): _shelf(960)},
+    )
+
+    feed = await discovery_service.home(tmdb, history=[_seed(96)], user_id=7, load_id=UUID(int=1))
+
+    personalized = [row for row in feed.rows if row.row_type.startswith("personalized:")]
+    assert len(personalized) == 1
+    assert [item.tmdb_id for item in personalized[0].items] == [960, 961, 962]
 
 
 class _PersonalizationFailureTmdb(FakeTmdb):
@@ -475,7 +529,7 @@ class _PersonalizationFailureTmdb(FakeTmdb):
             popular=[],
             upcoming=[],
             recommendation_profiles={(71, "movie"): RecommendationProfile(facets=(_genre(71),))},
-            recommendations={("movie", "genre", 71): [_recommendation(710)]},
+            recommendations={("movie", "genre", 71): _shelf(710)},
         )
         self.unexpected = unexpected
 

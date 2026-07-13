@@ -84,6 +84,7 @@ __all__ = [
     "SetupStatusResponse",
     "SubsystemHealthItem",
     "TmdbValidateRequest",
+    "WatchlistStatusItem",
 ]
 
 MediaTypeField = Literal["movie", "tv"]
@@ -561,6 +562,8 @@ class SettingsResponse(BaseModel):
     # the default applies). Plain boolean config, same wire semantics as
     # ``eviction_enabled`` above.
     auto_grab_enabled: bool | None = None
+    watchlist_sync_enabled: bool | None = None
+    watchlist_sync_interval_minutes: float | None = None
 
 
 class AppApiKeyResponse(BaseModel):
@@ -669,6 +672,10 @@ class SettingsUpdate(BaseModel):
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
+    watchlist_sync_enabled: bool | None = Field(default=None)
+    watchlist_sync_interval_minutes: float | None = Field(
+        default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
 
     @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
     @classmethod
@@ -943,6 +950,9 @@ class RequestResponse(BaseModel):
     # select this title (or, for a show, any of its seasons) regardless of watch
     # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.
     keep_forever: bool = False
+    # Capability is computed for the current caller. Request creators and admins
+    # may pin, report, or cancel; subscribers may observe the shared request only.
+    can_mutate: bool = False
 
 
 class RequestListResponse(BaseModel):
@@ -1254,6 +1264,21 @@ class AutograbStatusItem(BaseModel):
     cooled_down_scopes: int = 0
 
 
+class WatchlistStatusItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    last_error_at: datetime | None = None
+    fetched: int = 0
+    created: int = 0
+    existing: int = 0
+    failed_users: int = 0
+    failed_entries: int = 0
+
+
 class HealthResponse(BaseModel):
     """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
     healthy, is the reconcile loop running, how full is the disk"."""
@@ -1264,6 +1289,7 @@ class HealthResponse(BaseModel):
     disks: list[DiskGaugeItem]
     reconcile: ReconcileStatusItem
     autograb: AutograbStatusItem
+    watchlist: WatchlistStatusItem
 
 
 # --------------------------------------------------------------------------- #

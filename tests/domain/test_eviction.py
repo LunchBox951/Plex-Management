@@ -39,6 +39,7 @@ def _candidate(
     last_viewed_at: datetime | None = _STALE,
     keep_forever: bool = False,
     in_flight: bool = False,
+    watchlisted: bool = False,
     library_path: str | None = "/media/movies/Some Movie (2020)",
     size_percent: float = 5.0,
 ) -> EvictionCandidate:
@@ -52,6 +53,7 @@ def _candidate(
         last_viewed_at=last_viewed_at,
         keep_forever=keep_forever,
         in_flight=in_flight,
+        watchlisted=watchlisted,
         library_path=library_path,
         size_percent=size_percent,
     )
@@ -150,6 +152,18 @@ def test_keep_forever_is_never_evicted() -> None:
     candidates = [_candidate(keep_forever=True)]
     result = select_evictions(
         candidates, used_pct=95.0, threshold_pct=90.0, target_pct=0.0, grace_cutoff=_GRACE_CUTOFF
+    )
+    assert result == []
+
+
+def test_watchlisted_is_never_evicted() -> None:
+    candidates = [_candidate(watchlisted=True)]
+    result = select_evictions(
+        candidates,
+        used_pct=95.0,
+        threshold_pct=90.0,
+        target_pct=0.0,
+        grace_cutoff=_GRACE_CUTOFF,
     )
     assert result == []
 

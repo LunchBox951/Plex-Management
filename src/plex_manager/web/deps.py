@@ -76,6 +76,7 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.services.watchlist_service import WatchlistWorkerStatus
 from plex_manager.web.errors import AppError
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
@@ -111,6 +112,8 @@ __all__ = [
     "SECRET_SETTING_KEYS",
     "SESSION_COOKIE_NAME",
     "SETUP_TOKEN_HEADER_NAME",
+    "WATCHLIST_SYNC_ENABLED_DEFAULT",
+    "WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT",
     "AuthContext",
     "AuthMethod",
     "DiskPressurePercents",
@@ -118,6 +121,7 @@ __all__ = [
     "SettingsStore",
     "api_key_matches",
     "authenticate_request",
+    "configured_setup_token",
     "enforce_pre_init_setup_token",
     "ensure_system_settings",
     "get_anime_movie_root_optional",
@@ -153,6 +157,9 @@ __all__ = [
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
+    "get_watchlist_status",
+    "get_watchlist_sync_enabled",
+    "get_watchlist_sync_interval_minutes",
     "hash_session_token",
     "is_setup_token_required",
     "load_system_settings",
@@ -170,6 +177,7 @@ __all__ = [
     "resolve_prowlarr",
     "resolve_qbittorrent",
     "resolve_tmdb",
+    "resolve_watchlist_sync_interval_minutes",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -260,6 +268,8 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # north-star #1 "turn this bot off with a button, never a terminal" switch. The
     # manual Grab button stays the override regardless.
     "auto_grab_enabled",
+    "watchlist_sync_enabled",
+    "watchlist_sync_interval_minutes",
     # Anime library routing (ADR-0015): two OPTIONAL roots, mirroring tv_root's
     # optional treatment exactly. Unset ⇒ anime imports fall back to
     # movies_root/tv_root, i.e. identical behavior to before this feature
@@ -544,6 +554,42 @@ class SettingsStore:
                 out[key] = row.value
         return out
 
+    async def secret_values(self) -> frozenset[str]:
+        """Every currently-configured secret's DECRYPTED value (issue #268) --
+        the input to :func:`~plex_manager.logsafe.redact_known_secrets`'s
+        value-based redaction pass, never returned over the API (unlike
+        :meth:`redacted`, this is for in-process consumption only: the
+        log-capture handler and the ``/ops/logs*`` read boundaries, never a
+        response body).
+
+        One query across all of :data:`SECRET_SETTING_KEYS` rather than one
+        ``get()`` per key -- this is called on every log-capture drain tick
+        (see ``web/app.py``'s ``_log_drain_loop``) and every ``/ops/logs*``
+        read, so it stays a single round trip. An unset secret contributes
+        nothing (never an empty string -- ``redact_known_secrets`` would skip
+        it anyway via its length guard, but there is no reason to hand it one).
+
+        Also folds in ``SystemSettings.app_api_key`` -- the recovery/automation
+        break-glass ``X-Api-Key`` credential (see :func:`authenticate_request`).
+        It lives in a SEPARATE table from the generic ``settings`` key/value
+        store this method otherwise reads (:class:`SystemSettings` is a
+        singleton row, not a ``Setting`` row keyed by :data:`SECRET_SETTING_KEYS`),
+        so without this second query a bare occurrence of the break-glass key in
+        a log line -- e.g. echoed back in an error message, or pasted into a
+        support request -- would sail past this redaction pass entirely. A
+        second query (rather than folding it into the query above) is
+        unavoidable: it is a different table with no ``key`` column to join on,
+        and this is still only two round trips total, not N.
+        """
+        result = await self._session.execute(
+            select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
+        )
+        values = {value for value in result.scalars().all() if value}
+        system = await load_system_settings(self._session)
+        if system is not None and system.app_api_key:
+            values.add(system.app_api_key)
+        return frozenset(values)
+
 
 # --------------------------------------------------------------------------- #
 # Shared HTTP client
@@ -644,6 +690,14 @@ def get_autograb_status(request: Request) -> AutograbStatus:
     return current
 
 
+def get_watchlist_status(request: Request) -> WatchlistWorkerStatus:
+    current = getattr(request.app.state, "watchlist_status", None)
+    if not isinstance(current, WatchlistWorkerStatus):
+        current = WatchlistWorkerStatus()
+        request.app.state.watchlist_status = current
+    return current
+
+
 # --------------------------------------------------------------------------- #
 # Authentication
 # --------------------------------------------------------------------------- #
@@ -671,6 +725,21 @@ def _configured_setup_token() -> str | None:
         return None
     value = token.get_secret_value().strip()
     return value or None
+
+
+def configured_setup_token() -> str | None:
+    """Return the configured pre-init hardening token, or ``None`` if unset.
+
+    Public counterpart to :func:`_configured_setup_token`, for the ONE caller
+    outside this module allowed to see the raw value: the startup log line
+    (issue #65) that prints a ready-to-click ``Setup: http://host:port/setup?
+    setup_token=...`` URL so an operator can follow one link from ``docker logs``
+    instead of hunting ``PLEX_MANAGER_SETUP_TOKEN`` across env/compose/scrollback.
+    Callers should gate on :func:`is_setup_token_required` first, so the token is
+    only ever embedded when it is actually enforced — this stays a discoverability
+    aid (ADR-0005's install-time exception), never a new auth surface.
+    """
+    return _configured_setup_token()
 
 
 def is_setup_token_required(request: Request | None = None) -> bool:
@@ -1442,6 +1511,8 @@ LOG_MAX_ROWS_DEFAULT: int = 100_000
 # Auto-grab worker (ADR-0013): the background request->search->grab loop runs by
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
+WATCHLIST_SYNC_ENABLED_DEFAULT: bool = True
+WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT: float = 15.0
 
 # Upper bounds for the three settings above that feed directly into a sleep
 # duration or a timedelta cutoff (issue #92) live in ``web.settings_bounds``,
@@ -1648,6 +1719,27 @@ def resolve_eviction_interval_minutes(raw: str | None) -> tuple[float, bool]:
             EVICTION_INTERVAL_MINUTES_DEFAULT,
         )
         return EVICTION_INTERVAL_MINUTES_DEFAULT, False
+    return parsed, True
+
+
+def resolve_watchlist_sync_interval_minutes(raw: str | None) -> tuple[float, bool]:
+    """Resolve the watchlist polling interval to a safe finite weekly maximum."""
+    if raw is None:
+        return WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None or parsed <= 0:
+        _logger.warning(
+            "setting 'watchlist_sync_interval_minutes' is invalid; using default %s",
+            WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+        )
+        return WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT, False
+    if parsed > EVICTION_INTERVAL_MAX_MINUTES:
+        _logger.warning(
+            "setting 'watchlist_sync_interval_minutes' is %s, above %s; clamping",
+            parsed,
+            EVICTION_INTERVAL_MAX_MINUTES,
+        )
+        return EVICTION_INTERVAL_MAX_MINUTES, False
     return parsed, True
 
 
@@ -1888,5 +1980,21 @@ async def get_auto_grab_enabled(session: AsyncSession) -> bool:
         "auto_grab_enabled",
         await SettingsStore(session).get("auto_grab_enabled"),
         AUTO_GRAB_ENABLED_DEFAULT,
+    )
+    return value
+
+
+async def get_watchlist_sync_enabled(session: AsyncSession) -> bool:
+    value, _honored = resolve_bool_setting(
+        "watchlist_sync_enabled",
+        await SettingsStore(session).get("watchlist_sync_enabled"),
+        WATCHLIST_SYNC_ENABLED_DEFAULT,
+    )
+    return value
+
+
+async def get_watchlist_sync_interval_minutes(session: AsyncSession) -> float:
+    value, _honored = resolve_watchlist_sync_interval_minutes(
+        await SettingsStore(session).get("watchlist_sync_interval_minutes")
     )
     return value

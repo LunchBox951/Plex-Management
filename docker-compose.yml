@@ -25,6 +25,12 @@ services:
       # Keep the in-container app and healthcheck on 8000. Use
       # PLEX_MANAGER_HOST_BIND / PLEX_MANAGER_HOST_PORT below for the host socket.
       PLEX_MANAGER_PORT: "8000"
+      # Same value the ports mapping below publishes this container under —
+      # handed to the container itself (not just used for the mapping) so the
+      # app's own startup setup-URL hint (issue #65) can print a link that
+      # actually resolves from the operator's browser instead of always
+      # assuming the in-container port.
+      PLEX_MANAGER_HOST_PORT: ${PLEX_MANAGER_HOST_PORT:-8000}
       # Optional hardening — never required. When set (here or via .env), first-run
       # setup ALSO demands this token; unset/empty boots tokenless and setup is
       # claimed by the first Plex server owner to sign in.
