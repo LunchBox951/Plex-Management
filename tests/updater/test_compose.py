@@ -96,17 +96,16 @@ def test_auto_update_profile_confines_docker_authority_and_has_no_listener(
         for volume in cast(list[dict[str, Any]], service.get("volumes", []))
         if volume.get("target") == "/var/run/docker.sock"
     ]
-    assert socket_mounts == [
-        (
-            "updater",
-            {
-                "type": "bind",
-                "source": "/var/run/docker.sock",
-                "target": "/var/run/docker.sock",
-                "bind": {},
-            },
-        )
-    ]
+    assert len(socket_mounts) == 1
+    socket_service, socket_mount = socket_mounts[0]
+    assert socket_service == "updater"
+    assert socket_mount["type"] == "bind"
+    assert socket_mount["source"] == "/var/run/docker.sock"
+    assert socket_mount["target"] == "/var/run/docker.sock"
+    # Newer Docker Compose CLI versions populate the "bind" sub-dict with
+    # additional defaults (e.g. create_host_path); only the socket
+    # identity/confinement matters here, not the exact bind-option contents.
+    assert isinstance(socket_mount.get("bind"), dict)
     assert "ports" not in updater
     assert _secret_sources(app) == _secret_sources(updater) == {"plex_manager_updater"}
     assert updater["environment"]["PLEX_MANAGER_UPDATER_SECRET_FILE"] == _SECRET_PATH
