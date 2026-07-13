@@ -23,13 +23,15 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import AddResult
-from plex_manager.services import grab_service
+from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.services import grab_service, queue_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
     GrabError,
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
+    TorrentRemovalInFlightError,
 )
 from plex_manager.services.queue_service import mark_failed
 from tests.web.fakes import FakeQbittorrent, candidate
@@ -2346,3 +2348,311 @@ async def test_grab_stamps_metadata_timeout(sessionmaker_: SessionMaker) -> None
         # is irrelevant for an observability column (blueprint note).
         timeout_at = row.timeout_at.replace(tzinfo=UTC)
         assert before + METADATA_STALL_WINDOW <= timeout_at <= after + METADATA_STALL_WINDOW
+
+
+# --------------------------------------------------------------------------- #
+# #206: the terminal-row reuse path must refuse to resurrect a row whose
+# torrent removal is currently in flight (a concurrent cancel's post-commit
+# delete, or a reconcile-driven removal) -- reusing it would hand the new
+# request a torrent whose data is mid-deletion.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def clear_removals_in_flight() -> None:
+    """Isolate the module-global removal-in-flight registry between tests: a
+    leaked id (from a failing test) must never refuse an unrelated grab."""
+    queue_service._removals_in_flight.clear()  # pyright: ignore[reportPrivateUsage]
+
+
+async def _seed_terminal_download(sm: SessionMaker, *, torrent_hash: str) -> tuple[int, int, int]:
+    """Old request A owns a terminal (failed) download for ``torrent_hash``; new
+    request B is freshly created for the same title. Returns (old_id, new_id,
+    download_id)."""
+    async with sm() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.cancelled
+        )
+        new = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="B", status=RequestStatus.searching
+        )
+        session.add_all([old, new])
+        await session.flush()
+        old_id, new_id = old.id, new.id
+        download = Download(
+            torrent_hash=torrent_hash,
+            status="failed",
+            media_request_id=old_id,
+            tmdb_id=100,
+            failed_reason="cancelled by operator",
+        )
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+    return old_id, new_id, download_id
+
+
+async def test_reuse_refused_while_removal_in_flight(sessionmaker_: SessionMaker) -> None:
+    """The KNOWN-HASH pre-add guard (grab_service.py, the known-hash precheck):
+    when the indexer supplied the hash and it maps to a terminal row whose removal
+    is in flight, the grab is refused BEFORE ``qbt.add`` ever runs -- nothing is
+    added (so no fresh torrent is orphaned to seed untracked) and the terminal row
+    stays exactly as it was, still owned by the OLD request, never repointed."""
+    h = "1" * 40
+    old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
+
+    qbt = FakeQbittorrent()
+    queue_service.register_removal_in_flight(download_id)
+    try:
+        async with sessionmaker_() as session:
+            with pytest.raises(TorrentRemovalInFlightError) as excinfo:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored(h),
+                    request_id=new_id,
+                    tmdb_id=200,
+                )
+        assert excinfo.value.torrent_hash == h
+        assert excinfo.value.download_id == download_id
+    finally:
+        queue_service.release_removal_in_flight(download_id)
+
+    # Refused up front: the known hash let us gate BEFORE the client, so nothing was
+    # ever handed to qBittorrent (no orphan torrent) and nothing removed.
+    assert qbt.added == []
+    assert qbt.removed == []
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "failed"  # still terminal, not resurrected
+    assert row.media_request_id == old_id  # NOT repointed to the new request
+
+
+async def test_reuse_refused_after_add_cleans_up_the_orphan_torrent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 1 (#206): a HASHLESS candidate cannot be gated before the add -- the
+    real hash is only known once ``qbt.add`` returns -- so the reuse guard fires in
+    ``_reuse_terminal_row`` AFTER the add. When this grab genuinely CREATED the
+    torrent (``created=True``, qBittorrent had dropped the hash mid-removal), refusing
+    without cleanup would leave it seeding untracked. The guard must remove that fresh
+    torrent (WITH data) before raising, and leave the terminal row untouched."""
+    h = "7" * 40
+    old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
+
+    qbt = FakeQbittorrent()  # created=True for the freshly added hash
+    queue_service.register_removal_in_flight(download_id)
+    try:
+        async with sessionmaker_() as session:
+            with pytest.raises(TorrentRemovalInFlightError) as excinfo:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless("magnet:?xt=urn:btih:" + h),
+                    request_id=new_id,
+                    tmdb_id=200,
+                )
+        assert excinfo.value.download_id == download_id
+    finally:
+        queue_service.release_removal_in_flight(download_id)
+
+    # The add DID happen (hashless -> the guard can only fire post-add), and the
+    # orphaned fresh torrent was removed WITH its data before raising.
+    assert len(qbt.added) == 1
+    assert (h, True) in qbt.removed
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "failed"  # still terminal, not resurrected
+    assert row.media_request_id == old_id  # NOT repointed to the new request
+
+
+async def test_reuse_refused_after_add_leaves_a_pre_existing_torrent_in_place(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 1 counterpart: when the post-add guard fires but the torrent was
+    already PRESENT (``created=False`` -- it predates this grab, e.g. a still-seeding
+    import whose data may back a live library file), it is NOT ours to destroy. The
+    guard refuses without removing anything -- the pre-existing torrent is left
+    untouched, mirroring ``_remove_torrent_if_added``'s gate."""
+    h = "8" * 40
+    old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
+
+    qbt = FakeQbittorrent(pre_existing={h})  # created=False for this hash
+    queue_service.register_removal_in_flight(download_id)
+    try:
+        async with sessionmaker_() as session:
+            with pytest.raises(TorrentRemovalInFlightError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless("magnet:?xt=urn:btih:" + h),
+                    request_id=new_id,
+                    tmdb_id=200,
+                )
+    finally:
+        queue_service.release_removal_in_flight(download_id)
+
+    assert len(qbt.added) == 1  # the add was attempted (hashless)
+    assert qbt.removed == []  # but the pre-existing torrent was left untouched
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "failed"
+    assert row.media_request_id == old_id
+
+
+async def test_reuse_refused_while_operator_removal_in_flight(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Finding 3 (#206, operator-delete arm): an operator ``mark_failed(remove_torrent
+    =True)`` records its irreversible torrent delete ONLY on its ``_OperatorClaim``
+    (the ``removal_in_flight`` flag), NEVER in the shared ``_removals_in_flight``
+    registry. The reuse guard's single query point must still see it, so a same-hash
+    grab racing that operator delete -- after a cancel committed the row terminal and
+    released ITS OWN shared guard -- is refused rather than reusing a row whose data
+    the operator is mid-deletion. Would silently re-own the row before the fix."""
+    h = "9" * 40
+    old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
+
+    flags = queue_service._OperatorFailFlags(  # pyright: ignore[reportPrivateUsage]
+        blocklist=True, remove_torrent=True
+    )
+    token = queue_service._register_operator_claim(download_id, flags)  # pyright: ignore[reportPrivateUsage]
+    queue_service._mark_removal_in_flight(download_id, token)  # pyright: ignore[reportPrivateUsage]
+    qbt = FakeQbittorrent()
+    try:
+        # Nothing was ever published to the SHARED registry -- the operator flag is
+        # the only record of this in-flight delete.
+        assert download_id not in queue_service._removals_in_flight  # pyright: ignore[reportPrivateUsage]
+        async with sessionmaker_() as session:
+            with pytest.raises(TorrentRemovalInFlightError) as excinfo:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored(h),
+                    request_id=new_id,
+                    tmdb_id=200,
+                )
+        assert excinfo.value.download_id == download_id
+        assert qbt.added == []  # known-hash pre-add guard refused before the client
+    finally:
+        queue_service._release_operator_claim(download_id, token)  # pyright: ignore[reportPrivateUsage]
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "failed"  # still terminal, not resurrected
+    assert row.media_request_id == old_id  # NOT repointed to the new request
+    assert not queue_service.removal_in_flight(download_id)  # released with the claim
+
+
+async def test_reuse_succeeds_after_removal_released(sessionmaker_: SessionMaker) -> None:
+    """No regression to the ordinary reuse path: with nothing registered (or a
+    claim registered then released before the grab), the terminal row is reused
+    and re-owned to the new request exactly as before #206."""
+    h = "2" * 40
+    _old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
+
+    # Register then release, proving a settled (no longer in-flight) claim does
+    # not linger and block a later, legitimate reuse.
+    queue_service.register_removal_in_flight(download_id)
+    queue_service.release_removal_in_flight(download_id)
+
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored(h),
+            request_id=new_id,
+            tmdb_id=200,
+        )
+    assert record.status == "downloading"
+
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status == "downloading"
+    assert row.media_request_id == new_id  # re-owned to the CURRENT request
+    assert not queue_service.removal_in_flight(download_id)
+
+
+async def test_reuse_refused_while_removal_in_flight_via_unique_conflict(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SAME guard also covers the second reuse call site (grab_service.py
+    ~887, reached from the create-time ``IntegrityError`` branch): a genuine
+    DB-level race -- a competing terminal (cancelled) row for the SAME hash
+    lands between this call's ``get_by_hash`` miss and its own ``create()`` --
+    is recovered by re-reading the winner and calling the SAME shared
+    ``_reuse_terminal_row`` helper. Proves the guard is not accidentally
+    call-site-specific."""
+    h = "3" * 40
+    async with sessionmaker_() as session:
+        old = MediaRequest(
+            tmdb_id=100, media_type=MediaType.movie, title="A", status=RequestStatus.cancelled
+        )
+        new = MediaRequest(
+            tmdb_id=200, media_type=MediaType.movie, title="B", status=RequestStatus.searching
+        )
+        session.add_all([old, new])
+        await session.flush()
+        old_id, new_id = old.id, new.id
+        await session.commit()
+
+    registered_ids: list[int] = []
+    real_create = grab_service.SqlDownloadRepository.create
+
+    async def racing_create(
+        self: grab_service.SqlDownloadRepository, **kwargs: Any
+    ) -> DownloadRecord:
+        # Mirrors the existing racing-update fakes above: a concurrent actor
+        # (here, a cancel that already committed its terminal move) inserts the
+        # SAME hash as a terminal row just before this call's own INSERT lands
+        # -- the genuine DB-level race the ``except IntegrityError`` recovery
+        # (grab_service.py ~830) exists for. Registering the removal claim here,
+        # before the real ``create()`` raises, mirrors cancel's own
+        # register-before-commit ordering (#206): by the time this call's
+        # IntegrityError recovery reaches ``_reuse_terminal_row``, the claim is
+        # already in place.
+        async with sessionmaker_() as other:
+            competing = Download(
+                torrent_hash=h,
+                status="failed",
+                media_request_id=old_id,
+                tmdb_id=100,
+                failed_reason="cancelled by operator",
+            )
+            other.add(competing)
+            await other.commit()
+            registered_ids.append(competing.id)
+        queue_service.register_removal_in_flight(competing.id)
+        return await real_create(self, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "create", racing_create)
+
+    try:
+        async with sessionmaker_() as session:
+            with pytest.raises(TorrentRemovalInFlightError):
+                await grab_service.grab(
+                    FakeQbittorrent(),
+                    session,
+                    scored=_scored_hashless("magnet:?xt=urn:btih:" + h),
+                    request_id=new_id,
+                    tmdb_id=200,
+                )
+    finally:
+        for download_id in registered_ids:
+            queue_service.release_removal_in_flight(download_id)
+
+    assert len(registered_ids) == 1
+    async with sessionmaker_() as session:
+        row = await session.get(Download, registered_ids[0])
+    assert row is not None
+    assert row.status == "failed"  # still terminal, not resurrected
+    assert row.media_request_id == old_id  # NOT repointed to the new request

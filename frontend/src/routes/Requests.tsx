@@ -184,7 +184,7 @@ export function Requests() {
   }
 
   return (
-    <div>
+    <div className="mx-auto w-full max-w-[1060px] px-5 py-8 sm:px-8">
       <header className="mb-6 flex items-baseline gap-3">
         <h1 className="font-display text-2xl font-extrabold">Requests</h1>
         {data ? (

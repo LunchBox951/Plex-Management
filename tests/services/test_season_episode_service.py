@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.tmdb import TmdbApiError
 from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.metadata import EpisodeInfo
@@ -23,6 +24,7 @@ SessionMaker = async_sessionmaker[AsyncSession]
 
 _TODAY = date(2026, 7, 11)
 _NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+_PARSER = GuessitParser()
 
 
 async def _make_show(sm: SessionMaker, tmdb_id: int = 800) -> int:
@@ -327,7 +329,7 @@ async def test_reconcile_airing_rearms_a_season_whose_target_grew(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -363,7 +365,7 @@ async def test_reconcile_airing_leaves_season_alone_when_target_unchanged(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -384,7 +386,7 @@ async def test_reconcile_airing_skips_a_season_on_tmdb_error_without_aborting(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -429,7 +431,7 @@ async def test_reconcile_airing_skips_episode_scoped_request(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -470,7 +472,7 @@ async def test_reconcile_airing_adopts_baseline_for_done_season_with_no_rows(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -508,7 +510,7 @@ async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
     )
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
     assert rearmed == 0
@@ -525,7 +527,7 @@ async def test_reconcile_airing_baseline_adoption_still_rearms_on_later_growth(
     )
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb_grown, now=_NOW, max_refresh=5
+            session, tmdb_grown, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -589,6 +591,7 @@ async def test_reconcile_airing_adopts_partial_baseline_with_imported_pack_histo
             season=1,
             episodes_json=None,
             added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+            release_title="The.Show.S01.1080p.BluRay.x264-GROUP",
         )
         session.add(pack)
         await session.commit()
@@ -603,7 +606,7 @@ async def test_reconcile_airing_adopts_partial_baseline_with_imported_pack_histo
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -647,7 +650,7 @@ async def test_reconcile_airing_partial_rows_without_pack_history_still_rearm(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -682,6 +685,7 @@ async def test_reconcile_airing_pack_adoption_never_swallows_episodes_aired_afte
             season=1,
             episodes_json=None,
             added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+            release_title="The.Show.S01.1080p.BluRay.x264-GROUP",
         )
         session.add(pack)
         await session.commit()
@@ -698,7 +702,7 @@ async def test_reconcile_airing_pack_adoption_never_swallows_episodes_aired_afte
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -767,7 +771,7 @@ async def test_reconcile_airing_skips_rearm_when_newer_active_request_owns_the_s
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=5
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
         )
         await session.commit()
 
@@ -825,7 +829,7 @@ async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=3
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=3
         )
         await session.commit()
     assert rearmed == 0
@@ -834,7 +838,7 @@ async def test_reconcile_airing_rotates_the_refresh_window_across_cycles(
 
     async with sessionmaker_() as session:
         rearmed = await season_episode_service.reconcile_airing(
-            session, tmdb, now=_NOW, max_refresh=3
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=3
         )
         await session.commit()
     assert rearmed == 0
@@ -884,7 +888,7 @@ async def test_reconcile_airing_rotation_keeps_advancing_within_the_same_day(
         tmdb = FakeTmdb(season_episodes=dict(episodes))
         async with sessionmaker_() as session:
             rearmed = await season_episode_service.reconcile_airing(
-                session, tmdb, now=_NOW + timedelta(minutes=minutes), max_refresh=2
+                session, tmdb, parser=_PARSER, now=_NOW + timedelta(minutes=minutes), max_refresh=2
             )
             await session.commit()
         assert rearmed == 0
@@ -897,3 +901,112 @@ async def test_reconcile_airing_rotation_keeps_advancing_within_the_same_day(
     # date-granular cursor would have collapsed to id-order here and re-picked
     # cycles[0]'s pair a second consecutive time.
     assert cycles[3] == cycles[1]
+
+
+async def test_reconcile_airing_legacy_single_episode_row_is_not_pack_proof(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """THE #230 regression: a pre-#167 single-episode grab for a season scope is
+    ALSO recorded episode-unscoped (``episodes_json`` NULL, ``season`` set) --
+    the live apollo shape. Its ``release_title`` names one episode
+    (``...S04E07...``), which ``classify_release_scope`` reads as
+    ``single_episode``, NOT a pack. It must NOT be trusted as whole-season
+    coverage: the season re-arms and every pending episode (all but the one
+    genuinely imported) stays ``pending`` for a real search, rather than being
+    silently adopted as ``imported``.
+    """
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=819, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    await _seed_imported_episode_row(
+        sessionmaker_, season_request_id, 7, media_request_id=show_id, season_number=1
+    )
+    # The legacy shape: episodes_json NULL (pre-#167 season-scope grab), but the
+    # release name only ever named one episode.
+    async with sessionmaker_() as session:
+        legacy = Download(
+            torrent_hash="legacy-single-episode-hash-819",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            episodes_json=None,
+            added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+            release_title="The.Show.S04E07.1080p.WEB-DL-GROUP",
+        )
+        session.add(legacy)
+        await session.commit()
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (819, 1): [
+                EpisodeInfo(episode_number=n, air_date=date(2026, 1, n)) for n in range(1, 11)
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 1  # the legacy row is NOT pack proof -- must re-arm
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    by_episode = {r.episode_number: r.status for r in rows}
+    assert by_episode[7] == "imported"
+    # THE pin: every other episode stays pending -- NOT adopted as owned.
+    assert all(status == "pending" for ep, status in by_episode.items() if ep != 7)
+
+
+async def test_reconcile_airing_multi_season_pack_title_counts_as_pack_proof(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The multi_season_pack branch of the allow-list: a pack whose release
+    name spans several seasons (``S01-S03``) is still valid whole-season-pack
+    proof for THIS season and adoption proceeds."""
+    show_id = await _make_show_with_intent(sessionmaker_, tmdb_id=820, tv_request_mode="whole_show")
+    season_request_id = await _make_season(sessionmaker_, show_id, 1, RequestStatus.available)
+
+    await _seed_imported_episode_row(
+        sessionmaker_, season_request_id, 7, media_request_id=show_id, season_number=1
+    )
+    async with sessionmaker_() as session:
+        pack = Download(
+            torrent_hash="multi-season-pack-hash-820",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            episodes_json=None,
+            added_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC),
+            release_title="The.Show.S01-S03.1080p.BluRay.x264-GROUP",
+        )
+        session.add(pack)
+        await session.commit()
+
+    tmdb = FakeTmdb(
+        season_episodes={
+            (820, 1): [
+                EpisodeInfo(episode_number=n, air_date=date(2026, 1, n)) for n in range(1, 11)
+            ]
+        }
+    )
+
+    async with sessionmaker_() as session:
+        rearmed = await season_episode_service.reconcile_airing(
+            session, tmdb, parser=_PARSER, now=_NOW, max_refresh=5
+        )
+        await session.commit()
+
+    assert rearmed == 0  # adopted via multi-season-pack proof, never re-armed
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_request_id)
+        assert season is not None
+        assert season.status == RequestStatus.available
+        episode_repo = SqlSeasonEpisodeStateRepository(session)
+        rows = await episode_repo.list_for_season(season_request_id)
+    assert all(r.status == "imported" for r in rows)

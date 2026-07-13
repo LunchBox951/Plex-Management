@@ -71,6 +71,56 @@ export function downloadStatus(status: string): StatusPresentation {
   return lookup(DOWNLOAD_STATUS, status)
 }
 
+/**
+ * The `RequestStatus` values that count as "in flight" — a request that is mid-
+ * pipeline and not yet settled: hunting a release (`searching`), pulling one
+ * (`downloading`), between retries after finding none acceptable
+ * (`no_acceptable_release`, non-terminal, re-searches on a schedule), imported
+ * and awaiting Plex's availability confirmation (`completed` — the backend's
+ * in-flight "Finalizing" state; see `_SETTLED_REQUEST_STATUSES` in
+ * `repositories/requests.py`, which deliberately excludes it), or stuck
+ * mid-import awaiting the operator's retry/reject (`import_blocked` —
+ * non-terminal; see `RequestStatus` in `models.py`). Omitting either of the
+ * last two would let the badge read zero while the request is still visibly
+ * active on the Requests page — dishonest silence.
+ *
+ * Deliberately EXCLUDES:
+ *   - not-yet-started states with no pipeline activity to report (`pending`,
+ *     and `waiting_for_air_date`, which is dormant by design until its wake);
+ *   - settled states (`available`, `failed`, `cancelled`, `evicted`);
+ *   - `partially_available` — the parent-only TV rollup. Non-settled for dedup
+ *     purposes, but by rollup precedence it can NEVER coexist with an in-flight
+ *     season: any `import_blocked`/`downloading`/`searching`/
+ *     `no_acceptable_release` season wins the parent status outright
+ *     (`domain/season_rollup.py`, `_PRECEDENCE_STATUSES`), so the moment real
+ *     work starts on any season the parent reads that in-flight status and the
+ *     badge counts it. A show only sits at `partially_available` when its
+ *     non-done seasons are all dormant (`pending`/`waiting_for_air_date`) or
+ *     settled (`failed`/`evicted`/`cancelled`) — and a settled-partial show
+ *     (e.g. one season evicted after being watched, ADR-0012) holds that status
+ *     indefinitely, so counting it would keep the badge permanently lit with
+ *     zero activity. Overstating activity is as dishonest as understating it.
+ *
+ * This is the single source of truth for "this request is still being worked"
+ * so the shell's Requests nav badge (issue #187) can't silently desync from the
+ * status vocabulary above — the same reason `glyphKind` reads canonical labels
+ * rather than hardcoding strings. The badge count is only ever as truthful as
+ * the actor-scoped `/requests` payload it is derived from (own requests for a
+ * shared user; every request for an admin — matching what that actor sees on
+ * the page).
+ */
+export const IN_FLIGHT_REQUEST_STATUSES: ReadonlySet<string> = new Set([
+  'searching',
+  'downloading',
+  'no_acceptable_release',
+  'completed',
+  'import_blocked',
+])
+
+export function isInFlightRequestStatus(status: string): boolean {
+  return IN_FLIGHT_REQUEST_STATUSES.has(status)
+}
+
 /** Tailwind classes per intent (background tint + text + ring), used by StatusBadge. */
 export const INTENT_CLASSES: Record<StatusIntent, string> = {
   searching: 'bg-searching/15 text-searching ring-searching/30',

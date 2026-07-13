@@ -171,6 +171,7 @@ class FakeTmdb:
         popular_tv_results: list[MediaSearchResult] | None = None,
         season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
         season_episodes_error: Exception | None = None,
+        get_tv_show_error: Exception | None = None,
     ) -> None:
         self.movies = movies or {}
         self.shows = shows or {}
@@ -197,6 +198,12 @@ class FakeTmdb:
         # Call log (issue #178 pack-first-precedence test): proves the port was
         # NEVER even consulted when Pass 1 alone settled a scope.
         self.season_episodes_calls: list[tuple[int, int]] = []
+        # ``get_tv_show_error`` (issue #210, mirrors ``season_episodes_error``): when
+        # set, raised on every ``get_tv_show`` call -- the "TMDB outage / show state
+        # unknown" test double for the air-date wake pass.
+        self.get_tv_show_error = get_tv_show_error
+        # Call log (issue #210 "resolved once per distinct show" assertion).
+        self.get_tv_show_calls: list[int] = []
 
     async def search(self, query: str, year: int | None = None) -> list[MediaSearchResult]:
         return list(self.results)
@@ -205,6 +212,9 @@ class FakeTmdb:
         return self.movies.get(tmdb_id)
 
     async def get_tv_show(self, tmdb_id: int) -> TvMetadata | None:
+        self.get_tv_show_calls.append(tmdb_id)
+        if self.get_tv_show_error is not None:
+            raise self.get_tv_show_error
         return self.shows.get(tmdb_id)
 
     @staticmethod
@@ -275,6 +285,10 @@ class FakeQbittorrent:
         # adapter's 409 branch): the AddResult comes back ``created=False``, so
         # a lost-grab cleanup must leave the pre-existing torrent untouched.
         self.pre_existing = pre_existing or set()
+        # Records the (lowercased) hash sets each ``get_statuses_for_hashes``
+        # call was scoped to -- lets a test assert reconcile requested exactly
+        # its tracked hashes (issue #216), never the whole inventory.
+        self.status_queries: list[list[str]] = []
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         if magnet_or_url in self.source_errors:
@@ -295,6 +309,12 @@ class FakeQbittorrent:
 
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         return list(self.statuses)
+
+    async def get_statuses_for_hashes(self, hashes: Sequence[str]) -> list[DownloadStatus]:
+        wanted = [h.lower() for h in hashes]
+        self.status_queries.append(wanted)
+        wanted_set = set(wanted)
+        return [status for status in self.statuses if status.info_hash.lower() in wanted_set]
 
     async def pause(self, info_hash: str) -> None:
         return None
