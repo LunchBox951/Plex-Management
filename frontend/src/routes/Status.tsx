@@ -442,6 +442,18 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
         >
           {watchlist.failed_entries}
         </dd>
+        {/* Skipped users explain a skip-driven degraded tick (stale token after a
+            repoint, or plex.tv unreachable) that would otherwise show degraded
+            with zero failures and no visible cause. */}
+        <dt className="min-w-0 text-faint">Skipped users</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            watchlist.skipped_users > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {watchlist.skipped_users}
+        </dd>
         {watchlist.last_error_type ? (
           <>
             <dt className="min-w-0 text-faint">Last error</dt>

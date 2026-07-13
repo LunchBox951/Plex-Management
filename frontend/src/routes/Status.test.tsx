@@ -754,6 +754,12 @@ describe('Status', () => {
     expect(watchlist.getByText('1')).toBeInTheDocument()
     expect(watchlist.getByText('Failed entries')).toBeInTheDocument()
     expect(watchlist.getByText('3')).toBeInTheDocument()
+    // Skipped users must be visible: they are what explains a skip-driven
+    // degraded tick (stale/unrevalidatable tokens) when failed_users is 0.
+    expect(watchlist.getByText('Skipped users').tagName).toBe('DT')
+    const skippedValue = watchlist.getByText('Skipped users').nextElementSibling
+    expect(skippedValue).toHaveTextContent('2')
+    expect(skippedValue).toHaveClass('font-semibold', 'text-searching')
     expect(watchlist.getByText(/WatchlistEntryError/)).toBeInTheDocument()
 
     const lastRun = watchlist.getByText('Last run').nextElementSibling

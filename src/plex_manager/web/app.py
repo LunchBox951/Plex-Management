@@ -38,6 +38,7 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.logsafe import safe_int
+from plex_manager.models import User
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -249,13 +250,14 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 )
             status.mark_skipped("disabled")
             return 0
-        try:
-            tmdb = await resolve_tmdb(app.state, session, client)
-        except ServiceNotConfiguredError:
-            status.mark_skipped("not_configured")
-            return 0
-        library = await get_library_optional(session, client)
         client_identifier = await auth_router._get_or_create_client_identifier(session)  # pyright: ignore[reportPrivateUsage]
+        # Persist a just-minted identifier NOW: ``set_if_absent`` wrote it in this
+        # session, but this block otherwise exits without committing, and a
+        # rolled-back mint (while the minted value is still used below) would
+        # register a fresh plex.tv device on EVERY tick of an install lacking the
+        # setting -- violating the helper's create-once contract. Idempotent when
+        # the identifier already existed (nothing else has been written).
+        await session.commit()
         plex_tv = PlexTvClient(client, client_identifier=client_identifier)
         machine_identifier = await _resolve_watchlist_server_identity(
             SettingsStore(session), plex_tv
@@ -267,13 +269,14 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             return 0
         users = await watchlist_service.list_sync_users(session)
 
-    created = 0
-    fetched = 0
-    existing = 0
-    failed_users = 0
-    failed_entries = 0
+    # Revalidation + stale cleanup run BEFORE the TMDB gate below: clearing a
+    # stale account's eviction-protection snapshot needs only the stored Plex
+    # tokens and the configured server identity, so a repoint on an install with
+    # no TMDB key must still stop the old server's rows from protecting titles.
+    # Only request CREATION (the sync pass) is TMDB-gated.
     skipped_users = 0
     last_error: str | None = None
+    authorized: list[tuple[User, str]] = []
     for user in users:
         token = user.encrypted_plex_token
         if token is None:
@@ -300,10 +303,26 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             # on the new server forever (#296 finding 1).
             skipped_users += 1
             async with maker() as session:
-                # Re-read the token inside the deleting transaction (expected_token
-                # guard): if the user signed in again since revalidation loaded this
-                # token, the delete must NOT wipe the now-authorized account's
-                # snapshot. A changed token retains the rows; next tick re-evaluates.
+                # Two races guard this delete, both re-checked inside the deleting
+                # transaction because the STALE decision was made from state loaded
+                # earlier: (a) the SERVER may have been repointed again since this
+                # tick resolved its identity -- the stale verdict belonged to the
+                # PREVIOUS machine identifier, so re-resolve and skip if changed;
+                # (b) the USER may have signed in again -- the expected_token guard
+                # inside clear_user_snapshot skips the delete if their stored token
+                # changed. Either way the rows are retained and the next tick
+                # re-evaluates against the current state.
+                current_identity = await _resolve_watchlist_server_identity(
+                    SettingsStore(session), plex_tv
+                )
+                if current_identity != machine_identifier:
+                    _logger.info(
+                        "watchlist token for user_id=%s revalidated stale, but the "
+                        "configured server changed since; retaining the snapshot for "
+                        "re-evaluation against the new server",
+                        safe_int(user.id),
+                    )
+                    continue
                 cleared = await watchlist_service.clear_user_snapshot(
                     session, user_id=user.id, expected_token=token
                 )
@@ -328,6 +347,23 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 authorization.value,
             )
             continue
+        authorized.append((user, token))
+
+    async with maker() as session:
+        try:
+            tmdb = await resolve_tmdb(app.state, session, client)
+        except ServiceNotConfiguredError:
+            # Stale cleanup already ran above; only request creation needs TMDB.
+            status.mark_skipped("not_configured")
+            return 0
+        library = await get_library_optional(session, client)
+
+    created = 0
+    fetched = 0
+    existing = 0
+    failed_users = 0
+    failed_entries = 0
+    for user, token in authorized:
         try:
             async with maker() as session:
                 result = await watchlist_service.sync_user(

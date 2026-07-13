@@ -157,6 +157,93 @@ async def test_watchlist_tick_reports_not_configured_without_tmdb(
     assert status.last_ok_at is None
 
 
+async def test_tick_persists_minted_client_identifier(app: FastAPI, seed: SeedFn) -> None:
+    """The plex.tv device identifier minted by a tick must be COMMITTED, not rolled
+    back when the settings session closes: an uncommitted mint would still be used
+    for that tick's plex.tv calls, registering a fresh phantom device on every tick
+    of an install lacking the setting (the helper's create-once contract)."""
+    await seed(initialized=True)
+
+    await app_module._watchlist_sync_once(app)  # pyright: ignore[reportPrivateUsage]
+    async with app.state.sessionmaker() as session:
+        first = await SettingsStore(session).get("plex_oauth_client_identifier")
+    assert first  # persisted, visible to a fresh session
+
+    # A second tick reuses the stored identifier instead of minting another.
+    await app_module._watchlist_sync_once(app)  # pyright: ignore[reportPrivateUsage]
+    async with app.state.sessionmaker() as session:
+        assert await SettingsStore(session).get("plex_oauth_client_identifier") == first
+
+
+async def test_stale_cleanup_runs_even_without_tmdb_configured(app: FastAPI, seed: SeedFn) -> None:
+    """Stale-token cleanup needs only the stored Plex tokens and the configured
+    server identity -- it must NOT be gated on a TMDB key. After a repoint on an
+    install without TMDB, the old server's rows must still stop protecting titles;
+    only request CREATION is TMDB-gated (#296)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        await SettingsStore(session).set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+        user = User(username="stale-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(
+        transport=_plex_tv_resources_transport([_server_resource("some-other-server")])
+    )
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    # The tick still ends not_configured (no TMDB key -> no request creation)...
+    assert app.state.watchlist_status.state == "not_configured"
+    # ...but the stale snapshot was cleared BEFORE the TMDB gate.
+    async with app.state.sessionmaker() as session:
+        assert list((await session.execute(WatchlistItem.__table__.select())).all()) == []
+
+
+async def test_stale_delete_skipped_when_server_repointed_mid_tick(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """Repoint race: the STALE verdict was computed against the server identity
+    resolved at tick start. If the admin repoints AGAIN before the delete runs, the
+    verdict belonged to the PREVIOUS machine identifier -- the deleting transaction
+    re-resolves the current identity and must retain the snapshot for
+    re-evaluation against the new server (#296)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", "tmdb-key")
+        await store.set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+        user = User(username="stale-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/resources":
+            # The revalidation call itself is the race window: repoint the server
+            # (as the settings router's verified-repoint path would) BEFORE
+            # answering with a stale verdict for the OLD identity.
+            async with app.state.sessionmaker() as session:
+                await SettingsStore(session).set(PLEX_MACHINE_ID_SETTING, "repointed-again-mid")
+                await session.commit()
+            return httpx.Response(200, json=[_server_resource("some-other-server")])
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.skipped_users == 1
+    # The snapshot survives: the stale verdict was against the outdated identity.
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_watchlist_loop_wakes_immediately_when_settings_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
