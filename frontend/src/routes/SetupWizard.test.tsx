@@ -564,6 +564,45 @@ describe('SetupWizard — service validation flow', () => {
     expect(screen.queryByRole('heading', { name: 'Prowlarr' })).not.toBeInTheDocument()
   })
 
+  it('never marks the Services step complete on partial verification — the chip tracks position, not optimism', async () => {
+    // Honesty north star: a "completed" chip must reflect a real, crossed gate,
+    // never optimistic verification progress. Validating two of three services
+    // must leave Services the current (numbered) step with no checkmark, and the
+    // future Libraries/Done steps numbered — until the real Continue gate is met.
+    h.validate.mockImplementation(async ({ service }: { service: string }) => ({
+      ok: true,
+      message: `${service} ok`,
+    }))
+    await reachServices()
+
+    const testButtons = screen.getAllByRole('button', { name: /test connection/i })
+    fireEvent.click(testButtons[0]!)
+    fireEvent.click(testButtons[1]!)
+    await screen.findByText('2/3 verified')
+
+    const progress = screen.getByRole('list', { name: 'Setup progress' })
+    const items = within(progress).getAllByRole('listitem')
+    // Services (index 2) is still the current step — numbered, not checkmarked.
+    expect(items[2]).toHaveAttribute('aria-current', 'step')
+    expect(items[2]).not.toHaveAccessibleName('Services, completed')
+    expect(within(items[2]!).getByText('3')).toBeInTheDocument()
+    expect(within(items[2]!).queryByText('✓')).not.toBeInTheDocument()
+    // Future steps stay numbered.
+    expect(within(items[3]!).getByText('4')).toBeInTheDocument()
+    expect(within(items[4]!).getByText('5')).toBeInTheDocument()
+
+    // Crossing the real gate (all three verified) is what promotes Services to
+    // completed — position advances, so the chip earns its checkmark honestly.
+    fireEvent.click(testButtons[2]!)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    await screen.findByRole('heading', { level: 1, name: 'Confirm library roots' })
+    const advanced = within(
+      screen.getByRole('list', { name: 'Setup progress' }),
+    ).getAllByRole('listitem')
+    expect(advanced[2]).toHaveAccessibleName('Services, completed')
+    expect(within(advanced[2]!).getByText('✓')).toBeInTheDocument()
+  })
+
   it('keeps Continue gated on the required setup token after services validate', async () => {
     h.setupTokenRequired = true
     h.storedSetupToken = 'boot-token'
