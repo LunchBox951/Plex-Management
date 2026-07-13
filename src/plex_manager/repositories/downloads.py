@@ -238,6 +238,72 @@ class SqlDownloadRepository:
         scopes = await self._scopes_by_download([row.id for row in rows])
         return [_to_record(row, scopes.get(row.id, [])) for row in rows]
 
+    async def list_active_for_requests(
+        self, media_request_ids: list[int]
+    ) -> dict[int, list[DownloadRecord]]:
+        """Batch active physical downloads by each owning request id.
+
+        ``Download.media_request_id`` is the legacy ownership link, while
+        ``DownloadScope.media_request_id`` records every logical TV scope a shared
+        physical torrent covers. Read both shapes in one download query, load the
+        matching rows' scopes once, and group the resulting physical records by
+        caller-supplied request id. Once a scope exists for the scalar owner it is
+        authoritative: an imported/failed scope must not be resurrected by the
+        stale compatibility link. A physical row is added at most once to each
+        request even when both active ownership links name it; this is load-bearing
+        for presenting one honest byte-progress value for a multi-scope pack.
+
+        Terminal physical rows carry history, not live transfer progress, and are
+        excluded just like :meth:`list_active_for_request`.  The caller controls
+        the id set (the requests router supplies only rows visible to the actor),
+        so this read never widens request visibility or exposes queue metadata.
+        """
+        request_ids = list(dict.fromkeys(media_request_ids))
+        if not request_ids:
+            return {}
+
+        requested_ids = frozenset(request_ids)
+        scoped_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id.in_(request_ids),
+            DownloadScope.status.in_(_ACTIVE_SCOPE_STATUSES),
+        )
+        scalar_scope_exists = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id == Download.media_request_id,
+        )
+        legacy_scalar_match = Download.media_request_id.in_(request_ids) & ~scalar_scope_exists
+        stmt = (
+            select(Download)
+            .where(
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                or_(legacy_scalar_match, scoped_exists),
+            )
+            .order_by(Download.id)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        scopes_by_download = await self._scopes_by_download([row.id for row in rows])
+
+        grouped: dict[int, list[DownloadRecord]] = {request_id: [] for request_id in request_ids}
+        for row in rows:
+            scopes = scopes_by_download.get(row.id, [])
+            owners: set[int] = set()
+            scalar_has_scope = any(
+                scope.media_request_id == row.media_request_id for scope in scopes
+            )
+            if row.media_request_id in requested_ids and not scalar_has_scope:
+                owners.add(row.media_request_id)
+            owners.update(
+                scope.media_request_id
+                for scope in scopes
+                if scope.media_request_id in requested_ids
+                and scope.status in _ACTIVE_SCOPE_STATUSES
+            )
+            record = _to_record(row, scopes)
+            for owner_id in owners:
+                grouped[owner_id].append(record)
+        return grouped
+
     async def find_latest_for_request(
         self, media_request_id: int, *, season: int | None = None
     ) -> DownloadRecord | None:
