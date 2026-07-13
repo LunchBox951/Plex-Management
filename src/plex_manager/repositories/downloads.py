@@ -25,6 +25,8 @@ from plex_manager.models import (
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord, QueueRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlDownloadRepository"]
@@ -220,6 +222,89 @@ class SqlDownloadRepository:
         )
         row = (await self._session.execute(stmt)).scalars().first()
         return await self._to_record_with_scopes(row) if row is not None else None
+
+    async def find_active_for_requests(
+        self, keys: Sequence[tuple[int, int | None]]
+    ) -> frozenset[tuple[int, int | None]]:
+        """Batch :meth:`find_active_for_request` membership over MANY
+        ``(media_request_id, season)`` keys (issue #138).
+
+        Eviction candidate assembly probed the in-flight guard once PER candidate
+        (one ``find_active_for_request`` SELECT per movie/season row); this answers
+        the whole pool in exactly TWO queries regardless of pool size, replicating
+        :meth:`find_active_for_request`'s per-key match semantics exactly (legacy
+        scalar ownership superseded by a scope for the SAME key, or an
+        active-status scope) evaluated in Python against the two result sets.
+
+        1. Every non-terminal ``Download`` row that could match ANY key: either
+           its legacy scalar ``(media_request_id, season)`` names one of the
+           requested ids, or SOME ``DownloadScope`` (any status -- the negation
+           check below needs to see a suppressed/terminal scope too, exactly like
+           :meth:`find_active_for_request`'s own ``matching_scope_exists``) names
+           one. This is a deliberately BROADER net than the final per-key
+           decision -- it only bounds which download rows are worth examining.
+        2. Every scope those rows carry for the requested ids, read once and
+           reused two ways per row: negate a legacy match when a scope for the
+           EXACT SAME ``(download, media_request_id, season)`` exists at all
+           (regardless of status), and independently register a scoped match
+           when the scope's OWN status is active.
+
+        The returned membership is IDENTICAL to calling
+        ``find_active_for_request(media_request_id, season=season) is not None``
+        for each key one at a time.
+        """
+        if not keys:
+            return frozenset()
+        key_set = frozenset(keys)
+        request_ids = list({media_request_id for media_request_id, _season in key_set})
+
+        scope_exists_for_requests = exists().where(
+            DownloadScope.download_id == Download.id,
+            DownloadScope.media_request_id.in_(request_ids),
+        )
+        stmt = select(Download.id, Download.media_request_id, Download.season).where(
+            Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+            or_(Download.media_request_id.in_(request_ids), scope_exists_for_requests),
+        )
+        rows = (await self._session.execute(stmt)).all()
+        if not rows:
+            return frozenset()
+        download_ids = [row.id for row in rows]
+
+        scope_stmt = select(
+            DownloadScope.download_id,
+            DownloadScope.media_request_id,
+            DownloadScope.season_number,
+            DownloadScope.status,
+        ).where(
+            DownloadScope.download_id.in_(download_ids),
+            DownloadScope.media_request_id.in_(request_ids),
+        )
+        scopes_by_download: dict[int, list[tuple[int | None, int | None, str]]] = {}
+        for download_id, scope_request_id, season_number, scope_status in (
+            await self._session.execute(scope_stmt)
+        ).all():
+            scopes_by_download.setdefault(download_id, []).append(
+                (scope_request_id, season_number, scope_status)
+            )
+
+        active: set[tuple[int, int | None]] = set()
+        for row in rows:
+            scopes = scopes_by_download.get(row.id, [])
+            if row.media_request_id is not None:
+                key = (row.media_request_id, row.season)
+                matching_scope_exists = any(
+                    scope_request_id == row.media_request_id and season_number == row.season
+                    for scope_request_id, season_number, _status in scopes
+                )
+                if key in key_set and not matching_scope_exists:
+                    active.add(key)
+            for scope_request_id, season_number, scope_status in scopes:
+                if scope_status in _ACTIVE_SCOPE_STATUSES and scope_request_id is not None:
+                    scoped_key = (scope_request_id, season_number)
+                    if scoped_key in key_set:
+                        active.add(scoped_key)
+        return frozenset(active)
 
     async def list_active_for_request(self, media_request_id: int) -> list[DownloadRecord]:
         """Every ACTIVE (non-terminal) download for a request, across all seasons.

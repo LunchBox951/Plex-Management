@@ -52,6 +52,26 @@ async def test_list_by_status_filters(session: AsyncSession) -> None:
     assert len(await repo.list_by_status()) == 3
 
 
+async def test_get_many_batches_multiple_ids_in_one_call(session: AsyncSession) -> None:
+    """Issue #138: the batched parent-fan-out read for eviction candidate
+    assembly -- one query for however many distinct ids are asked about."""
+    repo = SqlRequestRepository(session)
+    a = await repo.create(tmdb_id=10, media_type="movie", title="A", status="pending")
+    b = await repo.create(tmdb_id=11, media_type="tv", title="B", status="pending")
+
+    found = await repo.get_many([a.id, b.id, 999_999])
+
+    assert set(found) == {a.id, b.id}
+    assert found[a.id].title == "A"
+    assert found[b.id].title == "B"
+    # A missing id is simply absent, never mapped to a fabricated record.
+    assert 999_999 not in found
+
+
+async def test_get_many_empty_input_returns_empty_dict(session: AsyncSession) -> None:
+    assert await SqlRequestRepository(session).get_many([]) == {}
+
+
 async def test_personalization_history_is_exactly_user_scoped_and_deduplicated(
     session: AsyncSession,
 ) -> None:

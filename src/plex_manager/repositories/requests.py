@@ -233,6 +233,21 @@ class SqlRequestRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
+    async def get_many(self, request_ids: Sequence[int]) -> dict[int, RequestRecord]:
+        """Batch :meth:`get` over MULTIPLE ids in one query (issue #138).
+
+        Empty input is a plain no-op (no query) returning ``{}``. An id with no
+        matching row is simply absent from the returned mapping, never mapped to
+        a fabricated record -- callers (e.g. ``eviction_service._season_
+        candidates``' parent-per-distinct-show fan-out) check for a missing key
+        exactly like a ``None`` :meth:`get` result.
+        """
+        if not request_ids:
+            return {}
+        stmt = select(MediaRequest).where(MediaRequest.id.in_(request_ids))
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return {row.id: _to_record(row) for row in rows}
+
     async def list_personalization_history(self, user_id: int) -> list[RequestRecord]:
         """Return only ``user_id``'s retained request intent, one row per title.
 

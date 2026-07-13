@@ -11,8 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
 from plex_manager.repositories import SqlSeasonRequestRepository
@@ -158,6 +158,42 @@ async def test_list_by_status_filters_across_shows(session: AsyncSession) -> Non
         (show_b.id, 1),
     }
     assert len(await repo.list_by_status()) == 3
+
+
+async def test_list_by_status_issues_one_query_regardless_of_distinct_parent_count(
+    session: AsyncSession, engine: AsyncEngine
+) -> None:
+    """Issue #137: ``list_by_status`` used to follow up with one ``_tmdb_id_for``
+    SELECT per DISTINCT parent show (``1 + distinct_parent_count`` queries). The
+    join-based rewrite must cost exactly ONE query, whether the result spans one
+    show or many."""
+    repo = SqlSeasonRequestRepository(session)
+    shows = [await _make_show(session, tmdb_id=940 + i) for i in range(4)]
+    for show in shows:
+        await repo.ensure(show.id, 1, status="pending")
+
+    statements: list[str] = []
+
+    def _capture(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        if "season_requests" in statement.lower():
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        rows = await repo.list_by_status("pending")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert {r.media_request_id for r in rows} == {show.id for show in shows}
+    assert {r.tmdb_id for r in rows} == {show.tmdb_id for show in shows}
+    assert len(statements) == 1
 
 
 async def test_list_for_requests_batches_multiple_shows_in_one_call(

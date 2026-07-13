@@ -89,7 +89,6 @@ if TYPE_CHECKING:
 
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
-    from plex_manager.ports.repositories import RequestRecord
 
 __all__ = [
     "EvictionOutcome",
@@ -328,10 +327,15 @@ async def _movie_candidates(
             for row in rows
         ]
     )
+    # Batch the active-download in-flight probe for the WHOLE candidate pool into
+    # ONE query pair (issue #138) rather than one ``find_active_for_request`` SELECT
+    # per candidate -- membership is byte-for-byte what a per-candidate call would
+    # report (see the repository method's docstring).
+    active_keys = await download_repo.find_active_for_requests([(row.id, None) for row in rows])
     size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row, watch in zip(rows, watch_states, strict=True):
-        in_flight = (await download_repo.find_active_for_request(row.id, season=None)) is not None
+        in_flight = (row.id, None) in active_keys
         size_bytes = await _sized_path(row.library_path, size_cache)
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0
@@ -369,10 +373,11 @@ async def _season_candidates(
 
     The pin (``keep_forever``) and the title live on the PARENT show
     (``MediaRequest``), never on the season row itself, so pinning a series
-    protects every one of its seasons — each parent is fetched once (cached in
-    ``parents``) even when a show has several tracked seasons. Season rows whose
-    ``library_path`` is not owned by ``root_path`` (see :func:`_owned_by_root`)
-    are skipped.
+    protects every one of its seasons — every distinct parent is resolved in ONE
+    batched :meth:`~plex_manager.ports.repositories.RequestRepository.get_many`
+    call (issue #137/#138) rather than one :meth:`get` per distinct show. Season
+    rows whose ``library_path`` is not owned by ``root_path`` (see
+    :func:`_owned_by_root`) are skipped.
     """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -398,22 +403,23 @@ async def _season_candidates(
             for row in rows
         ]
     )
-    parents: dict[int, RequestRecord] = {}
+    # One query for every distinct parent show (issue #137/#138) instead of one
+    # ``get()`` per distinct show.
+    parents = await request_repo.get_many(list({row.media_request_id for row in rows}))
+    # Batch the active-download in-flight probe for the WHOLE candidate pool into
+    # ONE query pair (issue #138) rather than one ``find_active_for_request``
+    # SELECT per candidate -- membership is byte-for-byte what a per-candidate
+    # call would report (see the repository method's docstring).
+    active_keys = await download_repo.find_active_for_requests(
+        [(row.media_request_id, row.season_number) for row in rows]
+    )
     size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row, watch in zip(rows, watch_states, strict=True):
         parent = parents.get(row.media_request_id)
-        if parent is None:
-            fetched = await request_repo.get(row.media_request_id)
-            if fetched is None:  # pragma: no cover - the FK guarantees the parent exists
-                continue
-            parent = fetched
-            parents[row.media_request_id] = parent
-        in_flight = (
-            await download_repo.find_active_for_request(
-                row.media_request_id, season=row.season_number
-            )
-        ) is not None
+        if parent is None:  # pragma: no cover - the FK guarantees the parent exists
+            continue
+        in_flight = (row.media_request_id, row.season_number) in active_keys
         size_bytes = await _sized_path(row.library_path, size_cache)
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0

@@ -275,20 +275,21 @@ class SqlSeasonRequestRepository:
         return (await self._session.execute(stmt)).scalars().first() is not None
 
     async def list_by_status(self, status: str | None = None) -> list[SeasonRequestRecord]:
-        stmt = select(SeasonRequest)
+        # JOIN straight to the parent's tmdb_id in ONE query (issue #137) -- the
+        # same pattern as :meth:`list_for_requests`/:meth:`list_due_for_search`,
+        # avoiding the per-distinct-show ``_tmdb_id_for`` follow-up this used to
+        # need. Recurring/background callers (auto-grab, availability promotion,
+        # eviction candidate assembly) previously paid ``1 + distinct_parent_count``
+        # queries; this is always exactly one.
+        stmt = select(SeasonRequest, MediaRequest.tmdb_id).join(
+            MediaRequest, MediaRequest.id == SeasonRequest.media_request_id
+        )
         if status is not None:
             stmt = stmt.where(SeasonRequest.status == RequestStatus(status))
         stmt = stmt.order_by(SeasonRequest.id)
-        rows = (await self._session.execute(stmt)).scalars().all()
-        # One tmdb_id lookup per distinct show, not one per row -- a show with
-        # several tracked seasons only needs its tmdb_id resolved once.
-        tmdb_ids: dict[int, int] = {}
-        records: list[SeasonRequestRecord] = []
-        for row in rows:
-            if row.media_request_id not in tmdb_ids:
-                tmdb_ids[row.media_request_id] = await self._tmdb_id_for(row.media_request_id)
-            records.append(_to_record(row, tmdb_ids[row.media_request_id]))
-        return records
+        return [
+            _to_record(row, tmdb_id) for row, tmdb_id in (await self._session.execute(stmt)).all()
+        ]
 
     async def list_for_airing_refresh(
         self, statuses: frozenset[str], limit: int, *, checked_before: datetime | None = None
