@@ -73,6 +73,7 @@ from plex_manager.domain.eviction import (
     select_evictions,
 )
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
+from plex_manager.ports.library import WatchStateQuery
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -237,6 +238,27 @@ def _size_bytes(path: str) -> int | None:
         return None
 
 
+async def _sized_path(library_path: str | None, cache: dict[str, int | None]) -> int | None:
+    """On-disk footprint of ``library_path``, walking each DISTINCT path at most
+    once per candidate-assembly pass (issue #213, "size only once per distinct
+    physical path").
+
+    ``None`` breadcrumb -> ``None`` (unknown share), exactly as before. Two rows
+    legitimately sharing one ``library_path`` (the #155 shared-breadcrumb "twins"
+    shape) would otherwise each ``os.walk`` the same tree; ``cache`` memoizes the
+    (identical) result so the tree is walked once. The walk itself is unchanged --
+    still offloaded via ``asyncio.to_thread`` because it is real, potentially slow
+    disk I/O (see :func:`_size_bytes`).
+    """
+    if library_path is None:
+        return None
+    if library_path in cache:
+        return cache[library_path]
+    size = await asyncio.to_thread(_size_bytes, library_path)
+    cache[library_path] = size
+    return size
+
+
 def _owned_by_root(library_path: str | None, root_path: str, all_roots: Sequence[str]) -> bool:
     """Whether ``library_path`` BELONGS to ``root_path``'s sweep: ``root_path`` is
     its DEEPEST containing configured root (see :func:`~plex_manager.services.
@@ -295,13 +317,21 @@ async def _movie_candidates(
         if row.media_type == "movie"
         and (row.library_path is None or _owned_by_root(row.library_path, root_path, all_roots))
     ]
+    # Batch the Plex watch-state discovery for the WHOLE candidate pool into ONE
+    # section crawl (issue #213/#238) rather than one full re-crawl per candidate.
+    # The Nth result is byte-for-byte what a per-candidate ``watch_state`` call
+    # would return -- semantics are preserved exactly (see the port docstring).
+    watch_states = await library.resolve_watch_states(
+        [
+            WatchStateQuery(tmdb_id=row.tmdb_id, media_type="movie", library_path=row.library_path)
+            for row in rows
+        ]
+    )
+    size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
-    for row in rows:
-        watch = await library.watch_state(row.tmdb_id, "movie", library_path=row.library_path)
+    for row, watch in zip(rows, watch_states, strict=True):
         in_flight = (await download_repo.find_active_for_request(row.id, season=None)) is not None
-        size_bytes = (
-            await asyncio.to_thread(_size_bytes, row.library_path) if row.library_path else None
-        )
+        size_bytes = await _sized_path(row.library_path, size_cache)
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0
             if size_bytes is not None and root_total_bytes > 0
@@ -351,9 +381,26 @@ async def _season_candidates(
         for row in await season_repo.list_by_status(RequestStatus.available.value)
         if row.library_path is None or _owned_by_root(row.library_path, root_path, all_roots)
     ]
+    # Batch the Plex watch-state discovery for every season candidate into ONE
+    # show-section crawl plus one ``/children`` read per distinct show (issue
+    # #213/#238), instead of re-crawling the section and re-reading the show's
+    # children once per season. The Nth result is byte-for-byte what a
+    # per-candidate ``watch_state`` call would return.
+    watch_states = await library.resolve_watch_states(
+        [
+            WatchStateQuery(
+                tmdb_id=row.tmdb_id,
+                media_type="tv",
+                season=row.season_number,
+                library_path=row.library_path,
+            )
+            for row in rows
+        ]
+    )
     parents: dict[int, RequestRecord] = {}
+    size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
-    for row in rows:
+    for row, watch in zip(rows, watch_states, strict=True):
         parent = parents.get(row.media_request_id)
         if parent is None:
             fetched = await request_repo.get(row.media_request_id)
@@ -361,17 +408,12 @@ async def _season_candidates(
                 continue
             parent = fetched
             parents[row.media_request_id] = parent
-        watch = await library.watch_state(
-            row.tmdb_id, "tv", season=row.season_number, library_path=row.library_path
-        )
         in_flight = (
             await download_repo.find_active_for_request(
                 row.media_request_id, season=row.season_number
             )
         ) is not None
-        size_bytes = (
-            await asyncio.to_thread(_size_bytes, row.library_path) if row.library_path else None
-        )
+        size_bytes = await _sized_path(row.library_path, size_cache)
         size_percent = (
             (size_bytes / root_total_bytes) * 100.0
             if size_bytes is not None and root_total_bytes > 0
@@ -1287,8 +1329,10 @@ async def _evict_one(
        the other.
     8. A rewatch during the sweep NEVER gets deleted (#209): candidate assembly
        (:func:`_movie_candidates`/:func:`_season_candidates`) reads Plex watch
-       state once, up front, for the WHOLE candidate pool -- a long, sequential
-       scan for a large library. Immediately BEFORE the claim, watch state is
+       state once, up front, for the WHOLE candidate pool -- a single batched
+       section crawl per media type (:meth:`LibraryPort.resolve_watch_states`,
+       issues #213/#238), not a fresh re-crawl per candidate. Immediately BEFORE
+       the claim, watch state is
        RE-READ for just this one candidate and re-checked against the watched +
        grace-cutoff predicate; anything now unwatched, too-recently-viewed, no
        longer path-correlated (zero/ambiguous, see issue #207), or erroring on

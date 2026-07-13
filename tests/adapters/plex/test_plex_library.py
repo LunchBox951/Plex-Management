@@ -27,7 +27,7 @@ from plex_manager.adapters.plex.library import (
     _resolve_correlated_watch_state,  # pyright: ignore[reportPrivateUsage]
     reset_caches,
 )
-from plex_manager.ports.library import WatchState
+from plex_manager.ports.library import WatchState, WatchStateQuery
 
 PLEX_URL = "http://plex:32400"
 TOKEN = "super-secret-plex-token"  # noqa: S105
@@ -2352,3 +2352,238 @@ async def test_watch_state_tv_merges_identical_episode_path_across_sections() ->
         1399, "tv", season=1, library_path="/data/tv/AnimeShow/Season 01"
     )
     assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_watch_states -- batch discovery (issues #213/#238)
+#
+# The whole point: one section crawl for the WHOLE candidate pool, one season
+# ``/children`` read per DISTINCT show (never once per candidate season), and a
+# result byte-for-byte identical to N per-candidate ``watch_state`` calls.
+# --------------------------------------------------------------------------- #
+_ONE_MOVIE_SECTION_SLASH_M: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "1", "title": "Movies", "type": "movie", "Location": [{"path": "/m"}]}
+        ]
+    }
+}
+
+
+def _make_batch_movie_handler(total: int, calls: dict[str, int]) -> Any:
+    """A movie section of ``total`` items (each with its OWN ``/m/Title{i}`` file);
+    item 1005 is watched, the rest never viewed. ``calls`` records every request
+    path so a test can prove the section is paged ONCE for the whole batch."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_ONE_MOVIE_SECTION_SLASH_M)
+        if path == "/library/sections/1/all":
+            start = int(request.headers["X-Plex-Container-Start"])
+            size = int(request.headers["X-Plex-Container-Size"])
+            chunk: list[dict[str, Any]] = []
+            for i in range(start, min(start + size, total)):
+                item: dict[str, Any] = {
+                    "Guid": [{"id": f"tmdb://{1000 + i}"}],
+                    "Media": [{"Part": [{"file": f"/m/Title{1000 + i}/f.mkv"}]}],
+                }
+                if 1000 + i == 1005:
+                    item["viewCount"] = 2
+                    item["lastViewedAt"] = _WATCHED_EPOCH
+                chunk.append(item)
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": chunk}})
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_pages_a_movie_section_once_for_the_whole_batch() -> None:
+    # 130 items => two pages. Three path-correlated movie candidates would cost
+    # 3 * 2 = 6 section-page reads one at a time; the batch pays exactly 2.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_movie_handler(130, calls), base_url="http://batch-movie:32400")
+    queries = [
+        WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/m/Title1000"),
+        WatchStateQuery(tmdb_id=1005, media_type="movie", library_path="/m/Title1005"),
+        WatchStateQuery(tmdb_id=1129, media_type="movie", library_path="/m/Title1129"),
+    ]
+    states = await adapter.resolve_watch_states(queries)
+
+    assert states == [
+        WatchState(watched=False, last_viewed_at=None),
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),
+        WatchState(watched=False, last_viewed_at=None),
+    ]
+    # ONE crawl (two pages), not one crawl PER candidate.
+    assert calls["/library/sections/1/all"] == 2
+    assert calls["/library/sections"] == 1
+
+
+async def test_resolve_watch_states_matches_per_item_watch_state_for_every_query() -> None:
+    # The batch result must equal what N separate ``watch_state`` calls return.
+    per_item_calls: dict[str, int] = {}
+    per_item = _adapter(
+        _make_batch_movie_handler(130, per_item_calls), base_url="http://per-item-movie:32400"
+    )
+    queries = [
+        WatchStateQuery(tmdb_id=1000, media_type="movie", library_path="/m/Title1000"),
+        WatchStateQuery(tmdb_id=1005, media_type="movie", library_path="/m/Title1005"),
+        WatchStateQuery(tmdb_id=1129, media_type="movie", library_path="/m/Title1129"),
+    ]
+    expected = [
+        await per_item.watch_state(q.tmdb_id, q.media_type, library_path=q.library_path)
+        for q in queries
+    ]
+
+    batch_calls: dict[str, int] = {}
+    batch = _adapter(_make_batch_movie_handler(130, batch_calls), base_url="http://batch-eq:32400")
+    assert await batch.resolve_watch_states(queries) == expected
+
+
+async def test_resolve_watch_states_empty_touches_no_network() -> None:
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_movie_handler(1, calls), base_url="http://batch-empty:32400")
+    assert await adapter.resolve_watch_states([]) == []
+    assert calls == {}
+
+
+_BATCH_SHOW_SECTION: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "2", "title": "TV", "type": "show", "Location": [{"path": "/data/tv"}]}
+        ]
+    }
+}
+
+
+def _batch_show_seasons(watched_seasons: frozenset[int]) -> dict[str, Any]:
+    """Five seasons (index 1..5) of one show, each its own ``ratingKey`` 10X;
+    seasons in ``watched_seasons`` are fully viewed, the rest partially."""
+    metadata: list[dict[str, Any]] = []
+    for season in range(1, 6):
+        fully = season in watched_seasons
+        metadata.append(
+            {
+                "index": season,
+                "ratingKey": str(100 + season),
+                "leafCount": 10,
+                "viewedLeafCount": 10 if fully else 4,
+                "lastViewedAt": _WATCHED_EPOCH if fully else _PARTIAL_EPOCH,
+            }
+        )
+    return {"MediaContainer": {"Metadata": metadata}}
+
+
+def _make_batch_tv_handler(total: int, calls: dict[str, int]) -> Any:
+    """A show section of ``total`` shows; show tmdb 1399 (ratingKey 100) carries
+    five seasons, each backed by an episode under ``/data/tv/Show/Season 0X``.
+    Seasons 2 and 4 are fully watched."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=_BATCH_SHOW_SECTION)
+        if path == "/library/sections/2/all":
+            start = int(request.headers["X-Plex-Container-Start"])
+            size = int(request.headers["X-Plex-Container-Size"])
+            chunk: list[dict[str, Any]] = []
+            for i in range(start, min(start + size, total)):
+                # The target show sits first; the rest are unrelated filler tmdb ids.
+                tmdb = 1399 if i == 0 else 5000 + i
+                chunk.append(
+                    {
+                        "ratingKey": str(100 if i == 0 else 9000 + i),
+                        "Guid": [{"id": f"tmdb://{tmdb}"}],
+                    }
+                )
+            return httpx.Response(200, json={"MediaContainer": {"Metadata": chunk}})
+        if path == "/library/metadata/100/children":
+            return httpx.Response(200, json=_batch_show_seasons(frozenset({2, 4})))
+        match = re.fullmatch(r"/library/metadata/(10[1-5])/children", path)
+        if match:
+            season = int(match.group(1)) - 100
+            return httpx.Response(
+                200,
+                json={
+                    "MediaContainer": {
+                        "Metadata": [
+                            {
+                                "Media": [
+                                    {"Part": [{"file": f"/data/tv/Show/Season 0{season}/e01.mkv"}]}
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_resolve_watch_states_reads_a_shows_season_list_once_for_all_its_seasons() -> None:
+    # Five season candidates of ONE show across a 130-show (two-page) section.
+    # Per-candidate today: 5 * (2 section pages + 1 season-list /children) = 15
+    # + 5 episode /children. Batched: 2 section pages, ONE season-list read for
+    # the show, and one episode read per distinct season.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_make_batch_tv_handler(130, calls), base_url="http://batch-tv:32400")
+    queries = [
+        WatchStateQuery(
+            tmdb_id=1399,
+            media_type="tv",
+            season=season,
+            library_path=f"/data/tv/Show/Season 0{season}",
+        )
+        for season in range(1, 6)
+    ]
+    states = await adapter.resolve_watch_states(queries)
+
+    assert states == [
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 1 partial
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),  # season 2 watched
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 3 partial
+        WatchState(watched=True, last_viewed_at=_WATCHED_AT),  # season 4 watched
+        WatchState(watched=False, last_viewed_at=_PARTIAL_AT),  # season 5 partial
+    ]
+    # ONE section crawl (two pages) for the whole batch.
+    assert calls["/library/sections/2/all"] == 2
+    # ONE season-list /children read for the distinct show, NOT one per season.
+    assert calls["/library/metadata/100/children"] == 1
+    # One episode /children per distinct season (issue #238's folded fetch).
+    for season in range(1, 6):
+        assert calls[f"/library/metadata/{100 + season}/children"] == 1
+
+
+async def test_resolve_watch_states_tv_result_matches_per_item_watch_state() -> None:
+    queries = [
+        WatchStateQuery(
+            tmdb_id=1399,
+            media_type="tv",
+            season=season,
+            library_path=f"/data/tv/Show/Season 0{season}",
+        )
+        for season in range(1, 6)
+    ]
+    per_item = _adapter(_make_batch_tv_handler(130, {}), base_url="http://per-item-tv:32400")
+    expected = [
+        await per_item.watch_state(
+            q.tmdb_id, q.media_type, season=q.season, library_path=q.library_path
+        )
+        for q in queries
+    ]
+    batch = _adapter(_make_batch_tv_handler(130, {}), base_url="http://batch-tv-eq:32400")
+    assert await batch.resolve_watch_states(queries) == expected
+
+
+async def test_resolve_watch_states_tv_requires_a_season() -> None:
+    adapter = _adapter(_make_batch_tv_handler(1, {}), base_url="http://batch-tv-noseason:32400")
+    with pytest.raises(ValueError, match="requires a season"):
+        await adapter.resolve_watch_states([WatchStateQuery(tmdb_id=1399, media_type="tv")])

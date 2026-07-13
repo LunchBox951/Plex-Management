@@ -37,7 +37,7 @@ import httpx
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import header_value_error
 from plex_manager.logsafe import safe_int
-from plex_manager.ports.library import LibrarySection, WatchState
+from plex_manager.ports.library import LibrarySection, WatchState, WatchStateQuery
 from plex_manager.services import path_visibility
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
@@ -397,6 +397,56 @@ def _section_scan_path(section: LibrarySection, path: str) -> str | None:
         if host is not None:
             return host
     return None
+
+
+def _find_season_entry_in(
+    entries: Sequence[Mapping[str, object]], season: int
+) -> Mapping[str, object] | None:
+    """The season row matching ``season`` among an already-fetched ``/children`` list.
+
+    The in-memory half of :meth:`PlexLibrary._find_season_entry`: it does the same
+    ``index == season`` scan, but over season rows a batch already read once and
+    memoized, so several seasons of one show never re-fetch its ``/children``
+    (issue #213).
+    """
+    for entry in entries:
+        if _get_int(entry, "index") == season:
+            return entry
+    return None
+
+
+def _resolve_movie_watch_state_from_index(
+    movie_index: Sequence[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]],
+    tmdb_id: int,
+    library_path: str | None,
+) -> WatchState:
+    """The batched movie branch -- mirrors :meth:`PlexLibrary._movie_watch_state`
+    against a memoized per-section tmdb-id index instead of a fresh crawl per call.
+
+    ``library_path=None`` returns the first matching item in the first section that
+    has one (:meth:`PlexLibrary._find_section_item`'s first-match semantics);
+    otherwise every ``tmdb_id``-matching item whose file path sits under the
+    reverse-mapped ``library_path`` is a correlated hit
+    (:meth:`PlexLibrary._find_section_items`), resolved by
+    :func:`_resolve_correlated_watch_state` exactly as the per-item method does.
+    """
+    if library_path is None:
+        for _section, by_tmdb_id in movie_index:
+            items = by_tmdb_id.get(tmdb_id)
+            if items:
+                return _movie_watch_state_from_item(items[0])
+        return WatchState(watched=False, last_viewed_at=None)
+
+    hits: list[tuple[frozenset[str], WatchState]] = []
+    for section, by_tmdb_id in movie_index:
+        scan_path = _section_scan_path(section, library_path)
+        if scan_path is None:
+            continue
+        for item in by_tmdb_id.get(tmdb_id, []):
+            file_paths = _extract_file_paths(item)
+            if any(_is_path_prefix(scan_path, fp) for fp in file_paths):
+                hits.append((frozenset(file_paths), _movie_watch_state_from_item(item)))
+    return _resolve_correlated_watch_state(hits)
 
 
 class PlexLibrary:
@@ -1313,3 +1363,175 @@ class PlexLibrary:
         for item in items:
             paths.extend(_extract_file_paths(_as_mapping(item)))
         return paths
+
+    async def resolve_watch_states(self, queries: Sequence[WatchStateQuery]) -> list[WatchState]:
+        """Batch :meth:`watch_state` -- one section crawl for the whole set.
+
+        See :meth:`LibraryPort.resolve_watch_states`. The result for the Nth query
+        is byte-for-byte what :meth:`watch_state` would return for it; only the
+        round-trip count differs. Each relevant section is paged exactly once into a
+        memoized tmdb-id -> items index (:meth:`_section_item_index`); every
+        distinct show's season ``/children`` and every distinct season's episode
+        ``/children`` is fetched at most once, shared across all queries that need
+        it. TV and movie queries can be mixed; a section type is crawled only when
+        at least one query needs it.
+        """
+        if not queries:
+            return []
+        sections = await self.list_sections()
+        need_movie = any(q.media_type == "movie" for q in queries)
+        need_tv = any(q.media_type == "tv" for q in queries)
+        movie_index = await self._section_item_index(sections, "movie") if need_movie else []
+        show_index = await self._section_item_index(sections, "show") if need_tv else []
+        # Per-batch memoization of the two ``/children`` reads the TV branch makes:
+        # a show's season listing (keyed by the show's ratingKey) and a season's
+        # episode listing (keyed by the season's ratingKey). Shared across every
+        # query in this batch so a show with N tracked seasons pays ONE season-list
+        # fetch, not N -- see :meth:`LibraryPort.resolve_watch_states`'s cost model.
+        show_season_entries: dict[str, list[Mapping[str, object]]] = {}
+        season_episode_paths: dict[str, list[str]] = {}
+        results: list[WatchState] = []
+        for query in queries:
+            if query.media_type == "tv":
+                if query.season is None:
+                    raise ValueError("resolve_watch_states requires a season for media_type='tv'")
+                results.append(
+                    await self._resolve_tv_watch_state(
+                        show_index,
+                        query.tmdb_id,
+                        query.season,
+                        query.library_path,
+                        show_season_entries,
+                        season_episode_paths,
+                    )
+                )
+            else:
+                results.append(
+                    _resolve_movie_watch_state_from_index(
+                        movie_index, query.tmdb_id, query.library_path
+                    )
+                )
+        return results
+
+    async def _section_item_index(
+        self, sections: Sequence[LibrarySection], section_type: Literal["movie", "show"]
+    ) -> list[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]]:
+        """Crawl each ``section_type`` section ONCE into a tmdb-id -> items index.
+
+        Preserves the same section iteration order :meth:`list_sections` returns and
+        the same in-section page order the per-item :meth:`watch_state` helpers see,
+        so a look-up against this index yields exactly what :meth:`_find_section_item`
+        (first match) / :meth:`_find_section_items` (every match) would return -- the
+        only difference is that the whole section is paged up front, once, rather
+        than re-paged per candidate. An item is indexed under EVERY tmdb id its
+        guid(s) resolve to (:func:`_collect_item_tmdb_ids`), matching
+        :func:`_item_matches_tmdb_id`.
+        """
+        index: list[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]] = []
+        for section in sections:
+            if section.type != section_type:
+                continue
+            by_tmdb_id: dict[int, list[Mapping[str, object]]] = {}
+            start = 0
+            while True:
+                payload = await self._get(
+                    f"/library/sections/{section.key}/all",
+                    {"includeGuids": "1"},
+                    headers={
+                        "X-Plex-Container-Start": str(start),
+                        "X-Plex-Container-Size": str(_PAGE_SIZE),
+                    },
+                )
+                items = _as_sequence(_media_container(payload).get("Metadata"))
+                for item in items:
+                    entry = _as_mapping(item)
+                    tmdb_ids: set[int] = set()
+                    _collect_item_tmdb_ids(entry, tmdb_ids)
+                    for tmdb_id in tmdb_ids:
+                        by_tmdb_id.setdefault(tmdb_id, []).append(entry)
+                if len(items) < _PAGE_SIZE:
+                    break
+                start += _PAGE_SIZE
+            index.append((section, by_tmdb_id))
+        return index
+
+    async def _cached_season_entries(
+        self, rating_key: str, cache: dict[str, list[Mapping[str, object]]]
+    ) -> list[Mapping[str, object]]:
+        """One show's ``/children`` season rows, fetched at most once per batch.
+
+        Memoizes the exact ``/children`` read :meth:`_find_season_entry` performs so
+        several tracked seasons of the SAME show share a single fetch (issue #213).
+        """
+        cached = cache.get(rating_key)
+        if cached is None:
+            payload = await self._get(f"/library/metadata/{rating_key}/children")
+            cached = [
+                _as_mapping(item)
+                for item in _as_sequence(_media_container(payload).get("Metadata"))
+            ]
+            cache[rating_key] = cached
+        return cached
+
+    async def _cached_children_file_paths(
+        self, rating_key: str, cache: dict[str, list[str]]
+    ) -> list[str]:
+        """One season's episode file paths, fetched at most once per batch (issue #238)."""
+        cached = cache.get(rating_key)
+        if cached is None:
+            cached = await self._fetch_children_file_paths(rating_key)
+            cache[rating_key] = cached
+        return cached
+
+    async def _resolve_tv_watch_state(
+        self,
+        show_index: Sequence[tuple[LibrarySection, dict[int, list[Mapping[str, object]]]]],
+        tmdb_id: int,
+        season: int,
+        library_path: str | None,
+        show_season_entries: dict[str, list[Mapping[str, object]]],
+        season_episode_paths: dict[str, list[str]],
+    ) -> WatchState:
+        """The batched TV branch -- mirrors :meth:`_tv_watch_state` against the
+        memoized ``show_index`` + shared ``/children`` caches."""
+        if library_path is None:
+            for _section, by_tmdb_id in show_index:
+                items = by_tmdb_id.get(tmdb_id)
+                if not items:
+                    continue
+                rating_key = _get_str(items[0], "ratingKey")
+                if rating_key is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                season_entry = _find_season_entry_in(
+                    await self._cached_season_entries(rating_key, show_season_entries), season
+                )
+                if season_entry is None:
+                    return WatchState(watched=False, last_viewed_at=None)
+                return _season_watch_state_from_entry(season_entry)
+            return WatchState(watched=False, last_viewed_at=None)
+
+        hits: list[tuple[frozenset[str], WatchState]] = []
+        for section, by_tmdb_id in show_index:
+            scan_path = _section_scan_path(section, library_path)
+            if scan_path is None:
+                continue
+            for item in by_tmdb_id.get(tmdb_id, []):
+                rating_key = _get_str(item, "ratingKey")
+                if rating_key is None:
+                    continue
+                season_entry = _find_season_entry_in(
+                    await self._cached_season_entries(rating_key, show_season_entries), season
+                )
+                if season_entry is None:
+                    continue
+                season_rating_key = _get_str(season_entry, "ratingKey")
+                if season_rating_key is None:
+                    continue
+                episode_paths = await self._cached_children_file_paths(
+                    season_rating_key, season_episode_paths
+                )
+                if any(_is_path_prefix(scan_path, fp) for fp in episode_paths):
+                    hits.append(
+                        (frozenset(episode_paths), _season_watch_state_from_entry(season_entry))
+                    )
+        return _resolve_correlated_watch_state(hits)
