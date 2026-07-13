@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
 from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
@@ -59,6 +60,7 @@ from plex_manager.services.update_coordination_service import (
 from plex_manager.web.deps import (
     CSRF_HEADER_NAME,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
+    PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
     SettingsStore,
@@ -190,8 +192,40 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
 
 
+async def _resolve_watchlist_server_identity(
+    store: SettingsStore, plex_tv: PlexTvClient
+) -> str | None:
+    """Resolve the configured Plex server's machine identifier, or ``None``.
+
+    Mirrors ``auth._post_init_access``: prefer the identifier cached at setup
+    (:data:`PLEX_MACHINE_ID_SETTING`), else probe the configured server's
+    ``/identity`` with its stored service credentials. Returns ``None`` when no
+    Plex server is configured (nothing to authorize against) or the probe fails.
+    """
+    machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
+    if machine_identifier:
+        return machine_identifier
+    plex_url = await store.get("plex_url")
+    plex_token = await store.get("plex_token")
+    if not plex_url or not plex_token:
+        return None
+    try:
+        return await plex_tv.fetch_server_identity(plex_url, plex_token)
+    except PlexVerifyError:
+        return None
+
+
 async def _watchlist_sync_once(app: FastAPI) -> int:
-    """Synchronize every reusable account token, isolating failures per user."""
+    """Synchronize every reusable account token, isolating failures per user.
+
+    Each candidate token is REVALIDATED against the currently-configured Plex
+    server before its watchlist is synced: a stored token survives a verified
+    server repoint (which only revokes browser sessions), so without this a user
+    from the OLD server would keep having their watchlist create and protect
+    requests on the NEW one. Stale/unauthorized users are skipped (and their
+    count surfaced on the worker status); a transient plex.tv failure retains the
+    previous snapshot rather than being read as a revoked account.
+    """
     maker = app.state.sessionmaker
     client = app.state.http_client
     status = getattr(app.state, "watchlist_status", None)
@@ -201,6 +235,18 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
     status.mark_started()
     async with maker() as session:
         if not await get_watchlist_sync_enabled(session):
+            # Disabling the feature must END watchlist-based eviction protection,
+            # not merely stop future ticks: eviction consults ``is_watchlisted``
+            # unconditionally, so a stale snapshot would keep protecting titles
+            # forever. Clear it (idempotent) so protection ends immediately.
+            cleared = await watchlist_service.clear_snapshots(session)
+            await session.commit()
+            if cleared:
+                _logger.info(
+                    "watchlist sync disabled; cleared %s stale snapshot row(s) so they no "
+                    "longer protect titles from eviction",
+                    cleared,
+                )
             status.mark_skipped("disabled")
             return 0
         try:
@@ -209,6 +255,16 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             status.mark_skipped("not_configured")
             return 0
         library = await get_library_optional(session, client)
+        client_identifier = await auth_router._get_or_create_client_identifier(session)  # pyright: ignore[reportPrivateUsage]
+        plex_tv = PlexTvClient(client, client_identifier=client_identifier)
+        machine_identifier = await _resolve_watchlist_server_identity(
+            SettingsStore(session), plex_tv
+        )
+        if machine_identifier is None:
+            # No configured server to authorize tokens against -- syncing anyone
+            # would protect titles on behalf of accounts we cannot verify.
+            status.mark_skipped("not_configured")
+            return 0
         users = await watchlist_service.list_sync_users(session)
 
     created = 0
@@ -216,10 +272,33 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
     existing = 0
     failed_users = 0
     failed_entries = 0
+    skipped_users = 0
     last_error: str | None = None
     for user in users:
         token = user.encrypted_plex_token
         if token is None:
+            continue
+        try:
+            authorization = await watchlist_service.revalidate_sync_user(
+                plex_tv, machine_identifier, token=token
+            )
+        except Exception as exc:  # pragma: no cover - defensive; revalidate maps its own errors
+            skipped_users += 1
+            last_error = type(exc).__name__
+            _logger.warning(
+                "watchlist revalidation errored for user_id=%s (%s); skipping this tick",
+                safe_int(user.id),
+                type(exc).__name__,
+            )
+            continue
+        if authorization is not watchlist_service.SyncUserAuthorization.AUTHORIZED:
+            skipped_users += 1
+            _logger.info(
+                "skipping watchlist sync for user_id=%s: %s for the configured server; "
+                "retaining the previous snapshot",
+                safe_int(user.id),
+                authorization.value,
+            )
             continue
         try:
             async with maker() as session:
@@ -254,6 +333,7 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         failed_users=failed_users,
         failed_entries=failed_entries,
         error=last_error,
+        skipped_users=skipped_users,
     )
     return created
 

@@ -100,6 +100,58 @@ async def test_rating_key_detail_fetch_failure_raises_not_empties() -> None:
             await PlexWatchlist(client, TOKEN).list_entries()
 
 
+async def test_malformed_detail_metadata_raises_not_skips() -> None:
+    """A ratingKey-only row whose detail fetch returns a malformed (non-list)
+    ``Metadata`` must RAISE -- coercing it to an empty tuple would silently drop
+    the title as "unsupported" instead of retaining the caller's last snapshot,
+    the inverse of the top-level list fetch's fail-fatal posture (#296)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections/watchlist/all":
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"totalSize": 1, "Metadata": [{"ratingKey": "1111"}]}},
+            )
+        # Detail endpoint answers 200 but with a broken (dict, not list) Metadata.
+        return httpx.Response(200, json={"MediaContainer": {"Metadata": {"ratingKey": "1111"}}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PlexWatchlistError):
+            await PlexWatchlist(client, TOKEN).list_entries()
+
+
+async def test_empty_detail_metadata_list_is_skipped_not_raised() -> None:
+    """An explicitly EMPTY detail ``Metadata`` list is a genuine "no results"
+    for the key -- the item is skipped, not treated as a fetch failure (#296)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections/watchlist/all":
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"totalSize": 1, "Metadata": [{"ratingKey": "1111"}]}},
+            )
+        return httpx.Response(200, json={"MediaContainer": {"size": 0, "Metadata": []}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await PlexWatchlist(client, TOKEN).list_entries() == ()
+
+
+async def test_absent_detail_metadata_is_skipped_not_raised() -> None:
+    """A detail response that OMITS ``Metadata`` entirely (a 200 with size 0 for
+    a deleted item) is a genuine "no results", skipped rather than raised."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/library/sections/watchlist/all":
+            return httpx.Response(
+                200,
+                json={"MediaContainer": {"totalSize": 1, "Metadata": [{"ratingKey": "1111"}]}},
+            )
+        return httpx.Response(200, json={"MediaContainer": {"size": 0}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await PlexWatchlist(client, TOKEN).list_entries() == ()
+
+
 async def test_unsupported_typed_row_is_skipped_without_detail_fetch() -> None:
     """A row that already declares an unsupported ``type`` (e.g. an episode)
     cannot become a movie/show via its detail, so it is skipped WITHOUT a wasted

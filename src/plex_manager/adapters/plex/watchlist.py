@@ -186,10 +186,15 @@ class PlexWatchlist:
         """Fetch a single watchlist item's full metadata (``type``/``Guid``).
 
         Returns the item mapping, or ``None`` when the response is well formed
-        but carries no metadata for the key (a genuinely unresolvable item that
-        the caller then skips). Transport errors, auth rejections, non-2xx
-        statuses, and undecodable bodies RAISE -- the module contract is that a
-        partial/failed fetch must never be mistaken for an empty watchlist.
+        but carries no metadata for the key (``Metadata`` absent or an explicitly
+        empty list -- a genuinely unresolvable item that the caller then skips).
+        Transport errors, auth rejections, non-2xx statuses, undecodable bodies,
+        and a MALFORMED ``Metadata`` (present but not a list/tuple) RAISE -- the
+        module contract is that a partial/failed fetch must never be mistaken for
+        an empty watchlist. A non-list ``Metadata`` mirrors the top-level list
+        fetch's fail-fatal posture (:meth:`list_entries`): coercing it to an
+        empty tuple would silently drop the item as "unsupported" instead of
+        retaining the caller's previous snapshot.
         """
         try:
             response = await self._client.get(
@@ -210,7 +215,17 @@ class PlexWatchlist:
         raw_container = _mapping(payload).get("MediaContainer")
         if not isinstance(raw_container, Mapping):
             raise PlexWatchlistError("Plex watchlist item is missing MediaContainer")
-        metadata = _sequence(cast("Mapping[str, object]", raw_container).get("Metadata"))
+        raw_metadata = cast("Mapping[str, object]", raw_container).get("Metadata")
+        if raw_metadata is None:
+            # No results for this key: a genuinely unresolvable item (e.g. a 200
+            # with size 0). The caller skips it -- this is NOT a fetch failure.
+            return None
+        if not isinstance(raw_metadata, (list, tuple)):
+            # A present-but-malformed Metadata (dict/str/int) is a broken/partial
+            # response, not "no results"; fail fatal so the caller retains its
+            # previous snapshot rather than silently skipping the title.
+            raise PlexWatchlistError("Plex watchlist item response has invalid Metadata")
+        metadata = cast("Sequence[object]", raw_metadata)
         # The detail endpoint returns the requested item as the sole (or first)
         # Metadata entry; prefer an exact ratingKey match, else fall back to the
         # first entry. An empty Metadata list means the item is unresolvable.

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 
+from plex_manager.adapters.plex.oauth import (
+    PlexTvClient,
+    PlexVerifyError,
+    account_server_resource,
+)
 from plex_manager.models import MediaType, User, WatchlistItem
 from plex_manager.services import request_service
 
@@ -18,13 +24,43 @@ if TYPE_CHECKING:
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.watchlist import WatchlistPort
 
+# The oauth adapter's stable error code for a token plex.tv rejected outright
+# (401/403). A rejected token can never be re-authorized for the configured
+# server, so its owner is treated as stale rather than "unknown/retry".
+_TOKEN_INVALID_CODE = "plex_token_invalid"  # noqa: S105 - error code, not a secret
+
 __all__ = [
+    "SyncUserAuthorization",
     "WatchlistSyncResult",
     "WatchlistWorkerStatus",
+    "clear_snapshots",
     "is_watchlisted",
     "list_sync_users",
+    "revalidate_sync_user",
     "sync_user",
 ]
+
+
+class SyncUserAuthorization(Enum):
+    """Whether a stored Plex token still governs the configured server.
+
+    Mirrors the sign-in authorization ladder (``auth._post_init_access``): a
+    token is authorized iff plex.tv still advertises the configured server as a
+    resource that account can reach.
+    """
+
+    AUTHORIZED = "authorized"
+    """The token still has access to the configured server -- sync it."""
+
+    STALE = "stale"
+    """plex.tv rejected the token, or the account no longer has access to the
+    configured server (e.g. after a verified repoint). Skip it -- do NOT let its
+    old snapshot keep creating/protecting requests on the new server."""
+
+    UNKNOWN = "unknown"
+    """Authorization could not be determined (plex.tv unreachable). Skip the sync
+    this tick but RETAIN the previous snapshot -- a transient plex.tv outage must
+    not be read as "no longer authorized"."""
 
 
 @dataclass
@@ -41,6 +77,15 @@ class WatchlistWorkerStatus:
     existing: int = field(default=0)
     failed_users: int = field(default=0)
     failed_entries: int = field(default=0)
+    skipped_users: int = field(default=0)
+    """Users skipped this tick because their stored token no longer governs the
+    configured server (stale after a repoint) or their authorization could not be
+    revalidated (plex.tv unreachable). Surfaced so an operator can see WHY a
+    watchlist stopped syncing rather than it silently vanishing (north star #3)."""
+
+    def _reset_counters(self) -> None:
+        self.fetched = self.created = self.existing = 0
+        self.failed_users = self.failed_entries = self.skipped_users = 0
 
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
@@ -49,7 +94,7 @@ class WatchlistWorkerStatus:
         self.state = state
         self.last_error_type = None
         self.last_error_at = None
-        self.fetched = self.created = self.existing = self.failed_users = self.failed_entries = 0
+        self._reset_counters()
 
     def mark_completed(
         self,
@@ -60,6 +105,7 @@ class WatchlistWorkerStatus:
         failed_users: int,
         failed_entries: int,
         error: str | None,
+        skipped_users: int = 0,
     ) -> None:
         self.state = "degraded" if failed_users else "ok"
         if not failed_users:
@@ -69,6 +115,7 @@ class WatchlistWorkerStatus:
         self.existing = existing
         self.failed_users = failed_users
         self.failed_entries = failed_entries
+        self.skipped_users = skipped_users
         self.last_error_type = error
         self.last_error_at = datetime.now(UTC) if error is not None else None
 
@@ -76,7 +123,7 @@ class WatchlistWorkerStatus:
         self.state = "error"
         self.last_error_type = type(exc).__name__
         self.last_error_at = datetime.now(UTC)
-        self.fetched = self.created = self.existing = self.failed_users = self.failed_entries = 0
+        self._reset_counters()
 
 
 @dataclass(frozen=True)
@@ -88,9 +135,63 @@ class WatchlistSyncResult:
 
 
 async def list_sync_users(session: AsyncSession) -> list[User]:
-    """Return users with reusable Plex account credentials."""
+    """Return users with reusable Plex account credentials.
+
+    This is only the candidate set: a stored token does NOT prove the account is
+    still authorized for the currently-configured Plex server. The worker
+    revalidates each candidate against the configured server
+    (:func:`revalidate_sync_user`) before syncing, so a token left behind by a
+    verified server repoint cannot keep creating/protecting requests.
+    """
     stmt = select(User).where(User.encrypted_plex_token.is_not(None)).order_by(User.id)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def revalidate_sync_user(
+    plex_tv: PlexTvClient,
+    machine_identifier: str,
+    *,
+    token: str,
+) -> SyncUserAuthorization:
+    """Re-confirm one stored token still governs the configured Plex server.
+
+    A stored ``User.encrypted_plex_token`` survives a verified server repoint
+    (which only revokes browser sessions), so without this check a user from the
+    OLD server keeps having their Universal Watchlist create and protect requests
+    on the NEW server they can no longer sign into. This applies the same
+    plex.tv ``/resources`` + ``account_server_resource`` test the sign-in flow
+    uses (``auth._post_init_access``): authorized iff the account still
+    advertises the configured server as a reachable resource.
+
+    Distinguishes a rejected/unauthorized token (:attr:`SyncUserAuthorization.
+    STALE` -- skip it) from a transient plex.tv failure (:attr:`SyncUserAuthorization.
+    UNKNOWN` -- skip this tick but keep the snapshot), so a plex.tv outage is
+    never mistaken for a revoked account.
+    """
+    try:
+        resources = await plex_tv.fetch_resources(token)
+    except PlexVerifyError as exc:
+        if exc.code == _TOKEN_INVALID_CODE:
+            return SyncUserAuthorization.STALE
+        return SyncUserAuthorization.UNKNOWN
+    if account_server_resource(resources, machine_identifier) is None:
+        return SyncUserAuthorization.STALE
+    return SyncUserAuthorization.AUTHORIZED
+
+
+async def clear_snapshots(session: AsyncSession) -> int:
+    """Delete every stored watchlist snapshot row; return how many were removed.
+
+    Used when ``watchlist_sync_enabled`` is turned off: eviction consults
+    :func:`is_watchlisted` unconditionally, so leaving the last snapshot in place
+    would keep its titles protected from disk-pressure eviction indefinitely
+    even though the operator disabled the feature. Clearing the rows ends that
+    protection immediately -- an operator who disables watchlist sync expects
+    watchlist-based protection to end, not to silently persist (north star #3).
+    Idempotent: a no-op (returns 0) once already cleared.
+    """
+    result = cast("CursorResult[Any]", await session.execute(delete(WatchlistItem)))
+    return result.rowcount or 0
 
 
 async def is_watchlisted(session: AsyncSession, tmdb_id: int, media_type: str) -> bool:

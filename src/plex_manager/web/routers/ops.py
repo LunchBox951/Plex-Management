@@ -240,6 +240,7 @@ async def health_endpoint(
             existing=watchlist_status.existing,
             failed_users=watchlist_status.failed_users,
             failed_entries=watchlist_status.failed_entries,
+            skipped_users=watchlist_status.skipped_users,
         ),
     )
 

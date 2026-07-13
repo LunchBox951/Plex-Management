@@ -81,6 +81,7 @@ async def test_every_subsystem_is_honestly_not_configured_by_default(
         "existing": 0,
         "failed_users": 0,
         "failed_entries": 0,
+        "skipped_users": 0,
     }
 
 

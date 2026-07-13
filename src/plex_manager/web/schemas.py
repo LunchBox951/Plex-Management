@@ -1521,6 +1521,7 @@ class WatchlistStatusItem(BaseModel):
     existing: int = 0
     failed_users: int = 0
     failed_entries: int = 0
+    skipped_users: int = 0
 
 
 class HealthResponse(BaseModel):

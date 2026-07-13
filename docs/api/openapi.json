@@ -3995,6 +3995,11 @@
             ],
             "title": "Last Run At"
           },
+          "skipped_users": {
+            "default": 0,
+            "title": "Skipped Users",
+            "type": "integer"
+          },
           "state": {
             "enum": [
               "starting",
