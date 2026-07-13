@@ -795,13 +795,14 @@
         "type": "object"
       },
       "DownloadScopeStatus": {
-        "description": "Lifecycle of one logical TV scope attached to a physical torrent download.\n\nMirrors the vocabulary ``repositories/downloads.py`` has always written to\n``download_scopes.status`` (a plain ``String`` column, no CHECK constraint \u2014\nsame rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this\nenum needs no column migration). Kept separate from :class:`RequestStatus`\nbecause a scope's vocabulary is a strict subset with different terminality\n(``imported``/``failed`` are scope-terminal; the request-level rollup is a\ndifferent state machine in ``domain/season_rollup.py``).",
+        "description": "Lifecycle of one logical TV scope attached to a physical torrent download.\n\nMirrors the vocabulary the services actually persist to\n``download_scopes.status`` \u2014 ``repositories/downloads.py`` and\n``import_service`` write the pipeline states, and\n``correction_service._mark_download_scopes_terminal`` additionally stamps\n``cancelled`` when an operator cancels a request whose scoped download is\nstill live (ADR-0014). It is a plain ``String`` column, no CHECK constraint \u2014\nsame rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this\nenum needs no column migration. Kept separate from :class:`RequestStatus`\nbecause a scope's vocabulary is a strict subset with different terminality\n(``imported``/``failed``/``cancelled`` are scope-terminal; the request-level\nrollup is a different state machine in ``domain/season_rollup.py``).",
         "enum": [
           "active",
           "import_blocked",
           "imported",
           "failed",
-          "no_acceptable_release"
+          "no_acceptable_release",
+          "cancelled"
         ],
         "title": "DownloadScopeStatus",
         "type": "string"

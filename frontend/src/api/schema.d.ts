@@ -1532,16 +1532,20 @@ export interface components {
          * DownloadScopeStatus
          * @description Lifecycle of one logical TV scope attached to a physical torrent download.
          *
-         *     Mirrors the vocabulary ``repositories/downloads.py`` has always written to
-         *     ``download_scopes.status`` (a plain ``String`` column, no CHECK constraint —
+         *     Mirrors the vocabulary the services actually persist to
+         *     ``download_scopes.status`` — ``repositories/downloads.py`` and
+         *     ``import_service`` write the pipeline states, and
+         *     ``correction_service._mark_download_scopes_terminal`` additionally stamps
+         *     ``cancelled`` when an operator cancels a request whose scoped download is
+         *     still live (ADR-0014). It is a plain ``String`` column, no CHECK constraint —
          *     same rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this
-         *     enum needs no column migration). Kept separate from :class:`RequestStatus`
+         *     enum needs no column migration. Kept separate from :class:`RequestStatus`
          *     because a scope's vocabulary is a strict subset with different terminality
-         *     (``imported``/``failed`` are scope-terminal; the request-level rollup is a
-         *     different state machine in ``domain/season_rollup.py``).
+         *     (``imported``/``failed``/``cancelled`` are scope-terminal; the request-level
+         *     rollup is a different state machine in ``domain/season_rollup.py``).
          * @enum {string}
          */
-        DownloadScopeStatus: "active" | "import_blocked" | "imported" | "failed" | "no_acceptable_release";
+        DownloadScopeStatus: "active" | "import_blocked" | "imported" | "failed" | "no_acceptable_release" | "cancelled";
         /**
          * DownloadState
          * @description The domain state of a tracked download (persisted to ``downloads.status``).

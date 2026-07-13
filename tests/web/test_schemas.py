@@ -110,3 +110,27 @@ def test_to_item_round_trips_download_state_and_scope_status() -> None:
     assert item.model_dump()["status"] == "import_blocked"
     assert item.scopes[0].status is DownloadScopeStatus.import_blocked
     assert item.model_dump()["scopes"][0]["status"] == "import_blocked"
+
+
+def test_to_item_serializes_a_cancelled_scope() -> None:
+    """Regression (Codex review on PR #269): ``correction_service.cancel_request``
+    persists ``download_scopes.status = "cancelled"`` (via
+    ``_mark_download_scopes_terminal`` with ``RequestStatus.cancelled.value``) on
+    every still-unresolved scope of the cancelled request's download. That row is
+    a legitimately persisted state — the enum omitting it turned every queue
+    listing containing one into a 500 (``ValidationError`` in ``_to_item``)."""
+    record = DownloadRecord(
+        id=8,
+        torrent_hash="deadbeef",
+        status=DownloadState.Downloading.value,
+        scopes=(
+            DownloadScopeRecord(
+                id=2,
+                download_id=8,
+                status=RequestStatus.cancelled.value,  # the exact value the cancel path writes
+            ),
+        ),
+    )
+    item = _to_item(record)
+    assert item.scopes[0].status is DownloadScopeStatus.cancelled
+    assert item.model_dump()["scopes"][0]["status"] == "cancelled"
