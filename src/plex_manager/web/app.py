@@ -1005,36 +1005,48 @@ _UNCONFIRMED_HOST_PORT_NOTE: Final = (
 #: value is being ignored and why, rather than asserting a possibly-wrong link.
 _BARE_METAL_HOST_PORT_NOTE: Final = (
     "(PLEX_MANAGER_HOST_PORT is set, but this process does not look like it is"
-    " running under docker-compose.yml's documented volumes -- ignoring it and"
-    " using the in-container port instead; remove the variable on a bare-metal"
-    " install, or fix the port here if this really is a remapped container)"
+    " running inside the documented docker-compose.yml deployment (the shipped"
+    " container image with its required volumes) -- ignoring it and using the"
+    " in-container port instead; remove the variable on a bare-metal install,"
+    " or fix the port here if this really is a remapped container)"
 )
 
 
-def _running_under_documented_compose() -> bool:
+def _running_under_documented_compose(settings: Settings) -> bool:
     """Whether this process looks like it is actually running under the
     documented ``docker-compose.yml`` topology (issue #294, finding 3).
 
-    ``docker-compose.yml`` REQUIRES both the ``/media`` and ``/downloads``
-    bind mounts (``:?set ... in .env`` -- compose refuses to start without
-    them), so BOTH must be live mounts for this to be a reliable,
-    environment-derived signal that this process is the documented container,
-    not a bare-metal install or a hand-rolled ``docker run`` with no
-    equivalent mounts. Deliberately ``all(...)``, not ``any(...)`` (P2 follow-up
-    to #294): a bare-metal box can easily have ONE of these paths be a real,
-    unrelated mount point on its own (e.g. a media disk mounted directly at
-    ``/media``) while still having copied the compose-only ``.env.example``
-    ``PLEX_MANAGER_HOST_PORT``/``PLEX_MANAGER_HOST_BIND`` defaults -- an
-    ``any()`` gate would misclassify that host as the documented Compose
-    topology (which requires BOTH mounts) and wrongly trust those compose-only
-    values instead of falling back to the real in-process listener. Reuses
-    :func:`~plex_manager.services.path_visibility.is_live_mount` -- the same
-    check that module already uses to distinguish the compose deployment from
-    a bare-metal host for library/download path remapping -- rather than
-    inventing a second, possibly-drifting detection rule. Module-qualified
-    (``path_visibility.is_live_mount`` / ``.KNOWN_CONTAINER_MOUNTS``) so tests
-    can ``monkeypatch.setattr(path_visibility, "is_live_mount", ...)`` exactly
-    like that module's own test suite already does.
+    Two independent, environment-derived signals must BOTH hold:
+
+    1. ``settings.in_container`` -- the image-baked
+       ``PLEX_MANAGER_IN_CONTAINER=1`` sentinel the Dockerfile's runtime stage
+       sets (second P2 follow-up to #294). Mount-point names alone are NOT
+       evidence of being INSIDE the documented container: a bare-metal media
+       server can have real, unrelated disks mounted at both conventional
+       paths (``/media`` and ``/downloads``) while ALSO having copied the
+       compose-only ``PLEX_MANAGER_HOST_BIND``/``PLEX_MANAGER_HOST_PORT``
+       defaults -- e.g. a widened ``PLEX_MANAGER_HOST_BIND=192.168.1.50``
+       would then print an unreachable setup link even though the process
+       still listens on ``settings.host``. The sentinel cannot false-positive
+       on bare metal: it is baked into the shipped image only, and
+       deliberately kept OUT of ``.env.example`` (see the Dockerfile comment)
+       so a bare-metal install can never copy it by accident.
+    2. BOTH documented bind mounts are live. ``docker-compose.yml`` REQUIRES
+       ``/media`` and ``/downloads`` (``:?set ... in .env`` -- compose refuses
+       to start without them), so their absence means this container -- even
+       our own image -- was NOT launched by that compose file (a hand-rolled
+       ``docker run`` with no equivalent mounts), and its compose-published
+       socket values cannot be presumed either. Deliberately ``all(...)``,
+       not ``any(...)`` (first P2 follow-up to #294): a box can easily have
+       ONE of these paths be a real, unrelated mount point on its own. Reuses
+       :func:`~plex_manager.services.path_visibility.is_live_mount` -- the
+       same check that module already uses to distinguish the compose
+       deployment from a bare-metal host for library/download path
+       remapping -- rather than inventing a second, possibly-drifting
+       detection rule. Module-qualified (``path_visibility.is_live_mount`` /
+       ``.KNOWN_CONTAINER_MOUNTS``) so tests can ``monkeypatch.setattr(
+       path_visibility, "is_live_mount", ...)`` exactly like that module's
+       own test suite already does.
 
     Without this gate, a bare-metal install that copies ``.env.example``
     verbatim (which ships the compose-only ``PLEX_MANAGER_HOST_PORT=8000``
@@ -1044,7 +1056,7 @@ def _running_under_documented_compose() -> bool:
     unconditionally, which happens to be right only by coincidence (the
     in-container default also being 8000).
     """
-    return all(
+    return settings.in_container and all(
         path_visibility.is_live_mount(mount) for mount in path_visibility.KNOWN_CONTAINER_MOUNTS
     )
 
@@ -1114,13 +1126,14 @@ def _setup_ready_url(settings: Settings) -> str:
     browser. This is a discoverability aid only (ADR-0005's install-time
     exception).
     """
-    if settings.host_bind is not None and _running_under_documented_compose():
+    documented_compose = _running_under_documented_compose(settings)
+    if settings.host_bind is not None and documented_compose:
         host = settings.host_bind
     else:
         host = settings.host
     if host in _UNDIALABLE_BIND_HOSTS:
         host = "localhost"
-    if settings.host_port is not None and _running_under_documented_compose():
+    if settings.host_port is not None and documented_compose:
         port: int = settings.host_port
         note = ""
     elif settings.host_port is not None:

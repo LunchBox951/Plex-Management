@@ -69,6 +69,19 @@ class Settings(BaseSettings):
     # container host, silently defeating the "click this exact link" promise.
     host_bind: str | None = None
 
+    # Image-baked sentinel: ``True`` only inside the shipped container image
+    # (the Dockerfile's runtime stage sets ``PLEX_MANAGER_IN_CONTAINER=1``).
+    # The startup setup-URL hint requires this before trusting the two
+    # compose-published values above -- the ``/media``+``/downloads`` mount
+    # check alone is not evidence of being INSIDE the documented container (a
+    # bare-metal media server can have real disks mounted at both conventional
+    # paths, and copied compose-only ``host_bind``/``host_port`` values would
+    # then print an unreachable link instead of the real in-process listener).
+    # NOT an operator knob: never set this by hand, and it is deliberately
+    # absent from ``.env.example`` so a bare-metal install cannot copy it by
+    # accident. Defaults ``False`` everywhere the image did not bake it.
+    in_container: bool = False
+
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync
     # URL from this for migrations — see ``migrations/env.py``.
     database_url: str = "sqlite+aiosqlite:///./data/plex_manager.db"
