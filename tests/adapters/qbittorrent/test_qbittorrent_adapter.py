@@ -32,6 +32,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     _MAX_FAILURE_DETAIL_CHARS,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
+    _assert_safe_fetch_url_shape,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
 from plex_manager.ports.download_client import FailureDetailSource
@@ -1396,6 +1397,175 @@ async def test_safe_fetch_backend_tries_next_address_on_connect_timeout(
 
     assert isinstance(stream, _DummyNetworkStream)
     assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
+
+
+async def test_assert_safe_fetch_url_shape_never_resolves_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real network path's per-hop pre-check must be shape-only: scheme +
+    hostname presence, no DNS. The connect-time backend is the sole resolver."""
+    calls = 0
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("shape-only pre-check must not resolve DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    # A safe-looking, well-formed URL passes without ever touching the resolver.
+    await _assert_safe_fetch_url_shape("http://indexer.example/download/1")
+    assert calls == 0
+
+    # Malformed shape (bad scheme) is still vetoed -- entirely off URL parsing,
+    # no resolver involved either.
+    with pytest.raises(QbittorrentSourceError):
+        await _assert_safe_fetch_url_shape("ftp://indexer.example/download/1")
+    assert calls == 0
+
+
+class _ScriptedResponseStream(httpcore.AsyncNetworkStream):
+    """Serves one canned raw HTTP/1.1 response, then EOF."""
+
+    def __init__(self, response: bytes) -> None:
+        self._response = response
+        self._sent = False
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        _ = max_bytes, timeout
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._response
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        _ = buffer, timeout
+
+    async def aclose(self) -> None:
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = ssl_context, server_hostname, timeout
+        return self
+
+    def get_extra_info(self, info: str) -> Any:
+        _ = info
+        return None
+
+
+class _ScriptedBackend(httpcore.AsyncNetworkBackend):
+    """Records the connected host and serves a fixed response on every connect."""
+
+    def __init__(self, response: bytes) -> None:
+        self.hosts: list[str] = []
+        self._response = response
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        return _ScriptedResponseStream(self._response)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+_MAGNET_REDIRECT_RESPONSE = (
+    b"HTTP/1.1 302 Found\r\nLocation: " + MAGNET.encode() + b"\r\nContent-Length: 0\r\n\r\n"
+)
+
+
+async def test_redirect_hop_resolves_dns_once_over_the_real_network_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full per-hop flow through the REAL (non-``source_client``) path: DNS must
+    resolve exactly ONCE for the hop, and the connection must be made to that
+    single resolved address -- even though a hostile/rebinding host resolves
+    differently on a hypothetical second lookup. This is issue #38: before the
+    fix, the per-hop pre-check resolved once and the connect-time backend
+    resolved again, so a rebinding host could answer safely for the first (the
+    pre-check) and unsafely for the second (the connect) -- or vice versa.
+    Collapsing to one resolution used for both closes that gap and the wasted
+    lookup."""
+    calls = 0
+
+    def fake_getaddrinfo(host: str, port: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        # Only the FIRST (and, after the fix, ONLY) answer is a safe global
+        # address; a second call would rebind to a blocked/private one.
+        address = "93.184.216.34" if calls == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    backend = _ScriptedBackend(_MAGNET_REDIRECT_RESPONSE)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    # No source_client: exercises the real _SafeFetchTransport/
+    # SafeFetchNetworkBackend path, not the source_client test seam.
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+    )
+
+    result = await client.add("http://indexer.example/download/1", "/downloads", "plex-manager")
+
+    assert result.torrent_hash == MAGNET_HASH
+    assert calls == 1
+    assert backend.hosts == ["93.184.216.34"]
+
+
+async def test_redirect_hop_single_resolution_still_vetoes_unsafe_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the above: when the hop's ONE resolution is itself unsafe, the
+    fetch is still rejected before any connect -- consolidating to a single
+    lookup must not weaken the veto in the other direction either."""
+    calls = 0
+
+    def fake_getaddrinfo(host: str, port: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    backend = _ScriptedBackend(_MAGNET_REDIRECT_RESPONSE)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+    )
+
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://indexer.example/download/1", "/downloads", "plex-manager")
+
+    assert calls == 1
+    assert backend.hosts == []
 
 
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:

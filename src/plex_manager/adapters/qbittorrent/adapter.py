@@ -683,7 +683,17 @@ def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, 
     return origin, segments
 
 
-async def _assert_safe_fetch_url(url: str) -> None:
+def _safe_fetch_shape(url: str) -> tuple[str, int]:
+    """Validate scheme + hostname SHAPE only (no DNS) and return ``(host, port)``.
+
+    ``SafeFetchNetworkBackend.connect_tcp`` never sees the URL scheme (only a
+    host/port pair), so an unsupported scheme -- e.g. a redirect hop that left
+    http(s) -- must still be caught here, before any connection is attempted.
+    Everything DNS-shaped (resolution + the private/global address veto) is
+    deliberately NOT done here: see ``_assert_safe_fetch_url_shape`` and
+    ``_assert_safe_fetch_url`` for why the two callers need different amounts
+    of work at this point.
+    """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
@@ -699,6 +709,34 @@ async def _assert_safe_fetch_url(url: str) -> None:
         # down" 502.
         raise QbittorrentSourceError("unsupported torrent source URL")
     port = _safe_fetch_port(parsed, parsed.scheme)
+    return hostname, port
+
+
+async def _assert_safe_fetch_url_shape(url: str) -> None:
+    """Per-hop pre-check for the REAL network path: scheme/host shape only.
+
+    Used when the fetch will go through ``SafeFetchNetworkBackend``, which
+    performs the single AUTHORITATIVE DNS resolution + SSRF/rebinding pin at
+    connect time and connects to exactly the address it validated. Resolving
+    DNS again here (issue #38) would be a second, wasted lookup that buys no
+    extra safety -- the connect-time pin already independently re-validates
+    whatever IT resolves before connecting to it -- while reopening a window
+    where the two lookups could answer differently for a rebinding host.
+    """
+    _safe_fetch_shape(url)
+
+
+async def _assert_safe_fetch_url(url: str) -> None:
+    """Full per-hop pre-check: shape + DNS resolution/vetting.
+
+    Used ONLY for the ``source_client``-injected fetch path (a test seam: no
+    production caller ever passes ``source_client``). That path supplies its
+    own transport and never goes through ``SafeFetchNetworkBackend``, so this
+    is the ONLY place DNS gets resolved and vetted for it -- unlike the real
+    network path (``_assert_safe_fetch_url_shape``), collapsing this one to
+    shape-only would drop DNS vetting entirely rather than just deduplicate it.
+    """
+    hostname, port = _safe_fetch_shape(url)
     await _safe_fetch_addresses_async(hostname, port)
 
 
@@ -1114,13 +1152,22 @@ class QbittorrentClient:
 
     # ---- add ------------------------------------------------------------ #
     async def _resolve_http_source_with_client(
-        self, client: httpx.AsyncClient, url: str
+        self, client: httpx.AsyncClient, url: str, *, precheck_resolves_dns: bool
     ) -> tuple[str | None, bytes | None]:
         """Walk an HTTP(S) source to a magnet URI or ``.torrent`` body.
 
         Returns ``(magnet_uri, None)`` if a redirect leads to a magnet, or
         ``(None, torrent_bytes)`` if the URL serves a bencoded ``.torrent``.
         qBittorrent cannot follow HTTP->magnet redirects itself, hence this walk.
+
+        ``precheck_resolves_dns`` picks which per-hop pre-check runs: the real
+        network path (``client`` backed by ``_SafeFetchTransport``) passes
+        ``False`` -- DNS resolution happens exactly once per hop, authoritatively,
+        inside ``SafeFetchNetworkBackend.connect_tcp`` below. The
+        ``source_client``-injected path (test seam; no connect-time backend of
+        its own) passes ``True`` so this pre-check remains the one place that
+        resolves + vets DNS for it. See :func:`_assert_safe_fetch_url_shape` and
+        :func:`_assert_safe_fetch_url`.
         """
         current = url
         for _ in range(_REDIRECT_MAX_DEPTH):
@@ -1131,7 +1178,10 @@ class QbittorrentClient:
             # including to another private host -- re-enters the full SSRF veto on
             # its own next iteration.
             if not self._is_trusted_source_url(current):
-                await _assert_safe_fetch_url(current)
+                if precheck_resolves_dns:
+                    await _assert_safe_fetch_url(current)
+                else:
+                    await _assert_safe_fetch_url_shape(current)
             try:
                 async with client.stream("GET", current, follow_redirects=False) as response:
                     if response.is_redirect:
@@ -1210,7 +1260,13 @@ class QbittorrentClient:
 
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
         if self._source_client is not None:
-            return await self._resolve_http_source_with_client(self._source_client, url)
+            # Test seam only (never wired in production): this client's own
+            # transport is not ``_SafeFetchTransport``, so it has no connect-time
+            # DNS pin of its own -- the per-hop pre-check must do the full
+            # resolve + vet.
+            return await self._resolve_http_source_with_client(
+                self._source_client, url, precheck_resolves_dns=True
+            )
         # The connection-time backend needs the same single allowance the per-hop
         # URL check grants: the trusted origin's host may legitimately resolve to a
         # private address. (scheme is enforced at the URL level; host+port is the
@@ -1225,7 +1281,12 @@ class QbittorrentClient:
             timeout=30.0,
             trust_env=False,
         ) as client:
-            return await self._resolve_http_source_with_client(client, url)
+            # The real network path: DNS resolves exactly once per hop, inside
+            # ``SafeFetchNetworkBackend.connect_tcp``, which is also the
+            # connection's authority -- the pre-check here is shape-only.
+            return await self._resolve_http_source_with_client(
+                client, url, precheck_resolves_dns=False
+            )
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         """Add a torrent; return its lowercased info-hash + whether it was created.
