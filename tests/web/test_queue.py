@@ -316,9 +316,19 @@ def test_queue_contract_documents_manual_error_bodies(app: FastAPI) -> None:
         assert responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
             "/ErrorDetail"
         )
-        assert responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
-            "/ErrorDetail"
-        )
+        # 409 is a union (issue #291): every one of these endpoints resolves at
+        # least one required service via a NON-optional dep (qBittorrent for all
+        # three, Prowlarr for grab too) or, for mark-failed, raises
+        # ``ServiceNotConfiguredError`` directly -- so its 409 can ALSO carry the
+        # app-wide ``ServiceNotConfiguredErrorDetail`` shape, not just the plain
+        # ``ErrorDetail`` one. See tests/web/test_openapi_correction_responses.py
+        # for the dedicated per-endpoint assertions.
+        error_409_refs = {
+            entry["$ref"]
+            for entry in responses["409"]["content"]["application/json"]["schema"]["anyOf"]
+        }
+        assert any(ref.endswith("/ErrorDetail") for ref in error_409_refs)
+        assert any(ref.endswith("/ServiceNotConfiguredErrorDetail") for ref in error_409_refs)
 
 
 async def test_get_queue_is_passive_and_does_not_reconcile(

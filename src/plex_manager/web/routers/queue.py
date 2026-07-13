@@ -66,6 +66,7 @@ from plex_manager.web.schemas import (
     QueueResponse,
     QueueScope,
     SearchPreviewRequest,
+    ServiceNotConfiguredErrorDetail,
 )
 
 __all__ = ["router"]
@@ -76,9 +77,24 @@ router = APIRouter(
     dependencies=[Depends(require_admin)],
 )
 
+# Shared 404/409 map for every queue mutation endpoint below (grab -- via
+# ``_GRAB_ERROR_RESPONSES``'s spread --, import, mark-failed, relocate). The 409
+# entry's ``model`` is a union (issue #291): on top of each endpoint's own plain
+# ``HTTPException`` conflicts (``ErrorDetail``), grab/import/relocate resolve
+# qBittorrent (and grab additionally Prowlarr) via NON-optional deps, and
+# mark-failed raises ``ServiceNotConfiguredError`` directly when
+# ``remove_torrent=true`` and qBittorrent is unconfigured -- all rendered by the
+# app-wide handler as the ``service``-carrying ``ServiceNotConfiguredErrorDetail``
+# shape, not the bare ``ErrorDetail`` one. FastAPI expands a ``X | Y`` "model"
+# into an anyOf AND registers both members' component schemas, so this documents
+# ``service`` on the generated client type for every endpoint that shares this
+# map, letting a caller route the operator straight to that service's setup step.
 _QUEUE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Referenced queue resource not found"},
-    409: {"model": ErrorDetail, "description": "Queue action conflict"},
+    409: {
+        "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
+        "description": "Queue action conflict, or a required service is not configured",
+    },
 }
 
 # The grab endpoint additionally 422s with an ErrorDetail code (a missing
@@ -526,6 +542,8 @@ async def relocate_endpoint(
     the row with a newer, different reason before this call's own status write
     lands, the move was still requested but the row's message is left alone (409
     ``relocation_superseded`` — re-fetch the queue item to see the current reason).
+    Requires qBittorrent configured (409 ``service_not_configured`` otherwise,
+    issue #291).
     """
     try:
         record = await correction_service.relocate_stranded_download(
