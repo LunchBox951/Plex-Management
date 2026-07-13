@@ -759,6 +759,7 @@ async def set_status_if_in(
     status: str,
     allowed_from: frozenset[str],
     require_parent_unpinned: bool = False,
+    require_not_watchlisted: bool = False,
     tolerate_active_conflict: bool = False,
 ) -> bool:
     """Compare-and-swap ONE season's status, recomputing the parent rollup ONLY when
@@ -790,7 +791,11 @@ async def set_status_if_in(
     collides with a newer active request for the same show.
     """
     changed = await SqlSeasonRequestRepository(session).set_status_if_in(
-        season_request_id, status, allowed_from, require_parent_unpinned=require_parent_unpinned
+        season_request_id,
+        status,
+        allowed_from,
+        require_parent_unpinned=require_parent_unpinned,
+        require_not_watchlisted=require_not_watchlisted,
     )
     if changed:
         await _recompute_parent(

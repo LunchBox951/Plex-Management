@@ -369,11 +369,9 @@ export function TitleDetailModal({
   boundRequestId,
 }: TitleDetailModalProps) {
   const { toast } = useToast()
-  // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
-  // correction / keep-forever verbs all sit behind `require_admin` server-side,
-  // so exposing them would only manufacture 403 `admin_required` failures.
-  // Defaults to the restricted view until /auth/me resolves (fail closed) —
-  // mirrors AdminGate's read of the same cached query.
+  // Preview, queue, and grab remain operator tools. Request correction and pin
+  // capabilities are supplied per request by the API, so creators can manage
+  // their own rows while subscribers retain a read-only shared view.
   const auth = useAuthMe()
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const createRequest = useCreateRequest()
@@ -430,6 +428,7 @@ export function TitleDetailModal({
   // tv only: the just-created request's own per-season rollup, shown before the
   // next /requests poll lands — mirrors `createdGrabbable`'s create-then-poll gap.
   const [createdSeasons, setCreatedSeasons] = useState<SeasonStatus[] | null>(null)
+  const [createdCanMutate, setCreatedCanMutate] = useState(false)
   // tv only, read at Request time: track the whole aired series (default) or just
   // the one season named below. Irrelevant once a request exists.
   const [wholeSeries, setWholeSeries] = useState(true)
@@ -469,6 +468,7 @@ export function TitleDetailModal({
     setReboundRequestId(null)
     setCreatedGrabbable(false)
     setCreatedSeasons(null)
+    setCreatedCanMutate(false)
     setWholeSeries(true)
     setActiveSeason(null)
     setGrabbingGuid(null)
@@ -544,6 +544,9 @@ export function TitleDetailModal({
   const pinTracksFreshRequest = requestId !== null && liveRequest?.id !== requestId
   const pinRequestId = pinTracksFreshRequest ? requestId : (liveRequest?.id ?? requestId)
   const keepForever = pinTracksFreshRequest ? false : (liveRequest?.keep_forever ?? false)
+  const canMutateRequest = pinTracksFreshRequest
+    ? createdCanMutate
+    : (liveRequest?.can_mutate ?? false)
 
   // tv only: this show's per-season rollup — the live poll once it lands, else the
   // just-created request's own list (the same create-then-poll gap as
@@ -682,6 +685,7 @@ export function TitleDetailModal({
       // resolving to that dead row once the poll brings the fresh one back too.
       setReboundRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
+      setCreatedCanMutate(created.can_mutate)
       // tv only: resolve the season against `created.seasons` — the BRAND NEW list —
       // rather than `currentSeason`, which still reflects the season list from
       // BEFORE this request existed. For a whole-series request that's `null`
@@ -733,6 +737,7 @@ export function TitleDetailModal({
       // force-create equivalent of "Request again".
       setReboundRequestId(created.id)
       setCreatedSeasons(created.seasons ?? null)
+      setCreatedCanMutate(created.can_mutate)
       const grabbable = isSeasonGrabbable(created, null)
       setCreatedGrabbable(grabbable)
       setReacquireOpen(false)
@@ -963,10 +968,8 @@ export function TitleDetailModal({
   // succeed — once the import lands the title re-renders as completed or
   // import_blocked, where the correction paths reappear. An unrecognized
   // status (future backend state, or corrupt/legacy data) is likewise absent
-  // from the allowlist and fails CLOSED, not just 'importing'. Every
-  // correction verb below is admin-only server-side (`require_admin`), so each
-  // button is built only for admins — a shared user gets the request-only
-  // experience (Request / Request again + honest status), never a 403 machine.
+  // from the allowlist and fails CLOSED, not just 'importing'. Queue mark-failed
+  // remains admin-only because GET /queue is admin-only.
   const canReport = isAdmin && queueItem !== null && isMarkFailableStatus(queueItem.status)
   const reportButton =
     canReport && queueItem ? (
@@ -990,7 +993,7 @@ export function TitleDetailModal({
   // (queue mark-failed): there is no active download here, so it acts on the
   // request + selected season via the report-issue endpoint. Needs a known request.
   const reportIssueButton =
-    isAdmin && effectiveRequestId !== null ? (
+    canMutateRequest && effectiveRequestId !== null ? (
       <Button
         variant="secondary"
         onClick={() =>
@@ -1031,7 +1034,7 @@ export function TitleDetailModal({
     (s) => s.status === 'available' || s.status === 'completed',
   )
   const canCancel =
-    isAdmin &&
+    canMutateRequest &&
     liveRequest != null &&
     CANCELLABLE_STATUSES.has(liveRequest.status) &&
     !anySeasonImported
@@ -1129,10 +1132,10 @@ export function TitleDetailModal({
           >
             Open in Plex ↗<span className="sr-only"> opens in a new tab</span>
           </a>
-          {/* Re-acquire (issue #131) sits beside report-issue for a movie: a shared
-              user sees only Re-acquire (report-issue is admin-only), an admin sees
-              both; tv shows only report-issue (reacquireQuiet is null for tv —
-              per-season re-acquisition is the report-issue verb's job). */}
+          {/* Re-acquire (issue #131) sits beside report-issue for a movie. The
+              request creator (or an admin) can report; a subscriber sees only
+              Re-acquire (reacquireQuiet is null for tv — per-season
+              re-acquisition is the report-issue verb's job). */}
           {reportIssueButton}
           {reacquireQuiet}
         </>
@@ -1304,15 +1307,16 @@ export function TitleDetailModal({
           ) : null}
         </section>
 
-        {actionZone || (isAdmin && pinRequestId != null && state.kind === 'available') ? (
+        {actionZone || (canMutateRequest && pinRequestId != null && state.kind === 'available') ? (
           <section aria-labelledby="title-actions-heading" className="mt-5">
             <h3 id="title-actions-heading" className="sr-only">
               Actions
             </h3>
             <div className="flex flex-wrap items-center gap-2.5">
               {actionZone}
-              {/* Keep-forever is available only for a known, watchable pin target. */}
-              {isAdmin && pinRequestId != null && state.kind === 'available' ? (
+              {/* Keep-forever is available only for a known, watchable pin target.
+                  Creators and admins may pin; subscribers keep a read-only view. */}
+              {canMutateRequest && pinRequestId != null && state.kind === 'available' ? (
                 <label className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-xs text-muted">
                   <input
                     type="checkbox"

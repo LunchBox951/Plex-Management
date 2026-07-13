@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
@@ -35,6 +36,7 @@ from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.logsafe import safe_int
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -43,6 +45,7 @@ from plex_manager.services import (
     log_capture_service,
     queue_service,
     retention_telemetry_service,
+    watchlist_service,
 )
 from plex_manager.services.health_service import (
     AutograbStatus,
@@ -77,6 +80,8 @@ from plex_manager.web.deps import (
     get_parser,
     get_quality_profile,
     get_tv_root_optional,
+    get_watchlist_sync_enabled,
+    get_watchlist_sync_interval_minutes,
     is_setup_token_required,
     resolve_prowlarr,
     resolve_qbittorrent,
@@ -175,6 +180,106 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # the per-cycle search cap keeps the single Prowlarr from being hammered. A
 # constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
+
+
+async def _watchlist_sync_once(app: FastAPI) -> int:
+    """Synchronize every reusable account token, isolating failures per user."""
+    maker = app.state.sessionmaker
+    client = app.state.http_client
+    status = getattr(app.state, "watchlist_status", None)
+    if not isinstance(status, watchlist_service.WatchlistWorkerStatus):
+        status = watchlist_service.WatchlistWorkerStatus()
+        app.state.watchlist_status = status
+    status.mark_started()
+    async with maker() as session:
+        if not await get_watchlist_sync_enabled(session):
+            status.mark_skipped("disabled")
+            return 0
+        try:
+            tmdb = await resolve_tmdb(app.state, session, client)
+        except ServiceNotConfiguredError:
+            status.mark_skipped("not_configured")
+            return 0
+        library = await get_library_optional(session, client)
+        users = await watchlist_service.list_sync_users(session)
+
+    created = 0
+    fetched = 0
+    existing = 0
+    failed_users = 0
+    failed_entries = 0
+    last_error: str | None = None
+    for user in users:
+        token = user.encrypted_plex_token
+        if token is None:
+            continue
+        try:
+            async with maker() as session:
+                result = await watchlist_service.sync_user(
+                    session,
+                    PlexWatchlist(client, token),
+                    tmdb,
+                    user_id=user.id,
+                    library=library,
+                )
+                created += result.created
+                fetched += result.fetched
+                existing += result.existing
+                if result.failed:
+                    failed_users += 1
+                    failed_entries += result.failed
+                    last_error = "WatchlistEntryError"
+        except Exception as exc:
+            failed_users += 1
+            last_error = type(exc).__name__
+            _logger.warning(
+                "watchlist sync failed for user_id=%s (%s); retaining the previous snapshot",
+                safe_int(user.id),
+                type(exc).__name__,
+            )
+    if created:
+        publish_realtime(app, ("requests", "queue", "discover"), reason="watchlist_sync")
+    status.mark_completed(
+        fetched=fetched,
+        created=created,
+        existing=existing,
+        failed_users=failed_users,
+        failed_entries=failed_entries,
+        error=last_error,
+    )
+    return created
+
+
+async def _watchlist_sync_loop(app: FastAPI) -> None:
+    """Run watchlist synchronization independently; one bad cycle never kills it."""
+    while True:
+        try:
+            await _watchlist_sync_once(app)
+        except Exception as exc:
+            status = getattr(app.state, "watchlist_status", None)
+            if isinstance(status, watchlist_service.WatchlistWorkerStatus):
+                status.mark_error(exc)
+            _logger.exception("watchlist sync tick failed; continuing")
+        try:
+            async with app.state.sessionmaker() as session:
+                interval = await get_watchlist_sync_interval_minutes(session)
+        except Exception:
+            interval = 15.0
+        wake_event = getattr(app.state, "watchlist_wake_event", None)
+        if not isinstance(wake_event, asyncio.Event):
+            wake_event = asyncio.Event()
+            app.state.watchlist_wake_event = wake_event
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=interval * 60.0)
+        except TimeoutError:
+            # Expected, not an error: the sync interval elapsed with no manual
+            # wake signal, which simply means it is time to run the next cycle.
+            # A fired wake_event (a settings change requesting an immediate
+            # re-sync) returns normally; both paths fall through to the next
+            # loop iteration, so there is nothing to log or surface here.
+            pass
+        finally:
+            wake_event.clear()
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -1004,6 +1109,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
+    app.state.watchlist_wake_event = asyncio.Event()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
     # it survives across auto-grab ticks; a restart clears it, like the health record.
     autograb_cooldowns: auto_grab_service.CooldownRegistry = {}
@@ -1028,7 +1135,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     autograb_task = asyncio.create_task(_autograb_loop(app))
     log_drain_task = asyncio.create_task(_log_drain_loop(app))
     eviction_task = asyncio.create_task(_eviction_loop(app))
-    background_tasks = (reconcile_task, autograb_task, log_drain_task, eviction_task)
+    watchlist_task = asyncio.create_task(_watchlist_sync_loop(app))
+    background_tasks = (
+        reconcile_task,
+        autograb_task,
+        log_drain_task,
+        eviction_task,
+        watchlist_task,
+    )
     try:
         yield
     finally:

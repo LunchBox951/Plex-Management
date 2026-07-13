@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import ReconcileStatus
+from plex_manager.services.watchlist_service import WatchlistWorkerStatus
 from plex_manager.web.deps import SettingsStore
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -68,6 +69,18 @@ async def test_every_subsystem_is_honestly_not_configured_by_default(
         "last_error_at": None,
         "consecutive_failures": 0,
         "cooled_down_scopes": 0,
+    }
+    assert body["watchlist"] == {
+        "state": "starting",
+        "last_run_at": None,
+        "last_ok_at": None,
+        "last_error_type": None,
+        "last_error_at": None,
+        "fetched": 0,
+        "created": 0,
+        "existing": 0,
+        "failed_users": 0,
+        "failed_entries": 0,
     }
 
 
@@ -241,3 +254,33 @@ async def test_health_reflects_the_live_reconcile_status(
     assert reconcile["last_ok_at"] is not None
     assert reconcile["last_error_type"] is None
     assert reconcile["consecutive_failures"] == 0
+
+
+async def test_health_reflects_degraded_watchlist_status(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    worker = WatchlistWorkerStatus()
+    worker.mark_started()
+    worker.mark_completed(
+        fetched=4,
+        created=1,
+        existing=2,
+        failed_users=1,
+        failed_entries=1,
+        error="WatchlistEntryError",
+    )
+    app.state.watchlist_status = worker
+
+    response = await client.get("/api/v1/ops/health", headers=_HEADERS)
+    watchlist = response.json()["watchlist"]
+    assert watchlist["state"] == "degraded"
+    assert watchlist["last_run_at"] is not None
+    assert watchlist["last_ok_at"] is None
+    assert watchlist["last_error_type"] == "WatchlistEntryError"
+    assert watchlist["last_error_at"] is not None
+    assert watchlist["fetched"] == 4
+    assert watchlist["created"] == 1
+    assert watchlist["existing"] == 2
+    assert watchlist["failed_users"] == 1
+    assert watchlist["failed_entries"] == 1

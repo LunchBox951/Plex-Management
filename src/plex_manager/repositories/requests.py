@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, func, insert, or_, select, update
+from sqlalchemy import CursorResult, case, func, insert, literal, or_, select, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -20,7 +20,9 @@ from plex_manager.models import (
     MediaType,
     RequestDedupLock,
     RequestStatus,
+    RequestSubscriber,
     SeasonRequest,
+    WatchlistItem,
 )
 from plex_manager.ports.repositories import RequestRecord
 
@@ -134,6 +136,74 @@ class SqlRequestRepository:
     async def get(self, request_id: int) -> RequestRecord | None:
         row = await self._session.get(MediaRequest, request_id)
         return _to_record(row) if row is not None else None
+
+    async def add_subscriber(self, request_id: int, user_id: int) -> None:
+        """Idempotently grant ``user_id`` visibility of ``request_id``."""
+        values = {"request_id": request_id, "user_id": user_id}
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            stmt = pg_insert(RequestSubscriber).values(**values).on_conflict_do_nothing()
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(RequestSubscriber).values(**values).on_conflict_do_nothing()
+        else:  # pragma: no cover - supported deployments are SQLite/PostgreSQL.
+            if await self.is_subscriber(request_id, user_id):
+                return
+            stmt = insert(RequestSubscriber).values(**values)
+        await self._session.execute(stmt)
+
+    async def copy_subscribers(self, source_request_id: int, target_request_id: int) -> None:
+        """Copy every subscriber to a collapse winner without visibility loss."""
+        subscriber_select = select(literal(target_request_id), RequestSubscriber.user_id).where(
+            RequestSubscriber.request_id == source_request_id
+        )
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            stmt = (
+                pg_insert(RequestSubscriber)
+                .from_select(("request_id", "user_id"), subscriber_select)
+                .on_conflict_do_nothing()
+            )
+            await self._session.execute(stmt)
+            return
+        if dialect_name == "sqlite":
+            stmt = (
+                sqlite_insert(RequestSubscriber)
+                .from_select(("request_id", "user_id"), subscriber_select)
+                .on_conflict_do_nothing()
+            )
+            await self._session.execute(stmt)
+            return
+        user_ids = list(
+            (
+                await self._session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == source_request_id
+                    )
+                )
+            ).scalars()
+        )
+        for user_id in user_ids:  # pragma: no cover - fallback dialect only.
+            await self.add_subscriber(target_request_id, user_id)
+
+    async def is_subscriber(self, request_id: int, user_id: int) -> bool:
+        stmt = select(RequestSubscriber.request_id).where(
+            RequestSubscriber.request_id == request_id,
+            RequestSubscriber.user_id == user_id,
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def list_for_user(self, user_id: int, status: str | None = None) -> list[RequestRecord]:
+        """Return requests visible through subscriber membership."""
+        stmt = (
+            select(MediaRequest)
+            .join(RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id)
+            .where(RequestSubscriber.user_id == user_id)
+            .order_by(MediaRequest.id)
+        )
+        if status is not None:
+            stmt = stmt.where(MediaRequest.status == RequestStatus(status))
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
 
     async def get_fresh(self, request_id: int) -> RequestRecord | None:
         """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
@@ -265,12 +335,11 @@ class SqlRequestRepository:
         ``prefer_user_id`` (the per-user visibility scope — see the port
         docstring) reorders WHICH terminal row wins when several exist for the
         same media: (a) a row OWNED by that user first, then (b) an OWNERLESS
-        (claimable) row, then (c) anyone else's — newest-by-id within each rank.
+        (subscribable) row, then (c) anyone else's — newest-by-id within each rank.
         Without the preference, the newest GLOBAL row wins unconditionally, so a
         user whose own older ``available`` row is shadowed by another user's
-        newer one would be handed the foreign row — which the service can only
-        honestly reject (409) even though a perfectly returnable row of their own
-        exists. ``None`` (admins / API-key automation) keeps the plain
+        newer one would be handed a less precise foreign row even though a row of
+        their own exists. ``None`` (admins / API-key automation) keeps the plain
         newest-row-wins behavior unchanged.
         """
         stmt = select(MediaRequest).where(
@@ -477,7 +546,9 @@ class SqlRequestRepository:
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
         stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
         if for_user_id is not None:
-            stmt = stmt.where(MediaRequest.user_id == for_user_id)
+            stmt = stmt.join(
+                RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id
+            ).where(RequestSubscriber.user_id == for_user_id)
         stmt = stmt.order_by(MediaRequest.id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
@@ -737,6 +808,8 @@ class SqlRequestRepository:
         )
         self._session.add(row)
         await self._session.flush()
+        if user_id is not None:
+            await self.add_subscriber(row.id, user_id)
         await self._session.refresh(row)
         return _to_record(row)
 
@@ -770,6 +843,7 @@ class SqlRequestRepository:
         allowed_from: frozenset[str],
         *,
         require_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if the row's CURRENT persisted
         status is in ``allowed_from`` (and, with ``require_unpinned``, only if the
@@ -817,6 +891,16 @@ class SqlRequestRepository:
         ]
         if require_unpinned:
             predicates.append(MediaRequest.keep_forever.is_(False))
+        if require_not_watchlisted:
+            watchlisted = (
+                select(WatchlistItem.user_id)
+                .where(
+                    WatchlistItem.tmdb_id == MediaRequest.tmdb_id,
+                    WatchlistItem.media_type == MediaRequest.media_type,
+                )
+                .exists()
+            )
+            predicates.append(~watchlisted)
         stmt = (
             update(MediaRequest)
             .where(*predicates)
@@ -870,11 +954,9 @@ class SqlRequestRepository:
         decides: an already-owned row is left untouched (an existing owner is never
         reassigned). Returns whether a row was actually claimed.
 
-        Used on the create-dedup path so a signed-in user whose request collapses
-        onto a previously ownerless active request (e.g. one created via the
-        API-key automation path, which carries no user identity) has the request
-        show up in THEIR own list, rather than succeeding yet silently vanishing
-        behind the per-user list filter.
+        Used only by collapse/heal paths that already have a user-owned row to
+        preserve while converging onto an ownerless winner. Ordinary dedup must
+        subscribe instead; automation provenance is not unclaimed authority.
         """
         result = cast(
             CursorResult[Any],
@@ -1188,7 +1270,12 @@ class SqlRequestRepository:
         await self._session.flush()
 
     async def set_keep_forever_for_title(
-        self, tmdb_id: int, media_type: str, keep_forever: bool
+        self,
+        tmdb_id: int,
+        media_type: str,
+        keep_forever: bool,
+        *,
+        restrict_to_user_id: int | None = None,
     ) -> None:
         """See ``RequestRepository.set_keep_forever_for_title``'s docstring: pins
         or unpins EVERY row sharing ``(tmdb_id, media_type)``, not just one.
@@ -1199,10 +1286,13 @@ class SqlRequestRepository:
         request's ``keep_forever`` protects (``eviction_service.
         _season_candidates`` reads the pin off each season's OWN parent, which
         may be a different, settled row than the one the operator toggled from
-        the UI). ``synchronize_session="fetch"`` keeps any already-loaded
-        identity-map instance for this title (e.g. the caller's own ``get``
-        moments earlier, in the SAME session/transaction) in sync with the
-        DB, mirroring ``set_status_if_in``'s same discipline.
+        the UI). When ``restrict_to_user_id`` is given, the update additionally
+        filters ``user_id = ?`` so a non-admin caller only ever touches their
+        OWN rows and can never flip another user's eviction protection.
+        ``synchronize_session="fetch"`` keeps any already-loaded identity-map
+        instance for this title (e.g. the caller's own ``get`` moments earlier,
+        in the SAME session/transaction) in sync with the DB, mirroring
+        ``set_status_if_in``'s same discipline.
         """
         stmt = (
             update(MediaRequest)
@@ -1213,5 +1303,7 @@ class SqlRequestRepository:
             .values(keep_forever=keep_forever)
             .execution_options(synchronize_session="fetch")
         )
+        if restrict_to_user_id is not None:
+            stmt = stmt.where(MediaRequest.user_id == restrict_to_user_id)
         await self._session.execute(stmt)
         await self._session.flush()

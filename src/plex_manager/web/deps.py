@@ -76,6 +76,7 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.services.watchlist_service import WatchlistWorkerStatus
 from plex_manager.web.errors import AppError
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
@@ -111,6 +112,8 @@ __all__ = [
     "SECRET_SETTING_KEYS",
     "SESSION_COOKIE_NAME",
     "SETUP_TOKEN_HEADER_NAME",
+    "WATCHLIST_SYNC_ENABLED_DEFAULT",
+    "WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT",
     "AuthContext",
     "AuthMethod",
     "DiskPressurePercents",
@@ -154,6 +157,9 @@ __all__ = [
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
+    "get_watchlist_status",
+    "get_watchlist_sync_enabled",
+    "get_watchlist_sync_interval_minutes",
     "hash_session_token",
     "is_setup_token_required",
     "load_system_settings",
@@ -171,6 +177,7 @@ __all__ = [
     "resolve_prowlarr",
     "resolve_qbittorrent",
     "resolve_tmdb",
+    "resolve_watchlist_sync_interval_minutes",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -261,6 +268,8 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # north-star #1 "turn this bot off with a button, never a terminal" switch. The
     # manual Grab button stays the override regardless.
     "auto_grab_enabled",
+    "watchlist_sync_enabled",
+    "watchlist_sync_interval_minutes",
     # Anime library routing (ADR-0015): two OPTIONAL roots, mirroring tv_root's
     # optional treatment exactly. Unset ⇒ anime imports fall back to
     # movies_root/tv_root, i.e. identical behavior to before this feature
@@ -678,6 +687,14 @@ def get_autograb_status(request: Request) -> AutograbStatus:
     if not isinstance(current, AutograbStatus):
         current = AutograbStatus()
         request.app.state.autograb_status = current
+    return current
+
+
+def get_watchlist_status(request: Request) -> WatchlistWorkerStatus:
+    current = getattr(request.app.state, "watchlist_status", None)
+    if not isinstance(current, WatchlistWorkerStatus):
+        current = WatchlistWorkerStatus()
+        request.app.state.watchlist_status = current
     return current
 
 
@@ -1494,6 +1511,8 @@ LOG_MAX_ROWS_DEFAULT: int = 100_000
 # Auto-grab worker (ADR-0013): the background request->search->grab loop runs by
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
+WATCHLIST_SYNC_ENABLED_DEFAULT: bool = True
+WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT: float = 15.0
 
 # Upper bounds for the three settings above that feed directly into a sleep
 # duration or a timedelta cutoff (issue #92) live in ``web.settings_bounds``,
@@ -1700,6 +1719,27 @@ def resolve_eviction_interval_minutes(raw: str | None) -> tuple[float, bool]:
             EVICTION_INTERVAL_MINUTES_DEFAULT,
         )
         return EVICTION_INTERVAL_MINUTES_DEFAULT, False
+    return parsed, True
+
+
+def resolve_watchlist_sync_interval_minutes(raw: str | None) -> tuple[float, bool]:
+    """Resolve the watchlist polling interval to a safe finite weekly maximum."""
+    if raw is None:
+        return WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None or parsed <= 0:
+        _logger.warning(
+            "setting 'watchlist_sync_interval_minutes' is invalid; using default %s",
+            WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+        )
+        return WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT, False
+    if parsed > EVICTION_INTERVAL_MAX_MINUTES:
+        _logger.warning(
+            "setting 'watchlist_sync_interval_minutes' is %s, above %s; clamping",
+            parsed,
+            EVICTION_INTERVAL_MAX_MINUTES,
+        )
+        return EVICTION_INTERVAL_MAX_MINUTES, False
     return parsed, True
 
 
@@ -1940,5 +1980,21 @@ async def get_auto_grab_enabled(session: AsyncSession) -> bool:
         "auto_grab_enabled",
         await SettingsStore(session).get("auto_grab_enabled"),
         AUTO_GRAB_ENABLED_DEFAULT,
+    )
+    return value
+
+
+async def get_watchlist_sync_enabled(session: AsyncSession) -> bool:
+    value, _honored = resolve_bool_setting(
+        "watchlist_sync_enabled",
+        await SettingsStore(session).get("watchlist_sync_enabled"),
+        WATCHLIST_SYNC_ENABLED_DEFAULT,
+    )
+    return value
+
+
+async def get_watchlist_sync_interval_minutes(session: AsyncSession) -> float:
+    value, _honored = resolve_watchlist_sync_interval_minutes(
+        await SettingsStore(session).get("watchlist_sync_interval_minutes")
     )
     return value

@@ -1155,13 +1155,17 @@
             },
             "title": "Subsystems",
             "type": "array"
+          },
+          "watchlist": {
+            "$ref": "#/components/schemas/WatchlistStatusItem"
           }
         },
         "required": [
           "subsystems",
           "disks",
           "reconcile",
-          "autograb"
+          "autograb",
+          "watchlist"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -1948,6 +1952,11 @@
             ],
             "title": "Backdrop Url"
           },
+          "can_mutate": {
+            "default": false,
+            "title": "Can Mutate",
+            "type": "boolean"
+          },
           "download_progress": {
             "anyOf": [
               {
@@ -2598,6 +2607,28 @@
               }
             ],
             "title": "Tv Root"
+          },
+          "watchlist_sync_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Enabled"
+          },
+          "watchlist_sync_interval_minutes": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Interval Minutes"
           }
         },
         "title": "SettingsResponse",
@@ -2848,6 +2879,30 @@
               }
             ],
             "title": "Tv Root"
+          },
+          "watchlist_sync_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Enabled"
+          },
+          "watchlist_sync_interval_minutes": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 10080.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Interval Minutes"
           }
         },
         "title": "SettingsUpdate",
@@ -3132,6 +3187,99 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WatchlistStatusItem": {
+        "properties": {
+          "created": {
+            "default": 0,
+            "title": "Created",
+            "type": "integer"
+          },
+          "existing": {
+            "default": 0,
+            "title": "Existing",
+            "type": "integer"
+          },
+          "failed_entries": {
+            "default": 0,
+            "title": "Failed Entries",
+            "type": "integer"
+          },
+          "failed_users": {
+            "default": 0,
+            "title": "Failed Users",
+            "type": "integer"
+          },
+          "fetched": {
+            "default": 0,
+            "title": "Fetched",
+            "type": "integer"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "ok",
+              "degraded",
+              "disabled",
+              "not_configured",
+              "error"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "WatchlistStatusItem",
         "type": "object"
       }
     },
@@ -4456,16 +4604,6 @@
             },
             "description": "Media not found"
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
-                }
-              }
-            },
-            "description": "Already requested by another user"
-          },
           "422": {
             "content": {
               "application/json": {
@@ -4635,7 +4773,7 @@
     },
     "/api/v1/requests/{request_id}/keep-forever": {
       "post": {
-        "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op.",
+        "description": "Set or clear the operator's \"keep forever\" pin (ADR-0012).\n\nThe north-star #1 correction path for \"don't let the eviction sweep touch\nthis one\": a pinned title (or, for a show, every one of its seasons -- the\npin lives on the parent) is never selected by ``domain/eviction.py``\nregardless of watch state or disk pressure. A 404 for an unknown id, never\na silent no-op. Open to the request's creator or an admin; a non-admin only\never moves their own rows, never another user's eviction protection.",
         "operationId": "keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post",
         "parameters": [
           {

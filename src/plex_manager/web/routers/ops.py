@@ -57,7 +57,7 @@ from plex_manager.domain.disk_usage import used_percent
 from plex_manager.logsafe import redact_known_secrets, redact_secrets
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
-from plex_manager.services import eviction_service
+from plex_manager.services import eviction_service, watchlist_service
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
     SUBSYSTEM_CACHE_KEYS,
@@ -88,6 +88,7 @@ from plex_manager.web.deps import (
     get_reconcile_status,
     get_session,
     get_tv_root_optional,
+    get_watchlist_status,
     require_admin,
 )
 from plex_manager.web.events import publish_realtime
@@ -107,6 +108,7 @@ from plex_manager.web.schemas import (
     LogsTailResponse,
     ReconcileStatusItem,
     SubsystemHealthItem,
+    WatchlistStatusItem,
 )
 
 __all__ = ["router"]
@@ -140,6 +142,9 @@ async def health_endpoint(
     cache: Annotated[TtlCache[SubsystemHealth], Depends(get_health_cache)],
     reconcile_status: Annotated[ReconcileStatus, Depends(get_reconcile_status)],
     autograb_status: Annotated[AutograbStatus, Depends(get_autograb_status)],
+    watchlist_status: Annotated[
+        watchlist_service.WatchlistWorkerStatus, Depends(get_watchlist_status)
+    ],
 ) -> HealthResponse:
     """One read: per-subsystem reachability, disk gauges, and the reconcile +
     auto-grab loops' own health. Each upstream probe is TTL-cached (~15s) so
@@ -223,6 +228,18 @@ async def health_endpoint(
             last_error_at=snapshot.autograb.last_error_at,
             consecutive_failures=snapshot.autograb.consecutive_failures,
             cooled_down_scopes=snapshot.autograb.cooled_down_scopes,
+        ),
+        watchlist=WatchlistStatusItem(
+            state=watchlist_status.state,
+            last_run_at=watchlist_status.last_run_at,
+            last_ok_at=watchlist_status.last_ok_at,
+            last_error_type=watchlist_status.last_error_type,
+            last_error_at=watchlist_status.last_error_at,
+            fetched=watchlist_status.fetched,
+            created=watchlist_status.created,
+            existing=watchlist_status.existing,
+            failed_users=watchlist_status.failed_users,
+            failed_entries=watchlist_status.failed_entries,
         ),
     )
 

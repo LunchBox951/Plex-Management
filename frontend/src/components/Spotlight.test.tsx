@@ -83,6 +83,7 @@ function requestResponse(status: RequestResponse['status'] = 'pending'): Request
     status,
     is_anime: false,
     keep_forever: false,
+    can_mutate: true,
   }
 }
 

@@ -687,7 +687,8 @@ export interface paths {
          *     this one": a pinned title (or, for a show, every one of its seasons -- the
          *     pin lives on the parent) is never selected by ``domain/eviction.py``
          *     regardless of watch state or disk pressure. A 404 for an unknown id, never
-         *     a silent no-op.
+         *     a silent no-op. Open to the request's creator or an admin; a non-admin only
+         *     ever moves their own rows, never another user's eviction protection.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
         delete?: never;
@@ -1751,6 +1752,7 @@ export interface components {
             reconcile: components["schemas"]["ReconcileStatusItem"];
             /** Subsystems */
             subsystems: components["schemas"]["SubsystemHealthItem"][];
+            watchlist: components["schemas"]["WatchlistStatusItem"];
         };
         /**
          * KeepForeverBody
@@ -2125,6 +2127,11 @@ export interface components {
         RequestResponse: {
             /** Backdrop Url */
             backdrop_url?: string | null;
+            /**
+             * Can Mutate
+             * @default false
+             */
+            can_mutate: boolean;
             /** Download Progress */
             download_progress?: number | null;
             /** Id */
@@ -2337,6 +2344,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SettingsUpdate
@@ -2409,6 +2420,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SetupCompleteRequest
@@ -2527,6 +2542,47 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** WatchlistStatusItem */
+        WatchlistStatusItem: {
+            /**
+             * Created
+             * @default 0
+             */
+            created: number;
+            /**
+             * Existing
+             * @default 0
+             */
+            existing: number;
+            /**
+             * Failed Entries
+             * @default 0
+             */
+            failed_entries: number;
+            /**
+             * Failed Users
+             * @default 0
+             */
+            failed_users: number;
+            /**
+             * Fetched
+             * @default 0
+             */
+            fetched: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
         };
     };
     responses: never;
@@ -3269,15 +3325,6 @@ export interface operations {
             };
             /** @description Media not found */
             404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
-                };
-            };
-            /** @description Already requested by another user */
-            409: {
                 headers: {
                     [name: string]: unknown;
                 };
