@@ -19,7 +19,13 @@ Every endpoint here is read-only or an idempotent operator action; none of them
 ever return a secret (subsystem ``detail`` strings and log messages carry
 whatever a call site already chose to log — see ``log_capture_service``'s
 module docstring on why that discipline lives upstream of this router, not in
-it).
+it). Both durable-store READ boundaries — ``GET /logs`` and ``GET /logs/export``
+— re-apply ``logsafe.redact_secrets`` to every persisted message as a second,
+independent redaction pass (issue #153): capture-time redaction only covers rows
+this build wrote through ``log_capture_service``, so a pre-upgrade row or a
+direct repository write is masked consistently at BOTH read boundaries, not just
+on export. (``GET /logs/tail`` reads the in-memory ring buffer, which is written
+only by the already-redacting capture path, so it needs no second pass.)
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.logsafe import redact_secrets
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service
@@ -241,7 +248,11 @@ async def list_logs_endpoint(
                 created_at=r.created_at,
                 level=r.level,
                 logger=r.logger,
-                message=r.message,
+                # Second redaction pass on the durable read (issue #153): capture-
+                # time redaction only covers rows THIS build wrote; a pre-upgrade
+                # row or a direct repository write is masked here just as it is on
+                # /logs/export, so both durable-read boundaries are secret-safe.
+                message=redact_secrets(r.message),
                 context=r.context,
             )
             for r in page.results
@@ -317,6 +328,14 @@ async def export_logs_endpoint(
     ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
     straight to this URL downloads a file; a caller reading the body via
     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+
+    Every message is passed through :func:`~plex_manager.logsafe.
+    redact_secrets` again here (issue #153) as a SECOND, independent line of
+    defense on top of the capture-time pass (``log_capture_service._capture``)
+    -- this is the boundary the blueprint explicitly calls out ("the log store
+    never records a secret"), and a row written before this redaction pass
+    existed, or by any future path that bypasses the capture pipeline, must
+    still never leave this endpoint carrying one.
     """
     repo = SqlLogEventRepository(session)
     if correlation_id is not None:
@@ -344,7 +363,7 @@ async def export_logs_endpoint(
                     created_at=e.created_at,
                     level=e.level,
                     logger=e.logger,
-                    message=e.message,
+                    message=redact_secrets(e.message),
                     context=e.context,
                 )
                 for e in events
@@ -352,7 +371,10 @@ async def export_logs_endpoint(
         )
         return JSONResponse(content=body.model_dump(mode="json"), headers=headers)
 
-    lines = [f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {e.message}" for e in events]
+    lines = [
+        f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: {redact_secrets(e.message)}"
+        for e in events
+    ]
     if truncated:
         dropped = page.total - len(page.results)
         lines.append(

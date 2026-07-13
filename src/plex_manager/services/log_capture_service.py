@@ -25,8 +25,10 @@ three pieces:
    (via ``drain_once``'s ``handler`` argument) so that counter stays honest
    about EVERY INFO+ record that missed durable storage, not just a full queue.
 3. A **retention sweep** (:func:`prune_once`) deletes ``log_events`` rows older
-   than the web-editable ``log_retention_days`` setting, keeping the table's
-   growth bounded.
+   than the web-editable ``log_retention_days`` setting, AND (issue #152)
+   beyond the web-editable ``log_max_rows`` row-count cap -- keeping the
+   table's growth bounded even for a chatty install running a generous
+   retention window, where the age cutoff alone would never trip.
 
 :func:`configure_logging` wires ``config.log_level`` (previously defined but
 never applied) to the root logger's effective level.
@@ -34,8 +36,14 @@ never applied) to the root logger's effective level.
 Never a secret-bearing pipeline: call sites are responsible for never logging a
 credential (the existing discipline throughout ``adapters``/``services`` already
 follows this — e.g. every adapter error message names a status code or exception
-type, never a raw URL/token/password). This module only carries whatever a call
-site already chose to log; it does not (and cannot) redact after the fact.
+type, never a raw URL/token/password). That discipline is the FIRST line of
+defense; as of issue #153 this module also applies a conservative,
+key-name-driven redaction pass (:func:`~plex_manager.logsafe.redact_secrets`)
+to every captured message as DEFENSE IN DEPTH — see that function's docstring
+for the exact secret shapes covered. This closes the gap a purely
+call-site-driven discipline cannot: a message assembled elsewhere (a
+third-party library's own log line, a forgotten call site) that happens to
+carry one of this app's real secret shapes.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
+from plex_manager.logsafe import redact_secrets
 from plex_manager.ports.repositories import LOG_EVENT_CORRELATION_KEYS, LogEventCreate
 
 if TYPE_CHECKING:
@@ -250,10 +259,21 @@ def _capture(record: logging.LogRecord) -> CapturedLogRecord:
     attached exception (``logger.exception(...)`` / ``exc_info=True``) has its
     traceback appended — the LLM-diagnosis affordance (Component 2) needs the
     full trace, not just the one-line message, to actually explain a failure.
+
+    The fully-rendered message (args merged, traceback appended) is then run
+    through :func:`~plex_manager.logsafe.redact_secrets` (issue #153) — AFTER
+    merging so a secret split across a format string and its args (e.g.
+    ``logger.info("token=%s", token)``) is still caught, since only the
+    merged result actually contains ``token=<value>`` as one contiguous
+    string. This is the ONE place every captured record passes through
+    (both the ring-buffer live tail and the durable-store queue read from
+    this same :class:`CapturedLogRecord`), so redaction happens exactly once,
+    upstream of both destinations.
     """
     message = record.getMessage()
     if record.exc_info:
         message = f"{message}\n{_EXC_FORMATTER.formatException(record.exc_info)}"
+    message = redact_secrets(message)
     return CapturedLogRecord(
         created_at=datetime.fromtimestamp(record.created, tz=UTC),
         level=record.levelname,
@@ -578,7 +598,9 @@ async def drain_once(
     return len(batch)
 
 
-async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
+async def prune_once(
+    repo: LogEventRepository, retention_days: int, *, max_rows: int | None = None
+) -> int:
     """Delete every stale ``log_events`` row -- TWO separate cutoffs, TWO deletes.
 
     Every logger EXCEPT the telemetry loggers (:data:`_TELEMETRY_LOGGERS`: the
@@ -604,7 +626,18 @@ async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     reverse) is the half-treatment bug class this coupling prevents. See
     :data:`TELEMETRY_LOGGER_NAME`'s docstring for the retention-window rationale.
 
-    Returns the total rows removed across both deletes. ``retention_days <= 0``
+    Then (issue #152) a THIRD, total, level/logger-agnostic delete: when
+    ``max_rows`` is given (not ``None``), :meth:`~plex_manager.ports.
+    repositories.LogEventRepository.prune_excess` deletes the OLDEST rows
+    beyond that row-count cap — the age cutoffs above alone leave
+    ``log_events`` unbounded in row COUNT for a chatty install running a
+    generous ``retention_days``, since age-based pruning never trips until a
+    row is actually stale. ``max_rows=None`` (the default) skips this pass
+    entirely — a caller that only wants the age-based sweep (most existing
+    tests, and any future caller with no row-cap policy to hand it) sees
+    unchanged behaviour.
+
+    Returns the total rows removed across all deletes. ``retention_days <= 0``
     is treated as "keep nothing older than now" rather than skipped for the
     ordinary cutoff — an operator who deliberately sets it to 0 gets the honest
     behaviour, not a silently ignored setting; the telemetry cutoff still holds
@@ -618,4 +651,6 @@ async def prune_once(repo: LogEventRepository, retention_days: int) -> int:
     pruned += await repo.prune_older_than(
         telemetry_cutoff, loggers=_TELEMETRY_LOGGERS, exclude_loggers=False
     )
+    if max_rows is not None:
+        pruned += await repo.prune_excess(max_rows)
     return pruned
