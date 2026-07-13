@@ -188,6 +188,11 @@ per the key-half rules above) back into the volume, remove any stale
 leftover WAL frames belong to whatever database was running most recently
 (likely a newer one) and SQLite replays them on open, which can silently
 reintroduce the very data/schema you are trying to roll back away from.
+If you copied the files from the host as root (typical for named-volume
+restores), also restore ownership — the image runs the app as the non-root
+`appuser` (UID 10001), which must be able to *write* the database and *read*
+the key: `chown 10001:10001 plex_manager.db secret.key` (keep the key at mode
+0600).
 
 **PostgreSQL deployment:** `pg_dump` backs up the database only — the Fernet
 key is never in Postgres. Where the key half lives depends on your deployment:

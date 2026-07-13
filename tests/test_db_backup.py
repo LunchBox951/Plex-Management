@@ -629,6 +629,91 @@ def test_partial_backup_is_not_published_on_failure(
         assert not any(n.startswith(".tmp-") for n in names), names
 
 
+def test_sqlite_uri_form_database_url_is_backed_up(tmp_path: Path) -> None:
+    """Finding: SQLAlchemy's SQLite URI form must resolve to the real file.
+
+    With ``sqlite+aiosqlite:///file:/abs/path.db?uri=true``, ``make_url()``
+    leaves ``url.database`` as the literal string ``file:/abs/path.db``.
+    Treating that as a filesystem path points at a nonexistent ``file:...``
+    name, so the hook logged "No existing database" and URI-style deployments
+    silently got NO pre-migration backup. The path must be extracted from the
+    SQLite URI the same way SQLite itself does.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "plex_manager.db"
+    settings = Settings(
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+        data_dir=str(data_dir),
+        database_url=f"sqlite+aiosqlite:///file:{db_path}?uri=true",
+    )
+    old_rev = _real_old_rev()
+    _stamp_db(db_path, old_rev)
+    _write_key(data_dir)
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
+    assert result.name.startswith(f"pre-migrate-{old_rev}-")
+    copied = sqlite3.connect(f"file:{result / 'plex_manager.db'}?mode=ro", uri=True)
+    try:
+        row = copied.execute("SELECT version_num FROM alembic_version").fetchone()
+    finally:
+        copied.close()
+    assert row is not None
+    assert row[0] == old_rev
+
+
+def test_sqlite_file_path_resolves_uri_forms(tmp_path: Path) -> None:
+    """_sqlite_file_path unwraps SQLite ``file:`` URIs and rejects memory DBs."""
+
+    def resolve(database_url: str) -> Path | None:
+        settings = Settings(
+            _env_file=None,  # pyright: ignore[reportCallIssue]
+            data_dir=str(tmp_path),
+            database_url=database_url,
+        )
+        return db_backup._sqlite_file_path(settings)  # pyright: ignore[reportPrivateUsage]
+
+    # URI form: the path is what SQLite would open, not the literal file:... string.
+    assert resolve("sqlite+aiosqlite:///file:/app/data/plex.db?uri=true") == Path(
+        "/app/data/plex.db"
+    )
+    # Percent-escaped characters in the URI path decode exactly as SQLite does.
+    assert resolve("sqlite+aiosqlite:///file:/app/data/plex%3Fmanager.db?uri=true") == Path(
+        "/app/data/plex?manager.db"
+    )
+    # In-memory databases have no file to back up, in any spelling.
+    assert resolve("sqlite+aiosqlite:///:memory:") is None
+    assert resolve("sqlite+aiosqlite:///file::memory:?uri=true") is None
+    assert resolve("sqlite+aiosqlite:///file:memdb1?mode=memory&cache=shared&uri=true") is None
+    # The plain (non-URI) forms are untouched.
+    assert resolve("sqlite+aiosqlite:////abs/plex.db") == Path("/abs/plex.db")
+    assert resolve("postgresql+asyncpg://u:p@localhost/pm") is None
+
+
+def test_manifest_instructs_restoring_ownership_for_container_user(tmp_path: Path) -> None:
+    """Finding: host-side (root) restores must be told to chown back to appuser.
+
+    The image runs the app as non-root UID 10001; a root-owned database can't
+    be written and a root-owned 0600 key can't be read, so a restore performed
+    from the host as root bricks the rolled-back install. The generated runbook
+    must carry the ownership step.
+    """
+    settings = _settings(tmp_path)
+    data_dir = Path(settings.data_dir)
+    _stamp_db(data_dir / "plex_manager.db", _real_old_rev())
+    _write_key(data_dir)
+
+    result = db_backup.create_pre_migration_backup(settings)
+
+    assert result is not None
+    manifest = (result / "MANIFEST.txt").read_text(encoding="utf-8")
+    assert "OWNERSHIP" in manifest
+    assert "10001" in manifest
+    assert "chown" in manifest
+
+
 def test_current_revision_none_only_for_missing_alembic_table(tmp_path: Path) -> None:
     """A genuinely unstamped/legacy DB (no ``alembic_version`` table) reads as base.
 

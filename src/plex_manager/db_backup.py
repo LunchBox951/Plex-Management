@@ -44,7 +44,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from sqlalchemy.engine import make_url
 
@@ -73,16 +73,39 @@ _UNKNOWN_HEAD: Final = "__unknown__"
 
 
 def _sqlite_file_path(settings: Settings) -> Path | None:
-    """Return the on-disk SQLite file path, or ``None`` for a non-SQLite backend.
+    """Return the on-disk SQLite file path, or ``None`` when there is none.
+
+    ``None`` means "no on-disk SQLite database file to snapshot": a non-SQLite
+    backend, or an in-memory SQLite database.
 
     Uses SQLAlchemy's URL parser rather than hand-stripping a ``sqlite:///``
     prefix so both absolute (``sqlite:////abs/path.db``) and relative
-    (``sqlite:///./data/plex_manager.db``) URLs resolve correctly.
+    (``sqlite:///./data/plex_manager.db``) URLs resolve correctly. SQLAlchemy's
+    SQLite **URI form** (``sqlite:///file:/abs/path.db?uri=true``) is also
+    handled: there the ``database`` component is itself a SQLite ``file:`` URI
+    whose path SQLite percent-decodes before opening -- treating it as a
+    literal filesystem path would point at a nonexistent ``file:...`` name, so
+    the backup hook would log "No existing database" and silently skip the one
+    pre-migration snapshot the deployment relies on. The path is therefore
+    extracted from the URI (and percent-decoded) exactly as SQLite itself does.
     """
     url = make_url(sync_database_url(settings.database_url))
-    if url.get_backend_name() != "sqlite" or url.database is None:
+    if url.get_backend_name() != "sqlite" or not url.database:
         return None
-    return Path(url.database)
+    database = url.database
+    if database.startswith("file:"):
+        # SQLAlchemy keeps its own query separate (``uri=true``, ``mode=...``
+        # land in ``url.query``), but honour a memory-mode param wherever it
+        # appears: there is no file to back up for an in-memory database.
+        if url.query.get("mode") == "memory":
+            return None
+        parsed = urlsplit(database)
+        if "memory" in parse_qs(parsed.query).get("mode", []):
+            return None
+        database = unquote(parsed.path)
+    if not database or database == ":memory:":
+        return None
+    return Path(database)
 
 
 def _sqlite_ro_uri(path: Path) -> str:
@@ -345,12 +368,20 @@ Restore steps:
      just restored; SQLite replays them on open, which can silently
      reintroduce the newer schema/data you are trying to roll back away from.
 {key_restore}
-  5. Re-point the deployment at the older image tag that matches this
+  5. Restore file OWNERSHIP if you copied the files from the host (typically
+     as root, for Docker named-volume restores): the official image runs the
+     app as the non-root user `appuser` (UID 10001), which must be able to
+     WRITE the database file and READ the key. Root-owned copies leave the
+     restored install unable to write its own database (or read its key):
+       chown 10001:10001 {_DB_COPY_NAME}          # and secret.key, if restored
+     (keep secret.key at mode 0600; adjust the UID if your deployment
+     overrides the container user).
+  6. Re-point the deployment at the older image tag that matches this
      database revision (same-schema rollback: just re-point; cross-migration
      rollback: this backup unit IS the recovery path -- see ADR-0021).
-  6. Start the container and verify: sign in, and confirm a stored credential
+  7. Start the container and verify: sign in, and confirm a stored credential
      (e.g. a configured service) still decrypts correctly.
-  7. Move this backup directory out of <data_dir>/backups/ (keep it as an
+  8. Move this backup directory out of <data_dir>/backups/ (keep it as an
      archive elsewhere). At most ONE backup is kept per from-revision -- so a
      failed migration's restart loop cannot bury the clean snapshot under
      partially-migrated retries -- which means a future upgrade attempt from
@@ -433,8 +464,9 @@ def create_pre_migration_backup(settings: Settings | None = None) -> Path | None
     db_path = _sqlite_file_path(settings)
     if db_path is None:
         logger.info(
-            "Non-SQLite database configured; automatic pre-migration file backup "
-            "is not performed. Snapshot the database AND the encryption key "
+            "No on-disk SQLite database file (non-SQLite backend, or an "
+            "in-memory database); automatic pre-migration file backup is not "
+            "performed. Snapshot the database AND the encryption key "
             "externally before upgrades (see ADR-0021 / README Backup & recovery)."
         )
         return None
