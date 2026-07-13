@@ -832,6 +832,9 @@ class UpdateCoordinatorState(Base):
     last_error_code: Mapped[str | None] = mapped_column(String(128))
     last_from_build: Mapped[str | None] = mapped_column(String(255))
     last_to_build: Mapped[str | None] = mapped_column(String(255))
+    # Receipt for idempotently accepting a retried outcome after the original
+    # response was lost. This is a one-way SHA-256 digest, never the lease token.
+    last_outcome_token_hash: Mapped[str | None] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

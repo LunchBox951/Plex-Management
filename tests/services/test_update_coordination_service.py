@@ -153,6 +153,22 @@ async def test_drain_blocks_new_work_until_existing_critical_lease_releases(
     assert snapshot.last_to_build == "build-new"
     assert snapshot.current_build == "build-new"
     assert snapshot.acknowledged_generation == generation
+    # Lost-response recovery: the exact same acknowledgement is idempotent even
+    # though the first commit deleted the drain lease.
+    assert await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.success,
+        from_build="build-old",
+        to_build="build-new",
+        current_build="build-new",
+        current_digest="sha256:new",
+    )
+    assert not await service.acknowledge_outcome(
+        drain.lease.token,
+        expected_generation=generation,
+        result=UpdateResult.failed,
+    )
     assert await service.release(drain.lease.token) is False
 
 

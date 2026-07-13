@@ -50,6 +50,7 @@ def upgrade() -> None:
         sa.Column("last_error_code", sa.String(length=128), nullable=True),
         sa.Column("last_from_build", sa.String(length=255), nullable=True),
         sa.Column("last_to_build", sa.String(length=255), nullable=True),
+        sa.Column("last_outcome_token_hash", sa.String(length=64), nullable=True),
         sa.Column(
             "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),

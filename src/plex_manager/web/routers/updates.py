@@ -38,7 +38,7 @@ __all__ = ["internal_router", "router"]
 _UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
 _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
-_DRAIN_TTL = timedelta(seconds=60)
+_DRAIN_TTL = timedelta(minutes=10)
 
 router = APIRouter(
     prefix="/api/v1/updates",
@@ -99,7 +99,9 @@ def _last_result(snapshot: CoordinatorSnapshot) -> UpdateResultItem | None:
     if outcome is None:
         return None
     operation: Literal["check", "install"] = (
-        "install" if outcome in {"succeeded", "rolled_back"} else "check"
+        "install"
+        if snapshot.last_from_build is not None or snapshot.last_to_build is not None
+        else "check"
     )
     return UpdateResultItem(
         operation=operation,
@@ -132,8 +134,11 @@ def _state_and_blocker(
         return "failed", snapshot.last_error_code or "update_rolled_back"
     if snapshot.phase == "succeeded":
         return "succeeded", None
-    if snapshot.requested_action == "install" and snapshot.active_critical_operations:
-        return "waiting_for_idle", "active_critical_work"
+    if snapshot.requested_action == "install":
+        if policy.idle_only and snapshot.active_critical_operations:
+            return "waiting_for_idle", "active_critical_work"
+        if snapshot.available_digest is not None:
+            return "update_available", None
     if snapshot.available_digest is not None:
         if policy.schedule.enabled and not policy.schedule.is_open(now):
             return "waiting_for_window", "outside_update_window"

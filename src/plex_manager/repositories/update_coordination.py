@@ -400,7 +400,17 @@ class SqlUpdateCoordinationRepository:
         await self._cleanup_expired(now)
         drain = await self._lease_for_token(token_hash, "drain")
         if drain is None:
-            return False
+            # The acknowledgement transaction may have committed while its HTTP
+            # response was lost during container cutover. Accept only the exact
+            # token+outcome receipt; a changed retry remains a conflict.
+            generation_matches = (
+                expected_generation is None or state.acknowledged_generation == expected_generation
+            )
+            return (
+                generation_matches
+                and state.last_outcome_token_hash == token_hash
+                and state.last_result == result
+            )
         if expected_generation is not None and (
             drain.action_generation != expected_generation
             or state.action_generation != expected_generation
@@ -414,6 +424,7 @@ class SqlUpdateCoordinationRepository:
             "last_error_code": error_code,
             "last_from_build": from_build,
             "last_to_build": to_build,
+            "last_outcome_token_hash": token_hash,
             "last_completed_at": now,
             "updated_at": now,
         }
