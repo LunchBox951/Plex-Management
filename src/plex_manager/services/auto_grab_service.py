@@ -92,6 +92,7 @@ from plex_manager.services.grab_service import (
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
+    TorrentRemovalInFlightError,
 )
 from plex_manager.services.log_capture_service import AUTO_GRAB_TELEMETRY_LOGGER_NAME
 
@@ -692,10 +693,17 @@ async def _attempt_episode_fallback(
             await session.commit()
             cooldowns.pop(scope_key, None)
             return _EpisodeFallbackOutcome(settled=True, grabbed=True, searched=True)
-        except (AlreadyDownloadingError, RequestNotActiveError, SeasonRequiredError) as exc:
+        except (
+            AlreadyDownloadingError,
+            RequestNotActiveError,
+            SeasonRequiredError,
+            TorrentRemovalInFlightError,
+        ) as exc:
             # Same posture as the Pass-1 loop: a scope-level concurrency/shape
             # refusal, not a per-release one -- trying another candidate cannot
-            # help, so settle without parking.
+            # help, so settle without parking. ``TorrentRemovalInFlightError``
+            # (#206) is transient/self-resolving -- a concurrent cancel's removal --
+            # so the scope is simply retried a later cycle, by when it has settled.
             await session.rollback()
             cooldowns.pop(scope_key, None)
             _logger.warning(
@@ -1144,16 +1152,21 @@ async def run_grab_cycle(
                 AlreadyDownloadingError,
                 RequestNotActiveError,
                 SeasonRequiredError,
+                TorrentRemovalInFlightError,
             ) as exc:
                 # Concurrency/shape cases that apply to the SCOPE, not this one
                 # release, so trying another candidate cannot help and the scope will
                 # NOT be re-selected next cycle: ``AlreadyDownloadingError`` -> the
                 # scope now has an active download and is skipped BEFORE it costs a
-                # search; the two others -> the scope is terminal / mis-shaped and out
-                # of ``DUE_SEARCH_STATUSES`` (or rejected up front). Discard any
-                # partial write, settle the scope (no park, no further candidates,
-                # no error), and leave its state as-is -- never a crash of the whole
-                # cycle, never a secret in the log.
+                # search; the next two -> the scope is terminal / mis-shaped and out
+                # of ``DUE_SEARCH_STATUSES`` (or rejected up front);
+                # ``TorrentRemovalInFlightError`` (#206) -> a concurrent cancel's
+                # removal is mid-flight for this same hash, transient and
+                # self-resolving -- the scope stays due and is retried next cycle,
+                # by when the removal has settled. Discard any partial write, settle
+                # the scope (no park, no further candidates, no error), and leave
+                # its state as-is -- never a crash of the whole cycle, never a
+                # secret in the log.
                 await session.rollback()
                 park_scope = False
                 # Resolved some other way (now downloading, terminal, or mis-shaped):

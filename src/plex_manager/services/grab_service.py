@@ -35,7 +35,7 @@ from plex_manager.models import (
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import season_request_service
+from plex_manager.services import queue_service, season_request_service
 from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
@@ -53,6 +53,7 @@ __all__ = [
     "RequestNotActiveError",
     "SeasonRequiredError",
     "TorrentAlreadyTrackedError",
+    "TorrentRemovalInFlightError",
     "grab",
 ]
 
@@ -195,6 +196,24 @@ class TorrentAlreadyTrackedError(Exception):
         super().__init__(f"torrent {torrent_hash} is already tracked by request {owner_request_id}")
 
 
+class TorrentRemovalInFlightError(Exception):
+    """The terminal row's torrent is being removed right now — refuse to reuse it (#206).
+
+    A concurrent ``cancel_request`` (or a reconcile-driven failure) has claimed this
+    download's torrent removal as in flight. Resurrecting the terminal row would
+    re-own a torrent whose data is mid-deletion, so the fresh grab would lose its
+    payload the instant the removal completes. Surfaced (HTTP 409
+    ``removal_in_progress``), never a silent reuse: refuse and let the request retry —
+    by the next attempt the removal has settled (the torrent is gone, so a fresh add
+    creates a new one, or, on a removal failure, its data is intact and reuse is safe).
+    """
+
+    def __init__(self, torrent_hash: str, download_id: int) -> None:
+        self.torrent_hash = torrent_hash
+        self.download_id = download_id
+        super().__init__(f"torrent {torrent_hash} (download {download_id}) is being removed; retry")
+
+
 async def _reuse_terminal_row(
     session: AsyncSession,
     download_repo: SqlDownloadRepository,
@@ -209,6 +228,8 @@ async def _reuse_terminal_row(
     episodes: list[int] | None,
     media_type: str | None,
     release_title: str | None,
+    qbt: DownloadClientPort,
+    actually_added: bool,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -268,6 +289,27 @@ async def _reuse_terminal_row(
     ``import_blocked`` on the very next outage instead of getting its own
     honest bound.
     """
+    # #206: refuse to resurrect a terminal row whose torrent is being removed right
+    # now (a concurrent cancel's post-commit delete, a reconcile-driven removal, or an
+    # operator mark-failed's in-flight delete). Re-owning it would hand this request a
+    # torrent whose data is mid-deletion. Checked here so BOTH reuse call sites (the
+    # post-add ``existing`` branch and the post-add UNIQUE-conflict branch) are covered
+    # in one place; a synchronous read of the in-process registry, no await between it
+    # and the CAS below. Both call sites reach here AFTER ``qbt.add`` (the known-hash
+    # precheck refuses before adding), so a torrent THIS grab genuinely created for a
+    # hash qBittorrent had dropped mid-removal (``actually_added``) would be left
+    # seeding untracked once we refuse — remove it (WITH data, since it is ours and
+    # orphaned) before raising. A pre-existing torrent (``actually_added=False``) is
+    # left in place by ``_remove_torrent_if_added``: it predates this grab.
+    if queue_service.removal_in_flight(download_id):
+        await _remove_torrent_if_added(
+            qbt,
+            torrent_hash,
+            actually_added=actually_added,
+            request_id=request_id,
+            reason="the terminal row's torrent is being removed",
+        )
+        raise TorrentRemovalInFlightError(torrent_hash, download_id)
     now = datetime.now(UTC)
     claimed = await download_repo.update_status_if_in(
         download_id,
@@ -623,6 +665,19 @@ async def grab(
     known_hash = candidate.info_hash.lower() if candidate.info_hash else None
     if known_hash is not None:
         pre = await download_repo.get_by_hash(known_hash)
+        # #206 (pre-add): the indexer gave us the hash up front, so if it maps to a
+        # TERMINAL row whose torrent is being removed right now (a racing cancel /
+        # reconcile / operator delete), refuse BEFORE ``qbt.add`` ever runs. Deferring
+        # to the post-add reuse guard would first re-create a fresh torrent for a hash
+        # qBittorrent has already dropped (``add_result.created=True``) and then refuse
+        # it, orphaning that torrent to seed untracked while the old data finishes
+        # deleting. Caught here, nothing is added; by retry the removal has settled.
+        if (
+            pre is not None
+            and pre.status in _TERMINAL_STATUS_VALUES
+            and queue_service.removal_in_flight(pre.id)
+        ):
+            raise TorrentRemovalInFlightError(known_hash, pre.id)
         if pre is not None and pre.status not in _TERMINAL_STATUS_VALUES:
             if request_id is not None and pre.media_request_id != request_id:
                 raise TorrentAlreadyTrackedError(known_hash, pre.media_request_id)
@@ -744,6 +799,8 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
                 release_title=candidate.title,
+                qbt=qbt,
+                actually_added=actually_added,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:
@@ -876,6 +933,8 @@ async def grab(
                 episodes=episodes,
                 media_type=request_media_type,
                 release_title=candidate.title,
+                qbt=qbt,
+                actually_added=actually_added,
             )
             if not claimed_reuse:
                 if record.status not in _TERMINAL_STATUS_VALUES:
