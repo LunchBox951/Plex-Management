@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from plex_manager.domain.quality_profile import QualityProfile
 from plex_manager.domain.release import ScoredRelease
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.models import DownloadScopeStatus
+from plex_manager.models import DownloadScopeStatus, RequestStatus
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -20,6 +20,7 @@ from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.ports.repositories import DownloadRecord, QueueRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     correction_service,
     grab_service,
@@ -188,7 +189,10 @@ async def grab_endpoint(
     if request is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
 
-    if request.status in request_service.TERMINAL_REQUEST_STATUS_VALUES:
+    if (
+        request.media_type != "tv"
+        and request.status in request_service.TERMINAL_REQUEST_STATUS_VALUES
+    ):
         # A stale TERMINAL request id (completed / available / failed) is not
         # grabbable: a newer ACTIVE request for the same media owns the
         # uq_media_requests_active slot. Reject up front — BEFORE run_preview can
@@ -196,6 +200,21 @@ async def grab_endpoint(
         # non-terminal dead-end no_acceptable_release (which would resurrect it as
         # a dedup-blocking ghost), and before grab can hand anything to the client.
         # Mirrors grab_service's RequestNotActiveError guard so both paths agree.
+        #
+        # MOVIE-ONLY: for a TV request, ``request.status`` is not this request's
+        # own state -- it is ``season_rollup.rollup_status``'s COMPUTED fold over
+        # every tracked season (see grab_service.grab's matching guard for the
+        # full rationale). A still-finalizing season (``completed``, issue #265)
+        # wins that fold outright over a genuinely due sibling, and ``completed``
+        # is ALSO in ``TERMINAL_REQUEST_STATUS_VALUES`` -- gating here on the
+        # coarse rollup would 409 a legitimate per-season grab (issue #272
+        # review). grab_service's own season-scoped guard (cancelled /
+        # waiting_for_air_date / a stale caller premise) is season-precise where
+        # this coarse check never was, and still runs for every tv grab below.
+        # But skipping the terminal gate ENTIRELY for tv (issue #287) let a
+        # wholly-terminal TV row slip into the empty-preview parking path below;
+        # the dedicated, season-scoped TV terminal gate just after the media-type
+        # validation restores that guarantee here too.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
     # Branch on the request's ACTUAL media type, never on whether ``body.season``
@@ -220,6 +239,33 @@ async def grab_endpoint(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
         )
+
+    # TV terminal gate (issue #287): the up-front guard above is MOVIE-ONLY on
+    # purpose -- a TV ``request.status`` is season_rollup's COMPUTED fold, not a
+    # real state, so gating the coarse rollup unconditionally would 409 a season
+    # that is genuinely due behind a still-finalizing ``completed`` sibling (issue
+    # #272). But skipping the terminal check ENTIRELY for tv let a wholly-terminal
+    # TV row (e.g. an old available/evicted request for an untracked season) slip
+    # into the empty-preview parking path below, where
+    # ``season_request_service.mark_no_acceptable_release`` ``ensure``s the
+    # untracked season as ``pending`` and recomputes the parent rollup to a
+    # non-terminal dead-end -- resurrecting a settled TV request as a
+    # dedup-blocking ghost, the very guarantee restored at grab's own qbt.add
+    # gate. Apply that SAME season-scoped gate here, BEFORE run_preview can reach
+    # the parking path: read this season's decision-time status (an untracked
+    # season reads ``pending``, exactly what ``mark_no_acceptable_release`` would
+    # ``ensure`` it as) and refuse unless it is genuinely due.
+    if request.media_type == "tv" and body.season is not None:
+        season_rows = await SqlSeasonRequestRepository(session).list_for_request(request.id)
+        observed_season_status = next(
+            (row.status for row in season_rows if row.season_number == body.season),
+            RequestStatus.pending.value,
+        )
+        if grab_service.tv_grab_blocked_by_terminal_parent(
+            parent_status=request.status,
+            observed_season_status=observed_season_status,
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
 
     effective_episodes = stored_episodes_for_request(
         request,
