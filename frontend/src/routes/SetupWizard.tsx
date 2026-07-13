@@ -28,6 +28,20 @@ import { useToast } from '../components/ui/toast'
  */
 type WizardStep = 'signin' | 'server' | 'services' | 'libraries' | 'done'
 
+// The query param the startup log line's ready-to-click URL carries (issue #65):
+// `Setup: http://<host>:<port>/setup?setup_token=<token>`. Reading it here lets
+// an operator follow that ONE link from `docker logs` straight into a filled-in
+// token field, instead of hunting `PLEX_MANAGER_SETUP_TOKEN` across
+// env/compose/scrollback and hand-typing it.
+const SETUP_TOKEN_QUERY_PARAM = 'setup_token'
+
+/** The trimmed `?setup_token=` value from the current URL, or `null` if absent/blank. */
+function setupTokenFromLocation(): string | null {
+  const raw = new URLSearchParams(window.location.search).get(SETUP_TOKEN_QUERY_PARAM)
+  const trimmed = raw?.trim()
+  return trimmed ? trimmed : null
+}
+
 /** Ordered setup copy used by both the shell and its contract tests. */
 // eslint-disable-next-line react-refresh/only-export-components -- tests import the canonical step contract.
 export const WIZARD_STEPS: ReadonlyArray<{
@@ -222,7 +236,28 @@ export function SetupWizard() {
   // getSetupToken() keeps the gate's source of truth aligned with what is actually
   // transmitted, and the token section (rendered on every step below) still lets a
   // fresh tab, whose per-tab sessionStorage is empty, (re)enter it.
-  const [setupTokenInput, setSetupTokenInput] = useState(() => getSetupToken() ?? '')
+  //
+  // A `?setup_token=` in THIS load's URL (issue #65's logged link) wins over the
+  // persisted value: it's what the operator just clicked, and is the freshest
+  // source of truth for a fresh tab that has no sessionStorage entry yet.
+  const [setupTokenInput, setSetupTokenInput] = useState(
+    () => setupTokenFromLocation() ?? getSetupToken() ?? '',
+  )
+
+  // Persist a URL-supplied token (mirrors the manual-entry path below) and strip
+  // it from the visible address bar once consumed — a bootstrap secret has no
+  // business lingering in browser history / a copy-pasted URL, and the field
+  // above already carries it forward for the rest of the wizard. Runs once on
+  // mount; nothing reactive is read besides stable imports.
+  useEffect(() => {
+    const fromUrl = setupTokenFromLocation()
+    if (!fromUrl) return
+    setSetupToken(fromUrl)
+    const url = new URL(window.location.href)
+    url.searchParams.delete(SETUP_TOKEN_QUERY_PARAM)
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+  }, [])
+
   // Reveal a typed override instead of the Plex pick-list (split-mount / odd layout).
   const [manualPath, setManualPath] = useState(false)
   const [manualTvPath, setManualTvPath] = useState(false)
@@ -733,6 +768,14 @@ function SetupTokenField({ value, onChange }: { value: string; onChange: (value:
           autoComplete="off"
           value={value}
           onChange={(event) => onChange(event.target.value)}
+          hint={
+            <>
+              Set as <code>PLEX_MANAGER_SETUP_TOKEN</code> on the server (your{' '}
+              <code>.env</code> / compose environment). On startup, the server also prints a
+              ready-to-click <code>Setup: http://…/setup?setup_token=…</code> line to{' '}
+              <code>docker logs</code> — following that link fills this field in for you.
+            </>
+          }
         />
       </div>
     </section>

@@ -14,6 +14,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Literal, cast
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, FastAPI
@@ -30,7 +31,7 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings
+from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.repositories.log_events import SqlLogEventRepository
@@ -52,6 +53,7 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
+    configured_setup_token,
     ensure_system_settings,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
@@ -75,6 +77,7 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_tmdb,
     get_tv_root_optional,
+    is_setup_token_required,
     resolve_qbittorrent,
 )
 from plex_manager.web.errors import install_error_handlers
@@ -806,6 +809,37 @@ async def _adapter_error_handler(request: Request, exc: Exception) -> Response:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
+# Bind addresses a browser can never dial directly (Docker's default
+# ``PLEX_MANAGER_HOST=0.0.0.0`` chief among them). The startup setup-URL hint
+# (issue #65) substitutes ``localhost`` for these, the same convention Jupyter's
+# own "copy this URL" hint uses for the identical reason -- the operator maps the
+# container's published port to a reachable host themselves via
+# ``docker-compose.yml``/``-p``, so the app has no way to know that host itself.
+_UNDIALABLE_BIND_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", ""})  # noqa: S104
+
+
+def _setup_ready_url(settings: Settings) -> str:
+    """Build the Jupyter-notebook-style "click to finish setup" URL (issue #65).
+
+    Always points at ``/setup`` -- the wizard's actual mounted route -- rather
+    than the bare origin: a bare ``/`` would bounce through ``SetupGate``'s
+    client-side redirect to ``/setup`` first, and that redirect does not carry
+    the query string along, silently dropping the token before the wizard ever
+    saw it. ``?setup_token=`` is appended ONLY when a token is both configured
+    and actually enforced (:func:`is_setup_token_required` already folds in
+    ``dev_auth_bypass`); an unset/bypassed token has nothing to disclose. This is
+    a discoverability aid only (ADR-0005's install-time exception) -- it changes
+    nothing about what the wizard accepts, only how easy the URL is to find.
+    """
+    host = settings.host if settings.host not in _UNDIALABLE_BIND_HOSTS else "localhost"
+    url = f"http://{host}:{settings.port}/setup"
+    if is_setup_token_required():
+        token = configured_setup_token()
+        if token:
+            url = f"{url}?setup_token={quote(token, safe='')}"
+    return url
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Prepare persistence + encryption, then share an HTTP client for adapters.
@@ -840,6 +874,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
     app.state.log_handler = log_handler
+    if not initialized:
+        # One ready-to-click line an operator can follow straight from
+        # ``docker logs`` instead of hunting ``PLEX_MANAGER_SETUP_TOKEN`` across
+        # env/compose/scrollback (issue #65). Logged after ``configure_logging``
+        # so it also lands in the in-app log viewer, not just the console.
+        _logger.info("Setup: %s", _setup_ready_url(get_settings()))
     # The background reconciler closes the request -> grab -> import -> available
     # loop without a GET /queue poll having to do the heavy work. The auto-grab
     # worker (ADR-0013) is what turns a fresh request INTO a grab in the first
