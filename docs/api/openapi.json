@@ -4256,11 +4256,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Grab Endpoint Api V1 Queue Grab Post"
                 }
               }
             },
-            "description": "Queue action conflict"
+            "description": "Queue action conflict, or a required service is not configured"
           },
           "422": {
             "content": {
@@ -4335,11 +4343,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Import Endpoint Api V1 Queue  Download Id  Import Post"
                 }
               }
             },
-            "description": "Queue action conflict"
+            "description": "Queue action conflict, or a required service is not configured"
           },
           "422": {
             "content": {
@@ -4427,11 +4443,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Mark Failed Endpoint Api V1 Queue  Download Id  Mark Failed Post"
                 }
               }
             },
-            "description": "Queue action conflict"
+            "description": "Queue action conflict, or a required service is not configured"
           },
           "422": {
             "content": {
@@ -4461,7 +4485,7 @@
     },
     "/api/v1/queue/{download_id}/relocate": {
       "post": {
-        "description": "Operator correction: relocate an import-blocked, path-invisible download\ninto the mounted downloads root (issues #133/#157).\n\nScoped to EXACTLY the honest \"download path not visible inside the\ncontainer\" block (409 ``not_relocatable`` for any other row/reason). qBittorrent\nmoves content asynchronously -- this call only REQUESTS the move and returns; the\noperator retries the import (``POST /queue/{id}/import``, already retryable \u2014\n``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:\nonly ever relocates INTO the app's own derived downloads root (409\n``downloads_root_unavailable`` when that root cannot be derived \u2014 bare metal, no\nDocker split), never an arbitrary path. If a concurrent Retry Import re-blocks\nthe row with a newer, different reason before this call's own status write\nlands, the move was still requested but the row's message is left alone (409\n``relocation_superseded`` \u2014 re-fetch the queue item to see the current reason).",
+        "description": "Operator correction: relocate an import-blocked, path-invisible download\ninto the mounted downloads root (issues #133/#157).\n\nScoped to EXACTLY the honest \"download path not visible inside the\ncontainer\" block (409 ``not_relocatable`` for any other row/reason). qBittorrent\nmoves content asynchronously -- this call only REQUESTS the move and returns; the\noperator retries the import (``POST /queue/{id}/import``, already retryable \u2014\n``import_blocked`` is a resumable state) once qBittorrent settles it. Root-guarded:\nonly ever relocates INTO the app's own derived downloads root (409\n``downloads_root_unavailable`` when that root cannot be derived \u2014 bare metal, no\nDocker split), never an arbitrary path. If a concurrent Retry Import re-blocks\nthe row with a newer, different reason before this call's own status write\nlands, the move was still requested but the row's message is left alone (409\n``relocation_superseded`` \u2014 re-fetch the queue item to see the current reason).\nRequires qBittorrent configured (409 ``service_not_configured`` otherwise,\nissue #291).",
         "operationId": "relocate_endpoint_api_v1_queue__download_id__relocate_post",
         "parameters": [
           {
@@ -4499,11 +4523,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Relocate Endpoint Api V1 Queue  Download Id  Relocate Post"
                 }
               }
             },
-            "description": "Queue action conflict"
+            "description": "Queue action conflict, or a required service is not configured"
           },
           "422": {
             "content": {
@@ -4889,12 +4921,16 @@
                     },
                     {
                       "$ref": "#/components/schemas/ErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
                     }
-                  ]
+                  ],
+                  "title": "Response 409 Report Issue Endpoint Api V1 Requests  Request Id  Report Issue Post"
                 }
               }
             },
-            "description": "Not reportable in its current state, an active duplicate exists, or the title's library folder isn't reachable from the app"
+            "description": "Not reportable in its current state, an active duplicate exists, the title's library folder isn't reachable from the app, or a required service (Plex/qBittorrent/Prowlarr) is not configured"
           },
           "422": {
             "content": {

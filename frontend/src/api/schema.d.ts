@@ -571,6 +571,8 @@ export interface paths {
          *     the row with a newer, different reason before this call's own status write
          *     lands, the move was still requested but the row's message is left alone (409
          *     ``relocation_superseded`` — re-fetch the queue item to see the current reason).
+         *     Requires qBittorrent configured (409 ``service_not_configured`` otherwise,
+         *     issue #291).
          */
         post: operations["relocate_endpoint_api_v1_queue__download_id__relocate_post"];
         delete?: never;
@@ -3102,13 +3104,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Queue action conflict */
+            /** @description Queue action conflict, or a required service is not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation error, missing request descriptor, or season mismatch */
@@ -3151,13 +3153,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Queue action conflict */
+            /** @description Queue action conflict, or a required service is not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -3203,13 +3205,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Queue action conflict */
+            /** @description Queue action conflict, or a required service is not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -3252,13 +3254,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Queue action conflict */
+            /** @description Queue action conflict, or a required service is not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -3500,13 +3502,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Not reportable in its current state, an active duplicate exists, or the title's library folder isn't reachable from the app */
+            /** @description Not reportable in its current state, an active duplicate exists, the title's library folder isn't reachable from the app, or a required service (Plex/qBittorrent/Prowlarr) is not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"];
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation error, or a tv request reported without a season */
