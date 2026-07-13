@@ -1265,6 +1265,96 @@ def test_delete_guard_refuses_mirrors_platform_capability_refusal(
     assert breadcrumb.exists()  # nothing was deleted
 
 
+def test_delete_refuses_dotdot_path_that_normalization_would_retarget(
+    tmp_path: Path,
+) -> None:
+    """Codex P1: ``realpath`` collapses ``Gone/..`` LEXICALLY when ``Gone`` does
+    not exist -- POSIX lookup of ``/root/Gone/../Other`` is ENOENT, yet the
+    normalized guarded location names the live sibling ``/root/Other`` (and a
+    ``..`` LEAF names the parent directory itself, i.e. the whole root). Acting
+    on the normalized location would therefore delete an entry the supplied
+    path does not name. Non-normalized paths must be refused outright -- by
+    ``delete`` (raised) and ``delete_guard_refuses`` (True) alike."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    other = root / "Other"
+    other.mkdir()
+    survivor = other / "movie.mkv"
+    survivor.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    dotdot_sibling = f"{os.fspath(root)}{os.sep}Gone{os.sep}..{os.sep}Other"
+    dotdot_leaf = f"{os.fspath(root)}{os.sep}Gone{os.sep}.."  # collapses to the root
+    dot_component = f"{os.fspath(root)}{os.sep}.{os.sep}Other"
+
+    for malformed in (dotdot_sibling, dotdot_leaf, dot_component):
+        assert fs.delete_guard_refuses(malformed) is True
+        with pytest.raises(LocalFileSystemError, match="refusing to delete"):
+            fs.delete(malformed)
+
+    assert survivor.read_bytes() == b"x" * 100  # the collapsed-onto sibling survives
+    assert root.is_dir()  # and so does the root a '..' leaf collapses onto
+
+
+def test_delete_refuses_trailing_slash_that_would_dereference_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: for ``/root/link.mkv/`` the basename is EMPTY, so the guarded
+    entry location is built from ``realpath('/root/link.mkv')`` -- which
+    dereferences the symlink -- and the walk would unlink the link's TARGET
+    while the caller named the link (POSIX refuses ``link/`` with ENOTDIR).
+    An empty final component must be refused outright, leaving both the link
+    entry and its target untouched."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Other Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+    link = root / "link.mkv"
+    os.symlink(target, link)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    slashed = os.fspath(link) + os.sep
+
+    assert fs.delete_guard_refuses(slashed) is True
+    with pytest.raises(LocalFileSystemError, match="refusing to delete"):
+        fs.delete(slashed)
+
+    assert link.is_symlink()  # the link entry survives
+    assert target.read_bytes() == b"x" * 100  # and its target was never unlinked
+
+
+def test_delete_traverses_execute_only_ancestors_like_pathname_unlink(
+    tmp_path: Path,
+) -> None:
+    """Codex P2: plain pathname ``unlink`` needs only SEARCH (execute)
+    permission on ancestors, but an ``O_RDONLY`` fd walk would demand READ on
+    every one of them and spuriously EACCES on a locked-down, execute-only
+    mount parent -- a path ``delete_guard_refuses`` reports as evictable. The
+    walk opens ancestors with ``O_PATH`` (search-only) where available, so a
+    breadcrumb under an execute-only ancestor still deletes."""
+    if not hasattr(os, "O_PATH"):
+        pytest.skip("requires O_PATH (Linux) for search-only ancestor traversal")
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    locked = tmp_path / "locked"
+    root = locked / "movies"
+    target = root / "Some Movie (2020)" / "movie.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])  # realpath'd while readable
+    # S103 suppressed deliberately: the execute-only mask IS the scenario under
+    # test, applied to a throwaway dir inside this test's private tmp_path.
+    os.chmod(locked, 0o111)  # noqa: S103 -- execute-only: search yes, read no
+    try:
+        assert fs.delete_guard_refuses(os.fspath(target)) is False
+        fs.delete(os.fspath(target))
+        assert not target.exists()
+    finally:
+        os.chmod(locked, 0o755)  # noqa: S103 -- restore so pytest can clean tmp_path
+
+
 # --------------------------------------------------------------------------- #
 # reclaimable_bytes — hardlink-aware freed-bytes accounting (R4-6, ADR-0012)
 # --------------------------------------------------------------------------- #

@@ -203,6 +203,19 @@ def _open_parent_nofollow(start_dir: str, components: list[str], original_path: 
     which would re-resolve through a swapped ancestor and hand back a DIFFERENT
     real path than the one already checked.
 
+    Ancestors are opened with ``O_PATH`` where the platform provides it (Linux):
+    an ``O_PATH`` descriptor requires only SEARCH (execute) permission on the
+    directory -- matching what plain pathname ``unlink`` demands of ancestors --
+    where ``O_RDONLY`` would demand READ permission on every ancestor and
+    spuriously ``EACCES`` on a locked-down, execute-only mount parent. The
+    no-follow guarantee is preserved: ``O_PATH | O_NOFOLLOW | O_DIRECTORY`` on a
+    swapped-in symlink fails ``ENOTDIR`` (the ``O_PATH | O_NOFOLLOW`` fd would
+    refer to the link itself, which is not a directory) -- still a surfaced
+    refusal, never a traversal -- and an ``O_PATH`` fd is valid as the ``dir_fd``
+    of the ``openat``/``fstatat``/``unlinkat`` family this walk and its caller
+    use. Without ``O_PATH`` the walk falls back to ``O_RDONLY`` (read permission
+    on ancestors -- the pre-existing requirement on such platforms).
+
     Returns the parent directory's fd (the caller must ``os.close`` it), or
     ``None`` when an intermediate ancestor no longer exists at all -- an
     idempotent no-op, matching :meth:`LocalFileSystem.delete`'s existing
@@ -211,13 +224,14 @@ def _open_parent_nofollow(start_dir: str, components: list[str], original_path: 
     walked here, so an ENOENT anywhere along it, including at the root's own
     parent, is caught, not raised).
     """
-    dir_fd = os.open(start_dir, os.O_RDONLY | os.O_DIRECTORY)
+    open_mode = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY
+    dir_fd = os.open(start_dir, open_mode)
     try:
         for component in components[:-1]:
             try:
                 next_fd = os.open(
                     component,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    open_mode | os.O_NOFOLLOW,
                     dir_fd=dir_fd,
                 )
             except FileNotFoundError:
@@ -502,8 +516,27 @@ class LocalFileSystem:
         descends to ``entry_location`` -- it does NOT need the matched root itself,
         which is why only these two values are returned. See :meth:`resolve_guarded`
         for the two-check rationale (issue #141).
+
+        A ``path`` containing a ``.`` or ``..`` component, or ending in a
+        separator (an empty final component), is REFUSED outright rather than
+        normalized. Normalizing here and acting on the normalized location is
+        NOT equivalent to what the supplied path names: ``realpath`` collapses
+        ``Gone/..`` LEXICALLY when ``Gone`` does not exist (POSIX lookup of the
+        original path would be ENOENT, yet the collapsed path names a live
+        sibling -- or, for a ``..`` leaf, the parent directory itself), and a
+        trailing separator on a symlink-to-file makes ``realpath(dirname)``
+        resolve THROUGH the link so the walk would target the link's TARGET
+        while the caller named the link (POSIX would refuse ``link/`` with
+        ENOTDIR). Our own pipeline only ever stores normalized absolute paths,
+        so such a breadcrumb is malformed input -- refused loudly (fails
+        closed), never silently retargeted.
         """
         if not path:
+            return None
+        parts = path.split(os.sep)
+        if parts[-1] in ("", os.curdir, os.pardir) or any(
+            part in (os.curdir, os.pardir) for part in parts
+        ):
             return None
         entry_dir = os.path.dirname(path) or "."
         entry_location = os.path.join(os.path.realpath(entry_dir), os.path.basename(path))
@@ -548,8 +581,10 @@ class LocalFileSystem:
            /etc/passwd``): its entry location passes check 1, but its resolved
            target fails check 2.
 
-        Fails CLOSED on either check -- an empty ``path``, or no configured
-        roots, returns ``None``.
+        Fails CLOSED on either check -- an empty ``path``, a non-normalized
+        ``path`` (a ``.``/``..`` component or a trailing separator, which
+        resolution could silently retarget -- see :meth:`_guarded_resolution`),
+        or no configured roots, returns ``None``.
         """
         resolution = self._guarded_resolution(path)
         return None if resolution is None else resolution[1]
@@ -587,7 +622,12 @@ class LocalFileSystem:
         always, RAISED as :class:`LocalFileSystemError` rather than silently
         skipped: eviction must never be able to reach outside a configured
         library root, and a caller passing a wrong path is a bug worth surfacing
-        loudly even if that wrong path happens not to exist.
+        loudly even if that wrong path happens not to exist. A NON-NORMALIZED
+        ``path`` (a ``.``/``..`` component or a trailing separator) is the same
+        loud refusal: resolution would silently retarget it onto a DIFFERENT
+        entry than the one POSIX lookup of the supplied string names (see
+        :meth:`_guarded_resolution`), and our pipeline only ever stores
+        normalized absolute paths, so such a breadcrumb is malformed input.
 
         ``path`` is resolved EXACTLY ONCE (via :meth:`_guarded_resolution`), and
         the removal below never re-resolves ``path`` through a SECOND pathname
@@ -649,7 +689,8 @@ class LocalFileSystem:
         resolution = self._guarded_resolution(path)
         if resolution is None:
             raise LocalFileSystemError(
-                f"refusing to delete {path!r}: outside every configured library root"
+                f"refusing to delete {path!r}: outside every configured library root "
+                "(or not a normalized path)"
             )
         entry_location, _real = resolution
         # Anchor the no-follow walk at the process filesystem root, NOT at
