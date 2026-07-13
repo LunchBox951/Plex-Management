@@ -2030,6 +2030,46 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
     expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
   })
 
+  it('never says a presence-only owned movie is "not in the library"', () => {
+    // Owned per Plex with no request row (the Re-acquire path, issue #131):
+    // the State sentence must agree with the Re-acquire action the modal
+    // simultaneously offers, not claim the title is absent from the library.
+    setBaseMocks()
+    render(
+      <TitleDetailModal
+        title={{ ...MOVIE, library_state: 'available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+    const stateRegion = screen.getByRole('region', { name: 'State' })
+    expect(
+      within(stateRegion).getByText(
+        'In the library, but not tracked by a request. Re-acquire it if its file is missing or was replaced.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Not in the library and not requested.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Re-acquire' })).toBeInTheDocument()
+  })
+
+  it('describes partial presence honestly for an untracked TV title', () => {
+    // No Re-acquire mention for tv (the verb is movie-only); presence is still
+    // stated truthfully, and "+ Request" remains the offered action.
+    setBaseMocks()
+    render(
+      <TitleDetailModal
+        title={{ ...TV, library_state: 'partially_available' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+    expect(
+      screen.getByText('Partly in the library, but not tracked by a request.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/not in the library and not requested/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '+ Request' })).toBeInTheDocument()
+  })
+
   it('never claims "no search run yet" while release search is closed', () => {
     // Downloading: a search DID run (its grab is why we're downloading) and the
     // browser is deliberately shut — the copy must say that, not "no search yet".

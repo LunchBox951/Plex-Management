@@ -256,11 +256,24 @@ function statePresentation(state: DerivedState): StatusPresentation {
 function stateSentence(
   state: DerivedState,
   mediaType: DiscoverResult['media_type'],
+  libraryState: DiscoverResult['library_state'],
   currentSeason: number | null,
   queueItem: QueueItem | null,
 ): string {
   switch (state.kind) {
     case 'none':
+      // Presence without a tracked request (issue #131): the discovery
+      // projection says Plex owns this title even though no request row exists
+      // (added out-of-band, or rows pruned). Never claim it is "not in the
+      // library" — for a movie the actions zone simultaneously offers
+      // Re-acquire BECAUSE it is owned, and the copy must agree with it.
+      if (libraryState === 'available' || libraryState === 'partially_available') {
+        const presence =
+          libraryState === 'partially_available' ? 'Partly in the library' : 'In the library'
+        return mediaType === 'movie'
+          ? `${presence}, but not tracked by a request. Re-acquire it if its file is missing or was replaced.`
+          : `${presence}, but not tracked by a request.`
+      }
       return 'Not in the library and not requested.'
     case 'pending':
       return 'Your request is queued and will be searched automatically.'
@@ -1059,7 +1072,13 @@ export function TitleDetailModal({
   const progressLabel = `Download progress for ${title.title}${
     title.media_type === 'tv' ? `, season ${currentSeason ?? 1}` : ''
   }`
-  const statusCopy = stateSentence(state, title.media_type, currentSeason, queueItem)
+  const statusCopy = stateSentence(
+    state,
+    title.media_type,
+    title.library_state,
+    currentSeason,
+    queueItem,
+  )
 
   return (
     <Dialog
