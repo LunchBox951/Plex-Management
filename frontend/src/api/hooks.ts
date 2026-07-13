@@ -312,9 +312,13 @@ export function usePlexLibraries(enabled = true) {
 
 /* --------------------------------------------------------------- discover -- */
 
-export function useDiscoverHome() {
+export function useDiscoverHome(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.discoverHome,
+    // Callers that mount on every authenticated route (the header search
+    // overlay) gate this on visibility so /discover/home's TMDB fan-out only
+    // runs when its data can actually be seen. Discover itself passes nothing.
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<DiscoverHomeResponse> =>
       unwrap(await client.GET('/api/v1/discover/home')),
   })
@@ -336,10 +340,13 @@ export function useDiscoverSearch(query: string, year?: number) {
 
 /* --------------------------------------------------------------- requests -- */
 
-export function useRequests(options?: { poll?: boolean }) {
+export function useRequests(options?: { poll?: boolean; enabled?: boolean }) {
   const realtimeConnected = useRealtimeConnected()
   return useQuery({
     queryKey: queryKeys.requests,
+    // Observers behind a closed surface (the header search overlay) disable
+    // themselves entirely; they read the shared cache when they wake up.
+    enabled: options?.enabled ?? true,
     queryFn: async (): Promise<RequestListResponse> => unwrap(await client.GET('/api/v1/requests')),
     // Two-tier: fast cadence when the stream is down, a slow floor (never off)
     // when it is up — the permanent safety net against a zombie stream.
