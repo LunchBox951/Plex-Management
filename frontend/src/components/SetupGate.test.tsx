@@ -2,7 +2,7 @@ import { act, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { AUTH_EXPIRED_EVENT, AUTH_INVALID_EVENT } from '../api/client'
+import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { queryKeys } from '../lib/queryClient'
 import { SetupGate } from './SetupGate'
 
@@ -117,25 +117,19 @@ describe('SetupGate auth routing', () => {
     expect(h.invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.authMe })
   })
 
-  it('shows KeyEntry after an access-key 401, even with cached authenticated state', () => {
-    // Authenticated via a stored access key: /auth/me is cached authenticated:true,
-    // so protected screens (an empty <Outlet/>) render — KeyEntry is NOT shown yet.
-    h.auth = {
-      data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
-      isLoading: false,
-    }
-
+  it('opens the break-glass KeyEntry from the Plex login access-key affordance', async () => {
+    // Unauthenticated: the gate shows the Plex login, whose "Use access key" button
+    // switches to the break-glass KeyEntry (the recovery-key exchange path). This is
+    // now the ONLY route to KeyEntry — the browser no longer stores a key to have
+    // rejected, so there is no AUTH_INVALID signal (CodeQL #263).
     render(<SetupGate />, { wrapper: MemoryRouter })
+    expect(screen.getByText('Mock Plex Login')).toBeInTheDocument()
     expect(screen.queryByText('Mock Key Entry')).not.toBeInTheDocument()
 
-    // The stored key is rejected (client clears it and fires AUTH_INVALID). The gate
-    // must drop the now-stale cached auth AND show KeyEntry — not strand the user on
-    // <Outlet/> (which would keep 401ing) or bounce them to the Plex login.
-    act(() => {
-      window.dispatchEvent(new Event(AUTH_INVALID_EVENT))
+    await act(async () => {
+      screen.getByText('Use access key').click()
     })
 
-    expect(h.invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.authMe })
     expect(screen.getByText('Mock Key Entry')).toBeInTheDocument()
     expect(screen.queryByText('Mock Plex Login')).not.toBeInTheDocument()
     expect(screen.queryByTestId('realtime-provider')).not.toBeInTheDocument()

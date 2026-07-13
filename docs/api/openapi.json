@@ -2279,6 +2279,26 @@
         "title": "SeasonStatus",
         "type": "object"
       },
+      "ServiceNotConfiguredErrorDetail": {
+        "description": "Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).\n\nThe app-wide handler (``app._service_not_configured_handler``) always\nrenders ``{\"detail\": \"service_not_configured\", \"service\": \"<name>\"}`` --\na REQUIRED ``service`` field, not the bare ``{\"detail\": ...}`` of\n:class:`ErrorDetail`. Endpoints that can raise this error must reference\nthis model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the\ngenerated client type carries ``service`` and callers can route the\noperator straight to that service's setup step instead of losing the\nfield to the generic shape.",
+        "properties": {
+          "detail": {
+            "const": "service_not_configured",
+            "default": "service_not_configured",
+            "title": "Detail",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service"
+        ],
+        "title": "ServiceNotConfiguredErrorDetail",
+        "type": "object"
+      },
       "ServiceValidateResponse": {
         "description": "Result of a connection check. ``message`` is operator-facing; ``detail``\nis an optional diagnostic. Neither ever contains a secret value.\n\nFor Plex, ``libraries`` carries the movie AND tv library folders (each tagged\nby ``section_type``) so the UI can offer pick-lists for ``movies_root`` /\n``tv_root`` instead of a typed path. ``None`` for every other service (and for\na failed Plex check). ``machine_identifier`` is the probed Plex server's\n``machineIdentifier`` (from its ``/identity``) \u2014 set only when the caller asked\nfor the ownership-verifying variant of the Plex probe, so setup can assert\nownership and store the id; ``None`` otherwise.\n\n``download_path_note`` (qBittorrent only, issues #133/#157) is a NON-blocking,\ninformational message: set only on an ``ok=True`` qBittorrent check whose\nclient-reported default save path is NOT visible inside this container. It never\nflips ``ok`` to ``False`` -- Plex Manager directs every grab's ``save_path``\nexplicitly (never relies on this default), so the mismatch is honestly\nsurfaced but does not block setup/health. ``None`` for every other service, and\nfor qBittorrent whenever the default path IS visible or could not be read.",
         "properties": {
@@ -3139,6 +3159,28 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/auth/api-key": {
+      "post": {
+        "description": "Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.\n\nThe recovery / automation key (ADR-0005, ADR-0016) is the terminal-free\nbreak-glass credential that authenticates when plex.tv is unreachable. Before\nthis endpoint the browser had to keep the raw key in JS-readable\n``localStorage`` so the break-glass path survived a reload \u2014 exactly the\ncleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the\nsame cookie the Plex sign-in flow mints means the key never needs JS-readable\nstorage: the resulting session is an admin-authority recovery session with no\nPlex identity (``auth_sessions.user_id`` NULL), and every later request\nauthenticates by the HTTP-only cookie exactly like a Plex session does.\n\nThe key is validated against the stored ``SystemSettings.app_api_key`` with a\nconstant-time compare \u2014 accepting a Plex session cookie here (as\n``require_api_key`` would) is deliberately NOT done: that would let any\nsigned-in NON-admin mint an ADMIN recovery session. Only a caller who proves\nthe recovery key gets one.",
+        "operationId": "exchange_api_key_endpoint_api_v1_auth_api_key_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Exchange Api Key Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/api/v1/auth/logout": {
       "post": {
         "description": "Revoke the current Plex browser session and clear auth cookies.",
@@ -4537,6 +4579,34 @@
             },
             "description": "Successful Response"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Cancel Request Endpoint Api V1 Requests  Request Id  Cancel Post"
+                }
+              }
+            },
+            "description": "Not cancellable in its current state, an import is in progress, or qBittorrent is required but not configured"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -4692,11 +4762,18 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Validation error, or a tv request reported without a season"
           }
         },
         "security": [

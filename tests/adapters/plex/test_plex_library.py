@@ -24,6 +24,7 @@ from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import (
     PlexAuthError,
     PlexLibraryError,
+    _resolve_correlated_watch_state,  # pyright: ignore[reportPrivateUsage]
     reset_caches,
 )
 from plex_manager.ports.library import WatchState
@@ -2093,3 +2094,261 @@ async def test_watch_state_tv_fails_closed_when_no_episode_under_the_path() -> N
     adapter = _adapter(_tv_dup_handler, base_url="http://watch-dup-tv-miss:32400")
     state = await adapter.watch_state(1399, "tv", season=1, library_path="/data/tv/Show/Season 02")
     assert state == WatchState(watched=False, last_viewed_at=None)
+
+
+# --------------------------------------------------------------------------- #
+# _resolve_correlated_watch_state / issue #239 -- merge SAME-file duplicate hits
+# --------------------------------------------------------------------------- #
+_NEWER_EPOCH = 1_750_000_000
+_NEWER_AT = datetime.fromtimestamp(_NEWER_EPOCH, tz=UTC)
+
+
+def test_resolve_correlated_watch_state_single_hit_passes_through() -> None:
+    state = WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+    assert _resolve_correlated_watch_state([(frozenset({"/a.mkv"}), state)]) == state
+
+
+def test_resolve_correlated_watch_state_zero_hits_fails_closed() -> None:
+    assert _resolve_correlated_watch_state([]) == WatchState(watched=False, last_viewed_at=None)
+
+
+def test_resolve_correlated_watch_state_different_paths_fail_closed() -> None:
+    # Genuinely distinct underlying files -- issue #207's original ambiguous
+    # case -- must still fail closed even though one copy is watched.
+    hits = [
+        (frozenset({"/a.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+        (frozenset({"/b.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
+
+
+def test_resolve_correlated_watch_state_identical_paths_merge_watched_if_any() -> None:
+    # Same underlying file, indexed by two sections; only ONE section's copy
+    # is watched -- the merge must not mask that real watch.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_WATCHED_AT
+    )
+
+
+def test_resolve_correlated_watch_state_identical_paths_use_newest_watched_timestamp() -> None:
+    # Both copies watched, with DIFFERENT lastViewedAt -- merge to the NEWEST,
+    # never the oldest: eviction treats last_viewed_at < grace_cutoff as
+    # eligible and sorts stalest-first, so keeping a stale timestamp from a
+    # section that hasn't caught up with a recent rewatch another section
+    # already recorded would make the item eligible for deletion during the
+    # grace window right after that rewatch (Codex review, PR #281).
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_NEWER_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(
+        watched=True, last_viewed_at=_NEWER_AT
+    )
+
+
+def test_resolve_correlated_watch_state_identical_paths_all_unwatched() -> None:
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
+
+
+def test_resolve_correlated_watch_state_three_way_split_still_fails_closed() -> None:
+    # Not every distinct-path pair need be pairwise-checked explicitly -- a set
+    # of >1 distinct path-sets among 3+ hits must fail closed too.
+    hits = [
+        (frozenset({"/shared.mkv"}), WatchState(watched=True, last_viewed_at=_WATCHED_AT)),
+        (frozenset({"/shared.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+        (frozenset({"/other.mkv"}), WatchState(watched=False, last_viewed_at=None)),
+    ]
+    assert _resolve_correlated_watch_state(hits) == WatchState(watched=False, last_viewed_at=None)
+
+
+# A broad section ("Movies" at /data/movies) and a NESTED section ("Anime
+# Movies" at /data/movies/Anime) both index the exact same physical file --
+# the issue #239 scenario a real Plex library produces. Section keys are
+# deliberately distinct from every other fixture group in this module so this
+# group's handler never accidentally answers another test's request.
+SECTIONS_OVERLAP: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {
+                "key": "1",
+                "title": "Movies",
+                "type": "movie",
+                "Location": [{"path": "/data/movies"}],
+            },
+            {
+                "key": "11",
+                "title": "Anime Movies",
+                "type": "movie",
+                "Location": [{"path": "/data/movies/Anime"}],
+            },
+        ]
+    }
+}
+
+MOVIES_OVERLAP_SECTION_1: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                "viewCount": 3,
+                "lastViewedAt": _WATCHED_EPOCH,
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/ep.mkv"}]}],
+            },
+        ],
+    }
+}
+
+MOVIES_OVERLAP_SECTION_11: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "Guid": [{"id": "tmdb://42"}],
+                # The identical physical file, but THIS section's own watch
+                # state has never synced a view.
+                "Media": [{"Part": [{"file": "/data/movies/Anime/Show/ep.mkv"}]}],
+            },
+        ],
+    }
+}
+
+
+def _movie_overlap_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_OVERLAP)
+    if path == "/library/sections/1/all":
+        return httpx.Response(200, json=MOVIES_OVERLAP_SECTION_1)
+    if path == "/library/sections/11/all":
+        return httpx.Response(200, json=MOVIES_OVERLAP_SECTION_11)
+    return httpx.Response(404, json={})
+
+
+async def test_watch_state_movie_merges_identical_path_across_sections() -> None:
+    # A broad section AND a nested section both index the SAME file (issue
+    # #239) -- two correlated hits that must merge, not fail closed.
+    adapter = _adapter(_movie_overlap_handler, base_url="http://watch-overlap-movie:32400")
+    state = await adapter.watch_state(42, "movie", library_path="/data/movies/Anime/Show/ep.mkv")
+    assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
+
+
+SHOWS_OVERLAP_SECTION_2: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"ratingKey": "300", "Guid": [{"id": "tmdb://1399"}]}],
+    }
+}
+
+SHOWS_OVERLAP_SECTION_21: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [{"ratingKey": "301", "Guid": [{"id": "tmdb://1399"}]}],
+    }
+}
+
+SEASON_OVERLAP_FOR_300: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "index": 1,
+                "ratingKey": "310",
+                "leafCount": 10,
+                "viewedLeafCount": 10,
+                "lastViewedAt": _WATCHED_EPOCH,
+            },
+        ],
+    }
+}
+
+SEASON_OVERLAP_FOR_301: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "index": 1,
+                "ratingKey": "311",
+                # This duplicate's own watch state never fully synced.
+                "leafCount": 10,
+                "viewedLeafCount": 0,
+            },
+        ],
+    }
+}
+
+EPISODES_OVERLAP_FOR_310: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {"Media": [{"Part": [{"file": "/data/tv/AnimeShow/Season 01/e01.mkv"}]}]},
+        ],
+    }
+}
+
+EPISODES_OVERLAP_FOR_311: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            # Identical episode file path to the other duplicate's season.
+            {"Media": [{"Part": [{"file": "/data/tv/AnimeShow/Season 01/e01.mkv"}]}]},
+        ],
+    }
+}
+
+
+def _tv_overlap_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers.get("X-Plex-Token") == TOKEN
+    path = request.url.path
+    if path == "/library/sections":
+        return httpx.Response(200, json=SECTIONS_OVERLAP_TV)
+    if path == "/library/sections/2/all":
+        return httpx.Response(200, json=SHOWS_OVERLAP_SECTION_2)
+    if path == "/library/sections/21/all":
+        return httpx.Response(200, json=SHOWS_OVERLAP_SECTION_21)
+    if path == "/library/metadata/300/children":
+        return httpx.Response(200, json=SEASON_OVERLAP_FOR_300)
+    if path == "/library/metadata/301/children":
+        return httpx.Response(200, json=SEASON_OVERLAP_FOR_301)
+    if path == "/library/metadata/310/children":
+        return httpx.Response(200, json=EPISODES_OVERLAP_FOR_310)
+    if path == "/library/metadata/311/children":
+        return httpx.Response(200, json=EPISODES_OVERLAP_FOR_311)
+    return httpx.Response(404, json={})
+
+
+SECTIONS_OVERLAP_TV: dict[str, Any] = {
+    "MediaContainer": {
+        "Directory": [
+            {"key": "2", "title": "TV", "type": "show", "Location": [{"path": "/data/tv"}]},
+            {
+                "key": "21",
+                "title": "TV Anime",
+                "type": "show",
+                # A NESTED section covering the same files as the broad "TV"
+                # section above -- the issue #239 scenario, TV branch.
+                "Location": [{"path": "/data/tv/AnimeShow"}],
+            },
+        ]
+    }
+}
+
+
+async def test_watch_state_tv_merges_identical_episode_path_across_sections() -> None:
+    # Same show/season/episode file indexed by a broad section AND a nested
+    # section (issue #239) -- the duplicate whose own watch state never
+    # synced must not mask the other's real, fully-watched season.
+    adapter = _adapter(_tv_overlap_handler, base_url="http://watch-overlap-tv:32400")
+    state = await adapter.watch_state(
+        1399, "tv", season=1, library_path="/data/tv/AnimeShow/Season 01"
+    )
+    assert state == WatchState(watched=True, last_viewed_at=_WATCHED_AT)
