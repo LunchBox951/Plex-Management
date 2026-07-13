@@ -4925,7 +4925,8 @@
                     {
                       "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
                     }
-                  ]
+                  ],
+                  "title": "Response 409 Report Issue Endpoint Api V1 Requests  Request Id  Report Issue Post"
                 }
               }
             },

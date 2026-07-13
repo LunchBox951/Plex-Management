@@ -50,6 +50,41 @@ def _references_schema(response: dict[str, Any], ref_name: str) -> bool:
     return any(entry.get("$ref") == ref for entry in any_of)
 
 
+def _assert_no_dangling_refs(schema: dict[str, Any]) -> None:
+    """Every ``$ref`` in the exported schema must resolve to a real component.
+
+    A hand-written ``content``/``schema`` dict can reference a component that
+    only happens to exist because some OTHER, unrelated endpoint's ``model``
+    union caused FastAPI to register it -- if that other endpoint ever stopped
+    referencing the shared model, the ref here would go dangling silently (a
+    generated TS client would still "work" against a broken schema). Walk the
+    whole document looking for any ``$ref`` string and confirm its target is
+    present in ``components/schemas``.
+    """
+    components = schema.get("components", {}).get("schemas", {})
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+                name = ref.removeprefix("#/components/schemas/")
+                assert name in components, f"dangling $ref: {ref}"
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(schema.get("paths", {}))
+
+
+def test_no_dangling_refs_in_exported_schema() -> None:
+    """Regression guard for issue #291's report-issue 409: a hand-written
+    ``$ref`` must always resolve, not merely happen to resolve because some
+    other endpoint's ``model`` union incidentally registered the component."""
+    _assert_no_dangling_refs(_schema())
+
+
 def _references_error_detail(response: dict[str, Any]) -> bool:
     return _references_schema(response, "ErrorDetail")
 
