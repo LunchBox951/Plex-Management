@@ -81,6 +81,7 @@ __all__ = [
     "SetupStatusResponse",
     "SubsystemHealthItem",
     "TmdbValidateRequest",
+    "WatchlistStatusItem",
 ]
 
 MediaTypeField = Literal["movie", "tv"]
@@ -539,6 +540,8 @@ class SettingsResponse(BaseModel):
     # the default applies). Plain boolean config, same wire semantics as
     # ``eviction_enabled`` above.
     auto_grab_enabled: bool | None = None
+    watchlist_sync_enabled: bool | None = None
+    watchlist_sync_interval_minutes: float | None = None
 
 
 class AppApiKeyResponse(BaseModel):
@@ -647,6 +650,10 @@ class SettingsUpdate(BaseModel):
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
+    watchlist_sync_enabled: bool | None = Field(default=None)
+    watchlist_sync_interval_minutes: float | None = Field(
+        default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
 
     @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
     @classmethod
@@ -1210,6 +1217,18 @@ class AutograbStatusItem(BaseModel):
     cooled_down_scopes: int = 0
 
 
+class WatchlistStatusItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    fetched: int = 0
+    created: int = 0
+    existing: int = 0
+    failed_users: int = 0
+
+
 class HealthResponse(BaseModel):
     """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
     healthy, is the reconcile loop running, how full is the disk"."""
@@ -1220,6 +1239,7 @@ class HealthResponse(BaseModel):
     disks: list[DiskGaugeItem]
     reconcile: ReconcileStatusItem
     autograb: AutograbStatusItem
+    watchlist: WatchlistStatusItem
 
 
 # --------------------------------------------------------------------------- #

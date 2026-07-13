@@ -41,6 +41,8 @@ const LOG_RETENTION_DAYS_DEFAULT = 7
 const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
+const WATCHLIST_SYNC_ENABLED_DEFAULT = true
+const WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT = 15
 
 interface FormState {
   plex_url: string
@@ -70,6 +72,8 @@ interface FormState {
   log_max_rows: string
   // Auto-grab worker (ADR-0013) — the master on/off switch.
   auto_grab_enabled: boolean
+  watchlist_sync_enabled: boolean
+  watchlist_sync_interval_minutes: string
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -103,6 +107,10 @@ function initialForm(data: SettingsResponse): FormState {
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
     log_max_rows: String(data.log_max_rows ?? LOG_MAX_ROWS_DEFAULT),
     auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
+    watchlist_sync_enabled: data.watchlist_sync_enabled ?? WATCHLIST_SYNC_ENABLED_DEFAULT,
+    watchlist_sync_interval_minutes: String(
+      data.watchlist_sync_interval_minutes ?? WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+    ),
   }
 }
 
@@ -121,9 +129,14 @@ type NumberKey =
   | 'disk_pressure_target_percent'
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
+  | 'watchlist_sync_interval_minutes'
   | 'log_retention_days'
   | 'log_max_rows'
-type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled' | 'auto_grab_enabled'
+type BoolKey =
+  | 'eviction_enabled'
+  | 'eviction_proactive_enabled'
+  | 'auto_grab_enabled'
+  | 'watchlist_sync_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
 // validation below so an invalid field's toast names it the same way the form
@@ -133,6 +146,7 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   disk_pressure_target_percent: 'Pressure target (%)',
   eviction_grace_days: 'Eviction grace period (days)',
   eviction_interval_minutes: 'Eviction check interval (minutes)',
+  watchlist_sync_interval_minutes: 'Watchlist sync interval (minutes)',
   log_retention_days: 'Log retention (days)',
   log_max_rows: 'Log retention (max rows)',
 }
@@ -719,6 +733,8 @@ export function Settings() {
       log_retention_days: Number(form.log_retention_days),
       log_max_rows: Number(form.log_max_rows),
       auto_grab_enabled: form.auto_grab_enabled,
+      watchlist_sync_enabled: form.watchlist_sync_enabled,
+      watchlist_sync_interval_minutes: Number(form.watchlist_sync_interval_minutes),
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -1125,6 +1141,16 @@ export function Settings() {
               'Enable auto-grab',
               'Automatically search and grab pending requests. Turn off to grab ' +
                 'only via the manual button on each title.',
+            )}
+            {checkboxField(
+              'watchlist_sync_enabled',
+              'Enable Plex watchlist sync',
+              'Create requests from every signed-in user’s Plex watchlist and protect them from eviction.',
+            )}
+            {numberField(
+              'watchlist_sync_interval_minutes',
+              'Watchlist sync interval (minutes)',
+              { min: 0.1, step: 0.1 },
             )}
           </div>
         </section>

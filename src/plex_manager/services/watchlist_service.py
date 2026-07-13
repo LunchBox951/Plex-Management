@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, select
@@ -17,7 +18,37 @@ if TYPE_CHECKING:
     from plex_manager.ports.metadata import MetadataPort
     from plex_manager.ports.watchlist import WatchlistPort
 
-__all__ = ["WatchlistSyncResult", "is_watchlisted", "list_sync_users", "sync_user"]
+__all__ = [
+    "WatchlistSyncResult",
+    "WatchlistWorkerStatus",
+    "is_watchlisted",
+    "list_sync_users",
+    "sync_user",
+]
+
+
+@dataclass
+class WatchlistWorkerStatus:
+    last_run_at: datetime | None = field(default=None)
+    last_ok_at: datetime | None = field(default=None)
+    last_error_type: str | None = field(default=None)
+    fetched: int = field(default=0)
+    created: int = field(default=0)
+    existing: int = field(default=0)
+    failed_users: int = field(default=0)
+
+    def mark_started(self) -> None:
+        self.last_run_at = datetime.now(UTC)
+
+    def mark_completed(
+        self, *, fetched: int, created: int, existing: int, failed_users: int, error: str | None
+    ) -> None:
+        self.last_ok_at = datetime.now(UTC)
+        self.fetched = fetched
+        self.created = created
+        self.existing = existing
+        self.failed_users = failed_users
+        self.last_error_type = error
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,15 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       consecutive_failures: 0,
       cooled_down_scopes: 0,
     },
+    watchlist: {
+      last_run_at: '2026-01-01T00:00:00Z',
+      last_ok_at: '2026-01-01T00:00:00Z',
+      last_error_type: null,
+      fetched: 0,
+      created: 0,
+      existing: 0,
+      failed_users: 0,
+    },
     ...overrides,
   }
 }
@@ -374,7 +383,19 @@ describe('Status', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       // Both background loops are fresh (never run), so neither panel may read
       // as "clean" just because failures==0.
-      data: health({ reconcile: freshLoop, autograb: freshLoop }),
+      data: health({
+        reconcile: freshLoop,
+        autograb: freshLoop,
+        watchlist: {
+          last_run_at: null,
+          last_ok_at: null,
+          last_error_type: null,
+          fetched: 0,
+          created: 0,
+          existing: 0,
+          failed_users: 0,
+        },
+      }),
       isLoading: false,
       isError: false,
     })
@@ -385,8 +406,8 @@ describe('Status', () => {
 
     // Never — a fresh boot must not read as "clean" just because failures==0.
     expect(screen.queryByText('running clean')).not.toBeInTheDocument()
-    // Both the reconcile AND auto-grab panels show the honest "starting up".
-    expect(screen.getAllByText('starting up')).toHaveLength(2)
+    // All three background panels show the honest "starting up".
+    expect(screen.getAllByText('starting up')).toHaveLength(3)
     // Both "Last run" and "Last success" render the same honest placeholder.
     const neverValues = screen.getAllByText('never')
     expect(neverValues.length).toBeGreaterThan(0)

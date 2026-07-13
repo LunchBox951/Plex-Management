@@ -1113,13 +1113,17 @@
             },
             "title": "Subsystems",
             "type": "array"
+          },
+          "watchlist": {
+            "$ref": "#/components/schemas/WatchlistStatusItem"
           }
         },
         "required": [
           "subsystems",
           "disks",
           "reconcile",
-          "autograb"
+          "autograb",
+          "watchlist"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -2510,6 +2514,28 @@
               }
             ],
             "title": "Tv Root"
+          },
+          "watchlist_sync_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Enabled"
+          },
+          "watchlist_sync_interval_minutes": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Interval Minutes"
           }
         },
         "title": "SettingsResponse",
@@ -2760,6 +2786,30 @@
               }
             ],
             "title": "Tv Root"
+          },
+          "watchlist_sync_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Enabled"
+          },
+          "watchlist_sync_interval_minutes": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 10080.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchlist Sync Interval Minutes"
           }
         },
         "title": "SettingsUpdate",
@@ -3044,6 +3094,67 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WatchlistStatusItem": {
+        "properties": {
+          "created": {
+            "default": 0,
+            "title": "Created",
+            "type": "integer"
+          },
+          "existing": {
+            "default": 0,
+            "title": "Existing",
+            "type": "integer"
+          },
+          "failed_users": {
+            "default": 0,
+            "title": "Failed Users",
+            "type": "integer"
+          },
+          "fetched": {
+            "default": 0,
+            "title": "Fetched",
+            "type": "integer"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          }
+        },
+        "title": "WatchlistStatusItem",
         "type": "object"
       }
     },
@@ -4316,16 +4427,6 @@
               }
             },
             "description": "Media not found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorDetail"
-                }
-              }
-            },
-            "description": "Already requested by another user"
           },
           "422": {
             "content": {

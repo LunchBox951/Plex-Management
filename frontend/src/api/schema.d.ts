@@ -1681,6 +1681,7 @@ export interface components {
             reconcile: components["schemas"]["ReconcileStatusItem"];
             /** Subsystems */
             subsystems: components["schemas"]["SubsystemHealthItem"][];
+            watchlist: components["schemas"]["WatchlistStatusItem"];
         };
         /**
          * KeepForeverBody
@@ -2242,6 +2243,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SettingsUpdate
@@ -2314,6 +2319,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SetupCompleteRequest
@@ -2432,6 +2441,35 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** WatchlistStatusItem */
+        WatchlistStatusItem: {
+            /**
+             * Created
+             * @default 0
+             */
+            created: number;
+            /**
+             * Existing
+             * @default 0
+             */
+            existing: number;
+            /**
+             * Failed Users
+             * @default 0
+             */
+            failed_users: number;
+            /**
+             * Fetched
+             * @default 0
+             */
+            fetched: number;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
         };
     };
     responses: never;
@@ -3143,15 +3181,6 @@ export interface operations {
             };
             /** @description Media not found */
             404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
-                };
-            };
-            /** @description Already requested by another user */
-            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -72,6 +72,7 @@ _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "disk_pressure_threshold_percent",
     "disk_pressure_target_percent",
     "eviction_interval_minutes",
+    "watchlist_sync_interval_minutes",
 )
 _INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "eviction_grace_days",

@@ -48,6 +48,8 @@ from plex_manager.web.deps import (
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
+    WATCHLIST_SYNC_ENABLED_DEFAULT,
+    WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -66,6 +68,7 @@ from plex_manager.web.deps import (
     resolve_eviction_interval_minutes,
     resolve_log_max_rows,
     resolve_log_retention_days,
+    resolve_watchlist_sync_interval_minutes,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams, publish_realtime
@@ -192,6 +195,7 @@ _BOOL_SETTING_DEFAULTS: dict[str, bool] = {
     "eviction_enabled": EVICTION_ENABLED_DEFAULT,
     "eviction_proactive_enabled": EVICTION_PROACTIVE_ENABLED_DEFAULT,
     "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
+    "watchlist_sync_enabled": WATCHLIST_SYNC_ENABLED_DEFAULT,
 }
 
 
@@ -278,6 +282,16 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, str | None
         interval,
         EVICTION_INTERVAL_MINUTES_DEFAULT,
         interval_honored,
+    )
+
+    watchlist_interval, watchlist_interval_honored = resolve_watchlist_sync_interval_minutes(
+        raw.get("watchlist_sync_interval_minutes")
+    )
+    out["watchlist_sync_interval_minutes"] = _present_effective(
+        raw.get("watchlist_sync_interval_minutes"),
+        watchlist_interval,
+        WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+        watchlist_interval_honored,
     )
 
     grace, grace_honored = resolve_eviction_grace_days(raw.get("eviction_grace_days"))

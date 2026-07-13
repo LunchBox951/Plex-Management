@@ -78,6 +78,8 @@ from plex_manager.web.deps import (
     get_quality_profile,
     get_tmdb,
     get_tv_root_optional,
+    get_watchlist_sync_enabled,
+    get_watchlist_sync_interval_minutes,
     resolve_qbittorrent,
 )
 from plex_manager.web.errors import install_error_handlers
@@ -129,22 +131,34 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # the per-cycle search cap keeps the single Prowlarr from being hammered. A
 # constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
-_WATCHLIST_INTERVAL_SECONDS = 15.0 * 60.0
 
 
 async def _watchlist_sync_once(app: FastAPI) -> int:
     """Synchronize every reusable account token, isolating failures per user."""
     maker = app.state.sessionmaker
     client = app.state.http_client
+    status = getattr(app.state, "watchlist_status", None)
+    if not isinstance(status, watchlist_service.WatchlistWorkerStatus):
+        status = watchlist_service.WatchlistWorkerStatus()
+        app.state.watchlist_status = status
+    status.mark_started()
     async with maker() as session:
+        if not await get_watchlist_sync_enabled(session):
+            status.mark_completed(fetched=0, created=0, existing=0, failed_users=0, error=None)
+            return 0
         try:
             tmdb = await get_tmdb(session, client)
         except ServiceNotConfiguredError:
+            status.mark_completed(fetched=0, created=0, existing=0, failed_users=0, error=None)
             return 0
         library = await get_library_optional(session, client)
         users = await watchlist_service.list_sync_users(session)
 
     created = 0
+    fetched = 0
+    existing = 0
+    failed_users = 0
+    last_error: str | None = None
     for user in users:
         token = user.encrypted_plex_token
         if token is None:
@@ -159,7 +173,11 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                     library=library,
                 )
                 created += result.created
+                fetched += result.fetched
+                existing += result.existing
         except Exception as exc:
+            failed_users += 1
+            last_error = type(exc).__name__
             _logger.warning(
                 "watchlist sync failed for user_id=%s (%s); retaining the previous snapshot",
                 safe_int(user.id),
@@ -167,6 +185,13 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             )
     if created:
         publish_realtime(app, ("requests", "queue", "discover"), reason="watchlist_sync")
+    status.mark_completed(
+        fetched=fetched,
+        created=created,
+        existing=existing,
+        failed_users=failed_users,
+        error=last_error,
+    )
     return created
 
 
@@ -177,7 +202,12 @@ async def _watchlist_sync_loop(app: FastAPI) -> None:
             await _watchlist_sync_once(app)
         except Exception:
             _logger.exception("watchlist sync tick failed; continuing")
-        await asyncio.sleep(_WATCHLIST_INTERVAL_SECONDS)
+        try:
+            async with app.state.sessionmaker() as session:
+                interval = await get_watchlist_sync_interval_minutes(session)
+        except Exception:
+            interval = 15.0
+        await asyncio.sleep(interval * 60.0)
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -885,6 +915,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
     # it survives across auto-grab ticks; a restart clears it, like the health record.
     autograb_cooldowns: auto_grab_service.CooldownRegistry = {}

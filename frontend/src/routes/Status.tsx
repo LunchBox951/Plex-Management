@@ -194,6 +194,39 @@ function AutograbPanel({ autograb }: { autograb: HealthResponse['autograb'] }) {
   )
 }
 
+function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] }) {
+  const hasRun = watchlist.last_run_at !== null
+  const healthy = hasRun && watchlist.failed_users === 0
+  const tone: DotTone = !hasRun ? 'neutral' : healthy ? 'ok' : 'warn'
+  const label = !hasRun ? 'starting up' : healthy ? 'running clean' : 'degraded'
+  return (
+    <div className="rounded-xl border border-hairline bg-surface p-4">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="font-display text-sm font-semibold text-ink">Watchlist sync</h3>
+        <Dot tone={tone} label={label} />
+      </div>
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs text-muted">
+        <dt>Last run</dt>
+        <dd className="text-right">{formatTimestamp(watchlist.last_run_at)}</dd>
+        <dt>Fetched</dt>
+        <dd className="text-right">{watchlist.fetched}</dd>
+        <dt>New requests</dt>
+        <dd className="text-right">{watchlist.created}</dd>
+        <dt>Failed users</dt>
+        <dd className={cn('text-right', watchlist.failed_users > 0 ? 'text-searching' : '')}>
+          {watchlist.failed_users}
+        </dd>
+        {watchlist.last_error_type ? (
+          <>
+            <dt>Last error</dt>
+            <dd className="text-right text-searching">{watchlist.last_error_type}</dd>
+          </>
+        ) : null}
+      </dl>
+    </div>
+  )
+}
+
 /** One configured library root: a usage bar, plus a ranked preview of what a
  * pressure sweep WOULD evict from it (never evicts anything itself — the
  * preview lists every eligible title regardless of current pressure, so the
@@ -448,9 +481,10 @@ export function Status() {
       {health.data ? (
         <section className="flex flex-col gap-[10px]">
           <SectionHeader>Background loops</SectionHeader>
-          <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2 lg:grid-cols-3">
             <ReconcilePanel reconcile={health.data.reconcile} />
             <AutograbPanel autograb={health.data.autograb} />
+            <WatchlistPanel watchlist={health.data.watchlist} />
           </div>
         </section>
       ) : null}
