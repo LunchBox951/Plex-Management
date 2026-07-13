@@ -178,11 +178,13 @@ Searching`. The exact states/transitions are finalized when v1 is planned.
 ## 6. Delivery: packaging, channels, deployment
 
 Shipped as a **Docker image to GitHub Container Registry (GHCR)**; installed with
-`docker compose up -d`. Each host is *designed* to auto-pull its channel; the
-updater mechanism (Watchtower vs. a systemd timer running `compose pull`) is an
-open decision — see §11 — and is **not** bundled in the compose file yet. See
-[ADR-0003](../adr/0003-docker-ghcr-packaging.md) and
-[ADR-0004](../adr/0004-edge-stable-release-channels.md).
+`docker compose up -d`. Automatic updates are an opt-in Compose profile backed
+by a first-party updater sidecar. Plex Manager owns schedule/idle policy and a
+database-backed drain lease; only the private, internally authenticated sidecar
+receives Docker authority. See
+[ADR-0003](../adr/0003-docker-ghcr-packaging.md),
+[ADR-0004](../adr/0004-edge-stable-release-channels.md), and
+[ADR-0023](../adr/0023-first-party-container-auto-updater.md).
 
 Two channels, by image **tag**, with a **promotion gate**: the canary (beta)
 fleet rides `:edge`; once a build proves itself, *you promote it by re-tagging the
@@ -207,8 +209,12 @@ flowchart TD
     end
 ```
 
-Config and database live in a **mounted volume** so updates and rollbacks never
-touch user data. Rollback is re-pointing a tag.
+Config and database live in a **mounted volume** so container replacement never
+removes user data. The updater keeps the previous image/container configuration
+until the replacement is healthy and restores it on startup failure. It never
+runs an Alembic downgrade: every automatically installable release must leave a
+database that the immediately previous image can still run against, using
+expand/migrate/contract migrations where necessary.
 
 ## 7. Technology stack
 
@@ -277,7 +283,6 @@ non-Plex media servers.
 3. Frontend approach (server-rendered vs light SPA).
 4. State-machine states/transitions, finalized.
 5. Quality-profile data model and defaults (resolutions, sources, cutoff).
-6. Auto-updater choice on each host (Watchtower vs systemd timer running compose pull).
 
 ## 12. Lessons carried from the prototype
 
