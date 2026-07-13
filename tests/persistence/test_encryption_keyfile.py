@@ -541,6 +541,80 @@ def test_ensure_secret_key_still_rejects_invalid_key_on_hardlink_fs(
     assert file_backed_key.read_bytes() == b"tooshort"
 
 
+def test_ensure_secret_key_still_rejects_old_invalid_key_on_real_hardlink_fs(
+    file_backed_key: Path,
+) -> None:
+    """Regression pin for the reap/probe ordering bug: on a REAL hardlink-capable
+    filesystem (no ``os.link`` monkeypatch here -- these tests run on
+    ext4/tmpfs, the beta hosts' real filesystem class) an invalid key OLDER
+    than the stale-partial bound must still fail loudly and be left completely
+    untouched. Age alone must never be sufficient to reap+replace real
+    operator-restored garbage; only a filesystem PROVEN (non-destructively) to
+    refuse hardlinks may ever recover a crashed partial. Pre-fix, the reap ran
+    before the hardlink-capability probe, so this exact case was silently
+    reaped and replaced with a fresh key instead of failing loudly."""
+    file_backed_key.write_bytes(b"tooshort")
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption.ensure_secret_key()
+
+    assert file_backed_key.read_bytes() == b"tooshort"
+
+
+def test_probe_hardlink_capability_true_on_real_fs(tmp_path: Path) -> None:
+    """The capability probe hardlinks the tempfile to a throwaway sibling path
+    and cleans up after itself, without ever touching any other file."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    assert encryption._probe_hardlink_capability(  # pyright: ignore[reportPrivateUsage]
+        tmp_name
+    )
+
+    assert not Path(tmp_name + ".hlprobe").exists()  # probe link removed
+    assert Path(tmp_name).exists()  # the tempfile itself is untouched
+
+
+def test_probe_hardlink_capability_false_when_fs_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``os.link`` raises a known hardlink-unsupported errno, the probe
+    reports incapability rather than propagating -- this is the signal that
+    makes it safe to reap a crashed partial."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    def _refusing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hardlinks unsupported")
+
+    monkeypatch.setattr(os, "link", _refusing_link)
+
+    assert not encryption._probe_hardlink_capability(  # pyright: ignore[reportPrivateUsage]
+        tmp_name
+    )
+
+
+def test_probe_hardlink_capability_reraises_non_fallback_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine failure (e.g. ``ENOSPC``) during the probe must propagate, not
+    be swallowed as if it meant "hardlinks unsupported"."""
+    tmp_name = str(tmp_path / ".secret.probe-src.tmp")
+    Path(tmp_name).write_bytes(b"key-bytes")
+
+    def _failing_link(src: str, dst: str, **kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(os, "link", _failing_link)
+
+    with pytest.raises(OSError) as exc_info:
+        encryption._probe_hardlink_capability(tmp_name)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.errno == errno.ENOSPC
+
+
 def test_reap_stale_key_tempfiles_removes_old_orphans_only(tmp_path: Path) -> None:
     """The stale-tempfile sweep removes a crashed publish's orphaned
     ``.secret.*.tmp`` (by age) but never a concurrent live publish's young
@@ -571,3 +645,158 @@ def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch
     finally:
         get_settings.cache_clear()
         encryption.reset_fernet_cache()
+
+
+def _existence_first_link(src: str, dst: str, **kwargs: object) -> None:
+    """Test double for a hardlink-refusing filesystem (issue #149).
+
+    A REAL hardlink-refusing mount (exFAT/FAT/SMB) still raises
+    ``FileExistsError`` -- not the hardlink-unsupported ``OSError`` -- when
+    the destination already exists: the kernel's EEXIST check fires before it
+    ever gets to ask whether the filesystem supports hardlinks at all. Only
+    once the destination is absent does the "no hardlinks here" ``OSError``
+    (``EPERM``/``EOPNOTSUPP``/etc.) surface. Beta hosts are ext4 (genuinely
+    hardlink-capable), so this fake is what stands in for that filesystem class
+    in tests -- never a real exotic-FS mount.
+    """
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "File exists", dst)
+    raise OSError(errno.EPERM, "hardlinks unsupported", dst)
+
+
+def test_generate_key_file_recovers_crashed_partial_behind_file_exists_error(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #149: on a hardlink-refusing filesystem, a crashed fallback
+    committer's INVALID partial at ``secret.key`` makes the PRIMARY (hardlink)
+    path's ``os.link`` raise ``FileExistsError`` -- not the ``OSError`` the
+    no-hardlink fallback branch expects -- because existence is checked before
+    hardlink support. That must no longer short-circuit straight to the
+    corrupt-key error: once the partial is old enough to be provably a crash
+    victim (not a live racer), it must be routed into the same lock-guarded
+    reap-and-republish recovery the ``OSError`` branch uses, and first-run key
+    creation must complete instead of requiring a manual ``secret.key``
+    deletion."""
+    file_backed_key.write_bytes(b"\x00" * 10)  # a crashed committer's partial
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert (file_backed_key.stat().st_mode & 0o777) == 0o600
+    assert not file_backed_key.with_name(file_backed_key.name + ".lock").exists()
+
+
+def test_generate_key_file_existence_first_link_still_adopts_valid_key(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No data loss for a valid existing key: on the same hardlink-refusing,
+    existence-checked-first filesystem double, a VALID existing key must be
+    adopted as-is -- never reaped, never replaced -- even though the primary
+    path observes the identical ``FileExistsError`` as the crashed-partial
+    case."""
+    original = Fernet.generate_key()
+    file_backed_key.write_bytes(original)
+    old = time.time() - 3600  # old enough to be reap-eligible IF it were invalid
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == original
+    assert file_backed_key.read_bytes() == original
+
+
+def test_generate_key_file_existence_first_link_never_reaps_young_partial(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The age gate still applies under the existence-first fake: a YOUNG
+    invalid partial (a possibly-live racer's in-flight commit) must be left
+    untouched and the call must fail loudly and PROMPTLY -- no long wait for
+    it to age out mid-call."""
+    file_backed_key.write_bytes(b"in-flight")  # young: mtime ~now
+    monkeypatch.setattr(os, "link", _existence_first_link)
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep retries instant
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert file_backed_key.read_bytes() == b"in-flight"  # untouched
+
+
+def test_ensure_secret_key_recovers_crashed_partial_behind_file_exists_error(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement (c) end-to-end via ``ensure_secret_key`` (the real first-run
+    entry point): a stale crashed partial that manifests as ``FileExistsError``
+    on the primary path must not brick a fresh install -- no manual
+    ``secret.key`` deletion required."""
+    file_backed_key.write_bytes(b"crashed-partial")
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    fernet = encryption.ensure_secret_key()
+
+    stored = file_backed_key.read_bytes()
+    assert encryption._is_valid_fernet_key(stored)  # pyright: ignore[reportPrivateUsage]
+    assert Fernet(stored).decrypt(fernet.encrypt(b"payload")) == b"payload"
+
+
+def test_recover_invalid_final_stale_lock_still_probes_before_reap_on_hardlink_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 finding on this PR: a stale ``secret.key.lock`` must not let the
+    reap-and-replace fallback run un-probed.
+
+    Scenario: the helper crashed AFTER creating the publish lock while still
+    deciding what to do about an old invalid ``secret.key`` (e.g. it died
+    between ``os.mkdir(lock_dir)`` and the hardlink-capability probe). On a
+    REAL hardlink-capable filesystem (no ``os.link`` monkeypatch -- ext4/tmpfs,
+    the beta hosts' filesystem class) that stale lock's mere PRESENCE must not
+    bypass :func:`_probe_hardlink_capability` and hand off to
+    :func:`_publish_key_no_hardlink`, which reaps an invalid partial
+    unconditionally once it holds the lock. The lock must be waited for/reaped
+    and then re-acquired by this function itself so the probe still runs --
+    proving the filesystem is hardlink-capable -- and the old invalid key must
+    still fail loudly with the corrupt-key error, completely untouched."""
+    file_backed_key.write_bytes(b"tooshort")  # operator-restored, invalid
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_dir.mkdir()
+    os.utime(lock_dir, (old, old))  # stale: older than _STALE_PUBLISH_LOCK_SECONDS
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep retries instant
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert file_backed_key.read_bytes() == b"tooshort"  # never reaped/replaced
+    assert not lock_dir.exists()  # the stale lock was reaped, but no key was minted
+
+
+def test_recover_invalid_final_stale_lock_still_recovers_on_hardlink_refusing_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PR's original scenario must keep passing after the stale-lock fix:
+    on a hardlink-REFUSING filesystem, a stale lock left behind by a crashed
+    committer (mid-commit, before releasing the lock) must still be reaped and
+    the crashed partial recovered. Waiting for/reaping the lock before running
+    the capability probe must not turn into a permanent block on the
+    legitimate fallback recovery this PR exists to restore (issue #149)."""
+    file_backed_key.write_bytes(b"\x00" * 10)  # a crashed committer's partial
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_dir.mkdir()
+    os.utime(lock_dir, (old, old))  # stale: crashed while holding the lock
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert not lock_dir.exists()
