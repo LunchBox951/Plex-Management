@@ -91,6 +91,16 @@ this compatibility rule:
 > N-1 must still be able to start and provide its supported behavior against the
 > resulting database.
 
+The rollback executor implements that rule by creating a clone from the retained
+N-1 image and effective container configuration, then overriding the clone's
+entrypoint to start the N-1 application module directly. It deliberately bypasses
+N-1's normal startup migration command: after N has stamped its revision, an
+older Alembic graph may reject that unknown revision before the otherwise
+compatible N-1 application can serve. The rollback clone must still pass the
+retained healthcheck. This bypass neither reverses nor skips N's already-applied
+forward migration; it relies on the post-migration schema satisfying the N/N-1
+application compatibility rule.
+
 Schema changes on the auto-update train are expand-first and tolerant of unknown
 columns/rows. A destructive rename, type narrowing, constraint tightening, or
 column/table removal must be split across releases: expand and dual-read/write,

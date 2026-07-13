@@ -212,8 +212,10 @@ flowchart TD
 Config and database live in a **mounted volume** so container replacement never
 removes user data. The updater keeps the previous image/container configuration
 until the replacement is healthy and restores it on startup failure. It never
-runs an Alembic downgrade: every automatically installable release must leave a
-database that the immediately previous image can still run against, using
+runs an Alembic downgrade: rollback starts a clone of the previous application
+image/configuration while bypassing that old image's now-behind Alembic
+entrypoint. Every automatically installable release must therefore leave a
+database that the immediately previous application can still run against, using
 expand/migrate/contract migrations where necessary.
 
 ## 7. Technology stack
