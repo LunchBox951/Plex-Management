@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from http.cookiejar import DefaultCookiePolicy
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, FastAPI
@@ -24,6 +26,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
     QbittorrentAuthError,
@@ -31,9 +34,10 @@ from plex_manager.adapters.qbittorrent import (
     QbittorrentSourceError,
 )
 from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
-from plex_manager.config import get_settings
+from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.logsafe import safe_int
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -42,6 +46,7 @@ from plex_manager.services import (
     log_capture_service,
     queue_service,
     retention_telemetry_service,
+    watchlist_service,
 )
 from plex_manager.services.health_service import (
     AutograbStatus,
@@ -57,6 +62,8 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
+    SettingsStore,
+    configured_setup_token,
     ensure_system_settings,
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
@@ -78,6 +85,9 @@ from plex_manager.web.deps import (
     get_parser,
     get_quality_profile,
     get_tv_root_optional,
+    get_watchlist_sync_enabled,
+    get_watchlist_sync_interval_minutes,
+    is_setup_token_required,
     resolve_prowlarr,
     resolve_qbittorrent,
     resolve_tmdb,
@@ -86,6 +96,7 @@ from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
     EventHub,
     current_build_id,
+    detect_multiworker_signals,
     get_event_hub,
     publish_realtime,
     warn_if_multiworker,
@@ -120,6 +131,49 @@ class _RejectAllResponseCookies(DefaultCookiePolicy):
 
 _logger = logging.getLogger(__name__)
 
+
+def _warn_if_multi_process() -> None:
+    """Warn loudly, once per process, if the environment implies >1 worker.
+
+    Several in-process registries assume a SINGLE Python process (issue #240):
+    ``services.queue_service``'s removal-physics guards (``_removals_in_flight`` /
+    ``_operator_fail_claims`` -- the same-hash grab/cancel/mark-failed race
+    closer), ``services.purge_service``'s purge-vs-import path serialization, and
+    ``web.routers.settings``'s ``_rotate_lock`` / ``_settings_update_lock`` are
+    all plain in-process ``dict``/``asyncio.Lock`` state with no cross-process
+    coordination -- each additional worker process (``uvicorn --workers>1``) or
+    container replica gets its OWN independent copy, silently REOPENING every
+    race those registries exist to close, with no error and no log line to say
+    so. This app deliberately does not build real multi-process coordination
+    (a DB-level lock/CAS) for that -- see this repo's CLAUDE.md north star
+    "honesty over silence": the fix here is making the violated assumption
+    LOUD at startup instead of leaving it silent, not adding the coordination
+    itself. Runs in EVERY worker process's own ``lifespan`` (never just the
+    first), so a multi-worker launch logs once per worker -- exactly the
+    operator-visible signal an install running more than one worker needs.
+
+    Uses :func:`~plex_manager.web.events.detect_multiworker_signals` -- the SAME
+    detection ``warn_if_multiworker`` uses for the realtime SSE hub's own
+    single-process invariant -- rather than looking at ``WEB_CONCURRENCY``
+    alone: a deployment that scales out via ``WORKERS``, ``UVICORN_WORKERS``, or
+    gunicorn's ``GUNICORN_CMD_ARGS`` breaks these registries exactly the same
+    way, and checking only one of the four signals would silently miss the
+    other three.
+    """
+    signals = detect_multiworker_signals()
+    if signals:
+        _logger.warning(
+            "multi-worker configuration detected (%s): this app assumes a "
+            "SINGLE process. Its in-process removal/settings-rotation guards "
+            "(queue_service, purge_service, web.routers.settings) do not "
+            "coordinate across worker processes or container replicas, so "
+            "running more than one silently reopens the same-hash download "
+            "races those guards exist to close. Run exactly one worker/replica "
+            "of this app.",
+            ", ".join(sorted(signals)),
+        )
+
+
 # How often the background reconciler reconciles the client, drains imports, and
 # confirms availability. A constant for the beta (a configurable interval / a
 # dedicated worker are noted follow-ups).
@@ -141,7 +195,7 @@ async def _ensure_update_coordinator(app: FastAPI) -> UpdateCoordinationService:
         return coordinator
     maker_obj = getattr(app.state, "sessionmaker", None)
     maker = (
-        cast("async_sessionmaker[AsyncSession]", maker_obj)
+        cast(async_sessionmaker[AsyncSession], maker_obj)
         if isinstance(maker_obj, async_sessionmaker)
         else get_sessionmaker()
     )
@@ -149,6 +203,106 @@ async def _ensure_update_coordinator(app: FastAPI) -> UpdateCoordinationService:
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
     return coordinator
+
+
+async def _watchlist_sync_once(app: FastAPI) -> int:
+    """Synchronize every reusable account token, isolating failures per user."""
+    maker = app.state.sessionmaker
+    client = app.state.http_client
+    status = getattr(app.state, "watchlist_status", None)
+    if not isinstance(status, watchlist_service.WatchlistWorkerStatus):
+        status = watchlist_service.WatchlistWorkerStatus()
+        app.state.watchlist_status = status
+    status.mark_started()
+    async with maker() as session:
+        if not await get_watchlist_sync_enabled(session):
+            status.mark_skipped("disabled")
+            return 0
+        try:
+            tmdb = await resolve_tmdb(app.state, session, client)
+        except ServiceNotConfiguredError:
+            status.mark_skipped("not_configured")
+            return 0
+        library = await get_library_optional(session, client)
+        users = await watchlist_service.list_sync_users(session)
+
+    created = 0
+    fetched = 0
+    existing = 0
+    failed_users = 0
+    failed_entries = 0
+    last_error: str | None = None
+    for user in users:
+        token = user.encrypted_plex_token
+        if token is None:
+            continue
+        try:
+            async with maker() as session:
+                result = await watchlist_service.sync_user(
+                    session,
+                    PlexWatchlist(client, token),
+                    tmdb,
+                    user_id=user.id,
+                    library=library,
+                )
+                created += result.created
+                fetched += result.fetched
+                existing += result.existing
+                if result.failed:
+                    failed_users += 1
+                    failed_entries += result.failed
+                    last_error = "WatchlistEntryError"
+        except Exception as exc:
+            failed_users += 1
+            last_error = type(exc).__name__
+            _logger.warning(
+                "watchlist sync failed for user_id=%s (%s); retaining the previous snapshot",
+                safe_int(user.id),
+                type(exc).__name__,
+            )
+    if created:
+        publish_realtime(app, ("requests", "queue", "discover"), reason="watchlist_sync")
+    status.mark_completed(
+        fetched=fetched,
+        created=created,
+        existing=existing,
+        failed_users=failed_users,
+        failed_entries=failed_entries,
+        error=last_error,
+    )
+    return created
+
+
+async def _watchlist_sync_loop(app: FastAPI) -> None:
+    """Run watchlist synchronization independently; one bad cycle never kills it."""
+    while True:
+        try:
+            await _watchlist_sync_once(app)
+        except Exception as exc:
+            status = getattr(app.state, "watchlist_status", None)
+            if isinstance(status, watchlist_service.WatchlistWorkerStatus):
+                status.mark_error(exc)
+            _logger.exception("watchlist sync tick failed; continuing")
+        try:
+            async with app.state.sessionmaker() as session:
+                interval = await get_watchlist_sync_interval_minutes(session)
+        except Exception:
+            interval = 15.0
+        wake_event = getattr(app.state, "watchlist_wake_event", None)
+        if not isinstance(wake_event, asyncio.Event):
+            wake_event = asyncio.Event()
+            app.state.watchlist_wake_event = wake_event
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=interval * 60.0)
+        except TimeoutError:
+            # Expected, not an error: the sync interval elapsed with no manual
+            # wake signal, which simply means it is time to run the next cycle.
+            # A fired wake_event (a settings change requesting an immediate
+            # re-sync) returns normally; both paths fall through to the next
+            # loop iteration, so there is nothing to log or surface here.
+            pass
+        finally:
+            wake_event.clear()
 
 
 def _get_reconcile_status(app: FastAPI) -> ReconcileStatus:
@@ -507,6 +661,14 @@ async def _log_drain_loop(app: FastAPI) -> None:
     while True:
         try:
             async with sessionmaker() as session:
+                # Refresh the capture handler's value-based redaction set
+                # (issue #268) EVERY tick, before draining -- ``emit`` (running
+                # synchronously off any thread, no DB access of its own -- see
+                # ``LogCaptureHandler.secret_values``) reads whatever this loop
+                # last assigned here, so a settings change (a rotated api key,
+                # a newly-configured qBittorrent password) is picked up within
+                # one drain interval rather than requiring a restart.
+                handler.secret_values = await SettingsStore(session).secret_values()
                 repo = SqlLogEventRepository(session)
                 drained = await log_capture_service.drain_once(handler.queue, repo, handler=handler)
                 try:
@@ -860,6 +1022,115 @@ async def _adapter_error_handler(request: Request, exc: Exception) -> Response:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
+# Bind addresses a browser can never dial directly (Docker's default
+# ``PLEX_MANAGER_HOST=0.0.0.0`` chief among them). The startup setup-URL hint
+# (issue #65) substitutes ``localhost`` for these, the same convention Jupyter's
+# own "copy this URL" hint uses for the identical reason -- the operator maps the
+# container's published port to a reachable host themselves via
+# ``docker-compose.yml``/``-p``, so the app has no way to know that host itself.
+_UNDIALABLE_BIND_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", ""})  # noqa: S104
+
+
+#: Appended to the printed setup URL whenever the externally-reachable host port
+#: could not actually be confirmed (:data:`Settings.host_port` unset) -- i.e. this
+#: process is not running under the documented ``docker-compose.yml`` (which hands
+#: ``PLEX_MANAGER_HOST_PORT`` to the container itself, see that file), so the URL
+#: below falls back to guessing the host port equals the in-container ``port``.
+#: That guess is right for bare-metal/no-Docker installs (no port mapping at all)
+#: and for the documented compose file's own 8000 default, but silently WRONG for
+#: any other port-remapped container launch (a hand-rolled ``docker run -p
+#: 9000:8000`` with no equivalent env var set) -- so the hint says so explicitly
+#: rather than asserting a link that may not resolve.
+_UNCONFIRMED_HOST_PORT_NOTE: Final = (
+    " (port guessed from the in-container value; if this is a container published"
+    " under a different host port, use that port instead -- set PLEX_MANAGER_HOST_PORT"
+    " to fix this link)"
+)
+
+
+def _setup_ready_url(settings: Settings) -> str:
+    """Build the Jupyter-notebook-style "click to finish setup" URL (issue #65).
+
+    Always points at ``/setup`` -- the wizard's actual mounted route -- rather
+    than the bare origin: a bare ``/`` would bounce through ``SetupGate``'s
+    client-side redirect to ``/setup`` first, and that redirect does not carry
+    the fragment along either, but the wizard's own ``useEffect`` reads
+    ``window.location.hash`` before that redirect fires (see ``SetupWizard.tsx``),
+    so the token still survives it.
+
+    Prefers ``settings.host_port`` (the container's PUBLISHED host port, see that
+    field's docstring) over ``settings.port`` (the in-container port) -- a Docker
+    install commonly remaps these, and only the host port is ever reachable from
+    the operator's browser. Falls back to ``settings.port`` with an explicit
+    caveat (:data:`_UNCONFIRMED_HOST_PORT_NOTE`) when the host port genuinely
+    cannot be confirmed from inside the container, rather than asserting a link
+    that may silently be wrong.
+
+    ``#setup_token=`` -- a URL FRAGMENT, never a query parameter -- is appended
+    ONLY when a token is both configured and actually enforced
+    (:func:`is_setup_token_required` already folds in ``dev_auth_bypass``); an
+    unset/bypassed token has nothing to disclose. A fragment is deliberate: it is
+    never sent to the server by a browser (unlike a query string), so it can
+    never land in ``uvicorn``'s access log -- or any reverse-proxy log -- when the
+    operator clicks this exact link, closing that credential-exposure window
+    without changing what the wizard accepts, only how it is carried to the
+    browser. This is a discoverability aid only (ADR-0005's install-time
+    exception).
+    """
+    host = settings.host if settings.host not in _UNDIALABLE_BIND_HOSTS else "localhost"
+    if settings.host_port is not None:
+        port: int = settings.host_port
+        note = ""
+    else:
+        port = settings.port
+        note = _UNCONFIRMED_HOST_PORT_NOTE
+    url = f"http://{host}:{port}/setup"
+    if is_setup_token_required():
+        token = configured_setup_token()
+        if token:
+            url = f"{url}#setup_token={quote(token, safe='')}"
+    return f"{url}{note}"
+
+
+def _emit_setup_ready_hint(url: str) -> None:
+    """Print the ready-to-click setup line (issue #65) so it ACTUALLY reaches
+    ``docker logs`` -- the entire point of the hint -- rather than silently going
+    nowhere.
+
+    Deliberately a plain ``print(..., file=sys.stderr)``, NOT a call through this
+    module's own ``_logger``:
+
+    * The production entry point (``__main__.main``) runs under ``uvicorn.run``
+      with ITS default logging config, which attaches handlers only to the
+      ``uvicorn``/``uvicorn.error``/``uvicorn.access`` loggers (with
+      ``propagate=False``) -- never to the root logger this app's own
+      ``_logger = logging.getLogger(__name__)`` propagates up to. A plain
+      ``_logger.info(...)`` call here has nowhere to go: it is not one of
+      uvicorn's own loggers, and the ONLY handler ``configure_logging`` (just
+      above) attaches to the root logger is :class:`~plex_manager.services.
+      log_capture_service.LogCaptureHandler`, which persists to the in-app log
+      viewer/DB, never to stderr.
+    * Even if it DID reach a stderr-attached handler, the token would arrive
+      redacted: every record that handler captures is run through
+      :func:`~plex_manager.logsafe.redact_secrets` (issue #153 defense in
+      depth), which matches ANY ``token=<value>`` shape -- including this
+      line's own ``setup_token=`` -- and masks it. That redaction is CORRECT
+      for the durable, exportable log store (secrets are never persisted), but
+      would silently defeat the one thing this specific line exists to do:
+      hand the operator the real, usable token.
+
+    So this line bypasses the logging pipeline entirely for the one thing that
+    must survive both hazards intact: the literal, clickable URL, in the one
+    place (the container's own stdout/stderr) every deployment can always read
+    via ``docker logs`` regardless of ``log_level``, log-capture wiring, or
+    redaction. A companion ``_logger.info`` call still records the (redacted)
+    line into the in-app log viewer, matching the previous behaviour for
+    operators who already have the UI open, but is no longer the ONLY copy.
+    """
+    print(f"Setup: {url}", file=sys.stderr, flush=True)
+    _logger.info("Setup: %s", url)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Prepare persistence + encryption, then share an HTTP client for adapters.
@@ -875,7 +1146,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     (``config.log_level`` applied to the root logger here, for the first time —
     previously defined but unused), and its sibling drain/eviction background
     tasks — each on its OWN interval, never the 15s reconcile tick.
+
+    Also asserts the single-process assumption (issue #240): see
+    :func:`_warn_if_multi_process`. First, so it fires before anything else --
+    including a slow encryption/DB step -- ever gets a chance to run.
     """
+    _warn_if_multi_process()
     maker = get_sessionmaker()
     app.state.sessionmaker = maker
     async with maker() as session:
@@ -891,13 +1167,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
+    app.state.watchlist_wake_event = asyncio.Event()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
     # it survives across auto-grab ticks; a restart clears it, like the health record.
     autograb_cooldowns: auto_grab_service.CooldownRegistry = {}
     app.state.autograb_cooldowns = autograb_cooldowns
 
     log_handler = log_capture_service.configure_logging(get_settings().log_level)
+    # Seed the value-based redaction set (issue #268) BEFORE serving traffic --
+    # without this, a request handled in the up-to-``LOG_DRAIN_INTERVAL_SECONDS``
+    # window before ``_log_drain_loop``'s first tick would capture logs with an
+    # empty ``secret_values``, missing this pass entirely for that brief window.
+    async with maker() as seed_session:
+        log_handler.secret_values = await SettingsStore(seed_session).secret_values()
     app.state.log_handler = log_handler
+    if not initialized:
+        _emit_setup_ready_hint(_setup_ready_url(get_settings()))
     # The background reconciler closes the request -> grab -> import -> available
     # loop without a GET /queue poll having to do the heavy work. The auto-grab
     # worker (ADR-0013) is what turns a fresh request INTO a grab in the first
@@ -907,7 +1193,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     autograb_task = asyncio.create_task(_autograb_loop(app))
     log_drain_task = asyncio.create_task(_log_drain_loop(app))
     eviction_task = asyncio.create_task(_eviction_loop(app))
-    background_tasks = (reconcile_task, autograb_task, log_drain_task, eviction_task)
+    watchlist_task = asyncio.create_task(_watchlist_sync_loop(app))
+    background_tasks = (
+        reconcile_task,
+        autograb_task,
+        log_drain_task,
+        eviction_task,
+        watchlist_task,
+    )
     try:
         yield
     finally:

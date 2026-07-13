@@ -60,6 +60,8 @@ from plex_manager.web.deps import (
     PLEX_MACHINE_ID_SETTING,
     SECRET_MASK,
     SECRET_SETTING_KEYS,
+    WATCHLIST_SYNC_ENABLED_DEFAULT,
+    WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -78,6 +80,7 @@ from plex_manager.web.deps import (
     resolve_eviction_interval_minutes,
     resolve_log_max_rows,
     resolve_log_retention_days,
+    resolve_watchlist_sync_interval_minutes,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams, publish_realtime
@@ -206,6 +209,7 @@ _BOOL_SETTING_DEFAULTS: dict[str, bool] = {
     "auto_grab_enabled": AUTO_GRAB_ENABLED_DEFAULT,
     "automatic_updates_enabled": AUTOMATIC_UPDATES_ENABLED_DEFAULT,
     "automatic_update_idle_only": AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
+    "watchlist_sync_enabled": WATCHLIST_SYNC_ENABLED_DEFAULT,
 }
 
 _UPDATE_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
@@ -340,6 +344,16 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | N
         interval,
         EVICTION_INTERVAL_MINUTES_DEFAULT,
         interval_honored,
+    )
+
+    watchlist_interval, watchlist_interval_honored = resolve_watchlist_sync_interval_minutes(
+        raw.get("watchlist_sync_interval_minutes")
+    )
+    out["watchlist_sync_interval_minutes"] = _present_effective(
+        raw.get("watchlist_sync_interval_minutes"),
+        watchlist_interval,
+        WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+        watchlist_interval_honored,
     )
 
     grace, grace_honored = resolve_eviction_grace_days(raw.get("eviction_grace_days"))
@@ -1054,6 +1068,15 @@ async def put_settings_endpoint(
                     .values(revoked_at=datetime.now(UTC))
                 )
         await session.commit()
+
+        # A long configured interval must not postpone an enable/shorten change
+        # until the old sleep expires. The worker owns this process-local event.
+        if written_fields.intersection(
+            {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
+        ):
+            wake_event = getattr(request.app.state, "watchlist_wake_event", None)
+            if isinstance(wake_event, asyncio.Event):
+                wake_event.set()
 
         # Clear backend probe caches before publishing: a listening tab can refetch
         # immediately on the SSE event, so publishing first could race it into the

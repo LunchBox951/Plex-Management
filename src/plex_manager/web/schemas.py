@@ -78,6 +78,7 @@ __all__ = [
     "SearchPreviewRequest",
     "SearchPreviewResponse",
     "SeasonStatus",
+    "ServiceNotConfiguredErrorDetail",
     "ServiceValidateResponse",
     "SettingsResponse",
     "SettingsUpdate",
@@ -94,6 +95,7 @@ __all__ = [
     "UpdateOutcomeRequest",
     "UpdateResultItem",
     "UpdateStatusResponse",
+    "WatchlistStatusItem",
 ]
 
 MediaTypeField = Literal["movie", "tv"]
@@ -122,6 +124,25 @@ class ErrorDetail(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     detail: str
+
+
+class ServiceNotConfiguredErrorDetail(BaseModel):
+    """Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).
+
+    The app-wide handler (``app._service_not_configured_handler``) always
+    renders ``{"detail": "service_not_configured", "service": "<name>"}`` --
+    a REQUIRED ``service`` field, not the bare ``{"detail": ...}`` of
+    :class:`ErrorDetail`. Endpoints that can raise this error must reference
+    this model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the
+    generated client type carries ``service`` and callers can route the
+    operator straight to that service's setup step instead of losing the
+    field to the generic shape.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: Literal["service_not_configured"] = "service_not_configured"
+    service: str
 
 
 class ErrorEnvelope(BaseModel):
@@ -569,6 +590,8 @@ class SettingsResponse(BaseModel):
     automatic_update_window_start: str | None = None
     automatic_update_window_end: str | None = None
     automatic_update_idle_only: bool | None = None
+    watchlist_sync_enabled: bool | None = None
+    watchlist_sync_interval_minutes: float | None = None
 
 
 class AppApiKeyResponse(BaseModel):
@@ -728,6 +751,10 @@ class SettingsUpdate(BaseModel):
         if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized) is None:
             raise ValueError("automatic update times must use 24-hour HH:MM format")
         return normalized
+    watchlist_sync_enabled: bool | None = Field(default=None)
+    watchlist_sync_interval_minutes: float | None = Field(
+        default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
 
     @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
     @classmethod
@@ -1162,6 +1189,9 @@ class RequestResponse(BaseModel):
     # select this title (or, for a show, any of its seasons) regardless of watch
     # state or disk pressure. Toggled via ``POST /requests/{id}/keep-forever``.
     keep_forever: bool = False
+    # Capability is computed for the current caller. Request creators and admins
+    # may pin, report, or cancel; subscribers may observe the shared request only.
+    can_mutate: bool = False
 
 
 class RequestListResponse(BaseModel):
@@ -1473,6 +1503,21 @@ class AutograbStatusItem(BaseModel):
     cooled_down_scopes: int = 0
 
 
+class WatchlistStatusItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    last_error_at: datetime | None = None
+    fetched: int = 0
+    created: int = 0
+    existing: int = 0
+    failed_users: int = 0
+    failed_entries: int = 0
+
+
 class HealthResponse(BaseModel):
     """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
     healthy, is the reconcile loop running, how full is the disk"."""
@@ -1483,6 +1528,7 @@ class HealthResponse(BaseModel):
     disks: list[DiskGaugeItem]
     reconcile: ReconcileStatusItem
     autograb: AutograbStatusItem
+    watchlist: WatchlistStatusItem
 
 
 # --------------------------------------------------------------------------- #

@@ -85,6 +85,9 @@ function browserTimezone(): string {
     return 'UTC'
   }
 }
+const WATCHLIST_SYNC_ENABLED_DEFAULT = true
+const WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT = 15
+const WATCHLIST_SYNC_INTERVAL_MINUTES_MAX = 10_080
 
 interface FormState {
   plex_url: string
@@ -120,6 +123,8 @@ interface FormState {
   automatic_update_window_start: string
   automatic_update_window_end: string
   automatic_update_idle_only: boolean
+  watchlist_sync_enabled: boolean
+  watchlist_sync_interval_minutes: string
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -164,6 +169,10 @@ function initialForm(data: SettingsResponse): FormState {
       data.automatic_update_window_end ?? AUTOMATIC_UPDATE_WINDOW_END_DEFAULT,
     automatic_update_idle_only:
       data.automatic_update_idle_only ?? AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
+    watchlist_sync_enabled: data.watchlist_sync_enabled ?? WATCHLIST_SYNC_ENABLED_DEFAULT,
+    watchlist_sync_interval_minutes: String(
+      data.watchlist_sync_interval_minutes ?? WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
+    ),
   }
 }
 
@@ -185,6 +194,7 @@ type NumberKey =
   | 'disk_pressure_target_percent'
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
+  | 'watchlist_sync_interval_minutes'
   | 'log_retention_days'
   | 'log_max_rows'
 type BoolKey =
@@ -193,6 +203,7 @@ type BoolKey =
   | 'auto_grab_enabled'
   | 'automatic_updates_enabled'
   | 'automatic_update_idle_only'
+  | 'watchlist_sync_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
 // validation below so an invalid field's toast names it the same way the form
@@ -202,6 +213,7 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   disk_pressure_target_percent: 'Pressure target (%)',
   eviction_grace_days: 'Eviction grace period (days)',
   eviction_interval_minutes: 'Eviction check interval (minutes)',
+  watchlist_sync_interval_minutes: 'Watchlist sync interval (minutes)',
   log_retention_days: 'Log retention (days)',
   log_max_rows: 'Log retention (max rows)',
 }
@@ -751,6 +763,15 @@ export function Settings() {
         return
       }
     }
+    const watchlistInterval = Number(form.watchlist_sync_interval_minutes)
+    if (watchlistInterval <= 0 || watchlistInterval > WATCHLIST_SYNC_INTERVAL_MINUTES_MAX) {
+      toast({
+        title: 'Save failed',
+        description: `Watchlist sync interval must be greater than 0 and at most ${WATCHLIST_SYNC_INTERVAL_MINUTES_MAX} minutes.`,
+        intent: 'error',
+      })
+      return
+    }
 
     if (!isIanaTimezone(form.automatic_update_timezone)) {
       toast({
@@ -844,6 +865,8 @@ export function Settings() {
       automatic_update_window_start: form.automatic_update_window_start,
       automatic_update_window_end: form.automatic_update_window_end,
       automatic_update_idle_only: form.automatic_update_idle_only,
+      watchlist_sync_enabled: form.watchlist_sync_enabled,
+      watchlist_sync_interval_minutes: Number(form.watchlist_sync_interval_minutes),
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -1250,6 +1273,16 @@ export function Settings() {
               'Enable auto-grab',
               'Automatically search and grab pending requests. Turn off to grab ' +
                 'only via the manual button on each title.',
+            )}
+            {checkboxField(
+              'watchlist_sync_enabled',
+              'Enable Plex watchlist sync',
+              'Create requests from every signed-in user’s Plex watchlist and protect them from eviction.',
+            )}
+            {numberField(
+              'watchlist_sync_interval_minutes',
+              'Watchlist sync interval (minutes)',
+              { min: 0.1, max: WATCHLIST_SYNC_INTERVAL_MINUTES_MAX, step: 0.1 },
             )}
           </div>
         </section>

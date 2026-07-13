@@ -55,6 +55,7 @@ __all__ = [
     "MediaType",
     "RequestDedupLock",
     "RequestStatus",
+    "RequestSubscriber",
     "SeasonEpisodeState",
     "SeasonRequest",
     "Setting",
@@ -62,6 +63,7 @@ __all__ = [
     "TmdbCache",
     "UpdateCoordinatorState",
     "User",
+    "WatchlistItem",
 ]
 
 
@@ -297,17 +299,26 @@ class SystemSettings(Base):
 
 
 class AuthSession(Base):
-    """HTTP-only browser session for a Plex-authenticated user.
+    """HTTP-only browser session, minted by Plex sign-in OR the recovery key.
 
     Only the SHA-256 digest of the random cookie token is stored. Revocation sets
     ``revoked_at`` rather than deleting so logout/session behavior remains
     auditable without retaining a usable bearer token.
+
+    ``user_id`` is NULL for a **recovery session** — one minted by exchanging a
+    valid ``X-Api-Key`` for this same HTTP-only cookie (``POST /auth/api-key``,
+    CodeQL #263). The recovery key is an admin-authority credential with no Plex
+    identity, so a session it mints has no owning user; it authenticates exactly
+    as direct ``X-Api-Key`` auth does (admin, no ``user``). A Plex sign-in session
+    always carries its owning ``users.id``.
     """
 
     __tablename__ = "auth_sessions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -463,6 +474,43 @@ class MediaRequest(Base):
     tv_request_mode: Mapped[str | None] = mapped_column(String)
     requested_seasons_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
     requested_episodes_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
+
+
+class RequestSubscriber(Base):
+    """A user who can see a shared request without becoming its creator.
+
+    ``MediaRequest.user_id`` remains the immutable creator/audit field.  This
+    association captures every user who expressed request intent, including the
+    creator, so active-title dedup can stay global without hiding the result from
+    later requesters.
+    """
+
+    __tablename__ = "request_subscribers"
+
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    subscribed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class WatchlistItem(Base):
+    """One title in a user's last completely synchronized Plex watchlist."""
+
+    __tablename__ = "watchlist_items"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    tmdb_id: Mapped[int] = mapped_column(primary_key=True)
+    media_type: Mapped[MediaType] = mapped_column(
+        _enum(MediaType, name="ck_watchlist_items_media_type_enum"), primary_key=True
+    )
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class RequestDedupLock(Base):

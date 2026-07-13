@@ -4248,7 +4248,7 @@ async def test_heal_sibling_collapse_cas_skips_when_ownership_changed_since_read
     """``delete_false_available_sibling_collapse`` must not delete a row whose
     ownership no longer matches the caller's snapshot -- the CAS guarding
     the exact race a concurrent user create's adoption
-    (``request_service._claim_dedup_winner_if_unowned``) can win in the
+    (``request_service._subscribe_dedup_winner``) can win in the
     multi-second window between the heal pass's top-of-cycle candidate read
     and this delete: an ownerless false-available row is claimed by user X's
     concurrent create (``find_in_library`` ranks it above a foreign-owned
@@ -4774,9 +4774,11 @@ async def test_heal_owned_candidate_adopts_ownerless_sibling_then_collapses(
     FIRST, then collapses onto it -- so the owner keeps the (now real-path) row."""
     async with sessionmaker_() as session:
         owner_a = User(username="owner-adopt", permissions=0)
-        session.add(owner_a)
+        viewer = User(username="owner-adopt-viewer", permissions=0)
+        session.add_all((owner_a, viewer))
         await session.commit()
         owner_a_id = owner_a.id
+        viewer_id = viewer.id
     false_id = await _seed_movie_request(
         sessionmaker_,
         tmdb_id=788,
@@ -4791,6 +4793,9 @@ async def test_heal_owned_candidate_adopts_ownerless_sibling_then_collapses(
         library_path="/movies/ownerless",
         user_id=None,  # ownerless real-path sibling
     )
+    async with sessionmaker_() as session:
+        await SqlRequestRepository(session).add_subscriber(false_id, viewer_id)
+        await session.commit()
     library = FakeLibrary()  # collapse needs no Plex answer
 
     with caplog.at_level(logging.INFO, logger=_IMPORT_SERVICE_LOGGER):
@@ -4804,6 +4809,9 @@ async def test_heal_owned_candidate_adopts_ownerless_sibling_then_collapses(
     assert sibling_row is not None
     assert sibling_row.user_id == owner_a_id  # adopted FIRST so the owner keeps visibility
     assert sibling_row.library_path == "/movies/ownerless"
+    async with sessionmaker_() as session:
+        assert await SqlRequestRepository(session).is_subscriber(sibling_id, owner_a_id)
+        assert await SqlRequestRepository(session).is_subscriber(sibling_id, viewer_id)
     assert any("adopted an ownerless sibling" in r.getMessage() for r in caplog.records)
 
 

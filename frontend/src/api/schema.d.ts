@@ -4,6 +4,42 @@
  */
 
 export interface paths {
+    "/api/v1/auth/api-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange Api Key Endpoint
+         * @description Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.
+         *
+         *     The recovery / automation key (ADR-0005, ADR-0016) is the terminal-free
+         *     break-glass credential that authenticates when plex.tv is unreachable. Before
+         *     this endpoint the browser had to keep the raw key in JS-readable
+         *     ``localStorage`` so the break-glass path survived a reload — exactly the
+         *     cleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the
+         *     same cookie the Plex sign-in flow mints means the key never needs JS-readable
+         *     storage: the resulting session is an admin-authority recovery session with no
+         *     Plex identity (``auth_sessions.user_id`` NULL), and every later request
+         *     authenticates by the HTTP-only cookie exactly like a Plex session does.
+         *
+         *     The key is validated against the stored ``SystemSettings.app_api_key`` with a
+         *     constant-time compare — accepting a Plex session cookie here (as
+         *     ``require_api_key`` would) is deliberately NOT done: that would let any
+         *     signed-in NON-admin mint an ADMIN recovery session. Only a caller who proves
+         *     the recovery key gets one.
+         */
+        post: operations["exchange_api_key_endpoint_api_v1_auth_api_key_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/logout": {
         parameters: {
             query?: never;
@@ -441,12 +477,20 @@ export interface paths {
          *     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
          *
          *     Every message is passed through :func:`~plex_manager.logsafe.
-         *     redact_secrets` again here (issue #153) as a SECOND, independent line of
-         *     defense on top of the capture-time pass (``log_capture_service._capture``)
-         *     -- this is the boundary the blueprint explicitly calls out ("the log store
-         *     never records a secret"), and a row written before this redaction pass
+         *     redact_known_secrets` (issue #268), against THIS instant's decrypted
+         *     secret values -- catching a since-rotated secret and the shape-grammar
+         *     gaps (cookie-jar/mapping dumps, basic-auth passwords containing ``@``)
+         *     issue #270 documents -- and THEN through :func:`~plex_manager.logsafe.
+         *     redact_secrets` (issue #153) as a SECOND, independent line of defense on
+         *     top of the capture-time passes (``log_capture_service._capture``) -- this
+         *     is the boundary the blueprint explicitly calls out ("the log store never
+         *     records a secret"), and a row written before these redaction passes
          *     existed, or by any future path that bypasses the capture pipeline, must
-         *     still never leave this endpoint carrying one.
+         *     still never leave this endpoint carrying one. Value-based FIRST,
+         *     deliberately: see ``log_capture_service._capture``'s docstring for why
+         *     running the shape grammar first can mangle a secret (a basic-auth password
+         *     containing ``@``, concretely) before the value-based exact-match search
+         *     ever sees it whole.
          */
         get: operations["export_logs_endpoint_api_v1_ops_logs_export_get"];
         put?: never;
@@ -745,7 +789,8 @@ export interface paths {
          *     this one": a pinned title (or, for a show, every one of its seasons -- the
          *     pin lives on the parent) is never selected by ``domain/eviction.py``
          *     regardless of watch state or disk pressure. A 404 for an unknown id, never
-         *     a silent no-op.
+         *     a silent no-op. Open to the request's creator or an admin; a non-admin only
+         *     ever moves their own rows, never another user's eviction protection.
          */
         post: operations["keep_forever_endpoint_api_v1_requests__request_id__keep_forever_post"];
         delete?: never;
@@ -1860,6 +1905,7 @@ export interface components {
             reconcile: components["schemas"]["ReconcileStatusItem"];
             /** Subsystems */
             subsystems: components["schemas"]["SubsystemHealthItem"][];
+            watchlist: components["schemas"]["WatchlistStatusItem"];
         };
         /**
          * KeepForeverBody
@@ -2234,6 +2280,11 @@ export interface components {
         RequestResponse: {
             /** Backdrop Url */
             backdrop_url?: string | null;
+            /**
+             * Can Mutate
+             * @default false
+             */
+            can_mutate: boolean;
             /** Download Progress */
             download_progress?: number | null;
             /** Id */
@@ -2338,6 +2389,29 @@ export interface components {
             target_episode_count?: number | null;
         };
         /**
+         * ServiceNotConfiguredErrorDetail
+         * @description Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).
+         *
+         *     The app-wide handler (``app._service_not_configured_handler``) always
+         *     renders ``{"detail": "service_not_configured", "service": "<name>"}`` --
+         *     a REQUIRED ``service`` field, not the bare ``{"detail": ...}`` of
+         *     :class:`ErrorDetail`. Endpoints that can raise this error must reference
+         *     this model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the
+         *     generated client type carries ``service`` and callers can route the
+         *     operator straight to that service's setup step instead of losing the
+         *     field to the generic shape.
+         */
+        ServiceNotConfiguredErrorDetail: {
+            /**
+             * Detail
+             * @default service_not_configured
+             * @constant
+             */
+            detail: "service_not_configured";
+            /** Service */
+            service: string;
+        };
+        /**
          * ServiceValidateResponse
          * @description Result of a connection check. ``message`` is operator-facing; ``detail``
          *     is an optional diagnostic. Neither ever contains a secret value.
@@ -2435,6 +2509,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SettingsUpdate
@@ -2519,6 +2597,10 @@ export interface components {
             tmdb_api_key?: string | null;
             /** Tv Root */
             tv_root?: string | null;
+            /** Watchlist Sync Enabled */
+            watchlist_sync_enabled?: boolean | null;
+            /** Watchlist Sync Interval Minutes */
+            watchlist_sync_interval_minutes?: number | null;
         };
         /**
          * SetupCompleteRequest
@@ -2828,6 +2910,47 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /** WatchlistStatusItem */
+        WatchlistStatusItem: {
+            /**
+             * Created
+             * @default 0
+             */
+            created: number;
+            /**
+             * Existing
+             * @default 0
+             */
+            existing: number;
+            /**
+             * Failed Entries
+             * @default 0
+             */
+            failed_entries: number;
+            /**
+             * Failed Users
+             * @default 0
+             */
+            failed_users: number;
+            /**
+             * Fetched
+             * @default 0
+             */
+            fetched: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
+        };
     };
     responses: never;
     parameters: never;
@@ -2837,6 +2960,26 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    exchange_api_key_endpoint_api_v1_auth_api_key_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthMeResponse"];
+                };
+            };
+        };
+    };
     logout_endpoint_api_v1_auth_logout_post: {
         parameters: {
             query?: never;
@@ -3754,15 +3897,6 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Already requested by another user */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
-                };
-            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -3832,6 +3966,24 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RequestResponse"];
+                };
+            };
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Not cancellable in its current state, an import is in progress, or qBittorrent is required but not configured */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
                 };
             };
             /** @description Validation Error */
@@ -3922,13 +4074,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Validation error, or a tv request reported without a season */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };

@@ -205,6 +205,90 @@ async def test_capture_redacts_a_secret_split_across_format_args(
     assert "token=<redacted>" in message
 
 
+# --------------------------------------------------------------------------- #
+# Capture-time VALUE-based redaction (issue #268): LogCaptureHandler.secret_values
+# is the synchronous snapshot _capture masks against, refreshed by
+# web/app.py's _log_drain_loop -- exercised directly here via the handler
+# attribute rather than a real settings-store round trip (which lives in the
+# web-layer integration tests). See test_logsafe.py for the pure-function unit
+# tests of redact_known_secrets itself.
+# --------------------------------------------------------------------------- #
+async def test_capture_masks_a_configured_secret_value_regardless_of_shape(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    """A secret VALUE the handler was handed is masked wherever it appears --
+    no key name, no recognizable shape needed, unlike the #153 grammar above."""
+    handler.secret_values = frozenset({"FAKEVALUEBASEDSECRET123"})
+    test_logger.addHandler(handler)
+    test_logger.info("third-party client said: FAKEVALUEBASEDSECRET123 was rejected")
+    await asyncio.sleep(0)
+
+    message = handler.ring_buffer[-1].message
+    assert "FAKEVALUEBASEDSECRET123" not in message
+    assert "<redacted>" in message
+
+
+async def test_capture_value_based_pass_is_a_noop_with_no_configured_secrets(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    """The default (never-refreshed) ``secret_values`` is an empty frozenset --
+    capture behaves exactly as it did before issue #268 for any install with
+    no configured secrets yet (e.g. pre-setup)."""
+    assert handler.secret_values == frozenset()
+    test_logger.addHandler(handler)
+    test_logger.info("nothing configured yet, mentions FAKEVALUEBASEDSECRET123 in prose")
+    await asyncio.sleep(0)
+
+    assert handler.ring_buffer[-1].message == (
+        "nothing configured yet, mentions FAKEVALUEBASEDSECRET123 in prose"
+    )
+
+
+@pytest.mark.parametrize(
+    ("message_template", "secret"),
+    [
+        # issue #270, gap 1: a cookie-jar/mapping repr dump -- NOT a raw
+        # ``name=value`` cookie assignment, so the #153 shape grammar's
+        # ``_COOKIE_RE`` never fires on it (see test_logsafe.py's
+        # ``test_cookie_jar_mapping_repr_dump_is_not_caught_by_shape_grammar``
+        # for the direct proof of that gap). The value-based pass has no such
+        # blind spot.
+        ("outgoing cookies: {'plexmgr.session': '%s'}", "sFAKESESSIONVALUE1234567890"),
+        # issue #270, gap 2: a basic-auth URL whose password itself contains a
+        # raw ``@`` -- the #153 shape grammar's URL pass stops at the
+        # password's OWN first internal ``@`` and leaves the remainder
+        # exposed (see test_logsafe.py's
+        # ``test_basic_auth_password_with_raw_at_sign_leaks_past_shape_grammar``).
+        (
+            "connecting to https://tracker_user:%s@tracker.example.com/announce",
+            "p@ssw0rd0123456789",
+        ),
+    ],
+)
+async def test_capture_masks_issue_270_shape_grammar_gaps_via_value_pass(
+    test_logger: logging.Logger,
+    handler: LogCaptureHandler,
+    message_template: str,
+    secret: str,
+) -> None:
+    """End-to-end regression proof (issue #270 folded into issue #268's test
+    matrix): given the app's actual configured secret value, BOTH deferred
+    shape-grammar gaps are still fully masked at the real capture call site --
+    not just in the pure ``logsafe`` unit tests."""
+    handler.secret_values = frozenset({secret})
+    test_logger.addHandler(handler)
+    test_logger.info(message_template, secret)
+    await asyncio.sleep(0)
+
+    message = handler.ring_buffer[-1].message
+    assert secret not in message
+    # No fragment of the raw secret should survive either (guards against a
+    # PARTIAL match leaving a suffix/prefix exposed, exactly the #270 failure
+    # mode the value-based pass exists to close).
+    assert "ssw0rd0123456789" not in message
+    assert "sFAKESESSIONVALUE1234567890" not in message
+
+
 async def test_exception_traceback_is_appended_to_the_message(
     test_logger: logging.Logger, handler: LogCaptureHandler
 ) -> None:

@@ -34,6 +34,7 @@ __all__ = [
     "RealtimeEvent",
     "close_realtime_streams",
     "current_build_id",
+    "detect_multiworker_signals",
     "get_event_hub",
     "publish_realtime",
     "warn_if_multiworker",
@@ -254,16 +255,22 @@ def current_build_id() -> str:
     return os.environ.get(_BUILD_ID_ENV) or __version__
 
 
-def warn_if_multiworker() -> None:
-    """Log a loud WARNING when a multi-worker deployment is detectable.
+def detect_multiworker_signals() -> set[str]:
+    """Return the env var names hinting this process is one of >1 workers.
 
-    The in-process hub only fans events out within its own process, so more than
-    one worker silently drops realtime events for clients pinned to a sibling
-    worker (the polling floor still heals the UI, but the realtime path is wrong).
-    We can only *detect* the common signals — ``WEB_CONCURRENCY``, gunicorn's
-    ``--workers`` via ``GUNICORN_CMD_ARGS``/``WORKERS``, or ``UVICORN_WORKERS`` —
-    the true worker count is not introspectable from inside a worker. This is a
-    best-effort guard, deliberately noisy rather than silent (north-star #3).
+    Shared by :func:`warn_if_multiworker` (this module's realtime-SSE-hub
+    warning) and ``web.app._warn_if_multi_process`` (the in-process
+    removal/settings-rotation-guard warning) -- BOTH have their own
+    single-process invariant broken by the exact same set of multi-worker
+    configurations, so the detection lives in ONE place rather than each
+    warning re-deriving (and risking drifting out of sync with) its own
+    partial list. We can only *detect* the common signals -- ``WEB_CONCURRENCY``,
+    gunicorn's ``--workers`` via ``GUNICORN_CMD_ARGS``/``WORKERS``, or
+    ``UVICORN_WORKERS`` -- the true worker count is not introspectable from
+    inside a worker. A malformed value (a process manager's own non-integer
+    convention, e.g. gunicorn's ``"auto"``) is tolerated and simply doesn't
+    count as a signal, never raised -- this is a best-effort, advisory-only
+    scan.
     """
     signals: set[str] = set()
     for var in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "WORKERS"):
@@ -279,6 +286,19 @@ def warn_if_multiworker() -> None:
     gunicorn_workers = _GUNICORN_WORKERS_RE.search(gunicorn_args)
     if gunicorn_workers is not None and int(gunicorn_workers.group(1)) > 1:
         signals.add("GUNICORN_CMD_ARGS")
+    return signals
+
+
+def warn_if_multiworker() -> None:
+    """Log a loud WARNING when a multi-worker deployment is detectable.
+
+    The in-process hub only fans events out within its own process, so more than
+    one worker silently drops realtime events for clients pinned to a sibling
+    worker (the polling floor still heals the UI, but the realtime path is wrong).
+    See :func:`detect_multiworker_signals` for the detectable signals. This is a
+    best-effort guard, deliberately noisy rather than silent (north-star #3).
+    """
+    signals = detect_multiworker_signals()
     if signals:
         _logger.warning(
             "realtime SSE hub is in-process and single-worker only, but a "

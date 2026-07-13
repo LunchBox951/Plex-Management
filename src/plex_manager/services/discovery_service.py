@@ -59,6 +59,15 @@ _PERSONALIZED_ROW_LIMIT = 2
 # subsequent load probes, so the whole history still participates over time.
 _PERSONALIZATION_PROBE_LIMIT = _PERSONALIZED_ROW_LIMIT * 4
 _METRIC_ORDER: tuple[RecommendationMetric, ...] = ("genre", "director", "cast", "anime")
+# A personalized shelf is worth showing only when it offers a genuine "more like
+# this" set (issue #277): an obscure seed's facet can round-trip a TMDB discover
+# page with just one or two results, which after the self-filter below can leave
+# a shelf effectively built from (and standing in for) a single outlier title --
+# e.g. a small-budget "Obsession" ending up as the entirety of its own genre
+# shelf. Small and deliberately a single named constant so it's easy to find and
+# retune; tighten/loosen this ONE value to change the bar for every personalized
+# row.
+_MIN_SHELF_TITLES = 3
 # Statuses that honestly support the "<title> is in your library" subtitle:
 # Plex-VERIFIED availability only. ``completed`` is deliberately NOT here — it is
 # the in-flight "Finalizing" state (imported, awaiting Plex confirmation; see the
@@ -136,15 +145,21 @@ def derive_library_state(request_status: str | None, present: bool) -> LibrarySt
 
 
 # Ordered STANDARD rows the home composes. Order + titles live here (a code
-# constant, no DB). Personalized rows are composed independently and interleaved
-# without changing this order or the spotlight source. There is no tv "upcoming"
-# row -- TMDB has no tv endpoint comparable to its movie release-date listing.
+# constant, no DB) -- a FIXED order (issue #278): the home used to interleave
+# the (dynamic, per-user) personalized rows into the middle of this list at
+# positions two/four, which visually reordered the category shelves from one
+# load to the next and made the whole home feel "random". "Coming Soon" is
+# deliberately LAST: it is the only row with no tv counterpart (TMDB has no tv
+# endpoint comparable to its movie release-date listing), so it anchors the
+# end of the feed rather than sitting in the middle of the movie/tv pairs.
+# ``interleave_personalized_rows`` below inserts the personalized block right
+# before this trailing row -- see its docstring.
 _ROWS: tuple[tuple[DiscoverCategory, str], ...] = (
     ("trending", "Trending this week"),
-    ("popular", "Popular movies"),
-    ("upcoming", "Coming soon"),
     ("trending_tv", "Trending TV this week"),
-    ("popular_tv", "Popular TV shows"),
+    ("popular_tv", "Popular TV"),
+    ("popular", "Popular Movies"),
+    ("upcoming", "Coming Soon"),
 )
 
 
@@ -253,14 +268,24 @@ async def list_category(
 def interleave_personalized_rows(
     standard_rows: Sequence[HomeRow], personalized_rows: Sequence[HomeRow]
 ) -> list[HomeRow]:
-    """Insert compacted successful personalized rows at one-based positions 2/4."""
+    """Insert up to two personalized rows as a FIXED block before the trailing row.
+
+    Issue #278: the prior behavior spliced a personalized row in after every
+    other standard row (one-based positions 2/4), which reordered the visible
+    category shelves unpredictably from one load to the next and made the whole
+    home feel "random". Personalized rows now always land as a single
+    contiguous block right before ``standard_rows``' LAST entry (``_ROWS``
+    deliberately ends with "Coming Soon" -- see its docstring), giving the
+    fixed order: Trending this week, Trending TV this week, Popular TV, Popular
+    Movies, [up to two personalized rows], Coming Soon. A successful/failed
+    personalized candidate still only affects HOW MANY of the two slots are
+    filled, never where they sit.
+    """
     personalized = list(personalized_rows[:_PERSONALIZED_ROW_LIMIT])
-    rows: list[HomeRow] = []
-    for index, row in enumerate(standard_rows):
-        rows.append(row)
-        if index < len(personalized) and index < _PERSONALIZED_ROW_LIMIT:
-            rows.append(personalized[index])
-    return rows
+    if not personalized or not standard_rows:
+        return [*standard_rows, *personalized]
+    *front, trailing = standard_rows
+    return [*front, *personalized, trailing]
 
 
 def _stable_random(user_id: int, load_id: UUID) -> random.Random:
@@ -375,7 +400,10 @@ async def _personalized_rows(
             for item in page.results
             if not (item.tmdb_id == seed.tmdb_id and item.media_type == seed.media_type)
         )
-        if not items:
+        # Below the minimum, this shelf is effectively just its outlier seed —
+        # skip it (never a thin/near-empty personalized row) and let the loop
+        # try the next candidate seed instead (issue #277).
+        if len(items) < _MIN_SHELF_TITLES:
             continue
         title, subtitle = _personalized_copy(seed, facet)
         rows.append(

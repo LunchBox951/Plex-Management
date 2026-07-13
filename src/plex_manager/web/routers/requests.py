@@ -31,11 +31,7 @@ from plex_manager.services.correction_service import (
     SeasonNotFoundError,
 )
 from plex_manager.services.library_roots import LibraryRoots
-from plex_manager.services.request_service import (
-    MediaNotFoundError,
-    NoAiredSeasonsError,
-    RequestOwnedByAnotherUserError,
-)
+from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
 from plex_manager.web.deps import (
     AuthContext,
     ServiceNotConfiguredError,
@@ -54,7 +50,6 @@ from plex_manager.web.deps import (
     get_session,
     get_tmdb,
     get_tv_root_optional,
-    require_admin,
     require_api_key,
 )
 from plex_manager.web.errors import AppError
@@ -67,6 +62,7 @@ from plex_manager.web.schemas import (
     RequestListResponse,
     RequestResponse,
     SeasonStatus,
+    ServiceNotConfiguredErrorDetail,
 )
 
 if TYPE_CHECKING:
@@ -86,7 +82,6 @@ router = APIRouter(
 _CREATE_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {"model": RequestResponse, "description": "Existing matching request"},
     404: {"model": ErrorDetail, "description": "Media not found"},
-    409: {"model": ErrorDetail, "description": "Already requested by another user"},
 }
 
 # The ONE download state whose ``progress`` is a live transfer percentage. Every
@@ -126,7 +121,67 @@ _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
             }
         },
     },
+    # A TV request reported with no ``season`` in the body (``ReportSeasonRequiredError``
+    # -- ``report_requires_season``), raised BEFORE any state change. Documented
+    # alongside FastAPI's own body-validation 422 via anyOf, mirroring the grab
+    # endpoint's ``_GRAB_ERROR_RESPONSES`` pattern -- this status code has two
+    # distinct producers here too.
+    422: {
+        "description": "Validation error, or a tv request reported without a season",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorDetail"},
+                    ]
+                }
+            }
+        },
+    },
 }
+
+# The cancel endpoint's manually-raised statuses (ADR-0014 correction verb):
+# 404 ``request_not_found``, 409 ``not_cancellable``/``import_in_progress`` (plain
+# ``HTTPException`` -- ``ErrorDetail`` wire shape), and ``ServiceNotConfiguredError``'s
+# 409 ``service_not_configured`` (rendered by the app-wide handler, NOT a plain
+# ``HTTPException``). That handler's body ALWAYS carries a ``service`` field
+# (``{"detail": "service_not_configured", "service": "qbittorrent"}``) that
+# ``ErrorDetail`` has no field for, so this status is documented across BOTH
+# shapes via a union "model" (FastAPI expands ``X | Y`` into an anyOf AND
+# registers both members' component schemas -- a raw ``content``/``schema``
+# dict with a hand-written ``$ref`` does NOT register a schema that isn't
+# ALSO used as a bare "model" somewhere else, which would leave
+# ``ServiceNotConfiguredErrorDetail`` a dangling ref). This documents
+# ``service`` on the generated client type, so callers can route the operator
+# straight to qBittorrent setup instead of losing the field to the generic shape.
+_CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorDetail, "description": "Request not found"},
+    409: {
+        "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
+        "description": (
+            "Not cancellable in its current state, an import is in progress, or "
+            "qBittorrent is required but not configured"
+        ),
+    },
+}
+
+
+def _can_mutate_request(auth: AuthContext, record: RequestRecord) -> bool:
+    """Return whether this caller owns the request or has operator access."""
+    return auth.is_admin or (auth.user_id is not None and record.user_id == auth.user_id)
+
+
+async def _require_request_mutator(
+    request_id: int,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AuthContext:
+    """Allow only the creator or an admin, hiding non-owned request existence."""
+    record = await request_service.get_request(session, request_id)
+    if record is None or not _can_mutate_request(auth, record):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+    return auth
 
 
 async def _to_response(
@@ -135,6 +190,8 @@ async def _to_response(
     seasons_by_request: dict[int, list[SeasonRequestRecord]] | None = None,
     episode_counts_by_season_id: dict[int, tuple[int, int]] | None = None,
     active_downloads_by_request: dict[int, list[DownloadRecord]] | None = None,
+    *,
+    can_mutate: bool = False,
 ) -> RequestResponse:
     """Map a request record to the wire DTO, embedding its per-season rollup for tv.
 
@@ -231,6 +288,7 @@ async def _to_response(
         ),
         download_progress=download_progress,
         keep_forever=record.keep_forever,
+        can_mutate=can_mutate,
     )
 
 
@@ -282,14 +340,6 @@ async def create_request_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="media_not_found",
         ) from exc
-    except RequestOwnedByAnotherUserError as exc:
-        # Issue #58: a non-admin cannot dedup onto another user's active request
-        # (it would mutate/return a row they can't even see). Honest 409, not a
-        # silent no-op or a hidden mutation.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="requested_by_another_user",
-        ) from exc
     except NoAiredSeasonsError as exc:
         # The show exists in TMDB but resolved to zero trackable seasons (a data
         # gap, or a specials-only show) -- an honest 404, never a persisted
@@ -300,7 +350,9 @@ async def create_request_endpoint(
         ) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK
-    response_body = await _to_response(session, result.record)
+    response_body = await _to_response(
+        session, result.record, can_mutate=_can_mutate_request(auth, result.record)
+    )
     publish_realtime(
         http_request.app,
         ("requests", "discover"),
@@ -315,15 +367,18 @@ async def list_requests_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestListResponse:
     """List all media requests."""
-    records = await request_service.list_requests(session)
-    if not auth.is_admin:
-        records = [record for record in records if record.user_id == auth.user_id]
+    if auth.is_admin or auth.user_id is None:
+        records = await request_service.list_requests(session)
+    else:
+        records = await request_service.list_requests_for_user(session, auth.user_id)
     # Fold duplicate rows for the same media (e.g. a healed-but-not-yet-collapsed
     # false-``available`` row alongside a genuine re-grab) down to ONE visible
     # row per the requester's own preference order -- AFTER the per-user filter
     # above, so a non-admin's own visible row is never folded onto a row they
     # cannot see. Underlying rows are untouched (see the helper's docstring).
-    records = request_service.fold_requests_for_display(records)
+    records = request_service.fold_requests_for_display(
+        records, subscriber_scoped=not auth.is_admin
+    )
     # Batch active physical downloads only AFTER actor filtering + display folding.
     # This preserves the shared-user boundary and gives every visible request a
     # consistent progress projection without calling the admin-only queue endpoint
@@ -350,6 +405,7 @@ async def list_requests_endpoint(
                 seasons_by_request,
                 episode_counts_by_season_id,
                 active_downloads_by_request,
+                can_mutate=_can_mutate_request(auth, r),
             )
             for r in records
         ]
@@ -367,9 +423,14 @@ async def get_request_endpoint(
 ) -> RequestResponse:
     """Return a single media request, or 404."""
     record = await request_service.get_request(session, request_id)
-    if record is None or (not auth.is_admin and record.user_id != auth.user_id):
+    visible = (
+        record is not None
+        and auth.user_id is not None
+        and await request_service.is_request_visible_to_user(session, request_id, auth.user_id)
+    )
+    if record is None or (not auth.is_admin and not visible):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-    return await _to_response(session, record)
+    return await _to_response(session, record, can_mutate=_can_mutate_request(auth, record))
 
 
 @router.post("/{request_id}/keep-forever")
@@ -377,7 +438,7 @@ async def keep_forever_endpoint(
     request_id: int,
     body: KeepForeverBody,
     http_request: Request,
-    _admin: Annotated[AuthContext, Depends(require_admin)],
+    auth: Annotated[AuthContext, Depends(_require_request_mutator)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RequestResponse:
     """Set or clear the operator's "keep forever" pin (ADR-0012).
@@ -386,14 +447,23 @@ async def keep_forever_endpoint(
     this one": a pinned title (or, for a show, every one of its seasons -- the
     pin lives on the parent) is never selected by ``domain/eviction.py``
     regardless of watch state or disk pressure. A 404 for an unknown id, never
-    a silent no-op.
+    a silent no-op. Open to the request's creator or an admin; a non-admin only
+    ever moves their own rows, never another user's eviction protection.
     """
+    # ``_require_request_mutator`` already confirmed the caller owns this row (or
+    # is an admin). Keep-forever is a title-wide sweep and a title's rows can
+    # belong to DIFFERENT users, so confine a non-admin's sweep to their own
+    # rows -- toggling their row must never silently flip another user's pin.
+    # Admins keep the unrestricted, whole-title sweep.
     record = await request_service.set_keep_forever(
-        session, request_id, keep_forever=body.keep_forever
+        session,
+        request_id,
+        keep_forever=body.keep_forever,
+        restrict_to_user_id=None if auth.is_admin else auth.user_id,
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-    response_body = await _to_response(session, record)
+    response_body = await _to_response(session, record, can_mutate=True)
     publish_realtime(
         http_request.app,
         ("requests", "discover", "ops:disk"),
@@ -407,7 +477,7 @@ async def report_issue_endpoint(
     request_id: int,
     body: ReportIssueBody,
     http_request: Request,
-    _admin: Annotated[AuthContext, Depends(require_admin)],
+    auth: Annotated[AuthContext, Depends(_require_request_mutator)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort, Depends(get_qbittorrent)],
     library: Annotated[LibraryPort, Depends(get_library)],
@@ -429,7 +499,7 @@ async def report_issue_endpoint(
     otherwise). The correction-without-a-terminal button for "this file is bad".
     """
     record = await request_service.get_request(session, request_id)
-    if record is None:
+    if record is None:  # Defensive: the authorization dependency already checked this row.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
     # The purge target's root: an unmounted/empty root is refused inside the service
     # (MediaRootUnavailableError -> 409). Build the root-scoped filesystem the same
@@ -500,9 +570,9 @@ async def report_issue_endpoint(
             "re-requested safely.",
             hint="Check the folder is mounted and visible to Plex Manager "
             "(Settings → Library), then try again.",
-            diagnostics=({"root": exc.root_path} if exc.root_path else None),
+            diagnostics=({"root": exc.root_path} if auth.is_admin and exc.root_path else None),
         ) from exc
-    response_body = await _to_response(session, updated)
+    response_body = await _to_response(session, updated, can_mutate=True)
     publish_realtime(
         http_request.app,
         ("requests", "queue", "blocklist", "discover"),
@@ -511,11 +581,11 @@ async def report_issue_endpoint(
     return response_body
 
 
-@router.post("/{request_id}/cancel")
+@router.post("/{request_id}/cancel", responses=_CANCEL_REQUEST_RESPONSES)
 async def cancel_request_endpoint(
     request_id: int,
     http_request: Request,
-    _admin: Annotated[AuthContext, Depends(require_admin)],
+    auth: Annotated[AuthContext, Depends(_require_request_mutator)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
 ) -> RequestResponse:
@@ -554,7 +624,7 @@ async def cancel_request_endpoint(
         # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
         # before any state change, so nothing was settled or removed.
         raise ServiceNotConfiguredError("qbittorrent") from exc
-    response_body = await _to_response(session, updated)
+    response_body = await _to_response(session, updated, can_mutate=True)
     publish_realtime(
         http_request.app,
         ("requests", "queue", "discover"),

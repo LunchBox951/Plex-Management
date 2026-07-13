@@ -37,12 +37,14 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.web.deps import (
+    API_KEY_HEADER_NAME,
     CSRF_COOKIE_NAME,
     PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
     AuthContext,
     AuthMethod,
     SettingsStore,
+    api_key_matches,
     authenticate_request,
     enforce_pre_init_setup_token,
     ensure_system_settings,
@@ -117,25 +119,7 @@ async def plex_sign_in_endpoint(
     user.encrypted_plex_token = body.auth_token
     user.last_login = datetime.now(UTC)
 
-    raw_session = secrets.token_urlsafe(32)
-    csrf_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(UTC) + timedelta(days=_SESSION_DAYS)
-    session.add(
-        AuthSession(
-            user_id=user.id,
-            token_hash=hash_session_token(raw_session),
-            expires_at=expires_at,
-            last_seen_at=datetime.now(UTC),
-        )
-    )
-    await session.commit()
-    _set_session_cookies(
-        response,
-        request=request,
-        session_token=raw_session,
-        csrf_token=csrf_token,
-        expires_at=expires_at,
-    )
+    await _issue_browser_session(session, response, request=request, user_id=user.id)
     return _me_response(
         AuthContext(
             method=AuthMethod.plex_session,
@@ -147,6 +131,45 @@ async def plex_sign_in_endpoint(
             is_admin=user.permissions > 0,
         )
     )
+
+
+@router.post("/api-key")
+async def exchange_api_key_endpoint(
+    response: Response,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AuthMeResponse:
+    """Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.
+
+    The recovery / automation key (ADR-0005, ADR-0016) is the terminal-free
+    break-glass credential that authenticates when plex.tv is unreachable. Before
+    this endpoint the browser had to keep the raw key in JS-readable
+    ``localStorage`` so the break-glass path survived a reload — exactly the
+    cleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the
+    same cookie the Plex sign-in flow mints means the key never needs JS-readable
+    storage: the resulting session is an admin-authority recovery session with no
+    Plex identity (``auth_sessions.user_id`` NULL), and every later request
+    authenticates by the HTTP-only cookie exactly like a Plex session does.
+
+    The key is validated against the stored ``SystemSettings.app_api_key`` with a
+    constant-time compare — accepting a Plex session cookie here (as
+    ``require_api_key`` would) is deliberately NOT done: that would let any
+    signed-in NON-admin mint an ADMIN recovery session. Only a caller who proves
+    the recovery key gets one.
+    """
+    _throttle_sign_in(request)
+    system = await load_system_settings(session)
+    expected = system.app_api_key if system is not None else None
+    provided = request.headers.get(API_KEY_HEADER_NAME)
+    if not api_key_matches(provided, expected):
+        raise AppError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_api_key",
+            message="That access key was not accepted.",
+            hint="Check the recovery key from Settings → Access, then try again.",
+        )
+    await _issue_browser_session(session, response, request=request, user_id=None)
+    return _me_response(AuthContext(method=AuthMethod.api_key, is_admin=True))
 
 
 @router.get("/me")
@@ -462,6 +485,46 @@ def _me_response(context: AuthContext | None) -> AuthMeResponse:
         auth_method=context.method.value,
         is_admin=context.is_admin,
         user=user,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Session issuance (shared by Plex sign-in and the recovery-key exchange)
+# --------------------------------------------------------------------------- #
+async def _issue_browser_session(
+    session: AsyncSession,
+    response: Response,
+    *,
+    request: Request,
+    user_id: int | None,
+) -> None:
+    """Mint an ``auth_sessions`` row, commit, and set the session + CSRF cookies.
+
+    The single session-issuance path both browser-auth flows share: Plex sign-in
+    passes the verified owning ``user_id``; the recovery-key exchange passes
+    ``None`` (an admin recovery session with no Plex identity, CodeQL #263). Only
+    the SHA-256 hash of the random token is stored; the raw token rides the
+    HTTP-only cookie. The commit flushes any caller-pending writes too (the Plex
+    path stages user-row updates before calling this).
+    """
+    raw_session = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(days=_SESSION_DAYS)
+    session.add(
+        AuthSession(
+            user_id=user_id,
+            token_hash=hash_session_token(raw_session),
+            expires_at=expires_at,
+            last_seen_at=datetime.now(UTC),
+        )
+    )
+    await session.commit()
+    _set_session_cookies(
+        response,
+        request=request,
+        session_token=raw_session,
+        csrf_token=csrf_token,
+        expires_at=expires_at,
     )
 
 

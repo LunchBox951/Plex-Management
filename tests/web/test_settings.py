@@ -37,6 +37,7 @@ from plex_manager.web.deps import (
     LOG_RETENTION_DAYS_MAX,
     PLEX_MACHINE_ID_SETTING,
     SECRET_SETTING_KEYS,
+    WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
     SettingsStore,
@@ -53,6 +54,7 @@ from plex_manager.web.deps import (
     get_log_retention_days,
     get_movies_root_optional,
     get_tv_root_optional,
+    get_watchlist_sync_interval_minutes,
     hash_session_token,
     load_system_settings,
     require_api_key,
@@ -72,6 +74,7 @@ _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "disk_pressure_threshold_percent",
     "disk_pressure_target_percent",
     "eviction_interval_minutes",
+    "watchlist_sync_interval_minutes",
 )
 _INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "eviction_grace_days",
@@ -1431,10 +1434,11 @@ async def test_empty_string_anime_root_reads_back_as_unset(
 # Operability beta (ADR-0012) settings: disk-pressure eviction + log retention
 # --------------------------------------------------------------------------- #
 async def test_put_round_trips_operability_settings(
-    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     headers = {"X-Api-Key": _API_KEY}
+    app.state.watchlist_wake_event = asyncio.Event()
     update = {
         "disk_pressure_threshold_percent": 88.5,
         "disk_pressure_target_percent": 75,
@@ -1442,11 +1446,14 @@ async def test_put_round_trips_operability_settings(
         "eviction_enabled": False,
         "eviction_proactive_enabled": True,
         "eviction_interval_minutes": 45,
+        "watchlist_sync_enabled": False,
+        "watchlist_sync_interval_minutes": 20,
         "log_retention_days": 3,
         "log_max_rows": 50_000,
     }
     put = await client.put("/api/v1/settings", json=update, headers=headers)
     assert put.status_code == 200
+    assert app.state.watchlist_wake_event.is_set()
     body = put.json()
     assert body["disk_pressure_threshold_percent"] == 88.5
     assert body["disk_pressure_target_percent"] == 75.0
@@ -1454,6 +1461,8 @@ async def test_put_round_trips_operability_settings(
     assert body["eviction_enabled"] is False
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
+    assert body["watchlist_sync_enabled"] is False
+    assert body["watchlist_sync_interval_minutes"] == 20.0
     assert body["log_retention_days"] == 3
     assert body["log_max_rows"] == 50_000
 
@@ -1471,6 +1480,7 @@ async def test_put_round_trips_operability_settings(
         assert await get_eviction_enabled(session) is False
         assert await get_eviction_proactive_enabled(session) is True
         assert await get_eviction_interval_minutes(session) == 45.0
+        assert await get_watchlist_sync_interval_minutes(session) == 20.0
         assert await get_log_retention_days(session) == 3
         assert await get_log_max_rows(session) == 50_000
 
@@ -1585,6 +1595,13 @@ async def test_put_rejects_out_of_range_operability_settings(
     )
     assert zero_interval.status_code == 422
 
+    zero_watchlist_interval = await client.put(
+        "/api/v1/settings",
+        json={"watchlist_sync_interval_minutes": 0},
+        headers=headers,
+    )
+    assert zero_watchlist_interval.status_code == 422
+
     negative_days = await client.put(
         "/api/v1/settings",
         json={"log_retention_days": -1},
@@ -1679,6 +1696,11 @@ def test_settings_update_rejects_non_finite_interval() -> None:
             SettingsUpdate(eviction_interval_minutes=bad)
     SettingsUpdate(eviction_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)  # boundary, inclusive
     SettingsUpdate(eviction_interval_minutes=45.0)  # an ordinary value still works
+    for bad in (float("inf"), float("nan"), float("-inf"), EVICTION_INTERVAL_MAX_MINUTES + 1):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(watchlist_sync_interval_minutes=bad)
+    SettingsUpdate(watchlist_sync_interval_minutes=EVICTION_INTERVAL_MAX_MINUTES)
+    SettingsUpdate(watchlist_sync_interval_minutes=WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT)
 
 
 @pytest.mark.parametrize(
@@ -1687,6 +1709,9 @@ def test_settings_update_rejects_non_finite_interval() -> None:
         ("eviction_interval_minutes", float("inf")),
         ("eviction_interval_minutes", float("nan")),
         ("eviction_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
+        ("watchlist_sync_interval_minutes", float("inf")),
+        ("watchlist_sync_interval_minutes", float("nan")),
+        ("watchlist_sync_interval_minutes", EVICTION_INTERVAL_MAX_MINUTES + 1),
         ("disk_pressure_threshold_percent", float("inf")),
         ("disk_pressure_threshold_percent", float("nan")),
         ("eviction_grace_days", EVICTION_GRACE_DAYS_MAX + 1),
@@ -1761,6 +1786,7 @@ async def test_put_accepts_upper_bound_operability_settings(
     headers = {"X-Api-Key": _API_KEY}
     update = {
         "eviction_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
+        "watchlist_sync_interval_minutes": EVICTION_INTERVAL_MAX_MINUTES,
         "eviction_grace_days": EVICTION_GRACE_DAYS_MAX,
         "log_retention_days": LOG_RETENTION_DAYS_MAX,
         "log_max_rows": LOG_MAX_ROWS_MAX,
@@ -1770,6 +1796,7 @@ async def test_put_accepts_upper_bound_operability_settings(
     assert put.status_code == 200
     body = put.json()
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["watchlist_sync_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
     assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
@@ -1779,6 +1806,7 @@ async def test_put_accepts_upper_bound_operability_settings(
 
     async with sessionmaker_() as session:
         assert await get_eviction_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
+        assert await get_watchlist_sync_interval_minutes(session) == EVICTION_INTERVAL_MAX_MINUTES
         assert await get_eviction_grace_days(session) == EVICTION_GRACE_DAYS_MAX
         assert await get_log_retention_days(session) == LOG_RETENTION_DAYS_MAX
         assert await get_log_max_rows(session) == LOG_MAX_ROWS_MAX
@@ -1952,6 +1980,7 @@ async def test_get_settings_does_not_500_on_non_finite_stored_interval(
         ("log_max_rows", "abc"),
         ("eviction_enabled", "maybe"),
         ("eviction_interval_minutes", "inf"),
+        ("watchlist_sync_interval_minutes", "inf"),
     ],
 )
 async def test_get_settings_tolerates_corrupt_stored_typed_values(
@@ -1989,6 +2018,7 @@ async def test_get_settings_preserves_valid_typed_values(
         "eviction_enabled": "false",
         "eviction_proactive_enabled": "true",
         "eviction_interval_minutes": "45.0",
+        "watchlist_sync_interval_minutes": "20.0",
         "log_retention_days": "3",
         "log_max_rows": "50000",
     }
@@ -2007,6 +2037,7 @@ async def test_get_settings_preserves_valid_typed_values(
     assert body["eviction_enabled"] is False
     assert body["eviction_proactive_enabled"] is True
     assert body["eviction_interval_minutes"] == 45.0
+    assert body["watchlist_sync_interval_minutes"] == 20.0
     assert body["log_retention_days"] == 3
     assert body["log_max_rows"] == 50000
 
@@ -2028,6 +2059,12 @@ async def test_get_settings_preserves_valid_typed_values(
             EVICTION_INTERVAL_MAX_MINUTES,
         ),
         ("eviction_interval_minutes", "0", None),  # gt=0 -- exclusive bound, no floor to clamp to
+        (
+            "watchlist_sync_interval_minutes",
+            str(EVICTION_INTERVAL_MAX_MINUTES + 1),
+            EVICTION_INTERVAL_MAX_MINUTES,
+        ),
+        ("watchlist_sync_interval_minutes", "0", None),
         ("disk_pressure_threshold_percent", "150", 100.0),  # clamp: stored >100 meant "never trip"
         ("disk_pressure_target_percent", "-1", None),  # default 80 (<= default threshold 90)
         ("eviction_grace_days", str(EVICTION_GRACE_DAYS_MAX + 1), EVICTION_GRACE_DAYS_MAX),
@@ -2074,6 +2111,7 @@ async def test_get_settings_preserves_boundary_typed_values(
         "disk_pressure_threshold_percent": "100",  # le=100, inclusive
         "disk_pressure_target_percent": "0",  # ge=0, inclusive
         "eviction_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),  # le, inclusive
+        "watchlist_sync_interval_minutes": str(EVICTION_INTERVAL_MAX_MINUTES),
         "eviction_grace_days": str(EVICTION_GRACE_DAYS_MAX),
         "log_retention_days": str(LOG_RETENTION_DAYS_MAX),
         "log_max_rows": str(LOG_MAX_ROWS_MAX),
@@ -2090,6 +2128,7 @@ async def test_get_settings_preserves_boundary_typed_values(
     assert body["disk_pressure_threshold_percent"] == 100.0
     assert body["disk_pressure_target_percent"] == 0.0
     assert body["eviction_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
+    assert body["watchlist_sync_interval_minutes"] == EVICTION_INTERVAL_MAX_MINUTES
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
     assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
@@ -2979,6 +3018,113 @@ async def test_settings_store_set_if_absent_routes_secret_keys_to_encrypted_colu
     assert raw_value is None  # the plaintext column is never used for a secret
     assert raw_encrypted is not None
     assert plaintext not in raw_encrypted  # at-rest value is ciphertext, not plaintext
+
+
+# --------------------------------------------------------------------------- #
+# SettingsStore.secret_values (issue #268) — the DECRYPTED value set fed to
+# logsafe.redact_known_secrets, at both the log-capture handler (via
+# web/app.py's _log_drain_loop) and the /ops/logs* read boundaries.
+# --------------------------------------------------------------------------- #
+async def test_secret_values_returns_every_configured_secret_decrypted(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_token", "fake-plex-token-1")
+        await store.set("prowlarr_api_key", "fake-prowlarr-key-1")
+        await store.set("qbittorrent_password", "fake-qbt-password-1")
+        await store.set("tmdb_api_key", "fake-tmdb-key-1")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset(
+        {
+            "fake-plex-token-1",
+            "fake-prowlarr-key-1",
+            "fake-qbt-password-1",
+            "fake-tmdb-key-1",
+        }
+    )
+
+
+async def test_secret_values_omits_unset_secrets(sessionmaker_: SessionMaker) -> None:
+    """Only the secrets actually configured contribute a value -- an unset one
+    is silently absent, never an empty string."""
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("prowlarr_api_key", "fake-prowlarr-key-2")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset({"fake-prowlarr-key-2"})
+
+
+async def test_secret_values_is_empty_with_nothing_configured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_never_returns_a_plaintext_setting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Only :data:`SECRET_SETTING_KEYS` are queried -- an ordinary plaintext
+    setting (a url, a username) never leaks into the value-based redaction set,
+    which would otherwise risk redacting innocuous config values out of logs."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("prowlarr_url", "http://prowlarr.local")
+        await store.set("qbittorrent_username", "admin")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_includes_the_system_app_api_key(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The recovery/automation break-glass ``X-Api-Key`` credential
+    (``SystemSettings.app_api_key``) lives in a SEPARATE table from the
+    generic ``settings`` key/value store -- it must still be folded into the
+    value-based redaction set, or a bare occurrence of that credential in a
+    log line (e.g. echoed back in an error message) would sail past the
+    value-based pass entirely."""
+    await seed(initialized=True, app_api_key="fake-app-api-key-1234567890")
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert "fake-app-api-key-1234567890" in values
+
+
+async def test_secret_values_combines_the_app_api_key_with_settings_secrets(
+    seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Both sources contribute to the SAME set -- the app api key does not
+    replace or shadow the generic settings-table secrets."""
+    await seed(initialized=True, app_api_key="fake-app-api-key-abcdefghij")
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("prowlarr_api_key", "fake-prowlarr-key-3")
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset({"fake-app-api-key-abcdefghij", "fake-prowlarr-key-3"})
+
+
+async def test_secret_values_omits_app_api_key_when_unset(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """No ``SystemSettings`` row at all (a fresh, pre-setup install) must not
+    raise or contribute a value -- exactly the same honest-absence contract
+    the generic settings query already keeps."""
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
 
 
 async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(

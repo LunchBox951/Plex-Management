@@ -380,8 +380,8 @@ class RequestRepository(Protocol):
         (claimable) one, then anyone else's; newest-by-id within each rank. This
         is the per-user visibility rule for shared (non-admin) sessions — without
         it, another user's NEWER terminal row shadows the caller's own older one
-        and turns their re-request into a spurious ``requested_by_another_user``
-        rejection. ``None`` (the default; admins and API-key automation) returns
+        and collapses their re-request onto a less precise foreign match. ``None``
+        (the default; admins and API-key automation) returns
         the newest row unconditionally, the pre-preference behavior.
         """
         raise NotImplementedError
@@ -474,6 +474,7 @@ class RequestRepository(Protocol):
         allowed_from: frozenset[str],
         *,
         require_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
         (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
@@ -522,7 +523,12 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def set_keep_forever_for_title(
-        self, tmdb_id: int, media_type: str, keep_forever: bool
+        self,
+        tmdb_id: int,
+        media_type: str,
+        keep_forever: bool,
+        *,
+        restrict_to_user_id: int | None = None,
     ) -> None:
         """Set the pin on EVERY ``MediaRequest`` row for this ``(tmdb_id,
         media_type)``, not just one (ADR-0012).
@@ -537,6 +543,13 @@ class RequestRepository(Protocol):
         believes they pinned the whole show. Keep-forever is a per-TITLE
         intent, so this updates every row sharing the key, symmetric for both
         pin and unpin.
+
+        ``restrict_to_user_id`` narrows the update to rows OWNED by that user.
+        The keep-forever endpoint is open to a request's creator (not just
+        admins), but a title's rows can belong to DIFFERENT users, so a
+        non-admin caller must never flip a row they do not own. Callers pass
+        their own ``user_id`` to confine the title-wide sweep to their rows;
+        ``None`` (the default) leaves it unrestricted for admin/operator use.
         """
         raise NotImplementedError
 
@@ -798,6 +811,7 @@ class SeasonRequestRepository(Protocol):
         allowed_from: frozenset[str],
         *,
         require_parent_unpinned: bool = False,
+        require_not_watchlisted: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
         (and, with ``require_parent_unpinned``, only if the PARENT show is not

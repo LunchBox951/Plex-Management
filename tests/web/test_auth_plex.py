@@ -851,6 +851,139 @@ async def test_concurrent_same_account_first_sign_in_yields_one_user_two_session
     assert len(session_rows) == 2  # BOTH racers hold a live session
 
 
+# --------------------------------------------------------------------------- #
+# Recovery-key exchange: POST /auth/api-key trades X-Api-Key for the SAME cookie
+# (CodeQL #263 — the key never needs JS-readable storage)
+# --------------------------------------------------------------------------- #
+async def test_api_key_exchange_mints_session_cookie(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A valid recovery key is exchanged for the same HTTP-only session cookie the
+    Plex flow issues — an admin recovery session with NO owning user."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    response = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["authenticated"] is True
+    assert body["auth_method"] == "api_key"
+    assert body["is_admin"] is True
+    assert body["user"] is None  # no Plex identity backs the recovery session
+    assert response.cookies.get("plexmgr.session")
+    assert response.cookies.get("plexmgr.csrf")
+
+    # The minted row is a genuine recovery session: user_id NULL, not revoked.
+    async with sessionmaker_() as db:
+        rows = (await db.execute(select(AuthSession))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].user_id is None
+    assert rows[0].revoked_at is None
+
+
+async def test_api_key_exchange_cookie_authenticates_later_requests(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """After the exchange the browser needs NO X-Api-Key header: the cookie in the
+    jar authenticates the admin-only settings read on its own."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    exchange = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+    assert exchange.status_code == 200
+
+    # No X-Api-Key header — the session cookie alone carries the request.
+    settings = await client.get("/api/v1/settings")
+    assert settings.status_code == 200
+
+    me = await client.get("/api/v1/auth/me")
+    assert me.json()["auth_method"] == "api_key"
+    assert me.json()["is_admin"] is True
+
+
+async def test_api_key_exchange_session_enforces_csrf_on_unsafe_methods(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """The recovery session is a COOKIE credential, so unsafe methods carry the
+    double-submit CSRF check exactly like a Plex session — a missing token is a
+    403, the echoed CSRF cookie succeeds (logout is the handy unsafe endpoint)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    exchange = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+    csrf_cookie = exchange.cookies["plexmgr.csrf"]
+
+    # The jar carries the session + CSRF cookies but no X-CSRF-Token header.
+    blocked = await client.post("/api/v1/auth/logout")
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == "csrf_token_required"
+
+    ok = await client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf_cookie})
+    assert ok.status_code == 204
+
+
+async def test_api_key_exchange_wrong_key_rejected_no_cookie(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    response = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": "nope"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_api_key"
+    assert response.cookies.get("plexmgr.session") is None
+
+
+async def test_api_key_exchange_missing_key_rejected(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    response = await client.post("/api/v1/auth/api-key")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_api_key"
+
+
+async def test_api_key_exchange_does_not_accept_plex_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A non-owner Plex session must NOT be able to mint an ADMIN recovery session
+    by calling the exchange with no key: the endpoint validates the recovery key
+    specifically, never falling back to whatever cookie is already in the jar."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    # A shared (non-owner) account signs in: it holds a limited (non-admin) session.
+    await _use_transport(app, _plex_tv_transport(user=_SECOND_USER, resources=[_shared_server()]))
+    signin = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert signin.json()["is_admin"] is False
+
+    # With that non-admin session cookie in the jar but NO recovery key header, the
+    # exchange must refuse rather than hand out an admin recovery session.
+    response = await client.post("/api/v1/auth/api-key")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid_api_key"
+
+
+async def test_api_key_exchange_throttled_after_limit(
+    client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """The exchange shares the sign-in throttle: another session-minting write on
+    the unauthenticated surface, braked the same way."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    for _ in range(10):
+        ok = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+        assert ok.status_code == 200
+    throttled = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": _API_KEY})
+
+    assert throttled.status_code == 429
+    assert throttled.json()["detail"] == "sign_in_throttled"
+
+
 async def test_openapi_advertises_both_cookie_and_apikey_auth(app: FastAPI) -> None:
     schema = app.openapi()
     schemes = schema["components"]["securitySchemes"]
