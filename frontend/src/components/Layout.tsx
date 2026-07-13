@@ -1,8 +1,10 @@
+import { useState } from 'react'
 import { Link, NavLink, Outlet } from 'react-router-dom'
 import { useAuthMe, useLogout, useRequests } from '../api/hooks'
 import { cn } from '../lib/cn'
 import { isInFlightRequestStatus } from '../lib/status'
 import { HealthDot } from './HealthDot'
+import { SearchOverlay } from './SearchOverlay'
 import { Button } from './ui/Button'
 
 const USER_NAV = [
@@ -23,6 +25,7 @@ export function Layout() {
   const auth = useAuthMe()
   const requests = useRequests({ poll: true })
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
+  const [searchOpen, setSearchOpen] = useState(false)
   // Only a settled `/requests` payload feeds the badge: while the query is
   // unresolved (or has never succeeded) the count stays `undefined` and the
   // badge is hidden — never an optimistic guess. A transient poll error keeps
@@ -95,6 +98,7 @@ export function Layout() {
               </>
             ) : null}
           </div>
+          <SearchOverlay onOpenChange={setSearchOpen} />
           <div className="ml-auto flex shrink-0 items-center gap-3">
             {isAdmin ? (
               <Link
@@ -120,7 +124,7 @@ export function Layout() {
         </div>
       </header>
       <main>
-        <Outlet />
+        <Outlet context={{ searchOpen }} />
       </main>
     </div>
   )

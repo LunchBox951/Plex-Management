@@ -484,7 +484,7 @@
         "type": "object"
       },
       "DiscoverHomeResponse": {
-        "description": "The composed Discover home: an optional spotlight + ordered rows.",
+        "description": "The composed Discover home: ordered spotlight candidates + rows.",
         "properties": {
           "rows": {
             "items": {
@@ -493,18 +493,16 @@
             "title": "Rows",
             "type": "array"
           },
-          "spotlight": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/DiscoverResult"
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "spotlights": {
+            "items": {
+              "$ref": "#/components/schemas/DiscoverResult"
+            },
+            "title": "Spotlights",
+            "type": "array"
           }
         },
         "required": [
+          "spotlights",
           "rows"
         ],
         "title": "DiscoverHomeResponse",
@@ -523,6 +521,17 @@
           "row_type": {
             "title": "Row Type",
             "type": "string"
+          },
+          "subtitle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtitle"
           },
           "title": {
             "title": "Title",
@@ -1910,6 +1919,17 @@
             ],
             "title": "Backdrop Url"
           },
+          "download_progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Progress"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -2381,6 +2401,17 @@
             ],
             "title": "Eviction Proactive Enabled"
           },
+          "log_max_rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Log Max Rows"
+          },
           "log_retention_days": {
             "anyOf": [
               {
@@ -2615,6 +2646,19 @@
               }
             ],
             "title": "Eviction Proactive Enabled"
+          },
+          "log_max_rows": {
+            "anyOf": [
+              {
+                "maximum": 2000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Log Max Rows"
           },
           "log_retention_days": {
             "anyOf": [
@@ -3269,8 +3313,27 @@
     },
     "/api/v1/discover/home": {
       "get": {
-        "description": "Return the server-composed Discover home (spotlight + ordered rows).",
+        "description": "Return the server-composed Discover home (spotlights + ordered rows).",
         "operationId": "discover_home_api_v1_discover_home_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "load_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Load Id"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3281,6 +3344,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -3702,7 +3775,7 @@
     },
     "/api/v1/ops/logs/export": {
       "get": {
-        "description": "The LLM-diagnosis affordance: one coherent, downloadable/copyable trail.\n\nEither a single correlation id's FULL history (``correlation_id`` \u2014 a\n``request_id``/``download_id``/``tmdb_id``), or a time window from\n``since`` through now (``since`` omitted defaults to the last 24h) \u2014 when\nboth are supplied, ``correlation_id`` wins (a specific id's whole trail is\nthe more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal\nsafety cap, not a policy setting); when the matching window exceeds the\ncap, the OLDEST rows are kept (the root-cause lead-up survives) and the\nnewest overflow is what's dropped, with an honest trailing note. Rendered\nOLDEST-first (a coherent top-to-bottom story), unlike the newest-first\n``GET /logs`` list. ``Content-Disposition: attachment`` so navigating\nstraight to this URL downloads a file; a caller reading the body via\n``fetch`` (the frontend's \"copy to clipboard\") is unaffected by the header.",
+        "description": "The LLM-diagnosis affordance: one coherent, downloadable/copyable trail.\n\nEither a single correlation id's FULL history (``correlation_id`` \u2014 a\n``request_id``/``download_id``/``tmdb_id``), or a time window from\n``since`` through now (``since`` omitted defaults to the last 24h) \u2014 when\nboth are supplied, ``correlation_id`` wins (a specific id's whole trail is\nthe more precise ask). Bounded to :data:`_MAX_EXPORT_ROWS` (an internal\nsafety cap, not a policy setting); when the matching window exceeds the\ncap, the OLDEST rows are kept (the root-cause lead-up survives) and the\nnewest overflow is what's dropped, with an honest trailing note. Rendered\nOLDEST-first (a coherent top-to-bottom story), unlike the newest-first\n``GET /logs`` list. ``Content-Disposition: attachment`` so navigating\nstraight to this URL downloads a file; a caller reading the body via\n``fetch`` (the frontend's \"copy to clipboard\") is unaffected by the header.\n\nEvery message is passed through :func:`~plex_manager.logsafe.\nredact_secrets` again here (issue #153) as a SECOND, independent line of\ndefense on top of the capture-time pass (``log_capture_service._capture``)\n-- this is the boundary the blueprint explicitly calls out (\"the log store\nnever records a secret\"), and a row written before this redaction pass\nexisted, or by any future path that bypasses the capture pipeline, must\nstill never leave this endpoint carrying one.",
         "operationId": "export_logs_endpoint_api_v1_ops_logs_export_get",
         "parameters": [
           {

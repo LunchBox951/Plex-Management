@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from urllib.parse import urlsplit
 
 import pytest
 
-from plex_manager.logsafe import safe_guid, safe_int, safe_text
+from plex_manager.logsafe import redact_secrets, safe_guid, safe_int, safe_text
 
 
 def _sha12(value: str) -> str:
@@ -280,3 +281,510 @@ def test_safe_guid_is_total_for_lone_surrogates() -> None:
     become a throw or a verbatim-passthrough bypass."""
     raw = "https://tracker.example.org/x?passkey=S\ud800ECRET"
     assert safe_guid(raw) == f"tracker.example.org#{_sha12(raw)}"
+
+
+# --------------------------------------------------------------------------- #
+# redact_secrets (issue #153): defense-in-depth redaction over a fully-rendered
+# log line, applied at capture time and again at the export boundary. Every
+# fixture secret below is an obviously-fake literal (never a real credential),
+# so asserting ``secret not in result`` -- which pytest's assertion rewriting
+# would otherwise echo on a failure -- never actually risks logging a real
+# secret in a test's own failure output (mirrors the existing ``safe_guid``
+# tests' identical convention above).
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("raw", "secret", "expected"),
+    [
+        # TMDB-shaped: api_key as a URL query parameter -- the httpx INFO log
+        # line shape this whole issue exists to catch.
+        (
+            "GET https://api.themoviedb.org/3/movie/603?api_key=FAKEAPIKEY123456&language=en-US",
+            "FAKEAPIKEY123456",
+            "GET https://api.themoviedb.org/3/movie/603?api_key=<redacted>&language=en-US",
+        ),
+        # Prowlarr-shaped: X-Api-Key as a plain header line (no quotes). The
+        # hyphenated prefix ``X-Api-`` is untouched text; only the "Key" word
+        # the alternation matches plus its value are replaced.
+        (
+            "X-Api-Key: FAKEPROWLARRKEY99",
+            "FAKEPROWLARRKEY99",
+            "X-Api-Key: <redacted>",
+        ),
+        # Prowlarr-shaped: X-Api-Key inside a dict-repr headers dump.
+        (
+            "sending request headers={'Accept': 'json', 'X-Api-Key': 'FAKEPROWLARRKEY99'}",
+            "FAKEPROWLARRKEY99",
+            "sending request headers={'Accept': 'json', 'X-Api-Key': '<redacted>'}",
+        ),
+        # Plex-shaped: X-Plex-Token as a header.
+        (
+            "X-Plex-Token: FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "X-Plex-Token: <redacted>",
+        ),
+        # Plex-shaped: X-Plex-Token riding a URL query parameter (some Plex
+        # media/transcode urls carry the token this way instead of a header).
+        (
+            "GET https://plex.example.com/library/sections?X-Plex-Token=FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "GET https://plex.example.com/library/sections?X-Plex-Token=<redacted>",
+        ),
+        # qBittorrent-shaped: password in a form/dict login payload -- the
+        # username stays visible (debuggability), only the password is masked.
+        (
+            "POST /api/v2/auth/login data={'username': 'admin', 'password': 'FAKEQBTPASSWORD1'}",
+            "FAKEQBTPASSWORD1",
+            "POST /api/v2/auth/login data={'username': 'admin', 'password': '<redacted>'}",
+        ),
+        # A generic bearer-style access token query param.
+        (
+            "refreshing session: access_token=FAKEACCESSTOKEN123456&expires_in=3600",
+            "FAKEACCESSTOKEN123456",
+            "refreshing session: access_token=<redacted>&expires_in=3600",
+        ),
+        # A generic "secret" key.
+        (
+            "loaded webhook secret=FAKEWEBHOOKSECRET99",
+            "FAKEWEBHOOKSECRET99",
+            "loaded webhook secret=<redacted>",
+        ),
+        # THIS app's real prefixed settings-field names: ``_`` is a word char, so
+        # a bare ``\b`` before ``api``/``token``/``password`` would never fire on
+        # these -- the bounded lazy prefix makes the key word a valid identifier
+        # suffix. The whole field name survives; only the value is masked.
+        (
+            "config tmdb_api_key=FAKETMDBKEY1234567",
+            "FAKETMDBKEY1234567",
+            "config tmdb_api_key=<redacted>",
+        ),
+        (
+            "loaded plex_token=FAKEPLEXTOKEN7890",
+            "FAKEPLEXTOKEN7890",
+            "loaded plex_token=<redacted>",
+        ),
+        (
+            "settings app_api_key=FAKEAPPKEY99",
+            "FAKEAPPKEY99",
+            "settings app_api_key=<redacted>",
+        ),
+        # A quoted credential whose value carries spaces/commas (a
+        # ``qbittorrent_password`` may contain any of these): the WHOLE quoted
+        # value is consumed, not just the first whitespace-delimited token, so no
+        # suffix is left behind the ``<redacted>``. The closing quote survives.
+        (
+            "login qbittorrent_password='FAKE pw, with spaces'",
+            "with spaces",
+            "login qbittorrent_password='<redacted>'",
+        ),
+        (
+            'headers={"password": "FAKE multi word pw"}',
+            "multi word pw",
+            'headers={"password": "<redacted>"}',
+        ),
+        # A quoted credential containing the OPPOSITE quote character
+        # (``SettingsUpdate`` accepts such passwords): the tempered run stops
+        # only at the MATCHING close quote, so the embedded quote does not end
+        # the value and no tail is left behind ``<redacted>``.
+        (
+            'password="abc\'FAKEEMBEDDED1"',
+            "FAKEEMBEDDED1",
+            'password="<redacted>"',
+        ),
+        (
+            "password='abc\"FAKEEMBEDDED2'",
+            "FAKEEMBEDDED2",
+            "password='<redacted>'",
+        ),
+        # TUPLE-rendered headers (``list(headers.items())``/raw header dumps):
+        # no ``:``/``=`` separator at all -- the dedicated tuple pass masks the
+        # quoted value whole, key name and surrounding structure intact.
+        (
+            "headers=[('X-Api-Key', 'FAKETUPLEKEY1')]",
+            "FAKETUPLEKEY1",
+            "headers=[('X-Api-Key', '<redacted>')]",
+        ),
+        (
+            'headers=[("x-plex-token", "FAKETUPLEKEY2")]',
+            "FAKETUPLEKEY2",
+            'headers=[("x-plex-token", "<redacted>")]',
+        ),
+        # An Authorization tuple: the quoted-value run masks through the
+        # internal space, so scheme AND credential are both consumed.
+        (
+            "sending [('Accept', 'json'), ('Authorization', 'Bearer FAKETUPLETOK')]",
+            "FAKETUPLETOK",
+            "sending [('Accept', 'json'), ('Authorization', '<redacted>')]",
+        ),
+        # P1 (escaped-quote leak): a JSON/repr dump of a quoted credential that
+        # itself contains a backslash-ESCAPED matching quote. The escape-aware
+        # run treats ``\"`` as one escaped char, not the close delimiter, so the
+        # suffix after it is masked instead of leaking past ``<redacted>``.
+        (
+            '{"password": "abc\\"FAKEESCSUFFIX"}',
+            "FAKEESCSUFFIX",
+            '{"password": "<redacted>"}',
+        ),
+        (
+            "{'password': 'abc\\'FAKEESCSUF2'}",
+            "FAKEESCSUF2",
+            "{'password': '<redacted>'}",
+        ),
+        # A backslash-escaped quote as the FIRST character of the value.
+        (
+            'password="\\"FAKEESCFIRST"',
+            "FAKEESCFIRST",
+            'password="<redacted>"',
+        ),
+        # P2 (list-wrapped): a multi-valued header/form mapping renders its value
+        # as a list -- the whole bracketed list is masked, not just the ``[``.
+        (
+            "sending request headers={'Accept': 'json', 'X-Api-Key': ['FAKELISTKEY1']}",
+            "FAKELISTKEY1",
+            "sending request headers={'Accept': 'json', 'X-Api-Key': <redacted>}",
+        ),
+        (
+            'headers={"X-Api-Key": ["FAKELISTKEY2", "FAKELISTKEY3"]}',
+            "FAKELISTKEY3",
+            'headers={"X-Api-Key": <redacted>}',
+        ),
+        # A list value with an embedded ``]`` inside a quoted element must not
+        # let that ``]`` close the list early.
+        (
+            "headers={'api_key': ['FAKE]LISTBRACKET']}",
+            "FAKE]LISTBRACKET",
+            "headers={'api_key': <redacted>}",
+        ),
+        # A tuple whose value is a list (``list(headers.items())`` of a
+        # multi-valued header).
+        (
+            "headers=[('X-Api-Key', ['FAKETUPLELIST'])]",
+            "FAKETUPLELIST",
+            "headers=[('X-Api-Key', <redacted>)]",
+        ),
+        # A NESTED list value: the body must not stop at the first inner ``]``
+        # and leave the later element (secret included) behind ``<redacted>``.
+        (
+            "headers={'X-Api-Key': [['FAKENESTA'], ['FAKENESTB']]}",
+            "FAKENESTB",
+            "headers={'X-Api-Key': <redacted>}",
+        ),
+        # A multi-valued Authorization list: the list pass covers it before the
+        # single-value Authorization pass can mis-grab the ``[``.
+        (
+            "headers={'Authorization': ['Bearer FAKEAUTHLIST']}",
+            "FAKEAUTHLIST",
+            "headers={'Authorization': <redacted>}",
+        ),
+        # P2 (session cookies): the browser ``plexmgr.session`` auth cookie and
+        # qBittorrent's upstream ``SID`` cookie -- keyed on the cookie name, the
+        # value masked up to the ``;`` attribute separator so ``Path``/``HttpOnly``
+        # stay diagnosable.
+        (
+            "Cookie: plexmgr.session=FAKESESSIONTOK",
+            "FAKESESSIONTOK",
+            "Cookie: plexmgr.session=<redacted>",
+        ),
+        (
+            "Set-Cookie: SID=FAKEQBTSID; Path=/; HttpOnly",
+            "FAKEQBTSID",
+            "Set-Cookie: SID=<redacted>; Path=/; HttpOnly",
+        ),
+        # Only the session cookie in a multi-cookie header is masked; benign
+        # cookies (and the surrounding ``;``-separated structure) survive.
+        (
+            "Cookie: theme=dark; plexmgr.session=FAKESESSIONTOK2; lang=en",
+            "FAKESESSIONTOK2",
+            "Cookie: theme=dark; plexmgr.session=<redacted>; lang=en",
+        ),
+        # qBittorrent 5.2 names its session cookie ``QBT_SID_<port>`` (the
+        # adapter's ``_session_cookie_header`` emits exactly this shape) -- the
+        # cookie-name match admits a separator-joined suffix after ``sid``.
+        (
+            "Cookie: QBT_SID_8080=FAKEQBTSID52; other=1",
+            "FAKEQBTSID52",
+            "Cookie: QBT_SID_8080=<redacted>; other=1",
+        ),
+        # P1 (unquoted freeform value): a forgotten call site interpolating a
+        # bare password that CONTAINS spaces/commas (``SettingsUpdate`` permits
+        # both) -- a single-token capture would leak everything past the first
+        # space; the freeform branch consumes through to the line boundary.
+        (
+            "login qbittorrent_password=FAKE pw, with spaces",
+            "with spaces",
+            "login qbittorrent_password=<redacted>",
+        ),
+        # ... but never PAST the line boundary: the next log record survives.
+        (
+            "qbittorrent_password=FAKEMLPW abc\nnext record",
+            "FAKEMLPW",
+            "qbittorrent_password=<redacted>\nnext record",
+        ),
+        # TOKEN-family keys keep the single-token capture: machine-generated
+        # urlsafe credentials cannot contain a space/&, so stopping at ``&``
+        # is fail-closed AND keeps the URL query diagnosable.
+        (
+            "GET /3/movie/603?api_key=FAKETOKFAM1&language=en-US",
+            "FAKETOKFAM1",
+            "GET /3/movie/603?api_key=<redacted>&language=en-US",
+        ),
+        # P2 (byte-string dumps): ``httpx.Headers.raw`` renders byte tuples --
+        # the ``b`` prefix on key and value must not defeat the tuple pass.
+        (
+            "headers=[(b'X-Api-Key', b'FAKEBYTEKEY1')]",
+            "FAKEBYTEKEY1",
+            "headers=[(b'X-Api-Key', b'<redacted>')]",
+        ),
+        # ... and the dict-style byte value must be masked whole, not leave the
+        # quoted secret behind a consumed ``b``.
+        (
+            "headers={b'X-Plex-Token': b'FAKEBYTEKEY2'}",
+            "FAKEBYTEKEY2",
+            "headers={b'X-Plex-Token': b'<redacted>'}",
+        ),
+        (
+            "headers=[(b'Authorization', b'Bearer FAKEBYTEAUTH')]",
+            "FAKEBYTEAUTH",
+            "headers=[(b'Authorization', b'<redacted>')]",
+        ),
+        # P2 (parameterized Authorization): Digest/SigV4-style values carry
+        # credential-bearing parameters past any token bound -- the whole
+        # header value is consumed to the line boundary.
+        (
+            'Authorization: Digest username="u", nonce="FAKEDIGNONCE", response="FAKEDIGRESP"',
+            "FAKEDIGRESP",
+            "Authorization: <redacted>",
+        ),
+        # A dict-repr Authorization value is QUOTED -- masked through its
+        # matching close quote, leaving the neighboring pair intact.
+        (
+            "headers={'Authorization': 'Bearer FAKEDICTAUTH', 'Accept': 'json'}",
+            "FAKEDICTAUTH",
+            "headers={'Authorization': '<redacted>', 'Accept': 'json'}",
+        ),
+        # P2 (tuple-wrapped values): a multi-valued field rendered as a TUPLE
+        # container -- ``('SECRET',)`` -- is masked whole like a list.
+        (
+            "headers={'X-Api-Key': ('FAKETUPLEWRAP1',)}",
+            "FAKETUPLEWRAP1",
+            "headers={'X-Api-Key': <redacted>}",
+        ),
+        (
+            "headers=[('X-Api-Key', ('FAKETUPLEWRAP2',))]",
+            "FAKETUPLEWRAP2",
+            "headers=[('X-Api-Key', <redacted>)]",
+        ),
+    ],
+)
+def test_redact_secrets_masks_key_value_shaped_secrets(
+    raw: str, secret: str, expected: str
+) -> None:
+    result = redact_secrets(raw)
+    assert result == expected
+    assert secret not in result
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The common English word "session" as prose -- followed by ``:`` and
+        # more text, NOT an adjacent ``=`` cookie assignment -- must not trip the
+        # cookie pass (the regression the existing ``access_token`` fixture also
+        # guards, isolated here).
+        "refreshing session: reconnecting in 5s",
+        "session established with upstream",
+        # ``sid`` only inside a longer word (no adjacent ``=``) is not a cookie.
+        "aside note: nothing secret here",
+        # ``sid`` mid-word directly before ``=`` without a name separator is
+        # prose, not a cookie name (``QBT_SID_8080=`` matches because its
+        # suffix follows a ``_`` separator; ``consider``'s trailing ``er``
+        # follows nothing).
+        "consider=carefully before retrying",
+        "residential=true",
+    ],
+)
+def test_redact_secrets_leaves_session_prose_untouched(raw: str) -> None:
+    assert redact_secrets(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # A never-closed quoted value (log line truncated mid-credential): the
+        # escape-aware run consumes to end, so the whole tail is masked -- fail
+        # closed, no trailing fragment survives.
+        "login password='FAKETRUNCPW",
+        # A never-closed list (truncated mid-list): consumed to end.
+        "headers={'api_key': ['FAKETRUNCLIST",
+        # A raw newline embedded in a quoted value (multi-line log record): the
+        # negated class matches the newline, so the value is masked past it.
+        'password="line one\nFAKEMULTILINE line two"',
+        # A lone surrogate inside a quoted value must not raise and must mask.
+        'password="FAKE\ud800SURROGATE"',
+        # Nested/mixed escaping.
+        'password="a\\"b\\\\c\\"FAKENESTESC"',
+        # A list element carrying an escaped quote.
+        "headers={'api_key': ['x\\'FAKELISTESC']}",
+    ],
+)
+def test_redact_secrets_fail_closed_on_adversarial_quoting(raw: str) -> None:
+    """Adversarial quoting/escaping/truncation the redaction must fail CLOSED on:
+    the obviously-fake credential embedded in each must never survive redaction.
+    The literal ``FAKE...`` markers below are never real secrets (mirrors the
+    fixture convention above), so pytest's assertion echo cannot leak one."""
+    result = redact_secrets(raw)
+    for marker in (
+        "FAKETRUNCPW",
+        "FAKETRUNCLIST",
+        "FAKEMULTILINE",
+        "FAKESURROGATE",
+        "FAKENESTESC",
+        "FAKELISTESC",
+    ):
+        assert marker not in result
+
+
+def test_redact_secrets_is_bounded_time_on_pathological_input() -> None:
+    """The value/list runs are backtracking-free (mutually exclusive branches /
+    possessive quantifiers): a long run of the ambiguity-inviting characters
+    (backslashes, quotes) must stay linear, never ReDoS. A generous ceiling --
+    the point is "not exponential", not a microbenchmark."""
+    import time
+
+    payloads = [
+        'password="' + "\\" * 40000,
+        "api_key=['" + "a'," * 20000,
+        "api_key=['" + "\\" * 40000,
+        'password="' + "a" * 200000,
+    ]
+    for payload in payloads:
+        start = time.perf_counter()
+        redact_secrets(payload)
+        assert time.perf_counter() - start < 1.0
+
+
+def test_redact_secrets_masks_basic_auth_url_password() -> None:
+    raw = "connecting to https://tracker_user:FAKEURLPASSWORD1@tracker.example.com/announce"
+    result = redact_secrets(raw)
+    assert result == "connecting to https://tracker_user:<redacted>@tracker.example.com/announce"
+    assert "FAKEURLPASSWORD1" not in result
+    assert "tracker_user" in result  # the account name stays diagnosable
+    # The host stays diagnosable. Compare the PARSED hostname rather than a bare
+    # substring check: an ``in`` test on an unparsed URL is the
+    # incomplete-URL-substring-sanitization shape CodeQL flags (the host could
+    # sit anywhere in the string); parsing pins it to the netloc exactly.
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
+
+
+def test_redact_secrets_masks_empty_username_basic_auth_url() -> None:
+    """A valid basic-auth URL with an EMPTY username (``https://:token@host``)
+    still carries a secret in its userinfo -- the username run is ``*`` not
+    ``+`` so the token is masked rather than leaked."""
+    raw = "connecting to https://:FAKEURLTOKEN9@tracker.example.com/announce"
+    result = redact_secrets(raw)
+    assert result == "connecting to https://:<redacted>@tracker.example.com/announce"
+    assert "FAKEURLTOKEN9" not in result
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
+
+
+@pytest.mark.parametrize(
+    ("scheme_word", "token"),
+    [
+        ("Bearer", "FAKEBEARERTOKEN.abc.def"),
+        ("Basic", "ZmFrZTpjcmVkZW50aWFs"),
+        # UNKNOWN schemes (RFC 7235 schemes are open-ended): a scheme allowlist
+        # would consume only the scheme word here and leave the credential after
+        # the space exposed -- the pattern must mask scheme + credential for ANY
+        # scheme word, not just the well-known four.
+        ("Token", "FAKEUNKNOWNSCHEME1"),
+        ("ApiKey", "FAKEUNKNOWNSCHEME2"),
+    ],
+)
+def test_redact_secrets_masks_the_whole_authorization_value(scheme_word: str, token: str) -> None:
+    """Authorization values carry an internal SPACE (scheme + token) that the
+    generic single-token value capture would only partially mask -- this must
+    redact the ENTIRE value, not just leave the scheme word exposed and the
+    token behind it untouched."""
+    raw = f"Authorization: {scheme_word} {token}"
+    result = redact_secrets(raw)
+    assert result == "Authorization: <redacted>"
+    assert token not in result
+    assert scheme_word not in result
+
+
+def test_redact_secrets_leaves_a_benign_tuple_key_containing_a_secret_word_alone() -> None:
+    """The tuple pass fires only when a secret key word ENDS the quoted key
+    name -- a key merely containing one mid-phrase is not a credential field
+    and must pass through untouched."""
+    raw = "queue=[('token of love', 'a title')]"
+    assert redact_secrets(raw) == raw
+
+
+def test_redact_secrets_masks_a_fernet_key_shaped_blob_regardless_of_context() -> None:
+    """The Fernet key has no "key name" attached in a log line at all (it is
+    loaded from a file) -- it must still be caught, on SHAPE alone."""
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    raw = f"generated a new encryption key at startup: {key}"
+    result = redact_secrets(raw)
+    assert key not in result
+    assert "<redacted-fernet-key>" in result
+    assert "generated a new encryption key at startup" in result
+
+
+def test_redact_secrets_masks_a_fernet_key_after_a_kv_equals() -> None:
+    """An env/config-dump rendering (``SOME_VAR=<key>``) puts a ``=`` right
+    before the key -- the boundary lookbehind must not treat that as
+    "mid-base64-run" and skip the master key (base64 padding only ever ENDS a
+    token, so a ``=`` before a 44-char blob always starts a new one)."""
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    # An arbitrary variable name the key-name pass does NOT know: only the
+    # shape pass can catch this, and it must fire across the ``=``.
+    result = redact_secrets(f"env dump: SOME_RANDOM_VAR={key}")
+    assert key not in result
+    assert "<redacted-fernet-key>" in result
+    # The app's own env var name IS covered by the key-name pass too
+    # (``fernet_key`` is a token-family key) -- masked either way, never raw.
+    result2 = redact_secrets(f"PLEX_MANAGER_FERNET_KEY={key}")
+    assert key not in result2
+
+
+def test_redact_secrets_does_not_mangle_an_unrelated_44_char_token() -> None:
+    """A 44-char run that is NOT base64-shaped (contains a character outside the
+    urlsafe-base64 alphabet, or has no trailing ``=``) must survive untouched --
+    the Fernet pattern is deliberately shape-EXACT, not "roughly 44 chars"."""
+    not_fernet_shaped = "x" * 44  # no trailing '=' pad
+    assert redact_secrets(f"id={not_fernet_shaped}") == f"id={not_fernet_shaped}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "reconcile tick completed in 1.23s",
+        "auto-grab cycle summary: attempted=3 granted=2 source_failures=1",
+        "grab failed for request 42: HTTP 503 Service Unavailable",
+        "pruned 12 log_events row(s) older than 7 day(s) or beyond 100000 row(s)",
+        "TMDB request failed: GET /movie/603 (HTTP 429)",
+        # An already-safe_guid-redacted value must pass through unchanged --
+        # no accidental re-match of its hash-suffix shape.
+        "release guid: tracker.example.org#a1b2c3d4e5f6",
+        # A benign field whose name merely CONTAINS one of the secret roots as
+        # a substring, not a whole word, must not be treated as a secret key.
+        "tokenizer initialized with vocab_size=32000",
+    ],
+)
+def test_redact_secrets_leaves_known_good_lines_unmangled(line: str) -> None:
+    assert redact_secrets(line) == line
+
+
+def test_redact_secrets_is_a_noop_on_empty_string() -> None:
+    assert redact_secrets("") == ""
+
+
+def test_redact_secrets_never_raises_on_malformed_input() -> None:
+    # Odd-but-plausible malformed inputs: an unterminated quote, a lone '=' at
+    # the end of the string right after a secret-shaped key name.
+    for raw in ("password='unterminated", "token=", "api_key", "://:@"):
+        redact_secrets(raw)  # must not raise

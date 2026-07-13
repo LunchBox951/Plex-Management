@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import heapq
 import ipaddress
 import json
 import logging
@@ -64,7 +65,15 @@ import httpcore
 import httpx
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
-from plex_manager.ports.download_client import AddResult, DownloadedFile, DownloadStatus
+from plex_manager.domain.failure_classification import ENVIRONMENTAL_FAILURE_PATTERNS
+from plex_manager.logsafe import safe_guid, safe_text
+from plex_manager.ports.download_client import (
+    AddResult,
+    DownloadedFile,
+    DownloadStatus,
+    FailureDetail,
+    FailureDetailSource,
+)
 
 __all__ = [
     "QbittorrentAuthError",
@@ -83,6 +92,32 @@ _HTTP_FORBIDDEN: Final = 403
 _HTTP_CONFLICT: Final = 409
 _REDIRECT_MAX_DEPTH: Final = 5
 _PROPERTIES_TTL_SECONDS: Final = 30.0
+# get_failure_detail (issue #181): bounds on the two best-effort diagnostic
+# sources it queries. _LOG_SCAN_LIMIT caps how many of qBittorrent's own
+# (potentially long-running-install-sized) in-memory app log entries are
+# scanned for a name match -- an unbounded scan would be an unbounded-cost
+# reconcile-cycle hot-path call. _MAX_FAILURE_DETAIL_CHARS bounds the returned
+# string so a runaway client message cannot bloat the persisted
+# ``failed_reason`` column / a log line.
+_LOG_SCAN_LIMIT: Final = 200
+_MAX_FAILURE_DETAIL_CHARS: Final = 300
+# qBittorrent's ``/log/main`` emitted the entry ``timestamp`` in MILLISECONDS on
+# WebAPI/app versions before 4.5.0 and in SECONDS from 4.5.0 on, while
+# ``/torrents/info`` ``added_on`` is ALWAYS Unix-epoch seconds. The log-scan
+# lower-bound compare (below) needs both in the same unit, but this adapter
+# supports the whole 4.1--5.x line and may not always be able to read the
+# client's version -- so we normalise by MAGNITUDE, not by a version gate: a
+# plausible seconds epoch stays below ~1e10 for the next two centuries, while a
+# millisecond epoch has been >= ~1e12 since the year 2001, so any ``timestamp``
+# at/above this threshold is milliseconds and is scaled to seconds. A value in
+# the ambiguous <1e12 range is read as seconds -- correct for every real date a
+# running client would stamp; the whole scan is best-effort regardless.
+_LOG_MS_EPOCH_THRESHOLD: Final = 1_000_000_000_000  # 1e12 == the year 2001 in ms
+# qBittorrent's ``/torrents/trackers`` ``status`` enum: 0 Disabled, 1 Not
+# contacted yet, 2 Working, 3 Updating, 4 Not working. Only 4 carries a
+# meaningful failure ``msg`` (a dead/unregistered torrent, a private-tracker
+# rejection) worth surfacing.
+_TRACKER_STATUS_NOT_WORKING: Final = 4
 # A .torrent metafile is normally tens of KB, but a large multi-file pack with a
 # small piece size legitimately reaches a few MB. 10 MiB is comfortably above any
 # real metafile yet still a hard ceiling against a hostile/unbounded source body.
@@ -408,6 +443,89 @@ def _s(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _log_entry_epoch_seconds(entry: dict[str, object]) -> int:
+    """Return a ``/log/main`` entry's ``timestamp`` normalised to Unix-epoch
+    SECONDS so it is comparable to ``/torrents/info`` ``added_on``.
+
+    qBittorrent < 4.5.0 stamps this field in milliseconds; :data:`_LOG_MS_EPOCH_THRESHOLD`
+    detects those by magnitude and scales them down. A 0/absent/negative value
+    stays ``0`` -- the caller then simply disables the lower bound (best-effort).
+    """
+    ts = _i(entry.get("timestamp"))
+    if ts >= _LOG_MS_EPOCH_THRESHOLD:
+        return ts // 1000
+    return ts
+
+
+# Matches a URI-shaped substring (``scheme://...`` or a bare ``magnet:...``)
+# embedded in an otherwise free-text qBittorrent log/tracker message -- the
+# rare case a log line quotes the source url/magnet it failed to fetch. A URI
+# never contains unencoded whitespace, so splitting on ``\S+`` cannot sever a
+# credential-bearing query string in two. Deliberately narrower than
+# ``logsafe.safe_guid``'s own contract (which redacts a value that IS,
+# wholesale, a GUID) -- applied only to matched tokens, so ordinary diagnostic
+# prose (file paths, "Permission denied:", host directory names) is never
+# touched.
+_EMBEDDED_URI_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://\S+|\bmagnet:\S+")
+
+
+def _cap_failure_detail(text: str) -> str:
+    """Cap ``text`` to :data:`_MAX_FAILURE_DETAIL_CHARS` for the persisted
+    ``failed_reason`` / UI WITHOUT severing the host-side signal the service
+    classifies on (issue #181).
+
+    A qBittorrent ``file_open`` error on a long/nested path can push its errno
+    phrase (``Permission denied``, ``No space left on device``, ...) past the
+    cap; a plain head truncation would drop the ONLY thing that tells
+    :func:`classify_failure_detail` the failure was environmental, and a good
+    release would then be wrongly blocklisted. So when the head would lose an
+    :data:`ENVIRONMENTAL_FAILURE_PATTERNS` phrase the full text carries, reserve
+    room and append that phrase -- the result stays within the cap (the head is
+    shortened by exactly the appended length) and the classifier still sees the
+    signal. No environmental phrase past the head -> a plain head cap.
+    """
+    if len(text) <= _MAX_FAILURE_DETAIL_CHARS:
+        return text
+    lowered = text.lower()
+    head_lower = lowered[:_MAX_FAILURE_DETAIL_CHARS]
+    for pattern in ENVIRONMENTAL_FAILURE_PATTERNS:
+        if pattern in head_lower or pattern not in lowered:
+            continue
+        # The phrase lives only beyond the head (or straddles the cap); keep it,
+        # in its real source casing, reserving room so the total never exceeds
+        # the cap.
+        index = lowered.find(pattern)
+        preserved = text[index : index + len(pattern)]
+        marker = "…"
+        head_room = _MAX_FAILURE_DETAIL_CHARS - len(marker) - len(preserved)
+        if head_room <= 0:
+            # Pathological: the phrase alone meets/exceeds the cap. Keep the
+            # bounded phrase so classification still works; drop the head.
+            return preserved[:_MAX_FAILURE_DETAIL_CHARS]
+        return f"{text[:head_room]}{marker}{preserved}"
+    return text[:_MAX_FAILURE_DETAIL_CHARS]
+
+
+def _sanitize_failure_detail(detail: str) -> str:
+    """Bound + redact a qBittorrent-sourced free-text detail before it can
+    reach the persisted ``failed_reason`` / UI (issue #181, north star #3).
+
+    ``safe_text`` collapses any line-boundary character so the detail cannot
+    forge a second log record; any embedded URL/magnet-shaped substring is
+    then redacted token-by-token via ``safe_guid`` (a tracker passkey or
+    session token can ride a quoted source url in a log line) with everything
+    else -- file paths, the actual error prose -- left byte-identical; finally
+    the whole string is capped to :data:`_MAX_FAILURE_DETAIL_CHARS` via
+    :func:`_cap_failure_detail`, which preserves any environmental errno phrase
+    that would otherwise fall past the cap. Redaction runs BEFORE the cap so a
+    length limit can never sever a redaction candidate mid-token and leak half a
+    credential.
+    """
+    text = safe_text(detail)
+    text = _EMBEDDED_URI_RE.sub(lambda match: safe_guid(match.group(0)), text)
+    return _cap_failure_detail(text)
+
+
 def _parse_webapi_version(text: str) -> tuple[int, ...]:
     """Parse a qBittorrent WebAPI version string (e.g. ``"2.11.0"``) into a tuple.
 
@@ -515,6 +633,54 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     except ValueError:
         return None
     return scheme, parsed.hostname.casefold(), port or (443 if scheme == "https" else 80)
+
+
+# Segment forms that are ambiguous under percent-decoding: a reverse proxy
+# (the whole premise of a configured path prefix) commonly decodes these
+# before it routes, so "prowlarr/%2e%2e/admin" reaches the sibling "/admin"
+# backend exactly like a literal "prowlarr/../admin" would. Checked against
+# the RAW, casefolded segment text (no decoding performed here) so we never
+# have to reason about *how much* a downstream proxy decodes.
+_AMBIGUOUS_PATH_SEGMENT_FORMS: Final = frozenset({".", "..", "%2e", "%2e.", ".%2e", "%2e%2e"})
+
+
+def _has_ambiguous_path_segment(segments: tuple[str, ...]) -> bool:
+    for part in segments:
+        folded = part.casefold()
+        if folded in _AMBIGUOUS_PATH_SEGMENT_FORMS:
+            return True
+        # An encoded or literal slash/backslash inside one raw segment hides an
+        # extra path boundary from this segment split entirely; a downstream
+        # proxy or the eventual fetch may still honor it as a separator.
+        if "%2f" in folded or "%5c" in folded or "\\" in part:
+            return True
+    return False
+
+
+def _source_origin_and_path(url: str) -> tuple[tuple[str, str, int], tuple[str, ...]] | None:
+    """Like :func:`_source_origin_triple`, plus the candidate's path segments.
+
+    The configured Prowlarr base may carry a reverse-proxy path prefix
+    (``http://127.0.0.1:9696/prowlarr``); ADR-0018 treats that prefix as a
+    service/credential boundary, so the trusted-source match must include it,
+    not just scheme/host/port. Segments are the RAW (undecoded), CASE-SENSITIVE
+    path split on ``/`` with empty segments dropped — paths are case-sensitive
+    (unlike host), and comparing raw text keeps mixed-case tricks from slipping
+    past the match. A literal or percent-encoded ``.``/``..`` segment, or a
+    segment hiding an encoded/literal slash, is ambiguous (its resolved meaning
+    depends on what the reverse proxy normalizes/decodes to) so it is rejected
+    here too: the caller falls through to the full SSRF veto rather than trying
+    to interpret it, mirroring ``ServiceUrl``'s own dot-segment rejection for
+    the configured base itself.
+    """
+    origin = _source_origin_triple(url)
+    if origin is None:
+        return None
+    path = urlparse(url).path
+    segments = tuple(part for part in path.split("/") if part)
+    if _has_ambiguous_path_segment(segments):
+        return None
+    return origin, segments
 
 
 async def _assert_safe_fetch_url(url: str) -> None:
@@ -735,15 +901,35 @@ class QbittorrentClient:
         self._source_client = source_client
         # The OPERATOR-CONFIGURED Prowlarr base URL (the endpoint the app already
         # trusts with an API key for every search call), normalized to its
-        # (scheme, host, port) origin. A torrent-source hop on EXACTLY this origin
-        # skips the private-address SSRF veto — Prowlarr routinely serves magnetless
+        # (scheme, host, port) origin plus its reverse-proxy path prefix. A
+        # torrent-source hop on EXACTLY this origin AND beneath this prefix skips
+        # the private-address SSRF veto — Prowlarr routinely serves magnetless
         # .torrent downloadUrls pointing at itself, and on the normal self-hosted
         # layout that host is 127.0.0.1 / RFC1918 / a compose alias, which the veto
-        # would otherwise make ungrabbable. Matching is by URL origin, never DNS
-        # results, and per hop: a redirect OFF this origin re-enters the full veto.
-        self._trusted_source_origin = (
-            _source_origin_triple(trusted_source_origin) if trusted_source_origin else None
-        )
+        # would otherwise make ungrabbable. Matching is by URL origin + path
+        # prefix, never DNS results, and per hop: a redirect OFF this origin or
+        # prefix re-enters the full veto. Parsed through the same canonical
+        # ``ServiceUrl`` the base URL itself uses, so the prefix is validated and
+        # normalized identically (dot-segments, trailing slash, etc). The origin
+        # itself is still derived via ``_source_origin_triple`` (not
+        # ``ServiceUrl.origin``): the latter IDNA-decodes to Unicode via
+        # ``httpx.URL.host``, while every per-hop candidate is normalized with
+        # ``urlparse``, which keeps punycode ASCII — comparing the two would
+        # silently and permanently deny trust for an IDNA-hostname Prowlarr base.
+        # Keeping both sides on ``_source_origin_triple`` preserves the single
+        # normalization the pre-fix code already relied on.
+        self._trusted_source_origin: tuple[str, str, int] | None = None
+        self._trusted_source_prefix: tuple[str, ...] = ()
+        if trusted_source_origin:
+            try:
+                trusted_service = ServiceUrl.parse(trusted_source_origin)
+            except InvalidServiceUrl:
+                pass
+            else:
+                self._trusted_source_origin = _source_origin_triple(trusted_service.base)
+                self._trusted_source_prefix = tuple(
+                    part for part in urlparse(trusted_service.base).path.split("/") if part
+                )
         if trusted_source_origin and self._trusted_source_origin is None:
             # The stored Prowlarr URL is not a usable origin (malformed IPv6
             # literal / bad port / non-http scheme — PUT /settings does not
@@ -1003,10 +1189,24 @@ class QbittorrentClient:
         return None, None
 
     def _is_trusted_source_url(self, url: str) -> bool:
-        """Whether ``url`` sits on the operator-configured trusted source origin."""
+        """Whether ``url`` sits beneath the trusted source origin's configured prefix.
+
+        Origin equality alone is not enough: the configured Prowlarr base may
+        carry a reverse-proxy path prefix that is itself a service/credential
+        boundary (ADR-0018). A same-origin URL must also match that prefix at a
+        path-SEGMENT boundary (``/prowlarr-evil`` must not match a ``/prowlarr``
+        prefix via plain string ``startswith``).
+        """
         if self._trusted_source_origin is None:
             return False
-        return _source_origin_triple(url) == self._trusted_source_origin
+        parsed = _source_origin_and_path(url)
+        if parsed is None:
+            return False
+        origin, segments = parsed
+        if origin != self._trusted_source_origin:
+            return False
+        prefix = self._trusted_source_prefix
+        return len(segments) >= len(prefix) and segments[: len(prefix)] == prefix
 
     async def _resolve_http_source(self, url: str) -> tuple[str | None, bytes | None]:
         if self._source_client is not None:
@@ -1277,6 +1477,146 @@ class QbittorrentClient:
         )
         self._raise_for_status(response)
         self._properties_cache.pop(info_hash.lower(), None)
+
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
+        """Best-effort qBittorrent-side detail for a failed torrent (issue #181).
+
+        See the port docstring for the why; this is the concrete two-source
+        implementation, queried in this priority:
+
+        1. **The app log** (``GET /log/main``): the most recent warning/critical
+           entry naming this torrent by its current ``/torrents/info`` name
+           (substring, case-insensitive) AND no older than when this torrent
+           instance was added (its ``added_on``), so a stale line left by a
+           PRIOR download of the same title cannot drive the new hash's detail.
+           The log is the ONLY surface that carries an I/O-class error at all --
+           neither ``/torrents/info`` nor ``/torrents/properties`` exposes one,
+           and it is exactly where the live incident's ``file_open ... error:
+           Permission denied`` landed. Returned with
+           :attr:`FailureDetailSource.log`.
+        2. **Tracker messages** (``GET /torrents/trackers``): the most recent
+           NOT_WORKING tracker's ``msg``, when the log scan found nothing --
+           covers release-side failures a log scan cannot see (an
+           unregistered/dead torrent, a private-tracker rejection). Returned
+           with :attr:`FailureDetailSource.tracker` so the environmental
+           classification never reads a tracker message as a host-side signal.
+
+        Total and best-effort per the port contract: an unreadable torrent
+        name, an empty log, no trackers, or any ``QbittorrentError`` from
+        either call all return ``None`` rather than raising -- this enriches
+        an ALREADY-failed torrent and must never itself abort the reconcile
+        cycle. The text is passed through :func:`_sanitize_failure_detail`
+        before return; a detail that sanitizes to empty is dropped.
+        """
+        info = await self._failure_info_row(info_hash)
+        if info is None:
+            return None
+        name, added_on = info
+        if not name:
+            return None
+        message = await self._scan_log_for_torrent(name, added_on)
+        source = FailureDetailSource.log
+        if message is None:
+            message = await self._latest_tracker_error(info_hash)
+            source = FailureDetailSource.tracker
+        if not message:
+            return None
+        text = _sanitize_failure_detail(message)
+        if not text:
+            return None
+        return FailureDetail(text=text, source=source)
+
+    async def _failure_info_row(self, info_hash: str) -> tuple[str, int] | None:
+        """Read this torrent's ``name`` + ``added_on`` (epoch seconds) from
+        ``/torrents/info`` for :meth:`get_failure_detail`, or ``None`` if it is
+        absent/unreadable. Best-effort: any ``QbittorrentError`` returns
+        ``None``. ``added_on`` gives the log scan a lower time bound so a stale
+        entry from a prior instance of the same name is ignored (0 when the
+        client omits it -- the bound is then simply disabled)."""
+        try:
+            response = await self._request(
+                "GET", "/torrents/info", params={"hashes": info_hash.lower()}
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/torrents/info"))
+        except QbittorrentError:
+            return None
+        if not rows:
+            return None
+        row = _as_dict(rows[0])
+        return _s(row.get("name")), _i(row.get("added_on"))
+
+    async def _scan_log_for_torrent(self, name: str, added_on: int) -> str | None:
+        """Return the most recent warning/critical app-log message naming
+        ``name`` and no older than ``added_on``, or ``None``. Best-effort: any
+        failure returns ``None``."""
+        try:
+            response = await self._request(
+                "GET",
+                "/log/main",
+                params={"normal": "false", "info": "false", "warning": "true", "critical": "true"},
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/log/main"))
+        except QbittorrentError:
+            return None
+        entries = (_as_dict(row) for row in rows)
+        # Take only the newest _LOG_SCAN_LIMIT warning/critical rows (highest
+        # ``id``) WITHOUT sorting the whole (possibly long-lived, large)
+        # in-memory log: ``nlargest`` keeps a window-sized heap, so the work is
+        # O(n log LIMIT), not O(n log n), and the limit is applied DURING
+        # selection rather than after a full sort. Returned newest-first.
+        recent = heapq.nlargest(
+            _LOG_SCAN_LIMIT,
+            (entry for entry in entries if entry),
+            key=lambda entry: _i(entry.get("id")),
+        )
+        needle = name.lower()
+        for entry in recent:
+            # Correlate the match to THIS torrent instance: skip any entry that
+            # predates the torrent's ``added_on`` so a stale line from a prior
+            # download of the same title cannot drive the new hash's detail /
+            # blocklist decision. The log ``timestamp`` is normalised to seconds
+            # first (qBit < 4.5.0 stamps it in ms) so the compare is unit-safe.
+            # A 0/absent ``added_on`` or ``timestamp`` disables only this lower
+            # bound (best-effort), never the name match.
+            entry_epoch = _log_entry_epoch_seconds(entry)
+            if added_on > 0 and 0 < entry_epoch < added_on:
+                continue
+            message = _s(entry.get("message"))
+            if message and needle in message.lower():
+                return message
+        return None
+
+    async def _latest_tracker_error(self, info_hash: str) -> str | None:
+        """Return the most recent NOT_WORKING tracker's ``msg`` for
+        ``info_hash``, or ``None``. Best-effort: any failure returns ``None``."""
+        try:
+            response = await self._request(
+                "GET", "/torrents/trackers", params={"hash": info_hash.lower()}
+            )
+            if response.status_code != _HTTP_OK:
+                return None
+            rows = _as_list(_decode_json(response, "/torrents/trackers"))
+        except QbittorrentError:
+            return None
+        for row in rows:
+            entry = _as_dict(row)
+            if not entry:
+                continue
+            url = _s(entry.get("url"))
+            if url.startswith("**"):
+                # qBittorrent's pseudo-tracker rows for DHT/PeX/LSD, not a real
+                # tracker -- never a meaningful failure message.
+                continue
+            if _i(entry.get("status")) != _TRACKER_STATUS_NOT_WORKING:
+                continue
+            msg = _s(entry.get("msg"))
+            if msg:
+                return msg
+        return None
 
     async def _fetch_properties(self, info_hash: str) -> dict[str, object] | None:
         """Fetch ``/torrents/properties`` for ``info_hash``, cached briefly.

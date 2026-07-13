@@ -23,6 +23,7 @@ from plex_manager.ports.download_client import (
     DownloadClientPort,
     DownloadedFile,
     DownloadStatus,
+    FailureDetail,
 )
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState
@@ -38,6 +39,8 @@ from plex_manager.ports.metadata import (
     MediaSearchResult,
     MetadataPort,
     MovieMetadata,
+    RecommendationFacet,
+    RecommendationProfile,
     TvMetadata,
 )
 from plex_manager.web.deps import (
@@ -169,6 +172,12 @@ class FakeTmdb:
         upcoming: list[MediaSearchResult] | None = None,
         trending_tv_results: list[MediaSearchResult] | None = None,
         popular_tv_results: list[MediaSearchResult] | None = None,
+        recommendation_profiles: dict[tuple[int, Literal["movie", "tv"]], RecommendationProfile]
+        | None = None,
+        recommendations: dict[
+            tuple[Literal["movie", "tv"], str, int | None], list[MediaSearchResult]
+        ]
+        | None = None,
         season_episodes: dict[tuple[int, int], list[EpisodeInfo]] | None = None,
         season_episodes_error: Exception | None = None,
         get_tv_show_error: Exception | None = None,
@@ -190,6 +199,12 @@ class FakeTmdb:
         self._popular_tv = (
             list(popular_tv_results) if popular_tv_results is not None else list(self.results)
         )
+        self._recommendation_profiles = recommendation_profiles or {}
+        self._recommendations = recommendations or {}
+        self.recommendation_profile_calls: list[tuple[int, Literal["movie", "tv"]]] = []
+        self.recommendation_calls: list[
+            tuple[Literal["movie", "tv"], RecommendationFacet, int]
+        ] = []
         # ADR-0020 (issue #178): keyed (tmdb_id, season_number). ``season_episodes_error``
         # (when set) is raised on every call -- the "TMDB outage / target unknown"
         # test double.
@@ -236,6 +251,21 @@ class FakeTmdb:
     async def popular_tv(self, page: int = 1) -> MediaPage:
         return self._page(self._popular_tv)
 
+    async def recommendation_profile(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"]
+    ) -> RecommendationProfile | None:
+        self.recommendation_profile_calls.append((tmdb_id, media_type))
+        return self._recommendation_profiles.get((tmdb_id, media_type))
+
+    async def discover_recommendations(
+        self,
+        media_type: Literal["movie", "tv"],
+        facet: RecommendationFacet,
+        page: int = 1,
+    ) -> MediaPage:
+        self.recommendation_calls.append((media_type, facet, page))
+        return self._page(self._recommendations.get((media_type, facet.metric, facet.value_id), []))
+
     async def season_episodes(self, tmdb_id: int, season_number: int) -> list[EpisodeInfo]:
         self.season_episodes_calls.append((tmdb_id, season_number))
         if self.season_episodes_error is not None:
@@ -266,6 +296,7 @@ class FakeQbittorrent:
         source_errors: set[str] | None = None,
         pre_existing: set[str] | None = None,
         default_save_path: str | None = None,
+        failure_details: dict[str, FailureDetail] | None = None,
     ) -> None:
         self.statuses = statuses or []
         self.files = files or {}
@@ -275,6 +306,10 @@ class FakeQbittorrent:
         # and a recorder of every ``set_location`` call (lowercased hash, target).
         self.default_save_path = default_save_path
         self.relocated: list[tuple[str, str]] = []
+        # Canned ``get_failure_detail`` results, keyed by lowercased info-hash
+        # (issue #181) -- a hash absent from this map returns ``None``, mirroring
+        # the real adapter's "nothing more specific to say" default.
+        self.failure_details = failure_details or {}
         # Sources (a magnet/HTTP url) for which ``add`` raises
         # :class:`QbittorrentSourceError`, mirroring the real adapter's honest
         # "HTTP source resolved to neither a magnet nor a hashable .torrent" — the
@@ -339,6 +374,9 @@ class FakeQbittorrent:
 
     async def set_location(self, info_hash: str, save_path: str) -> None:
         self.relocated.append((info_hash.lower(), save_path))
+
+    async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
+        return self.failure_details.get(info_hash.lower())
 
 
 class FakeLibrary:

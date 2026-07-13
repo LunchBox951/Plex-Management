@@ -315,6 +315,14 @@ class RequestRepository(Protocol):
         """List requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def list_personalization_history(self, user_id: int) -> list[RequestRecord]:
+        """List one user's non-cancelled, display-deduplicated request history.
+
+        The user predicate is applied by the persistence query. Ownerless and
+        other users' rows are never candidates, including for an administrator.
+        """
+        raise NotImplementedError
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[RequestRecord]:
@@ -1041,5 +1049,27 @@ class LogEventRepository(Protocol):
         multi-name ``NOT IN`` in ONE statement -- composing it from per-logger
         excludes would wrongly delete each telemetry logger's rows on the passes
         that name a different one.
+        """
+        raise NotImplementedError
+
+    async def prune_excess(self, max_rows: int) -> int:
+        """Delete the OLDEST rows beyond the newest ``max_rows``; return the count removed.
+
+        The ROW-COUNT companion to :meth:`prune_older_than`'s AGE cutoff
+        (issue #152): a chatty install running a generous ``log_retention_days``
+        can otherwise grow ``log_events`` unboundedly, since age-based pruning
+        alone never trips until a row is actually stale. Ordered by
+        ``created_at``, ``id`` (the same tie-break :meth:`list_events` uses for
+        rows a single batch-insert stamped with an identical ``created_at``) so
+        "oldest" is well-defined even under a burst insert; the newest
+        ``max_rows`` survive regardless of level/logger -- this is a total cap,
+        not a per-logger one (the telemetry carve-out is an AGE exception only).
+
+        A no-op (0 rows removed) when the table is already at or under the cap
+        -- the common, cheap-to-check-for tick. ``max_rows`` is caller-supplied
+        already-resolved policy (:func:`~plex_manager.web.deps.
+        get_log_max_rows`); a negative value is treated as ``0`` (keep nothing)
+        rather than raising, so a corrupt/adversarial cap value degrades to the
+        safe (over-pruning, never under-bounding) side.
         """
         raise NotImplementedError

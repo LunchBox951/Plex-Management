@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { StrictMode, type ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useCancelRequest,
@@ -1015,6 +1015,251 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /request again/i })).toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — one-shot release-preview action', () => {
+  const EMPTY_PREVIEW: SearchPreviewResponse = {
+    accepted: [],
+    rejected: [],
+    no_acceptable_release: true,
+  }
+
+  function baseMocks(requests: RequestResponse[]) {
+    const previewMutation = mutation(EMPTY_PREVIEW)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(previewMutation)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests } })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+    return previewMutation
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('consumes a movie re-search token once across rerenders', async () => {
+    const request: RequestResponse = {
+      id: 71,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const previewMutation = baseMocks([request])
+    const action = { kind: 're-search' as const, requestId: 71, season: null, token: 9 }
+    const view = render(
+      <StrictMode>
+        <TitleDetailModal title={TITLE} open onOpenChange={() => {}} action={action} />
+      </StrictMode>,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 71 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+
+    view.rerender(
+      <StrictMode>
+        <TitleDetailModal title={TITLE} open onOpenChange={() => {}} action={action} />
+      </StrictMode>,
+    )
+    await waitFor(() => expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1))
+  })
+
+  it('uses the action-supplied TV season, not the modal season state', async () => {
+    const title: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 100,
+      title: 'Test Show',
+      year: 2022,
+      library_state: 'processing',
+    }
+    const request: RequestResponse = {
+      id: 72,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'no_acceptable_release' },
+      ],
+    }
+    const previewMutation = baseMocks([request])
+
+    render(
+      <TitleDetailModal
+        title={title}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 72, season: 2, token: 10 }}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 72, season: 2 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a stale season picked on a PREVIOUS title in the same modal instance', async () => {
+    // A long-mounted modal is reused across titles. The operator picks season 1
+    // on show A; the shortcut then opens show B in the same instance. The action
+    // effect fires in the render where `activeSeason` still holds A's pick (the
+    // title-reset effect has not applied yet), so the search must use the season
+    // the action carries — resolved from B's own fresh request row — never the
+    // modal's stale season state.
+    const showA: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 100,
+      title: 'Show A',
+      year: 2022,
+      library_state: 'processing',
+    }
+    const showB: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 200,
+      title: 'Show B',
+      year: 2023,
+      library_state: 'processing',
+    }
+    const requestA: RequestResponse = {
+      id: 73,
+      tmdb_id: 100,
+      media_type: 'tv',
+      title: 'Show A',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'downloading' },
+        { season_number: 2, status: 'pending' },
+      ],
+    }
+    const requestB: RequestResponse = {
+      id: 74,
+      tmdb_id: 200,
+      media_type: 'tv',
+      title: 'Show B',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+      seasons: [
+        { season_number: 1, status: 'available' },
+        { season_number: 2, status: 'no_acceptable_release' },
+      ],
+    }
+    const previewMutation = baseMocks([requestA, requestB])
+
+    const view = render(
+      <TitleDetailModal title={showA} open onOpenChange={() => {}} action={null} />,
+    )
+    // Show B also tracks a season 1, so this stale pick stays "valid" for B and
+    // would silently win inside `resolveSeason` without the explicit override.
+    fireEvent.change(screen.getByLabelText('Season'), { target: { value: '1' } })
+
+    view.rerender(
+      <TitleDetailModal
+        title={showB}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 74, season: 2, token: 12 }}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 74, season: 2 }),
+    )
+    expect(previewMutation.mutateAsync).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed for a shared user even when an action is supplied', async () => {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+    const previewMutation = baseMocks([])
+
+    render(
+      <TitleDetailModal
+        title={TITLE}
+        open
+        onOpenChange={() => {}}
+        action={{ kind: 're-search', requestId: 71, season: null, token: 11 }}
+      />,
+    )
+
+    await waitFor(() => expect(previewMutation.mutateAsync).not.toHaveBeenCalled())
+  })
+})
+
+describe('TitleDetailModal — bound request row (duplicate same-title rows)', () => {
+  it('presents and acts on the CLICKED row, not the first title match', async () => {
+    // An admin's Requests list legitimately shows TWO users' rows for the same
+    // title (the display fold keys on user_id). Without an explicit binding the
+    // modal's title-based correlation resolves to the FIRST non-settled match —
+    // here another user's `downloading` row — so previewing/grabbing from the
+    // clicked no-release row would target a different user's request.
+    const otherUsersRow: RequestResponse = {
+      id: 80,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const clickedRow: RequestResponse = {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'no_acceptable_release',
+      is_anime: false,
+      keep_forever: false,
+    }
+    const previewMutation = mutation({
+      accepted: [],
+      rejected: [],
+      no_acceptable_release: true,
+    })
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(previewMutation)
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [otherUsersRow, clickedRow] },
+    })
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+
+    render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    // The action zone reflects the BOUND row's no-release state (Re-search),
+    // not the unbound first match's `downloading` state…
+    const reSearch = await screen.findByRole('button', { name: /re-search/i })
+    fireEvent.click(reSearch)
+    // …and the preview runs against the bound row's id.
+    await waitFor(() =>
+      expect(previewMutation.mutateAsync).toHaveBeenCalledWith({ request_id: 81 }),
+    )
   })
 })
 

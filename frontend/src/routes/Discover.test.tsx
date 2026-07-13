@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useDiscoverHome,
-  useDiscoverSearch,
   useRequests,
   useRequestsInvalidated,
 } from '../api/hooks'
@@ -15,11 +15,10 @@ import { Discover } from './Discover'
 // calls its full hook surface before its own guard, and each unbadged tile mounts a
 // QuickRequestButton (useCreateRequest + useToast). Stub the whole hooks module —
 // same pattern as Requests.test.tsx — so nothing touches the network; the hooks
-// this suite actually drives (useDiscoverHome / useDiscoverSearch / useRequests /
+// this suite actually drives (useDiscoverHome / useRequests /
 // useRequestsInvalidated) are overridden per test.
 vi.mock('../api/hooks', () => ({
   useDiscoverHome: vi.fn(),
-  useDiscoverSearch: vi.fn(),
   useRequests: vi.fn(),
   useRequestsInvalidated: vi.fn(() => false),
   // Admin context for the shared modal's RBAC gating (same default as
@@ -71,6 +70,14 @@ const SHOW: DiscoverResult = {
   library_state: 'none',
 }
 
+const HERO: DiscoverResult = {
+  media_type: 'movie',
+  tmdb_id: 3,
+  title: 'Hero Movie',
+  year: 2024,
+  library_state: 'none',
+}
+
 // Exact-string matches select the quick-request action, not the card details
 // button that includes the same title in its accessible name.
 const REQUEST_MOVIE = 'Request Fresh Movie'
@@ -89,18 +96,12 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
   }
 }
 
-function mockHome(items: DiscoverResult[] = [MOVIE]) {
+function mockHome(items: DiscoverResult[] = [MOVIE], spotlights: DiscoverResult[] = []) {
   ;(useDiscoverHome as unknown as Mock).mockReturnValue({
-    data: { spotlight: null, rows: [{ row_type: 'trending', title: 'Trending', items }] },
+    data: { spotlights, rows: [{ row_type: 'trending', title: 'Trending', items }] },
     isLoading: false,
     isError: false,
     dataUpdatedAt: Date.now(),
-  })
-  ;(useDiscoverSearch as unknown as Mock).mockReturnValue({
-    data: undefined,
-    isError: false,
-    isFetching: false,
-    dataUpdatedAt: 0,
   })
 }
 
@@ -118,7 +119,119 @@ beforeEach(() => {
   // module-level state — reset between tests like tileState.test.ts does.
   resetSettleObservations()
   mockHome()
+  mockRequests([])
   ;(useRequestsInvalidated as unknown as Mock).mockReturnValue(false)
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('Discover — hero-first home (issue #188)', () => {
+  it('creates one load id per mount and reuses it across rerenders', () => {
+    const firstView = render(<Discover />)
+    const firstId = (useDiscoverHome as unknown as Mock).mock.calls.at(-1)?.[0]?.loadId
+    expect(firstId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+
+    firstView.rerender(<Discover />)
+    const idsBeforeUnmount = (useDiscoverHome as unknown as Mock).mock.calls.map(
+      (call) => (call[0] as { loadId?: string }).loadId,
+    )
+    expect(new Set(idsBeforeUnmount)).toEqual(new Set([firstId]))
+
+    firstView.unmount()
+    render(<Discover />)
+    const remountedId = (useDiscoverHome as unknown as Mock).mock.calls.at(-1)?.[0]?.loadId
+    expect(remountedId).not.toBe(firstId)
+  })
+
+  it('removes the page heading, subtitle, and inline search input', () => {
+    render(<Discover />)
+
+    expect(screen.queryByRole('heading', { name: 'Discover' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Search TMDB to request a movie or show.')).not.toBeInTheDocument()
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument()
+  })
+
+  it('renders Spotlight before the first home row on a successful response', () => {
+    mockHome([MOVIE], [HERO])
+    render(<Discover />)
+
+    const hero = screen.getByRole('heading', { name: HERO.title }).closest('section')
+    const firstRow = screen.getByRole('heading', { name: 'Trending' }).closest('section')
+    expect(hero).not.toBeNull()
+    expect(firstRow).not.toBeNull()
+    expect(hero!.compareDocumentPosition(firstRow!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  })
+
+  it('lets the first non-empty row lead when the server returns no spotlight', () => {
+    const view = render(<Discover />)
+
+    expect(view.container.firstElementChild?.firstElementChild?.firstElementChild).toBe(
+      screen.getByRole('heading', { name: 'Trending' }).closest('section'),
+    )
+  })
+
+  it('honors server row order and forwards personalized subtitles', () => {
+    ;(useDiscoverHome as unknown as Mock).mockReturnValue({
+      data: {
+        spotlights: [],
+        rows: [
+          {
+            row_type: 'personalized:genre:movie:1',
+            title: 'Because you requested Fresh Movie',
+            subtitle: 'more horror',
+            items: [MOVIE],
+          },
+          { row_type: 'popular_tv', title: 'Popular TV shows', subtitle: null, items: [SHOW] },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+      dataUpdatedAt: Date.now(),
+    })
+
+    render(<Discover />)
+
+    const first = screen
+      .getByRole('heading', { name: 'Because you requested Fresh Movie' })
+      .closest('section')
+    const second = screen.getByRole('heading', { name: 'Popular TV shows' }).closest('section')
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+    expect(first!.compareDocumentPosition(second!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(screen.getByText('more horror')).toBeInTheDocument()
+  })
+
+  it('passes the header search-overlay state through to pause spotlight rotation', () => {
+    vi.useFakeTimers()
+    mockHome([MOVIE], [HERO, SHOW])
+    render(
+      <MemoryRouter>
+        <Routes>
+          <Route element={<Outlet context={{ searchOpen: true }} />}>
+            <Route index element={<Discover />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    act(() => vi.advanceTimersByTime(20_000))
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(HERO.title)
+  })
+
+  it('pauses rotation while the title modal is open', () => {
+    vi.useFakeTimers()
+    mockHome([MOVIE], [HERO, SHOW])
+    render(<Discover />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    act(() => vi.advanceTimersByTime(20_000))
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(HERO.title)
+  })
 })
 
 describe('Discover — quick-request freshness gate (Codex P2)', () => {
@@ -165,6 +278,8 @@ describe('Discover — quick-request freshness gate (Codex P2)', () => {
     // so the one-click Request is safe to offer.
     mockRequests([])
     render(<Discover />)
+    // getByRole (singular) doubles as a honesty check: the looping row exposes the
+    // quick-request action exactly once, not one-per-clone.
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
   })
 })
@@ -183,8 +298,9 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       ])
       render(<Discover />)
       expect(screen.queryByRole('button', { name: REQUEST_SHOW })).not.toBeInTheDocument()
-      // The tile itself still opens the detail modal — the correction path.
-      fireEvent.click(screen.getByRole('button', { name: /Fresh Show/ }))
+      // The tile itself still opens the detail modal — the correction path. The
+      // real tile is the single reachable details trigger (clones are inert).
+      fireEvent.click(screen.getByRole('button', { name: 'View details for Fresh Show (2021)' }))
       expect(screen.getByRole('heading', { name: 'Fresh Show' })).toBeInTheDocument()
     },
   )
@@ -210,33 +326,5 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
     ])
     render(<Discover />)
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
-  })
-})
-
-describe('Discover — tile status affordance is an icon, not a text pill (issue #135)', () => {
-  it('badges a search-result tile with the icon glyph instead of a visible status pill', async () => {
-    mockRequests([])
-    ;(useDiscoverSearch as unknown as Mock).mockReturnValue({
-      data: { results: [{ ...MOVIE, title: 'Owned Movie', library_state: 'available' }] },
-      isError: false,
-      isFetching: false,
-      dataUpdatedAt: Date.now(),
-    })
-    render(<Discover />)
-
-    fireEvent.change(screen.getByPlaceholderText('Search for a title…'), {
-      target: { value: 'owned' },
-    })
-
-    // The debounced query (300ms) has to land before the search branch renders.
-    await waitFor(
-      () => {
-        expect(screen.getByRole('img', { name: 'In library' })).toBeInTheDocument()
-      },
-      { timeout: 2000 },
-    )
-    // The old StatusBadge rendered the label as visible text — confirm it's gone,
-    // not just that a new element also exists alongside it.
-    expect(screen.queryByText('In library')).not.toBeInTheDocument()
   })
 })

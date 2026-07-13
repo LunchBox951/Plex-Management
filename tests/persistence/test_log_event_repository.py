@@ -298,6 +298,106 @@ async def test_prune_older_than_excludes_every_named_logger_when_exclude_loggers
     assert sorted(row.message for row in remaining) == ["spared a", "spared b"]
 
 
+async def test_prune_excess_deletes_the_oldest_rows_beyond_the_cap(session: AsyncSession) -> None:
+    repo = SqlLogEventRepository(session)
+    for i in range(5):
+        await repo.create(
+            level="INFO", logger="a", message=f"m{i}", created_at=_T0 + timedelta(seconds=i)
+        )
+
+    removed = await repo.prune_excess(3)
+    assert removed == 2
+
+    remaining = (await session.execute(select(LogEvent).order_by(LogEvent.id))).scalars().all()
+    # The newest 3 (by created_at) survive; the 2 oldest are gone.
+    assert [row.message for row in remaining] == ["m2", "m3", "m4"]
+
+
+async def test_prune_excess_is_a_noop_when_within_the_cap(session: AsyncSession) -> None:
+    repo = SqlLogEventRepository(session)
+    for i in range(3):
+        await repo.create(
+            level="INFO", logger="a", message=f"m{i}", created_at=_T0 + timedelta(seconds=i)
+        )
+
+    removed = await repo.prune_excess(10)
+    assert removed == 0
+
+    remaining = (await session.execute(select(LogEvent))).scalars().all()
+    assert len(remaining) == 3
+
+
+async def test_prune_excess_at_exactly_the_cap_is_a_noop(session: AsyncSession) -> None:
+    repo = SqlLogEventRepository(session)
+    for i in range(3):
+        await repo.create(
+            level="INFO", logger="a", message=f"m{i}", created_at=_T0 + timedelta(seconds=i)
+        )
+
+    removed = await repo.prune_excess(3)
+    assert removed == 0
+
+
+async def test_prune_excess_breaks_ties_on_id_for_identical_created_at(
+    session: AsyncSession,
+) -> None:
+    """Rows a single batch-insert stamps with the SAME ``created_at`` must still
+    have a well-defined "oldest" -- the ``id`` tie-break (mirrors
+    ``list_events``'s identical ordering)."""
+    repo = SqlLogEventRepository(session)
+    events = [
+        LogEventCreate(created_at=_T0, level="INFO", logger="a", message=f"m{i}") for i in range(4)
+    ]
+    await repo.create_many(events)
+
+    removed = await repo.prune_excess(2)
+    assert removed == 2
+
+    remaining = (await session.execute(select(LogEvent).order_by(LogEvent.id))).scalars().all()
+    # The two highest-id (most-recently-inserted) rows survive.
+    assert [row.message for row in remaining] == ["m2", "m3"]
+
+
+async def test_prune_excess_treats_a_negative_cap_as_zero(session: AsyncSession) -> None:
+    repo = SqlLogEventRepository(session)
+    await repo.create(level="INFO", logger="a", message="only")
+
+    removed = await repo.prune_excess(-5)
+    assert removed == 1
+
+    remaining = (await session.execute(select(LogEvent))).scalars().all()
+    assert remaining == []
+
+
+async def test_prune_excess_issues_a_single_delete_statement(
+    session: AsyncSession, engine: AsyncEngine
+) -> None:
+    """Regression guard for #152: the cap prune must be ONE batched ``DELETE ...
+    WHERE id IN (subquery)`` -- never a row-by-row loop of individual deletes."""
+    repo = SqlLogEventRepository(session)
+    for i in range(5):
+        await repo.create(
+            level="INFO", logger="a", message=f"m{i}", created_at=_T0 + timedelta(seconds=i)
+        )
+
+    delete_calls: list[str] = []
+
+    def _capture(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        if statement.strip().lower().startswith("delete") and "log_events" in statement.lower():
+            delete_calls.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        removed = await repo.prune_excess(2)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert removed == 3
+    assert len(delete_calls) == 1
+
+
 async def test_prune_older_than_targets_only_named_loggers_when_exclude_loggers_is_false(
     session: AsyncSession,
 ) -> None:

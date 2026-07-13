@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApiError } from '../lib/errors'
 import type { QueueItem } from '../api/types'
@@ -10,6 +10,11 @@ import { Queue } from './Queue'
 // scope by the time the factory runs.
 const h = vi.hoisted(() => ({
   queue: [] as QueueItem[],
+  hasData: true,
+  isLoading: false,
+  isError: false,
+  error: new Error('queue unavailable'),
+  refetch: vi.fn(),
   markFailed: vi.fn(),
   importDownload: vi.fn(),
   relocateDownload: vi.fn(),
@@ -18,11 +23,11 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../api/hooks', () => ({
   useQueue: () => ({
-    data: { queue: h.queue },
-    isLoading: false,
-    isError: false,
-    error: null,
-    refetch: vi.fn(),
+    data: h.hasData ? { queue: h.queue } : undefined,
+    isLoading: h.isLoading,
+    isError: h.isError,
+    error: h.error,
+    refetch: h.refetch,
   }),
   useMarkFailed: () => ({ mutateAsync: h.markFailed, isPending: false }),
   useImportDownload: () => ({ mutateAsync: h.importDownload, isPending: false }),
@@ -45,15 +50,149 @@ function queueItem(overrides: Partial<QueueItem> = {}): QueueItem {
   }
 }
 
-describe('Queue — tv season/episode badge', () => {
-  beforeEach(() => {
-    h.queue = []
-    h.markFailed.mockReset()
-    h.importDownload.mockReset()
-    h.relocateDownload.mockReset()
-    h.toast.mockReset()
+beforeEach(() => {
+  h.queue = []
+  h.hasData = true
+  h.isLoading = false
+  h.isError = false
+  h.error = new Error('queue unavailable')
+  h.refetch.mockReset()
+  h.markFailed.mockReset()
+  h.importDownload.mockReset()
+  h.relocateDownload.mockReset()
+  h.toast.mockReset()
+})
+
+describe('Queue — admin header and query states', () => {
+  it('renders the shared header, resolved active count, description, and healthy poll hint', () => {
+    h.queue = [
+      queueItem({ id: 1, title: 'Moving', status: 'downloading' }),
+      queueItem({ id: 2, title: 'Blocked', status: 'import_blocked' }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.getByRole('heading', { name: 'Queue' })).toBeInTheDocument()
+    expect(screen.getByText('1 active')).toBeInTheDocument()
+    expect(
+      screen.getByText('Everything the download client is holding, including blocked imports.'),
+    ).toBeInTheDocument()
+    const pollStatus = screen.getByRole('status')
+    expect(pollStatus).toHaveTextContent('updating every 2s')
+    expect(pollStatus.querySelector('[aria-hidden="true"]')).toHaveClass(
+      'motion-safe:animate-pulse',
+      'bg-downloading',
+    )
   })
 
+  it('keeps loading ahead of a first-load error', () => {
+    h.hasData = false
+    h.isLoading = true
+    h.isError = true
+
+    render(<Queue />)
+
+    expect(screen.getByText('Loading queue')).toBeInTheDocument()
+    expect(screen.queryByText("Couldn't load the queue")).not.toBeInTheDocument()
+    expect(screen.queryByText(/active$/)).not.toBeInTheDocument()
+  })
+
+  it('renders an actionable first-load error when no queue data exists', () => {
+    h.hasData = false
+    h.isError = true
+    h.error = new Error('download client unavailable')
+
+    render(<Queue />)
+
+    expect(screen.getByText("Couldn't load the queue")).toBeInTheDocument()
+    expect(screen.getByText('download client unavailable')).toBeInTheDocument()
+    const pollStatus = screen.getByRole('status')
+    expect(pollStatus).toHaveTextContent('reconnecting…')
+    expect(pollStatus.querySelector('[aria-hidden="true"]')).toHaveClass('bg-error')
+    expect(pollStatus.querySelector('[aria-hidden="true"]')).not.toHaveClass(
+      'motion-safe:animate-pulse',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(h.refetch).toHaveBeenCalledOnce()
+  })
+
+  it('retains cached rows during a failed background poll', () => {
+    h.queue = [queueItem({ title: 'Cached title' })]
+    h.isError = true
+
+    render(<Queue />)
+
+    expect(screen.getByText('Cached title')).toBeInTheDocument()
+    expect(screen.queryByText("Couldn't load the queue")).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('reconnecting…')
+  })
+
+  it('retains a cached empty result during a failed background poll', () => {
+    h.isError = true
+
+    render(<Queue />)
+
+    expect(screen.getByText('0 active')).toBeInTheDocument()
+    expect(screen.getByText('Nothing downloading')).toBeInTheDocument()
+    expect(
+      screen.getByText("Grab a release from a title's detail to see it here."),
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Couldn't load the queue")).not.toBeInTheDocument()
+    expect(screen.getAllByRole('status')[0]).toHaveTextContent('reconnecting…')
+  })
+})
+
+describe('Queue — truthful transfer progress', () => {
+  it('renders one named progressbar and one matching rounded percentage for downloading', () => {
+    h.queue = [queueItem({ title: 'Fractional title', progress: 0.456 })]
+
+    render(<Queue />)
+
+    const progress = screen.getByRole('progressbar', {
+      name: 'Fractional title download progress',
+    })
+    expect(progress).toHaveAttribute('aria-valuenow', '46')
+    expect(progress).toHaveClass('h-[5px]', 'max-w-[420px]')
+    expect(screen.getByText('46%')).toHaveClass('tabular-nums')
+  })
+
+  it.each([
+    { value: -0.5, expected: 0 },
+    { value: 1.5, expected: 100 },
+  ])('clamps a $value transfer fraction to $expected%', ({ value, expected }) => {
+    h.queue = [queueItem({ title: 'Clamp title', progress: value })]
+
+    render(<Queue />)
+
+    expect(
+      screen.getByRole('progressbar', { name: 'Clamp title download progress' }),
+    ).toHaveAttribute('aria-valuenow', String(expected))
+    expect(screen.getByText(`${expected}%`)).toBeInTheDocument()
+  })
+
+  it.each([
+    { status: 'metadata_fetching', label: 'Fetching metadata', activeCount: 1 },
+    { status: 'import_pending', label: 'Import pending' },
+    { status: 'importing', label: 'Importing' },
+    { status: 'import_blocked', label: 'Import blocked', activeCount: 0 },
+    { status: 'client_missing', label: 'Client missing', activeCount: 0 },
+    { status: 'failed', label: 'Failed', activeCount: 0 },
+  ])(
+    'shows the $label badge without claiming transfer progress',
+    ({ status, label, activeCount = 1 }) => {
+      h.queue = [queueItem({ title: 'Import phase', status, progress: 1 })]
+
+      render(<Queue />)
+
+      expect(screen.getByText(label)).toBeInTheDocument()
+      expect(screen.getByText(`${activeCount} active`)).toBeInTheDocument()
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+      expect(screen.queryByText('100%')).not.toBeInTheDocument()
+    },
+  )
+})
+
+describe('Queue — tv season/episode badge', () => {
   it('renders no season badge for a movie download (season is null)', () => {
     h.queue = [queueItem({ season: null, episodes: null })]
 
@@ -132,14 +271,6 @@ describe('Queue — tv season/episode badge', () => {
 })
 
 describe('Queue — human-legible identity (issue #134)', () => {
-  beforeEach(() => {
-    h.queue = []
-    h.markFailed.mockReset()
-    h.importDownload.mockReset()
-    h.relocateDownload.mockReset()
-    h.toast.mockReset()
-  })
-
   it('shows the media title as the heading, with release_title as a secondary line', () => {
     h.queue = [
       queueItem({
@@ -152,7 +283,32 @@ describe('Queue — human-legible identity (issue #134)', () => {
     render(<Queue />)
 
     expect(screen.getByText('Some Movie')).toBeInTheDocument()
-    expect(screen.getByText('Some.Movie.2020.1080p.WEB-DL.x264-GROUP')).toBeInTheDocument()
+    expect(screen.getByText('Some.Movie.2020.1080p.WEB-DL.x264-GROUP')).toHaveClass('font-mono')
+  })
+
+  it('renders the exact short-hash and seed-ratio metadata without implying a seeder count', () => {
+    h.queue = [
+      queueItem({
+        title: 'Some Movie',
+        torrent_hash: 'abc123def4567890',
+        seed_ratio: 1.237,
+      }),
+    ]
+
+    render(<Queue />)
+
+    const shortHash = screen.getByTitle('abc123def4567890')
+    expect(shortHash).toHaveTextContent('abc123def456')
+    expect(shortHash.parentElement).toHaveTextContent('abc123def456 · seed 1.24')
+  })
+
+  it('renders queue cards as a dense semantic list', () => {
+    h.queue = [queueItem({ title: 'Some Movie' })]
+
+    render(<Queue />)
+
+    expect(screen.getByRole('list')).toBeInTheDocument()
+    expect(screen.getByRole('listitem')).toHaveClass('px-[14px]', 'py-[11px]', 'rounded-[10px]')
   })
 
   it('falls back to release_title as the heading when title is absent, without repeating it', () => {
@@ -197,6 +353,25 @@ describe('Queue — human-legible identity (issue #134)', () => {
 
     const img = container.querySelector('img')
     expect(img).toHaveAttribute('src', 'https://image.tmdb.org/poster.jpg')
+    expect(img).toHaveAttribute('alt', '')
+    expect(img).toHaveClass('w-[38px]')
+  })
+
+  it('falls back to the poster placeholder when an image fails to load', () => {
+    h.queue = [
+      queueItem({ title: 'Some Movie', poster_url: 'https://image.tmdb.org/missing.jpg' }),
+    ]
+
+    const { container } = render(<Queue />)
+
+    const img = container.querySelector('img')
+    expect(img).not.toBeNull()
+    fireEvent.error(img!)
+    expect(container.querySelector('img')).not.toBeInTheDocument()
+    expect(container.querySelector('[aria-hidden="true"].bg-poster')).toHaveClass(
+      'w-[38px]',
+      'aspect-[2/3]',
+    )
   })
 
   it('renders a placeholder (no img) when poster_url is absent', () => {
@@ -205,18 +380,58 @@ describe('Queue — human-legible identity (issue #134)', () => {
     const { container } = render(<Queue />)
 
     expect(container.querySelector('img')).not.toBeInTheDocument()
+    expect(container.querySelector('[aria-hidden="true"].bg-poster')).toBeInTheDocument()
+  })
+
+  it('surfaces a long failure reason verbatim in an overflow-safe detail line', () => {
+    const reason =
+      'download path not visible inside the container /an/extremely/long/container/path/that/must/not/be/shortened/movie.mkv'
+    h.queue = [queueItem({ title: 'Blocked title', status: 'import_blocked', failed_reason: reason })]
+
+    render(<Queue />)
+
+    expect(screen.getByText(reason)).toHaveClass('[overflow-wrap:anywhere]')
+  })
+
+  // A live poll replaces every row object with a fresh one for the same id. The
+  // card is keyed by id, so its per-row state (a poster that already 404'd) must
+  // survive the re-render — the row must not flash back to a broken <img>, and
+  // progress must track the new value without remounting the card.
+  it('preserves a failed-poster fallback across a poll that only advances progress', () => {
+    h.queue = [
+      queueItem({
+        id: 1,
+        title: 'Some Movie',
+        progress: 0.4,
+        poster_url: 'https://image.tmdb.org/missing.jpg',
+      }),
+    ]
+
+    const { container, rerender } = render(<Queue />)
+    fireEvent.error(container.querySelector('img')!)
+    expect(container.querySelector('img')).not.toBeInTheDocument()
+
+    // Same id, same (still-broken) URL, new progress — the poll's fresh object.
+    h.queue = [
+      queueItem({
+        id: 1,
+        title: 'Some Movie',
+        progress: 0.7,
+        poster_url: 'https://image.tmdb.org/missing.jpg',
+      }),
+    ]
+    rerender(<Queue />)
+
+    // The fallback held (state survived the re-render); no broken <img> reappeared.
+    expect(container.querySelector('img')).not.toBeInTheDocument()
+    expect(container.querySelector('[aria-hidden="true"].bg-poster')).toBeInTheDocument()
+    expect(
+      screen.getByRole('progressbar', { name: 'Some Movie download progress' }),
+    ).toHaveAttribute('aria-valuenow', '70')
   })
 })
 
 describe('Queue actions', () => {
-  beforeEach(() => {
-    h.queue = []
-    h.markFailed.mockReset()
-    h.importDownload.mockReset()
-    h.relocateDownload.mockReset()
-    h.toast.mockReset()
-  })
-
   it('hides fail actions while a download is importing', () => {
     h.queue = [queueItem({ status: 'importing' })]
 
@@ -236,6 +451,35 @@ describe('Queue actions', () => {
     expect(screen.getByRole('button', { name: /blocklist & fail/i })).toBeInTheDocument()
   })
 
+  it.each([
+    {
+      action: 'Mark failed',
+      title: 'Mark this download failed?',
+      blocklist: false,
+    },
+    {
+      action: 'Blocklist & fail',
+      title: "Blocklist this release and mark failed? It won't be grabbed again.",
+      blocklist: true,
+    },
+  ])('confirms $action with the current row identity', async ({ action, title, blocklist }) => {
+    h.queue = [queueItem({ id: 27, title: 'Action title', status: 'downloading' })]
+    h.markFailed.mockResolvedValue(queueItem({ id: 27, status: 'failed' }))
+
+    render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('heading', { name: title })).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeInTheDocument()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: action }))
+
+    await waitFor(() => {
+      expect(h.markFailed).toHaveBeenCalledWith({ downloadId: 27, blocklist })
+    })
+  })
+
   it('closes a pending fail dialog when polling makes the download non-actionable', async () => {
     h.queue = [queueItem({ status: 'downloading' })]
     const view = render(<Queue />)
@@ -251,17 +495,48 @@ describe('Queue actions', () => {
     })
     expect(h.markFailed).not.toHaveBeenCalled()
   })
+
+  it('closes a pending fail dialog without mutating when polling removes the row', async () => {
+    h.queue = [queueItem({ id: 19, status: 'downloading' })]
+    const view = render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^mark failed$/i }))
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+    h.queue = []
+    view.rerender(<Queue />)
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    })
+    expect(h.markFailed).not.toHaveBeenCalled()
+  })
+
+  it('keeps the mark-failed error visible through the existing error toast', async () => {
+    const apiError: ApiError = {
+      code: 'invalid_state_transition',
+      message: 'download already importing',
+      status: 409,
+    }
+    h.queue = [queueItem({ id: 31, status: 'downloading' })]
+    h.markFailed.mockRejectedValue(apiError)
+
+    render(<Queue />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^mark failed$/i }))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Mark failed' }))
+
+    await waitFor(() =>
+      expect(h.toast).toHaveBeenCalledWith({
+        title: 'Action failed',
+        description: 'download already importing',
+        intent: 'error',
+      }),
+    )
+  })
 })
 
 describe('Queue — Retry import (import_blocked only)', () => {
-  beforeEach(() => {
-    h.queue = []
-    h.markFailed.mockReset()
-    h.importDownload.mockReset()
-    h.relocateDownload.mockReset()
-    h.toast.mockReset()
-  })
-
   it('renders a Retry import button for an import_blocked download and retries it', () => {
     h.importDownload.mockResolvedValue(queueItem({ status: 'import_blocked' }))
     h.queue = [queueItem({ id: 7, status: 'import_blocked' })]
@@ -301,14 +576,6 @@ describe('Queue — Retry import (import_blocked only)', () => {
 })
 
 describe('Queue — Relocate & retry (path-not-visible import_blocked rows, issues #133/#157)', () => {
-  beforeEach(() => {
-    h.queue = []
-    h.markFailed.mockReset()
-    h.importDownload.mockReset()
-    h.relocateDownload.mockReset()
-    h.toast.mockReset()
-  })
-
   it('shows Relocate & retry for an import_blocked row with the path-not-visible reason, and calls it', () => {
     h.relocateDownload.mockResolvedValue(queueItem({ id: 11, status: 'import_blocked' }))
     h.queue = [
@@ -325,6 +592,19 @@ describe('Queue — Relocate & retry (path-not-visible import_blocked rows, issu
     expect(h.relocateDownload).toHaveBeenCalledWith(11)
     // The operator still needs to retry the import once qBittorrent settles.
     expect(screen.getByRole('button', { name: /retry import/i })).toBeInTheDocument()
+    const buttons = screen.getAllByRole('button')
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      'Relocate & retry',
+      'Retry import',
+      'Mark failed',
+      'Blocklist & fail',
+    ])
+    expect(buttons[0]?.parentElement).toHaveClass(
+      'col-span-2',
+      'flex-wrap',
+      'justify-end',
+      'lg:col-start-3',
+    )
   })
 
   it('does not show Relocate & retry for an import_blocked row with a different reason', () => {
@@ -332,6 +612,21 @@ describe('Queue — Relocate & retry (path-not-visible import_blocked rows, issu
       queueItem({
         status: 'import_blocked',
         failed_reason: 'no video file found in the completed torrent',
+      }),
+    ]
+
+    render(<Queue />)
+
+    expect(screen.queryByRole('button', { name: /relocate & retry/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /retry import/i })).toBeInTheDocument()
+  })
+
+  it('does not loosely match the path-not-visible prefix later in a failure reason', () => {
+    h.queue = [
+      queueItem({
+        status: 'import_blocked',
+        failed_reason:
+          'import failed because download path not visible inside the container /downloads/movie',
       }),
     ]
 

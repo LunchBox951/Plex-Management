@@ -1,10 +1,14 @@
 import { useState } from 'react'
 import { useBlocklist, useDeleteBlocklistEntry } from '../api/hooks'
 import type { BlocklistEntry } from '../api/types'
+import { AdminEmptyState } from '../components/ui/AdminEmptyState'
+import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
 import { Dialog } from '../components/ui/Dialog'
+import { adminRowPadding } from '../components/ui/adminStyles'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
+import { cn } from '../lib/cn'
 
 /** The mono meta line under a title: "{reason} · {indexer} · {added_at}", null parts skipped. */
 function metaLine(entry: BlocklistEntry): string {
@@ -31,7 +35,8 @@ export function Blocklist() {
 
   if (isLoading) {
     return (
-      <div className="mx-auto w-full max-w-[1060px] px-5 py-8 sm:px-8">
+      <div className="mx-auto flex w-full max-w-[1060px] flex-col gap-6 px-5 py-8 sm:px-8">
+        <AdminPageHeader title="Blocklist" />
         <CenteredSpinner />
       </div>
     )
@@ -39,7 +44,8 @@ export function Blocklist() {
 
   if (error) {
     return (
-      <div className="mx-auto w-full max-w-[1060px] px-5 py-8 sm:px-8">
+      <div className="mx-auto flex w-full max-w-[1060px] flex-col gap-6 px-5 py-8 sm:px-8">
+        <AdminPageHeader title="Blocklist" />
         <StateMessage
           tone="error"
           title="Couldn't load the blocklist"
@@ -69,26 +75,34 @@ export function Blocklist() {
 
   return (
     <div className="mx-auto w-full max-w-[1060px] space-y-6 px-5 py-8 sm:px-8">
-      <div className="flex items-baseline gap-3">
-        <h1 className="font-display text-2xl font-extrabold">Blocklist</h1>
-        <span className="font-mono text-sm text-faint">{entries.length}</span>
-      </div>
+      <AdminPageHeader title="Blocklist" count={String(entries.length)} />
 
       {entries.length === 0 ? (
-        <StateMessage
+        <AdminEmptyState
           title="Nothing blocklisted"
           message="Releases you mark failed-with-blocklist will appear here."
         />
       ) : (
-        <ul className="space-y-3">
+        <ul className="flex flex-col gap-2">
           {entries.map((entry) => (
             <li
               key={entry.id}
-              className="flex items-center gap-4 rounded-xl border-hairline bg-surface p-4"
+              className={cn(
+                adminRowPadding,
+                'grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2',
+                'rounded-[10px] border border-hairline bg-surface',
+              )}
             >
               <div className="min-w-0 flex-1">
-                <p className="truncate font-medium text-ink">{entry.source_title}</p>
-                <p className="mt-1 truncate font-mono text-xs text-muted">{metaLine(entry)}</p>
+                <p
+                  title={entry.source_title}
+                  className="truncate text-[13px] leading-snug font-semibold text-ink"
+                >
+                  {entry.source_title}
+                </p>
+                <p className="mt-1 font-mono text-[11px] leading-snug break-words text-muted">
+                  {metaLine(entry)}
+                </p>
               </div>
               <Button
                 variant="danger"
@@ -126,6 +140,7 @@ export function Blocklist() {
             variant="danger"
             loading={del.isPending}
             disabled={del.isPending}
+            aria-label="Remove blocklist entry"
             onClick={() => void confirmRemove()}
           >
             Remove

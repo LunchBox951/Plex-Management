@@ -1,6 +1,8 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { useExportLogs, useLogs, useLogsTail, type LogsFilter } from '../api/hooks'
 import type { LiveLogRecordItem, LogEventItem } from '../api/types'
+import { AdminEmptyState } from '../components/ui/AdminEmptyState'
+import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
@@ -14,8 +16,8 @@ const LEVELS = ['', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
 const LEVEL_CLASS: Record<string, string> = {
   DEBUG: 'text-faint',
-  INFO: 'text-muted',
-  WARNING: 'text-searching',
+  INFO: 'text-searching',
+  WARNING: 'text-downloading',
   ERROR: 'text-error',
   CRITICAL: 'text-error',
 }
@@ -40,26 +42,57 @@ function matchesSearch(event: LogLike, term: string): boolean {
 
 function LogRow({ event }: { event: LogLike }) {
   return (
-    <li className="flex flex-col gap-1 border-b border-hairline px-1 py-2 last:border-0">
-      <div className="flex flex-wrap items-baseline gap-2 font-mono text-[11px] text-faint">
-        <span>{new Date(event.created_at).toLocaleString()}</span>
-        <span className={cn('font-semibold', levelClass(event.level))}>{event.level}</span>
-        <span className="truncate">{event.logger}</span>
+    <li className="grid min-w-0 grid-cols-[minmax(0,1fr)_3.25rem] items-start gap-x-3 gap-y-1 border-b border-hairline px-[14px] py-[7px] last:border-b-0 sm:grid-cols-[max-content_3.25rem_minmax(8rem,17.5rem)_minmax(0,1fr)] sm:gap-y-0">
+      <time
+        dateTime={event.created_at}
+        className="col-start-1 row-start-1 min-w-0 font-mono text-[11px] leading-5 break-words text-faint [overflow-wrap:anywhere] sm:whitespace-nowrap"
+      >
+        {new Date(event.created_at).toLocaleString()}
+      </time>
+      <span
+        className={cn(
+          'col-start-2 row-start-1 whitespace-nowrap font-mono text-[11px] leading-5 font-semibold',
+          levelClass(event.level),
+        )}
+      >
+        {event.level}
+      </span>
+      <span
+        title={event.logger}
+        className="col-span-2 col-start-1 row-start-2 min-w-0 truncate font-mono text-[11px] leading-5 text-faint sm:col-span-1 sm:col-start-3 sm:row-start-1"
+      >
+        {event.logger}
+      </span>
+      <div className="col-span-2 col-start-1 row-start-3 min-w-0 sm:col-span-1 sm:col-start-4 sm:row-start-1">
+        <p className="min-w-0 text-sm leading-5 break-words text-ink [overflow-wrap:anywhere]">
+          {event.message}
+        </p>
+        {event.context ? (
+          <p className="mt-0.5 min-w-0 font-mono text-[10px] leading-4 break-all text-faint">
+            {JSON.stringify(event.context)}
+          </p>
+        ) : null}
       </div>
-      <p className="text-sm break-words text-ink">{event.message}</p>
-      {event.context ? (
-        <p className="font-mono text-[10px] break-all text-faint">{JSON.stringify(event.context)}</p>
-      ) : null}
     </li>
   )
 }
 
 function renderLogList(events: LogLike[]): ReactNode {
+  const liveKeyOccurrences = new Map<string, number>()
+
   return (
-    <ul className="rounded-xl border border-hairline bg-surface px-3">
-      {events.map((event, index) => (
-        <LogRow key={'id' in event ? `row-${event.id}` : `tail-${index}`} event={event} />
-      ))}
+    <ul className="overflow-hidden rounded-[10px] border border-hairline bg-surface-deep">
+      {events.map((event) => {
+        if ('id' in event) return <LogRow key={`row-${event.id}`} event={event} />
+
+        // Ring-buffer DTOs deliberately have no durable id. Build identity from
+        // their complete exposed payload so prepending a new tail record does not
+        // make React reinterpret every existing row as a different log event.
+        const fingerprint = `${event.created_at}\u0000${event.level}\u0000${event.logger}\u0000${event.message}\u0000${JSON.stringify(event.context ?? null)}`
+        const occurrence = liveKeyOccurrences.get(fingerprint) ?? 0
+        liveKeyOccurrences.set(fingerprint, occurrence + 1)
+        return <LogRow key={`tail-${fingerprint}-${occurrence}`} event={event} />
+      })}
     </ul>
   )
 }
@@ -194,7 +227,12 @@ export function Logs() {
         />
       )
     } else if (tailEvents.length === 0) {
-      body = <StateMessage title="No matching log events" message="Nothing has been logged yet." />
+      body = (
+        <AdminEmptyState
+          title="No matching log events"
+          message="Nothing has been logged yet."
+        />
+      )
     } else {
       body = renderLogList(tailEvents)
     }
@@ -216,7 +254,10 @@ export function Logs() {
       )
     } else if (durableEvents.length === 0) {
       body = (
-        <StateMessage title="No matching log events" message="Try a wider filter or time range." />
+        <AdminEmptyState
+          title="No matching log events"
+          message="Try a wider filter or time range."
+        />
       )
     } else {
       body = renderLogList(durableEvents)
@@ -224,57 +265,67 @@ export function Logs() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-6 px-5 py-8 sm:px-8">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="font-display text-2xl font-extrabold">Logs</h1>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            variant="secondary"
-            onClick={() => void onExport('copy')}
-            loading={exportLogs.isPending}
-          >
-            Copy for diagnosis
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={() => void onExport('download')}
-            loading={exportLogs.isPending}
-          >
-            Download
-          </Button>
-        </div>
-      </header>
+    <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-6 px-5 py-8 sm:px-8 lg:px-11">
+      <AdminPageHeader
+        title="Logs"
+        actions={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void onExport('copy')}
+              loading={exportLogs.isPending}
+            >
+              Copy for diagnosis
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void onExport('download')}
+              loading={exportLogs.isPending}
+            >
+              Download
+            </Button>
+          </>
+        }
+      />
 
-      <div className="flex flex-wrap items-end gap-3">
-        <label className="flex flex-col gap-1.5 text-sm font-medium text-muted">
+      <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2">
+        <label htmlFor="logs-level" className="sr-only">
           Level
-          <select
-            className="h-10 rounded-lg bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50 disabled:opacity-50"
-            value={level}
-            disabled={liveTail}
-            onChange={(e) => onLevelChange(e.target.value)}
-          >
-            {LEVELS.map((l) => (
-              <option key={l || 'all'} value={l}>
-                {l || 'All levels'}
-              </option>
-            ))}
-          </select>
         </label>
+        <select
+          id="logs-level"
+          aria-describedby="logs-mode-description"
+          className="h-9 w-[6.75rem] min-w-0 rounded-lg bg-surface-deep px-2 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50 disabled:opacity-50"
+          value={level}
+          disabled={liveTail}
+          onChange={(e) => onLevelChange(e.target.value)}
+        >
+          {LEVELS.map((l) => (
+            <option key={l || 'all'} value={l}>
+              {l || 'All levels'}
+            </option>
+          ))}
+        </select>
 
-        <label className="flex min-w-48 flex-1 flex-col gap-1.5 text-sm font-medium text-muted">
+        <label htmlFor="logs-search" className="sr-only">
           Search
-          <input
-            className="h-10 rounded-lg bg-bg px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none placeholder:text-faint focus-visible:ring-2 focus-visible:ring-gold/50"
-            value={search}
-            placeholder="Message, logger, or a request/download/tmdb id"
-            onChange={(e) => onSearchChange(e.target.value)}
-          />
         </label>
+        <input
+          id="logs-search"
+          aria-describedby="logs-mode-description"
+          className="h-9 w-full min-w-0 rounded-lg bg-surface-deep px-3 text-sm text-ink ring-1 ring-inset ring-white/10 outline-none placeholder:text-faint focus-visible:ring-2 focus-visible:ring-gold/50"
+          value={search}
+          placeholder="Message, logger, or a request/download/tmdb id"
+          onChange={(e) => onSearchChange(e.target.value)}
+        />
 
-        <label className="flex h-10 items-center gap-2 text-sm text-muted">
+        <label className="flex h-9 shrink-0 items-center gap-2 whitespace-nowrap text-sm text-muted">
           <input
             type="checkbox"
+            aria-describedby="logs-mode-description"
+            className="size-4 accent-gold outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
             checked={liveTail}
             onChange={(e) => setLiveTail(e.target.checked)}
           />
@@ -282,7 +333,13 @@ export function Logs() {
         </label>
       </div>
 
-      <p className="-mt-3 font-mono text-[11px] text-faint">
+      <p
+        id="logs-mode-description"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="-mt-3 font-mono text-[11px] text-faint"
+      >
         {liveTail
           ? `Live, all levels — the in-memory tail, lost on restart.${
               tailQuery.data && tailQuery.data.dropped_count > 0

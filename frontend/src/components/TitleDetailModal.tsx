@@ -9,7 +9,6 @@ import {
   useQueue,
   useReportIssue,
   useRequests,
-  useSearchPreview,
   useSetKeepForever,
   type ReportReason,
 } from '../api/hooks'
@@ -20,8 +19,6 @@ import type {
   GrabRequest,
   QueueItem,
   RequestResponse,
-  SearchPreviewRequest,
-  SearchPreviewResponse,
   SeasonStatus,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
@@ -33,11 +30,40 @@ import { StatusBadge } from './ui/StatusBadge'
 import { ProgressBar } from './ui/ProgressBar'
 import { CenteredSpinner } from './ui/feedback'
 import { useToast } from './ui/toast'
+import { useTitleReleasePreview } from './useTitleReleasePreview'
+
+export interface TitleDetailModalAction {
+  kind: 're-search'
+  requestId: number
+  /**
+   * The TV season the shortcut targets, resolved by the CALLER from the fresh
+   * request row it was clicked on (`null` for a movie). The action effect must
+   * not fall back to the modal's own `currentSeason`: when one long-mounted
+   * modal instance is reused across titles, the title-reset effect has not yet
+   * applied in the render this action first fires in, so `currentSeason` can
+   * still read a season the operator picked on a DIFFERENT title.
+   */
+  season: number | null
+  token: number
+}
 
 interface TitleDetailModalProps {
   title: DiscoverResult | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  returnFocusTo?: HTMLElement | null | (() => HTMLElement | null)
+  action?: TitleDetailModalAction | null
+  /**
+   * Pin the modal's request correlation to ONE specific row. The Requests list
+   * passes the clicked row's id: an admin's list legitimately shows two
+   * different users' rows for the same title (the display fold keys on user_id
+   * too), and the modal's own `(tmdb_id, media_type)` correlation would
+   * otherwise resolve `liveRequest` — and with it the preview/grab/report/
+   * cancel/pin targets — to the FIRST matching row, which can be a DIFFERENT
+   * user's request than the one that was clicked. Omitted (Discover), the
+   * correlation behaves exactly as before.
+   */
+  boundRequestId?: number | null
 }
 
 function asApiError(error: unknown): ApiError {
@@ -215,7 +241,14 @@ const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'e
  * a state-aware action zone — including an in-modal "report a problem" correction
  * that blocklists the bad release and re-arms the request (north star #1).
  */
-export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModalProps) {
+export function TitleDetailModal({
+  title,
+  open,
+  onOpenChange,
+  returnFocusTo,
+  action,
+  boundRequestId,
+}: TitleDetailModalProps) {
   const { toast } = useToast()
   // Shared (non-admin) sessions get a REQUEST-ONLY modal: the preview / grab /
   // correction / keep-forever verbs all sit behind `require_admin` server-side,
@@ -225,7 +258,6 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   const auth = useAuthMe()
   const isAdmin = auth.data?.is_admin ?? auth.data?.user?.is_admin ?? false
   const createRequest = useCreateRequest()
-  const searchPreview = useSearchPreview()
   const grab = useGrab()
   const markFailed = useMarkFailed()
   const importDownload = useImportDownload()
@@ -254,7 +286,6 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   // `null` until they touch the control — `currentSeason` below resolves the
   // real default (the first actionable tracked season, else 1).
   const [activeSeason, setActiveSeason] = useState<number | null>(null)
-  const [preview, setPreview] = useState<SearchPreviewResponse | null>(null)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   // The confirm dialog for "report a problem"; carries the download to re-arm.
   const [reportFor, setReportFor] = useState<{ downloadId: number } | null>(null)
@@ -286,7 +317,6 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     setCreatedSeasons(null)
     setWholeSeries(true)
     setActiveSeason(null)
-    setPreview(null)
     setGrabbingGuid(null)
     setReportFor(null)
     setReportIssueFor(null)
@@ -308,6 +338,15 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     const matches = (requestsQuery.data?.requests ?? []).filter(
       (r) => r.tmdb_id === title.tmdb_id && r.media_type === title.media_type,
     )
+    // A caller-pinned row wins outright — the operator clicked THAT row, so its
+    // state (even a settled one) is what the modal must present and act on. The
+    // title-match filter above still applies: a bound id that no longer matches
+    // this title (or vanished from the poll) falls through to normal resolution
+    // rather than binding the modal to a foreign title's request.
+    if (boundRequestId != null) {
+      const bound = matches.find((r) => r.id === boundRequestId)
+      if (bound) return bound
+    }
     const active = matches.find(
       (r) =>
         r.status !== 'available' &&
@@ -319,7 +358,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         r.status !== 'cancelled',
     )
     return active ?? matches[matches.length - 1] ?? null
-  }, [requestsQuery.data, title])
+  }, [requestsQuery.data, title, boundRequestId])
 
   // A just-created request shows immediately even before the next poll lands. Used
   // for preview + queue correlation (a terminal request still owns its old download).
@@ -414,40 +453,31 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     }
   }, [reportFor, reportActionable])
 
-  const runPreview = useCallback(
-    // `seasonOverride` lets a caller preview a season that hasn't made it into
-    // `currentSeason` yet — namely `onRequest`, which must search the season the
-    // BRAND NEW create resolved to, not the one `currentSeason` still reads at
-    // click time (see onRequest below). Omitted (not merely `null`), it falls back
-    // to `currentSeason` — every other caller's behaviour is unchanged.
-    async (forRequestId: number | null, seasonOverride?: number | null) => {
-      if (!title) return
-      const startedKey = `${title.media_type}:${title.tmdb_id}`
-      const body: SearchPreviewRequest =
-        forRequestId !== null
-          ? { request_id: forRequestId }
-          : { tmdb_id: title.tmdb_id, media_type: title.media_type, title: title.title }
-      if (forRequestId === null && typeof title.year === 'number') {
-        body.year = title.year
-      }
-      const season = seasonOverride !== undefined ? seasonOverride : currentSeason
-      // tv only: search/grab is always per-season, so a concrete season is threaded
-      // whenever one is known — `season` is `null` for a movie, so this is a
-      // no-op there (the field stays entirely absent, same payload as before).
-      if (title.media_type === 'tv' && season != null) {
-        body.season = season
-      }
-      try {
-        const result = await searchPreview.mutateAsync(body)
-        if (latestTitleKey.current !== startedKey) return // modal moved to another title
-        setPreview(result)
-      } catch (error) {
-        if (latestTitleKey.current !== startedKey) return
-        toast({ title: 'Search failed', description: asApiError(error).message, intent: 'error' })
-      }
-    },
-    [title, searchPreview, toast, currentSeason],
-  )
+  const { preview, isPending: previewPending, clearPreview, runPreview } =
+    useTitleReleasePreview(title, currentSeason)
+
+  // A route-level shortcut opens this same modal and asks it to run the same
+  // preview path once. Mark the token consumed BEFORE starting the async call so
+  // rerenders, changing mutation identities, and StrictMode's repeated effect
+  // setup cannot issue a duplicate search. Fail closed until admin auth resolves.
+  const consumedActionToken = useRef<number | null>(null)
+  useEffect(() => {
+    if (
+      !open ||
+      !isAdmin ||
+      action?.kind !== 're-search' ||
+      consumedActionToken.current === action.token
+    ) {
+      return
+    }
+    consumedActionToken.current = action.token
+    // The season comes from the action itself (resolved by the caller from the
+    // clicked request row), passed as an explicit override: `runPreview`'s
+    // `currentSeason` fallback closes over pre-reset state in this effect pass
+    // (see TitleDetailModalAction.season). `null` explicitly omits the season
+    // (movie, or a defensive tv fallback -> request-scoped series preview).
+    void runPreview(action.requestId, action.season)
+  }, [action, isAdmin, open, runPreview])
 
   const onRequest = useCallback(async () => {
     if (!title) return
@@ -498,13 +528,13 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       if (grabbable && isAdmin) {
         await runPreview(created.id, resolvedSeason)
       } else {
-        setPreview(null)
+        clearPreview()
       }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin])
+  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin, clearPreview])
 
   // Re-acquire (issue #131), movie-only: force-create a fresh grabbable request
   // even though Plex still reports the title present (its file was deleted or
@@ -530,13 +560,13 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
       if (grabbable && isAdmin) {
         await runPreview(created.id, null)
       } else {
-        setPreview(null)
+        clearPreview()
       }
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Re-acquire failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, isAdmin])
+  }, [title, createRequest, toast, runPreview, isAdmin, clearPreview])
 
   const onGrab = useCallback(
     async (release: AcceptedRelease) => {
@@ -694,7 +724,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             // different scope, and grabbing one now would send the newly selected
             // season and 404 (release_not_found) or grab under the wrong context.
             // The operator re-searches for the newly selected season.
-            setPreview(null)
+            clearPreview()
           }}
         >
           {effectiveSeasons.map((s) => (
@@ -817,7 +847,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
     <Button
       variant="secondary"
       onClick={() => void runPreview(effectiveRequestId)}
-      loading={searchPreview.isPending}
+      loading={previewPending}
     >
       Re-search
     </Button>
@@ -856,7 +886,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
             <Button
               variant="secondary"
               onClick={() => void runPreview(null)}
-              loading={searchPreview.isPending}
+              loading={previewPending}
             >
               Preview releases
             </Button>
@@ -1044,7 +1074,13 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} title={title.title} description={title.title}>
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={title.title}
+      description={title.title}
+      returnFocusTo={returnFocusTo}
+    >
       <div className="flex flex-col gap-6">
         <div className="flex gap-5">
           <div className="aspect-[2/3] w-28 shrink-0 overflow-hidden rounded-lg bg-poster ring-1 ring-white/10">
@@ -1077,7 +1113,7 @@ export function TitleDetailModal({ title, open, onOpenChange }: TitleDetailModal
         </div>
 
         {showReleases ? (
-          searchPreview.isPending && !preview ? (
+          previewPending && !preview ? (
             <CenteredSpinner label="Running the decision engine…" />
           ) : preview ? (
             <ReleaseList

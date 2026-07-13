@@ -5,6 +5,7 @@ import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useEvict,
+  useDiscoverHome,
   useMarkFailed,
   useQueue,
   useRelocateDownload,
@@ -126,6 +127,76 @@ describe('useUpdateSettings', () => {
     // every queryKeys.discover(query, year) variant. Fails before the fix
     // (Discover data stays keyed to the old TMDB credentials).
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] }))
+  })
+
+  it('invalidates ops health so saved service cards never show the old server (Codex P2)', async () => {
+    const saved: SettingsResponse = { prowlarr_url: 'http://new-prowlarr:9696' }
+    ;(client.PUT as unknown as Mock).mockResolvedValue({ data: saved, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    qc.setQueryData(queryKeys.settings, { prowlarr_url: 'http://old-prowlarr:9696' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useUpdateSettings(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync({ prowlarr_url: 'http://new-prowlarr:9696' })
+
+    // Settings reads health with poll:false, so without this invalidation a
+    // disconnected realtime stream leaves the cards claiming the OLD server's
+    // Connected/Down status after the save. Fails before the fix.
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.opsHealth }),
+    )
+  })
+})
+
+describe('useDiscoverHome', () => {
+  it('keys and serializes the mount load id across invalidation refetches', async () => {
+    const loadId = '00000000-0000-4000-8000-000000000191'
+    const home = { spotlights: [], rows: [] }
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: home,
+      response: { status: 200 },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const { result } = renderHook(() => useDiscoverHome({ loadId }), {
+      wrapper: createWrapper(qc),
+    })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    expect(qc.getQueryData(queryKeys.discoverHome(loadId))).toEqual(home)
+    expect(client.GET).toHaveBeenCalledWith('/api/v1/discover/home', {
+      params: { query: { load_id: loadId } },
+    })
+
+    await act(async () => {
+      await qc.invalidateQueries({ queryKey: ['discover'] })
+    })
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(client.GET).mock.calls).toEqual([
+      ['/api/v1/discover/home', { params: { query: { load_id: loadId } } }],
+      ['/api/v1/discover/home', { params: { query: { load_id: loadId } } }],
+    ])
+  })
+
+  it('keeps direct/legacy callers on the standard home key without a load id', async () => {
+    ;(client.GET as unknown as Mock).mockResolvedValue({
+      data: { spotlights: [], rows: [] },
+      response: { status: 200 },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const { result } = renderHook(() => useDiscoverHome(), {
+      wrapper: createWrapper(qc),
+    })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    expect(client.GET).toHaveBeenCalledWith('/api/v1/discover/home', {
+      params: { query: {} },
+    })
+    expect(qc.getQueryData(queryKeys.discoverHome())).toBeDefined()
   })
 })
 

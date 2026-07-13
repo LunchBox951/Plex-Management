@@ -134,6 +134,77 @@ async def test_no_correlation_keys_present_is_none_not_empty_dict(
     assert handler.ring_buffer[-1].context is None
 
 
+# --------------------------------------------------------------------------- #
+# Capture-time redaction (issue #153): every secret shape this app's real
+# adapters can produce must never survive into the ring buffer OR the durable
+# queue -- both read from the SAME ``_capture``-built ``CapturedLogRecord``, so
+# exercising the ring buffer (populated synchronously in ``emit``, no
+# ``drain_once`` round trip needed) proves the durable path too. Every fixture
+# secret is an obviously-fake literal (never a real credential) -- see
+# ``test_logsafe.py``'s identical convention for why asserting ``secret not in
+# ...`` is safe even though pytest would otherwise echo it on a failure.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("message_template", "secret"),
+    [
+        ("GET https://api.themoviedb.org/3/movie/603?api_key=%s&language=en-US", "FAKETMDBKEY123"),
+        ("X-Api-Key: %s", "FAKEPROWLARRKEY99"),
+        ("X-Plex-Token: %s", "FAKEPLEXTOKEN7890"),
+        ("qBittorrent login data={'username': 'admin', 'password': '%s'}", "FAKEQBTPASSWORD1"),
+        ("Authorization: Bearer %s", "FAKEBEARERTOKEN123"),
+    ],
+)
+async def test_capture_redacts_every_known_secret_shape(
+    test_logger: logging.Logger,
+    handler: LogCaptureHandler,
+    message_template: str,
+    secret: str,
+) -> None:
+    test_logger.addHandler(handler)
+    test_logger.info(message_template, secret)
+    await asyncio.sleep(0)
+
+    # The ring buffer (the live ``/ops/logs/tail`` view) never carries it.
+    tail_message = handler.ring_buffer[-1].message
+    assert secret not in tail_message
+    assert "<redacted" in tail_message
+
+    # Neither does the durable-store queue (what the drain task batch-inserts
+    # into ``log_events``) -- same ``CapturedLogRecord``, read independently to
+    # prove BOTH destinations, not just whichever happens to be checked first.
+    queued_message = handler.queue.get_nowait().message
+    assert secret not in queued_message
+    assert "<redacted" in queued_message
+
+
+async def test_capture_leaves_an_ordinary_message_unmangled(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    """The redaction pass must not have false positives on ordinary operational
+    logging -- a plain, secret-free message round-trips byte-identical."""
+    test_logger.addHandler(handler)
+    test_logger.info("reconcile cycle completed: %d requests processed", 12)
+    await asyncio.sleep(0)
+
+    assert handler.ring_buffer[-1].message == "reconcile cycle completed: 12 requests processed"
+
+
+async def test_capture_redacts_a_secret_split_across_format_args(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    """Redaction runs AFTER ``%``-arg merging (on ``record.getMessage()``'s
+    result), not on the raw format string -- a secret that only becomes part
+    of a contiguous ``key=value`` shape once its arg is substituted in must
+    still be caught."""
+    test_logger.addHandler(handler)
+    test_logger.info("qbittorrent auth: token=%s", "FAKESPLITTOKEN456")
+    await asyncio.sleep(0)
+
+    message = handler.ring_buffer[-1].message
+    assert "FAKESPLITTOKEN456" not in message
+    assert "token=<redacted>" in message
+
+
 async def test_exception_traceback_is_appended_to_the_message(
     test_logger: logging.Logger, handler: LogCaptureHandler
 ) -> None:
@@ -487,6 +558,9 @@ class _FailingRepo:
     ) -> int:
         raise NotImplementedError
 
+    async def prune_excess(self, max_rows: int) -> int:
+        raise NotImplementedError
+
 
 async def test_drain_failure_counts_the_whole_lost_batch_as_dropped(
     test_logger: logging.Logger,
@@ -744,3 +818,72 @@ async def test_prune_once_telemetry_retention_never_shorter_than_the_operator_wi
 
         remaining = await repo.list_events(limit=10)
     assert [r.message for r in remaining.results] == ["telemetry, 45 days old"]
+
+
+# --------------------------------------------------------------------------- #
+# prune_once's row-count cap (issue #152)
+# --------------------------------------------------------------------------- #
+async def test_prune_once_defaults_to_no_row_cap(sessionmaker_: SessionMaker) -> None:
+    """``max_rows`` defaults to ``None`` -- unchanged behaviour for every
+    existing caller/test that only wants the age-based sweep."""
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        for i in range(5):
+            await repo.create(level="INFO", logger="a", message=f"m{i}", created_at=now)
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=7)
+        await session.commit()
+        assert removed == 0
+
+        remaining = await repo.list_events(limit=10)
+    assert remaining.total == 5
+
+
+async def test_prune_once_enforces_the_row_cap_when_given(sessionmaker_: SessionMaker) -> None:
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        for i in range(5):
+            await repo.create(
+                level="INFO", logger="a", message=f"m{i}", created_at=now - timedelta(seconds=5 - i)
+            )
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=7, max_rows=3)
+        await session.commit()
+        assert removed == 2
+
+        remaining = await repo.list_events(limit=10, oldest_first=True)
+    assert [r.message for r in remaining.results] == ["m2", "m3", "m4"]
+
+
+async def test_prune_once_row_cap_applies_after_the_age_based_deletes(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Both cutoffs stack: an age-stale row is removed by the age sweep, and the
+    row-count cap then trims whatever survives that down further."""
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        await repo.create(
+            level="INFO", logger="a", message="ancient", created_at=now - timedelta(days=10)
+        )
+        for i in range(3):
+            await repo.create(
+                level="INFO",
+                logger="a",
+                message=f"recent{i}",
+                created_at=now - timedelta(seconds=3 - i),
+            )
+        await session.commit()
+
+        removed = await prune_once(repo, retention_days=1, max_rows=2)
+        await session.commit()
+        # 1 from the age cutoff ("ancient") + 1 from the row cap (the oldest of
+        # the 3 remaining "recent*" rows).
+        assert removed == 2
+
+        remaining = await repo.list_events(limit=10, oldest_first=True)
+    assert [r.message for r in remaining.results] == ["recent1", "recent2"]

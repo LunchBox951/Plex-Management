@@ -28,9 +28,13 @@ from plex_manager.adapters.qbittorrent import (
 )
 from plex_manager.adapters.qbittorrent.adapter import (
     _HASHES_PER_REQUEST,  # pyright: ignore[reportPrivateUsage]
+    _LOG_SCAN_LIMIT,  # pyright: ignore[reportPrivateUsage]
+    _MAX_FAILURE_DETAIL_CHARS,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
 )
+from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
+from plex_manager.ports.download_client import FailureDetailSource
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -894,6 +898,271 @@ async def test_malformed_trusted_origin_degrades_to_closed_veto(
         await client.add("http://127.0.0.1:9696/file.torrent", "/downloads", "plex-manager")
 
 
+# --------------------------------------------------------------------------- #
+# Trusted source origin under a reverse-proxy path prefix
+# --------------------------------------------------------------------------- #
+PROWLARR_PREFIXED_ORIGIN = "http://127.0.0.1:9696/prowlarr"
+PROWLARR_PREFIXED_DOWNLOAD_URL = f"{PROWLARR_PREFIXED_ORIGIN}/1/download?apikey=x&file=y.torrent"
+
+
+async def test_add_torrent_from_configured_prowlarr_prefixed_origin_is_allowed() -> None:
+    """A reverse-proxied Prowlarr (a configured ``/prowlarr`` prefix) must stay
+    fetchable beneath its own prefix -- the prefix match is additive to the
+    origin match, never a narrowing that breaks the rootless case above."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    info_hash = (
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+    ).torrent_hash
+
+    assert info_hash == _TORRENT_HASH
+    assert any(url.endswith("/api/v2/torrents/add") for url in seen)
+
+
+async def test_off_prefix_same_origin_direct_path_is_vetoed() -> None:
+    """Same scheme/host/port as the configured Prowlarr endpoint, but OUTSIDE
+    its reverse-proxy prefix, must re-enter the full SSRF veto -- otherwise a
+    downloadUrl that merely shares the origin could blind-GET a sibling admin
+    path behind the same proxy."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/admin", "/downloads", "plex-manager")
+
+    assert seen == []  # vetoed before any fetch
+
+
+async def test_off_prefix_sibling_service_path_is_vetoed() -> None:
+    """A sibling reverse-proxy path (a different backend behind the same proxy)
+    must not inherit the Prowlarr trust just because it shares the origin."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/other-service", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_lookalike_prefix_is_vetoed_not_string_prefix_matched() -> None:
+    """``/prowlarr-evil`` starts with the string ``/prowlarr`` but is not
+    BENEATH it at a path-segment boundary -- a naive ``str.startswith`` match
+    would wrongly trust it; the segment-boundary match must not."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr-evil/1/download", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_redirect_off_prefix_same_origin_is_vetoed() -> None:
+    """A same-origin redirect from inside the configured prefix to a path
+    outside it must re-enter the veto on its next hop -- the trust is per-hop
+    AND per-prefix, never merely per-origin."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            return httpx.Response(302, headers={"Location": "http://127.0.0.1:9696/admin"})
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted hop was fetched; the off-prefix redirect target never was.
+    assert seen == [PROWLARR_PREFIXED_DOWNLOAD_URL]
+
+
+async def test_dot_segment_traversal_off_prefix_is_vetoed() -> None:
+    """A literal ``..`` segment must never be trusted, even when it would
+    textually resolve back inside the configured prefix -- ambiguous/dot forms
+    fall through to the full veto rather than being interpreted."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add("http://127.0.0.1:9696/prowlarr/../admin", "/downloads", "plex-manager")
+
+    assert seen == []
+
+
+async def test_percent_encoded_dot_segment_traversal_off_prefix_is_vetoed() -> None:
+    """A PERCENT-ENCODED ``%2e%2e`` segment must be treated exactly like the
+    literal ``..`` case above: a reverse proxy commonly decodes escapes before
+    routing, so an undecoded match here would let this reach the sibling
+    ``/admin`` backend behind the same proxy."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/%2e%2e/admin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_encoded_slash_traversal_off_prefix_is_vetoed() -> None:
+    """An encoded ``..%2f..%2fadmin`` segment hides an extra path boundary
+    from the raw ``/``-split entirely -- it must fall through to the full
+    veto rather than being read as one harmless path element beneath the
+    trusted prefix."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    with pytest.raises(QbittorrentSourceError):
+        await client.add(
+            "http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", "/downloads", "plex-manager"
+        )
+
+    assert seen == []
+
+
+async def test_trusted_source_fetch_forwards_no_stored_credential_headers() -> None:
+    """The dedicated source fetch must not carry the qBittorrent session cookie
+    or an Authorization header -- only the verbatim query credential Prowlarr
+    itself embedded in the downloadUrl travels; nothing this client stores is
+    added to the request."""
+    seen_headers: dict[str, httpx.Headers] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
+            seen_headers["source"] = request.headers
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    client = _client(handler, trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    assert "source" in seen_headers
+    assert "cookie" not in seen_headers["source"]
+    assert "authorization" not in seen_headers["source"]
+
+
+def test_is_trusted_source_url_root_prefix_allows_any_path() -> None:
+    """A root-configured Prowlarr (no reverse-proxy prefix) keeps allowing
+    every same-origin path -- the prefix check is additive and must not
+    regress the no-prefix layout that most installs use."""
+    client = _client(trusted_source_origin=PROWLARR_ORIGIN)
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{PROWLARR_ORIGIN}/1/download?apikey=x"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{PROWLARR_ORIGIN}/anything/else"
+    )
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://10.0.0.5/1/download"
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (PROWLARR_PREFIXED_DOWNLOAD_URL, True),
+        (f"{PROWLARR_PREFIXED_ORIGIN}/", True),
+        (PROWLARR_PREFIXED_ORIGIN, True),
+        ("http://127.0.0.1:9696/admin", False),
+        ("http://127.0.0.1:9696/other-service", False),
+        ("http://127.0.0.1:9696/prowlarr-evil/1/download", False),
+        ("http://127.0.0.1:9696/prowlarrx", False),
+        ("http://127.0.0.1:9696", False),  # empty path under a set prefix
+        ("http://127.0.0.1:9696/prowlarr/../admin", False),  # dot-segment
+        # percent-encoded dot-segment: a reverse proxy commonly decodes this
+        # before routing, reaching the sibling "/admin" backend just like the
+        # literal ".." case above must not be allowed to.
+        ("http://127.0.0.1:9696/prowlarr/%2e%2e/admin", False),
+        ("http://127.0.0.1:9696/prowlarr/%2E%2E/admin", False),  # uppercase escape
+        # encoded traversal slash: an encoded "/" hides an extra path boundary
+        # from the segment split, so this must not be trusted either.
+        ("http://127.0.0.1:9696/prowlarr/..%2f..%2fadmin", False),
+        ("http://127.0.0.1:9697/prowlarr/1/download", False),  # different port
+        # userinfo before the authority is stripped by ``parsed.hostname``, so
+        # this resolves to host ``evil.example`` -- not the trusted host -- and
+        # must not be fooled into matching.
+        ("http://127.0.0.1:9696@evil.example/prowlarr/1/download", False),
+    ],
+)
+def test_is_trusted_source_url_prefix_matrix(url: str, expected: bool) -> None:
+    client = _client(trusted_source_origin=PROWLARR_PREFIXED_ORIGIN)
+    assert client._is_trusted_source_url(url) is expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_trusted_origin_idna_host_normalizes_symmetrically_with_candidates() -> None:
+    """The stored trusted origin and every per-hop candidate origin MUST be
+    derived through the same normalization. ``ServiceUrl.origin`` IDNA-decodes
+    the host to Unicode (via ``httpx.URL.host``), while every candidate hop is
+    normalized with plain ``urlparse`` (punycode ASCII, never decoded) -- had
+    the stored side been taken from ``ServiceUrl.origin`` directly, an
+    IDNA-hostname Prowlarr base would never again match its own downloadUrls."""
+    idna_origin = "http://xn--e1afmkfd.example:9696/prowlarr"
+    client = _client(trusted_source_origin=idna_origin)
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        f"{idna_origin}/1/download?apikey=x"
+    )
+
+
 class _RecordingBackend(httpcore.AsyncNetworkBackend):
     def __init__(self) -> None:
         self.hosts: list[str] = []
@@ -1535,6 +1804,289 @@ async def test_set_location_drops_cached_properties_entry() -> None:
     assert await client.get_save_path(MAGNET_HASH) == "/downloads/movies"
     await client.set_location(MAGNET_HASH, "/home/lunchbox/Downloads")
     assert await client.get_save_path(MAGNET_HASH) == "/home/lunchbox/Downloads"
+
+
+def _failure_detail_handler(
+    *,
+    log_rows: list[dict[str, Any]] | None = None,
+    tracker_rows: list[dict[str, Any]] | None = None,
+    info_status: int = 200,
+    log_status: int = 200,
+    trackers_status: int = 200,
+    torrent_name: str = "Completed.Movie.1080p",
+    added_on: int = 0,
+) -> Any:
+    """A router for ``get_failure_detail`` tests: ``/torrents/info`` (single-hash
+    lookup, honoring ``info_status``), ``/log/main``, and ``/torrents/trackers``.
+    ``added_on`` (0 = omit) sets the torrent's add time for the log-correlation
+    lower bound."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if path == "/api/v2/auth/login" and method == "POST":
+            return _login_response()
+        if path == "/api/v2/torrents/info" and method == "GET":
+            if info_status != 200:
+                return httpx.Response(info_status, text="boom")
+            row: dict[str, Any] = {"hash": MAGNET_HASH, "name": torrent_name, "state": "error"}
+            if added_on:
+                row["added_on"] = added_on
+            return httpx.Response(200, json=[row])
+        if path == "/api/v2/log/main" and method == "GET":
+            if log_status != 200:
+                return httpx.Response(log_status, text="boom")
+            return httpx.Response(200, json=log_rows or [])
+        if path == "/api/v2/torrents/trackers" and method == "GET":
+            if trackers_status != 200:
+                return httpx.Response(trackers_status, text="boom")
+            return httpx.Response(200, json=tracker_rows or [])
+        return httpx.Response(404, text="unhandled")
+
+    return handler
+
+
+async def test_get_failure_detail_surfaces_log_permission_denied() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "some unrelated line", "type": 3},
+        {
+            "id": 2,
+            "message": (
+                "Completed.Movie.1080p: file_open: /downloads/.plex_manager/x.mkv, "
+                "error: Permission denied"
+            ),
+            "type": 3,
+        },
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "Permission denied" in detail.text
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_picks_most_recent_matching_log_entry() -> None:
+    """Newest (highest ``id``) matching log entry wins, regardless of list order."""
+    log_rows: list[dict[str, Any]] = [
+        {"id": 5, "message": "Completed.Movie.1080p: stale first attempt error", "type": 3},
+        {"id": 9, "message": "Completed.Movie.1080p: No space left on device", "type": 4},
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert detail.text == "Completed.Movie.1080p: No space left on device"
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_ignores_log_entry_older_than_added_on() -> None:
+    """Correlate the match to THIS torrent instance: a stale warning left by a
+    PRIOR download of the same title (timestamp before this torrent's
+    ``added_on``) is skipped, so it cannot drive the new hash's failure detail."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 900,  # before added_on -> a prior instance's line
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_keeps_log_entry_at_or_after_added_on() -> None:
+    """The correlation bound is a floor, not a strict window: a log line at/after
+    ``added_on`` belongs to THIS instance and is used."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1500,
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert "Permission denied" in detail.text
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_normalizes_millisecond_log_timestamp_older() -> None:
+    """qBittorrent < 4.5.0 stamps ``/log/main`` timestamps in MILLISECONDS while
+    ``added_on`` is seconds. A stale line from a PRIOR download (its real time
+    before ``added_on``) must still be skipped after unit normalisation -- the
+    unnormalised ms value would dwarf the seconds ``added_on`` and be wrongly
+    kept, re-poisoning the new hash's detail on those versions."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1_699_000_000_000,  # ms, real time BEFORE added_on
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1_700_000_000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_normalizes_millisecond_log_timestamp_newer() -> None:
+    """The mirror of the older-ms case: a ms-stamped line whose real time is at/
+    after ``added_on`` belongs to THIS instance and is kept after normalisation."""
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 4,
+            "message": "Completed.Movie.1080p: error: Permission denied",
+            "type": 3,
+            "timestamp": 1_701_000_000_000,  # ms, real time AFTER added_on
+        },
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, added_on=1_700_000_000)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert "Permission denied" in detail.text
+
+
+async def test_get_failure_detail_bounds_scan_to_newest_entries() -> None:
+    """The scan is bounded to the newest ``_LOG_SCAN_LIMIT`` rows (highest id)
+    WITHOUT sorting the whole log: a match older than that window is not returned
+    even though its text matches, while the newest matching row within it wins."""
+    # A matching row buried below the newest-LIMIT window (small id) is invisible.
+    old_match = {"id": 1, "message": "Completed.Movie.1080p: buried old match", "type": 3}
+    filler = [
+        {"id": 100 + n, "message": f"other torrent {n}", "type": 3}
+        for n in range(_LOG_SCAN_LIMIT + 5)
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=[old_match, *filler])
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_falls_back_to_tracker_message() -> None:
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "**DHT**", "status": 4, "msg": "should be ignored (pseudo-tracker)"},
+        {"url": "http://tracker.example/announce", "status": 2, "msg": ""},
+        {"url": "http://tracker2.example/announce", "status": 4, "msg": "Unregistered torrent"},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=[], tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert detail.text == "Unregistered torrent"
+    assert detail.source is FailureDetailSource.tracker
+
+
+async def test_get_failure_detail_prefers_log_over_tracker() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "Completed.Movie.1080p: Read-only file system", "type": 4},
+    ]
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "http://tracker.example/announce", "status": 4, "msg": "Unregistered torrent"},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is not None
+    assert detail.text == "Completed.Movie.1080p: Read-only file system"
+    assert detail.source is FailureDetailSource.log
+
+
+async def test_get_failure_detail_returns_none_when_torrent_absent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/info":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, text="unhandled")
+
+    assert await _client(handler).get_failure_detail(MAGNET_HASH) is None
+
+
+async def test_get_failure_detail_returns_none_on_log_and_tracker_outage() -> None:
+    """Best-effort per the port contract: a transport failure enriching an
+    already-failed torrent must never raise or abort the reconcile cycle."""
+    detail = await _client(
+        _failure_detail_handler(log_status=500, trackers_status=500)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_returns_none_when_info_lookup_fails() -> None:
+    detail = await _client(_failure_detail_handler(info_status=500)).get_failure_detail(MAGNET_HASH)
+    assert detail is None
+
+
+async def test_get_failure_detail_redacts_embedded_url_and_bounds_length() -> None:
+    long_tail = "x" * 500
+    log_rows: list[dict[str, Any]] = [
+        {
+            "id": 1,
+            "message": (
+                "Completed.Movie.1080p: failed fetching "
+                "http://tracker.example/announce?passkey=SECRET123 " + long_tail
+            ),
+            "type": 3,
+        },
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "SECRET123" not in detail.text
+    assert "passkey" not in detail.text
+    assert len(detail.text) <= 300
+
+
+async def test_get_failure_detail_preserves_errno_signal_past_cap() -> None:
+    """A ``file_open`` error on a long/nested path can push the errno phrase past
+    :data:`_MAX_FAILURE_DETAIL_CHARS`. The cap must NOT sever it: the classifier
+    still has to read ``Permission denied`` as environmental (issue #181), or a
+    good release gets wrongly blocklisted -- while the total stays bounded."""
+    long_path = "/downloads/.plex_manager/" + "nested_dir/" * 40
+    message = f"Completed.Movie.1080p: file_open: {long_path}x.mkv, error: Permission denied"
+    assert message.index("Permission denied") > _MAX_FAILURE_DETAIL_CHARS  # signal is past the cap
+    log_rows: list[dict[str, Any]] = [{"id": 1, "message": message, "type": 3}]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert len(detail.text) <= _MAX_FAILURE_DETAIL_CHARS
+    assert "Permission denied" in detail.text
+    assert classify_failure_detail(detail.text) is FailureClass.environmental
+
+
+async def test_get_failure_detail_strips_cr_lf_from_log_message() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "Completed.Movie.1080p: line one\r\ninjected line two", "type": 3},
+    ]
+    detail = await _client(_failure_detail_handler(log_rows=log_rows)).get_failure_detail(
+        MAGNET_HASH
+    )
+    assert detail is not None
+    assert "\r" not in detail.text
+    assert "\n" not in detail.text
+
+
+async def test_get_failure_detail_returns_none_when_nothing_matches() -> None:
+    log_rows: list[dict[str, Any]] = [
+        {"id": 1, "message": "some other torrent entirely: boom", "type": 4},
+    ]
+    tracker_rows: list[dict[str, Any]] = [
+        {"url": "http://tracker.example/announce", "status": 2, "msg": ""},
+    ]
+    detail = await _client(
+        _failure_detail_handler(log_rows=log_rows, tracker_rows=tracker_rows)
+    ).get_failure_detail(MAGNET_HASH)
+    assert detail is None
 
 
 def test_adapter_satisfies_download_client_port() -> None:

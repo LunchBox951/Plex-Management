@@ -1,20 +1,23 @@
-import { useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import {
   useAppKeyStatus,
+  useOpsHealth,
   useRevokeAppKey,
   useRotateAppKey,
   usePlexLibraries,
   useSettings,
   useUpdateSettings,
 } from '../api/hooks'
-import type { SettingsResponse, SettingsUpdate } from '../api/types'
+import type { SettingsResponse, SettingsUpdate, SubsystemHealthItem } from '../api/types'
 import { libraryOptionNote, libraryOptionValue } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { AuthErrorCard } from '../components/AuthErrorCard'
+import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
 import { LinkButton } from '../components/ui/LinkButton'
 import { Field } from '../components/ui/Field'
 import { Dialog } from '../components/ui/Dialog'
+import { Dot, type DotTone } from '../components/ui/Dot'
 import { CenteredSpinner, StateMessage } from '../components/ui/feedback'
 import { useToast } from '../components/ui/toast'
 
@@ -33,6 +36,9 @@ const EVICTION_ENABLED_DEFAULT = true
 const EVICTION_PROACTIVE_ENABLED_DEFAULT = false
 const EVICTION_INTERVAL_MINUTES_DEFAULT = 30
 const LOG_RETENTION_DAYS_DEFAULT = 7
+// The row-count companion to log_retention_days (issue #152) — mirrors the
+// backend default (web/deps.py LOG_MAX_ROWS_DEFAULT).
+const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
 
@@ -61,6 +67,7 @@ interface FormState {
   eviction_proactive_enabled: boolean
   eviction_interval_minutes: string
   log_retention_days: string
+  log_max_rows: string
   // Auto-grab worker (ADR-0013) — the master on/off switch.
   auto_grab_enabled: boolean
 }
@@ -94,6 +101,7 @@ function initialForm(data: SettingsResponse): FormState {
       data.eviction_interval_minutes ?? EVICTION_INTERVAL_MINUTES_DEFAULT,
     ),
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
+    log_max_rows: String(data.log_max_rows ?? LOG_MAX_ROWS_DEFAULT),
     auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
   }
 }
@@ -114,6 +122,7 @@ type NumberKey =
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
   | 'log_retention_days'
+  | 'log_max_rows'
 type BoolKey = 'eviction_enabled' | 'eviction_proactive_enabled' | 'auto_grab_enabled'
 
 // Operator-facing label per numeric operability knob — reused by the Save
@@ -125,6 +134,7 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   eviction_grace_days: 'Eviction grace period (days)',
   eviction_interval_minutes: 'Eviction check interval (minutes)',
   log_retention_days: 'Log retention (days)',
+  log_max_rows: 'Log retention (max rows)',
 }
 
 /** ``true`` only for a non-blank string that parses to a finite number.
@@ -181,7 +191,116 @@ function credentialReentryMessage(credential: string): string {
   return `Re-enter the ${credential} because the service address changed.`
 }
 
-const Heading = () => <h1 className="font-display text-2xl font-extrabold">Settings</h1>
+type ServiceName = 'plex' | 'prowlarr' | 'qbittorrent' | 'tmdb'
+
+interface ServiceDescriptor {
+  name: ServiceName
+  title: string
+  validateLabel: string
+}
+
+const SERVICE_DESCRIPTORS: Record<ServiceName, ServiceDescriptor> = {
+  plex: {
+    name: 'plex',
+    title: 'Plex',
+    validateLabel: 'Validate Plex connection',
+  },
+  prowlarr: {
+    name: 'prowlarr',
+    title: 'Prowlarr',
+    validateLabel: 'Validate Prowlarr connection',
+  },
+  qbittorrent: {
+    name: 'qbittorrent',
+    title: 'qBittorrent',
+    validateLabel: 'Validate qBittorrent connection',
+  },
+  tmdb: {
+    name: 'tmdb',
+    title: 'TMDB',
+    validateLabel: 'Validate TMDB connection',
+  },
+}
+
+const HEALTH_TONE: Record<SubsystemHealthItem['status'], DotTone> = {
+  ok: 'ok',
+  degraded: 'warn',
+  down: 'error',
+  not_configured: 'neutral',
+}
+
+const HEALTH_LABEL: Record<SubsystemHealthItem['status'], string> = {
+  ok: 'Connected',
+  degraded: 'Degraded',
+  down: 'Down',
+  not_configured: 'Not configured',
+}
+
+function ServiceCard({
+  descriptor,
+  subsystem,
+  dirty,
+  validating,
+  onValidate,
+  children,
+}: {
+  descriptor: ServiceDescriptor
+  subsystem: SubsystemHealthItem | undefined
+  dirty: boolean
+  validating: boolean
+  onValidate: () => void
+  children: ReactNode
+}) {
+  const tone: DotTone = dirty ? 'neutral' : subsystem ? HEALTH_TONE[subsystem.status] : 'neutral'
+  const label = dirty
+    ? 'Unsaved changes'
+    : subsystem
+      ? HEALTH_LABEL[subsystem.status]
+      : 'Status unavailable'
+  const detailTone =
+    subsystem?.status === 'down'
+      ? 'text-error'
+      : subsystem?.status === 'degraded'
+        ? 'text-searching'
+        : 'text-muted'
+
+  return (
+    <section className="rounded-[10px] border border-hairline bg-surface p-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <h2 className="font-display text-sm font-semibold text-ink">{descriptor.title}</h2>
+        <Dot tone={tone} label={label} />
+        <Button
+          variant="secondary"
+          size="sm"
+          className="ml-auto shrink-0"
+          aria-label={descriptor.validateLabel}
+          disabled={dirty}
+          // The query is shared by all four cards. A clean card's refetch must
+          // never make a dirty card look as though its unsaved candidate is
+          // being validated.
+          loading={!dirty && validating}
+          onClick={onValidate}
+        >
+          Validate
+        </Button>
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">{children}</div>
+
+      {dirty ? (
+        <p className="mt-3 text-xs text-faint">
+          Save changes before validating this connection.
+        </p>
+      ) : null}
+      {!dirty && subsystem?.detail ? (
+        <p className={`mt-3 text-xs break-words ${detailTone}`}>{subsystem.detail}</p>
+      ) : null}
+      {!dirty && subsystem?.note ? (
+        <p className="mt-3 text-xs break-words text-searching">⚠ {subsystem.note}</p>
+      ) : null}
+    </section>
+  )
+}
 
 /** The exact one-time reveal caption (ADR-0016). Kept verbatim so it never
  * drifts from what the operator was promised when the key was generated. */
@@ -351,6 +470,7 @@ function AccessSection() {
 
 export function Settings() {
   const { data, isLoading, isError, error, refetch } = useSettings()
+  const health = useOpsHealth({ poll: false })
   const update = useUpdateSettings()
   const { toast } = useToast()
 
@@ -387,7 +507,7 @@ export function Settings() {
   if (isLoading || (data && form === null)) {
     return (
       <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
-        <Heading />
+        <AdminPageHeader title="Settings" />
         <CenteredSpinner label="Loading settings…" />
       </div>
     )
@@ -396,7 +516,7 @@ export function Settings() {
   if (isError || !data || !form) {
     return (
       <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
-        <Heading />
+        <AdminPageHeader title="Settings" />
         <StateMessage
           tone="error"
           title="Couldn't load settings"
@@ -423,8 +543,22 @@ export function Settings() {
   const qbittorrentPasswordReentry =
     qbittorrentBaseChanged && data.qbittorrent_password === SECRET_SET
 
+  const subsystem = (name: ServiceName) =>
+    health.isError ? undefined : health.data?.subsystems.find((item) => item.name === name)
+  const serviceDirty: Record<ServiceName, boolean> = {
+    plex: form.plex_url !== (data.plex_url ?? '') || form.plex_token.length > 0,
+    prowlarr:
+      form.prowlarr_url !== (data.prowlarr_url ?? '') || form.prowlarr_api_key.length > 0,
+    qbittorrent:
+      form.qbittorrent_url !== (data.qbittorrent_url ?? '') ||
+      form.qbittorrent_username !== (data.qbittorrent_username ?? '') ||
+      form.qbittorrent_password.length > 0,
+    tmdb: form.tmdb_api_key.length > 0,
+  }
+
   const textField = (key: TextKey, label: string, placeholder: string) => (
     <Field
+      appearance="admin"
       label={label}
       value={form[key]}
       onChange={(e) => setField(key, e.target.value)}
@@ -454,6 +588,7 @@ export function Settings() {
         : undefined
     return (
       <Field
+        appearance="admin"
         label={label}
         type="password"
         autoComplete="off"
@@ -472,6 +607,7 @@ export function Settings() {
     bounds: { min: number; max?: number; step?: number },
   ) => (
     <Field
+      appearance="admin"
       label={label}
       type="number"
       min={bounds.min}
@@ -581,6 +717,7 @@ export function Settings() {
       eviction_proactive_enabled: form.eviction_proactive_enabled,
       eviction_interval_minutes: Number(form.eviction_interval_minutes),
       log_retention_days: Number(form.log_retention_days),
+      log_max_rows: Number(form.log_max_rows),
       auto_grab_enabled: form.auto_grab_enabled,
     }
     if (form.plex_token) body.plex_token = form.plex_token
@@ -629,36 +766,54 @@ export function Settings() {
 
   return (
     <div className="mx-auto flex w-full max-w-[900px] flex-col gap-6 px-5 py-8 sm:px-8">
-      <Heading />
+      <AdminPageHeader
+        title="Settings"
+        actions={
+          <Button loading={update.isPending} onClick={() => void handleSave()}>
+            Save changes
+          </Button>
+        }
+      />
 
       <div className="flex flex-col gap-5">
-        <section className="rounded-xl border border-hairline bg-surface p-5">
-          <h2 className="font-display text-sm font-semibold text-ink">Plex</h2>
-          <div className="mt-4 flex flex-col gap-4">
-            {textField('plex_url', 'URL', 'http://localhost:32400')}
-            {secretField('plex_token', 'Token', data.plex_token === SECRET_SET, {
-              credential: 'Plex token',
-              destinationChanged: plexBaseChanged,
-            })}
-          </div>
-        </section>
+        <ServiceCard
+          descriptor={SERVICE_DESCRIPTORS.plex}
+          subsystem={subsystem('plex')}
+          dirty={serviceDirty.plex}
+          validating={health.isFetching}
+          onValidate={() => void health.refetch()}
+        >
+          {textField('plex_url', 'URL', 'http://localhost:32400')}
+          {secretField('plex_token', 'Token', data.plex_token === SECRET_SET, {
+            credential: 'Plex token',
+            destinationChanged: plexBaseChanged,
+          })}
+        </ServiceCard>
 
-        <section className="rounded-xl border border-hairline bg-surface p-5">
-          <h2 className="font-display text-sm font-semibold text-ink">Prowlarr</h2>
-          <div className="mt-4 flex flex-col gap-4">
-            {textField('prowlarr_url', 'URL', 'http://localhost:9696')}
-            {secretField('prowlarr_api_key', 'API key', data.prowlarr_api_key === SECRET_SET, {
-              credential: 'Prowlarr API key',
-              destinationChanged: prowlarrBaseChanged,
-            })}
-          </div>
-        </section>
+        <ServiceCard
+          descriptor={SERVICE_DESCRIPTORS.prowlarr}
+          subsystem={subsystem('prowlarr')}
+          dirty={serviceDirty.prowlarr}
+          validating={health.isFetching}
+          onValidate={() => void health.refetch()}
+        >
+          {textField('prowlarr_url', 'URL', 'http://localhost:9696')}
+          {secretField('prowlarr_api_key', 'API key', data.prowlarr_api_key === SECRET_SET, {
+            credential: 'Prowlarr API key',
+            destinationChanged: prowlarrBaseChanged,
+          })}
+        </ServiceCard>
 
-        <section className="rounded-xl border border-hairline bg-surface p-5">
-          <h2 className="font-display text-sm font-semibold text-ink">qBittorrent</h2>
-          <div className="mt-4 flex flex-col gap-4">
-            {textField('qbittorrent_url', 'URL', 'http://localhost:8080')}
-            {textField('qbittorrent_username', 'Username', 'admin')}
+        <ServiceCard
+          descriptor={SERVICE_DESCRIPTORS.qbittorrent}
+          subsystem={subsystem('qbittorrent')}
+          dirty={serviceDirty.qbittorrent}
+          validating={health.isFetching}
+          onValidate={() => void health.refetch()}
+        >
+          {textField('qbittorrent_url', 'URL', 'http://localhost:8080')}
+          {textField('qbittorrent_username', 'Username', 'admin')}
+          <div className="sm:col-span-2">
             {secretField(
               'qbittorrent_password',
               'Password',
@@ -670,14 +825,19 @@ export function Settings() {
               },
             )}
           </div>
-        </section>
+        </ServiceCard>
 
-        <section className="rounded-xl border border-hairline bg-surface p-5">
-          <h2 className="font-display text-sm font-semibold text-ink">TMDB</h2>
-          <div className="mt-4 flex flex-col gap-4">
+        <ServiceCard
+          descriptor={SERVICE_DESCRIPTORS.tmdb}
+          subsystem={subsystem('tmdb')}
+          dirty={serviceDirty.tmdb}
+          validating={health.isFetching}
+          onValidate={() => void health.refetch()}
+        >
+          <div className="sm:col-span-2">
             {secretField('tmdb_api_key', 'API key', data.tmdb_api_key === SECRET_SET)}
           </div>
-        </section>
+        </ServiceCard>
 
         <section className="rounded-xl border border-hairline bg-surface p-5">
           <h2 className="font-display text-sm font-semibold text-ink">Library</h2>
@@ -979,7 +1139,7 @@ export function Settings() {
             Controls the automatic disk-pressure sweep and how long ops logs are kept.
           </p>
           <div className="mt-4 flex flex-col gap-4">
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {numberField('disk_pressure_threshold_percent', 'Pressure threshold (%)', {
                 min: 0,
                 max: 100,
@@ -988,8 +1148,6 @@ export function Settings() {
                 min: 0,
                 max: 100,
               })}
-            </div>
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               {numberField('eviction_grace_days', 'Eviction grace period (days)', { min: 0 })}
               {numberField('eviction_interval_minutes', 'Eviction check interval (minutes)', {
                 // The schema requires gt=0 (not ge=0 like the other knobs), so
@@ -999,8 +1157,9 @@ export function Settings() {
                 min: 0.1,
                 step: 0.1,
               })}
+              {numberField('log_retention_days', 'Log retention (days)', { min: 0 })}
+              {numberField('log_max_rows', 'Log retention (max rows)', { min: 0 })}
             </div>
-            {numberField('log_retention_days', 'Log retention (days)', { min: 0 })}
             <div className="flex flex-col gap-3">
               {checkboxField(
                 'eviction_enabled',
@@ -1019,25 +1178,33 @@ export function Settings() {
         </section>
       </div>
 
-      <div>
-        <Button loading={update.isPending} onClick={() => void handleSave()}>
-          Save changes
-        </Button>
-      </div>
-
       <AccessSection />
 
-      <section className="rounded-xl border border-hairline bg-surface p-5">
-        <h2 className="font-display text-sm font-semibold text-ink">More</h2>
-        <div className="mt-4 flex flex-wrap gap-3">
-          <LinkButton variant="secondary" to="/blocklist">
-            Manage blocklist
-          </LinkButton>
-          <LinkButton variant="secondary" to="/quality">
-            View quality profile
-          </LinkButton>
-        </div>
-      </section>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <section className="rounded-[10px] border border-hairline bg-surface p-4">
+          <h2 className="font-display text-sm font-semibold text-ink">Quality profile</h2>
+          <p className="mt-1 text-xs text-faint">
+            Ordered qualities with a hard cutoff. Read-only in v1.
+          </p>
+          <div className="mt-4">
+            <LinkButton variant="secondary" size="sm" to="/quality">
+              View profile
+            </LinkButton>
+          </div>
+        </section>
+
+        <section className="rounded-[10px] border border-hairline bg-surface p-4">
+          <h2 className="font-display text-sm font-semibold text-ink">Blocklist</h2>
+          <p className="mt-1 text-xs text-faint">
+            Review releases that Plex Manager must not grab again.
+          </p>
+          <div className="mt-4">
+            <LinkButton variant="secondary" size="sm" to="/blocklist">
+              Manage blocklist
+            </LinkButton>
+          </div>
+        </section>
+      </div>
     </div>
   )
 }

@@ -117,7 +117,7 @@ export interface paths {
         };
         /**
          * Discover Home
-         * @description Return the server-composed Discover home (spotlight + ordered rows).
+         * @description Return the server-composed Discover home (spotlights + ordered rows).
          */
         get: operations["discover_home_api_v1_discover_home_get"];
         put?: never;
@@ -337,6 +337,14 @@ export interface paths {
          *     ``GET /logs`` list. ``Content-Disposition: attachment`` so navigating
          *     straight to this URL downloads a file; a caller reading the body via
          *     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
+         *
+         *     Every message is passed through :func:`~plex_manager.logsafe.
+         *     redact_secrets` again here (issue #153) as a SECOND, independent line of
+         *     defense on top of the capture-time pass (``log_capture_service._capture``)
+         *     -- this is the boundary the blueprint explicitly calls out ("the log store
+         *     never records a secret"), and a row written before this redaction pass
+         *     existed, or by any future path that bypasses the capture pipeline, must
+         *     still never leave this endpoint carrying one.
          */
         get: operations["export_logs_endpoint_api_v1_ops_logs_export_get"];
         put?: never;
@@ -1396,12 +1404,13 @@ export interface components {
         };
         /**
          * DiscoverHomeResponse
-         * @description The composed Discover home: an optional spotlight + ordered rows.
+         * @description The composed Discover home: ordered spotlight candidates + rows.
          */
         DiscoverHomeResponse: {
             /** Rows */
             rows: components["schemas"]["DiscoverHomeRow"][];
-            spotlight?: components["schemas"]["DiscoverResult"] | null;
+            /** Spotlights */
+            spotlights: components["schemas"]["DiscoverResult"][];
         };
         /**
          * DiscoverHomeRow
@@ -1416,6 +1425,8 @@ export interface components {
             items: components["schemas"]["DiscoverResult"][];
             /** Row Type */
             row_type: string;
+            /** Subtitle */
+            subtitle?: string | null;
             /** Title */
             title: string;
         };
@@ -2050,6 +2061,8 @@ export interface components {
         RequestResponse: {
             /** Backdrop Url */
             backdrop_url?: string | null;
+            /** Download Progress */
+            download_progress?: number | null;
             /** Id */
             id: number;
             /**
@@ -2209,6 +2222,8 @@ export interface components {
             eviction_interval_minutes?: number | null;
             /** Eviction Proactive Enabled */
             eviction_proactive_enabled?: boolean | null;
+            /** Log Max Rows */
+            log_max_rows?: number | null;
             /** Log Retention Days */
             log_retention_days?: number | null;
             /** Movies Root */
@@ -2279,6 +2294,8 @@ export interface components {
             eviction_interval_minutes?: number | null;
             /** Eviction Proactive Enabled */
             eviction_proactive_enabled?: boolean | null;
+            /** Log Max Rows */
+            log_max_rows?: number | null;
             /** Log Retention Days */
             log_retention_days?: number | null;
             /** Movies Root */
@@ -2572,7 +2589,9 @@ export interface operations {
     };
     discover_home_api_v1_discover_home_get: {
         parameters: {
-            query?: never;
+            query?: {
+                load_id?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2586,6 +2605,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiscoverHomeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
