@@ -290,13 +290,27 @@ def _resolve_correlated_watch_state(
     whose own watch-state sync lags behind (or that a user happens to browse
     less) must never mask a real watch recorded via another section indexing
     the identical file. The timestamp is the NEWEST ``last_viewed_at`` among
-    the WATCHED hits, never the oldest -- eviction treats
+    ALL correlated hits -- INCLUDING not-yet-fully-watched / in-progress ones
+    (issue #290) -- never the oldest. Eviction treats
     ``last_viewed_at < grace_cutoff`` as eligible and sorts stalest-first, so
     keeping a STALE timestamp from a section that hasn't caught up with a
     recent rewatch another section already recorded would make the item
     eligible for deletion during the grace window right after that rewatch.
-    Deletion safety requires the most-recent watch evidence to win, not the
-    most-conservative one.
+
+    Considering only the WATCHED hits' timestamps here would FAIL OPEN: a
+    physical file indexed by two sections where section A recorded a completed
+    watch long past the grace cutoff (``watched=True``, stale timestamp) while
+    the operator is mid-rewatch via section B (its ``viewCount`` /
+    ``viewedLeafCount`` not yet incremented, so ``watched=False`` -- but its
+    ``lastViewedAt`` is RECENT) would merge to A's stale timestamp and become
+    eviction-eligible DURING the active rewatch. Deletion safety requires the
+    most-recent watch evidence -- from ANY correlated hit, watched or not -- to
+    win, so a disk-pressure sweep landing mid-rewatch never deletes the file
+    out from under the viewer. (The movie case has no season equivalent of the
+    partial-view state, but the same multi-section merge introduces the same
+    fail-open there: a single-section item's own in-progress ``viewCount=0``
+    protects it, but the merge must not let A's stale watched timestamp override
+    B's recent in-progress one.)
     """
     if len(hits) == 1:
         return hits[0][1]
@@ -307,14 +321,16 @@ def _resolve_correlated_watch_state(
         # Genuinely ambiguous: the hits do not all agree on the same underlying
         # file(s) -- fail closed, exactly as issue #207 originally specified.
         return WatchState(watched=False, last_viewed_at=None)
-    watched_timestamps = [
-        state.last_viewed_at
-        for _, state in hits
-        if state.watched and state.last_viewed_at is not None
-    ]
-    if not watched_timestamps:
+    if not any(state.watched for _, state in hits):
         return WatchState(watched=False, last_viewed_at=None)
-    return WatchState(watched=True, last_viewed_at=max(watched_timestamps))
+    # NEWEST across ALL hits (watched or in-progress), not just the watched ones
+    # -- see the docstring's fail-open note (issue #290). A watched hit always
+    # carries a timestamp (``WatchState``'s own contract), so ``watched`` being
+    # true guarantees at least one; the guard below stays defensive regardless.
+    all_timestamps = [state.last_viewed_at for _, state in hits if state.last_viewed_at is not None]
+    if not all_timestamps:
+        return WatchState(watched=False, last_viewed_at=None)
+    return WatchState(watched=True, last_viewed_at=max(all_timestamps))
 
 
 def _is_path_prefix(prefix: str, path: str) -> bool:
@@ -1241,9 +1257,11 @@ class PlexLibrary:
         merely indexed by more than one Plex section (e.g. a broad ``/media``
         section plus a nested ``/media/anime`` section covering the same files)
         and are merged into one logical item -- watched if ANY hit is watched, at
-        the NEWEST watched timestamp (deletion safety: a stale timestamp from a
-        section that hasn't caught up with a recent rewatch another section
-        already recorded must never make the item look grace-window-eligible).
+        the NEWEST ``lastViewedAt`` across ALL hits (issue #290: including a
+        not-yet-watched / mid-rewatch section, whose recent in-progress view must
+        win over another section's stale fully-watched timestamp -- deletion
+        safety: a stale timestamp must never make the item look
+        grace-window-eligible while it is being actively rewatched).
         Hits whose file paths genuinely DIFFER remain ambiguous and still FAIL CLOSED, exactly as
         before -- a legitimate duplicate (distinct copies on disk) must never let
         one copy's watched state authorize deleting the other. The TV branch pays
