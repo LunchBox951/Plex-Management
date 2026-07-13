@@ -744,3 +744,59 @@ def test_ensure_secret_key_recovers_crashed_partial_behind_file_exists_error(
     stored = file_backed_key.read_bytes()
     assert encryption._is_valid_fernet_key(stored)  # pyright: ignore[reportPrivateUsage]
     assert Fernet(stored).decrypt(fernet.encrypt(b"payload")) == b"payload"
+
+
+def test_recover_invalid_final_stale_lock_still_probes_before_reap_on_hardlink_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2 finding on this PR: a stale ``secret.key.lock`` must not let the
+    reap-and-replace fallback run un-probed.
+
+    Scenario: the helper crashed AFTER creating the publish lock while still
+    deciding what to do about an old invalid ``secret.key`` (e.g. it died
+    between ``os.mkdir(lock_dir)`` and the hardlink-capability probe). On a
+    REAL hardlink-capable filesystem (no ``os.link`` monkeypatch -- ext4/tmpfs,
+    the beta hosts' filesystem class) that stale lock's mere PRESENCE must not
+    bypass :func:`_probe_hardlink_capability` and hand off to
+    :func:`_publish_key_no_hardlink`, which reaps an invalid partial
+    unconditionally once it holds the lock. The lock must be waited for/reaped
+    and then re-acquired by this function itself so the probe still runs --
+    proving the filesystem is hardlink-capable -- and the old invalid key must
+    still fail loudly with the corrupt-key error, completely untouched."""
+    file_backed_key.write_bytes(b"tooshort")  # operator-restored, invalid
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_dir.mkdir()
+    os.utime(lock_dir, (old, old))  # stale: older than _STALE_PUBLISH_LOCK_SECONDS
+    monkeypatch.setattr(encryption, "_KEY_READ_ATTEMPTS", 1)  # keep retries instant
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert file_backed_key.read_bytes() == b"tooshort"  # never reaped/replaced
+    assert not lock_dir.exists()  # the stale lock was reaped, but no key was minted
+
+
+def test_recover_invalid_final_stale_lock_still_recovers_on_hardlink_refusing_fs(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PR's original scenario must keep passing after the stale-lock fix:
+    on a hardlink-REFUSING filesystem, a stale lock left behind by a crashed
+    committer (mid-commit, before releasing the lock) must still be reaped and
+    the crashed partial recovered. Waiting for/reaping the lock before running
+    the capability probe must not turn into a permanent block on the
+    legitimate fallback recovery this PR exists to restore (issue #149)."""
+    file_backed_key.write_bytes(b"\x00" * 10)  # a crashed committer's partial
+    old = time.time() - 3600
+    os.utime(file_backed_key, (old, old))
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_dir.mkdir()
+    os.utime(lock_dir, (old, old))  # stale: crashed while holding the lock
+    monkeypatch.setattr(os, "link", _existence_first_link)
+
+    result = encryption._generate_key_file(file_backed_key)  # pyright: ignore[reportPrivateUsage]
+
+    assert encryption._is_valid_fernet_key(result)  # pyright: ignore[reportPrivateUsage]
+    assert file_backed_key.read_bytes() == result
+    assert not lock_dir.exists()

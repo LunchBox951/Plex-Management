@@ -447,8 +447,9 @@ def _recover_invalid_final_after_link_exists(key_path: Path, tmp_name: str, key:
     :func:`_publish_key_no_hardlink`'s lock-guarded, age-gated recovery,
     forcing a manual ``secret.key`` deletion to unstick a fresh install.
 
-    Recovery here is a single, lock-guarded, age-gated attempt -- never an
-    unbounded wait -- and, critically, proves hardlink capability BEFORE ever
+    Recovery here is a lock-guarded, age-gated attempt -- the wait for the
+    lock is bounded by :data:`_PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS`, never
+    unbounded -- and, critically, proves hardlink capability BEFORE ever
     reaping anything:
 
     1. Acquire the publish lock (mirroring :func:`_publish_key_no_hardlink`'s
@@ -473,16 +474,38 @@ def _recover_invalid_final_after_link_exists(key_path: Path, tmp_name: str, key:
        delegating to :func:`_publish_key_no_hardlink` on the fallback
        ``OSError`` -- now unmasked because the blocking destination is gone).
 
-    If the publish lock is already held (a live commit in progress via either
-    route), delegate straight to :func:`_publish_key_no_hardlink`, which
-    already knows how to ride out a live holder or reap a genuinely stale
-    lock -- avoiding a second, competing single-shot reap here.
+    If the publish lock is already held -- a live commit in progress via
+    either route, OR a crashed holder's leftover from handling this exact
+    invalid final -- this function waits for/reaps it and acquires the lock
+    ITSELF (mirroring :func:`_publish_key_no_hardlink`'s own acquire loop)
+    rather than delegating straight to :func:`_publish_key_no_hardlink`.
+    Delegating on mere lock contention would skip step 1's probe entirely:
+    that function reaps an invalid partial unconditionally once it holds the
+    lock, with no hardlink-capability check at all, so a stale lock alone
+    (e.g. this helper crashed after creating the lock while still deciding
+    what to do about an old invalid ``secret.key``) would let a
+    hardlink-CAPABLE filesystem's operator-restored invalid key be silently
+    reaped and replaced instead of failing loud -- exactly the regression the
+    probe exists to prevent. Winning the lock ourselves guarantees the probe
+    always runs before any reap, no matter how the lock came to be held.
     """
     lock_dir = key_path.with_name(key_path.name + _PUBLISH_LOCK_SUFFIX)
-    try:
-        os.mkdir(os.fspath(lock_dir), 0o700)
-    except FileExistsError:
-        return _publish_key_no_hardlink(key_path, key)
+    deadline = time.monotonic() + _PUBLISH_LOCK_ACQUIRE_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.mkdir(os.fspath(lock_dir), 0o700)
+            break
+        except FileExistsError:
+            # A live holder is mid-commit (ride it out and adopt its result),
+            # or a crashed one left the lock behind (age-reap it, then retry
+            # acquiring it OURSELVES -- never hand off to
+            # _publish_key_no_hardlink here, which would skip the probe).
+            adopted = _read_valid_key(key_path)  # bounded retry: ride out a live commit
+            if adopted is not None:
+                return adopted
+            _reap_stale_publish_lock(lock_dir)
+            if time.monotonic() >= deadline:
+                raise _unbreakable_publish_lock_error(key_path, lock_dir) from None
     try:
         if _probe_hardlink_capability(tmp_name):
             # Proven hardlink-capable WITHOUT touching the existing final:
