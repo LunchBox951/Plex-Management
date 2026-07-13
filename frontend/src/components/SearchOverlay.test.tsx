@@ -10,6 +10,7 @@ import {
 import type { DiscoverResult, RequestResponse } from '../api/types'
 import { resetSettleObservations } from '../lib/tileState'
 import { SearchOverlay } from './SearchOverlay'
+import { TitleDetailModal } from './TitleDetailModal'
 
 vi.mock('../api/hooks', () => ({
   useDiscoverHome: vi.fn(),
@@ -24,8 +25,10 @@ vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 // Keep nested-dialog behavior real while avoiding TitleDetailModal's unrelated
 // request/queue/correction hook surface. This preserves Radix layer ordering,
 // Escape handling, focus restoration, and portal behavior for the overlay tests.
+// Wrapped in vi.fn so tests can assert WHEN the modal mounts at all (it must
+// not before a title is selected — its hooks fire ahead of its null guard).
 vi.mock('./TitleDetailModal', () => ({
-  TitleDetailModal: ({
+  TitleDetailModal: vi.fn(({
     title,
     open,
     onOpenChange,
@@ -55,7 +58,7 @@ vi.mock('./TitleDetailModal', () => ({
         </RadixDialog.Content>
       </RadixDialog.Portal>
     </RadixDialog.Root>
-  ),
+  )),
 }))
 
 const POPULAR_MOVIE: DiscoverResult = {
@@ -291,6 +294,31 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
 
     openOverlay()
     expect(useDiscoverHome).toHaveBeenLastCalledWith({ enabled: true })
+  })
+
+  it('adds no /requests observer while closed — Layout already polls that query', () => {
+    render(<SearchOverlay />)
+
+    expect(useRequests).toHaveBeenLastCalledWith({ poll: false, enabled: false })
+    expect(useRequests).not.toHaveBeenCalledWith({ poll: true, enabled: true })
+
+    openOverlay()
+    expect(useRequests).toHaveBeenLastCalledWith({ poll: true, enabled: true })
+  })
+
+  it('mounts the details modal only after a title is selected', async () => {
+    setSearch({ data: { results: [DETAIL_MOVIE] } })
+    render(<SearchOverlay />)
+    openOverlay()
+    await enterSearch('detail')
+
+    // The modal calls its full request/queue hook surface before its own null
+    // guard, so it must not exist at all until something is selected.
+    expect(TitleDetailModal).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: /View details for Detail Movie/ }))
+    expect(TitleDetailModal).toHaveBeenCalled()
+    expect(screen.getByRole('dialog', { name: 'Details for Detail Movie' })).toBeInTheDocument()
   })
 
   it('combines popular movie and TV rows in server order and removes duplicates', () => {

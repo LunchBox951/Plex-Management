@@ -10,9 +10,18 @@ import { deriveTileState } from '../lib/tileState'
  * rendered (home or search). That keeps deriveTileState's stale-base healing on
  * one client clock while allowing every Discover surface to share the same
  * safety-critical one-click request gate.
+ *
+ * Surfaces that mount on every route but only render tiles when visible (the
+ * header search overlay) pass `enabled: false` while hidden so this hook adds
+ * no /requests observer — Layout's badge already keeps that query polling, and
+ * a fresh fetch starts the moment the surface becomes visible.
  */
-export function useDiscoverTilePresentation(baseDataUpdatedAt: number | undefined) {
-  const requests = useRequests({ poll: true })
+export function useDiscoverTilePresentation(
+  baseDataUpdatedAt: number | undefined,
+  options?: { enabled?: boolean },
+) {
+  const enabled = options?.enabled ?? true
+  const requests = useRequests({ poll: enabled, enabled })
   const requestsInvalidated = useRequestsInvalidated()
   const requestRows = requests.data?.requests
   const requestsSettled = requests.isSuccess && !requestsInvalidated

@@ -83,8 +83,11 @@ export function SearchOverlay() {
   const suggestions = useMemo(() => popularTitles(home.data), [home.data])
   const results = queryReady ? (search.data?.results ?? []) : []
   const activeDataUpdatedAt = hasQuery ? search.dataUpdatedAt : home.dataUpdatedAt
-  const { tileState, quickRequestable } =
-    useDiscoverTilePresentation(activeDataUpdatedAt)
+  // Same visibility gate: no /requests observer (Layout's badge already polls
+  // that query) until tiles can actually render.
+  const { tileState, quickRequestable } = useDiscoverTilePresentation(activeDataUpdatedAt, {
+    enabled: open,
+  })
 
   useEffect(() => {
     const openWithSlash = (event: KeyboardEvent) => {
@@ -337,14 +340,22 @@ export function SearchOverlay() {
             </div>
           </div>
 
-          <TitleDetailModal
-            title={selected}
-            open={detailsOpen}
-            onOpenChange={setDetailsOpen}
-            returnFocusTo={() =>
-              detailsTrigger?.isConnected ? detailsTrigger : inputRef.current
-            }
-          />
+          {/* Mount the details modal only once a title has been selected: it
+              calls its full request/queue hook surface before its own null
+              guard, which would otherwise fire hidden fetches (an admin /queue
+              GET among them) whenever the overlay is open. `selected` survives
+              a details close, so Radix stays mounted through the close and the
+              returnFocusTo handoff below still runs. */}
+          {selected ? (
+            <TitleDetailModal
+              title={selected}
+              open={detailsOpen}
+              onOpenChange={setDetailsOpen}
+              returnFocusTo={() =>
+                detailsTrigger?.isConnected ? detailsTrigger : inputRef.current
+              }
+            />
+          ) : null}
         </RadixDialog.Content>
       </RadixDialog.Portal>
     </RadixDialog.Root>

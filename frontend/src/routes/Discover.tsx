@@ -57,7 +57,13 @@ export function Discover() {
         </>
       )}
 
-      <TitleDetailModal title={selected} open={modalOpen} onOpenChange={setModalOpen} />
+      {/* Same lazy-mount as the search overlay: the modal runs its full
+          request/queue hook surface before its own null guard, so don't mount
+          it until a title has been selected. `selected` survives a close, so
+          Radix stays mounted through its exit. */}
+      {selected ? (
+        <TitleDetailModal title={selected} open={modalOpen} onOpenChange={setModalOpen} />
+      ) : null}
     </div>
   )
 }
