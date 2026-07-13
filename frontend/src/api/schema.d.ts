@@ -2221,6 +2221,29 @@ export interface components {
             target_episode_count?: number | null;
         };
         /**
+         * ServiceNotConfiguredErrorDetail
+         * @description Wire shape of ``deps.ServiceNotConfiguredError``'s 409 (honesty over silence).
+         *
+         *     The app-wide handler (``app._service_not_configured_handler``) always
+         *     renders ``{"detail": "service_not_configured", "service": "<name>"}`` --
+         *     a REQUIRED ``service`` field, not the bare ``{"detail": ...}`` of
+         *     :class:`ErrorDetail`. Endpoints that can raise this error must reference
+         *     this model (not ``ErrorDetail``) in their OpenAPI ``responses={}`` so the
+         *     generated client type carries ``service`` and callers can route the
+         *     operator straight to that service's setup step instead of losing the
+         *     field to the generic shape.
+         */
+        ServiceNotConfiguredErrorDetail: {
+            /**
+             * Detail
+             * @default service_not_configured
+             * @constant
+             */
+            detail: "service_not_configured";
+            /** Service */
+            service: string;
+        };
+        /**
          * ServiceValidateResponse
          * @description Result of a connection check. ``message`` is operator-facing; ``detail``
          *     is an optional diagnostic. Neither ever contains a secret value.
@@ -3325,6 +3348,24 @@ export interface operations {
                     "application/json": components["schemas"]["RequestResponse"];
                 };
             };
+            /** @description Request not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Not cancellable in its current state, an import is in progress, or qBittorrent is required but not configured */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
+                };
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -3413,13 +3454,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Validation error, or a tv request reported without a season */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };
