@@ -536,6 +536,26 @@ class SettingsStore:
                 out[key] = row.value
         return out
 
+    async def secret_values(self) -> frozenset[str]:
+        """Every currently-configured secret's DECRYPTED value (issue #268) --
+        the input to :func:`~plex_manager.logsafe.redact_known_secrets`'s
+        value-based redaction pass, never returned over the API (unlike
+        :meth:`redacted`, this is for in-process consumption only: the
+        log-capture handler and the ``/ops/logs*`` read boundaries, never a
+        response body).
+
+        One query across all of :data:`SECRET_SETTING_KEYS` rather than one
+        ``get()`` per key -- this is called on every log-capture drain tick
+        (see ``web/app.py``'s ``_log_drain_loop``) and every ``/ops/logs*``
+        read, so it stays a single round trip. An unset secret contributes
+        nothing (never an empty string -- ``redact_known_secrets`` would skip
+        it anyway via its length guard, but there is no reason to hand it one).
+        """
+        result = await self._session.execute(
+            select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
+        )
+        return frozenset(value for value in result.scalars().all() if value)
+
 
 # --------------------------------------------------------------------------- #
 # Shared HTTP client

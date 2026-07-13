@@ -44,6 +44,20 @@ for the exact secret shapes covered. This closes the gap a purely
 call-site-driven discipline cannot: a message assembled elsewhere (a
 third-party library's own log line, a forgotten call site) that happens to
 carry one of this app's real secret shapes.
+
+As of issue #268, a THIRD, value-based pass (:func:`~plex_manager.logsafe.
+redact_known_secrets`) runs FIRST, before the shape pass (see :func:`_capture`
+for exactly why the order is load-bearing, not incidental): it masks any
+VERBATIM occurrence of this app's own currently-configured secret VALUES
+(fetched decrypted from the settings store — see :meth:`~plex_manager.web.
+deps.SettingsStore.secret_values`), independent of the surrounding shape. This
+catches renderings no shape grammar anticipates — a cookie-jar/mapping
+``repr()`` dump, a basic-auth URL whose password itself contains ``@`` (both
+issue #270) — without adding one more denylist pattern. :class:`LogCaptureHandler`
+carries the current secret-value set on :attr:`LogCaptureHandler.secret_values`,
+refreshed each tick by ``web/app.py``'s ``_log_drain_loop`` (this module has no
+DB access of its own, and ``emit`` runs synchronously off any thread, so the
+value set is a periodically-refreshed snapshot, not a live read).
 """
 
 from __future__ import annotations
@@ -57,7 +71,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
-from plex_manager.logsafe import redact_secrets
+from plex_manager.logsafe import redact_known_secrets, redact_secrets
 from plex_manager.ports.repositories import LOG_EVENT_CORRELATION_KEYS, LogEventCreate
 
 if TYPE_CHECKING:
@@ -251,7 +265,9 @@ def _extract_context(record: logging.LogRecord) -> dict[str, Any] | None:
     return context or None
 
 
-def _capture(record: logging.LogRecord) -> CapturedLogRecord:
+def _capture(
+    record: logging.LogRecord, secret_values: frozenset[str] = frozenset()
+) -> CapturedLogRecord:
     """Render one stdlib ``LogRecord`` into the pipeline's own frozen shape.
 
     ``record.getMessage()`` (not the raw ``record.msg``) so ``%``-style args are
@@ -261,18 +277,32 @@ def _capture(record: logging.LogRecord) -> CapturedLogRecord:
     full trace, not just the one-line message, to actually explain a failure.
 
     The fully-rendered message (args merged, traceback appended) is then run
-    through :func:`~plex_manager.logsafe.redact_secrets` (issue #153) — AFTER
-    merging so a secret split across a format string and its args (e.g.
-    ``logger.info("token=%s", token)``) is still caught, since only the
-    merged result actually contains ``token=<value>`` as one contiguous
-    string. This is the ONE place every captured record passes through
-    (both the ring-buffer live tail and the durable-store queue read from
-    this same :class:`CapturedLogRecord`), so redaction happens exactly once,
-    upstream of both destinations.
+    through :func:`~plex_manager.logsafe.redact_known_secrets` (issue #268)
+    against ``secret_values`` (the app's own currently-configured secret
+    values — see :class:`LogCaptureHandler.secret_values`) and THEN through
+    :func:`~plex_manager.logsafe.redact_secrets` (issue #153) — value-based
+    pass FIRST, deliberately: the shape grammar's own masking can otherwise
+    MANGLE a secret before the value-based pass ever sees it whole. A basic-
+    auth password containing a raw ``@`` (issue #270) is the concrete case —
+    ``redact_secrets``'s URL pass stops at the password's OWN first internal
+    ``@`` and masks only that leading fragment, leaving the remainder as
+    ordinary text; if that ran first, the full password would no longer
+    appear as one contiguous substring anywhere in the message, and the
+    value-based pass's exact-match search would find nothing to redact. Value-
+    based first guarantees it always sees the secret's pristine, complete
+    rendering at least once, regardless of what the shape pass would have done
+    to it. AFTER merging (not before) so a secret split across a format string
+    and its args (e.g. ``logger.info("token=%s", token)``) is still caught,
+    since only the merged result actually contains ``token=<value>`` as one
+    contiguous string. This is the ONE place every captured record passes
+    through (both the ring-buffer live tail and the durable-store queue read
+    from this same :class:`CapturedLogRecord`), so both redaction passes
+    happen exactly once, upstream of both destinations.
     """
     message = record.getMessage()
     if record.exc_info:
         message = f"{message}\n{_EXC_FORMATTER.formatException(record.exc_info)}"
+    message = redact_known_secrets(message, secret_values)
     message = redact_secrets(message)
     return CapturedLogRecord(
         created_at=datetime.fromtimestamp(record.created, tz=UTC),
@@ -313,6 +343,22 @@ class LogCaptureHandler(logging.Handler):
     :meth:`snapshot_tail` is the only supported way to read it: it takes
     ``_lock`` around both the read (here) and the write (in :meth:`emit`), so a
     reader is never caught mid-iteration by a concurrent append.
+
+    ``secret_values`` (issue #268) is the app's own currently-configured secret
+    VALUES (Plex token, Prowlarr/TMDB api keys, qBittorrent password —
+    decrypted, in-process), fed to every :func:`_capture` call for the
+    value-based redaction pass. This handler has no DB access of its own (it
+    must never ``await`` from ``emit``, which can run off any thread — see
+    above), so it cannot fetch these itself; ``web/app.py``'s
+    ``_log_drain_loop`` — which already opens a DB session on its own interval
+    — refreshes this attribute each tick. Reassigning it to a NEW ``frozenset``
+    (never mutating one in place) is what makes the no-lock read in ``emit``
+    safe: a plain attribute read/write is atomic under the GIL, so ``emit``
+    always sees either the old set or the new one, never a partially-updated
+    one. Defaults to an empty ``frozenset`` — before the first refresh (a
+    startup race of at most one drain interval) or with no secrets configured
+    yet, this pass is simply a no-op, exactly as :func:`~plex_manager.logsafe.
+    redact_known_secrets` defines for an empty value set.
     """
 
     def __init__(
@@ -326,6 +372,7 @@ class LogCaptureHandler(logging.Handler):
         self.ring_buffer: deque[CapturedLogRecord] = deque(maxlen=ring_buffer_maxlen)
         self.queue: asyncio.Queue[CapturedLogRecord] = asyncio.Queue(maxsize=queue_maxsize)
         self.dropped_count = 0
+        self.secret_values: frozenset[str] = frozenset()
         self._loop = loop if loop is not None else asyncio.get_running_loop()
         # Guards ``ring_buffer`` against the concurrent-iteration hazard above.
         # A ``threading.Lock`` (not ``asyncio.Lock``): ``emit`` can run from a
@@ -341,7 +388,7 @@ class LogCaptureHandler(logging.Handler):
         # in the first place). ``handleError`` is the stdlib's own "a handler
         # failed" escape hatch (prints to stderr, respects ``logging.raiseExceptions``).
         try:
-            captured = _capture(record)
+            captured = _capture(record, self.secret_values)
         except Exception:
             self.handleError(record)
             return

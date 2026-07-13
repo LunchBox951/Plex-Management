@@ -12,13 +12,20 @@ secret is never logged.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import pytest
 
-from plex_manager.logsafe import redact_secrets, safe_guid, safe_int, safe_text
+from plex_manager.logsafe import (
+    redact_known_secrets,
+    redact_secrets,
+    safe_guid,
+    safe_int,
+    safe_text,
+)
 
 
 def _sha12(value: str) -> str:
@@ -788,3 +795,193 @@ def test_redact_secrets_never_raises_on_malformed_input() -> None:
     # the end of the string right after a secret-shaped key name.
     for raw in ("password='unterminated", "token=", "api_key", "://:@"):
         redact_secrets(raw)  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# redact_known_secrets (issue #268) -- the VALUE-based complement to
+# redact_secrets's SHAPE grammar above. These tests exercise exact-value
+# matching independent of surrounding shape, the URL-encoded/base64 variants,
+# the minimum-length guard, and (issue #270) the two shape-grammar gaps this
+# pass is meant to categorically close: a cookie-jar/mapping-repr dump and a
+# basic-auth URL whose password itself contains a raw ``@``.
+# --------------------------------------------------------------------------- #
+
+_FAKE_API_KEY = "sk-FAKEAPIKEY1234567890abcdef"
+_FAKE_PASSWORD = "correct-horse-battery-staple"  # noqa: S105
+
+
+def test_redact_known_secrets_masks_an_exact_occurrence_anywhere() -> None:
+    raw = f"upstream request failed: GET /api?key={_FAKE_API_KEY}&lang=en"
+    result = redact_known_secrets(raw, [_FAKE_API_KEY])
+    assert _FAKE_API_KEY not in result
+    assert "<redacted>" in result
+    assert "GET /api?key=" in result and "&lang=en" in result
+
+
+def test_redact_known_secrets_matches_regardless_of_surrounding_shape() -> None:
+    """No key name, no quoting, no recognizable syntax at all -- just the raw
+    value sitting mid-prose. redact_secrets's shape grammar has nothing to key
+    on here; the value-based pass needs none."""
+    raw = f"third-party client logged its own line mentioning {_FAKE_PASSWORD} directly"
+    result = redact_known_secrets(raw, [_FAKE_PASSWORD])
+    assert _FAKE_PASSWORD not in result
+    assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_multiple_configured_values_independently() -> None:
+    raw = f"plex_token={_FAKE_API_KEY} qbittorrent_password={_FAKE_PASSWORD}"
+    result = redact_known_secrets(raw, [_FAKE_API_KEY, _FAKE_PASSWORD])
+    assert _FAKE_API_KEY not in result
+    assert _FAKE_PASSWORD not in result
+    assert result.count("<redacted>") == 2
+
+
+def test_redact_known_secrets_masks_a_url_percent_encoded_variant() -> None:
+    """A password containing reserved URL characters often arrives percent-
+    encoded (query string / userinfo) rather than raw -- the pass must catch
+    the ENCODED rendering too, not just the literal value."""
+    password_with_reserved_chars = "p@ss/word&more=stuff"  # noqa: S105
+    encoded = quote(password_with_reserved_chars, safe="")
+    raw = f"connecting to https://user:{encoded}@tracker.example.com/announce"
+    result = redact_known_secrets(raw, [password_with_reserved_chars])
+    assert encoded not in result
+    assert "<redacted>" in result
+    assert "tracker.example.com" in result
+
+
+def test_redact_known_secrets_masks_a_base64_encoded_variant() -> None:
+    """A credential base64-encoded for a header/config dump must be caught in
+    that rendering too, even though the raw value never appears literally."""
+    b64 = base64.b64encode(_FAKE_PASSWORD.encode()).decode("ascii")
+    raw = f"dumping config: qbittorrent_password_b64={b64}"
+    result = redact_known_secrets(raw, [_FAKE_PASSWORD])
+    assert b64 not in result
+    assert "<redacted>" in result
+
+
+def test_redact_known_secrets_applies_minimum_length_guard() -> None:
+    """A very short 'secret' (below the length floor) must NOT redact common
+    substrings elsewhere in the line -- over-redaction is the failure mode the
+    guard exists to prevent."""
+    short_value = "ab"
+    raw = "grab this from the tab, then label it"
+    result = redact_known_secrets(raw, [short_value])
+    assert result == raw  # untouched: "ab" is far too short to treat as a secret
+
+
+def test_redact_known_secrets_min_length_is_configurable() -> None:
+    short_value = "abcdef"  # 6 chars
+    raw = f"token value is {short_value} exactly"
+    # Below the caller-supplied floor: skipped.
+    assert redact_known_secrets(raw, [short_value], min_length=8) == raw
+    # At/above the caller-supplied floor: masked.
+    result = redact_known_secrets(raw, [short_value], min_length=6)
+    assert short_value not in result
+
+
+def test_redact_known_secrets_skips_none_and_empty_values() -> None:
+    raw = f"value is {_FAKE_API_KEY}"
+    result = redact_known_secrets(raw, ["", _FAKE_API_KEY])
+    assert _FAKE_API_KEY not in result
+
+
+def test_redact_known_secrets_is_a_noop_with_no_secret_values() -> None:
+    raw = "ordinary log line with nothing configured"
+    assert redact_known_secrets(raw, []) == raw
+
+
+def test_redact_known_secrets_is_a_noop_on_empty_string() -> None:
+    assert redact_known_secrets("", [_FAKE_API_KEY]) == ""
+
+
+def test_redact_known_secrets_never_raises_on_malformed_input() -> None:
+    for raw in ("", "plain text", "\ud800lone surrogate"):
+        redact_known_secrets(raw, [_FAKE_API_KEY, "\ud800also-a-surrogate-secret"])
+
+
+def test_redact_known_secrets_leaves_unrelated_text_untouched_when_value_absent() -> None:
+    raw = "reconcile tick completed in 1.23s"
+    assert redact_known_secrets(raw, [_FAKE_API_KEY]) == raw
+
+
+# --- issue #270: shape-grammar gaps, closed categorically by value matching -- #
+
+
+def test_cookie_jar_mapping_repr_dump_is_not_caught_by_shape_grammar() -> None:
+    """Regression fixture proving the GAP redact_secrets leaves open: a cookie
+    logged as a jar/mapping repr (rather than a raw ``Cookie:`` header line) is
+    NOT recognized by ``_COOKIE_RE``, which requires a direct
+    ``name=value`` assignment."""
+    session_value = "sVeryLongSessionTokenValue123456789"
+    raw = f"outgoing cookies: {{'plexmgr.session': '{session_value}'}}"
+    result = redact_secrets(raw)
+    # Proves the gap: the shape pass leaves the value exposed.
+    assert session_value in result
+
+
+def test_cookie_jar_mapping_repr_dump_is_caught_by_value_based_pass() -> None:
+    """The value-based pass (issue #268) closes issue #270's cookie-jar/
+    mapping-repr gap: it doesn't matter that the shape is a dict repr rather
+    than a ``name=value`` header line -- the exact secret VALUE is masked
+    wherever it appears."""
+    session_value = "sVeryLongSessionTokenValue123456789"
+    raw = f"outgoing cookies: {{'plexmgr.session': '{session_value}'}}"
+    result = redact_known_secrets(raw, [session_value])
+    assert session_value not in result
+    assert "<redacted>" in result
+    assert "plexmgr.session" in result  # the cookie NAME survives, diagnosable
+
+
+def test_basic_auth_password_with_raw_at_sign_leaks_past_shape_grammar() -> None:
+    """Regression fixture proving the GAP redact_secrets leaves open:
+    ``_BASIC_AUTH_URL_RE`` stops its password capture at the FIRST ``@``, so a
+    password that itself CONTAINS ``@`` leaks its own remainder past that
+    point instead of being masked whole."""
+    password_with_at = "p@ssw0rd0123456789"  # noqa: S105
+    raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
+    result = redact_secrets(raw)
+    # Proves the gap: some suffix of the password (everything after its own
+    # first internal '@') survives in the shape-based output.
+    assert "ssw0rd0123456789" in result
+
+
+def test_basic_auth_password_with_raw_at_sign_is_caught_by_value_based_pass() -> None:
+    """The value-based pass (issue #268) closes issue #270's basic-auth gap:
+    given the actual configured password, the WHOLE value is masked
+    regardless of where an internal ``@`` would have confused the shape
+    grammar's password-boundary heuristic."""
+    password_with_at = "p@ssw0rd0123456789"  # noqa: S105
+    raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
+    result = redact_known_secrets(raw, [password_with_at])
+    assert password_with_at not in result
+    assert "ssw0rd0123456789" not in result
+    assert "<redacted>" in result
+    assert "tracker_user" in result
+
+
+def test_shape_and_value_passes_compose_to_fully_redact_the_at_sign_case() -> None:
+    """End-to-end: running BOTH passes in the order the capture/export
+    boundaries actually apply them -- VALUE-based first, then shape -- fully
+    redacts the basic-auth-with-embedded-``@`` case that shape alone leaves
+    partially exposed, proving the two passes are complementary, not
+    redundant. The order is load-bearing, not incidental: running shape FIRST
+    would mangle the password (mask only its leading fragment up to its own
+    internal ``@``) before the value-based pass ever saw the full, pristine
+    value to exact-match against -- see ``log_capture_service._capture``'s
+    docstring for the same reasoning applied at the real call sites."""
+    password_with_at = "p@ssw0rd0123456789"  # noqa: S105
+    raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
+    value_first = redact_known_secrets(raw, [password_with_at])
+    assert password_with_at not in value_first
+    combined = redact_secrets(value_first)
+    assert password_with_at not in combined
+    assert "ssw0rd0123456789" not in combined
+
+    # Reversing the order reproduces the gap this test guards against: shape
+    # first leaves a mangled remainder that no longer contains the full
+    # password as one contiguous substring, so the value-based pass (run
+    # second) has nothing left to exact-match.
+    shape_first = redact_secrets(raw)
+    assert "ssw0rd0123456789" in shape_first  # the gap, reconfirmed
+    still_leaking = redact_known_secrets(shape_first, [password_with_at])
+    assert "ssw0rd0123456789" in still_leaking

@@ -12,10 +12,12 @@ credential-bearing part at all (north star #3: secrets are never logged). See
 CONTRIBUTING.md "Logging request-derived values".
 """
 
+import base64
 import hashlib
 import re
+from collections.abc import Iterable
 from typing import Final
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 #: The ONLY shape :func:`safe_guid` ever passes through verbatim: a bounded run
 #: of letters, digits, dots, underscores, and hyphens. This covers every benign
@@ -502,3 +504,148 @@ def redact_secrets(text: str) -> str:
     redacted = _COOKIE_RE.sub(_mask_value, redacted)
     redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
     return redacted
+
+
+# --------------------------------------------------------------------------- #
+# redact_known_secrets (issue #268): a VALUE-based redaction pass, complementary
+# to :func:`redact_secrets`'s SHAPE-based grammar above. ``redact_secrets`` asks
+# "does this text contain something shaped like a credential" (a key name next
+# to a value, a basic-auth URL, a cookie assignment, ...) -- a denylist of known
+# RENDERINGS that, per that function's own module comment, keeps growing a new
+# rule every time a novel shape turns up (issue #270's cookie-jar/mapping-repr
+# dump and its raw-``@``-in-password basic-auth URL are exactly two such
+# shapes, deliberately NOT patched into the grammar -- see below).
+#
+# ``redact_known_secrets`` asks a categorically different, STRUCTURALLY
+# STRONGER question: "does this text contain one of THIS APP'S OWN, CURRENTLY
+# CONFIGURED secret VALUES" -- Plex/Prowlarr/TMDB/qBittorrent credentials the
+# settings store holds (already decrypted in-process by the caller; this
+# module has no DB access and never acquires one). A value-shaped question has
+# no grammar to outrun: it doesn't matter whether the value sits inside a
+# ``key=value`` pair, a cookie-jar ``repr()``, a basic-auth URL whose password
+# itself contains ``@``, a third-party library's own log line, or bare mid-
+# prose -- if the EXACT bytes of a known secret appear anywhere in the text,
+# they are masked, regardless of the surrounding shape. This is why issue #270
+# folds its two shape-grammar gaps into THIS function's test matrix rather than
+# into another ``redact_secrets`` pattern: both gaps are simply an instance of
+# "a real settings-store secret value appeared verbatim in a shape the grammar
+# doesn't recognize", which is precisely the class of leak a value-based pass
+# closes by construction, without one more denylist rule that only narrows the
+# NEXT unrecognized shape.
+#
+# Deliberately COMPLEMENTARY, not a replacement: this pass can only mask a
+# value it was HANDED, so a secret this app never stored in settings (a
+# user-pasted tracker/indexer token typed into a correction flow, an ad-hoc
+# credential a future adapter accepts but never persists) is invisible to it
+# -- ``redact_secrets``'s key-name grammar is still the only barrier for that
+# class, and both passes run at every capture/export boundary (see
+# ``log_capture_service._capture`` and ``web/routers/ops.py``). Reuses
+# :data:`_REDACTED` -- the same placeholder :func:`redact_secrets` emits, so a
+# reader of a log line can never tell WHICH pass masked a given span, nor does
+# it need to: either way, the answer is "a secret was here".
+
+#: The minimum LENGTH a configured secret value must have before this pass will
+#: ever mask it. Without a floor, a short value -- an early-beta qBittorrent
+#: password like ``"admin"`` (5 chars) users are warned but not blocked from
+#: setting, or a stub/test API key -- would exact-match countless innocent
+#: substrings of ordinary log prose (a word, a path segment, a hex fragment of
+#: an unrelated id) and redact them, which is exactly the "over-redaction of
+#: common substrings" the issue calls out to guard against. 8 is chosen as a
+#: floor beneath which NO real API key/token/Fernet-derived credential this app
+#: issues or accepts ever falls (Prowlarr/TMDB keys and qBittorrent-generated
+#: passwords are all far longer), while still being long enough that an 8+
+#: character OPERATOR-CHOSEN password is rare as an accidental substring of
+#: unrelated log text. A value shorter than this is silently skipped by this
+#: pass -- ``redact_secrets``'s shape grammar is the backstop for short
+#: secrets sitting in a recognized ``key=value``/header/cookie shape.
+_MIN_SECRET_VALUE_LENGTH: Final = 8
+
+
+def _secret_value_variants(value: str) -> frozenset[str]:
+    """Every literal RENDERING of ``value`` this pass will mask: the raw value
+    itself, its URL-percent-encoded form (a password/token embedded in a query
+    string or userinfo often arrives percent-encoded rather than raw -- e.g. a
+    password containing ``@`` or ``&``), and its base64 form (``cryptography``/
+    third-party clients frequently base64-encode a credential for a header or
+    a config dump). Each variant is included only when it actually DIFFERS from
+    the raw value, so a value with no reserved/non-ASCII characters (already
+    identical to its own percent-encoding) contributes exactly one entry rather
+    than three redundant copies for the caller's alternation to consider.
+
+    Total -- never raises: ``quote``'s own DEFAULT ``errors="strict"`` UTF-8
+    encode raises ``UnicodeEncodeError`` on a lone UTF-16 surrogate (a JSON log
+    payload permits one; a settings value round-tripped through JSON could
+    carry one) -- ``errors="surrogatepass"`` (the same choice :func:`safe_guid`
+    makes for its own digest) absorbs it instead of raising.
+    """
+    variants = {value}
+    percent_encoded = quote(value, safe="", errors="surrogatepass")
+    if percent_encoded != value:
+        variants.add(percent_encoded)
+    b64_encoded = base64.b64encode(value.encode("utf-8", "surrogatepass")).decode("ascii")
+    if b64_encoded != value:
+        variants.add(b64_encoded)
+    return frozenset(variants)
+
+
+def redact_known_secrets(
+    text: str,
+    secret_values: Iterable[str],
+    *,
+    min_length: int = _MIN_SECRET_VALUE_LENGTH,
+) -> str:
+    """Mask every VERBATIM occurrence of a value in ``secret_values`` inside
+    ``text`` with ``"<redacted>"`` -- the value-based complement to
+    :func:`redact_secrets`'s shape grammar (issue #268; see the module comment
+    above for the two functions' division of labor).
+
+    ``secret_values`` is whatever the caller currently holds decrypted
+    in-process (this app's configured Plex token, Prowlarr/TMDB api keys,
+    qBittorrent password, ...) -- this function has no opinion on WHERE those
+    came from and does no I/O of its own; it is a plain string-matching pass,
+    exactly as total and side-effect-free as :func:`redact_secrets`. A value
+    shorter than ``min_length`` (default :data:`_MIN_SECRET_VALUE_LENGTH`) is
+    skipped entirely -- see that constant's docstring for why a short value is
+    a false-positive hazard rather than a real credential to guard.
+
+    Matching is EXACT substring matching (plus the URL-encoded/base64
+    renderings :func:`_secret_value_variants` derives from each value), never
+    a regex built FROM the secret's own shape -- so it catches a real secret
+    wherever it appears, independent of the surrounding syntax: inside a
+    cookie-jar/mapping ``repr()`` dump (``{'plexmgr.session': '<value>'}``, a
+    shape :func:`redact_secrets`'s ``_COOKIE_RE`` does not recognize -- it
+    requires a direct ``name=value`` cookie assignment, not a dict repr), or
+    inside a basic-auth URL whose password itself contains a raw ``@``
+    (``scheme://user:p@ss@host`` -- :func:`redact_secrets`'s
+    ``_BASIC_AUTH_URL_RE`` stops at the FIRST ``@`` after the colon and leaves
+    the password's remainder exposed past it). Both are issue #270's deferred
+    shape-grammar gaps, folded into this function's test matrix as regression
+    coverage rather than patched into the grammar (see the module comment
+    above for why).
+
+    Every matched variant is replaced whole with ``"<redacted>"`` -- unlike
+    ``redact_secrets``'s ``key=<redacted>`` convention (which keeps the key
+    name for debuggability), there is no surrounding key name to preserve
+    here: the match IS the secret, start to end, so nothing of it survives.
+    All variants across all supplied values are combined into ONE alternation,
+    LONGEST-first (:data:`re.escape`d, so a value containing regex
+    metacharacters is matched literally) -- longest-first so a shorter variant
+    that happens to be a PREFIX of a longer one (e.g. a raw value that is
+    itself a prefix of its own base64 encoding, however unlikely) can never win
+    the alternation and leave the longer form's remainder unmasked; ``re``'s
+    leftmost-alternative-wins semantics make the ordering, not just the
+    content, load-bearing here. An empty ``text`` or an empty/entirely-
+    too-short ``secret_values`` is a no-op, returned byte-identical, exactly
+    like an ordinary miss in :func:`redact_secrets`.
+    """
+    if not text:
+        return text
+    variants: set[str] = set()
+    for value in secret_values:
+        if not value or len(value) < min_length:
+            continue
+        variants |= _secret_value_variants(value)
+    if not variants:
+        return text
+    pattern = re.compile("|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True)))
+    return pattern.sub(_REDACTED, text)

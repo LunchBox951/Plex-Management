@@ -339,12 +339,20 @@ export interface paths {
          *     ``fetch`` (the frontend's "copy to clipboard") is unaffected by the header.
          *
          *     Every message is passed through :func:`~plex_manager.logsafe.
-         *     redact_secrets` again here (issue #153) as a SECOND, independent line of
-         *     defense on top of the capture-time pass (``log_capture_service._capture``)
-         *     -- this is the boundary the blueprint explicitly calls out ("the log store
-         *     never records a secret"), and a row written before this redaction pass
+         *     redact_known_secrets` (issue #268), against THIS instant's decrypted
+         *     secret values -- catching a since-rotated secret and the shape-grammar
+         *     gaps (cookie-jar/mapping dumps, basic-auth passwords containing ``@``)
+         *     issue #270 documents -- and THEN through :func:`~plex_manager.logsafe.
+         *     redact_secrets` (issue #153) as a SECOND, independent line of defense on
+         *     top of the capture-time passes (``log_capture_service._capture``) -- this
+         *     is the boundary the blueprint explicitly calls out ("the log store never
+         *     records a secret"), and a row written before these redaction passes
          *     existed, or by any future path that bypasses the capture pipeline, must
-         *     still never leave this endpoint carrying one.
+         *     still never leave this endpoint carrying one. Value-based FIRST,
+         *     deliberately: see ``log_capture_service._capture``'s docstring for why
+         *     running the shape grammar first can mangle a secret (a basic-auth password
+         *     containing ``@``, concretely) before the value-based exact-match search
+         *     ever sees it whole.
          */
         get: operations["export_logs_endpoint_api_v1_ops_logs_export_get"];
         put?: never;
