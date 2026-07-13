@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 import {
   useEvict,
   useDiscoverHome,
+  useExchangeApiKey,
   useMarkFailed,
   useQueue,
   useRelocateDownload,
@@ -23,11 +24,10 @@ import {
   REQUESTS_REALTIME_FLOOR_MS,
   queryKeys,
 } from '../lib/queryClient'
-import * as apiKeyLib from '../lib/apiKey'
-import * as apiKeyRotationLib from '../lib/apiKeyRotation'
 import { setRealtimeConnected } from '../lib/realtimeState'
 import type {
   AppApiKeyResponse,
+  AuthMeResponse,
   EvictResponse,
   PlexLibraryOption,
   QueueItem,
@@ -50,14 +50,12 @@ beforeEach(() => {
   vi.mocked(client.POST).mockReset()
   vi.mocked(client.PUT).mockReset()
   vi.mocked(client.DELETE).mockReset()
-  apiKeyLib.clearApiKey()
   setRealtimeConnected(false)
 })
 
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
-  apiKeyLib.clearApiKey()
 })
 
 describe('useUpdateSettings', () => {
@@ -314,49 +312,55 @@ describe('useRequestsInvalidated', () => {
   })
 })
 
+describe('useExchangeApiKey', () => {
+  it('sends the key in the X-Api-Key header and seeds the /auth/me answer', async () => {
+    const me: AuthMeResponse = { authenticated: true, auth_method: 'api_key', is_admin: true }
+    ;(client.POST as unknown as Mock).mockResolvedValue({ data: me, response: { status: 200 } })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const { result } = renderHook(() => useExchangeApiKey(), { wrapper: createWrapper(qc) })
+    const outcome = await result.current.mutateAsync('recovery-key')
+
+    // The raw key rides a single request header — never a stored value (CodeQL #263).
+    expect(client.POST).toHaveBeenCalledWith('/api/v1/auth/api-key', {
+      headers: { 'X-Api-Key': 'recovery-key' },
+    })
+    expect(outcome.auth_method).toBe('api_key')
+    // The gate re-renders authenticated at once from the seeded answer.
+    expect(qc.getQueryData(queryKeys.authMe)).toEqual(me)
+  })
+})
+
 describe('useRotateAppKey', () => {
-  it('persists the rotated key immediately so the current session survives (issue #28)', async () => {
+  it('rotates and invalidates the status without touching the browser credential', async () => {
     const rotated: AppApiKeyResponse = { app_api_key: 'brand-new-key' }
     ;(client.POST as unknown as Mock).mockResolvedValue({
       data: rotated,
       response: { status: 200 },
     })
-    const finishRotation = vi.fn(() => {
-      // The replacement must already be visible when the old-key barrier opens.
-      expect(apiKeyLib.getApiKey()).toBe('brand-new-key')
-    })
-    const beginRotationSpy = vi
-      .spyOn(apiKeyRotationLib, 'beginApiKeyRotation')
-      .mockReturnValue(finishRotation)
-    const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries')
     const { result } = renderHook(() => useRotateAppKey(), { wrapper: createWrapper(qc) })
     const outcome = await result.current.mutateAsync()
 
+    expect(client.POST).toHaveBeenCalledWith('/api/v1/settings/app-key/rotate')
+    // The plaintext is returned once for the operator to copy elsewhere.
     expect(outcome.app_api_key).toBe('brand-new-key')
-    expect(beginRotationSpy).toHaveBeenCalledTimes(1)
-    // Fails before the fix: a rotated key never written into THIS browser's
-    // own store would 401 the very next request from the device that just
-    // rotated it -- every other device is correctly locked out, but this one
-    // must not be.
-    expect(setApiKeySpy).toHaveBeenCalledWith('brand-new-key')
-    expect(finishRotation).toHaveBeenCalledTimes(1)
     // Minting flips the Access card from Generate to Rotate/Revoke: the status
     // query must be invalidated so the card reflects that a key now exists.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
+    // The browser authenticates by the session cookie, not the raw key: rotating
+    // the shared key never disturbs this session (no own-credential to update).
   })
 })
 
 describe('useRevokeAppKey', () => {
-  it('deletes the key and invalidates the status without persisting anything locally', async () => {
+  it('deletes the key and invalidates the status', async () => {
     ;(client.DELETE as unknown as Mock).mockResolvedValue({
       data: undefined,
       response: { status: 204 },
     })
-    const setApiKeySpy = vi.spyOn(apiKeyLib, 'setApiKey')
-    setApiKeySpy.mockClear()
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries')
@@ -365,9 +369,6 @@ describe('useRevokeAppKey', () => {
 
     expect(client.DELETE).toHaveBeenCalledWith('/api/v1/settings/app-key')
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.appKeyStatus })
-    // Revoke clears the SHARED server-side key; it must never write a value into
-    // this browser's own key store.
-    expect(setApiKeySpy).not.toHaveBeenCalled()
   })
 })
 

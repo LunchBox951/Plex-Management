@@ -3139,6 +3139,28 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/auth/api-key": {
+      "post": {
+        "description": "Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.\n\nThe recovery / automation key (ADR-0005, ADR-0016) is the terminal-free\nbreak-glass credential that authenticates when plex.tv is unreachable. Before\nthis endpoint the browser had to keep the raw key in JS-readable\n``localStorage`` so the break-glass path survived a reload \u2014 exactly the\ncleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the\nsame cookie the Plex sign-in flow mints means the key never needs JS-readable\nstorage: the resulting session is an admin-authority recovery session with no\nPlex identity (``auth_sessions.user_id`` NULL), and every later request\nauthenticates by the HTTP-only cookie exactly like a Plex session does.\n\nThe key is validated against the stored ``SystemSettings.app_api_key`` with a\nconstant-time compare \u2014 accepting a Plex session cookie here (as\n``require_api_key`` would) is deliberately NOT done: that would let any\nsigned-in NON-admin mint an ADMIN recovery session. Only a caller who proves\nthe recovery key gets one.",
+        "operationId": "exchange_api_key_endpoint_api_v1_auth_api_key_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Exchange Api Key Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/api/v1/auth/logout": {
       "post": {
         "description": "Revoke the current Plex browser session and clear auth cookies.",

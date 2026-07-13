@@ -797,22 +797,38 @@ async def _session_auth_context(
     token_hash = hash_session_token(token)
     now = datetime.now(UTC)
     result = await session.execute(
-        select(AuthSession, User)
-        .join(User, User.id == AuthSession.user_id)
-        .where(
+        select(AuthSession).where(
             AuthSession.token_hash == token_hash,
             AuthSession.revoked_at.is_(None),
         )
     )
-    row = result.first()
-    if row is None:
+    auth_session = result.scalars().first()
+    if auth_session is None:
         return None
-    auth_session, user = row
     expires_at = _normalize_dt(auth_session.expires_at)
     if expires_at <= now:
         return None
     if enforce_csrf:
         _require_csrf_for_session(request)
+    if auth_session.user_id is None:
+        # A recovery session: minted by exchanging a valid ``X-Api-Key`` for this
+        # HTTP-only cookie (``POST /auth/api-key``, CodeQL #263). It carries the
+        # recovery key's admin authority with no Plex identity — reported exactly
+        # like direct ``X-Api-Key`` auth (``authenticate_request`` above), so the
+        # ``/auth/me`` answer and every gate see one consistent api-key context
+        # whether the key rode the header or was exchanged for the cookie. CSRF is
+        # still enforced above because this IS a cookie credential, unlike the
+        # header path.
+        return AuthContext(
+            method=AuthMethod.api_key,
+            is_admin=True,
+            session_expires_at=expires_at,
+        )
+    user = await session.get(User, auth_session.user_id)
+    if user is None:
+        # The owning user row was deleted out from under a still-live session
+        # (ondelete=CASCADE normally removes both together; this guards the race).
+        return None
     return AuthContext(
         method=AuthMethod.plex_session,
         user_id=user.id,
