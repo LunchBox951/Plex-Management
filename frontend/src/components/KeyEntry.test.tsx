@@ -35,8 +35,8 @@ describe('KeyEntry break-glass exchange', () => {
     await waitFor(() => expect(onAuthenticated).toHaveBeenCalledTimes(1))
   })
 
-  it('shows a retryable error and does not proceed when the exchange is rejected', async () => {
-    h.mutateAsync.mockRejectedValue(new Error('invalid_api_key'))
+  it('reports a rejected key distinctly and does not proceed on a 401', async () => {
+    h.mutateAsync.mockRejectedValue({ code: 'invalid_api_key', message: 'nope', status: 401 })
     const onAuthenticated = vi.fn()
 
     render(<KeyEntry onAuthenticated={onAuthenticated} />)
@@ -44,6 +44,19 @@ describe('KeyEntry break-glass exchange', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
 
     await waitFor(() => expect(screen.getByText(/rejected/i)).toBeInTheDocument())
+    expect(onAuthenticated).not.toHaveBeenCalled()
+  })
+
+  it('reports a connectivity problem distinctly (not a bad key) when the server is unreachable', async () => {
+    h.mutateAsync.mockRejectedValue({ code: 'unknown_error', message: 'boom', status: 0 })
+    const onAuthenticated = vi.fn()
+
+    render(<KeyEntry onAuthenticated={onAuthenticated} />)
+    typeKey('recovery-key')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    await waitFor(() => expect(screen.getByText(/reach the server/i)).toBeInTheDocument())
+    expect(screen.queryByText(/rejected/i)).not.toBeInTheDocument()
     expect(onAuthenticated).not.toHaveBeenCalled()
   })
 

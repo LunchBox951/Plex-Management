@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useExchangeApiKey } from '../api/hooks'
+import { isApiError } from '../lib/errors'
 import { Button } from './ui/Button'
 import { Field } from './ui/Field'
 
@@ -33,10 +34,16 @@ export function KeyEntry({
     try {
       await exchange.mutateAsync(key)
       onAuthenticated()
-    } catch {
-      // The exchange either rejected the key (401) or the server was unreachable;
-      // either way the screen stays honest and retryable rather than proceeding.
-      setError('That access key was rejected, or the server was unreachable. Try again.')
+    } catch (err) {
+      // Keep the two failure modes distinct so the operator knows what to fix
+      // (north star #3): a 401 is a wrong key to re-check; anything else (network
+      // drop, 5xx, throttle) is a reach-the-server problem, not a bad secret.
+      // Either way the screen stays honest and retryable rather than proceeding.
+      setError(
+        isApiError(err) && err.status === 401
+          ? 'That access key was rejected. Double-check it and try again.'
+          : "Couldn't reach the server to verify that key. Try again in a moment.",
+      )
     }
   }
 
