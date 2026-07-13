@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.config import get_settings
 from plex_manager.domain.eviction import EvictionCandidate, select_evictions
 from plex_manager.models import AuthSession, Setting, User
 from plex_manager.services import path_visibility
@@ -3143,6 +3144,139 @@ async def test_secret_values_omits_app_api_key_when_unset(
     async with sessionmaker_() as session:
         values = await SettingsStore(session).secret_values()
     assert values == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# secret_values -- issue #292, items 5-6: the stored Plex OAuth token
+# (User.encrypted_plex_token) and the optional PLEX_MANAGER_SETUP_TOKEN were
+# both missing from the value-based redaction set.
+# --------------------------------------------------------------------------- #
+async def test_secret_values_includes_a_stored_user_plex_oauth_token(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A signed-in Plex owner's per-user OAuth token
+    (:class:`~plex_manager.models.User`.``encrypted_plex_token``) lives in a
+    SEPARATE table from the generic ``settings`` store and is never a
+    ``Setting`` row keyed by :data:`SECRET_SETTING_KEYS` -- without folding it
+    in, an echoed/logged occurrence of that token (reused for the user's own
+    Plex resource/ownership calls) would sail past the value-based pass
+    entirely."""
+    async with sessionmaker_() as session:
+        session.add(
+            User(
+                plex_id=1001,
+                username="owner-1",
+                permissions=1,
+                encrypted_plex_token="fake-user-oauth-token-1",  # noqa: S106
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert "fake-user-oauth-token-1" in values
+
+
+async def test_secret_values_includes_every_users_plex_oauth_token(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Every signed-in user's token contributes -- the redaction set is not
+    limited to a single (e.g. the first-claiming owner's) account."""
+    async with sessionmaker_() as session:
+        session.add_all(
+            [
+                User(
+                    plex_id=1002,
+                    username="owner-2",
+                    permissions=1,
+                    encrypted_plex_token="fake-user-oauth-token-2",  # noqa: S106
+                ),
+                User(
+                    plex_id=1003,
+                    username="member-3",
+                    permissions=0,
+                    encrypted_plex_token="fake-user-oauth-token-3",  # noqa: S106
+                ),
+            ]
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert "fake-user-oauth-token-2" in values
+    assert "fake-user-oauth-token-3" in values
+
+
+async def test_secret_values_omits_a_users_token_left_unset(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A user row with no stored token (the degenerate token-less case) must
+    not raise or contribute a value -- the same honest-absence contract as
+    every other source."""
+    async with sessionmaker_() as session:
+        session.add(
+            User(plex_id=1004, username="owner-4", permissions=1, encrypted_plex_token=None)
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_includes_the_configured_setup_token(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The optional pre-init hardening ``PLEX_MANAGER_SETUP_TOKEN`` is
+    environment-sourced, never a DB row -- without folding it in directly,
+    the one place it is deliberately printed to the operator (the startup
+    setup-URL hint, issue #65/#294) would have nothing to redact it with when
+    it is echoed into the durable, exportable log store."""
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "fake-setup-token-12345")
+    get_settings.cache_clear()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert "fake-setup-token-12345" in values
+
+
+async def test_secret_values_omits_the_setup_token_when_unset(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset()
+
+
+async def test_secret_values_combines_all_sources(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every source -- generic settings-table secrets, the break-glass app API
+    key, every user's Plex OAuth token, and the setup token -- lands in the
+    SAME set; none shadows or replaces another."""
+    monkeypatch.setenv("PLEX_MANAGER_SETUP_TOKEN", "fake-setup-token-combo")
+    get_settings.cache_clear()
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("prowlarr_api_key", "fake-prowlarr-key-combo")
+        session.add(
+            User(
+                plex_id=1005,
+                username="owner-5",
+                permissions=1,
+                encrypted_plex_token="fake-user-oauth-token-combo",  # noqa: S106
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        values = await SettingsStore(session).secret_values()
+    assert values == frozenset(
+        {
+            "fake-prowlarr-key-combo",
+            "fake-user-oauth-token-combo",
+            "fake-setup-token-combo",
+        }
+    )
 
 
 async def test_rotate_app_key_cas_rejects_rotate_after_concurrent_revoke(

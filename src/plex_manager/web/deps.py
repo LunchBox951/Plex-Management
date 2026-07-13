@@ -600,8 +600,32 @@ class SettingsStore:
         a log line -- e.g. echoed back in an error message, or pasted into a
         support request -- would sail past this redaction pass entirely. A
         second query (rather than folding it into the query above) is
-        unavoidable: it is a different table with no ``key`` column to join on,
-        and this is still only two round trips total, not N.
+        unavoidable: it is a different table with no ``key`` column to join on.
+        (Issue #292 items 5-6 below add a THIRD query, over ``User``, for the
+        same reason -- see there; this is now three round trips total, still
+        not one per credential.)
+
+        Also folds in (issue #292, items 5-6) two further credential sources
+        this method previously missed entirely:
+
+        * Every ``User.encrypted_plex_token`` -- the per-user Plex OAuth token
+          (:class:`~plex_manager.models.User`, ADR-0016), reused for that
+          user's own Plex resource/ownership calls after sign-in. It lives in
+          yet another separate table (one row per signed-in user, not a
+          singleton and not keyed by :data:`SECRET_SETTING_KEYS`), so -- same
+          reasoning as ``app_api_key`` above -- it needs its own query, and a
+          bare occurrence of ANY user's token in a log line would otherwise
+          sail past this pass entirely. An unset (``None``) token contributes
+          nothing, same honest-absence contract as every other source here.
+        * The optional pre-init hardening ``PLEX_MANAGER_SETUP_TOKEN``
+          (:func:`get_settings`'s ``setup_token`` / :func:`_configured_setup_token`)
+          -- an environment-sourced credential, not a DB row at all, so unlike
+          every other source above it needs no query: it is folded in directly
+          via the same helper :func:`enforce_pre_init_setup_token` uses to
+          validate an incoming ``X-Setup-Token``, so "what counts as the
+          configured setup token" can never drift between the two. Unset
+          (``None``, the default -- no hardening configured) contributes
+          nothing.
         """
         result = await self._session.execute(
             select(Setting.encrypted_value).where(Setting.key.in_(SECRET_SETTING_KEYS))
@@ -610,6 +634,11 @@ class SettingsStore:
         system = await load_system_settings(self._session)
         if system is not None and system.app_api_key:
             values.add(system.app_api_key)
+        user_tokens = await self._session.execute(select(User.encrypted_plex_token))
+        values.update(token for token in user_tokens.scalars().all() if token)
+        setup_token = _configured_setup_token()
+        if setup_token:
+            values.add(setup_token)
         return frozenset(values)
 
 
