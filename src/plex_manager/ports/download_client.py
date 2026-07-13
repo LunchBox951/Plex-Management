@@ -150,7 +150,15 @@ class DownloadClientPort(Protocol):
         raise NotImplementedError
 
     async def get_status(self, info_hash: str) -> DownloadStatus | None:
-        """Return the status for ``info_hash``, or ``None`` if absent."""
+        """Return the status for ``info_hash``, or ``None`` if absent.
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent
+        implicit-``None`` default would let the reconciler misread a forgotten
+        override as ``ClientMissing`` (an honest "torrent is gone") for every
+        torrent, never surfacing the real bug -- a missing override must fail
+        loudly at call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def get_all_statuses(self, category: str | None = None) -> list[DownloadStatus]:
         """Return statuses for all torrents, optionally filtered by category."""
@@ -176,19 +184,53 @@ class DownloadClientPort(Protocol):
         raise NotImplementedError
 
     async def pause(self, info_hash: str) -> None:
-        """Pause the torrent identified by ``info_hash``."""
+        """Pause the torrent identified by ``info_hash``.
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let a caller believe a torrent was paused when nothing
+        happened -- must fail loudly at call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def resume(self, info_hash: str) -> None:
-        """Resume the torrent identified by ``info_hash``."""
+        """Resume the torrent identified by ``info_hash``.
+
+        Raises ``NotImplementedError`` by default (issue #204): same rationale
+        as :meth:`pause` -- a silent no-op default would let a caller believe a
+        torrent was resumed when nothing happened.
+        """
+        raise NotImplementedError
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
-        """Remove the torrent, deleting its files when ``delete_files`` is set."""
+        """Remove the torrent, deleting its files when ``delete_files`` is set.
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default is the single most dangerous of this batch -- it would let
+        ``purge_service.remove_torrent`` report ``True`` (success) for a
+        removal that never happened, leaving a blocklisted/cancelled torrent
+        seeding forever with no visible failure anywhere. Must fail loudly at
+        call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def set_category(self, info_hash: str, category: str) -> None:
-        """Set the torrent's category (used to mark imported items)."""
+        """Set the torrent's category (used to mark imported items).
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let a caller believe the category was set when nothing
+        happened -- must fail loudly at call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def get_save_path(self, info_hash: str) -> str | None:
-        """Return the torrent's current save path, re-read from the client."""
+        """Return the torrent's current save path, re-read from the client.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "unreadable"
+        answer, silently hiding a forgotten override -- must fail loudly at
+        call time instead, mirroring #80/#81.
+        """
+        raise NotImplementedError
 
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         """Return the torrent's files (relative path + size) so the importer can
@@ -201,7 +243,13 @@ class DownloadClientPort(Protocol):
         Read-only: the port deliberately has no matching setter. This is a
         DIAGNOSTIC signal (the setup/health visibility probe, issues #133/#157) --
         never mutate the operator's shared qBittorrent instance's global config.
+
+        Raises ``NotImplementedError`` by default (issue #204): an implicit
+        ``None`` default is indistinguishable from an honest "unreadable"
+        answer, silently hiding a forgotten override -- must fail loudly at
+        call time instead, mirroring #80/#81.
         """
+        raise NotImplementedError
 
     async def set_location(self, info_hash: str, save_path: str) -> None:
         """Relocate an existing torrent's save directory (qBittorrent moves it
@@ -210,7 +258,14 @@ class DownloadClientPort(Protocol):
         Per-torrent only -- this is the correction verb for a torrent stranded
         outside the app's visible download mount (issues #133/#157), never a
         bulk sweep and never the client's global default (see
-        :meth:`get_default_save_path`)."""
+        :meth:`get_default_save_path`).
+
+        Raises ``NotImplementedError`` by default (issue #204): a silent no-op
+        default would let a caller believe the relocation was requested when
+        nothing happened -- must fail loudly at call time instead, mirroring
+        #80/#81.
+        """
+        raise NotImplementedError
 
     async def get_failure_detail(self, info_hash: str) -> FailureDetail | None:
         """Return a best-effort detail (text + SOURCE) for why ``info_hash`` is
