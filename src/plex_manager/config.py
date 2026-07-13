@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     # rollbacks never touch it (see the design overview, §6).
     data_dir: str = "./data"
 
+    # Container auto-update bootstrap (ADR-0024). Policy lives in the database;
+    # these values define only the private sidecar boundary and fixed target.
+    image: str = "ghcr.io/lunchbox951/plex-manager:stable"
+    container_name: str = "plex-manager"
+    updater_secret_file: str | None = None
+
     # Optional override for the at-rest encryption key. When unset, the key is
     # generated once into ``<data_dir>/secret.key`` (mode 0600) on first start.
     # Wrapped in ``SecretStr`` so it never leaks through a log line or ``repr`` of

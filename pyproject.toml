@@ -114,6 +114,9 @@ reportUnknownArgumentType = false
 testpaths = ["tests"]
 addopts = "--cov=plex_manager --cov-report=term-missing"
 asyncio_mode = "auto"
+markers = [
+    "docker: disposable tests that require a local Docker Engine and explicit opt-in",
+]
 
 [tool.coverage.run]
 source = ["plex_manager"]

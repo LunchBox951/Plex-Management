@@ -1,10 +1,11 @@
 """SQLAlchemy 2.0 typed ORM models — the persisted schema (owned by Alembic).
 
-Thirteen tables back the alpha + beta pipeline: ``users``, ``settings``,
+Fifteen tables back the application: ``users``, ``settings``,
 ``system_settings``, ``auth_sessions``, ``audit_log``, ``media_requests``,
 ``request_dedup_locks``, ``season_requests``, ``downloads``, ``download_history``,
-``blocklist``, ``tmdb_cache``, and ``log_events``. Column shapes, indexes, and ``ON DELETE``
-behaviour follow the persistence design (see the analysis extract's
+``blocklist``, ``tmdb_cache``, ``log_events``, ``update_coordinator_state``, and
+``maintenance_leases``. Column shapes, indexes, and ``ON DELETE`` behaviour
+follow the persistence design (see the analysis extract's
 "Persistence + Schema Migrations" section, ADR-0007, and — for
 ``log_events``/``library_path``/``keep_forever``/the ``evicted`` status —
 ADR-0012).
@@ -49,6 +50,7 @@ __all__ = [
     "DownloadScopeStatus",
     "EpisodeState",
     "LogEvent",
+    "MaintenanceLease",
     "MediaRequest",
     "MediaType",
     "RequestDedupLock",
@@ -59,6 +61,7 @@ __all__ = [
     "Setting",
     "SystemSettings",
     "TmdbCache",
+    "UpdateCoordinatorState",
     "User",
     "WatchlistItem",
 ]
@@ -871,3 +874,79 @@ class LogEvent(Base):
     logger: Mapped[str] = mapped_column(String)
     message: Mapped[str] = mapped_column(Text)
     context_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON)
+
+
+class UpdateCoordinatorState(Base):
+    """Singleton durable status shared by the app and updater sidecar.
+
+    Policy remains in the ordinary ``settings`` table. This row records only
+    action sequencing, sidecar heartbeat/build observations, and the last
+    bounded outcome needed for crash recovery and an honest admin status view.
+    String-valued state intentionally has no CHECK constraint: adding a future
+    phase/result must remain an expand-only change that N-1 can ignore.
+    """
+
+    __tablename__ = "update_coordinator_state"
+    __table_args__ = (sa.CheckConstraint("id = 1", name="ck_update_coordinator_singleton"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    requested_action: Mapped[str] = mapped_column(
+        String(32), default="none", server_default=sa.text("'none'")
+    )
+    action_generation: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    acknowledged_generation: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    phase: Mapped[str] = mapped_column(String(32), default="idle", server_default=sa.text("'idle'"))
+    current_build: Mapped[str | None] = mapped_column(String(255))
+    current_digest: Mapped[str | None] = mapped_column(String(255))
+    available_build: Mapped[str | None] = mapped_column(String(255))
+    available_digest: Mapped[str | None] = mapped_column(String(255))
+    updater_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_operation: Mapped[str | None] = mapped_column(String(16))
+    last_result: Mapped[str | None] = mapped_column(String(32))
+    last_error_code: Mapped[str | None] = mapped_column(String(128))
+    last_from_build: Mapped[str | None] = mapped_column(String(255))
+    last_to_build: Mapped[str | None] = mapped_column(String(255))
+    # Receipt for idempotently accepting a retried outcome after the original
+    # response was lost. This is a one-way SHA-256 digest, never the lease token.
+    last_outcome_token_hash: Mapped[str | None] = mapped_column(String(64))
+    # Canonical acknowledgement payload receipt. A replay must match every
+    # outcome field before it can be treated as the already-committed response.
+    last_outcome_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MaintenanceLease(Base):
+    """One expiring critical-operation or updater drain lease.
+
+    Only a SHA-256 token digest is stored. A unique partial index permits many
+    simultaneous critical operations but at most one drain owner. Expired rows
+    are removed under the coordinator-row serialization lock before every claim.
+    """
+
+    __tablename__ = "maintenance_leases"
+    __table_args__ = (
+        Index("ix_maintenance_leases_kind_expires", "kind", "expires_at"),
+        Index(
+            "uq_maintenance_leases_drain",
+            "kind",
+            unique=True,
+            sqlite_where=sa.text("kind = 'drain'"),
+            postgresql_where=sa.text("kind = 'drain'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    owner: Mapped[str] = mapped_column(String(128))
+    operation: Mapped[str | None] = mapped_column(String(64))
+    action_generation: Mapped[int | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    renewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

@@ -230,6 +230,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/internal/updates/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Claim Endpoint */
+        post: operations["claim_endpoint_api_v1_internal_updates_claim_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/updates/eligibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Eligibility Endpoint */
+        post: operations["eligibility_endpoint_api_v1_internal_updates_eligibility_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/updates/heartbeat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Heartbeat Endpoint */
+        post: operations["heartbeat_endpoint_api_v1_internal_updates_heartbeat_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/updates/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Outcome Endpoint */
+        post: operations["outcome_endpoint_api_v1_internal_updates_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/updates/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Endpoint */
+        post: operations["release_endpoint_api_v1_internal_updates_release_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/updates/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Renew Endpoint */
+        post: operations["renew_endpoint_api_v1_internal_updates_renew_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/ops/disk": {
         parameters: {
             query?: never;
@@ -1214,6 +1316,57 @@ export interface paths {
          * @description Test a candidate TMDB api key.
          */
         post: operations["validate_tmdb_endpoint_api_v1_setup_validate_tmdb_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/updates/check-now": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Check Now Endpoint */
+        post: operations["check_now_endpoint_api_v1_updates_check_now_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/updates/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Update Status Endpoint */
+        get: operations["update_status_endpoint_api_v1_updates_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/updates/update-when-ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update When Ready Endpoint */
+        post: operations["update_when_ready_endpoint_api_v1_updates_update_when_ready_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2310,6 +2463,18 @@ export interface components {
             anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
+            /** Automatic Update Idle Only */
+            automatic_update_idle_only?: boolean | null;
+            /** Automatic Update Timezone */
+            automatic_update_timezone?: string | null;
+            /** Automatic Update Weekdays */
+            automatic_update_weekdays?: ("monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday")[] | null;
+            /** Automatic Update Window End */
+            automatic_update_window_end?: string | null;
+            /** Automatic Update Window Start */
+            automatic_update_window_start?: string | null;
+            /** Automatic Updates Enabled */
+            automatic_updates_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */
@@ -2386,6 +2551,18 @@ export interface components {
             anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
+            /** Automatic Update Idle Only */
+            automatic_update_idle_only?: boolean | null;
+            /** Automatic Update Timezone */
+            automatic_update_timezone?: string | null;
+            /** Automatic Update Weekdays */
+            automatic_update_weekdays?: ("monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday")[] | null;
+            /** Automatic Update Window End */
+            automatic_update_window_end?: string | null;
+            /** Automatic Update Window Start */
+            automatic_update_window_start?: string | null;
+            /** Automatic Updates Enabled */
+            automatic_updates_enabled?: boolean | null;
             /** Disk Pressure Target Percent */
             disk_pressure_target_percent?: number | null;
             /** Disk Pressure Threshold Percent */
@@ -2531,6 +2708,196 @@ export interface components {
         TmdbValidateRequest: {
             /** Api Key */
             api_key: string;
+        };
+        /**
+         * UpdateActionRequest
+         * @description Bodyless public/internal action guard; arbitrary target fields are forbidden.
+         */
+        UpdateActionRequest: Record<string, never>;
+        /**
+         * UpdateClaimRequest
+         * @description Recovery claims bind only to an existing action generation, never a target.
+         */
+        UpdateClaimRequest: {
+            /** Expected Generation */
+            expected_generation?: number | null;
+            /**
+             * Recovery
+             * @default false
+             */
+            recovery: boolean;
+        };
+        /**
+         * UpdateClaimResponse
+         * @description A newly-created drain claim, or a fail-closed busy response.
+         */
+        UpdateClaimResponse: {
+            /** Action Generation */
+            action_generation?: number | null;
+            /** Blocker */
+            blocker?: string | null;
+            /** Lease Seconds */
+            lease_seconds: number;
+            /** Lease Token */
+            lease_token?: string | null;
+            /** Ready */
+            ready: boolean;
+        };
+        /**
+         * UpdateEligibilityResponse
+         * @description Policy/action snapshot returned to the authenticated sidecar heartbeat.
+         */
+        UpdateEligibilityResponse: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "none" | "check" | "install";
+            /** Action Generation */
+            action_generation: number;
+            /** Automatic Enabled */
+            automatic_enabled: boolean;
+            /** Blocker */
+            blocker?: string | null;
+            /** Idle Only */
+            idle_only: boolean;
+            /**
+             * Poll After Seconds
+             * @default 15
+             */
+            poll_after_seconds: number;
+            /** Window Open */
+            window_open: boolean;
+        };
+        /**
+         * UpdateHeartbeatRequest
+         * @description Unleased liveness for digest checks before a drain is claimed.
+         */
+        UpdateHeartbeatRequest: {
+            /** Action Generation */
+            action_generation: number;
+            /**
+             * Phase
+             * @constant
+             */
+            phase: "checking";
+        };
+        /** UpdateLeaseRequest */
+        UpdateLeaseRequest: {
+            /** Lease Token */
+            lease_token: string;
+        };
+        /** UpdateLeaseResponse */
+        UpdateLeaseResponse: {
+            /** Blocker */
+            blocker?: string | null;
+            /** Lease Seconds */
+            lease_seconds: number;
+            /** Ready */
+            ready: boolean;
+        };
+        /**
+         * UpdateOutcomeRequest
+         * @description Sidecar acknowledgement. Targets/configuration are intentionally absent.
+         */
+        UpdateOutcomeRequest: {
+            /** Action Generation */
+            action_generation: number;
+            /** Available Build */
+            available_build?: string | null;
+            /** Available Digest */
+            available_digest?: string | null;
+            /** Current Build */
+            current_build?: string | null;
+            /** Current Digest */
+            current_digest?: string | null;
+            /** Detail Code */
+            detail_code?: string | null;
+            /** From Build */
+            from_build?: string | null;
+            /** Lease Token */
+            lease_token?: string | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "check" | "install";
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "no_update" | "update_available" | "succeeded" | "failed" | "rolled_back";
+            /** To Build */
+            to_build?: string | null;
+        };
+        /**
+         * UpdateRenewRequest
+         * @description Lease renewal plus a bounded, token-owned active phase.
+         */
+        UpdateRenewRequest: {
+            /** Lease Token */
+            lease_token: string;
+            /** Phase */
+            phase?: ("installing" | "rollback") | null;
+        };
+        /**
+         * UpdateResultItem
+         * @description The last completed updater operation, with only bounded safe detail.
+         */
+        UpdateResultItem: {
+            /** Detail Code */
+            detail_code?: string | null;
+            /**
+             * Finished At
+             * Format: date-time
+             */
+            finished_at: string;
+            /** From Build */
+            from_build?: string | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "check" | "install";
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "no_update" | "update_available" | "succeeded" | "failed" | "rolled_back";
+            /** To Build */
+            to_build?: string | null;
+        };
+        /**
+         * UpdateStatusResponse
+         * @description Honest public status for the admin update controls.
+         */
+        UpdateStatusResponse: {
+            /** Available Build */
+            available_build?: string | null;
+            /** Available Digest */
+            available_digest?: string | null;
+            /** Blocker */
+            blocker?: string | null;
+            /** Channel */
+            channel: string;
+            /** Current Build */
+            current_build: string;
+            /** Current Digest */
+            current_digest?: string | null;
+            /** Last Checked At */
+            last_checked_at?: string | null;
+            last_result?: components["schemas"]["UpdateResultItem"] | null;
+            /** Next Window End */
+            next_window_end?: string | null;
+            /** Next Window Start */
+            next_window_start?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "disabled" | "unavailable" | "idle" | "checking" | "update_available" | "waiting_for_window" | "waiting_for_idle" | "draining" | "installing" | "rollback" | "succeeded" | "failed";
+            /** Updater Available */
+            updater_available: boolean;
         };
         /** ValidationError */
         ValidationError: {
@@ -2868,6 +3235,204 @@ export interface operations {
                 };
                 content: {
                     "text/event-stream": unknown;
+                };
+            };
+        };
+    };
+    claim_endpoint_api_v1_internal_updates_claim_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateClaimRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateClaimResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    eligibility_endpoint_api_v1_internal_updates_eligibility_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateEligibilityResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    heartbeat_endpoint_api_v1_internal_updates_heartbeat_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateHeartbeatRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateLeaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    outcome_endpoint_api_v1_internal_updates_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOutcomeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_endpoint_api_v1_internal_updates_release_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateLeaseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateLeaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    renew_endpoint_api_v1_internal_updates_renew_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRenewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateLeaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -4087,6 +4652,92 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_now_endpoint_api_v1_updates_check_now_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_status_endpoint_api_v1_updates_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+        };
+    };
+    update_when_ready_endpoint_api_v1_updates_update_when_ready_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
                 };
             };
             /** @description Validation Error */
