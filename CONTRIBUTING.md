@@ -16,11 +16,19 @@ standard. This guide covers the dev workflow.
 ```bash
 make install      # creates editable install with dev extras + installs pre-commit
 make ui-install   # installs frontend dependencies used by make check
+make migrate      # create/upgrade the local database schema (required before first run)
 # equivalent to:
 #   pip install -e ".[dev]"
 #   pre-commit install
 #   npm --prefix frontend ci
+#   alembic upgrade head
 ```
+
+> **Note — local vs Docker migration:** Docker runs `alembic upgrade head`
+> automatically on every container start (see `docker/entrypoint.sh`). The local
+> entry point does **not** — you must run `make migrate` (or `alembic upgrade head`)
+> manually before the first `make run` and again after pulling any commit that adds
+> a new migration.
 
 ## Day-to-day
 
@@ -30,6 +38,7 @@ make format   # ruff format
 make type     # pyright (strict)
 make test     # pytest + coverage
 make check    # backend + frontend gates — run this before pushing
+make migrate  # apply any new migrations after pulling (run before make run)
 make run      # run the app locally (http://localhost:8000)
 ```
 
