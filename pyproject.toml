@@ -42,8 +42,12 @@ postgres = [
     "psycopg2-binary>=2.9",
 ]
 dev = [
-    # Gate tools are pinned exactly so pre-commit, local, and CI never drift
-    # (bump deliberately; Dependabot's pip ecosystem proposes updates).
+    # Gate tools are pinned exactly so local and CI never drift (bump
+    # deliberately; Dependabot's pip ecosystem proposes updates). ``ruff`` is
+    # additionally mirrored in .pre-commit-config.yaml, so its pin also keeps
+    # the pre-commit hook in sync; ``pyright`` is NOT a pre-commit hook (it
+    # runs via ``make type`` / ``make check`` and CI only), so this pin only
+    # keeps local and CI agreeing on it.
     "ruff==0.15.20",
     "pyright==1.1.411",
     "pytest>=8.2",

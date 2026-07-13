@@ -6,7 +6,10 @@ standard. This guide covers the dev workflow.
 ## Prerequisites
 
 - Python **3.12+**
-- Node.js **22+** with npm
+- Node.js **22.13+ on the 22 line, or Node.js 24+** with npm (Node 24 LTS
+  recommended). The floor is set by the locked frontend toolchain (ESLint
+  10.6, jsdom 29.1, the Vite 8.1 React plugin); `frontend/package.json`'s
+  `engines` field enforces this exact range.
 - FFmpeg (`ffprobe` is used to validate completed video files before import)
 - Docker (for building/running the container)
 - `make` (optional, for the shortcuts below)
@@ -55,11 +58,14 @@ plus session cookies; generate the optional recovery/automation `X-Api-Key` from
 Settings -> Access (`POST /api/v1/settings/app-key/rotate`) when you need API
 automation or a break-glass credential.
 
-CI runs the same gates (`make check`), so green locally ≈ green in CI. The `ruff`
-and `pyright` versions are pinned exactly in `pyproject.toml` and mirrored in
-`.pre-commit-config.yaml`, so the hook, local, and CI agree. Dependabot does not
-track pre-commit hook revisions — run `pre-commit autoupdate` periodically (and
-re-pin `ruff` in `pyproject.toml` to match) to keep them current.
+CI runs the same gates (`make check`), so green locally ≈ green in CI. `ruff` is
+pinned exactly in `pyproject.toml` **and** mirrored in `.pre-commit-config.yaml`,
+so the hook, local, and CI agree on it. `pyright` is pinned exactly in
+`pyproject.toml` too, but is **not** a pre-commit hook — strict typechecking runs
+via `make type` (part of `make check`) and in CI only; a `pre-commit run` alone
+will not catch a typing regression. Dependabot does not track pre-commit hook
+revisions — run `pre-commit autoupdate` periodically (and re-pin `ruff` in
+`pyproject.toml` to match) to keep them current.
 
 ## Project layout
 
