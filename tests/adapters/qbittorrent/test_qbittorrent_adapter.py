@@ -32,6 +32,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     _MAX_FAILURE_DETAIL_CHARS,  # pyright: ignore[reportPrivateUsage]
     _MAX_TORRENT_BYTES,  # pyright: ignore[reportPrivateUsage]
     SafeFetchNetworkBackend,
+    _assert_safe_fetch_url_shape,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
 from plex_manager.ports.download_client import FailureDetailSource
@@ -1151,15 +1152,83 @@ def test_is_trusted_source_url_prefix_matrix(url: str, expected: bool) -> None:
 
 def test_trusted_origin_idna_host_normalizes_symmetrically_with_candidates() -> None:
     """The stored trusted origin and every per-hop candidate origin MUST be
-    derived through the same normalization. ``ServiceUrl.origin`` IDNA-decodes
-    the host to Unicode (via ``httpx.URL.host``), while every candidate hop is
-    normalized with plain ``urlparse`` (punycode ASCII, never decoded) -- had
-    the stored side been taken from ``ServiceUrl.origin`` directly, an
-    IDNA-hostname Prowlarr base would never again match its own downloadUrls."""
+    derived through the same normalization -- both now go through httpx's own
+    host encoder (``_source_origin_triple``), which keeps punycode ASCII
+    as-is. Had the stored side been IDNA-decoded to Unicode (as
+    ``ServiceUrl.origin`` does via ``httpx.URL.host``) while candidates
+    stayed ASCII, an IDNA-hostname Prowlarr base would never again match its
+    own downloadUrls."""
     idna_origin = "http://xn--e1afmkfd.example:9696/prowlarr"
     client = _client(trusted_source_origin=idna_origin)
     assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
         f"{idna_origin}/1/download?apikey=x"
+    )
+
+
+def test_unicode_casefold_alias_of_trusted_host_is_not_trusted() -> None:
+    """``"faß.de".casefold() == "fass.de"``, but httpx connects a ``faß.de``
+    URL to ``xn--fa-hia.de`` -- a DIFFERENT registrable host. A casefold-based
+    origin match would hand that other host the trusted origin's
+    private-address exemption; the httpx-encoder-based match must not. The
+    match must also stay symmetric: a Unicode-configured base still trusts its
+    own downloadUrls in either spelling (``ServiceUrl.parse`` stores the base
+    in IDNA form, and candidates encode to the same form), and plain ASCII
+    hosts keep their case-insensitive match."""
+    client = _client(trusted_source_origin="http://fass.de/prowlarr")
+    # The genuine trusted host, in any ASCII case, stays trusted.
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://fass.de/prowlarr/1/download"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://FASS.de/prowlarr/1/download"
+    )
+    # The Unicode casefold alias encodes to a different host: never trusted.
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://faß.de/prowlarr/1/download"
+    )
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://xn--fa-hia.de/prowlarr/1/download"
+    )
+
+    # Symmetric case: a Unicode-configured base trusts its own host in both
+    # Unicode and punycode spellings, and does NOT trust the casefold alias.
+    unicode_client = _client(trusted_source_origin="http://faß.de/prowlarr")
+    assert unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://faß.de/prowlarr/1/download"
+    )
+    assert unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://xn--fa-hia.de/prowlarr/1/download"
+    )
+    assert not unicode_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://fass.de/prowlarr/1/download"
+    )
+
+
+def test_ipv6_trusted_origin_hex_case_is_insensitive() -> None:
+    """httpx lowercases registered names but PRESERVES hex-letter case in
+    IPv6 literals (``[FE80::1]`` stays ``FE80::1`` in ``raw_host``), so the
+    httpx-encoder-based origin match must lowercase the encoded host itself
+    -- otherwise a trusted origin configured in one case would deny its own
+    downloadUrls written in the other, failing CLOSED on legitimate fetches
+    that the old casefold match allowed. Case-insensitivity here is safe:
+    post-encoding hosts are pure ASCII, where lowercasing cannot create the
+    Unicode-casefold alias problem."""
+    client = _client(trusted_source_origin="http://[FE80::1]:9696/prowlarr")
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[fe80::1]:9696/prowlarr/1/download"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[FE80::1]:9696/prowlarr/1/download"
+    )
+    # A different address is still a different origin, whatever the case.
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[fe80::2]:9696/prowlarr/1/download"
+    )
+
+    # Symmetric: a lowercase-configured origin trusts the uppercase spelling.
+    lower_client = _client(trusted_source_origin="http://[fe80::1]:9696/prowlarr")
+    assert lower_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[FE80::1]:9696/prowlarr/1/download"
     )
 
 
@@ -1269,34 +1338,80 @@ async def test_safe_fetch_backend_pins_the_vetted_dns_answer(
     assert calls == 1
 
 
-async def test_safe_fetch_backend_allows_private_answer_for_trusted_host_only(
+async def test_safe_fetch_backend_allows_private_answer_only_when_hop_marked_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The connection-time backend mirrors the per-hop URL allowance: the
-    operator-configured Prowlarr host+port may resolve to a private address
-    (compose alias / LAN name), while the SAME private answer for any other
-    host stays a refused connect."""
+    """``connect_tcp`` only ever sees a bare host+port -- it cannot itself tell
+    a genuinely trusted hop from an off-prefix sibling that happens to share
+    the same host+port (see ``SafeFetchNetworkBackend``'s docstring and issue
+    #38's follow-up: a same-host, off-prefix redirect must NOT inherit the
+    private-address allowance). Trust is instead granted per hop by the
+    caller via ``note_hop_trust`` immediately before the connect it applies
+    to, and is consumed (reset to closed) by that one ``connect_tcp`` call --
+    a private DNS answer connects only for a call explicitly granted trust;
+    the identical answer for an ungranted call, on the very same host+port,
+    stays a refused connect."""
 
     def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", 9696))]
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
-    trusted = SafeFetchNetworkBackend(_AcceptingBackend(), ("prowlarr.local", 9696))
-    stream = await trusted.connect_tcp("prowlarr.local", 9696)
+    trusted_backend = SafeFetchNetworkBackend(_AcceptingBackend())
+    trusted_backend.note_hop_trust(("prowlarr.local", 9696))
+    stream = await trusted_backend.connect_tcp("prowlarr.local", 9696)
     assert isinstance(stream, _DummyNetworkStream)
 
-    # Same private DNS answer, untrusted host: refused before any connect.
+    # Same private DNS answer, same host+port, but this connect was never
+    # granted trust: refused before any delegate connect.
     delegate = _RecordingBackend()
-    untrusted = SafeFetchNetworkBackend(delegate, ("prowlarr.local", 9696))
+    untrusted_backend = SafeFetchNetworkBackend(delegate)
     with pytest.raises(httpcore.ConnectError):
-        await untrusted.connect_tcp("indexer.example", 9696)
+        await untrusted_backend.connect_tcp("prowlarr.local", 9696)
     assert delegate.hosts == []
 
-    # Trusted host on a DIFFERENT port is a different endpoint: refused too.
+    # The grant is consumed: a second connect on the SAME backend and SAME
+    # host+port, without a fresh grant, fails closed too -- exactly what
+    # stops an off-prefix hop from riding a prior hop's trust.
+    trusted_backend.note_hop_trust(("prowlarr.local", 9696))
+    await trusted_backend.connect_tcp("prowlarr.local", 9696)
     with pytest.raises(httpcore.ConnectError):
-        await untrusted.connect_tcp("prowlarr.local", 9999)
+        await trusted_backend.connect_tcp("prowlarr.local", 9696)
+
+
+async def test_safe_fetch_backend_trust_grant_is_bound_to_the_connect_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grant carries the expected connect host+port; a connect for ANY
+    other host or port -- e.g. the IDNA encoding of a Unicode casefold alias
+    (``faß.de`` casefolds to ``fass.de`` but connects to ``xn--fa-hia.de``) --
+    must not inherit the exemption even when the grant is pending."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    delegate = _RecordingBackend()
+    backend = SafeFetchNetworkBackend(delegate)
+
+    # Grant for fass.de, actual connect to the alias's real IDNA host: veto.
+    backend.note_hop_trust(("fass.de", 80))
+    with pytest.raises(httpcore.ConnectError):
+        await backend.connect_tcp("xn--fa-hia.de", 80)
     assert delegate.hosts == []
+
+    # Grant for the right host but the wrong port: veto too.
+    backend.note_hop_trust(("fass.de", 80))
+    with pytest.raises(httpcore.ConnectError):
+        await backend.connect_tcp("fass.de", 9999)
+    assert delegate.hosts == []
+
+    # Exact match connects.
+    accepting = SafeFetchNetworkBackend(_AcceptingBackend())
+    accepting.note_hop_trust(("fass.de", 80))
+    stream = await accepting.connect_tcp("fass.de", 80)
+    assert isinstance(stream, _DummyNetworkStream)
 
 
 class _AcceptingBackend(httpcore.AsyncNetworkBackend):
@@ -1396,6 +1511,414 @@ async def test_safe_fetch_backend_tries_next_address_on_connect_timeout(
 
     assert isinstance(stream, _DummyNetworkStream)
     assert delegate.hosts == ["93.184.216.34", "8.8.8.8"]
+
+
+async def test_assert_safe_fetch_url_shape_never_resolves_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real network path's per-hop pre-check must be shape-only: scheme +
+    hostname presence, no DNS. The connect-time backend is the sole resolver.
+
+    ``fake_getaddrinfo`` must return normally (not raise) so that ``calls``
+    genuinely reflects whether the resolver was invoked -- a mock that raises
+    on any call would make the post-call ``assert calls == 0`` vacuously true
+    (unreachable otherwise), which is exactly what CodeQL's py/redundant-
+    comparison flagged (alert #339): the assertion could never actually catch
+    a regression that made the shape check resolve DNS.
+    """
+    calls = 0
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    # A safe-looking, well-formed URL passes without ever touching the resolver.
+    await _assert_safe_fetch_url_shape("http://indexer.example/download/1")
+    assert calls == 0
+
+    # Malformed shape (bad scheme) is still vetoed -- entirely off URL parsing,
+    # no resolver involved either.
+    with pytest.raises(QbittorrentSourceError):
+        await _assert_safe_fetch_url_shape("ftp://indexer.example/download/1")
+    assert calls == 0
+
+
+class _ScriptedResponseStream(httpcore.AsyncNetworkStream):
+    """Serves one canned raw HTTP/1.1 response, then EOF."""
+
+    def __init__(self, response: bytes) -> None:
+        self._response = response
+        self._sent = False
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        _ = max_bytes, timeout
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._response
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        _ = buffer, timeout
+
+    async def aclose(self) -> None:
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = ssl_context, server_hostname, timeout
+        return self
+
+    def get_extra_info(self, info: str) -> Any:
+        _ = info
+        return None
+
+
+class _ScriptedBackend(httpcore.AsyncNetworkBackend):
+    """Records the connected host and serves a fixed response on every connect."""
+
+    def __init__(self, response: bytes) -> None:
+        self.hosts: list[str] = []
+        self._response = response
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        return _ScriptedResponseStream(self._response)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+_MAGNET_REDIRECT_RESPONSE = (
+    b"HTTP/1.1 302 Found\r\nLocation: " + MAGNET.encode() + b"\r\nContent-Length: 0\r\n\r\n"
+)
+
+
+async def test_redirect_hop_resolves_dns_once_over_the_real_network_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full per-hop flow through the REAL (non-``source_client``) path: DNS must
+    resolve exactly ONCE for the hop, and the connection must be made to that
+    single resolved address -- even though a hostile/rebinding host resolves
+    differently on a hypothetical second lookup. This is issue #38: before the
+    fix, the per-hop pre-check resolved once and the connect-time backend
+    resolved again, so a rebinding host could answer safely for the first (the
+    pre-check) and unsafely for the second (the connect) -- or vice versa.
+    Collapsing to one resolution used for both closes that gap and the wasted
+    lookup."""
+    calls = 0
+
+    def fake_getaddrinfo(host: str, port: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        # Only the FIRST (and, after the fix, ONLY) answer is a safe global
+        # address; a second call would rebind to a blocked/private one.
+        address = "93.184.216.34" if calls == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    backend = _ScriptedBackend(_MAGNET_REDIRECT_RESPONSE)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    # No source_client: exercises the real _SafeFetchTransport/
+    # SafeFetchNetworkBackend path, not the source_client test seam.
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+    )
+
+    result = await client.add("http://indexer.example/download/1", "/downloads", "plex-manager")
+
+    assert result.torrent_hash == MAGNET_HASH
+    assert calls == 1
+    assert backend.hosts == ["93.184.216.34"]
+
+
+async def test_redirect_hop_single_resolution_still_vetoes_unsafe_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the above: when the hop's ONE resolution is itself unsafe, the
+    fetch is still rejected before any connect -- consolidating to a single
+    lookup must not weaken the veto in the other direction either."""
+    calls = 0
+
+    def fake_getaddrinfo(host: str, port: object, **_kwargs: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    backend = _ScriptedBackend(_MAGNET_REDIRECT_RESPONSE)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+    )
+
+    # The message must stay the specific SSRF-veto message, not degrade to the
+    # generic "torrent source request failed" once the veto fires inside
+    # ``SafeFetchNetworkBackend.connect_tcp`` and gets wrapped by httpx/httpcore
+    # on its way back out to the caller.
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
+        await client.add("http://indexer.example/download/1", "/downloads", "plex-manager")
+
+    assert calls == 1
+    assert backend.hosts == []
+
+
+class _RedirectThenServeBackend(httpcore.AsyncNetworkBackend):
+    """First connect serves a 302 redirect; every connect after that serves a
+    canned response -- lets a test tell whether a SECOND hop's connection was
+    ever actually allowed to happen."""
+
+    def __init__(self, redirect_response: bytes, served_response: bytes) -> None:
+        self.hosts: list[str] = []
+        self._redirect_response = redirect_response
+        self._served_response = served_response
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        response = self._redirect_response if len(self.hosts) == 1 else self._served_response
+        return _ScriptedResponseStream(response)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        _ = path, timeout, socket_options
+        raise NotImplementedError
+
+    async def sleep(self, seconds: float) -> None:
+        _ = seconds
+
+
+async def test_redirect_off_prefix_same_host_port_over_real_network_path_is_vetoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for a P1 review finding on PR #303: on the REAL network path,
+    ``SafeFetchNetworkBackend.connect_tcp`` only ever sees a bare host+port. If
+    trust were still keyed off host+port alone (the pre-fix design), a redirect
+    that stays on the trusted Prowlarr host+port but steps OUTSIDE its
+    configured ``/prowlarr`` reverse-proxy prefix would wrongly inherit the
+    private-address allowance meant only for the prefix-bounded endpoint --
+    even though ``_is_trusted_source_url`` (and its ``source_client``-seam
+    mirror, ``test_redirect_off_prefix_same_origin_is_vetoed``) already say
+    that hop is untrusted. The fix threads the per-hop
+    ``_is_trusted_source_url`` decision down to the connect-time backend via
+    ``note_hop_trust`` instead of re-deriving it from host+port, so this
+    same-host, off-prefix hop must still be vetoed before it ever connects."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9696))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    redirect_response = (
+        b"HTTP/1.1 302 Found\r\n"
+        b"Location: http://127.0.0.1:9696/admin/x\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    served_response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nd3:foo3:bar"
+    backend = _RedirectThenServeBackend(redirect_response, served_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin=PROWLARR_PREFIXED_ORIGIN,
+    )
+
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
+        await client.add(PROWLARR_PREFIXED_DOWNLOAD_URL, "/downloads", "plex-manager")
+
+    # The trusted (in-prefix) hop connected; the off-prefix redirect target --
+    # on the SAME host+port -- must never have been allowed to connect at all.
+    assert backend.hosts == ["127.0.0.1"]
+
+
+async def test_unicode_casefold_alias_over_real_network_path_keeps_full_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end mirror of the casefold-alias unit test, over the REAL
+    (non-``source_client``) network path: with trusted origin
+    ``http://fass.de/prowlarr``, a source URL on ``faß.de`` (casefolds equal,
+    but httpx connects to ``xn--fa-hia.de`` -- a DIFFERENT host) must get the
+    full SSRF veto when it resolves privately, never the trusted origin's
+    private-address exemption; the genuine trusted host must keep working.
+    Two independent layers now enforce this: ``_is_trusted_source_url``
+    compares httpx-encoded (connect-time) host forms, and the connect-time
+    grant is bound to the trusted origin's exact host+port."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    torrent_response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: "
+        + str(len(_TORRENT_BYTES)).encode()
+        + b"\r\n\r\n"
+        + _TORRENT_BYTES
+    )
+
+    # The casefold alias resolves privately: full veto, no connection at all.
+    alias_backend = _ScriptedBackend(torrent_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: alias_backend)
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin="http://fass.de/prowlarr",
+    )
+    with pytest.raises(QbittorrentSourceError, match="unsafe torrent source URL"):
+        await client.add("http://faß.de/prowlarr/1/download", "/downloads", "plex-manager")
+    assert alias_backend.hosts == []
+
+    # The genuine trusted host, resolving to the same private answer, is the
+    # configured allowance and must still fetch (regression guard in the
+    # other direction: binding the grant must not break the trusted origin).
+    trusted_backend = _ScriptedBackend(torrent_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: trusted_backend)
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin="http://fass.de/prowlarr",
+    )
+    result = await client.add("http://fass.de/prowlarr/1/download", "/downloads", "plex-manager")
+    assert result.torrent_hash == _TORRENT_HASH
+    # The backend connects to the RESOLVED address it vetted (the pin), not
+    # the hostname -- exactly one connection, for the trusted hop.
+    assert trusted_backend.hosts == ["127.0.0.1"]
+
+
+@pytest.mark.parametrize("url_host", ["[fe80::1]", "[FE80::1]"])
+async def test_ipv6_trusted_origin_fetches_in_either_hex_case_over_real_path(
+    monkeypatch: pytest.MonkeyPatch, url_host: str
+) -> None:
+    """End-to-end mirror of the IPv6 hex-case unit test over the REAL network
+    path: a trusted origin configured as ``[FE80::1]`` must fetch its own
+    downloadUrls written in either case. The lowercase-URL case exercises the
+    URL-level origin match; the uppercase-URL case additionally exercises the
+    connect-time grant comparison (httpx hands ``connect_tcp`` the
+    case-preserved ``FE80::1`` while the grant is stored lowercase)."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1", 9696, 0, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    torrent_response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: "
+        + str(len(_TORRENT_BYTES)).encode()
+        + b"\r\n\r\n"
+        + _TORRENT_BYTES
+    )
+    backend = _ScriptedBackend(torrent_response)
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin="http://[FE80::1]:9696/prowlarr",
+    )
+
+    result = await client.add(
+        f"http://{url_host}:9696/prowlarr/1/download", "/downloads", "plex-manager"
+    )
+    assert result.torrent_hash == _TORRENT_HASH
+    assert backend.hosts == ["fe80::1"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # IPvFuture literal: urlparse accepts it, httpx.URL raises InvalidURL
+        # (which inherits from Exception directly, not RequestError).
+        "http://[v1.fe80::]/file.torrent",
+        # Malformed A-label: urlparse AND httpx.URL both accept it, but the
+        # idna-decode in httpx.URL.host (Host-header preparation inside
+        # client.stream's build_request) raises raw idna.IDNAError -- a
+        # UnicodeError, also not a RequestError.
+        "http://xn--/file.torrent",
+    ],
+)
+async def test_httpx_rejected_source_url_stays_in_source_error_taxonomy(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """A source URL that ``urlparse`` accepts (so the real path's shape-only
+    pre-check passes) but httpx rejects while building the request must be
+    converted to the SourceError subtype (a 422 release problem), never
+    escape the adapter taxonomy as a raw exception that 500s the manual grab
+    and aborts the auto-grab cycle. Neither escape route is an
+    ``httpx.RequestError`` -- see the parametrize cases. Before issue #38's
+    shape-only pre-check, the full per-hop DNS resolve caught these at
+    resolve time; the real path no longer resolves there, so the conversion
+    has to happen at the fetch."""
+    backend = _ScriptedBackend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    # A configured trusted origin routes the malformed URL through the full
+    # per-hop trust check first (_is_trusted_source_url ->
+    # _source_origin_triple's own httpx.URL call), exercising BOTH boundaries
+    # where an idna/httpx URL failure could surface.
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin=PROWLARR_ORIGIN,
+    )
+
+    with pytest.raises(QbittorrentSourceError, match="unsupported torrent source URL"):
+        await client.add(url, "/downloads", "plex-manager")
+
+    # Rejected while building the request: nothing was ever connected.
+    assert backend.hosts == []
 
 
 async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add() -> None:

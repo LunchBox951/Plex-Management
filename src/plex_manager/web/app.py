@@ -1027,9 +1027,27 @@ _UNDIALABLE_BIND_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", ""})  # noq
 #: 9000:8000`` with no equivalent env var set) -- so the hint says so explicitly
 #: rather than asserting a link that may not resolve.
 _UNCONFIRMED_HOST_PORT_NOTE: Final = (
-    " (port guessed from the in-container value; if this is a container published"
+    "(port guessed from the in-container value; if this is a container published"
     " under a different host port, use that port instead -- set PLEX_MANAGER_HOST_PORT"
     " to fix this link)"
+)
+
+#: Appended instead of :data:`_UNCONFIRMED_HOST_PORT_NOTE` when
+#: ``settings.host_port`` IS set but ``settings.in_container`` is not (issue
+#: #294, finding 3) -- a bare-metal install that copies ``.env.example``
+#: verbatim inherits its compose-only ``PLEX_MANAGER_HOST_PORT=8000`` default
+#: even though no port mapping was ever applied, so trusting the value would
+#: silently print a link the operator's own process isn't actually listening
+#: on that "published" port for. Honesty over silence: say explicitly that the
+#: value is being ignored and why, rather than asserting a possibly-wrong link.
+#: (Inside the shipped image the value IS honored -- see ``_setup_ready_url`` --
+#: so this note never tells a containerized operator to fix a variable that
+#: would then be ignored.)
+_BARE_METAL_HOST_PORT_NOTE: Final = (
+    "(PLEX_MANAGER_HOST_PORT is set, but this process is not running inside the"
+    " shipped container image, so no host port mapping can apply -- ignoring it"
+    " and using the in-process port instead; remove the variable on a"
+    " bare-metal install)"
 )
 
 
@@ -1043,13 +1061,63 @@ def _setup_ready_url(settings: Settings) -> str:
     ``window.location.hash`` before that redirect fires (see ``SetupWizard.tsx``),
     so the token still survives it.
 
-    Prefers ``settings.host_port`` (the container's PUBLISHED host port, see that
-    field's docstring) over ``settings.port`` (the in-container port) -- a Docker
-    install commonly remaps these, and only the host port is ever reachable from
-    the operator's browser. Falls back to ``settings.port`` with an explicit
-    caveat (:data:`_UNCONFIRMED_HOST_PORT_NOTE`) when the host port genuinely
-    cannot be confirmed from inside the container, rather than asserting a link
-    that may silently be wrong.
+    The HOST component prefers ``settings.host_bind`` (issue #294, finding 4 --
+    the container-PUBLISHED bind address, see that field's docstring) over
+    ``settings.host`` (the in-process listen address, commonly the undialable
+    ``0.0.0.0``), substituting ``localhost`` for either when it is itself one
+    of :data:`_UNDIALABLE_BIND_HOSTS` (an operator who deliberately widens the
+    published bind to a real LAN IP gets a link that actually resolves off the
+    container host, instead of always asserting ``localhost``) -- and the PORT
+    likewise prefers ``settings.host_port`` (the container's PUBLISHED host
+    port) over ``settings.port`` (the in-container port): a Docker install
+    commonly remaps these, and only the host socket is ever reachable from
+    the operator's browser.
+
+    Both published values are trusted ONLY when ``settings.in_container``
+    confirms this process runs inside the shipped image (the image-baked
+    ``PLEX_MANAGER_IN_CONTAINER=1`` sentinel -- see that field's docstring).
+    That single gate resolves the two remaining #294 P2 follow-ups at once:
+
+    * Bare metal must NEVER trust them (round 2): ``.env.example`` ships both
+      variables uncommented for Compose's benefit, so a bare-metal install
+      that copies it verbatim -- even one with real disks mounted at both
+      conventional ``/media``/``/downloads`` paths, which is why mount-point
+      probing was abandoned as a topology signal -- would otherwise print a
+      "published" socket nothing is listening on, instead of the real
+      in-process listener. The sentinel cannot be copied by accident: it is
+      baked into the image only and deliberately absent from ``.env.example``.
+    * Inside the shipped image, an EXPLICIT value must always be honored
+      (round 3), however the container was launched. ``host_bind``/
+      ``host_port`` default to ``None``, so a non-``None`` value was
+      necessarily provided by the launch environment -- the documented
+      compose file's ``environment:`` block or a hand-rolled ``docker run
+      -e``/other orchestrator equivalent -- and the app has no better source
+      of truth for a port mapping it cannot see from inside. A prior revision
+      additionally demanded both documented compose mounts before trusting
+      them, which discarded a ``docker run`` operator's explicit
+      ``PLEX_MANAGER_HOST_PORT`` while the printed caveat simultaneously told
+      them to set that very variable -- self-contradictory guidance.
+
+    When ``host_port`` is set but ignored (bare metal, round 2), the fallback
+    to ``settings.port`` carries :data:`_BARE_METAL_HOST_PORT_NOTE`; with no
+    ``host_port`` configured at all, :data:`_UNCONFIRMED_HOST_PORT_NOTE`
+    instead.
+
+    Either caveat, when present, is appended on its OWN trailing line -- a
+    real ``\\n``, never concatenated into the same line as the URL (P2
+    follow-up to issue #294, finding 1). An earlier revision spliced the
+    caveat's prose directly between the path and the ``#setup_token=``
+    fragment on one line; because that prose contains spaces, a terminal
+    linkifier would then only recognize ``.../setup`` (stopping at the first
+    space) as the clickable link -- silently dropping the fragment -- while
+    copying the whole printed line verbatim produced a request for a literal
+    ``/setup <prose...>`` path that the React ``/setup`` route does not match,
+    so the wizard never saw the token either way. Keeping the URL (including
+    its fragment, when present) as one contiguous, space-free line -- with any
+    caveat confined to its own separate line before/after it -- fixes both
+    failure modes at once: the clickable link always carries the full
+    fragment, and copying just that one line can never tack trailing prose
+    onto the token value.
 
     ``#setup_token=`` -- a URL FRAGMENT, never a query parameter -- is appended
     ONLY when a token is both configured and actually enforced
@@ -1062,10 +1130,18 @@ def _setup_ready_url(settings: Settings) -> str:
     browser. This is a discoverability aid only (ADR-0005's install-time
     exception).
     """
-    host = settings.host if settings.host not in _UNDIALABLE_BIND_HOSTS else "localhost"
-    if settings.host_port is not None:
+    if settings.host_bind is not None and settings.in_container:
+        host = settings.host_bind
+    else:
+        host = settings.host
+    if host in _UNDIALABLE_BIND_HOSTS:
+        host = "localhost"
+    if settings.host_port is not None and settings.in_container:
         port: int = settings.host_port
         note = ""
+    elif settings.host_port is not None:
+        port = settings.port
+        note = _BARE_METAL_HOST_PORT_NOTE
     else:
         port = settings.port
         note = _UNCONFIRMED_HOST_PORT_NOTE
@@ -1074,7 +1150,13 @@ def _setup_ready_url(settings: Settings) -> str:
         token = configured_setup_token()
         if token:
             url = f"{url}#setup_token={quote(token, safe='')}"
-    return f"{url}{note}"
+    if note:
+        # A real newline, deliberately NOT concatenated into the URL itself --
+        # see the docstring above (P2 follow-up to issue #294, finding 1). This
+        # keeps the URL line (fragment included) one contiguous, space-free
+        # token no matter what the caveat says.
+        url = f"{url}\n{note}"
+    return url
 
 
 def _emit_setup_ready_hint(url: str) -> None:

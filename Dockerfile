@@ -43,11 +43,21 @@ ARG PLEX_MANAGER_BUILD_ID=0.0.0
 # here or `docker run -p` would map to a dead socket (the healthcheck, probing
 # 127.0.0.1 from INSIDE, would still pass -- an unreachable-but-green trap).
 # Overridable per-deployment via the environment like any other setting.
+#
+# PLEX_MANAGER_IN_CONTAINER is the image-baked "this process runs inside the
+# shipped container image" sentinel (Settings.in_container). The startup
+# setup-URL hint requires it before trusting the compose-published
+# PLEX_MANAGER_HOST_BIND/HOST_PORT values -- mount-point names alone are not
+# evidence of being inside this container (a bare-metal media server can have
+# real disks mounted at both /media and /downloads). Baked here, deliberately
+# NOT listed in .env.example, so a bare-metal install can never copy it by
+# accident.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     PLEX_MANAGER_BUILD_ID=${PLEX_MANAGER_BUILD_ID} \
-    PLEX_MANAGER_HOST=0.0.0.0
+    PLEX_MANAGER_HOST=0.0.0.0 \
+    PLEX_MANAGER_IN_CONTAINER=1
 WORKDIR /app
 
 # Validate downloaded candidates by their actual media container/streams before

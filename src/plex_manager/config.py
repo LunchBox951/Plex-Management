@@ -55,6 +55,35 @@ class Settings(BaseSettings):
     # otherwise make that printed link silently wrong.
     host_port: int | None = None
 
+    # The HOST-namespace bind address docker-compose PUBLISHES this container's
+    # port under (docker-compose.yml's ``PLEX_MANAGER_HOST_BIND``, default
+    # ``127.0.0.1`` -- loopback-only until an operator deliberately widens it for
+    # LAN/reverse-proxy access). Mirrored into the container's own
+    # ``environment:`` block exactly like ``host_port`` above, so the app itself
+    # can see what was actually published rather than always guessing. ``None``
+    # means "not running under that compose file" (issue #294): the startup
+    # setup-URL hint then falls back to substituting ``localhost`` for an
+    # undialable in-process bind, unchanged from before this field existed.
+    # Without this, a Compose install deliberately published under a LAN IP
+    # would still print a ``localhost``-only link that never resolves off the
+    # container host, silently defeating the "click this exact link" promise.
+    host_bind: str | None = None
+
+    # Image-baked sentinel: ``True`` only inside the shipped container image
+    # (the Dockerfile's runtime stage sets ``PLEX_MANAGER_IN_CONTAINER=1``).
+    # The startup setup-URL hint trusts the two published socket values above
+    # ONLY when this is set: outside a container no port mapping can exist, so
+    # copied compose-only ``host_bind``/``host_port`` values would print an
+    # unreachable link instead of the real in-process listener. (Mount-point
+    # probing was rejected as an alternative signal: a bare-metal media server
+    # can have real disks mounted at both conventional paths, while a
+    # ``docker run`` of this image WITHOUT the compose mounts still deserves
+    # its explicitly-provided values honored.) NOT an operator knob: never set
+    # this by hand, and it is deliberately absent from ``.env.example`` so a
+    # bare-metal install cannot copy it by accident. Defaults ``False``
+    # everywhere the image did not bake it.
+    in_container: bool = False
+
     # The app talks to SQLite asynchronously (aiosqlite). Alembic derives a sync
     # URL from this for migrations — see ``migrations/env.py``.
     database_url: str = "sqlite+aiosqlite:///./data/plex_manager.db"

@@ -289,6 +289,54 @@ async def test_capture_masks_issue_270_shape_grammar_gaps_via_value_pass(
     assert "sFAKESESSIONVALUE1234567890" not in message
 
 
+# --------------------------------------------------------------------------- #
+# issue #294, finding 2: the startup setup-URL hint's companion
+# ``_logger.info("Setup: %s", url)`` call (web/app.py's
+# ``_emit_setup_ready_hint``) carries the raw ``#setup_token=`` fragment. This
+# proves the value-based pass -- fed the setup token via issue #292 item 6 --
+# masks it at the real capture call site, exactly like the issue #270 proofs
+# above for the OTHER two settings-store-derived secrets.
+# --------------------------------------------------------------------------- #
+async def test_capture_masks_the_setup_token_in_the_printed_setup_url(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    handler.secret_values = frozenset({"fake-boot-setup-token-1234567890"})
+    test_logger.addHandler(handler)
+    test_logger.info(
+        "Setup: %s", "http://localhost:8000/setup#setup_token=fake-boot-setup-token-1234567890"
+    )
+    await asyncio.sleep(0)
+
+    message = handler.ring_buffer[-1].message
+    assert "fake-boot-setup-token-1234567890" not in message
+    assert "<redacted>" in message
+    # The path up to the fragment survives -- still diagnosable which install
+    # printed the hint, only the credential itself is gone.
+    assert "http://localhost:8000/setup#setup_token=" in message
+
+
+async def test_capture_masks_a_percent_encoded_setup_token_in_the_printed_setup_url(
+    test_logger: logging.Logger, handler: LogCaptureHandler
+) -> None:
+    """The URL embeds ``quote(token, safe='')`` -- a token containing a
+    reserved character therefore appears PERCENT-ENCODED in the log line, not
+    raw. The value-based pass's percent-encoded variant (``_secret_value_variants``)
+    must still catch it."""
+    raw_token = "fake/boot token+with reserved chars"  # noqa: S105
+    handler.secret_values = frozenset({raw_token})
+    test_logger.addHandler(handler)
+    test_logger.info(
+        "Setup: %s",
+        "http://localhost:8000/setup#setup_token=fake%2Fboot%20token%2Bwith%20reserved%20chars",
+    )
+    await asyncio.sleep(0)
+
+    message = handler.ring_buffer[-1].message
+    assert raw_token not in message
+    assert "fake%2Fboot%20token%2Bwith%20reserved%20chars" not in message
+    assert "<redacted>" in message
+
+
 async def test_exception_traceback_is_appended_to_the_message(
     test_logger: logging.Logger, handler: LogCaptureHandler
 ) -> None:
