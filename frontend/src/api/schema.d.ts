@@ -1425,6 +1425,8 @@ export interface components {
             items: components["schemas"]["DiscoverResult"][];
             /** Row Type */
             row_type: string;
+            /** Subtitle */
+            subtitle?: string | null;
             /** Title */
             title: string;
         };
@@ -2587,7 +2589,9 @@ export interface operations {
     };
     discover_home_api_v1_discover_home_get: {
         parameters: {
-            query?: never;
+            query?: {
+                load_id?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2601,6 +2605,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiscoverHomeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

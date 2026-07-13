@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useCreateRequest } from '../api/hooks'
 import type { CreateRequestBody, DiscoverResult } from '../api/types'
@@ -31,6 +31,107 @@ const SHOW: DiscoverResult = {
   library_state: 'requested',
 }
 
+const SET_WIDTH = 3_320
+const TRACK_SCROLL_WIDTH = SET_WIDTH * 3 - 16
+const TRACK_CLIENT_WIDTH = 1_000
+
+let measuredSetWidth = SET_WIDTH
+let reducedMotion = false
+let scrollBySpy: Mock
+let resizeObservers: ResizeObserverMock[] = []
+
+class ResizeObserverMock {
+  readonly observe = vi.fn()
+  readonly unobserve = vi.fn()
+  readonly disconnect = vi.fn()
+
+  constructor(private readonly callback: ResizeObserverCallback) {
+    resizeObservers.push(this)
+  }
+
+  trigger() {
+    this.callback([], this as unknown as ResizeObserver)
+  }
+}
+
+function installGeometryMocks() {
+  measuredSetWidth = SET_WIDTH
+  reducedMotion = false
+  resizeObservers = []
+  scrollBySpy = vi.fn()
+
+  Object.defineProperties(HTMLElement.prototype, {
+    scrollLeft: {
+      configurable: true,
+      writable: true,
+      value: 0,
+    },
+    offsetLeft: {
+      configurable: true,
+      get(this: HTMLElement) {
+        const copy = this.getAttribute('data-loop-copy-start')
+        return copy === null ? 0 : Number(copy) * measuredSetWidth
+      },
+    },
+    scrollWidth: {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.hasAttribute('data-row-track') ? TRACK_SCROLL_WIDTH : 0
+      },
+    },
+    clientWidth: {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.hasAttribute('data-row-track') ? TRACK_CLIENT_WIDTH : 0
+      },
+    },
+    scrollBy: {
+      configurable: true,
+      writable: true,
+      value: scrollBySpy,
+    },
+  })
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: vi.fn(
+      (query: string) =>
+        ({
+          matches: reducedMotion,
+          media: query,
+        }) as MediaQueryList,
+    ),
+  })
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    writable: true,
+    value: ResizeObserverMock,
+  })
+}
+
+function track(): HTMLDivElement {
+  const element = document.querySelector<HTMLDivElement>('[data-row-track]')
+  if (!element) throw new Error('Row track was not rendered')
+  return element
+}
+
+function loopTile(copyIndex: number, slotIndex: number): HTMLElement {
+  const element = document.querySelector<HTMLElement>(
+    `[data-loop-copy="${copyIndex}"][data-loop-slot="${slotIndex}"]`,
+  )
+  if (!element) throw new Error(`Loop tile ${copyIndex}:${slotIndex} was not rendered`)
+  return element
+}
+
+function item(index: number): DiscoverResult {
+  return {
+    media_type: index % 2 === 0 ? 'movie' : 'tv',
+    tmdb_id: 100 + index,
+    title: `Title ${index}`,
+    year: 2000 + index,
+    library_state: 'none',
+  }
+}
+
 function mutation(resolved: unknown = { id: 99 }) {
   return { mutateAsync: vi.fn().mockResolvedValue(resolved), isPending: false }
 }
@@ -38,6 +139,48 @@ function mutation(resolved: unknown = { id: 99 }) {
 function rejecting(error: unknown) {
   return { mutateAsync: vi.fn().mockRejectedValue(error), isPending: false }
 }
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  installGeometryMocks()
+  ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+})
+
+describe('Row subtitle', () => {
+  it('renders muted secondary copy without changing the heading or controls', () => {
+    render(
+      <Row
+        title="Because you requested Unbadged Movie"
+        subtitle="more horror"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => REQUESTED}
+      />,
+    )
+
+    expect(
+      screen.getByRole('heading', { name: 'Because you requested Unbadged Movie' }),
+    ).toBeInTheDocument()
+    expect(screen.getByText('more horror')).toHaveClass('text-muted')
+    expect(screen.getByRole('button', { name: 'Scroll left' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Scroll right' })).toBeInTheDocument()
+  })
+
+  it('omits the secondary node entirely when no subtitle is supplied', () => {
+    const { container } = render(
+      <Row
+        title="Home row"
+        items={[MOVIE]}
+        onSelect={() => {}}
+        tileState={() => REQUESTED}
+      />,
+    )
+
+    expect(screen.queryByText('more horror')).not.toBeInTheDocument()
+    expect(container.querySelectorAll('section p')).toHaveLength(0)
+    expect(screen.getByRole('heading', { name: 'Home row' })).toBeInTheDocument()
+  })
+})
 
 describe('Row quick-request action (issue #42)', () => {
   beforeEach(() => {
@@ -59,12 +202,14 @@ describe('Row quick-request action (issue #42)', () => {
       />,
     )
 
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    expect(within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     // SHOW is badged, so it gets no Request action of its own.
-    expect(screen.queryByRole('button', { name: 'Request Already Requested Show' })).not.toBeInTheDocument()
+    expect(
+      within(loopTile(1, 1)).queryByRole('button', { name: 'Request Already Requested Show' }),
+    ).not.toBeInTheDocument()
     // The badge on SHOW is now a TileStatusGlyph icon (issue #135), not a text
     // pill — it still carries the same label via an accessible `role="img"` name.
-    expect(screen.getByRole('img', { name: 'Requested' })).toBeInTheDocument()
+    expect(within(loopTile(1, 1)).getByRole('img', { name: 'Requested' })).toBeInTheDocument()
   })
 
   it('suppresses the Request action when quickRequestable vetoes, even for a null-state tile', () => {
@@ -84,7 +229,9 @@ describe('Row quick-request action (issue #42)', () => {
         quickRequestable={() => false}
       />,
     )
-    expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
+    expect(
+      within(loopTile(1, 0)).queryByRole('button', { name: REQUEST_MOVIE }),
+    ).not.toBeInTheDocument()
   })
 
   it('renders the Request action for a null-state tile that quickRequestable approves', () => {
@@ -98,7 +245,7 @@ describe('Row quick-request action (issue #42)', () => {
         quickRequestable={(item) => item.tmdb_id === MOVIE.tmdb_id}
       />,
     )
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    expect(within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
   })
 
   it('hides the action once the tile becomes badged', () => {
@@ -106,12 +253,13 @@ describe('Row quick-request action (issue #42)', () => {
     const { rerender } = render(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />,
     )
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    const movieTile = loopTile(1, 0)
+    expect(within(movieTile).getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
 
     rerender(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />,
     )
-    expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
+    expect(within(movieTile).queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
   it('hides the button and returns focus to the card on a successful request', async () => {
@@ -120,8 +268,9 @@ describe('Row quick-request action (issue #42)', () => {
     render(
       <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />,
     )
+    const movieTile = loopTile(1, 0)
 
-    fireEvent.click(screen.getByRole('button', { name: REQUEST_MOVIE }))
+    fireEvent.click(within(movieTile).getByRole('button', { name: REQUEST_MOVIE }))
 
     await waitFor(() => {
       expect(createMutation.mutateAsync).toHaveBeenCalledWith({
@@ -130,12 +279,12 @@ describe('Row quick-request action (issue #42)', () => {
       } satisfies CreateRequestBody)
     })
     await waitFor(() => {
-      expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
+      expect(within(movieTile).queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
     })
     // Focus was handed to the card's details trigger so a keyboard user isn't
     // dumped to <body> when the action unmounts.
     expect(
-      screen.getByRole('button', { name: 'View details for Unbadged Movie (2020)' }),
+      within(movieTile).getByRole('button', { name: 'View details for Unbadged Movie (2020)' }),
     ).toHaveFocus()
     expect(toastSpy).toHaveBeenCalledWith(
       expect.objectContaining({ intent: 'success', title: expect.stringContaining('Requested') }),
@@ -147,7 +296,7 @@ describe('Row quick-request action (issue #42)', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
 
-    const action = screen.getByRole('button', { name: REQUEST_MOVIE })
+    const action = within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })
     // The action is a DOM sibling of the card's details trigger, not nested inside
     // it, so there's no shared handler for a keyboard activation to reach —
     // activating the action must not open details.
@@ -163,8 +312,9 @@ describe('Row quick-request action (issue #42)', () => {
       rejecting({ code: 'upstream_error', message: 'An upstream service failed. Try again shortly.' }),
     )
     render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
+    const movieTile = loopTile(1, 0)
 
-    fireEvent.click(screen.getByRole('button', { name: REQUEST_MOVIE }))
+    fireEvent.click(within(movieTile).getByRole('button', { name: REQUEST_MOVIE }))
 
     await waitFor(() => {
       expect(toastSpy).toHaveBeenCalledWith(
@@ -177,7 +327,7 @@ describe('Row quick-request action (issue #42)', () => {
     // The button survives a failed request (no local "just requested" flip), and
     // clicking it — a DOM sibling of the card's details trigger, not nested inside
     // it — never fires the card's own onSelect.
-    expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
+    expect(within(movieTile).getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
     expect(onSelect).not.toHaveBeenCalled()
   })
 })
@@ -193,7 +343,7 @@ describe('Row quick-request hover-reveal affordance (issue #135)', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
 
-    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    const button = within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })
     // The old text pill ("Request") is gone — the accessible name now lives
     // entirely in aria-label, not in rendered text content.
     expect(button).toHaveTextContent('')
@@ -206,7 +356,7 @@ describe('Row quick-request hover-reveal affordance (issue #135)', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
 
-    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    const button = within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })
     expect(button).not.toHaveAttribute('hidden')
     expect(button.tabIndex).toBe(0)
     expect(button).toBeVisible() // jsdom's visibility check: opacity-0 still passes, `hidden` would not
@@ -229,8 +379,370 @@ describe('Row quick-request hover-reveal affordance (issue #135)', () => {
     ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
     render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
 
-    const button = screen.getByRole('button', { name: REQUEST_MOVIE })
+    const button = within(loopTile(1, 0)).getByRole('button', { name: REQUEST_MOVIE })
     button.focus()
     expect(button).toHaveFocus()
+  })
+})
+
+describe('Row looping track (issue #190)', () => {
+  it('pads a short source to 20 logical slots and preserves longer sources before tripling', () => {
+    const shortItems = [MOVIE, SHOW, item(2)]
+    const { rerender } = render(
+      <Row title="Home row" items={shortItems} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(60)
+    for (const copyIndex of [0, 1, 2]) {
+      expect(document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)).toHaveLength(20)
+    }
+    // Slot 4 is a padding REPEAT of SHOW (4 % 3 === 1) — its poster art is present
+    // for the loop runway, but as an aria-hidden clone it renders no focusable
+    // control of its own (its clicks delegate to the real item; see the clone suite).
+    const paddingRepeat = loopTile(1, 4)
+    expect(paddingRepeat).toHaveTextContent('Already Requested Show')
+    expect(paddingRepeat).toHaveAttribute('aria-hidden', 'true')
+    expect(paddingRepeat.querySelectorAll('button')).toHaveLength(0)
+    // The single real SHOW tile (first, un-padded occurrence) keeps its control.
+    expect(
+      within(loopTile(1, 1)).getByRole('button', {
+        name: 'View details for Already Requested Show (2019)',
+      }),
+    ).toBeInTheDocument()
+
+    const longerItems = Array.from({ length: 21 }, (_, index) => item(index))
+    rerender(
+      <Row title="Home row" items={longerItems} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(63)
+    for (const copyIndex of [0, 1, 2]) {
+      expect(document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)).toHaveLength(21)
+    }
+    expect(
+      within(loopTile(1, 20)).getByRole('button', { name: 'View details for Title 20 (2020)' }),
+    ).toBeInTheDocument()
+  })
+
+  it('keeps stable keys on an ordinary rerender and callbacks receive the current source item', () => {
+    const onSelect = vi.fn()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { rerender } = render(
+      <Row title="Home row" items={[MOVIE, SHOW]} onSelect={onSelect} tileState={() => REQUESTED} />,
+    )
+    const rowTrack = track()
+    rowTrack.scrollLeft = SET_WIDTH + 740
+
+    const updatedMovie = { ...MOVIE, title: 'Updated Movie' }
+    const updatedShow = { ...SHOW, title: 'Updated Show' }
+    rerender(
+      <Row
+        title="Home row"
+        items={[updatedMovie, updatedShow]}
+        onSelect={onSelect}
+        tileState={() => REQUESTED}
+      />,
+    )
+
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH + 740)
+    fireEvent.click(
+      within(loopTile(1, 1)).getByRole('button', {
+        name: 'View details for Updated Show (2019)',
+      }),
+    )
+    expect(onSelect).toHaveBeenCalledWith(updatedShow)
+    const keyWarnings = consoleError.mock.calls.filter(([message]) =>
+      String(message).includes('unique "key"'),
+    )
+    expect(keyWarnings).toHaveLength(0)
+    consoleError.mockRestore()
+  })
+
+  it('initializes at the marker-measured start of the middle copy and resets for new identities', () => {
+    const { rerender } = render(
+      <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    const rowTrack = track()
+
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH)
+    expect(resizeObservers).toHaveLength(1)
+    expect(resizeObservers[0]?.observe).toHaveBeenCalledWith(rowTrack)
+
+    rowTrack.scrollLeft = SET_WIDTH + 300
+    rerender(
+      <Row title="Home row" items={[SHOW]} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH)
+    expect(resizeObservers).toHaveLength(2)
+    expect(resizeObservers[0]?.disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('wraps native scrolling at either physical edge but leaves interior scrolling alone', () => {
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />)
+    const rowTrack = track()
+    const maxScroll = TRACK_SCROLL_WIDTH - TRACK_CLIENT_WIDTH
+    scrollBySpy.mockClear()
+
+    rowTrack.scrollLeft = SET_WIDTH + 500
+    fireEvent.scroll(rowTrack)
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH + 500)
+
+    rowTrack.scrollLeft = 4
+    fireEvent.scroll(rowTrack)
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH + 4)
+    // A browser may emit a follow-up event while touch/trackpad momentum is
+    // still settling. The content-identical jump must already be outside the
+    // threshold so that event cannot translate a second time.
+    fireEvent.scroll(rowTrack)
+    expect(rowTrack.scrollLeft).toBe(SET_WIDTH + 4)
+
+    rowTrack.scrollLeft = maxScroll - 4
+    fireEvent.scroll(rowTrack)
+    expect(rowTrack.scrollLeft).toBe(maxScroll - 4 - SET_WIDTH)
+    fireEvent.scroll(rowTrack)
+    expect(rowTrack.scrollLeft).toBe(maxScroll - 4 - SET_WIDTH)
+    expect(scrollBySpy).not.toHaveBeenCalled()
+    expect(rowTrack.className).not.toContain('scroll-smooth')
+    expect(document.querySelector('[data-row-end-fade]')).toBeInTheDocument()
+  })
+
+  it('keeps both chevrons enabled and creates runway before each 600px scroll', () => {
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />)
+    const rowTrack = track()
+    const left = screen.getByRole('button', { name: 'Scroll left' })
+    const right = screen.getByRole('button', { name: 'Scroll right' })
+    const maxScroll = TRACK_SCROLL_WIDTH - TRACK_CLIENT_WIDTH
+
+    expect(left).toBeEnabled()
+    expect(right).toBeEnabled()
+
+    rowTrack.scrollLeft = 604
+    fireEvent.click(left)
+    expect(rowTrack.scrollLeft).toBe(604 + SET_WIDTH)
+    expect(scrollBySpy).toHaveBeenLastCalledWith({ left: -600, behavior: 'smooth' })
+
+    scrollBySpy.mockClear()
+    rowTrack.scrollLeft = maxScroll - 604
+    fireEvent.click(right)
+    expect(rowTrack.scrollLeft).toBe(maxScroll - 604 - SET_WIDTH)
+    expect(scrollBySpy).toHaveBeenLastCalledWith({ left: 600, behavior: 'smooth' })
+  })
+
+  it('uses smooth chevron motion normally and auto behavior for reduced motion', () => {
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />)
+    const rowTrack = track()
+    rowTrack.scrollLeft = SET_WIDTH
+
+    fireEvent.click(screen.getByRole('button', { name: 'Scroll right' }))
+    expect(scrollBySpy).toHaveBeenLastCalledWith({ left: 600, behavior: 'smooth' })
+
+    reducedMotion = true
+    fireEvent.click(screen.getByRole('button', { name: 'Scroll left' }))
+    expect(scrollBySpy).toHaveBeenLastCalledWith({ left: -600, behavior: 'auto' })
+  })
+
+  it('preserves proportional position when markers resize, then normalizes away from an edge', () => {
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />)
+    const rowTrack = track()
+    const observer = resizeObservers[0]
+    if (!observer) throw new Error('ResizeObserver was not created')
+
+    rowTrack.scrollLeft = SET_WIDTH * 1.5
+    measuredSetWidth = 4_000
+    observer.trigger()
+    expect(rowTrack.scrollLeft).toBe(6_000)
+
+    rowTrack.scrollLeft = 4
+    measuredSetWidth = 5_000
+    observer.trigger()
+    expect(rowTrack.scrollLeft).toBe(5_005)
+  })
+
+  it('disconnects its observer and removes the native scroll listener on unmount', () => {
+    const { unmount } = render(
+      <Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    const rowTrack = track()
+    const removeEventListener = vi.spyOn(rowTrack, 'removeEventListener')
+    const observer = resizeObservers[0]
+    if (!observer) throw new Error('ResizeObserver was not created')
+
+    unmount()
+
+    expect(observer.disconnect).toHaveBeenCalledOnce()
+    expect(removeEventListener).toHaveBeenCalledWith('scroll', expect.any(Function))
+  })
+
+  it('keeps the eight-skeleton loading branch control-free and returns null when empty', () => {
+    const { container, rerender } = render(
+      <Row title="Home row" items={[]} loading onSelect={() => {}} />,
+    )
+
+    expect(container.querySelectorAll('.animate-pulse')).toHaveLength(8)
+    expect(screen.queryByRole('button', { name: 'Scroll left' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Scroll right' })).not.toBeInTheDocument()
+    expect(document.querySelector('[data-row-end-fade]')).not.toBeInTheDocument()
+
+    rerender(<Row title="Home row" items={[]} onSelect={() => {}} />)
+    expect(container).toBeEmptyDOMElement()
+  })
+})
+
+describe('Row loop-clone a11y contract and screen-reader honesty (issue #190)', () => {
+  const REQUEST_MOVIE = 'Request Unbadged Movie'
+
+  it('leaves only the middle copy of an already-long source in the tab order and a11y tree', () => {
+    // 21 unique items => no padding; each copy is a faithful 21-tile mirror.
+    const longItems = Array.from({ length: 21 }, (_, index) => item(index))
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={longItems} onSelect={() => {}} tileState={() => null} />)
+
+    // 63 tiles are rendered for the visual loop, but exactly the 21 real ones (the
+    // middle copy) are in the accessibility tree; mirror copies are aria-hidden
+    // and contain nothing focusable (no buttons at all — the delegated click
+    // lives on the untabbable wrapper).
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(63)
+    expect(document.querySelectorAll('[data-loop-real]')).toHaveLength(21)
+    for (const copyIndex of [0, 2]) {
+      for (const el of document.querySelectorAll(`[data-loop-copy="${copyIndex}"]`)) {
+        expect(el).toHaveAttribute('aria-hidden', 'true')
+        expect(el.querySelectorAll('button, [tabindex]')).toHaveLength(0)
+      }
+    }
+    for (const el of document.querySelectorAll('[data-loop-copy="1"]')) {
+      expect(el).not.toHaveAttribute('aria-hidden')
+    }
+
+    // Screen-reader honesty: one details button + one request action per real item,
+    // never one-per-clone. getAllByRole ignores aria-hidden subtrees.
+    expect(screen.getAllByRole('button', { name: /^View details for/ })).toHaveLength(21)
+    expect(screen.getAllByRole('button', { name: /^Request / })).toHaveLength(21)
+  })
+
+  it('announces a padded short source by its real item count, not the padded/cloned count', () => {
+    // 3 unique items padded to 20 logical slots, tripled to 60 tiles — yet a screen
+    // reader must hear three titles, once each.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row
+        title="Home row"
+        items={[MOVIE, SHOW, item(2)]}
+        onSelect={() => {}}
+        tileState={() => null}
+      />,
+    )
+
+    expect(document.querySelectorAll('[data-loop-copy]')).toHaveLength(60)
+    expect(document.querySelectorAll('[data-loop-real]')).toHaveLength(3)
+    // Exactly the three unique titles are reachable as details triggers.
+    const detailNames = screen
+      .getAllByRole('button', { name: /^View details for/ })
+      .map((el) => el.getAttribute('aria-label'))
+    expect(detailNames).toHaveLength(3)
+    expect(new Set(detailNames).size).toBe(3)
+    // And exactly the three request actions, one per real unbadged tile.
+    expect(screen.getAllByRole('button', { name: /^Request / })).toHaveLength(3)
+  })
+
+  it('offers the request action only from a real tile, and it targets the real source item', () => {
+    const createMutation = mutation({ id: 1 })
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    // The padded clone at copy 1, slot 1 carries no request control at all.
+    expect(loopTile(1, 1).querySelectorAll('button')).toHaveLength(0)
+    expect(loopTile(1, 1)).toHaveAttribute('aria-hidden', 'true')
+
+    // The lone reachable request action belongs to the real tile and POSTs the
+    // real item's identity — clones can never source a request.
+    const action = screen.getByRole('button', { name: REQUEST_MOVIE })
+    expect(action.closest('[data-loop-copy]')).toBe(loopTile(1, 0))
+    fireEvent.click(action)
+    expect(createMutation.mutateAsync).toHaveBeenCalledWith({
+      tmdb_id: MOVIE.tmdb_id,
+      media_type: MOVIE.media_type,
+    } satisfies CreateRequestBody)
+  })
+
+  it('opens details from a clicked clone, acting on the real source item (codex P2 round 1)', () => {
+    // A mirror-copy tile is exactly what the user sees after a wrap, and a padding
+    // repeat is visible immediately for a short row — both must respond to a click
+    // by opening the REAL item's details, not ignore it.
+    const onSelect = vi.fn()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(
+      <Row title="Home row" items={[MOVIE, SHOW]} onSelect={onSelect} tileState={() => null} />,
+    )
+
+    // Mirror copy (copy 0, slot 1 => SHOW).
+    fireEvent.click(loopTile(0, 1))
+    expect(onSelect).toHaveBeenLastCalledWith(SHOW)
+    // Padding repeat inside the real copy (slot 3 folds to source slot 1 => SHOW).
+    fireEvent.click(loopTile(1, 3))
+    expect(onSelect).toHaveBeenLastCalledWith(SHOW)
+    expect(onSelect).toHaveBeenCalledTimes(2)
+
+    // Before opening, the delegated handler hands focus to the REAL tile's details
+    // trigger so a modal opened from a clone returns focus somewhere sane on close
+    // (the real tile), never to <body> or an aria-hidden clone.
+    expect(
+      within(loopTile(1, 1)).getByRole('button', {
+        name: 'View details for Already Requested Show (2019)',
+      }),
+    ).toHaveFocus()
+  })
+
+  it('does not double-fire when the real tile itself is clicked', () => {
+    // The real tile's clicks are handled by its own native button; the delegated
+    // clone path only exists on aria-hidden wrappers. One click, one onSelect.
+    const onSelect = vi.fn()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={onSelect} tileState={() => null} />)
+
+    fireEvent.click(
+      within(loopTile(1, 0)).getByRole('button', {
+        name: 'View details for Unbadged Movie (2020)',
+      }),
+    )
+    expect(onSelect).toHaveBeenCalledTimes(1)
+    expect(onSelect).toHaveBeenCalledWith(MOVIE)
+  })
+
+  it('gives clones the same hover affordances as real tiles', () => {
+    // Codex round 1: a visible poster that looks interactive must feel interactive.
+    // Clones restore the pointer cursor and hover lift/ring that PosterCard only
+    // applies when it has an onClick of its own.
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    render(<Row title="Home row" items={[MOVIE]} onSelect={() => {}} tileState={() => null} />)
+
+    const cloneCard = loopTile(0, 0).querySelector('[data-poster-card]')
+    expect(cloneCard).not.toBeNull()
+    expect(cloneCard!.className).toContain('cursor-pointer')
+    expect(cloneCard!.className).toContain('hover:-translate-y-1')
+    expect(cloneCard!.className).toContain('hover:ring-white/15')
+  })
+
+  it('pads deterministically by modular repetition (no randomness, stable across renders)', () => {
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(mutation())
+    const source = [MOVIE, SHOW, item(2)]
+    const readSlotTitles = () =>
+      Array.from({ length: 20 }, (_, slotIndex) =>
+        loopTile(1, slotIndex).querySelector('.font-display')?.textContent,
+      )
+
+    const { rerender } = render(
+      <Row title="Home row" items={source} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    const firstPass = readSlotTitles()
+    // Each padded slot is source[slot % source.length] — pure, index-driven.
+    for (let slotIndex = 0; slotIndex < 20; slotIndex += 1) {
+      expect(firstPass[slotIndex]).toBe(source[slotIndex % source.length]!.title)
+    }
+
+    // Re-rendering the same source yields byte-identical padding (no Math.random).
+    rerender(
+      <Row title="Home row" items={source} onSelect={() => {}} tileState={() => REQUESTED} />,
+    )
+    expect(readSlotTitles()).toEqual(firstPass)
   })
 })

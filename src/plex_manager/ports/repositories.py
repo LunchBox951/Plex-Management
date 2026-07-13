@@ -315,6 +315,14 @@ class RequestRepository(Protocol):
         """List requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def list_personalization_history(self, user_id: int) -> list[RequestRecord]:
+        """List one user's non-cancelled, display-deduplicated request history.
+
+        The user predicate is applied by the persistence query. Ownerless and
+        other users' rows are never candidates, including for an administrator.
+        """
+        raise NotImplementedError
+
     async def list_due_for_search(
         self, statuses: frozenset[str], now: datetime
     ) -> list[RequestRecord]:
