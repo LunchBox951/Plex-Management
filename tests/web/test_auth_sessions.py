@@ -450,7 +450,7 @@ async def test_last_seen_refresh_failure_never_fails_auth() -> None:
     fake = _CommitFailsSession()
 
     result = await deps._maybe_refresh_last_seen(  # pyright: ignore[reportPrivateUsage]
-        cast("AsyncSession", fake), auth_session, datetime.now(UTC)
+        cast(AsyncSession, fake), auth_session, datetime.now(UTC)
     )
 
     # Never raised; reported the pre-refresh effective value; rolled the write back.
