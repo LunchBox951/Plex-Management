@@ -231,6 +231,14 @@ export function useUpdateSettings() {
       // (['discover','home']) and every queryKeys.discover(query, year) variant
       // (['discover', query, year]) with this one call (issue #14).
       void qc.invalidateQueries({ queryKey: ['discover'] })
+      // A save may have re-pointed a service, and the Settings page reads
+      // health with poll:false — so with the realtime stream disconnected
+      // nothing else would ever refresh its cards and they'd keep showing the
+      // OLD server's Connected/Down until a manual Validate (honesty gap;
+      // north star #3). The backend already busts the affected subsystem's
+      // probe cache on PUT /settings (issue #93), so this refetch re-probes
+      // the freshly saved credentials, not a stale snapshot.
+      void qc.invalidateQueries({ queryKey: queryKeys.opsHealth })
     },
   })
 }
