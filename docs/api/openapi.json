@@ -3525,7 +3525,7 @@
           "available_build": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
@@ -3537,7 +3537,7 @@
           "available_digest": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
@@ -3549,7 +3549,7 @@
           "current_build": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
@@ -3561,7 +3561,7 @@
           "current_digest": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
@@ -3585,7 +3585,7 @@
           "from_build": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
@@ -3629,7 +3629,7 @@
           "to_build": {
             "anyOf": [
               {
-                "maxLength": 255,
+                "maxLength": 400,
                 "type": "string"
               },
               {
