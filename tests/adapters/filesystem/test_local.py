@@ -1344,15 +1344,16 @@ def test_delete_traverses_execute_only_ancestors_like_pathname_unlink(
     target.write_bytes(b"x" * 100)
 
     fs = LocalFileSystem([os.fspath(root)])  # realpath'd while readable
-    # S103 suppressed deliberately: the execute-only mask IS the scenario under
-    # test, applied to a throwaway dir inside this test's private tmp_path.
-    os.chmod(locked, 0o111)  # noqa: S103 -- execute-only: search yes, read no
+    # Owner-only masks: 0o100 (owner execute-only, no read) is the scenario
+    # under test -- the walk runs as the owner, so owner-x alone proves
+    # search-only traversal, and is STRICTER than a world-execute mask.
+    os.chmod(locked, 0o100)  # execute-only: search yes, read no
     try:
         assert fs.delete_guard_refuses(os.fspath(target)) is False
         fs.delete(os.fspath(target))
         assert not target.exists()
     finally:
-        os.chmod(locked, 0o755)  # noqa: S103 -- restore so pytest can clean tmp_path
+        os.chmod(locked, 0o700)  # restore (owner-only) so pytest can clean tmp_path
 
 
 # --------------------------------------------------------------------------- #
