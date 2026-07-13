@@ -597,6 +597,59 @@ async def test_events_stream_closes_when_its_browser_session_logs_out(
     await _wait_subscribers_zero(app)
 
 
+async def _recovery_session(
+    sessionmaker_: SessionMaker, *, tag: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Mint a recovery/break-glass session (``user_id IS NULL``) and return
+    ``(cookies, CSRF headers)`` — the cookie a valid ``X-Api-Key`` exchange yields
+    (``POST /auth/api-key``), an admin session with NO Plex identity."""
+    token = f"events-recovery-{tag}"
+    csrf = f"events-recovery-csrf-{tag}"
+    async with sessionmaker_() as session:
+        session.add(
+            AuthSession(
+                user_id=None,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    cookies = {SESSION_COOKIE_NAME: token, CSRF_COOKIE_NAME: csrf}
+    return cookies, {CSRF_HEADER_NAME: csrf}
+
+
+async def test_events_stream_closes_when_its_recovery_session_logs_out(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A recovery-cookie session (``user_id IS NULL``) has an open SSE stream;
+    logging it out must proactively close that stream rather than leaving it to
+    reconnect/expiry (issue #293 finding 1). The subscription reports ``api_key``
+    auth (no Plex identity), so logout closes it by that credential filter."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _recovery_session(sessionmaker_, tag="logout-stream")
+
+    async with _AsgiStream(app, _cookie_headers(cookies)) as stream:
+        assert stream.status == 200
+        _ = await stream.next_frame()  # sync
+
+        subscriptions = tuple(get_event_hub(app)._subscribers)  # pyright: ignore[reportPrivateUsage]
+        assert len(subscriptions) == 1
+        assert subscriptions[0].auth_method == AuthMethod.api_key.value
+        assert subscriptions[0].user_id is None
+
+        client.cookies.update(cookies)
+        logout = await client.post("/api/v1/auth/logout", headers=csrf)
+        assert logout.status_code == 204
+
+        await stream.expect_body_end()
+
+    await _wait_subscribers_zero(app)
+
+
 async def test_events_stream_closes_via_close_all_helper(
     app: FastAPI,
     seed: SeedFn,

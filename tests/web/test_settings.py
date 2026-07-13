@@ -3428,6 +3428,135 @@ async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
         assert system.app_api_key == new_key
 
 
+async def _recovery_session_cookies(
+    app: FastAPI, *, tag: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Mint a live recovery/break-glass session (``AuthSession.user_id IS NULL``).
+
+    The cookie a valid ``X-Api-Key`` exchange yields (``POST /auth/api-key``): an
+    admin-authority session with NO Plex identity. Returns ``(cookies, csrf)`` in
+    the same shape as :func:`_admin_session_cookies`.
+    """
+    token = f"recovery-session-{tag}"
+    csrf = f"recovery-csrf-{tag}"
+    async with app.state.sessionmaker() as session:
+        session.add(
+            AuthSession(
+                user_id=None,
+                token_hash=hash_session_token(token),
+                expires_at=datetime.now(UTC) + timedelta(days=1),
+                last_seen_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    return {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
+
+
+async def _recovery_session_states(sessionmaker_: SessionMaker) -> list[bool]:
+    """Return, for every recovery session (``user_id IS NULL``), whether it is
+    revoked (``revoked_at is not None``)."""
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(AuthSession).where(AuthSession.user_id.is_(None))))
+            .scalars()
+            .all()
+        )
+    return [row.revoked_at is not None for row in rows]
+
+
+async def test_rotate_app_key_via_recovery_cookie_succeeds(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A break-glass admin signed in through the recovery-key exchange can ROTATE
+    the very key they used (issue #293 finding 3).
+
+    The recovery session reports ``AuthMethod.api_key`` but, being a cookie
+    credential, sends no ``X-Api-Key`` header. The pre-fix CAS sourced ``observed``
+    from that absent header whenever ``auth.method is api_key``, so it compared the
+    stored key against ``None`` and ALWAYS 409'd — a break-glass admin could never
+    manage the key from the browser (a north-star-#1 violation). The fixed CAS
+    treats a header-less recovery session like a session caller.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _recovery_session_cookies(app, tag="rotate")
+
+    rotate = await client.post("/api/v1/settings/app-key/rotate", cookies=cookies, headers=csrf)
+
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key != _API_KEY
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key == new_key
+
+
+async def test_revoke_app_key_via_recovery_cookie_succeeds(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A break-glass admin can also REVOKE the key they signed in with (finding 3):
+    the same header-less-recovery CAS path, on the delete endpoint."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, csrf = await _recovery_session_cookies(app, tag="revoke")
+
+    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+
+    assert revoke.status_code == 204
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        assert system is not None
+        assert system.app_api_key is None
+
+
+async def test_rotate_app_key_revokes_active_recovery_sessions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Rotating the app key invalidates every live recovery-cookie session (issue
+    #293 finding 4): a break-glass cookie must not outlive the key it was minted
+    from. Rotated here by a DIRECT ``X-Api-Key`` caller so the recovery session
+    under test is a bystander, not the rotator."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _recovery_session_cookies(app, tag="bystander")
+    assert await _recovery_session_states(sessionmaker_) == [False]
+
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    assert rotate.status_code == 200
+
+    # The recovery session was revoked alongside the key change.
+    assert await _recovery_session_states(sessionmaker_) == [True]
+
+
+async def test_revoke_app_key_revokes_active_recovery_sessions(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Revoking the app key invalidates every live recovery-cookie session (finding
+    4): with the key gone, the break-glass cookie must lose admin access too — the
+    same immediate lockout a direct ``X-Api-Key`` caller already gets."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    cookies, _csrf = await _recovery_session_cookies(app, tag="revoked-bystander")
+    assert await _recovery_session_states(sessionmaker_) == [False]
+
+    revoke = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+    assert revoke.status_code == 204
+
+    assert await _recovery_session_states(sessionmaker_) == [True]
+    # The revoked recovery cookie no longer authenticates a later request.
+    later = await client.get("/api/v1/settings", cookies=cookies)
+    assert later.status_code == 401
+
+
 # --------------------------------------------------------------------------- #
 # Opt-in recovery key — status / generate-from-null / revoke (keyless setup)
 # --------------------------------------------------------------------------- #

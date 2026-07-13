@@ -133,6 +133,7 @@ __all__ = [
     "DiskPressurePercents",
     "ServiceNotConfiguredError",
     "SettingsStore",
+    "api_key_header",
     "api_key_matches",
     "authenticate_request",
     "configured_setup_token",
@@ -215,6 +216,13 @@ CSRF_HEADER_NAME = "X-CSRF-Token"
 # ``auto_error=False``: we do the rejection ourselves so the failure detail stays
 # the stable ``invalid_api_key`` (and so the pre-init paths can stay open).
 _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+# Public alias so routers OUTSIDE this module (the recovery-key exchange endpoint,
+# ``POST /api/v1/auth/api-key``) can source the header through the SAME
+# ``APIKeyHeader`` dependency rather than a raw ``Request.headers.get`` — so the
+# security scheme + per-route requirement land in the exported OpenAPI (issue #293
+# finding 5). Reusing the one instance keeps a single ``X-Api-Key`` scheme in the
+# document instead of minting a duplicate.
+api_key_header = _api_key_header
 
 
 class AuthMethod(StrEnum):

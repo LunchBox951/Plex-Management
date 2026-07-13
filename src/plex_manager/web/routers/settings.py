@@ -32,7 +32,7 @@ from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.adapters.service_url import same_service_base
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
-from plex_manager.models import AuthSession, User
+from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibraryPort
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
@@ -195,6 +195,47 @@ _rotate_lock = asyncio.Lock()
 # with a database-level version/CAS or advisory lock spanning the same critical
 # section; an in-process lock alone would not coordinate separate workers.
 _settings_update_lock = asyncio.Lock()
+
+
+def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:
+    """The key value THIS request proved it held at auth time — the CAS baseline.
+
+    A HEADER-authenticated ``X-Api-Key`` caller proved the exact header value, so
+    that is its baseline. Every OTHER admin observed only the stored value their
+    request session loaded at auth time: a Plex-session admin (no key at all), AND
+    — the issue #293 finding 3 fix — a cookie-based recovery/break-glass admin.
+
+    A recovery session reports ``AuthMethod.api_key`` (it carries the recovery
+    key's admin authority) yet, being a COOKIE credential, sends no ``X-Api-Key``
+    header. Sourcing the baseline from the (absent) header for that admin made the
+    CAS compare the stored key against ``None`` and ALWAYS 409, so a break-glass
+    admin could never rotate or revoke the very key they signed in with from the
+    browser — a north-star-#1 (never require a terminal) violation. Keying off the
+    header's PRESENCE (not merely ``auth.method``) is the reliable discriminator:
+    only a genuine header caller has one to compare against.
+    """
+    header = request.headers.get(API_KEY_HEADER_NAME)
+    if auth.method is AuthMethod.api_key and header is not None:
+        return header
+    return system.app_api_key
+
+
+async def _revoke_recovery_sessions(session: AsyncSession) -> None:
+    """Revoke every live recovery-cookie session (``AuthSession.user_id IS NULL``).
+
+    When the underlying app key is rotated or revoked, a still-open recovery
+    session minted by exchanging that key (``POST /auth/api-key``) must lose its
+    authority too (issue #293 finding 4) — otherwise a break-glass cookie keeps
+    admin access after the key it was born from is gone, contradicting the
+    revoke/rotate semantics a direct ``X-Api-Key`` caller already gets (its next
+    request 401s immediately). Staged in the caller's transaction; the caller's
+    own ``commit`` persists it alongside the key change.
+    """
+    await session.execute(
+        update(AuthSession)
+        .where(AuthSession.user_id.is_(None), AuthSession.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(UTC))
+    )
 
 
 # The default each boolean key degrades to on an unrecognized stored value --
@@ -600,11 +641,7 @@ async def rotate_app_key_endpoint(
             # pulled this row into the identity map, and ``ensure_system_settings``
             # returned that same cached instance — a concurrent commit does not
             # update it).
-            observed = (
-                request.headers.get(API_KEY_HEADER_NAME)
-                if auth.method is AuthMethod.api_key
-                else system.app_api_key
-            )
+            observed = _observed_app_key(request, auth, system)
             # Force a fresh read (in the same transaction as the write below, and
             # under _rotate_lock so no other rotation can commit between this read
             # and our own commit) so the CAS reflects any rotation that committed
@@ -630,6 +667,10 @@ async def rotate_app_key_endpoint(
                 raise HTTPException(status_code=409, detail="app_key_changed")
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         system.app_api_key = new_key
+        # Invalidate any recovery-cookie session born from the OLD key (finding 4):
+        # its authority ends with the key it was minted from. Staged in this same
+        # transaction so it commits atomically with the new key.
+        await _revoke_recovery_sessions(session)
         await session.commit()
     close_realtime_streams(
         request.app,
@@ -674,17 +715,17 @@ async def revoke_app_key_endpoint(
             # header; session callers observed the value their request session
             # loaded at auth time (a concurrent commit does not update that cached
             # instance).
-            observed = (
-                request.headers.get(API_KEY_HEADER_NAME)
-                if auth.method is AuthMethod.api_key
-                else system.app_api_key
-            )
+            observed = _observed_app_key(request, auth, system)
             # Force a fresh read in this transaction, under _rotate_lock, so the CAS
             # reflects any rotation that committed while this revoke was in flight.
             await session.refresh(system)
             if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
                 raise HTTPException(status_code=409, detail="app_key_changed")
         system.app_api_key = None
+        # Invalidate any recovery-cookie session (finding 4): with the key gone,
+        # a break-glass cookie must not keep admin access — the same immediate
+        # lockout a direct ``X-Api-Key`` caller gets. Atomic with the key clear.
+        await _revoke_recovery_sessions(session)
         await session.commit()
     close_realtime_streams(
         request.app,

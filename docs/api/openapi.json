@@ -4059,6 +4059,15 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
         "summary": "Exchange Api Key Endpoint",
         "tags": [
           "auth"

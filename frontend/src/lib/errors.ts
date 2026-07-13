@@ -11,6 +11,7 @@ const DETAIL_MESSAGES: Record<string, string> = {
   // --- request/download pipeline (pre-existing) ---
   setup_required: 'Finish first-run setup to continue.',
   invalid_api_key: 'Your access key is no longer valid. Re-run setup.',
+  recovery_key_rejected: 'That access key was rejected. Double-check it and try again.',
   invalid_setup_token: 'Enter the setup token from your server environment.',
   indexer_unavailable: 'The indexer (Prowlarr) is unavailable right now. Try again shortly.',
   indexer_rate_limited: 'The indexer is rate-limiting requests. Try again shortly.',
