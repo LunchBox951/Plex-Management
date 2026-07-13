@@ -339,8 +339,15 @@ def remap_download_content(
     the bind source), so only the ``save_path`` prefix may be remapped, never the
     file below it -- and the winning interpretation must carry PROOF:
 
-    1. return ``content`` unchanged when it already exists here (the
-       same-namespace fast path -- no remap happened, so no proof is needed);
+    1. return ``content`` unchanged ONLY when it already exists here AND
+       genuinely sits under a live download mount (:func:`content_is_mounted`) --
+       the same-namespace fast path, where no remap happened so no proof is
+       needed. A ``content`` that EXISTS but lies OUTSIDE every live mount can be
+       a host-shaped PHANTOM (the old importer ``os.makedirs``-ed such trees), so
+       it does NOT short-circuit here: the proof-gated remap (step 2) runs first,
+       letting the real mounted file win over the stale twin (issue #290, finding
+       #2). With NO live mount (bare metal / no host-container split) there is no
+       phantom hazard, so a verbatim existing path stands as-is;
     2. otherwise remap the torrent's ``save_path`` ONCE to a container-visible
        download directory -- its DEEPEST existing suffix under a live mount (a
        real category dir like ``/downloads/movies`` always wins over the mount
@@ -350,12 +357,28 @@ def remap_download_content(
        :func:`_proves_content`: the torrent's own file list (relative path +
        exact size, from the download client) must be exhibited at the candidate
        location. No proof -> ``None`` (an honest, retryable "not visible /
-       content mismatch" block), NEVER an existence-only guess.
+       content mismatch" block), NEVER an existence-only guess. This gate is
+       SHARED with the import path, so it also tightens imports: when a save-dir
+       suffix resolves under a live mount but cannot be proven, an outside-mount
+       ``content`` fails CLOSED here rather than importing verbatim -- even if a
+       same-named mounted category dir merely collides without holding this
+       torrent's file (a legitimate extra-volume import in that specific
+       multi-root topology becomes an honest, retryable block);
+    3. a genuinely-EXISTING verbatim ``content`` is returned only as a LAST
+       resort, when NO mounted candidate was resolvable at all -- no existing
+       save-dir suffix under a live mount, no proven bind-root, and either no
+       ``save_path`` (a crash-resume breadcrumb) or ``content`` not strictly under
+       it. An operator's legitimate EXTRA volume at a custom path lands here. This
+       is deliberately NOT reached when a save-dir suffix DID resolve but its
+       proof failed (step 2 returns ``None`` there): a resolvable-yet-unproven
+       mounted candidate fails CLOSED, never falling back to the outside-mount
+       verbatim path.
 
     Without a ``save_path`` anchor (a stored crash-resume breadcrumb, or a client
     status that carried no save path) there is nothing to anchor to, so ONLY the
-    verbatim ``content`` counts (step 1) -- a free suffix search would reintroduce
-    exactly the stale-match hazard, so it is deliberately not attempted.
+    verbatim ``content`` counts (steps 1/3) -- a free suffix search would
+    reintroduce exactly the stale-match hazard, so it is deliberately not
+    attempted.
 
     Download mounts only (never the library mounts): a completed torrent and an
     old library file can share a basename, and content must never place from

@@ -424,6 +424,47 @@ def test_download_content_verbatim_when_outside_mount_but_no_mounted_candidate(
     ) == str(extra)
 
 
+def test_download_content_fails_closed_when_colliding_mounted_subdir_lacks_the_file(
+    tmp_path: Path,
+) -> None:
+    # Finding #1 (the disclosed narrowing of the SHARED import path, pinned): the
+    # legitimate operator EXTRA-volume case COLLIDES with a same-named mounted
+    # category subdir. ``content`` exists OUTSIDE every live mount, but the
+    # save_path's trailing component (``movies``) ALSO resolves to a real
+    # ``<mount>/movies`` dir under the live mount -- one that does NOT hold this
+    # torrent's file. The old unconditional verbatim fast path would import the
+    # outside-mount file; now the mounted save-dir suffix resolves, its proof
+    # FAILS (the file is absent there), and the function fails CLOSED to None (an
+    # honest, retryable "not visible / content mismatch") rather than the verbatim
+    # extra-volume path. This is intended: fail-CLOSED over an unproven guess, per
+    # the north stars. Contrast test_..._verbatim_when_outside_mount_but_no_mounted
+    # _candidate, where NO colliding subdir exists and the verbatim path IS kept.
+    mount = tmp_path / "dl"
+    (mount / "movies").mkdir(parents=True)  # colliding category dir, WITHOUT the file
+    extra = tmp_path / "extra_volume" / "movies" / "Foo.mkv"  # the real file, outside
+    extra.parent.mkdir(parents=True)
+    extra.write_bytes(b"x")
+    assert (
+        remap_download_content(
+            str(extra),
+            str(extra.parent),  # ".../extra_volume/movies" -> suffix "movies" collides
+            [("Foo.mkv", 1)],
+            candidate_mounts=(str(mount),),
+        )
+        is None
+    )
+    # Sanity: with the colliding subdir ALSO holding the torrent's file, the same
+    # inputs resolve to the MOUNTED file (the phantom-preference path), proving the
+    # None above is the failed-proof block, not an unrelated mismatch.
+    (mount / "movies" / "Foo.mkv").write_bytes(b"x")
+    assert remap_download_content(
+        str(extra),
+        str(extra.parent),
+        [("Foo.mkv", 1)],
+        candidate_mounts=(str(mount),),
+    ) == str(mount / "movies" / "Foo.mkv")
+
+
 def test_content_is_mounted_distinguishes_mounted_from_phantom(tmp_path: Path) -> None:
     mount = tmp_path / "dl"
     mount.mkdir()
