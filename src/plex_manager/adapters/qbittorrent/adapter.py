@@ -63,6 +63,7 @@ from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 import anyio.to_thread
 import httpcore
 import httpx
+import idna
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.domain.failure_classification import ENVIRONMENTAL_FAILURE_PATTERNS
@@ -638,6 +639,15 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
     (``ServiceUrl.parse`` already stores the configured base in IDNA form),
     and plain ASCII hosts are merely lowercased — preserving the pre-existing
     case-insensitive host match.
+
+    The ``.lower()`` on the encoded host exists for IP literals: httpx
+    lowercases registered names itself but PRESERVES hex-letter case in an
+    IPv6 literal (``[FE80::1]`` stays ``FE80::1``), so without it a trusted
+    origin configured in one case would deny its own downloadUrls written in
+    the other — failing CLOSED on legitimate fetches. Post-encoding the host
+    is pure ASCII (reg-names already IDNA/punycode), where lowercasing is
+    both IDNA-correct and DNS/IP-semantics-preserving; it cannot reintroduce
+    the Unicode-casefold hole, which exists only in PRE-encoding comparisons.
     """
     try:
         parsed = urlparse(url)
@@ -647,9 +657,13 @@ def _source_origin_triple(url: str) -> tuple[str, str, int] | None:
         port = parsed.port
     except ValueError:
         return None
+    # ``idna.IDNAError`` (a UnicodeError sibling of UnicodeDecodeError, NOT an
+    # httpx.InvalidURL) escapes some httpx URL operations raw -- e.g. a
+    # malformed A-label like ``xn--`` fails idna-decoding in httpx internals.
+    # Nothing trustable either way: the veto stays fully closed.
     try:
-        host = httpx.URL(url).raw_host.decode("ascii")
-    except (httpx.InvalidURL, UnicodeDecodeError):
+        host = httpx.URL(url).raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, idna.IDNAError, UnicodeDecodeError):
         return None
     if not host:
         return None
@@ -822,9 +836,10 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         for the NEXT ``connect_tcp`` call -- and only if that call's actual
         host+port equals ``host_port`` exactly. ``host_port`` must be the
         connect-time identity: the trusted origin's host in the same
-        ASCII/IDNA form httpx hands the transport (``_source_origin_triple``
-        produces exactly that form). See the class docstring for why
-        ``connect_tcp`` can't make this decision on its own."""
+        ASCII/IDNA form httpx hands the transport, lowercased
+        (``_source_origin_triple`` produces exactly that form). See the class
+        docstring for why ``connect_tcp`` can't make this decision on its
+        own."""
         self._hop_trust = host_port
 
     async def connect_tcp(
@@ -843,8 +858,12 @@ class SafeFetchNetworkBackend(httpcore.AsyncNetworkBackend):
         # the granted one -- a URL whose host merely compared equal under some
         # looser equivalence (e.g. a Unicode casefold alias that IDNA-encodes
         # to a different registrable host) connects to a different host and
-        # must keep the full veto.
-        trusted = granted is not None and (host, port) == granted
+        # must keep the full veto. ``host`` is lowercased for the comparison
+        # because httpx preserves hex-letter case in IPv6 literals
+        # (``[FE80::1]`` connects as ``FE80::1``) while the grant is stored
+        # lowercase (``_source_origin_triple``); post-encoding ASCII
+        # lowercasing is IDNA/DNS/IP-correct and cannot widen the grant.
+        trusted = granted is not None and (host.lower(), port) == granted
         try:
             addresses = await _safe_fetch_addresses_async(host, port, allow_blocked=trusted)
         except QbittorrentError as exc:
@@ -1331,18 +1350,21 @@ class QbittorrentClient:
                         if body[:1] == b"d":
                             return None, body
                     break
-            except httpx.InvalidURL as exc:
+            except (httpx.InvalidURL, idna.IDNAError) as exc:
                 # A source URL that urlparse accepts but httpx rejects while
-                # BUILDING the request (an IPvFuture literal like
-                # ``http://[v1.fe80::]/``, an invalid-IDNA host, ...). The
-                # shape-only pre-check on the real network path deliberately
-                # no longer resolves the hostname (issue #38), so these now
-                # surface here instead of at resolve time -- and
-                # ``httpx.InvalidURL`` inherits from ``Exception`` directly,
-                # NOT ``httpx.RequestError``, so without this catch an
+                # BUILDING the request. Two distinct escape routes, neither a
+                # ``httpx.RequestError`` subclass, so without this catch an
                 # attacker-suppliable indexer URL would escape the adapter's
                 # source-error taxonomy and 500 the manual grab / abort the
-                # auto-grab cycle instead of being a 422 release problem.
+                # auto-grab cycle instead of being a 422 release problem:
+                # ``httpx.InvalidURL`` (Exception directly) from URL parsing
+                # -- e.g. an IPvFuture literal like ``http://[v1.fe80::]/`` --
+                # and raw ``idna.IDNAError`` (a UnicodeError) leaking out of
+                # ``httpx.URL.host``'s idna-decode during Host-header
+                # preparation for a malformed A-label like ``http://xn--/``.
+                # The shape-only pre-check on the real network path
+                # deliberately no longer resolves the hostname (issue #38), so
+                # these now surface here instead of at resolve time.
                 raise QbittorrentSourceError("unsupported torrent source URL") from exc
             except httpx.RequestError as exc:
                 # Indexer/Prowlarr download_url unreachable (DNS / refused / timeout):

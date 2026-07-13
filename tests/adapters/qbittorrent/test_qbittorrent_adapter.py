@@ -1204,6 +1204,34 @@ def test_unicode_casefold_alias_of_trusted_host_is_not_trusted() -> None:
     )
 
 
+def test_ipv6_trusted_origin_hex_case_is_insensitive() -> None:
+    """httpx lowercases registered names but PRESERVES hex-letter case in
+    IPv6 literals (``[FE80::1]`` stays ``FE80::1`` in ``raw_host``), so the
+    httpx-encoder-based origin match must lowercase the encoded host itself
+    -- otherwise a trusted origin configured in one case would deny its own
+    downloadUrls written in the other, failing CLOSED on legitimate fetches
+    that the old casefold match allowed. Case-insensitivity here is safe:
+    post-encoding hosts are pure ASCII, where lowercasing cannot create the
+    Unicode-casefold alias problem."""
+    client = _client(trusted_source_origin="http://[FE80::1]:9696/prowlarr")
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[fe80::1]:9696/prowlarr/1/download"
+    )
+    assert client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[FE80::1]:9696/prowlarr/1/download"
+    )
+    # A different address is still a different origin, whatever the case.
+    assert not client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[fe80::2]:9696/prowlarr/1/download"
+    )
+
+    # Symmetric: a lowercase-configured origin trusts the uppercase spelling.
+    lower_client = _client(trusted_source_origin="http://[fe80::1]:9696/prowlarr")
+    assert lower_client._is_trusted_source_url(  # pyright: ignore[reportPrivateUsage]
+        "http://[FE80::1]:9696/prowlarr/1/download"
+    )
+
+
 class _RecordingBackend(httpcore.AsyncNetworkBackend):
     def __init__(self) -> None:
         self.hosts: list[str] = []
@@ -1806,19 +1834,29 @@ async def test_unicode_casefold_alias_over_real_network_path_keeps_full_veto(
     assert trusted_backend.hosts == ["127.0.0.1"]
 
 
-async def test_httpx_rejected_source_url_stays_in_source_error_taxonomy(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("url_host", ["[fe80::1]", "[FE80::1]"])
+async def test_ipv6_trusted_origin_fetches_in_either_hex_case_over_real_path(
+    monkeypatch: pytest.MonkeyPatch, url_host: str
 ) -> None:
-    """A source URL that ``urlparse`` accepts (so the real path's shape-only
-    pre-check passes) but httpx rejects while building the request -- e.g. an
-    IPvFuture literal -- raises ``httpx.InvalidURL``, which inherits from
-    ``Exception`` directly, NOT ``httpx.RequestError``. It must be converted
-    to the SourceError subtype (a 422 release problem), never escape the
-    adapter taxonomy as a raw exception that 500s the manual grab and aborts
-    the auto-grab cycle. Before issue #38's shape-only pre-check, the full
-    per-hop DNS resolve caught these at resolve time; the real path no longer
-    resolves there, so the conversion has to happen at the fetch."""
-    backend = _ScriptedBackend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    """End-to-end mirror of the IPv6 hex-case unit test over the REAL network
+    path: a trusted origin configured as ``[FE80::1]`` must fetch its own
+    downloadUrls written in either case. The lowercase-URL case exercises the
+    URL-level origin match; the uppercase-URL case additionally exercises the
+    connect-time grant comparison (httpx hands ``connect_tcp`` the
+    case-preserved ``FE80::1`` while the grant is stored lowercase)."""
+
+    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1", 9696, 0, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    torrent_response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: "
+        + str(len(_TORRENT_BYTES)).encode()
+        + b"\r\n\r\n"
+        + _TORRENT_BYTES
+    )
+    backend = _ScriptedBackend(torrent_response)
     monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
 
     client = QbittorrentClient(
@@ -1826,10 +1864,58 @@ async def test_httpx_rejected_source_url_stays_in_source_error_taxonomy(
         BASE_URL,
         USERNAME,
         PASSWORD,
+        trusted_source_origin="http://[FE80::1]:9696/prowlarr",
+    )
+
+    result = await client.add(
+        f"http://{url_host}:9696/prowlarr/1/download", "/downloads", "plex-manager"
+    )
+    assert result.torrent_hash == _TORRENT_HASH
+    assert backend.hosts == ["fe80::1"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # IPvFuture literal: urlparse accepts it, httpx.URL raises InvalidURL
+        # (which inherits from Exception directly, not RequestError).
+        "http://[v1.fe80::]/file.torrent",
+        # Malformed A-label: urlparse AND httpx.URL both accept it, but the
+        # idna-decode in httpx.URL.host (Host-header preparation inside
+        # client.stream's build_request) raises raw idna.IDNAError -- a
+        # UnicodeError, also not a RequestError.
+        "http://xn--/file.torrent",
+    ],
+)
+async def test_httpx_rejected_source_url_stays_in_source_error_taxonomy(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """A source URL that ``urlparse`` accepts (so the real path's shape-only
+    pre-check passes) but httpx rejects while building the request must be
+    converted to the SourceError subtype (a 422 release problem), never
+    escape the adapter taxonomy as a raw exception that 500s the manual grab
+    and aborts the auto-grab cycle. Neither escape route is an
+    ``httpx.RequestError`` -- see the parametrize cases. Before issue #38's
+    shape-only pre-check, the full per-hop DNS resolve caught these at
+    resolve time; the real path no longer resolves there, so the conversion
+    has to happen at the fetch."""
+    backend = _ScriptedBackend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+
+    # A configured trusted origin routes the malformed URL through the full
+    # per-hop trust check first (_is_trusted_source_url ->
+    # _source_origin_triple's own httpx.URL call), exercising BOTH boundaries
+    # where an idna/httpx URL failure could surface.
+    client = QbittorrentClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(_router())),
+        BASE_URL,
+        USERNAME,
+        PASSWORD,
+        trusted_source_origin=PROWLARR_ORIGIN,
     )
 
     with pytest.raises(QbittorrentSourceError, match="unsupported torrent source URL"):
-        await client.add("http://[v1.fe80::]/file.torrent", "/downloads", "plex-manager")
+        await client.add(url, "/downloads", "plex-manager")
 
     # Rejected while building the request: nothing was ever connected.
     assert backend.hosts == []
