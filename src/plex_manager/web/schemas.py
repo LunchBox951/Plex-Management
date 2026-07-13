@@ -13,7 +13,9 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
+from plex_manager.models import DownloadScopeStatus, RequestStatus
 from plex_manager.web.settings_bounds import (
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
@@ -861,7 +863,7 @@ class SeasonStatus(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     season_number: int
-    status: str
+    status: RequestStatus
     installed_quality_id: int | None = None
     installed_profile_index: int | None = None
     # Episode-level fallback progress (ADR-0020, issue #178): "N/M episodes"
@@ -884,7 +886,7 @@ class RequestResponse(BaseModel):
     tmdb_id: int
     media_type: str
     title: str
-    status: str
+    status: RequestStatus
     year: int | None = None
     is_anime: bool = False
     poster_url: str | None = None
@@ -1010,7 +1012,7 @@ class QueueScope(BaseModel):
     media_request_id: int | None = None
     season: int | None = None
     episodes: list[int] | None = None
-    status: str = "active"
+    status: DownloadScopeStatus = DownloadScopeStatus.active
 
 
 def _empty_queue_scopes() -> list[QueueScope]:
@@ -1024,7 +1026,7 @@ class QueueItem(BaseModel):
 
     id: int
     torrent_hash: str
-    status: str
+    status: DownloadState
     progress: float = 0.0
     seed_ratio: float = 0.0
     media_request_id: int | None = None

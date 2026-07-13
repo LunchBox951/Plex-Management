@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useImportDownload, useMarkFailed, useQueue, useRelocateDownload } from '../api/hooks'
-import type { QueueItem } from '../api/types'
+import type { DownloadStateValue, QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
 import { downloadStatus, INTENT_CLASSES } from '../lib/status'
 import type { ApiError } from '../lib/errors'
@@ -31,6 +31,40 @@ const PATH_NOT_VISIBLE_REASON_PREFIX = 'download path not visible inside the con
  * relocate endpoint can act on (see {@link PATH_NOT_VISIBLE_REASON_PREFIX}). */
 function isRelocatable(item: QueueItem): boolean {
   return item.status === 'import_blocked' && (item.failed_reason ?? '').startsWith(PATH_NOT_VISIBLE_REASON_PREFIX)
+}
+
+/**
+ * The download states Mark failed / Blocklist & fail can act on without a 409:
+ * every state that legally reaches `FailedPending` per the backend's
+ * `TRANSITIONS` graph (`domain/state_machine.py`) -- `downloading`,
+ * `metadata_fetching`, `import_pending`, `import_blocked`, `client_missing` --
+ * PLUS `failed_pending` itself. That last one is not a `TRANSITIONS` edge (a
+ * state can't transition to itself there) but `queue_service.mark_failed`
+ * special-cases it as an "adopt": an operator call on an already-`failed_pending`
+ * row (a stranded prior attempt, or one a reconcile cycle just detected) re-stamps
+ * it with the fresh blocklist/remove_torrent flags instead of 409ing, so it is a
+ * genuinely legal, backend-accepted operator action -- omitting it here would
+ * violate "known legal actions remain available" for a real, reachable queue row.
+ * `searching` and `importing` have no such edge or adopt path (mid-search / mid-import
+ * can't be operator-failed) and are correctly excluded.
+ *
+ * Positive allowlist (issue #205), not a terminal denylist: a runtime-unknown
+ * status (a future backend state this bundle predates, or corrupt/legacy data)
+ * is absent from the set and fails CLOSED (no buttons shown), mirroring the
+ * authoritative backend guard rather than merely excluding the one denylisted
+ * `importing` value the old code checked.
+ */
+const MARK_FAILABLE = new Set<DownloadStateValue>([
+  'downloading',
+  'metadata_fetching',
+  'import_pending',
+  'import_blocked',
+  'client_missing',
+  'failed_pending',
+])
+
+function canMarkFailedStatus(status: string): boolean {
+  return MARK_FAILABLE.has(status as DownloadStateValue)
 }
 
 /**
@@ -80,7 +114,13 @@ function scopeBadges(item: QueueItem): ScopeBadge[] {
   if (item.scopes && item.scopes.length > 0) {
     return item.scopes
       .map((scope) => {
-        const status = scope.status ?? 'active'
+        // Widen to `string` (ScopeBadge's declared field type): otherwise TS
+        // infers the narrower `DownloadScopeStatus | 'active'` literal union
+        // here, which then fails the `.filter` type predicate below (a
+        // predicate's asserted type must be assignable TO the inferred
+        // parameter type, and the wider `ScopeBadge` is not assignable to
+        // that narrower inferred literal type).
+        const status: string = scope.status ?? 'active'
         const label = scopeBadgeLabel(scope.season, scope.episodes, status)
         return label ? { label, status } : null
       })
@@ -118,7 +158,7 @@ export function Queue() {
   const items = data?.queue ?? []
   const activeCount = items.filter((item) => isActive(item.status)).length
   const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
-  const pendingActionable = pendingItem !== null && pendingItem.status !== 'importing'
+  const pendingActionable = pendingItem !== null && canMarkFailedStatus(pendingItem.status)
 
   useEffect(() => {
     if (pending && !pendingActionable) {
@@ -127,7 +167,7 @@ export function Queue() {
   }, [pending, pendingActionable])
 
   async function runConfirm() {
-    if (!pending || !pendingItem || pendingItem.status === 'importing') {
+    if (!pending || !pendingItem || !canMarkFailedStatus(pendingItem.status)) {
       setPending(null)
       return
     }
@@ -289,7 +329,7 @@ function QueueCard({
 }) {
   const presentation = downloadStatus(item.status)
   const showTransferProgress = item.status === 'downloading'
-  const canMarkFailed = item.status !== 'importing'
+  const canMarkFailed = canMarkFailedStatus(item.status)
   const progress = Math.min(1, Math.max(0, item.progress ?? 0))
   const pct = Math.round(progress * 100)
   const shortHash = item.torrent_hash.slice(0, 12)

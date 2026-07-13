@@ -46,6 +46,7 @@ __all__ = [
     "DownloadHistory",
     "DownloadHistoryEvent",
     "DownloadScope",
+    "DownloadScopeStatus",
     "EpisodeState",
     "LogEvent",
     "MediaRequest",
@@ -117,6 +118,25 @@ class RequestStatus(StrEnum):
     # partial index is an INCLUSION list that never named ``cancelled``, it is
     # excluded by omission -- no index migration either (mirrors ``evicted``).
     cancelled = "cancelled"
+
+
+class DownloadScopeStatus(StrEnum):
+    """Lifecycle of one logical TV scope attached to a physical torrent download.
+
+    Mirrors the vocabulary ``repositories/downloads.py`` has always written to
+    ``download_scopes.status`` (a plain ``String`` column, no CHECK constraint —
+    same rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this
+    enum needs no column migration). Kept separate from :class:`RequestStatus`
+    because a scope's vocabulary is a strict subset with different terminality
+    (``imported``/``failed`` are scope-terminal; the request-level rollup is a
+    different state machine in ``domain/season_rollup.py``).
+    """
+
+    active = "active"
+    import_blocked = "import_blocked"
+    imported = "imported"
+    failed = "failed"
+    no_acceptable_release = "no_acceptable_release"
 
 
 class BlocklistReason(StrEnum):

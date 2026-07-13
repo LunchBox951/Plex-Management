@@ -20,9 +20,11 @@ import {
 } from '../api/hooks'
 import type {
   DiscoverResult,
+  DownloadStateValue,
   GrabRequest,
   QueueItem,
   RequestResponse,
+  RequestStatusValue,
   SearchPreviewResponse,
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
@@ -130,7 +132,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     no_acceptable_release: false,
   }
 
-  function setup(createdStatus: string) {
+  function setup(createdStatus: RequestStatusValue) {
     const created: RequestResponse = {
       id: 7,
       tmdb_id: 42,
@@ -236,7 +238,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
   }
 
   // Request always 'downloading' (the lagging status); only the download status moves.
-  function setDownloadStatus(downloadStatus: string): void {
+  function setDownloadStatus(downloadStatus: DownloadStateValue): void {
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: { requests: [request({ status: 'downloading' })] },
     })
@@ -969,6 +971,68 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     })
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — unknown status fails closed, not open (issue #205)', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  })
+
+  // A status this bundle's `RequestStatusValue` union doesn't recognize can only
+  // arrive at runtime (a rolling deploy talking to a newer backend, or a
+  // corrupt/legacy row) -- constructing it here needs a cast, exactly like the
+  // real boundary where untyped JSON crosses into the typed `RequestResponse`.
+  const UNKNOWN_STATUS = 'a_future_backend_status' as RequestStatusValue
+
+  it('renders a neutral badge for an unrecognized request status, never throwing', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
+    })
+    expect(() =>
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />),
+    ).not.toThrow()
+    expect(screen.getByText('A future backend status')).toBeInTheDocument()
+  })
+
+  it('offers no Grab and no Re-search for an unrecognized status (so the release browser, only reachable via Re-search/Preview, can never be opened)', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /^grab$/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /preview releases/i })).not.toBeInTheDocument()
+  })
+
+  it('still offers Re-search for a KNOWN non-terminal status (no_acceptable_release)', () => {
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /re-search/i })).toBeInTheDocument()
   })
 })
 

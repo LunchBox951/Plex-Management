@@ -794,6 +794,36 @@
         "title": "DiskRootItem",
         "type": "object"
       },
+      "DownloadScopeStatus": {
+        "description": "Lifecycle of one logical TV scope attached to a physical torrent download.\n\nMirrors the vocabulary ``repositories/downloads.py`` has always written to\n``download_scopes.status`` (a plain ``String`` column, no CHECK constraint \u2014\nsame rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this\nenum needs no column migration). Kept separate from :class:`RequestStatus`\nbecause a scope's vocabulary is a strict subset with different terminality\n(``imported``/``failed`` are scope-terminal; the request-level rollup is a\ndifferent state machine in ``domain/season_rollup.py``).",
+        "enum": [
+          "active",
+          "import_blocked",
+          "imported",
+          "failed",
+          "no_acceptable_release"
+        ],
+        "title": "DownloadScopeStatus",
+        "type": "string"
+      },
+      "DownloadState": {
+        "description": "The domain state of a tracked download (persisted to ``downloads.status``).",
+        "enum": [
+          "searching",
+          "downloading",
+          "metadata_fetching",
+          "import_pending",
+          "import_blocked",
+          "importing",
+          "imported",
+          "failed_pending",
+          "failed",
+          "no_acceptable_release",
+          "client_missing"
+        ],
+        "title": "DownloadState",
+        "type": "string"
+      },
       "ErrorDetail": {
         "description": "Machine-readable error body returned by manual HTTPException paths.",
         "properties": {
@@ -1677,8 +1707,7 @@
             "type": "number"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/DownloadState"
           },
           "title": {
             "anyOf": [
@@ -1772,9 +1801,8 @@
             "title": "Season"
           },
           "status": {
-            "default": "active",
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/DownloadScopeStatus",
+            "default": "active"
           }
         },
         "title": "QueueScope",
@@ -2005,8 +2033,7 @@
             "title": "Seasons"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/RequestStatus"
           },
           "title": {
             "title": "Title",
@@ -2048,6 +2075,25 @@
         ],
         "title": "RequestResponse",
         "type": "object"
+      },
+      "RequestStatus": {
+        "description": "Lifecycle of a media (or season) request.",
+        "enum": [
+          "pending",
+          "searching",
+          "no_acceptable_release",
+          "waiting_for_air_date",
+          "downloading",
+          "completed",
+          "available",
+          "partially_available",
+          "failed",
+          "import_blocked",
+          "evicted",
+          "cancelled"
+        ],
+        "title": "RequestStatus",
+        "type": "string"
       },
       "SearchPreviewRequest": {
         "description": "Preview by ``request_id`` OR by an explicit media descriptor.\n\nWhen ``request_id`` is set, ``tmdb_id``/``media_type``/``title``/``year`` are\nresolved from the stored request and any values passed for them are ignored;\n``season`` comes from this body. ``episodes`` also comes from this body when\npresent; when omitted, a stored ``explicit_episodes`` request supplies the\nselected season's episode target. Otherwise (no ``request_id``) ``tmdb_id``,\n``media_type`` and ``title`` are required.\n\nEvery TV preview is per-season: the endpoint REJECTS (422) a tv media type\npreviewed with no ``season``, and REJECTS (422) a non-tv (movie) media type\npreviewed WITH a ``season`` or ``episodes`` -- mirroring the grab endpoint's\nscope guard exactly, so an invalid combination never reaches the indexer.",
@@ -2211,8 +2257,7 @@
             "type": "integer"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/RequestStatus"
           },
           "target_episode_count": {
             "anyOf": [

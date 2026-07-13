@@ -1529,6 +1529,26 @@ export interface components {
             used_percent: number;
         };
         /**
+         * DownloadScopeStatus
+         * @description Lifecycle of one logical TV scope attached to a physical torrent download.
+         *
+         *     Mirrors the vocabulary ``repositories/downloads.py`` has always written to
+         *     ``download_scopes.status`` (a plain ``String`` column, no CHECK constraint —
+         *     same rationale as :class:`RequestStatus`'s ``cancelled`` note above, so this
+         *     enum needs no column migration). Kept separate from :class:`RequestStatus`
+         *     because a scope's vocabulary is a strict subset with different terminality
+         *     (``imported``/``failed`` are scope-terminal; the request-level rollup is a
+         *     different state machine in ``domain/season_rollup.py``).
+         * @enum {string}
+         */
+        DownloadScopeStatus: "active" | "import_blocked" | "imported" | "failed" | "no_acceptable_release";
+        /**
+         * DownloadState
+         * @description The domain state of a tracked download (persisted to ``downloads.status``).
+         * @enum {string}
+         */
+        DownloadState: "searching" | "downloading" | "metadata_fetching" | "import_pending" | "import_blocked" | "importing" | "imported" | "failed_pending" | "failed" | "no_acceptable_release" | "client_missing";
+        /**
          * ErrorDetail
          * @description Machine-readable error body returned by manual HTTPException paths.
          */
@@ -1961,8 +1981,7 @@ export interface components {
              * @default 0
              */
             seed_ratio: number;
-            /** Status */
-            status: string;
+            status: components["schemas"]["DownloadState"];
             /** Title */
             title?: string | null;
             /** Tmdb Id */
@@ -1989,11 +2008,8 @@ export interface components {
             media_request_id?: number | null;
             /** Season */
             season?: number | null;
-            /**
-             * Status
-             * @default active
-             */
-            status: string;
+            /** @default active */
+            status: components["schemas"]["DownloadScopeStatus"];
         };
         /**
          * ReconcileStatusItem
@@ -2087,8 +2103,7 @@ export interface components {
             requested_seasons?: number[] | null;
             /** Seasons */
             seasons?: components["schemas"]["SeasonStatus"][] | null;
-            /** Status */
-            status: string;
+            status: components["schemas"]["RequestStatus"];
             /** Title */
             title: string;
             /** Tmdb Id */
@@ -2098,6 +2113,12 @@ export interface components {
             /** Year */
             year?: number | null;
         };
+        /**
+         * RequestStatus
+         * @description Lifecycle of a media (or season) request.
+         * @enum {string}
+         */
+        RequestStatus: "pending" | "searching" | "no_acceptable_release" | "waiting_for_air_date" | "downloading" | "completed" | "available" | "partially_available" | "failed" | "import_blocked" | "evicted" | "cancelled";
         /**
          * SearchPreviewRequest
          * @description Preview by ``request_id`` OR by an explicit media descriptor.
@@ -2155,8 +2176,7 @@ export interface components {
             installed_quality_id?: number | null;
             /** Season Number */
             season_number: number;
-            /** Status */
-            status: string;
+            status: components["schemas"]["RequestStatus"];
             /** Target Episode Count */
             target_episode_count?: number | null;
         };

@@ -1,12 +1,25 @@
+import type { DownloadStateValue, RequestStatusValue } from '../api/types'
+
 /**
  * Per-title / per-download status presentation.
  *
- * The backend's `status` fields are free strings carrying the canonical
- * `RequestStatus` / `DownloadState` enum values (see the backend's
- * domain/state machine). The design handoff (§4) collapses these onto five
+ * The backend's `status` fields carry the canonical `RequestStatus` /
+ * `DownloadState` enum values, typed in the OpenAPI contract and generated
+ * client (issue #205). The design handoff (§4) collapses these onto five
  * semantic colors. This map is the single place that translation lives, so
- * every badge/pill across the app reads identically. Unknown values fall back to
- * a neutral intent rather than throwing — honesty over silence.
+ * every badge/pill across the app reads identically.
+ *
+ * The maps below are typed `Record<RequestStatusValue, …>` /
+ * `Record<DownloadStateValue, …>` — a `Record` over a union type requires
+ * every member to have an entry, so adding or renaming a backend enum value
+ * red-builds `tsc` right here until this map is updated (that's the
+ * contract-drift guarantee ADR-0009 promises). `lookup()` still falls back to
+ * a neutral, humanized label for a status that is unknown AT RUNTIME (a
+ * rolling deploy: a stale bundle whose union is missing a value the backend
+ * — running newer code — actually emits) — honesty over silence, not a
+ * contradiction: the exhaustiveness check is compile-time against what THIS
+ * bundle's contract says exists, while the runtime fallback covers a bundle
+ * that hasn't caught up yet.
  */
 export type StatusIntent = 'searching' | 'downloading' | 'available' | 'error' | 'neutral'
 
@@ -15,7 +28,7 @@ export interface StatusPresentation {
   intent: StatusIntent
 }
 
-const REQUEST_STATUS: Record<string, StatusPresentation> = {
+const REQUEST_STATUS: Record<RequestStatusValue, StatusPresentation> = {
   pending: { label: 'Requested', intent: 'neutral' },
   searching: { label: 'Searching', intent: 'searching' },
   no_acceptable_release: { label: 'No release', intent: 'error' },
@@ -39,7 +52,7 @@ const REQUEST_STATUS: Record<string, StatusPresentation> = {
   cancelled: { label: 'Cancelled', intent: 'neutral' },
 }
 
-const DOWNLOAD_STATUS: Record<string, StatusPresentation> = {
+const DOWNLOAD_STATUS: Record<DownloadStateValue, StatusPresentation> = {
   searching: { label: 'Searching', intent: 'searching' },
   downloading: { label: 'Downloading', intent: 'downloading' },
   metadata_fetching: { label: 'Fetching metadata', intent: 'searching' },
@@ -59,8 +72,17 @@ function humanize(value: string): string {
     .replace(/^\w/, (c) => c.toUpperCase())
 }
 
-function lookup(table: Record<string, StatusPresentation>, status: string): StatusPresentation {
-  return table[status] ?? { label: humanize(status), intent: 'neutral' }
+/**
+ * `status` is deliberately plain `string` (callers pass `string | null` from
+ * looser call sites), not the narrower union — so the lookup itself must
+ * treat the table as a partial map and honor a miss (an unknown-at-runtime
+ * value) with the neutral humanized fallback, never a throw.
+ */
+function lookup<T extends string>(
+  table: Partial<Record<T, StatusPresentation>>,
+  status: string,
+): StatusPresentation {
+  return table[status as T] ?? { label: humanize(status), intent: 'neutral' }
 }
 
 export function requestStatus(status: string): StatusPresentation {

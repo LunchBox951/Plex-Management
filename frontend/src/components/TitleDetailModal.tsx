@@ -19,6 +19,7 @@ import type {
   GrabRequest,
   QueueItem,
   RequestResponse,
+  RequestStatusValue,
   SeasonStatus,
 } from '../api/types'
 import type { ApiError } from '../lib/errors'
@@ -192,28 +193,32 @@ const CANCELLABLE_STATUSES = new Set([
 
 /**
  * A request is grabbable only while it is non-terminal: the backend rejects a
- * terminal request id in /queue/grab (`request_not_active`). Terminal statuses are
- * `available` (already in the library), `completed` (imported, finalizing),
- * `failed`, and `evicted` (ADR-0012 — the disk-pressure sweep already deleted the
- * file; re-grabbing the same id would just re-arm a row the backend now treats as
- * settled, see `_SETTLED_REQUEST_STATUSES`). POST /requests can itself hand back a
- * terminal row — Plex already owns the title, or an existing completed/failed/
- * evicted request is reused — so the create path must gate Grab on the returned
- * status, not merely the presence of an id.
+ * terminal request id in /queue/grab (`request_not_active`). Positive allowlist
+ * (issue #205), not a terminal denylist — an unrecognized status (a future
+ * backend enum member this bundle predates, or corrupt/legacy data) is absent
+ * from the set and therefore fails CLOSED (not grabbable), rather than a
+ * denylist's fail-OPEN default. Mirrors the backend's non-terminal statuses:
+ * everything in `RequestStatus` except `available` (already in the library),
+ * `completed` (imported, finalizing), `failed`, `evicted` (ADR-0012 — the
+ * disk-pressure sweep already deleted the file; re-grabbing the same id would
+ * just re-arm a row the backend now treats as settled, see
+ * `_SETTLED_REQUEST_STATUSES`), `waiting_for_air_date`, and `cancelled`
+ * (ADR-0014 — settled and terminal for grab; a fresh "Request again" must be
+ * made before grabbing). `partially_available` is included even though it is a
+ * tv-only rollup NEVER set on a single season (a harmless superset — see
+ * `seasonStatusFor`) because it is genuinely non-terminal at the request level.
  */
+const GRABBABLE_STATUSES = new Set<RequestStatusValue>([
+  'pending',
+  'searching',
+  'no_acceptable_release',
+  'downloading',
+  'import_blocked',
+  'partially_available',
+])
+
 function isGrabbableStatus(status: string): boolean {
-  return (
-    status !== 'available' &&
-    status !== 'completed' &&
-    status !== 'failed' &&
-    status !== 'evicted' &&
-    status !== 'waiting_for_air_date' &&
-    // ADR-0014: a `cancelled` request is settled and terminal for grab (the backend
-    // rejects a cancelled id in /queue/grab with request_not_active); a fresh
-    // "Request again" must be made before grabbing. Mirrors the backend's
-    // `_SETTLED_REQUEST_STATUSES` / `TERMINAL_REQUEST_STATUS_VALUES`.
-    status !== 'cancelled'
-  )
+  return GRABBABLE_STATUSES.has(status as RequestStatusValue)
 }
 
 /**
@@ -952,15 +957,17 @@ export function TitleDetailModal({
   // States where browsing/grabbing releases is part of the action — the decision
   // engine output stays visible (especially the honest no-acceptable-release).
   // Admin-only: search-preview and grab are `require_admin` routes, so shared
-  // users never see the release browser at all.
+  // users never see the release browser at all. `unknown` is deliberately
+  // EXCLUDED (issue #205, fail closed): a runtime-unknown status must not open
+  // the release browser or expose Grab/Re-search, even though the header badge
+  // and state sentence still render it honestly.
   const showReleaseSearch =
     isAdmin &&
     (state.kind === 'none' ||
       state.kind === 'pending' ||
       state.kind === 'searching' ||
       state.kind === 'no_acceptable_release' ||
-      state.kind === 'failed' ||
-      state.kind === 'unknown')
+      state.kind === 'failed')
 
   let actionZone: ReactNode
   switch (state.kind) {
@@ -1057,6 +1064,11 @@ export function TitleDetailModal({
       actionZone = requestAgainButton
       break
     case 'unknown':
+      // issue #205: a runtime-unknown status (a future backend enum member this
+      // bundle predates, or corrupt/legacy data) gets NO actions — no Grab, no
+      // Re-search, no release browser. Fail closed on the action, never on the
+      // display: the header StatusBadge and state sentence already render it
+      // honestly via `statePresentation`/`stateSentence`.
       actionZone = null
       break
   }
