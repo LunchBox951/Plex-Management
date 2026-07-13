@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ def _positive_float(
         value = float(raw)
     except ValueError as exc:
         raise UpdaterConfigError(f"{name} must be a number") from exc
-    if value <= 0 or value < minimum or value > maximum:
+    if not math.isfinite(value) or value <= 0 or value < minimum or value > maximum:
         lower = f"at least {minimum:g}" if minimum > 0 else "greater than zero"
         raise UpdaterConfigError(f"{name} must be {lower} and at most {maximum:g}")
     return value
