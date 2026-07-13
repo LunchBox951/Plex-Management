@@ -294,17 +294,26 @@ class SystemSettings(Base):
 
 
 class AuthSession(Base):
-    """HTTP-only browser session for a Plex-authenticated user.
+    """HTTP-only browser session, minted by Plex sign-in OR the recovery key.
 
     Only the SHA-256 digest of the random cookie token is stored. Revocation sets
     ``revoked_at`` rather than deleting so logout/session behavior remains
     auditable without retaining a usable bearer token.
+
+    ``user_id`` is NULL for a **recovery session** — one minted by exchanging a
+    valid ``X-Api-Key`` for this same HTTP-only cookie (``POST /auth/api-key``,
+    CodeQL #263). The recovery key is an admin-authority credential with no Plex
+    identity, so a session it mints has no owning user; it authenticates exactly
+    as direct ``X-Api-Key`` auth does (admin, no ``user``). A Plex sign-in session
+    always carries its owning ``users.id``.
     """
 
     __tablename__ = "auth_sessions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
