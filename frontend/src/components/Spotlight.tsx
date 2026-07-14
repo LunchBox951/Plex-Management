@@ -10,6 +10,7 @@ import { useCreateRequest } from '../api/hooks'
 import type { CreateRequestBody, DiscoverResult } from '../api/types'
 import type { ApiError } from '../lib/errors'
 import { PLEX_WEB_APP_URL } from '../lib/plex'
+import { useImageFallback } from '../lib/useImageFallback'
 import { requestStatus, type StatusPresentation } from '../lib/status'
 import { Button } from './ui/Button'
 import { buttonClasses } from './ui/button-variants'
@@ -353,6 +354,36 @@ export function Spotlight({
   )
 }
 
+/**
+ * The hero backdrop with the artwork fallback chain (issue #66): Plex-native art
+ * for an in-library title, then TMDB art, then the gradient placeholder. Rendered
+ * as an `<img>` (not a CSS `background-image`) so a source that fails to load —
+ * the Plex proxy 404ing for a present title with no `art` — triggers `onError`
+ * and the chain advances, instead of a broken hero.
+ */
+function SpotlightBackdrop({ item }: { item: DiscoverResult }) {
+  const { src, onError } = useImageFallback([item.plex_backdrop_url, item.backdrop_url])
+  if (src === null) {
+    return (
+      <div
+        data-testid="spotlight-art-fallback"
+        className="absolute inset-0 bg-gradient-to-br from-surface via-poster to-bg"
+        aria-hidden
+      />
+    )
+  }
+  return (
+    <img
+      key={src}
+      src={src}
+      alt=""
+      onError={onError}
+      aria-hidden
+      className="absolute inset-0 size-full object-cover"
+    />
+  )
+}
+
 interface SpotlightSlideProps {
   item: DiscoverResult
   state: StatusPresentation | null
@@ -384,19 +415,7 @@ function SpotlightSlide({
       // focus or pointer targeting while the active slide changes beneath them.
       {...(inert ? { inert: true } : {})}
     >
-      {item.backdrop_url ? (
-        <div
-          className="absolute inset-0 bg-cover bg-center"
-          style={{ backgroundImage: `url(${item.backdrop_url})` }}
-          aria-hidden
-        />
-      ) : (
-        <div
-          data-testid="spotlight-art-fallback"
-          className="absolute inset-0 bg-gradient-to-br from-surface via-poster to-bg"
-          aria-hidden
-        />
-      )}
+      <SpotlightBackdrop item={item} />
 
       <div
         data-testid="spotlight-bottom-fade"

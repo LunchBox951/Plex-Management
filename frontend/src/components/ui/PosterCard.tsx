@@ -1,9 +1,16 @@
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn'
+import { useImageFallback } from '../../lib/useImageFallback'
 
 interface PosterCardProps {
   title: string
   year?: number | null
+  /**
+   * Plex-native poster (issue #66), tried BEFORE `posterUrl`. Points at the
+   * backend artwork proxy for an in-library title; on load failure the card falls
+   * back to `posterUrl` (TMDB) and then the gradient.
+   */
+  plexPosterUrl?: string | null
   posterUrl?: string | null
   /** Seed for the deterministic placeholder gradient (e.g. tmdb_id). */
   seed?: number
@@ -24,6 +31,7 @@ function gradient(seed: number): string {
 export function PosterCard({
   title,
   year,
+  plexPosterUrl,
   posterUrl,
   seed = 0,
   onClick,
@@ -32,6 +40,7 @@ export function PosterCard({
   className,
 }: PosterCardProps) {
   const interactive = typeof onClick === 'function'
+  const { src: posterSrc, onError: onPosterError } = useImageFallback([plexPosterUrl, posterUrl])
   return (
     <div
       data-poster-card
@@ -42,11 +51,13 @@ export function PosterCard({
         className,
       )}
     >
-      {posterUrl ? (
+      {posterSrc ? (
         <img
-          src={posterUrl}
+          key={posterSrc}
+          src={posterSrc}
           alt=""
           loading="lazy"
+          onError={onPosterError}
           className="absolute inset-0 size-full object-cover"
         />
       ) : (

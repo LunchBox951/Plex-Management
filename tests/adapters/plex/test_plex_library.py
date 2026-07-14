@@ -2957,3 +2957,174 @@ async def test_resolve_watch_states_tv_uncorrelated_first_match_skips_later_fail
     assert states == [WatchState(watched=True, last_viewed_at=_WATCHED_AT)]
     assert calls["/library/sections/2/all"] == 1
     assert "/library/sections/3/all" not in calls
+
+
+# --------------------------------------------------------------------------- #
+# fetch_artwork (issue #66) — Plex-native poster/background proxy
+# --------------------------------------------------------------------------- #
+_POSTER_BYTES = b"\x89PNG\r\n\x1a\nfake-poster-bytes"
+_ART_BYTES = b"\xff\xd8\xff\xe0fake-jpeg-backdrop"
+
+# One movie WITH artwork paths (tmdb 27205) plus one WITHOUT (tmdb 129), so a
+# present-but-artless item is covered alongside the happy path.
+MOVIES_WITH_ART: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 2,
+        "Metadata": [
+            {
+                "guid": "plex://movie/aaa",
+                "Guid": [{"id": "tmdb://27205"}],
+                "thumb": "/library/metadata/27205/thumb/1700",
+                "art": "/library/metadata/27205/art/1700",
+            },
+            {"guid": "themoviedb://129", "Guid": [], "thumb": None, "art": None},
+        ],
+    }
+}
+
+
+def _artwork_handler(
+    calls: dict[str, int] | None = None,
+    *,
+    thumb_content_type: str = "image/png",
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Serves the sections/crawl JSON and the two image bytes at their thumb/art paths.
+
+    Every branch asserts the token rides the header and never the URL — the whole
+    security point of the proxy (issue #66).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Plex-Token") == TOKEN
+        assert TOKEN not in str(request.url)
+        path = request.url.path
+        if calls is not None:
+            calls[path] = calls.get(path, 0) + 1
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/1/all":
+            assert request.headers.get("Accept") == "application/json"
+            return httpx.Response(200, json=MOVIES_WITH_ART)
+        if path == "/library/metadata/27205/thumb/1700":
+            assert request.headers.get("Accept", "").startswith("image/")
+            return httpx.Response(
+                200, content=_POSTER_BYTES, headers={"Content-Type": thumb_content_type}
+            )
+        if path == "/library/metadata/27205/art/1700":
+            return httpx.Response(200, content=_ART_BYTES, headers={"Content-Type": "image/jpeg"})
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_fetch_artwork_poster_returns_bytes_and_content_type() -> None:
+    image = await _adapter(_artwork_handler()).fetch_artwork(27205, "movie", "poster")
+    assert image is not None
+    assert image.content == _POSTER_BYTES
+    assert image.content_type == "image/png"
+
+
+async def test_fetch_artwork_background_uses_the_art_path() -> None:
+    image = await _adapter(_artwork_handler()).fetch_artwork(27205, "movie", "background")
+    assert image is not None
+    assert image.content == _ART_BYTES
+    assert image.content_type == "image/jpeg"
+
+
+async def test_fetch_artwork_absent_item_is_a_miss() -> None:
+    # A tmdb id not in the library resolves to None (browser falls back to TMDB).
+    assert await _adapter(_artwork_handler()).fetch_artwork(999999, "movie", "poster") is None
+
+
+async def test_fetch_artwork_item_without_that_kind_is_a_miss() -> None:
+    # tmdb 129 is present but carries no thumb/art — an honest None, not an error.
+    assert await _adapter(_artwork_handler()).fetch_artwork(129, "movie", "poster") is None
+
+
+async def test_fetch_artwork_non_image_body_is_a_miss() -> None:
+    # A 200 whose Content-Type is not image/* (a reverse-proxy login page in front
+    # of Plex) must never be proxied to the browser as a poster.
+    adapter = _adapter(_artwork_handler(thumb_content_type="text/html; charset=utf-8"))
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+
+
+async def test_fetch_artwork_content_type_params_are_stripped() -> None:
+    adapter = _adapter(_artwork_handler(thumb_content_type="image/png; charset=binary"))
+    image = await adapter.fetch_artwork(27205, "movie", "poster")
+    assert image is not None
+    assert image.content_type == "image/png"
+
+
+async def test_fetch_artwork_caches_the_crawl_across_calls() -> None:
+    # The section crawl runs once; a second fetch is served from the artwork index.
+    calls: dict[str, int] = {}
+    adapter = _adapter(_artwork_handler(calls), base_url="http://art-cache:32400")
+    await adapter.fetch_artwork(27205, "movie", "poster")
+    await adapter.fetch_artwork(27205, "movie", "background")
+    assert calls["/library/sections/1/all"] == 1  # crawled once, not per image
+
+
+async def test_fetch_artwork_propagates_a_plex_transport_failure() -> None:
+    def down(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={})
+
+    with pytest.raises(PlexLibraryError):
+        await _adapter(down).fetch_artwork(27205, "movie", "poster")
+
+
+async def test_fetch_artwork_auth_failure_raises_plex_auth_error() -> None:
+    def unauthorized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    with pytest.raises(PlexAuthError):
+        await _adapter(unauthorized).fetch_artwork(27205, "movie", "poster")
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        "http://evil.example/steal",
+        "https://evil.example/steal",
+        "//evil.example/steal",
+    ],
+)
+async def test_fetch_artwork_never_fetches_a_smuggled_absolute_artwork_url(
+    smuggled: str,
+) -> None:
+    # SSRF regression pin (issue #66 review): Plex metadata is upstream input — a
+    # compromised/misbehaving server (or a tampering reverse proxy) could smuggle
+    # an absolute or protocol-relative URL into ``thumb``/``art``. That value must
+    # resolve as a MISS (None -> the route's 404 -> TMDB fallback), and no request
+    # may ever leave the configured Plex origin. Pins the ``startswith("/")`` /
+    # ``//`` guard and the ServiceUrl.endpoint boundary against future refactors.
+    crawl_with_smuggled_art: dict[str, Any] = {
+        "MediaContainer": {
+            "size": 1,
+            "Metadata": [
+                {
+                    "guid": "plex://movie/bbb",
+                    "Guid": [{"id": "tmdb://27205"}],
+                    "thumb": smuggled,
+                    "art": smuggled,
+                }
+            ],
+        }
+    }
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        assert request.url.host != "evil.example", "SSRF: request escaped the Plex origin"
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(200, json=crawl_with_smuggled_art)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url=f"http://ssrf-{abs(hash(smuggled)) % 10**8}:32400")
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert await adapter.fetch_artwork(27205, "movie", "background") is None
+    # Only the section list + crawl ran; the smuggled URL itself was never fetched.
+    assert all("evil.example" not in url for url in requested_urls)
+    assert all("/steal" not in url for url in requested_urls)

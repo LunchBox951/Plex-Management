@@ -174,6 +174,7 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
             key={`${item.media_type}-${item.tmdb_id}`}
             title={item.title}
             year={item.year ?? null}
+            plexPosterUrl={item.plex_poster_url ?? null}
             posterUrl={item.poster_url ?? null}
             seed={item.tmdb_id}
             onClick={(trigger) => openTitle(item, trigger)}

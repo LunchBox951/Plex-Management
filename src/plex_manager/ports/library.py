@@ -8,12 +8,25 @@ wiring is a drop-in later. All methods are async.
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-__all__ = ["LibraryPort", "LibrarySection", "WatchState", "WatchStateQuery"]
+__all__ = [
+    "ArtworkImage",
+    "ArtworkKind",
+    "LibraryPort",
+    "LibrarySection",
+    "WatchState",
+    "WatchStateQuery",
+]
+
+# Which Plex-native image a caller wants for a library item: the poster (Plex's
+# ``thumb``) or the background/backdrop (Plex's ``art``). Deliberately named for
+# the UI role, not Plex's wire field, so the port stays adapter-agnostic.
+ArtworkKind = Literal["poster", "background"]
 
 
 class LibrarySection(BaseModel):
@@ -86,6 +99,23 @@ class WatchStateQuery(BaseModel):
     media_type: Literal["movie", "tv"]
     season: int | None = None
     library_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtworkImage:
+    """One fetched artwork image: its raw bytes plus the ``Content-Type`` to serve.
+
+    A plain frozen dataclass, not a pydantic model: the payload is an already-
+    validated image body (bytes) proxied straight through to the browser, so there
+    is nothing to coerce/validate and no reason to pay pydantic's per-field copy on
+    the byte string. ``content_type`` is the upstream media server's own
+    ``Content-Type`` (an ``image/*`` value the adapter verifies before ever
+    constructing this), forwarded verbatim so the browser renders the poster/
+    backdrop with the right decoder.
+    """
+
+    content: bytes
+    content_type: str
 
 
 @runtime_checkable
@@ -342,6 +372,37 @@ class LibraryPort(Protocol):
         ``library_path=None`` keeps the legacy UNCORRELATED first-match read --
         only for callers with no known target, e.g. a row predating the
         breadcrumb.
+        """
+        raise NotImplementedError
+
+    async def fetch_artwork(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        kind: ArtworkKind,
+    ) -> ArtworkImage | None:
+        """Fetch a library item's Plex-native poster/background as raw image bytes.
+
+        Resolves the item ALREADY IN THE LIBRARY by ``tmdb_id`` (the same GUID
+        matching :meth:`present_ids` uses), reads Plex's own selected artwork path
+        for it (``thumb`` for ``kind='poster'``, ``art`` for ``kind='background'``),
+        and returns those image bytes plus their ``Content-Type`` so the web layer
+        can proxy them to the browser WITHOUT the Plex token ever leaving the
+        server (issue #66). The caller supplies only ``tmdb_id``/``media_type``/
+        ``kind`` — never a Plex URL — so this can never be steered at an arbitrary
+        host (no SSRF): the artwork path is resolved server-side from Plex's own
+        metadata and fetched only against the configured Plex origin.
+
+        Returns ``None`` — never raises — when the title is not in the library, has
+        no artwork of the requested kind, or the fetched body is not an image. A
+        genuine Plex transport/credential failure still raises
+        ``PlexLibraryError``/``PlexAuthError`` (honesty over silence): the web
+        layer converts that into a normal miss so the browser falls back to TMDB
+        artwork, never a fabricated image or a 500.
+
+        Raises ``NotImplementedError`` by default (issue #204 discipline): a silent
+        ``None`` default would be indistinguishable from an honest "no Plex art",
+        masking a forgotten override.
         """
         raise NotImplementedError
 

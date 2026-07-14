@@ -4,6 +4,30 @@
  */
 
 export interface paths {
+    "/api/v1/artwork/plex/{media_type}/{tmdb_id}/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Plex Artwork
+         * @description Proxy a library item's Plex-native ``poster``/``background`` image.
+         *
+         *     404 (so the browser falls back to TMDB) whenever Plex is unconfigured, the
+         *     title is not in the library, it has no artwork of that kind, or Plex is
+         *     down/rejects the token — never a 500 that would break the tile.
+         */
+        get: operations["plex_artwork_api_v1_artwork_plex__media_type___tmdb_id___kind__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/api-key": {
         parameters: {
             query?: never;
@@ -1819,6 +1843,10 @@ export interface components {
             media_type: "movie" | "tv";
             /** Overview */
             overview?: string | null;
+            /** Plex Backdrop Url */
+            plex_backdrop_url?: string | null;
+            /** Plex Poster Url */
+            plex_poster_url?: string | null;
             /** Poster Url */
             poster_url?: string | null;
             /** Title */
@@ -3179,7 +3207,7 @@ export interface components {
              * State
              * @enum {string}
              */
-            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
+            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "probe_failed" | "error";
         };
     };
     responses: never;
@@ -3190,6 +3218,47 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    plex_artwork_api_v1_artwork_plex__media_type___tmdb_id___kind__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                media_type: "movie" | "tv";
+                tmdb_id: number;
+                kind: "poster" | "background";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The Plex-native artwork image. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                    "image/*": unknown;
+                };
+            };
+            /** @description No Plex artwork for this item; the client falls back to TMDB. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     exchange_api_key_endpoint_api_v1_auth_api_key_post: {
         parameters: {
             query?: never;
