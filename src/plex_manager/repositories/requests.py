@@ -280,6 +280,26 @@ class SqlRequestRepository:
         stmt = select(RequestSubscriber.request_id).where(RequestSubscriber.user_id == user_id)
         return set((await self._session.execute(stmt)).scalars().all())
 
+    async def subscribed_request_ids_among(
+        self, user_id: int, request_ids: Sequence[int]
+    ) -> set[int]:
+        """The subset of ``request_ids`` that ``user_id`` subscribes to (issue #218).
+
+        The PAGE-SCOPED sibling of :meth:`list_subscribed_request_ids`: an
+        admin's paginated history view needs ``can_withdraw`` membership for
+        exactly one page of rows, and the whole-set read is O(all the user's
+        subscriptions) per page. The ``(user_id, request_id)`` predicate pair is
+        served by ``ix_request_subscribers_user_id_request_id``. Empty input is
+        a no-op (no query) returning the empty set.
+        """
+        if not request_ids:
+            return set()
+        stmt = select(RequestSubscriber.request_id).where(
+            RequestSubscriber.user_id == user_id,
+            RequestSubscriber.request_id.in_(request_ids),
+        )
+        return set((await self._session.execute(stmt)).scalars().all())
+
     async def get_fresh(self, request_id: int) -> RequestRecord | None:
         """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
 

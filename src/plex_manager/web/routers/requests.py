@@ -464,13 +464,29 @@ async def create_request_endpoint(
 
 @router.get(
     "",
+    # A route-level 422 REPLACES FastAPI's automatic validation entry, so the
+    # union documents BOTH shapes (mirroring queue.py's grab / search_preview's
+    # anyOf idiom): the framework's array-detail ``HTTPValidationError`` (e.g.
+    # ``limit`` outside 1..200, a non-integer ``cursor`` -- rejected before the
+    # handler runs) and this endpoint's own ``ErrorDetail`` literal.
     responses={
         422: {
-            "model": ErrorDetail,
             "description": (
-                "``cursor_requires_limit`` -- ``cursor`` was supplied without ``limit`` "
-                "(a cursor only means anything within the paginated mode)"
+                "Validation error (FastAPI's standard shape -- e.g. ``limit`` "
+                "outside 1..200 or a non-integer ``cursor``), or "
+                "``cursor_requires_limit`` (``cursor`` supplied without ``limit``; "
+                "a cursor only means anything within the paginated mode)"
             ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/HTTPValidationError"},
+                            {"$ref": "#/components/schemas/ErrorDetail"},
+                        ]
+                    }
+                }
+            },
         },
     },
 )
@@ -565,17 +581,33 @@ async def list_requests_endpoint(
         all_season_ids
     )
     # Batch the issue #314 subscriber-control flags too: one count-per-request query
-    # (``has_other_participants``) plus one membership-set query for the caller
-    # (``can_withdraw``) instead of a per-row subscriber lookup. A non-admin's list
-    # is already subscriber-filtered above, so every row is in the caller's own
-    # membership set by construction; an admin's UNFILTERED view is not, so the real
-    # membership check still matters there (see ``list_subscribed_request_ids``).
+    # (``has_other_participants``) plus membership for the caller (``can_withdraw``)
+    # instead of a per-row subscriber lookup.
     subscriber_counts = await request_service.count_subscribers(session, [r.id for r in records])
-    subscribed_ids: set[int] = (
-        await request_service.list_subscribed_request_ids(session, auth.user_id)
-        if auth.user_id is not None
-        else set()
-    )
+    subscribed_ids: set[int]
+    if auth.user_id is None:
+        subscribed_ids = set()
+    elif limit is not None:
+        # PAGE-SCOPED membership (#218 Codex round 1): a page must never pay the
+        # O(all-the-caller's-subscriptions) whole-set read the legacy mode uses.
+        # A shared user's page rows are subscriber-filtered IN the page SQL, so
+        # membership IS the page (zero extra queries); an admin's unfiltered page
+        # gets one membership read scoped to exactly the page ids (served by the
+        # ``(user_id, request_id)`` composite index).
+        subscribed_ids = (
+            {r.id for r in records}
+            if not auth.is_admin
+            else await request_service.subscribed_request_ids_among(
+                session, auth.user_id, [r.id for r in records]
+            )
+        )
+    else:
+        # LEGACY mode keeps its whole-set read untouched (byte-compat promise):
+        # a non-admin's list is already subscriber-filtered above, so every row
+        # is in the caller's own membership set by construction; an admin's
+        # UNFILTERED view is not, so the real membership check still matters
+        # (see ``list_subscribed_request_ids``).
+        subscribed_ids = await request_service.list_subscribed_request_ids(session, auth.user_id)
     return RequestListResponse(
         requests=[
             await _to_response(

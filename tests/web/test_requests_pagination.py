@@ -140,11 +140,35 @@ async def test_page_past_the_end_is_empty_with_null_cursor(
 async def test_page_parameter_validation(
     client: httpx.AsyncClient, seed: SeedFn, params: dict[str, int]
 ) -> None:
-    """``cursor`` without ``limit`` is an explicit 422 (never silently ignored);
-    ``limit`` outside 1..200 is FastAPI's own validation 422."""
+    """``cursor`` without ``limit`` is an explicit 422 with the ErrorDetail literal
+    (never silently ignored); ``limit`` outside 1..200 is FastAPI's own validation
+    422 with the standard array-detail shape -- both are documented (see the
+    endpoint's 422 anyOf)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     response = await client.get("/api/v1/requests", params=params, headers=_HEADERS)
     assert response.status_code == 422
+    detail = response.json()["detail"]
+    if "limit" in params:
+        assert isinstance(detail, list)  # FastAPI's standard validation shape
+    else:
+        assert detail == "cursor_requires_limit"  # this endpoint's own literal
+
+
+async def test_openapi_422_documents_both_validation_and_cursor_literal(app: FastAPI) -> None:
+    """#218 Codex round 1: a route-level 422 override REPLACES FastAPI's automatic
+    validation entry, so the endpoint documents the union -- the framework's
+    ``HTTPValidationError`` (limit/cursor validation, rejected before the handler)
+    AND the ``ErrorDetail`` carrying ``cursor_requires_limit``."""
+    schema = app.openapi()
+    responses = schema["paths"]["/api/v1/requests"]["get"]["responses"]
+    any_of = responses["422"]["content"]["application/json"]["schema"]["anyOf"]
+    assert {entry["$ref"] for entry in any_of} == {
+        "#/components/schemas/HTTPValidationError",
+        "#/components/schemas/ErrorDetail",
+    }
+    # Both referenced components actually exist in the document.
+    assert "HTTPValidationError" in schema["components"]["schemas"]
+    assert "ErrorDetail" in schema["components"]["schemas"]
 
 
 async def test_shared_user_page_visibility_is_enforced_in_sql(
@@ -165,8 +189,14 @@ async def test_shared_user_page_visibility_is_enforced_in_sql(
     async def full_scan_forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("paginated mode must never materialize the full list")
 
+    async def whole_set_forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "paginated mode must never run the O(all-subscriptions) whole-set membership read"
+        )
+
     monkeypatch.setattr(SqlRequestRepository, "list_by_status", full_scan_forbidden)
     monkeypatch.setattr(SqlRequestRepository, "list_for_user", full_scan_forbidden)
+    monkeypatch.setattr(SqlRequestRepository, "list_subscribed_request_ids", whole_set_forbidden)
 
     seen: list[int] = []
     cursor: int | None = None
@@ -180,10 +210,60 @@ async def test_shared_user_page_visibility_is_enforced_in_sql(
         assert response.status_code == 200
         body = response.json()
         seen.extend(r["id"] for r in body["requests"])
+        # A shared user's page rows are subscriber-filtered in the page SQL, so
+        # membership derives from the page itself -- truthful can_withdraw with
+        # no whole-set read (poisoned above) and no extra membership query.
+        assert all(r["can_withdraw"] is True for r in body["requests"])
         cursor = body["next_cursor"]
         if cursor is None:
             break
     assert seen == sorted(mine, reverse=True)  # every subscribed row, nothing foreign
+
+
+async def test_admin_page_membership_is_scoped_to_the_page_ids(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admin's paginated page derives ``can_withdraw`` from ONE membership read
+    scoped to exactly the page's ids (the composite-index lookup), never the
+    O(all-subscriptions) whole-set read the legacy mode uses (#218 Codex round 1)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    admin_id, cookies, headers = await _user_session(app, tag="admin", permissions=1)
+    subscribed = await _seed_movies(sessionmaker_, 2, tmdb_base=49000, user_id=admin_id)
+    unsubscribed = await _seed_movies(sessionmaker_, 4, tmdb_base=49100)
+
+    async def whole_set_forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "paginated mode must never run the O(all-subscriptions) whole-set membership read"
+        )
+
+    real_among = SqlRequestRepository.subscribed_request_ids_among
+    seen_batches: list[list[int]] = []
+
+    async def spying_among(
+        self: SqlRequestRepository, user_id: int, request_ids: list[int]
+    ) -> set[int]:
+        seen_batches.append(list(request_ids))
+        return await real_among(self, user_id, request_ids)
+
+    monkeypatch.setattr(SqlRequestRepository, "list_subscribed_request_ids", whole_set_forbidden)
+    monkeypatch.setattr(SqlRequestRepository, "subscribed_request_ids_among", spying_among)
+
+    response = await client.get(
+        "/api/v1/requests", params={"limit": 5}, cookies=cookies, headers=headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    page_ids = [r["id"] for r in body["requests"]]
+    # Admin scope: unfiltered page -- the newest 5 of the 6 rows, both populations.
+    assert page_ids == sorted([*subscribed, *unsubscribed], reverse=True)[:5]
+    assert seen_batches == [page_ids]  # ONE membership read, exactly the page ids
+    flags = {r["id"]: r["can_withdraw"] for r in body["requests"]}
+    for rid in page_ids:
+        assert flags[rid] is (rid in set(subscribed))  # membership still truthful
 
 
 async def test_page_bounds_row_materialization(

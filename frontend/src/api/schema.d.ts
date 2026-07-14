@@ -4195,13 +4195,13 @@ export interface operations {
                     "application/json": components["schemas"]["RequestListResponse"];
                 };
             };
-            /** @description ``cursor_requires_limit`` -- ``cursor`` was supplied without ``limit`` (a cursor only means anything within the paginated mode) */
+            /** @description Validation error (FastAPI's standard shape -- e.g. ``limit`` outside 1..200 or a non-integer ``cursor``), or ``cursor_requires_limit`` (``cursor`` supplied without ``limit``; a cursor only means anything within the paginated mode) */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorDetail"];
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };
