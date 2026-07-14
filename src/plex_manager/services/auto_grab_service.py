@@ -33,7 +33,14 @@ Design decisions (see ADR-0013):
 * **Protect the single Prowlarr.** At most :data:`AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`
   actual searches run per cycle, processed sequentially; a scope that already has
   an active download is skipped BEFORE it costs a search (and never races
-  ``grab_service``'s one-active guard).
+  ``grab_service``'s one-active guard). This is the DEFAULT for the
+  web-configurable ``auto_grab_max_searches_per_cycle`` setting (issue #150) --
+  see ``web.deps.get_auto_grab_max_searches_per_cycle`` -- so an operator can
+  raise or lower the per-cycle budget from Settings without a restart; the cycle
+  interval is likewise configurable (``auto_grab_interval_seconds``). The
+  backoff ladder (:data:`BACKOFF_SCHEDULE`) and the per-scope grab-attempt cap
+  (:data:`MAX_GRAB_ATTEMPTS_PER_SCOPE`) stay fixed module constants, not exposed
+  to Settings.
 * **Cool a scope whose GRAB keeps failing (never park it).** A scope that keeps
   raising ``GrabError`` (releases exist; the grab pipeline is what's broken) must
   not be parked ``no_acceptable_release`` -- that would LIE -- yet, being eager
@@ -169,8 +176,11 @@ BACKOFF_SCHEDULE: tuple[timedelta, ...] = (
 
 # At most this many ACTUAL Prowlarr searches per cycle -- the single-Prowlarr load
 # guard. A scope skipped for an active download does NOT consume this budget (no
-# search happened). A module constant for the beta (a web-config knob is a noted
-# follow-up), mirroring ``web/app.py``'s interval constants.
+# search happened). This is the DEFAULT for the web-configurable
+# ``auto_grab_max_searches_per_cycle`` setting (issue #150); see
+# ``web.deps.get_auto_grab_max_searches_per_cycle`` /
+# ``AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT``, which is this exact constant --
+# one source of truth, no duplicated literal to drift.
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE: int = 5
 
 # At most this many GRAB attempts per scope in one cycle. When the top-ranked

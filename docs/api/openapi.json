@@ -2564,6 +2564,28 @@
             ],
             "title": "Auto Grab Enabled"
           },
+          "auto_grab_interval_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Interval Seconds"
+          },
+          "auto_grab_max_searches_per_cycle": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Max Searches Per Cycle"
+          },
           "automatic_update_idle_only": {
             "anyOf": [
               {
@@ -2901,6 +2923,32 @@
               }
             ],
             "title": "Auto Grab Enabled"
+          },
+          "auto_grab_interval_seconds": {
+            "anyOf": [
+              {
+                "maximum": 3600.0,
+                "minimum": 15.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Interval Seconds"
+          },
+          "auto_grab_max_searches_per_cycle": {
+            "anyOf": [
+              {
+                "maximum": 50.0,
+                "minimum": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Grab Max Searches Per Cycle"
           },
           "automatic_update_idle_only": {
             "anyOf": [

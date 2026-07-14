@@ -61,6 +61,7 @@ from plex_manager.services.update_coordination_service import (
     UpdateCoordinationService,
 )
 from plex_manager.web.deps import (
+    AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
     CSRF_HEADER_NAME,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     PLEX_MACHINE_ID_SETTING,
@@ -72,6 +73,8 @@ from plex_manager.web.deps import (
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
     get_auto_grab_enabled,
+    get_auto_grab_interval_seconds,
+    get_auto_grab_max_searches_per_cycle,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_downloads_host_root,
@@ -190,9 +193,16 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 # Prowlarr (ADR-0013). Slower than the 15s reconcile tick on purpose: the tick
 # itself is cheap (a due-scope query bounded by a per-scope backoff ladder), but a
 # tick that DOES find work runs real Prowlarr searches, so a 60s base cadence plus
-# the per-cycle search cap keeps the single Prowlarr from being hammered. A
-# constant for the beta, mirroring ``_RECONCILE_INTERVAL_SECONDS``.
-_AUTOGRAB_INTERVAL_SECONDS = 60.0
+# the per-cycle search cap keeps the single Prowlarr from being hammered.
+#
+# Web-editable (issue #150) as of this constant's replacement: ``_autograb_loop``
+# reads ``get_auto_grab_interval_seconds`` fresh every iteration (mirroring
+# ``_eviction_loop``'s interval pickup) instead of sleeping this fixed value, so
+# a web-edited cadence takes effect on the very next tick with no restart. This
+# alias is ONLY the fallback used when that settings read itself fails (never
+# wedge the loop at an undefined sleep) -- see ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT``
+# in ``web.deps``, the single source of truth for the default value.
+_AUTOGRAB_INTERVAL_SECONDS = AUTO_GRAB_INTERVAL_SECONDS_DEFAULT
 
 
 async def _resolve_watchlist_server_identity(
@@ -678,6 +688,10 @@ async def _autograb_once_leased(app: FastAPI) -> None:
       no restart -- north-star #1's "turn this bot off with a button". A disabled
       or not-yet-configured (Prowlarr/qBittorrent absent) worker is a CLEAN no-op
       (``mark_ok``), never an error: nothing is wrong, there is just nothing to do.
+    * The per-cycle Prowlarr search cap (``auto_grab_max_searches_per_cycle``,
+      issue #150) is likewise re-read every tick and threaded into
+      :func:`auto_grab_service.run_grab_cycle`'s ``max_searches`` -- a web-edited
+      cap takes effect on the very next cycle, no restart.
     * Otherwise it delegates to :func:`auto_grab_service.run_grab_cycle`, which
       reuses the SAME ``decision_service.preview`` + ``grab_service.grab`` brains
       as the manual Grab button.
@@ -725,6 +739,7 @@ async def _autograb_once_leased(app: FastAPI) -> None:
         # state instead (a duplicate download can never happen for content that
         # isn't in Plex) -- mirrors ``_eviction_tick``'s own optional resolution.
         library = await get_library_optional(session, client)
+        max_searches = await get_auto_grab_max_searches_per_cycle(session)
         result = await auto_grab_service.run_grab_cycle(
             session,
             prowlarr=prowlarr,
@@ -735,6 +750,7 @@ async def _autograb_once_leased(app: FastAPI) -> None:
             library=library,
             cooldowns=_get_autograb_cooldowns(app),
             save_path=get_downloads_host_root(),
+            max_searches=max_searches,
         )
     # Surface how many scopes are CURRENTLY in a grab-pipeline cooldown (ADR-0013
     # round-3 #2), independent of the ok/error verdict below: a non-zero count is the
@@ -772,8 +788,28 @@ async def _autograb_loop(app: FastAPI) -> None:
     ``AutograbStatus`` health signal and the loop simply sleeps its base interval
     before retrying -- ``run_grab_cycle`` already ABORTS the rest of the cycle on
     the first raise (rather than hammering a down Prowlarr with every due scope),
-    so a 60s base cadence is itself the global cycle backoff. Mirrors
+    so the base cadence is itself the global cycle backoff. Mirrors
     ``_reconcile_loop``'s "one bad cycle never kills the loop".
+
+    The sleep duration is read FRESH every iteration (issue #150, mirroring
+    ``_eviction_loop``'s interval pickup) via ``get_auto_grab_interval_seconds``,
+    NOT cached -- a web-edited cadence takes effect on the very next sleep, no
+    restart (north star #1). That settings read is itself wrapped: a DB hiccup
+    (including one that also broke ``_autograb_once`` this same iteration) falls
+    back to ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT`` rather than ever wedging the
+    loop with an unresolved sleep.
+
+    The inter-cycle sleep is a WAKEABLE wait (issue #332, mirroring
+    ``_watchlist_sync_loop``): a settings write that changes the interval, the
+    per-cycle search cap, or the ``auto_grab_enabled`` toggle sets
+    ``app.state.autograb_wake_event`` so a lowered interval (or a re-enable) is
+    observed immediately instead of after the OLD -- possibly hour-long -- sleep
+    expires. A wake simply returns the ``wait_for`` early and falls through to
+    the next iteration, which re-reads ``auto_grab_enabled`` (inside
+    ``_autograb_once_leased``), the interval, and the search cap all fresh; it
+    never runs a second cycle concurrently (the loop is strictly sequential --
+    the cycle runs only at the top, exactly as the watchlist loop does), so a
+    spurious wake costs at most one extra cadence tick, never a double grab.
     """
     while True:
         try:
@@ -781,7 +817,29 @@ async def _autograb_loop(app: FastAPI) -> None:
         except Exception as exc:
             _get_autograb_status(app).mark_error(exc)
             _logger.exception("auto-grab loop iteration failed; continuing")
-        await asyncio.sleep(_AUTOGRAB_INTERVAL_SECONDS)
+        try:
+            async with app.state.sessionmaker() as session:
+                sleep_seconds = await get_auto_grab_interval_seconds(session)
+        except Exception:
+            _logger.exception(
+                "auto-grab interval read failed; sleeping the default interval and continuing"
+            )
+            sleep_seconds = _AUTOGRAB_INTERVAL_SECONDS
+        wake_event = getattr(app.state, "autograb_wake_event", None)
+        if not isinstance(wake_event, asyncio.Event):
+            wake_event = asyncio.Event()
+            app.state.autograb_wake_event = wake_event
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=sleep_seconds)
+        except TimeoutError:
+            # Expected, not an error: the interval elapsed with no manual wake
+            # signal, so it is simply time to run the next cycle. A fired
+            # wake_event (a relevant settings change requesting immediate pickup)
+            # returns normally; both paths fall through to the next iteration, so
+            # there is nothing to log or surface here.
+            pass
+        finally:
+            wake_event.clear()
 
 
 async def _log_drain_loop(app: FastAPI) -> None:
@@ -1430,6 +1488,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    # Wakeable inter-cycle sleep for ``_autograb_loop`` (issue #332): a settings
+    # write touching the interval / search-cap / enabled toggle sets this so the
+    # loop observes the change immediately instead of after the old sleep. Mirror
+    # of ``watchlist_wake_event`` below.
+    app.state.autograb_wake_event = asyncio.Event()
     app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
     app.state.watchlist_wake_event = asyncio.Event()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so

@@ -816,6 +816,8 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       log_max_rows: null,
       watchlist_sync_enabled: null,
       watchlist_sync_interval_minutes: null,
+      auto_grab_interval_seconds: null,
+      auto_grab_max_searches_per_cycle: null,
     }
     render(<Settings />, { wrapper: Wrapper })
 
@@ -830,6 +832,18 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       'max',
       '10080',
     )
+    expect(screen.getByLabelText('Auto-grab check interval (seconds)')).toHaveValue(60)
+    expect(screen.getByLabelText('Auto-grab check interval (seconds)')).toHaveAttribute(
+      'min',
+      '15',
+    )
+    expect(screen.getByLabelText('Auto-grab check interval (seconds)')).toHaveAttribute(
+      'max',
+      '3600',
+    )
+    expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveValue(5)
+    expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveAttribute('min', '2')
+    expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveAttribute('max', '50')
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).not.toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Enable Plex watchlist sync/i })).toBeChecked()
@@ -852,6 +866,12 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     fireEvent.change(screen.getByLabelText('Watchlist sync interval (minutes)'), {
       target: { value: '60' },
     })
+    fireEvent.change(screen.getByLabelText('Auto-grab check interval (seconds)'), {
+      target: { value: '120' },
+    })
+    fireEvent.change(screen.getByLabelText('Auto-grab searches per cycle'), {
+      target: { value: '10' },
+    })
     fireEvent.click(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i }))
     fireEvent.click(screen.getByRole('checkbox', { name: /^Proactive eviction/i }))
     fireEvent.click(screen.getByRole('checkbox', { name: /^Enable Plex watchlist sync/i }))
@@ -870,6 +890,8 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
     expect(body.eviction_proactive_enabled).toBe(true)
     expect(body.watchlist_sync_enabled).toBe(false)
     expect(body.watchlist_sync_interval_minutes).toBe(60)
+    expect(body.auto_grab_interval_seconds).toBe(120)
+    expect(body.auto_grab_max_searches_per_cycle).toBe(10)
   })
 
   it('surfaces the backend 422 (target above threshold) instead of swallowing it', async () => {

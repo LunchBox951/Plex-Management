@@ -2621,6 +2621,10 @@ export interface components {
             anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
+            /** Auto Grab Interval Seconds */
+            auto_grab_interval_seconds?: number | null;
+            /** Auto Grab Max Searches Per Cycle */
+            auto_grab_max_searches_per_cycle?: number | null;
             /** Automatic Update Idle Only */
             automatic_update_idle_only?: boolean | null;
             /** Automatic Update Timezone */
@@ -2709,6 +2713,10 @@ export interface components {
             anime_tv_root?: string | null;
             /** Auto Grab Enabled */
             auto_grab_enabled?: boolean | null;
+            /** Auto Grab Interval Seconds */
+            auto_grab_interval_seconds?: number | null;
+            /** Auto Grab Max Searches Per Cycle */
+            auto_grab_max_searches_per_cycle?: number | null;
             /** Automatic Update Idle Only */
             automatic_update_idle_only?: boolean | null;
             /** Automatic Update Timezone */

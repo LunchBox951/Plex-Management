@@ -43,6 +43,8 @@ from plex_manager.services.update_policy import (
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
+    AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
     AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
     AUTOMATIC_UPDATE_WEEKDAYS_DEFAULT,
     AUTOMATIC_UPDATE_WINDOW_END_DEFAULT,
@@ -76,6 +78,8 @@ from plex_manager.web.deps import (
     hash_session_token,
     load_system_settings,
     require_admin,
+    resolve_auto_grab_interval_seconds,
+    resolve_auto_grab_max_searches_per_cycle,
     resolve_bool_setting,
     resolve_disk_pressure_percents,
     resolve_eviction_grace_days,
@@ -418,6 +422,26 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | N
     max_rows, max_rows_honored = resolve_log_max_rows(raw.get("log_max_rows"))
     out["log_max_rows"] = _present_effective(
         raw.get("log_max_rows"), max_rows, LOG_MAX_ROWS_DEFAULT, max_rows_honored
+    )
+
+    autograb_interval, autograb_interval_honored = resolve_auto_grab_interval_seconds(
+        raw.get("auto_grab_interval_seconds")
+    )
+    out["auto_grab_interval_seconds"] = _present_effective(
+        raw.get("auto_grab_interval_seconds"),
+        autograb_interval,
+        AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+        autograb_interval_honored,
+    )
+
+    autograb_max_searches, autograb_max_searches_honored = resolve_auto_grab_max_searches_per_cycle(
+        raw.get("auto_grab_max_searches_per_cycle")
+    )
+    out["auto_grab_max_searches_per_cycle"] = _present_effective(
+        raw.get("auto_grab_max_searches_per_cycle"),
+        autograb_max_searches,
+        AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
+        autograb_max_searches_honored,
     )
 
     for key, default in _BOOL_SETTING_DEFAULTS.items():
@@ -1139,6 +1163,22 @@ async def put_settings_endpoint(
             wake_event = getattr(request.app.state, "watchlist_wake_event", None)
             if isinstance(wake_event, asyncio.Event):
                 wake_event.set()
+
+        # Same immediacy for the auto-grab worker (issue #332): a shortened
+        # interval, a changed per-cycle search cap, or a re-enable must be
+        # observed on the next tick, not after the OLD (up to 1h) sleep expires.
+        # ``_autograb_loop`` re-reads all three fresh when woken; the worker owns
+        # this process-local event.
+        if written_fields.intersection(
+            {
+                "auto_grab_enabled",
+                "auto_grab_interval_seconds",
+                "auto_grab_max_searches_per_cycle",
+            }
+        ):
+            autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
+            if isinstance(autograb_wake_event, asyncio.Event):
+                autograb_wake_event.set()
 
         # Clear backend probe caches before publishing: a listening tab can refetch
         # immediately on the SSE event, so publishing first could race it into the
