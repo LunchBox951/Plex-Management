@@ -82,6 +82,14 @@ const DETAIL_MESSAGES: Record<string, string> = {
   already_initialized: 'Setup is already complete. Change settings from the Settings page instead.',
   app_key_not_set: 'No recovery key exists. Generate one from Settings → Access.',
   app_key_changed: 'The recovery key changed while you were rotating it. Refresh and try again.',
+
+  // --- subscriber control (issue #314): withdrawal / collaborative cancellation ---
+  import_in_progress:
+    'A download for this request is finishing its import — try again in a moment.',
+  has_other_participants:
+    'Other people have requested this too — withdraw instead of cancelling it for everyone.',
+  withdrawal_blocked_active_request:
+    'This request still needs attention (a blocked import, or seasons still downloading) and you’re the last person on it. Resolve it first, then withdraw.',
 }
 
 export { DETAIL_MESSAGES }

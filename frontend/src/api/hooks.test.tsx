@@ -18,6 +18,7 @@ import {
   useUpdateSettings,
   useUpdateStatus,
   useUpdateWhenReady,
+  useWithdrawSubscription,
 } from './hooks'
 import { client } from './client'
 import {
@@ -323,6 +324,48 @@ describe('useMarkFailed', () => {
 
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
+  })
+})
+
+describe('useWithdrawSubscription', () => {
+  it('DELETEs the subscription path and invalidates requests, queue, and discover', async () => {
+    ;(client.DELETE as unknown as Mock).mockResolvedValue({
+      data: undefined,
+      response: { status: 204 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useWithdrawSubscription(), {
+      wrapper: createWrapper(qc),
+    })
+    await result.current.mutateAsync(42)
+
+    expect(client.DELETE).toHaveBeenCalledWith('/api/v1/requests/{request_id}/subscription', {
+      params: { path: { request_id: 42 } },
+    })
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.requests }))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.queue })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
+  })
+
+  it('throws the normalized ApiError on failure without invalidating anything', async () => {
+    ;(client.DELETE as unknown as Mock).mockResolvedValue({
+      error: { detail: 'has_other_participants' },
+      response: { status: 409 },
+    })
+
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+
+    const { result } = renderHook(() => useWithdrawSubscription(), {
+      wrapper: createWrapper(qc),
+    })
+    await expect(result.current.mutateAsync(42)).rejects.toMatchObject({
+      code: 'has_other_participants',
+    })
+    expect(invalidate).not.toHaveBeenCalled()
   })
 })
 

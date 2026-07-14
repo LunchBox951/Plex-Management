@@ -36,6 +36,7 @@ vi.mock('../api/hooks', () => ({
   useSetKeepForever: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -109,6 +110,9 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
     ...overrides,
   }
 }

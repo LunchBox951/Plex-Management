@@ -589,6 +589,35 @@ export function useCancelRequest() {
   })
 }
 
+/**
+ * Withdraw the caller's OWN subscription from a shared request (issue #314):
+ * the collaborative counterpart to `useCancelRequest`. Removes only the
+ * caller's participation — with other subscribers still attached this hands
+ * ownership off instead of cancelling their shared request out from under
+ * them; as the LAST participant it settles like a normal cancel. Always
+ * `204 No Content` on success, so there is nothing to render — the row simply
+ * drops out of the caller's next requests list. Invalidates requests + queue
+ * + discover so every surface (including tiles, whose `can_mutate`/ownership
+ * badge derive from the same rows) reflects the change at once.
+ */
+export function useWithdrawSubscription() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (requestId: number): Promise<void> => {
+      ensureOk(
+        await client.DELETE('/api/v1/requests/{request_id}/subscription', {
+          params: { path: { request_id: requestId } },
+        }),
+      )
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.requests })
+      void qc.invalidateQueries({ queryKey: queryKeys.queue })
+      void qc.invalidateQueries({ queryKey: ['discover'] })
+    },
+  })
+}
+
 /* --------------------------------------------------------- search-preview -- */
 
 export function useSearchPreview() {

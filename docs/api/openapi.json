@@ -2070,6 +2070,11 @@
             "title": "Can Mutate",
             "type": "boolean"
           },
+          "can_withdraw": {
+            "default": false,
+            "title": "Can Withdraw",
+            "type": "boolean"
+          },
           "download_progress": {
             "anyOf": [
               {
@@ -2081,6 +2086,11 @@
             ],
             "title": "Download Progress"
           },
+          "has_other_participants": {
+            "default": false,
+            "title": "Has Other Participants",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -2088,6 +2098,11 @@
           "is_anime": {
             "default": false,
             "title": "Is Anime",
+            "type": "boolean"
+          },
+          "is_owner": {
+            "default": false,
+            "title": "Is Owner",
             "type": "boolean"
           },
           "keep_forever": {
@@ -6044,7 +6059,7 @@
     },
     "/api/v1/requests/{request_id}/cancel": {
       "post": {
-        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.",
+        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\n``POST /cancel`` is a HARD cancel of the whole request -- it never silently\nremoves just the caller. An admin may always hard-cancel. A non-admin owner\nmay too, but ONLY when they are the request's sole participant; with other\nsubscribers still attached, this refuses 409 ``has_other_participants``\n(issue #314) -- the collaborative correction path for that case is\n``DELETE /subscription`` (Withdraw), which hands ownership off instead of\ncancelling co-participants' shared request out from under them.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.",
         "operationId": "cancel_request_endpoint_api_v1_requests__request_id__cancel_post",
         "parameters": [
           {
@@ -6094,7 +6109,7 @@
                 }
               }
             },
-            "description": "Not cancellable in its current state, an import is in progress, or qBittorrent is required but not configured"
+            "description": "Not cancellable in its current state, an import is in progress, a non-admin owner has other participants and must withdraw instead (``has_other_participants``), or qBittorrent is required but not configured"
           },
           "422": {
             "content": {
@@ -6279,6 +6294,79 @@
           }
         ],
         "summary": "Report Issue Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/{request_id}/subscription": {
+      "delete": {
+        "description": "Withdraw the caller's OWN subscription from a shared request (issue #314).\n\nThe collaborative counterpart to ``POST /cancel``: removes only the caller's\nparticipation, never the whole request out from under other subscribers. If\nOTHER subscribers remain, this is a mere subscription removal (with an\nownership handoff to the earliest remaining subscriber, if the caller was\nthe owner) -- nothing else is touched. If the caller is the LAST\nparticipant, this settles like a normal cancel (teardown + ``cancelled``)\nfor a not-yet-imported request, or simply removes the subscription for an\nalready-terminal one. See ``correction_service.withdraw_participant``'s\ndocstring for the full matrix.\n\nAlways ``204 No Content`` on success -- the caller removed themselves, so\nthere is nothing of theirs left to render; the row simply drops out of\ntheir next ``GET /requests``.",
+        "operationId": "withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "Request not found, or the caller does not subscribe to it"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorDetail"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ServiceNotConfiguredErrorDetail"
+                    }
+                  ],
+                  "title": "Response 409 Withdraw Subscription Endpoint Api V1 Requests  Request Id  Subscription Delete"
+                }
+              }
+            },
+            "description": "An import is in progress, the last-participant settle hit a not-cancellable TV season, the last participant tried to withdraw from an active non-cancellable request, or qBittorrent is required but not configured"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Withdraw Subscription Endpoint",
         "tags": [
           "requests"
         ]

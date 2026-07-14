@@ -17,6 +17,7 @@ import {
   useRequests,
   useSearchPreview,
   useSetKeepForever,
+  useWithdrawSubscription,
 } from '../api/hooks'
 import type {
   DiscoverResult,
@@ -58,6 +59,7 @@ vi.mock('../api/hooks', () => ({
   // works without each setup wiring them (individual tests can still override).
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
 
 beforeEach(() => {
@@ -142,6 +144,9 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       year: 2021,
     }
     const createMutation = mutation(created)
@@ -219,6 +224,9 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       media_type: 'movie',
       status: 'downloading',
       title: 'Test Movie',
@@ -327,6 +335,9 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const createRequestMock = mutation(created)
     const searchPreviewMock = mutation({
@@ -389,6 +400,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [{ season_number: 2, status: 'pending' }],
     }
     const createRequestMock = mutation(created)
@@ -439,6 +453,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'failed' },
@@ -499,6 +516,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'completed' },
         { season_number: 2, status: 'failed' },
@@ -557,6 +577,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'completed' },
         { season_number: 2, status: 'failed' },
@@ -596,6 +619,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -682,6 +708,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -716,6 +745,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'pending' },
@@ -756,6 +788,9 @@ describe('TitleDetailModal — tv season selector', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'downloading' },
@@ -804,6 +839,9 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }
@@ -954,6 +992,9 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }
@@ -1025,6 +1066,9 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
     }
     ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
@@ -1100,6 +1144,9 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
             is_anime: false,
             keep_forever: false,
             can_mutate: true,
+            is_owner: false,
+            can_withdraw: false,
+            has_other_participants: false,
             seasons: [
               { season_number: 1, status: 'available' },
               { season_number: 2, status: 'downloading' },
@@ -1110,6 +1157,259 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     })
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+})
+
+describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #314)', () => {
+  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 7,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
+      ...overrides,
+    }
+  }
+
+  function asSharedUser() {
+    authState.current = {
+      data: {
+        authenticated: true,
+        auth_method: 'plex_session',
+        is_admin: false,
+        user: { is_admin: false },
+      },
+      isLoading: false,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    authState.current = authState.admin
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
+    ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(idle())
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(idle())
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+  })
+
+  it('shows "Cancel request" (never Withdraw) to an admin, even with other participants', () => {
+    // authState.current already defaults to admin (see beforeEach above).
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            is_owner: false,
+            can_withdraw: false,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /cancel request/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /withdraw/i })).not.toBeInTheDocument()
+  })
+
+  it('shows "Cancel request" to a non-admin sole owner (no other participants)', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: false }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /cancel request/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /withdraw/i })).not.toBeInTheDocument()
+  })
+
+  it('shows "Withdraw" (never Cancel) to a non-admin owner WITH other participants', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: true }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it('shows "Withdraw" to a plain (non-owner) subscriber', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ is_owner: false, can_withdraw: true, has_other_participants: true }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it('shows the plain-subscriber withdraw confirm copy and calls withdraw with the live request id', async () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ id: 9, is_owner: false, can_withdraw: true, has_other_participants: true }),
+        ],
+      },
+    })
+    const withdrawMock = mutation(undefined)
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Remove from your requests?')).toBeInTheDocument()
+    const confirms = screen.getAllByRole('button', { name: /withdraw/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(9))
+  })
+
+  it('shows the owner-with-others withdraw confirm copy (hand-off wording)', () => {
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: true }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Withdraw and hand off?')).toBeInTheDocument()
+  })
+
+  it('shows "Withdraw" to a non-admin SOLE owner of a SETTLED row (Cancel is unavailable there)', () => {
+    // Codex #333, Finding 2: a settled row has no Cancel (CANCELLABLE_STATUSES
+    // excludes it), so gating Withdraw on `(!isOwner || hasOtherParticipants)`
+    // wrongly left a sole owner with NO self-removal path. Gating on `!canCancel`
+    // fixes it: Cancel is absent here, so Withdraw appears.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it.each(['available', 'completed', 'failed', 'cancelled', 'evicted', 'import_blocked'] as const)(
+    'offers Withdraw to a participant on a settled/blocked row (%s)',
+    (status) => {
+      // Codex #333, Finding 2: these switch arms previously omitted the Withdraw
+      // button entirely, stranding a participant of a settled/blocked row with no
+      // self-removal affordance.
+      asSharedUser()
+      ;(useRequests as unknown as Mock).mockReturnValue({
+        data: {
+          requests: [
+            movieRequest({
+              status,
+              is_owner: false,
+              can_withdraw: true,
+              has_other_participants: true,
+            }),
+          ],
+        },
+      })
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+      expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    },
+  )
+
+  it('still shows Withdraw to a sole participant on import_blocked (backend owns the 409)', () => {
+    // Codex #333, Findings 1+2: we deliberately do NOT re-derive the backend's
+    // active-non-cancellable status set in the client. The button shows; a
+    // last-participant withdrawal from import_blocked / partially_available 409s
+    // `withdrawal_blocked_active_request`, which `runWithdraw` surfaces as a toast.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'import_blocked',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+  })
+
+  it('shows "Withdraw" to an ADMIN who is ALSO a participant of a settled row', () => {
+    // Codex #333 round 2, Finding C: gating on the API's `can_withdraw` (not a
+    // blanket `!isAdmin`) lets an admin-participant remove THEMSELVES from a
+    // settled row instead of being forced to hard-cancel it for everyone. The
+    // admin auth default from beforeEach stands; `can_withdraw: true` marks them
+    // a participant of this row.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+  })
+
+  it('hides "Withdraw" from a NON-participant admin on a settled row', () => {
+    // Finding C boundary: an admin who does NOT subscribe to the row
+    // (`can_withdraw: false`) still sees no Withdraw -- withdrawal is a
+    // participant capability, and the API drives that with `can_withdraw`.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: false,
+            can_withdraw: false,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /withdraw/i })).not.toBeInTheDocument()
   })
 })
 
@@ -1124,6 +1424,9 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }
@@ -1191,6 +1494,9 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }
@@ -1375,6 +1681,9 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const previewMutation = baseMocks([request])
     const action = { kind: 're-search' as const, requestId: 71, season: null, token: 9 }
@@ -1414,6 +1723,9 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'no_acceptable_release' },
@@ -1466,6 +1778,9 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'downloading' },
         { season_number: 2, status: 'pending' },
@@ -1480,6 +1795,9 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       seasons: [
         { season_number: 1, status: 'available' },
         { season_number: 2, status: 'no_acceptable_release' },
@@ -1550,6 +1868,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const clickedRow: RequestResponse = {
       id: 81,
@@ -1560,6 +1881,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const previewMutation = mutation({
       accepted: [],
@@ -1607,6 +1931,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const freshRow: RequestResponse = {
       id: 82,
@@ -1617,6 +1944,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const createRequestMock = mutation(freshRow)
     ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
@@ -1672,6 +2002,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const freshRow: RequestResponse = {
       id: 82,
@@ -1682,6 +2015,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const otherUsersRow: RequestResponse = {
       id: 83,
@@ -1692,6 +2028,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const createRequestMock = mutation(freshRow)
     ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
@@ -1758,6 +2097,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const freshRow: RequestResponse = {
       id: 82,
@@ -1768,6 +2110,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     const otherUsersRow: RequestResponse = {
       id: 83,
@@ -1778,6 +2123,9 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
     }
     // A queue item for EACH request: the stale created row (82, id 501) and the
     // freshly clicked row (83, id 502). Both are mark-failable ('downloading')
@@ -1871,6 +2219,9 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }
@@ -1975,6 +2326,9 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
             is_anime: false,
             keep_forever: false,
             can_mutate: true,
+            is_owner: false,
+            can_withdraw: false,
+            has_other_participants: false,
             seasons: [{ season_number: 1, status: 'available' }],
           } satisfies RequestResponse,
         ],
@@ -2031,6 +2385,9 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       is_anime: false,
       keep_forever: false,
       can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
       ...overrides,
     }
   }

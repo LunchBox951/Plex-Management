@@ -22,6 +22,8 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.library import LibraryPort
@@ -29,11 +31,13 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import RequestRecord
 
 __all__ = [
+    "SETTLED_REQUEST_STATUS_VALUES",
     "TERMINAL_REQUEST_STATUS_VALUES",
     "CreateRequestResult",
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
+    "count_subscribers",
     "create_request",
     "create_request_result",
     "fold_requests_for_display",
@@ -41,6 +45,8 @@ __all__ = [
     "is_request_visible_to_user",
     "list_requests",
     "list_requests_for_user",
+    "list_subscribed_request_ids",
+    "list_subscribers",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
@@ -122,13 +128,24 @@ _PARKABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 # for the requests-list fold (:func:`fold_requests_for_display`) -- that helper
 # works over ``RequestRecord.status`` (already a ``str``, per the DTO), so it
 # needs the string-valued set rather than the SQL-side ``RequestStatus`` enum
-# frozenset. ``completed`` and ``no_acceptable_release`` are deliberately NOT
-# settled here, for the SAME reason the repo module documents: a ``completed``
-# ("Finalizing") row must keep shadowing a stale duplicate rather than being
-# folded away by one. Kept in sync with the repo module's set by
+# frozenset. This is exactly the DEDUP-INACTIVE set: the complement (among
+# request statuses) of ``uq_media_requests_active``'s partial-index predicate,
+# so a row in this set no longer shadows a fresh request for the same media.
+# ``completed`` and ``no_acceptable_release`` are deliberately NOT settled here,
+# for the SAME reason the repo module documents: a ``completed`` ("Finalizing")
+# row must keep shadowing a stale duplicate rather than being folded away by one.
+# Kept in sync with the repo module's set by
 # ``test_settled_status_value_sets_in_sync`` -- if the two ever drift, that test
 # fails loudly rather than the list quietly folding the wrong row.
-_SETTLED_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+#
+# Public (issue #314 / #333 round 2): ``correction_service.withdraw_participant``
+# gates the last participant's plain (no-teardown) settle on this set -- a last
+# withdrawal is only safe from a genuinely settled row, NEVER a still
+# dedup-blocking one like ``completed`` (which would strand an active,
+# participant-less, dedup-blocking row), so it must reason about the SAME
+# boundary this drives, not the broader ``TERMINAL_REQUEST_STATUS_VALUES`` (which
+# includes the still-dedup-active ``completed``).
+SETTLED_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     s.value
     for s in (
         RequestStatus.available,
@@ -472,9 +489,12 @@ async def _subscribe_user(
 ) -> RequestRecord:
     """Persist shared visibility for an authenticated requester.
 
-    TODO(issue #58): richer subscriber control (withdrawal, collaborative
-    cancellation, per-user intent) belongs in the shared-request policy, not in
-    watchlist synchronization. Until then subscribers remain view-only.
+    Withdrawal + collaborative cancellation shipped in issue #314
+    (``correction_service.withdraw_participant`` / ``cancel_request_as_owner``,
+    ``DELETE /api/v1/requests/{id}/subscription``). TODO(issue #314): per-user
+    TV season-scope intent (differing season sets under one shared request)
+    remains deferred -- this function still just grants VIEW-and-withdraw
+    visibility, never distinct per-subscriber season intent.
     """
     if user_id is None:
         return record
@@ -675,6 +695,30 @@ async def create_request_result(
 
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
+    if existing is not None:
+        # (Codex #333 round 2, Finding D) Serialize the dedup-JOIN under the SAME
+        # per-media lock ``correction_service.withdraw_participant`` /
+        # ``cancel_request_as_owner`` hold. ``find_active`` above ran BEFORE any
+        # lock, so a concurrent sole-participant withdrawal can settle/cancel this
+        # exact row in the gap before a subscriber is attached below -- and
+        # attaching one to a just-cancelled row would resurrect a dead request as
+        # a zombie subscription (a settled row is participant-less by design).
+        # Take the lock and RE-READ ``find_active`` under it: only join a row that
+        # is STILL active. The ``_subscribe_*`` helpers below commit (releasing the
+        # lock), so the durable subscriber row is written while liveness holds --
+        # a later withdrawal that acquires this lock then sees the subscriber and
+        # falls to a mere removal instead of a teardown. The lock is held only
+        # across the DB re-read + the quick subscriber INSERT (no Plex/TMDB I/O),
+        # matching every other participant-set path's ordering.
+        await repo.acquire_media_lock(tmdb_id, media_type)
+        existing = await repo.find_active(tmdb_id, media_type)
+        if existing is None:
+            # The active row we saw was concurrently settled/cancelled. Release the
+            # lock -- its write transaction must NOT stay open across the Plex/TMDB
+            # I/O the fresh-create path runs below (SQLite single-writer, ADR-0007)
+            # -- and fall through to a normal create, which re-reads + re-locks as
+            # needed and mints a fresh row rather than joining the corpse.
+            await session.rollback()
     if existing is not None:
         # Issue #58: a non-admin authenticated user must not dedup onto an active
         # request OWNED BY A DIFFERENT USER. Falling through would (a) for tv mutate
@@ -1209,6 +1253,34 @@ async def is_request_visible_to_user(session: AsyncSession, request_id: int, use
     return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
 
 
+async def list_subscribers(session: AsyncSession, request_id: int) -> list[int]:
+    """Return every subscribed user id, earliest-subscribed first (issue #314).
+
+    Drives the ``can_withdraw``/``has_other_participants``/``is_owner`` DTO
+    flags (``web/routers/requests.py:_to_response``) for a single-record
+    response; the list endpoint uses the batched :func:`count_subscribers` and
+    :func:`list_subscribed_request_ids` instead to avoid an N+1.
+    """
+    return await SqlRequestRepository(session).list_subscribers(request_id)
+
+
+async def count_subscribers(session: AsyncSession, request_ids: Sequence[int]) -> dict[int, int]:
+    """Batch subscriber counts per request id (issue #314); ``{}`` on empty input."""
+    return await SqlRequestRepository(session).count_subscribers(request_ids)
+
+
+async def list_subscribed_request_ids(session: AsyncSession, user_id: int) -> set[int]:
+    """Return the set of request ids ``user_id`` subscribes to (issue #314).
+
+    Used to compute ``can_withdraw``/``has_other_participants`` on the requests
+    list endpoint without a per-row query: a non-admin's list is already
+    subscriber-filtered (every returned row is in this set by construction),
+    while an admin's unfiltered view needs the real membership check (an admin
+    is not necessarily a subscriber of every row they can see).
+    """
+    return await SqlRequestRepository(session).list_subscribed_request_ids(user_id)
+
+
 def fold_requests_for_display(
     records: list[RequestRecord], *, subscriber_scoped: bool = False
 ) -> list[RequestRecord]:
@@ -1251,7 +1323,7 @@ def fold_requests_for_display(
     chosen: list[RequestRecord] = []
     for key in order:
         group = groups[key]
-        active = next((r for r in group if r.status not in _SETTLED_STATUS_VALUES), None)
+        active = next((r for r in group if r.status not in SETTLED_REQUEST_STATUS_VALUES), None)
         chosen.append(active if active is not None else group[-1])
     return sorted(chosen, key=lambda r: r.id)
 

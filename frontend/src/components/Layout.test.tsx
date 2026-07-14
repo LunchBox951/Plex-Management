@@ -52,6 +52,9 @@ function requestRow(id: number, status: RequestResponse['status']): RequestRespo
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
   }
 }
 

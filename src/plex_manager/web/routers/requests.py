@@ -29,6 +29,7 @@ from plex_manager.services.correction_service import (
     NotReportableError,
     ReportSeasonRequiredError,
     SeasonNotFoundError,
+    WithdrawalBlockedActiveError,
 )
 from plex_manager.services.library_roots import LibraryRoots
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
@@ -140,10 +141,11 @@ _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
 }
 
-# The cancel endpoint's manually-raised statuses (ADR-0014 correction verb):
-# 404 ``request_not_found``, 409 ``not_cancellable``/``import_in_progress`` (plain
-# ``HTTPException`` -- ``ErrorDetail`` wire shape), and ``ServiceNotConfiguredError``'s
-# 409 ``service_not_configured`` (rendered by the app-wide handler, NOT a plain
+# The cancel endpoint's manually-raised statuses (ADR-0014 correction verb, extended
+# by issue #314): 404 ``request_not_found``, 409 ``not_cancellable``/
+# ``import_in_progress``/``has_other_participants`` (plain ``HTTPException`` --
+# ``ErrorDetail`` wire shape), and ``ServiceNotConfiguredError``'s 409
+# ``service_not_configured`` (rendered by the app-wide handler, NOT a plain
 # ``HTTPException``). That handler's body ALWAYS carries a ``service`` field
 # (``{"detail": "service_not_configured", "service": "qbittorrent"}``) that
 # ``ErrorDetail`` has no field for, so this status is documented across BOTH
@@ -154,13 +156,47 @@ _REPORT_ISSUE_RESPONSES: dict[int | str, dict[str, Any]] = {
 # ``ServiceNotConfiguredErrorDetail`` a dangling ref). This documents
 # ``service`` on the generated client type, so callers can route the operator
 # straight to qBittorrent setup instead of losing the field to the generic shape.
+#
+# ``has_other_participants`` (issue #314): a non-admin owner's ``POST /cancel``
+# with other subscribers still attached is refused rather than silently
+# hard-cancelling their shared request out from under them -- the UI routes
+# that case to ``DELETE /subscription`` (Withdraw) instead.
 _CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorDetail, "description": "Request not found"},
     409: {
         "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
         "description": (
-            "Not cancellable in its current state, an import is in progress, or "
-            "qBittorrent is required but not configured"
+            "Not cancellable in its current state, an import is in progress, a "
+            "non-admin owner has other participants and must withdraw instead "
+            "(``has_other_participants``), or qBittorrent is required but not "
+            "configured"
+        ),
+    },
+}
+
+# The withdraw endpoint's manually-raised statuses (issue #314): 404
+# ``request_not_found`` (unknown id, or the caller is not a subscriber -- the same
+# "hide non-participant existence" posture as the cancel/report-issue mutator
+# guard), 409 ``import_in_progress``/``not_cancellable`` (the last-participant
+# settle branch reuses ``cancel_request``'s own refusals verbatim),
+# ``withdrawal_blocked_active_request`` (the last participant tried to withdraw
+# from an ACTIVE non-cancellable row -- ``import_blocked``/``partially_available``/
+# ``completed`` -- which is still dedup-blocking yet neither tearable-down nor
+# genuinely settled; ``completed`` is imported-but-awaiting-Plex-confirmation), and
+# ``ServiceNotConfiguredError``'s 409 ``service_not_configured`` (same shape/
+# rationale as the cancel endpoint's, above).
+_WITHDRAW_SUBSCRIPTION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {
+        "model": ErrorDetail,
+        "description": "Request not found, or the caller does not subscribe to it",
+    },
+    409: {
+        "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
+        "description": (
+            "An import is in progress, the last-participant settle hit a "
+            "not-cancellable TV season, the last participant tried to withdraw "
+            "from an active non-cancellable request, or qBittorrent is required "
+            "but not configured"
         ),
     },
 }
@@ -169,6 +205,16 @@ _CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
 def _can_mutate_request(auth: AuthContext, record: RequestRecord) -> bool:
     """Return whether this caller owns the request or has operator access."""
     return auth.is_admin or (auth.user_id is not None and record.user_id == auth.user_id)
+
+
+def _is_owner(auth: AuthContext, record: RequestRecord) -> bool:
+    """Return whether this caller is the request's CURRENT owner (issue #314).
+
+    ``user_id`` can hand off on withdrawal (``correction_service.
+    withdraw_participant``), so this is deliberately re-derived per response
+    rather than cached from creation time.
+    """
+    return auth.user_id is not None and record.user_id == auth.user_id
 
 
 async def _require_request_mutator(
@@ -183,6 +229,47 @@ async def _require_request_mutator(
     return auth
 
 
+async def _require_subscriber(
+    request_id: int,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AuthContext:
+    """Allow only a subscriber (participant) of the request (issue #314).
+
+    Withdrawal is a participant's own capability, not an admin one: an admin
+    who is NOT a subscriber of this row gets 404 here (the same "hide
+    non-owned/non-participant existence" posture as ``_require_request_mutator``)
+    and uses ``POST /cancel`` instead. The legacy app API key carries no user
+    identity (``auth.user_id is None``) and so can never withdraw.
+    """
+    record = await request_service.get_request(session, request_id)
+    if (
+        record is None
+        or auth.user_id is None
+        or not await request_service.is_request_visible_to_user(session, request_id, auth.user_id)
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+    return auth
+
+
+async def _subscriber_flags(
+    session: AsyncSession, record: RequestRecord, auth: AuthContext
+) -> tuple[bool, bool]:
+    """Return ``(can_withdraw, has_other_participants)`` for the caller (issue #314).
+
+    A single-record analogue of the list endpoint's batched
+    ``count_subscribers``/``list_subscribed_request_ids`` -- used everywhere a
+    ``RequestResponse`` is built for exactly one row (create/get/keep-forever/
+    report-issue/cancel), where batching would buy nothing.
+    """
+    if auth.user_id is None:
+        return False, False
+    subscribers = await request_service.list_subscribers(session, record.id)
+    can_withdraw = auth.user_id in subscribers
+    has_other_participants = any(uid != auth.user_id for uid in subscribers)
+    return can_withdraw, has_other_participants
+
+
 async def _to_response(
     session: AsyncSession,
     record: RequestRecord,
@@ -191,6 +278,9 @@ async def _to_response(
     active_downloads_by_request: dict[int, list[DownloadRecord]] | None = None,
     *,
     can_mutate: bool = False,
+    is_owner: bool = False,
+    can_withdraw: bool = False,
+    has_other_participants: bool = False,
 ) -> RequestResponse:
     """Map a request record to the wire DTO, embedding its per-season rollup for tv.
 
@@ -288,6 +378,9 @@ async def _to_response(
         download_progress=download_progress,
         keep_forever=record.keep_forever,
         can_mutate=can_mutate,
+        is_owner=is_owner,
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
     )
 
 
@@ -349,8 +442,14 @@ async def create_request_endpoint(
         ) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK
+    can_withdraw, has_other_participants = await _subscriber_flags(session, result.record, auth)
     response_body = await _to_response(
-        session, result.record, can_mutate=_can_mutate_request(auth, result.record)
+        session,
+        result.record,
+        can_mutate=_can_mutate_request(auth, result.record),
+        is_owner=_is_owner(auth, result.record),
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
     )
     publish_realtime(
         http_request.app,
@@ -396,6 +495,18 @@ async def list_requests_endpoint(
     episode_counts_by_season_id = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
         all_season_ids
     )
+    # Batch the issue #314 subscriber-control flags too: one count-per-request query
+    # (``has_other_participants``) plus one membership-set query for the caller
+    # (``can_withdraw``) instead of a per-row subscriber lookup. A non-admin's list
+    # is already subscriber-filtered above, so every row is in the caller's own
+    # membership set by construction; an admin's UNFILTERED view is not, so the real
+    # membership check still matters there (see ``list_subscribed_request_ids``).
+    subscriber_counts = await request_service.count_subscribers(session, [r.id for r in records])
+    subscribed_ids: set[int] = (
+        await request_service.list_subscribed_request_ids(session, auth.user_id)
+        if auth.user_id is not None
+        else set()
+    )
     return RequestListResponse(
         requests=[
             await _to_response(
@@ -405,6 +516,11 @@ async def list_requests_endpoint(
                 episode_counts_by_season_id,
                 active_downloads_by_request,
                 can_mutate=_can_mutate_request(auth, r),
+                is_owner=_is_owner(auth, r),
+                can_withdraw=r.id in subscribed_ids,
+                has_other_participants=(
+                    subscriber_counts.get(r.id, 0) - (1 if r.id in subscribed_ids else 0) > 0
+                ),
             )
             for r in records
         ]
@@ -429,7 +545,15 @@ async def get_request_endpoint(
     )
     if record is None or (not auth.is_admin and not visible):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-    return await _to_response(session, record, can_mutate=_can_mutate_request(auth, record))
+    can_withdraw, has_other_participants = await _subscriber_flags(session, record, auth)
+    return await _to_response(
+        session,
+        record,
+        can_mutate=_can_mutate_request(auth, record),
+        is_owner=_is_owner(auth, record),
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
+    )
 
 
 @router.post("/{request_id}/keep-forever")
@@ -462,7 +586,15 @@ async def keep_forever_endpoint(
     )
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
-    response_body = await _to_response(session, record, can_mutate=True)
+    can_withdraw, has_other_participants = await _subscriber_flags(session, record, auth)
+    response_body = await _to_response(
+        session,
+        record,
+        can_mutate=True,
+        is_owner=_is_owner(auth, record),
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
+    )
     publish_realtime(
         http_request.app,
         ("requests", "discover", "ops:disk"),
@@ -571,7 +703,15 @@ async def report_issue_endpoint(
             "(Settings → Library), then try again.",
             diagnostics=({"root": exc.root_path} if auth.is_admin and exc.root_path else None),
         ) from exc
-    response_body = await _to_response(session, updated, can_mutate=True)
+    can_withdraw, has_other_participants = await _subscriber_flags(session, updated, auth)
+    response_body = await _to_response(
+        session,
+        updated,
+        can_mutate=True,
+        is_owner=_is_owner(auth, updated),
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
+    )
     publish_realtime(
         http_request.app,
         ("requests", "queue", "blocklist", "discover"),
@@ -596,6 +736,14 @@ async def cancel_request_endpoint(
     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
     to redo an imported title instead.
 
+    ``POST /cancel`` is a HARD cancel of the whole request -- it never silently
+    removes just the caller. An admin may always hard-cancel. A non-admin owner
+    may too, but ONLY when they are the request's sole participant; with other
+    subscribers still attached, this refuses 409 ``has_other_participants``
+    (issue #314) -- the collaborative correction path for that case is
+    ``DELETE /subscription`` (Withdraw), which hands ownership off instead of
+    cancelling co-participants' shared request out from under them.
+
     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
     ``pending``/``searching``/``no_acceptable_release`` request with NO active download
     rows is a pure DB settle that never touches the client, so it still works on an
@@ -604,10 +752,25 @@ async def cancel_request_endpoint(
     ``service_not_configured``) rather than silently leaking a seeding torrent.
     """
     try:
-        updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+        if auth.is_admin:
+            updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+        else:
+            if auth.user_id is None:  # pragma: no cover - defensive; the mutator dependency
+                # already required a user-owned row match, which is impossible without a
+                # user identity -- this can never actually be reached.
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
+                )
+            updated = await correction_service.cancel_request_as_owner(
+                session, qbt, request_id=request_id, user_id=auth.user_id
+            )
     except correction_service.RequestNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
+        ) from exc
+    except correction_service.HasOtherParticipantsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="has_other_participants"
         ) from exc
     except NotCancellableError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
@@ -623,10 +786,87 @@ async def cancel_request_endpoint(
         # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
         # before any state change, so nothing was settled or removed.
         raise ServiceNotConfiguredError("qbittorrent") from exc
-    response_body = await _to_response(session, updated, can_mutate=True)
+    can_withdraw, has_other_participants = await _subscriber_flags(session, updated, auth)
+    response_body = await _to_response(
+        session,
+        updated,
+        can_mutate=True,
+        is_owner=_is_owner(auth, updated),
+        can_withdraw=can_withdraw,
+        has_other_participants=has_other_participants,
+    )
     publish_realtime(
         http_request.app,
         ("requests", "queue", "discover"),
         reason="cancel_request",
     )
     return response_body
+
+
+@router.delete(
+    "/{request_id}/subscription",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=_WITHDRAW_SUBSCRIPTION_RESPONSES,
+)
+async def withdraw_subscription_endpoint(
+    request_id: int,
+    http_request: Request,
+    auth: Annotated[AuthContext, Depends(_require_subscriber)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
+) -> Response:
+    """Withdraw the caller's OWN subscription from a shared request (issue #314).
+
+    The collaborative counterpart to ``POST /cancel``: removes only the caller's
+    participation, never the whole request out from under other subscribers. If
+    OTHER subscribers remain, this is a mere subscription removal (with an
+    ownership handoff to the earliest remaining subscriber, if the caller was
+    the owner) -- nothing else is touched. If the caller is the LAST
+    participant, this settles like a normal cancel (teardown + ``cancelled``)
+    for a not-yet-imported request, or simply removes the subscription for an
+    already-terminal one. See ``correction_service.withdraw_participant``'s
+    docstring for the full matrix.
+
+    Always ``204 No Content`` on success -- the caller removed themselves, so
+    there is nothing of theirs left to render; the row simply drops out of
+    their next ``GET /requests``.
+    """
+    if auth.user_id is None:  # pragma: no cover - defensive; ``_require_subscriber``
+        # already required real subscriber membership, which is impossible without
+        # a user identity -- this can never actually be reached.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found")
+    try:
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=auth.user_id
+        )
+    except correction_service.RequestNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
+        ) from exc
+    except NotCancellableError as exc:
+        # Defensive: a mere-removal (others remain) never settles a done row, but the
+        # last-participant branch reuses cancel_request's own TV per-season guard,
+        # which CAN raise this (a done season under an otherwise-cancellable parent
+        # rollup) -- surfaced the same honest, retryable 409 the cancel endpoint uses.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
+    except WithdrawalBlockedActiveError as exc:
+        # The last participant tried to withdraw from an ACTIVE non-cancellable row
+        # (import_blocked / partially_available / completed): still dedup-blocking,
+        # yet neither tearable-down nor genuinely settled. Refused with an honest,
+        # actionable 409 -- resolve the import, let the in-flight seasons settle, or
+        # let the Plex confirmation land (completed -> available) first, then withdraw.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="withdrawal_blocked_active_request"
+        ) from exc
+    except ImportInProgressError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"
+        ) from exc
+    except DownloadClientRequiredError as exc:
+        raise ServiceNotConfiguredError("qbittorrent") from exc
+    publish_realtime(
+        http_request.app,
+        ("requests", "queue", "discover"),
+        reason="cancel_request" if outcome.settled else "request_withdrawn",
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

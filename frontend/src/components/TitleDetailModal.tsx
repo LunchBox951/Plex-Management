@@ -10,6 +10,7 @@ import {
   useReportIssue,
   useRequests,
   useSetKeepForever,
+  useWithdrawSubscription,
   type ReportReason,
 } from '../api/hooks'
 import type {
@@ -393,6 +394,7 @@ export function TitleDetailModal({
   const setKeepForever = useSetKeepForever()
   const reportIssue = useReportIssue()
   const cancelRequest = useCancelRequest()
+  const withdrawSubscription = useWithdrawSubscription()
 
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
@@ -478,6 +480,13 @@ export function TitleDetailModal({
   const [reportReason, setReportReason] = useState<ReportReason>('bad_quality')
   // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
   const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
+  // The confirm dialog for withdrawing the caller's OWN subscription (issue
+  // #314) -- the collaborative counterpart to `cancelFor`. `isOwnerWithOthers`
+  // picks the confirm copy (see `withdrawButton` below).
+  const [withdrawFor, setWithdrawFor] = useState<{
+    requestId: number
+    isOwnerWithOthers: boolean
+  } | null>(null)
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
   const [reacquireOpen, setReacquireOpen] = useState(false)
@@ -505,6 +514,7 @@ export function TitleDetailModal({
     setReportIssueFor(null)
     setReportReason('bad_quality')
     setCancelFor(null)
+    setWithdrawFor(null)
     setReacquireOpen(false)
     setBackdropFailed(false)
     setPosterFailed(false)
@@ -576,6 +586,15 @@ export function TitleDetailModal({
   const canMutateRequest = pinTracksFreshRequest
     ? createdCanMutate
     : (liveRequest?.can_mutate ?? false)
+
+  // Issue #314 subscriber-control relationship flags -- drive the Cancel-vs-
+  // Withdraw decision below. Read straight off the live request (not gated by
+  // `pinTracksFreshRequest` like the pin fields above): a just-created request
+  // has no OTHER subscribers yet, so there is nothing collaborative to get
+  // wrong during that transient create-then-poll window.
+  const isOwner = liveRequest?.is_owner ?? false
+  const canWithdraw = liveRequest?.can_withdraw ?? false
+  const hasOtherParticipants = liveRequest?.has_other_participants ?? false
 
   // tv only: this show's per-season rollup — the live poll once it lands, else the
   // just-created request's own list (the same create-then-poll gap as
@@ -871,6 +890,20 @@ export function TitleDetailModal({
     }
   }, [cancelFor, cancelRequest, toast])
 
+  // Withdraw the caller's OWN subscription (issue #314) -- collaborative
+  // self-removal. Never touches what a remaining owner/other subscriber wants;
+  // as the LAST participant it settles like a normal cancel server-side.
+  const runWithdraw = useCallback(async () => {
+    if (!withdrawFor) return
+    try {
+      await withdrawSubscription.mutateAsync(withdrawFor.requestId)
+      toast({ title: 'Removed from your requests', intent: 'success' })
+      setWithdrawFor(null)
+    } catch (error) {
+      toast({ title: 'Withdraw failed', description: asApiError(error).message, intent: 'error' })
+    }
+  }, [withdrawFor, withdrawSubscription, toast])
+
   // Retry a blocked import (operator fixed the infra, or it was a transient Plex
   // hiccup). The reconcile loop re-runs validate -> place -> scan; an idempotent
   // re-import skips the copy if the file is already in place.
@@ -1062,15 +1095,54 @@ export function TitleDetailModal({
   const anySeasonImported = (liveRequest?.seasons ?? []).some(
     (s) => s.status === 'available' || s.status === 'completed',
   )
+  // Issue #314: a non-admin owner with OTHER subscribers attached must not see
+  // "Cancel request" -- the backend 409s `has_other_participants` for exactly
+  // that combination (POST /cancel is a hard cancel of the whole shared row).
+  // An admin's hard-cancel right is unrestricted; a non-admin owner's is
+  // narrowed to "I am the sole participant" -- everyone else uses Withdraw.
   const canCancel =
     canMutateRequest &&
     liveRequest != null &&
     CANCELLABLE_STATUSES.has(liveRequest.status) &&
-    !anySeasonImported
+    !anySeasonImported &&
+    (isAdmin || !hasOtherParticipants)
   const cancelButton =
     canCancel && liveRequest ? (
       <Button variant="danger" onClick={() => setCancelFor({ requestId: liveRequest.id })}>
         Cancel request
+      </Button>
+    ) : null
+
+  // Issue #314: collaborative self-removal, the counterpart to Cancel above.
+  // Shown to ANY participant (`canWithdraw`, the API's own participant flag)
+  // EXCEPT where Cancel is their applicable verb -- i.e. gated on `!canCancel`,
+  // the exact mutual-exclusion the two buttons need: a SOLE owner of a
+  // still-cancellable row uses Cancel (canCancel true -> Withdraw hidden), but the
+  // same sole owner of a SETTLED row has no Cancel (canCancel false, since
+  // CANCELLABLE_STATUSES excludes it) and MUST be able to withdraw. Gating on the
+  // API's `canWithdraw` rather than a blanket `!isAdmin` (Codex #333 round 2,
+  // Finding C): an admin who is ALSO a participant of this row can (and the API's
+  // `can_withdraw` permits) withdraw themselves instead of being forced to
+  // hard-cancel it for everyone -- while a NON-participant admin still sees no
+  // Withdraw (`canWithdraw` is false for them). Deliberately NOT gated on
+  // `CANCELLABLE_STATUSES`: withdrawal is valid from any status the caller
+  // participates in, including an already-settled row. The backend still owns
+  // the last-participant refusal for an ACTIVE non-cancellable row
+  // (import_blocked / partially_available / completed -> 409
+  // `withdrawal_blocked_active_request`); we deliberately show the button there
+  // rather than duplicating that status set in the client, and `runWithdraw`
+  // surfaces the honest 409 message (a sole participant on such a row is rare; a
+  // co-participant's withdrawal always succeeds as a mere removal).
+  const canWithdrawHere = canWithdraw && liveRequest != null && !canCancel
+  const withdrawButton =
+    canWithdrawHere && liveRequest ? (
+      <Button
+        variant="danger"
+        onClick={() =>
+          setWithdrawFor({ requestId: liveRequest.id, isOwnerWithOthers: isOwner })
+        }
+      >
+        Withdraw
       </Button>
     ) : null
 
@@ -1118,34 +1190,57 @@ export function TitleDetailModal({
       break
     case 'pending':
     case 'searching':
-      actionZone = cancelButton
+      actionZone = cancelButton || withdrawButton
       break
     case 'downloading':
       actionZone =
-        reportButton || cancelButton ? (
+        reportButton || cancelButton || withdrawButton ? (
           <>
             {reportButton}
             {cancelButton}
+            {withdrawButton}
           </>
         ) : null
       break
     case 'no_acceptable_release':
       actionZone =
-        reSearchNowButton || cancelButton ? (
+        reSearchNowButton || cancelButton || withdrawButton ? (
           <>
             {reSearchNowButton}
             {cancelButton}
+            {withdrawButton}
           </>
         ) : null
       break
     case 'waiting_for_air_date':
-      actionZone = cancelButton
+      actionZone = cancelButton || withdrawButton
       break
     case 'import_blocked':
-      actionZone = reportButton
+      // A participant may withdraw from a needs-attention row too (issue #314).
+      // reportButton is admin-only; withdrawButton shows for any participant
+      // (incl. an admin who is also a subscriber -- Codex #333 round 2, Finding C),
+      // so the fragment renders both slots. NB the last participant's withdrawal
+      // here 409s `withdrawal_blocked_active_request` (import_blocked is
+      // dedup-active) -- surfaced honestly by runWithdraw; a co-participant's is a
+      // plain removal.
+      actionZone =
+        reportButton || withdrawButton ? (
+          <>
+            {reportButton}
+            {withdrawButton}
+          </>
+        ) : null
       break
     case 'completed':
-      actionZone = reportIssueButton
+      // A non-admin OWNER sees BOTH report-issue and Withdraw here, so render a
+      // fragment rather than a single button (issue #314).
+      actionZone =
+        reportIssueButton || withdrawButton ? (
+          <>
+            {reportIssueButton}
+            {withdrawButton}
+          </>
+        ) : null
       break
     case 'available':
       // In the library. The download is terminal (gone from the active queue), so
@@ -1167,6 +1262,8 @@ export function TitleDetailModal({
               re-acquisition is the report-issue verb's job). */}
           {reportIssueButton}
           {reacquireQuiet}
+          {/* A participant may withdraw from an in-library row too (issue #314). */}
+          {withdrawButton}
         </>
       )
       break
@@ -1177,6 +1274,7 @@ export function TitleDetailModal({
               one (re-searching the dead id would show releases that all fail to grab). */}
           {requestAgainButton}
           {reportButton}
+          {withdrawButton}
         </>
       )
       break
@@ -1184,13 +1282,23 @@ export function TitleDetailModal({
       // ADR-0012: honest, retryable — the disk-pressure sweep freed this title's
       // file on purpose (not a failure), and re-requesting grabs it again from
       // scratch (the old id is settled, same as available/failed).
-      actionZone = requestAgainButton
+      actionZone = (
+        <>
+          {requestAgainButton}
+          {withdrawButton}
+        </>
+      )
       break
     case 'cancelled':
       // ADR-0014: the operator cancelled this (not-yet-imported) request. Settled,
       // same as evicted/available/failed — "Request again" makes a fresh, grabbable
       // request (the old id is settled).
-      actionZone = requestAgainButton
+      actionZone = (
+        <>
+          {requestAgainButton}
+          {withdrawButton}
+        </>
+      )
       break
     case 'unknown':
       // issue #205: a runtime-unknown status (a future backend enum member this
@@ -1520,6 +1628,41 @@ export function TitleDetailModal({
             </Button>
             <Button variant="danger" loading={cancelRequest.isPending} onClick={() => void runCancel()}>
               Cancel request
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {/* Withdraw confirm (issue #314): collaborative self-removal. Copy differs
+          by relationship -- a plain subscriber's download continues for others,
+          while an owner-with-others hands ownership off on the way out. */}
+      {withdrawFor ? (
+        <Dialog
+          open
+          onOpenChange={(next) => {
+            if (!next) setWithdrawFor(null)
+          }}
+          title={withdrawFor.isOwnerWithOthers ? 'Withdraw and hand off?' : 'Remove from your requests?'}
+          description={
+            withdrawFor.isOwnerWithOthers
+              ? 'Someone else who requested this becomes the owner. The download continues.'
+              : 'The download continues for others who requested it.'
+          }
+        >
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setWithdrawFor(null)}
+              disabled={withdrawSubscription.isPending}
+            >
+              Keep it
+            </Button>
+            <Button
+              variant="danger"
+              loading={withdrawSubscription.isPending}
+              onClick={() => void runWithdraw()}
+            >
+              Withdraw
             </Button>
           </div>
         </Dialog>

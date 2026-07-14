@@ -1310,6 +1310,20 @@ class RequestResponse(BaseModel):
     # Capability is computed for the current caller. Request creators and admins
     # may pin, report, or cancel; subscribers may observe the shared request only.
     can_mutate: bool = False
+    # Issue #314 subscriber control -- capability/relationship flags the UI uses
+    # to pick between "Cancel request" (hard cancel, admins and sole owners) and
+    # "Withdraw" (collaborative self-removal, ``DELETE /subscription``), and to
+    # word the confirm dialog. ``is_owner``: the caller is this row's CURRENT
+    # ``user_id`` (ownership can hand off on withdrawal -- see
+    # ``correction_service.withdraw_participant``). ``can_withdraw``: the caller
+    # is a subscriber (participant) of this row at all -- a non-participant
+    # admin viewing someone else's request gets ``False`` (they use hard cancel
+    # instead). ``has_other_participants``: a subscriber OTHER than the caller
+    # exists -- when true for the owner, ``POST /cancel`` 409s
+    # ``has_other_participants`` and the UI must offer Withdraw instead.
+    is_owner: bool = False
+    can_withdraw: bool = False
+    has_other_participants: bool = False
 
 
 class RequestListResponse(BaseModel):
