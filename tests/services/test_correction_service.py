@@ -3319,7 +3319,9 @@ async def test_withdraw_owner_hands_off_to_earliest_remaining_subscriber(
     assert withdraw_row.entity_type == "media_request"
     assert withdraw_row.entity_id == request_id
     assert handoff_row.action_type == "request.owner_handoff"
-    assert handoff_row.user_id == third_id
+    # The actor is the withdrawing owner who CAUSED the handoff, not the
+    # passive recipient (#337) -- old_value/new_value carry the recipient.
+    assert handoff_row.user_id == owner_id
     assert handoff_row.old_value == {"owner_user_id": owner_id}
     assert handoff_row.new_value == {"owner_user_id": third_id}
 
