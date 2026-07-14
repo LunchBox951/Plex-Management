@@ -193,10 +193,12 @@ _WITHDRAW_SUBSCRIPTION_RESPONSES: dict[int | str, dict[str, Any]] = {
     409: {
         "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
         "description": (
-            "An import is in progress, the last-participant settle hit a "
-            "not-cancellable TV season, the last participant tried to withdraw "
-            "from an active non-cancellable request, or qBittorrent is required "
-            "but not configured"
+            "An import is in progress (``import_in_progress``), the "
+            "last-participant settle hit a not-cancellable TV season "
+            "(``not_cancellable``), the last participant tried to withdraw from "
+            "an active non-cancellable request (``withdrawal_blocked_active_"
+            "request``), or qBittorrent is required but not configured "
+            "(``service_not_configured``)"
         ),
     },
 }
