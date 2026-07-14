@@ -426,6 +426,40 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
     expect(screen.getByRole('button', { name: 'Request Fresh Movie' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Request Retry Show' })).not.toBeInTheDocument()
   })
+
+  it('prefers Plex-native posters for in-library results (issue #66)', async () => {
+    // An owned result carrying plex_poster_url must render the backend artwork
+    // proxy as its poster source; a not-owned result stays on its TMDB poster.
+    // Overlay cards share PosterCard's Plex -> TMDB -> gradient chain, so only
+    // the wiring (which URL wins first) is pinned here — the fallback mechanics
+    // themselves are covered by PosterCard's own tests.
+    setSearch({
+      data: {
+        results: [
+          {
+            ...OWNED_MOVIE,
+            plex_poster_url: '/api/v1/artwork/plex/movie/4/poster',
+            poster_url: 'https://image.tmdb.org/t/p/w500/owned.jpg',
+          },
+          { ...FRESH_MOVIE, poster_url: 'https://image.tmdb.org/t/p/w500/fresh.jpg' },
+        ],
+      },
+    })
+    setRequests([])
+    render(<SearchOverlay />)
+    openOverlay()
+
+    await enterSearch('owned')
+
+    // Radix portals the overlay to document.body, so query the document.
+    expect(document.querySelector('img[src="/api/v1/artwork/plex/movie/4/poster"]')).not.toBeNull()
+    expect(
+      document.querySelector('img[src="https://image.tmdb.org/t/p/w500/fresh.jpg"]'),
+    ).not.toBeNull()
+    expect(
+      document.querySelector('img[src="https://image.tmdb.org/t/p/w500/owned.jpg"]'),
+    ).toBeNull()
+  })
 })
 
 describe('SearchOverlay — honest search states', () => {
