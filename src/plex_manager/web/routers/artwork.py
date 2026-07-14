@@ -64,10 +64,15 @@ async def plex_artwork(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="artwork_not_found")
     try:
         image = await library.fetch_artwork(tmdb_id, media_type, kind)
-    except (PlexLibraryError, PlexAuthError, NotImplementedError) as exc:
+    except (PlexLibraryError, PlexAuthError) as exc:
         # Honesty over silence: a Plex outage/credential failure is logged (no
         # secrets — only the error type), then folded into a 404 so the tile shows
-        # TMDB artwork rather than a broken image or a 500.
+        # TMDB artwork rather than a broken image or a 500. ``NotImplementedError``
+        # is deliberately NOT folded in: the port default raises it precisely to
+        # fail loudly on a forgotten override (``LibraryPort.fetch_artwork``), so
+        # it propagates as a 500 — a programming error, not an artwork miss. The
+        # browser's <img> onError falls back to TMDB on a 500 just like a 404, so
+        # tiles never break; the operator's logs get the loud failure instead.
         _logger.info(
             "plex artwork unavailable; client falls back to TMDB",
             extra={"error": type(exc).__name__},

@@ -3078,3 +3078,53 @@ async def test_fetch_artwork_auth_failure_raises_plex_auth_error() -> None:
 
     with pytest.raises(PlexAuthError):
         await _adapter(unauthorized).fetch_artwork(27205, "movie", "poster")
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        "http://evil.example/steal",
+        "https://evil.example/steal",
+        "//evil.example/steal",
+    ],
+)
+async def test_fetch_artwork_never_fetches_a_smuggled_absolute_artwork_url(
+    smuggled: str,
+) -> None:
+    # SSRF regression pin (issue #66 review): Plex metadata is upstream input — a
+    # compromised/misbehaving server (or a tampering reverse proxy) could smuggle
+    # an absolute or protocol-relative URL into ``thumb``/``art``. That value must
+    # resolve as a MISS (None -> the route's 404 -> TMDB fallback), and no request
+    # may ever leave the configured Plex origin. Pins the ``startswith("/")`` /
+    # ``//`` guard and the ServiceUrl.endpoint boundary against future refactors.
+    crawl_with_smuggled_art: dict[str, Any] = {
+        "MediaContainer": {
+            "size": 1,
+            "Metadata": [
+                {
+                    "guid": "plex://movie/bbb",
+                    "Guid": [{"id": "tmdb://27205"}],
+                    "thumb": smuggled,
+                    "art": smuggled,
+                }
+            ],
+        }
+    }
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        assert request.url.host != "evil.example", "SSRF: request escaped the Plex origin"
+        path = request.url.path
+        if path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if path == "/library/sections/1/all":
+            return httpx.Response(200, json=crawl_with_smuggled_art)
+        return httpx.Response(404, json={})
+
+    adapter = _adapter(handler, base_url=f"http://ssrf-{abs(hash(smuggled)) % 10**8}:32400")
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert await adapter.fetch_artwork(27205, "movie", "background") is None
+    # Only the section list + crawl ran; the smuggled URL itself was never fetched.
+    assert all("evil.example" not in url for url in requested_urls)
+    assert all("/steal" not in url for url in requested_urls)

@@ -1712,10 +1712,13 @@ class PlexLibrary:
         if keys is None:
             return None
         path = keys.poster if kind == "poster" else keys.background
-        if path is None or not path.startswith("/"):
+        if path is None or not path.startswith("/") or path.startswith("//"):
             # Absent, or not a server-relative path we can safely append to the
-            # configured Plex origin (a stray absolute/`//host` value is treated as
-            # a miss rather than fetched) — the browser falls back to TMDB.
+            # configured Plex origin: an absolute ``http://host/...`` or a
+            # protocol-relative ``//host/...`` value smuggled into ``thumb``/``art``
+            # is an honest MISS, never fetched — SSRF defense-in-depth on top of
+            # ``ServiceUrl.endpoint``'s own path validation (which would reject
+            # both anyway before any request left this origin). TMDB takes over.
             return None
         # ``Accept: image/*`` (overriding _request's JSON default) asks Plex for the
         # raw image; the token is injected by _request into the header only, and the
