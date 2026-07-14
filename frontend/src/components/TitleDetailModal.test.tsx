@@ -71,15 +71,18 @@ vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 vi.mock('./ui/Dialog', () => ({
   Dialog: ({
     title,
+    description,
     children,
     customChrome = false,
   }: {
     title: string
+    description?: string
     children: ReactNode
     customChrome?: boolean
   }) => (
     <div role="dialog">
       {customChrome ? null : <h2>{title}</h2>}
+      {description ? <p>{description}</p> : null}
       {children}
     </div>
   ),
@@ -1301,11 +1304,49 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     expect(screen.getByText('Withdraw and hand off?')).toBeInTheDocument()
   })
 
-  it('shows "Withdraw" to a non-admin SOLE owner of a SETTLED row (Cancel is unavailable there)', () => {
+  it('shows the destructive cancel warning to a sole NON-OWNER subscriber (issue #335)', () => {
+    // Issue #335: the backend's last-participant branch settles like a normal
+    // cancel (teardown + `cancelled`) whenever `has_other_participants` is
+    // false, REGARDLESS of ownership -- e.g. a browser user who subscribed to
+    // an ownerless/API-key-created active request. Keying the dialog off
+    // `isOwner` instead of `hasOtherParticipants` would show the benign
+    // "continues for others" copy here even though withdrawing actually
+    // cancels the request and removes the download.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          // Ownerless request (`can_mutate: false`, matching the real API's
+          // `_can_mutate_request`: neither admin nor owner) with the caller as
+          // its sole subscriber -- Cancel is unavailable to them, only Withdraw.
+          movieRequest({
+            can_mutate: false,
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    expect(
+      screen.getByText(/withdrawing will cancel it and remove the download/i),
+    ).toBeInTheDocument()
+  })
+
+  it('shows "Withdraw" -- and the destructive warning -- to a non-admin SOLE owner of a SETTLED row (Cancel is unavailable there)', () => {
     // Codex #333, Finding 2: a settled row has no Cancel (CANCELLABLE_STATUSES
     // excludes it), so gating Withdraw on `(!isOwner || hasOtherParticipants)`
     // wrongly left a sole owner with NO self-removal path. Gating on `!canCancel`
-    // fixes it: Cancel is absent here, so Withdraw appears.
+    // fixes it: Cancel is absent here, so Withdraw appears. Issue #335: the
+    // confirm dialog it opens must ALSO carry the destructive warning -- this
+    // caller is the last participant (`has_other_participants: false`), so the
+    // same backend branch that cancels + tears down for a non-owner (see the
+    // test above) applies here too, regardless of ownership.
     asSharedUser()
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: {
@@ -1322,6 +1363,12 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    expect(
+      screen.getByText(/withdrawing will cancel it and remove the download/i),
+    ).toBeInTheDocument()
   })
 
   it.each(['available', 'completed', 'failed', 'cancelled', 'evicted', 'import_blocked'] as const)(

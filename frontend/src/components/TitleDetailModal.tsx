@@ -481,11 +481,19 @@ export function TitleDetailModal({
   // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
   const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
   // The confirm dialog for withdrawing the caller's OWN subscription (issue
-  // #314) -- the collaborative counterpart to `cancelFor`. `isOwnerWithOthers`
-  // picks the confirm copy (see `withdrawButton` below).
+  // #314) -- the collaborative counterpart to `cancelFor`. Copy is keyed off
+  // `hasOtherParticipants`, NOT ownership (issue #335): the backend's
+  // last-participant branch (`withdraw_subscription_endpoint`) settles like a
+  // normal cancel -- teardown + `cancelled` -- for ANY sole participant,
+  // owner or not. `isOwner` only distinguishes hand-off from mere-removal
+  // copy WHEN others remain; it must never gate the destructive warning
+  // itself, or a sole non-owner subscriber's withdrawal would show the
+  // benign "continues for others" copy while actually cancelling the request
+  // and removing the download.
   const [withdrawFor, setWithdrawFor] = useState<{
     requestId: number
-    isOwnerWithOthers: boolean
+    isOwner: boolean
+    hasOtherParticipants: boolean
   } | null>(null)
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
@@ -892,12 +900,22 @@ export function TitleDetailModal({
 
   // Withdraw the caller's OWN subscription (issue #314) -- collaborative
   // self-removal. Never touches what a remaining owner/other subscriber wants;
-  // as the LAST participant it settles like a normal cancel server-side.
+  // as the LAST participant it settles like a normal cancel server-side. The
+  // success toast (issue #335) reflects that: `hasOtherParticipants`, captured
+  // on `withdrawFor` at click time, tells us whether this call was a mere
+  // removal or the destructive last-participant branch -- an always-benign
+  // "Removed from your requests" toast would hide the cancel + download
+  // teardown from the one caller who actually triggered it.
   const runWithdraw = useCallback(async () => {
     if (!withdrawFor) return
     try {
       await withdrawSubscription.mutateAsync(withdrawFor.requestId)
-      toast({ title: 'Removed from your requests', intent: 'success' })
+      toast({
+        title: withdrawFor.hasOtherParticipants
+          ? 'Removed from your requests'
+          : 'Request cancelled and download removed',
+        intent: 'success',
+      })
       setWithdrawFor(null)
     } catch (error) {
       toast({ title: 'Withdraw failed', description: asApiError(error).message, intent: 'error' })
@@ -1139,7 +1157,7 @@ export function TitleDetailModal({
       <Button
         variant="danger"
         onClick={() =>
-          setWithdrawFor({ requestId: liveRequest.id, isOwnerWithOthers: isOwner })
+          setWithdrawFor({ requestId: liveRequest.id, isOwner, hasOtherParticipants })
         }
       >
         Withdraw
@@ -1633,20 +1651,32 @@ export function TitleDetailModal({
         </Dialog>
       ) : null}
 
-      {/* Withdraw confirm (issue #314): collaborative self-removal. Copy differs
-          by relationship -- a plain subscriber's download continues for others,
-          while an owner-with-others hands ownership off on the way out. */}
+      {/* Withdraw confirm (issue #314, honesty fix #335): copy is keyed off
+          `hasOtherParticipants`, NOT ownership -- the backend's last-participant
+          branch settles like a normal cancel (teardown + `cancelled`) for ANY
+          sole participant, owner or not. With others remaining, an owner hands
+          ownership off and a plain subscriber's download just continues; with
+          NO others remaining, withdrawal is destructive regardless of who the
+          caller is, so that case must plainly warn about it. */}
       {withdrawFor ? (
         <Dialog
           open
           onOpenChange={(next) => {
             if (!next) setWithdrawFor(null)
           }}
-          title={withdrawFor.isOwnerWithOthers ? 'Withdraw and hand off?' : 'Remove from your requests?'}
+          title={
+            !withdrawFor.hasOtherParticipants
+              ? 'Withdraw and cancel request?'
+              : withdrawFor.isOwner
+                ? 'Withdraw and hand off?'
+                : 'Remove from your requests?'
+          }
           description={
-            withdrawFor.isOwnerWithOthers
-              ? 'Someone else who requested this becomes the owner. The download continues.'
-              : 'The download continues for others who requested it.'
+            !withdrawFor.hasOtherParticipants
+              ? "You're the last person tracking this request. Withdrawing will cancel it and remove the download."
+              : withdrawFor.isOwner
+                ? 'Someone else who requested this becomes the owner. The download continues.'
+                : 'The download continues for others who requested it.'
           }
         >
           <div className="flex justify-end gap-3">
