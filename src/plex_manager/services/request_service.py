@@ -155,6 +155,14 @@ SETTLED_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     )
 )
 
+# Bound on :func:`create_request_result`'s IntegrityError dedup-JOIN recovery
+# retries (issue #334). The recovery re-reads ``find_active`` UNDER the per-media
+# lock; if the conflicting active row settled/cancelled in the gap it retries the
+# whole create (mint a fresh row rather than join the corpse). A pathological
+# settle/insert flap that never converges surfaces the original IntegrityError
+# honestly after this many attempts rather than looping forever.
+_MAX_DEDUP_JOIN_ATTEMPTS: Final[int] = 3
+
 
 class MediaNotFoundError(Exception):
     """The metadata port could not resolve the requested ``(tmdb_id, media_type)``.
@@ -631,6 +639,7 @@ async def create_request_result(
     episodes: dict[int, list[int]] | None = None,
     force: bool = False,
     expand_shared_tv: bool = False,
+    _attempt: int = 0,
 ) -> CreateRequestResult:
     """Create (or return the existing active) media request for this media.
 
@@ -872,7 +881,14 @@ async def create_request_result(
             if existing_active is not None:
                 foreign = _owned_by_another_user(existing_active, user_id, actor_is_admin)
                 if foreign:
-                    await session.rollback()
+                    # #334: subscribe while STILL HOLDING the media lock (the
+                    # ``find_active`` re-read above verified liveness under it), the
+                    # same discipline as the non-foreign ``_subscribe_dedup_winner``
+                    # branch below. Do NOT ``session.rollback()`` first: releasing the
+                    # lock before the subscriber INSERT reopens the exact window a
+                    # concurrent sole-participant withdrawal needs to settle this row
+                    # between the read and the INSERT. ``_subscribe_user``'s own commit
+                    # releases the lock durably with the subscriber attached.
                     existing_active = await _subscribe_user(session, repo, existing_active, user_id)
                     if not expand_shared_tv:
                         return CreateRequestResult(record=existing_active, created=False)
@@ -926,7 +942,11 @@ async def create_request_result(
                     # ownerless subscribable one) over a foreign row when several terminal rows
                     # exist, so sharing a foreign row is the final fallback.
                     if _owned_by_another_user(in_library, user_id, actor_is_admin):
-                        await session.rollback()
+                        # #334: hold the media lock through the subscriber INSERT (no
+                        # pre-subscribe ``session.rollback()``), mirroring the ownerless
+                        # branch below -- the terminal-row re-read ran under the lock, so
+                        # the subscribe must too, and ``_subscribe_user``'s commit is what
+                        # releases the lock.
                         in_library = await _subscribe_user(session, repo, in_library, user_id)
                         return CreateRequestResult(record=in_library, created=False)
                     # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
@@ -1003,7 +1023,13 @@ async def create_request_result(
             if existing_active is not None:
                 foreign = _owned_by_another_user(existing_active, user_id, actor_is_admin)
                 if foreign:
-                    await session.rollback()
+                    # #334: subscribe UNDER the lock (no pre-subscribe rollback), the
+                    # same discipline as the non-foreign branch below -- the
+                    # ``find_active`` re-read verified liveness under the lock, so the
+                    # subscriber INSERT must land before the lock is released.
+                    # ``_subscribe_user``'s commit releases it durably; the clean-slate
+                    # rollback below (before the Plex-crawling ensure_seasons) is then a
+                    # no-op for the expand path.
                     existing_active = await _subscribe_user(session, repo, existing_active, user_id)
                     if not expand_shared_tv:
                         return CreateRequestResult(record=existing_active, created=False)
@@ -1044,7 +1070,11 @@ async def create_request_result(
                 # watchlist sync may opt into complete-show expansion below.
                 foreign = _owned_by_another_user(in_library, user_id, actor_is_admin)
                 if foreign:
-                    await session.rollback()
+                    # #334: subscribe UNDER the lock (no pre-subscribe rollback),
+                    # mirroring the ownerless branch below -- the terminal-row re-read
+                    # ran under the lock, so the subscriber INSERT must too;
+                    # ``_subscribe_user``'s commit releases the lock, and the clean-slate
+                    # rollback before ensure_seasons is then a no-op for the expand path.
                     in_library = await _subscribe_user(session, repo, in_library, user_id)
                     if not expand_shared_tv:
                         return CreateRequestResult(record=in_library, created=False)
@@ -1178,9 +1208,46 @@ async def create_request_result(
         # Resolve to the existing active request instead of crashing (idempotent
         # dedup, honesty over silence). The failed transaction is rolled back first.
         await session.rollback()
+        # Serialize the dedup-JOIN recovery under the SAME per-media lock the
+        # top-of-function dedup path and ``correction_service.withdraw_participant``
+        # hold (issue #334; the Codex #333 round-2 Finding D pattern). ``find_active``
+        # below MUST run under the lock so we only ever attach a subscriber to a row
+        # that is STILL active: without it, the winner's sole participant could
+        # withdraw -- settling/cancelling the row -- in the gap between this read and
+        # the subscriber INSERT, resurrecting a dead request as a zombie subscription
+        # (a settled row is participant-less by design). The ``_subscribe_*`` helpers
+        # below commit while the lock is held, so the durable subscriber row is
+        # written while liveness holds. The lock spans only the DB re-read + the quick
+        # subscriber INSERT (no Plex/TMDB I/O), matching every other participant-set
+        # path's ordering.
+        await repo.acquire_media_lock(tmdb_id, media_type)
         winner = await repo.find_active(tmdb_id, media_type)
-        if winner is None:  # pragma: no cover - the conflicting active row must exist
-            raise
+        if winner is None:
+            # The conflicting active row was concurrently settled/cancelled under the
+            # lock. Release it (its write transaction must NOT span the retry's
+            # Plex/TMDB I/O -- SQLite single-writer, ADR-0007) and RETRY the whole
+            # create: the retry's top-of-function ``find_active`` now sees no active
+            # row and mints a FRESH request rather than joining the corpse (the "fall
+            # through to a fresh create" #334 asks for). Bounded so a pathological
+            # settle/insert flap surfaces the original IntegrityError honestly rather
+            # than looping forever.
+            await session.rollback()
+            if _attempt + 1 >= _MAX_DEDUP_JOIN_ATTEMPTS:
+                raise
+            return await create_request_result(
+                session,
+                tmdb,
+                tmdb_id=tmdb_id,
+                media_type=media_type,
+                user_id=user_id,
+                actor_is_admin=actor_is_admin,
+                library=library,
+                seasons=seasons,
+                episodes=episodes,
+                force=force,
+                expand_shared_tv=expand_shared_tv,
+                _attempt=_attempt + 1,
+            )
         # Issue #58: same ownership decision as the find_active dedup. A non-admin
         # who lost the insert race subscribes to the winner without changing its
         # ownership or ordinary manual TV season intent.

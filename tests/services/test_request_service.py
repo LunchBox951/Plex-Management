@@ -9,7 +9,7 @@ index over active statuses rejects the loser; ``create_request`` catches the
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Literal
 
 import httpx
@@ -1738,6 +1738,52 @@ async def _is_subscriber(sm: SessionMaker, request_id: int, user_id: int) -> boo
         return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
 
 
+def _lock_subscribe_rollback_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], Callable[[], None]]:
+    """Record the ORDER of media-lock acquisitions, subscriber INSERTs, and session
+    rollbacks so a test can assert a dedup subscribe lands under the held lock (#334).
+    Returns the event list plus a ``restore`` that un-patches ``AsyncSession.rollback``
+    before the session context manager's own teardown rollback would run."""
+    events: list[str] = []
+    real_lock = SqlRequestRepository.acquire_media_lock
+    real_add = SqlRequestRepository.add_subscriber
+    real_rollback = AsyncSession.rollback
+
+    async def spy_lock(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        events.append("lock")
+        await real_lock(self, tmdb_id, media_type)
+
+    async def spy_add(self: SqlRequestRepository, request_id: int, user_id: int) -> None:
+        events.append("subscribe")
+        await real_add(self, request_id, user_id)
+
+    async def spy_rollback(self: AsyncSession) -> None:
+        events.append("rollback")
+        await real_rollback(self)
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", spy_lock)
+    monkeypatch.setattr(SqlRequestRepository, "add_subscriber", spy_add)
+    monkeypatch.setattr(AsyncSession, "rollback", spy_rollback)
+
+    def restore() -> None:
+        monkeypatch.setattr(AsyncSession, "rollback", real_rollback)
+
+    return events, restore
+
+
+def _assert_subscribed_under_lock(events: list[str]) -> None:
+    """Assert a subscriber INSERT happened while the media lock was held: it follows
+    the last preceding lock acquisition with NO lock-releasing rollback in between
+    (the #334 invariant -- the old code rolled back, releasing the lock, right before
+    the subscribe)."""
+    assert "subscribe" in events, events
+    sub_i = events.index("subscribe")
+    preceding_locks = [i for i, e in enumerate(events[:sub_i]) if e == "lock"]
+    assert preceding_locks, events  # a lock was acquired before the subscribe
+    assert "rollback" not in events[preceding_locks[-1] : sub_i], events
+
+
 async def test_non_admin_dedup_onto_foreign_owned_tv_request_subscribes_without_mutating(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1797,6 +1843,164 @@ async def test_non_admin_dedup_onto_foreign_owned_movie_request_subscribes(
             actor_is_admin=False,
         )
     assert await _is_subscriber(sessionmaker_, shared.id, intruder_id)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #334: serialize the residual dedup-JOIN paths under the media lock.    #
+# Window 1 = the IntegrityError recovery; window 2 = the plex_present foreign  #
+# sub-branches that rolled the lock back BEFORE the visibility subscribe.      #
+# --------------------------------------------------------------------------- #
+
+
+async def test_integrity_recovery_forks_fresh_when_winner_settles_under_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#334 window 1: the IntegrityError dedup-JOIN recovery re-reads ``find_active``
+    UNDER the per-media lock. If the winner's sole participant withdraws -- settling
+    the row ``cancelled`` (dedup-inactive) -- in the gap after the losing INSERT, the
+    recovery must NOT attach a subscriber to that corpse and hand it back: it sees no
+    active row under the lock and forks a FRESH request instead."""
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=901, media_type=MediaType.movie, title="Tenet", status=RequestStatus.pending
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    real_find_active = SqlRequestRepository.find_active
+    find_calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        # The first (top-of-function) lookup misses so the INSERT loses the UNIQUE
+        # race and enters the recovery; every later lookup (recovery + retry) is real.
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    lock_calls = {"n": 0}
+
+    async def settling_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        # The recovery's ONLY lock acquisition: simulate a concurrent sole-participant
+        # withdrawal committing the winner to ``cancelled`` from another connection,
+        # just before this call re-reads ``find_active`` under the lock.
+        if lock_calls["n"] == 0:
+            lock_calls["n"] = 1
+            async with sessionmaker_() as other:
+                row = await other.get(MediaRequest, winner_id)
+                assert row is not None
+                row.status = RequestStatus.cancelled
+                await other.commit()
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", settling_acquire)
+
+    tmdb = FakeTmdb(movies={901: MovieMetadata(tmdb_id=901, title="Tenet", year=2020)})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=901, media_type="movie"
+        )
+
+    assert record.id != winner_id  # a FRESH row, never the cancelled corpse
+    assert record.status == RequestStatus.pending.value
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 901)))
+            .scalars()
+            .all()
+        )
+        by_id = {r.id: r.status for r in rows}
+    assert by_id[winner_id] == RequestStatus.cancelled  # winner stayed settled
+    assert [rid for rid, s in by_id.items() if s == RequestStatus.pending] == [record.id]
+
+
+async def test_integrity_recovery_subscribes_under_the_media_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#334 window 1 (join case): when the winner is still active, the recovery joins
+    it -- and writes the visibility subscriber while STILL HOLDING the media lock. The
+    only rollback is the one clearing the failed INSERT, and it happens BEFORE the
+    lock; there is none between the lock and the subscriber INSERT."""
+    owner_id = await _make_user(sessionmaker_, username="owner-ir")
+    intruder_id = await _make_user(sessionmaker_, username="intruder-ir")
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=903,
+            media_type=MediaType.movie,
+            title="Heat",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    real_find_active = SqlRequestRepository.find_active
+    find_calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    events, restore = _lock_subscribe_rollback_spy(monkeypatch)
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(movies={903: MovieMetadata(tmdb_id=903, title="Heat", year=1995)})
+    async with sessionmaker_() as session:
+        shared = await request_service.create_request(
+            session, tmdb, tmdb_id=903, media_type="movie", user_id=intruder_id
+        )
+    restore()
+
+    assert shared.id == winner_id  # joined the still-active winner
+    assert await _is_subscriber(sessionmaker_, winner_id, intruder_id)
+    _assert_subscribed_under_lock(events)
+
+
+async def test_movie_in_library_foreign_dedup_subscribes_under_the_media_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#334 window 2: a non-admin deduping onto ANOTHER user's in-library movie row
+    (under the plex_present lock) attaches its visibility subscriber while STILL
+    HOLDING the lock -- it must never ``session.rollback()`` (releasing the lock)
+    before the subscriber INSERT, which reopened the settle-in-the-gap window."""
+    owner_id = await _make_user(sessionmaker_, username="owner-lk")
+    intruder_id = await _make_user(sessionmaker_, username="intruder-lk")
+    tmdb = FakeTmdb(movies={902: MovieMetadata(tmdb_id=902, title="Sicario", year=2015)})
+    library = FakeLibrary(available={902})
+
+    async with sessionmaker_() as session:
+        await request_service.create_request(
+            session, tmdb, tmdb_id=902, media_type="movie", user_id=owner_id, library=library
+        )
+
+    events, restore = _lock_subscribe_rollback_spy(monkeypatch)
+    async with sessionmaker_() as session:
+        shared = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=902,
+            media_type="movie",
+            user_id=intruder_id,
+            actor_is_admin=False,
+            library=library,
+        )
+    restore()
+
+    assert await _is_subscriber(sessionmaker_, shared.id, intruder_id)
+    _assert_subscribed_under_lock(events)
 
 
 async def test_admin_dedup_onto_foreign_owned_tv_request_keeps_shared_behavior(
