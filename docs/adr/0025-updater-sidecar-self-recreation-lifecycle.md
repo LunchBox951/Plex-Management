@@ -103,48 +103,82 @@ reasons rooted in the current code:
 
 The sidecar, only while no operation is in flight, pulls the promoted image and
 creates a **successor** updater container from the new bytes; the predecessor
-**survives until it confirms the successor is alive**, then stops itself, and the
-successor — once it holds the state lock — removes the predecessor and takes over
-the canonical identity. This is the Watchtower/`docker-compose` self-update
-pattern, adapted to our coordinator. The handoff is one ordered sequence:
+survives — first as lock-holder, then as a passive watcher — until the successor
+**durably acknowledges holding the state lock**, and only then stops itself; the
+successor then removes the predecessor and takes over the canonical identity.
+This is the Watchtower/`docker-compose` self-update pattern, adapted to our
+coordinator. The handoff is one ordered sequence with a **two-stage gate**: a
+nonce'd liveness ping, then a post-lock acknowledgement.
 
 1. Gate: `state.json` empty (no install/rollback pending) and no lease held.
-2. The predecessor pulls the promoted image, writes a durable **self-refresh
-   record** to the shared state volume (operation id, **its own container id**,
-   and the temporary successor name), and creates + starts the successor under
-   that temporary name.
-3. The successor starts in a new **successor-bootstrap mode**: it emits its
-   coordinator heartbeat (`touch_updater`, carrying its build identity — a new
-   protocol field, see below) **before** taking the state lock, then wait-loops
-   on the `flock`. This inverts today's startup order, in which the process
-   acquires the state lock fail-fast before doing anything. The heartbeat is an
-   HTTP write to the app's coordinator, **not** gated by the flock, so the
-   successor can prove liveness while the predecessor still holds the lock.
-   Until it owns the lock, the successor performs *no* Docker mutation and no
-   coordination operation beyond that liveness ping.
-4. The predecessor confirms, within a bounded window, a fresh heartbeat carrying
-   the **new build id**. On timeout it removes the temp-named successor,
-   surfaces a visible `updater_refresh_failed` state, and keeps running
-   (old-but-working). On confirmation it stops itself **through the Engine API**
-   — a user-initiated stop, so `restart: unless-stopped` does not resurrect it —
-   and exits, releasing the flock.
-5. The successor acquires the flock, reconciles the self-refresh record, removes
-   the stopped predecessor (matched by the **container id recorded in step 2**,
-   verified stopped — see the first-predecessor carve-out below), and renames
-   itself to the canonical `plex-manager-updater` name.
+2. The predecessor pulls the promoted image and captures its **own effective
+   container configuration** by self-inspection; writes a durable
+   **self-refresh record** to the shared state volume (operation id, a fresh
+   **per-attempt nonce**, and its own container id); creates + starts the
+   successor under a temporary name as a **clone of that captured
+   configuration** (work item 2 below), differing only by image, role/operation
+   labels, name, and the successor-bootstrap marker; and extends the record
+   with the successor's container id returned by the create call.
+3. The successor starts in a new **successor-bootstrap mode**, inverting today's
+   lock-first fail-fast startup: it reads the self-refresh record from the state
+   volume (a plain file read, not gated by the advisory `flock`), emits a
+   **liveness-only heartbeat** — a new no-phase wire variant (work item 1)
+   carrying its build identity, its own container id, and the record's nonce —
+   **before** taking the state lock, then wait-loops on the `flock`. The
+   heartbeat is an HTTP write to the app's coordinator, not gated by the flock,
+   so the successor can prove liveness while the predecessor still holds the
+   lock. Until it owns the lock, the successor performs *no* Docker mutation
+   and no coordination operation beyond that liveness ping.
+4. The predecessor confirms, within a bounded window, a liveness ping from the
+   **exact successor it created** — matched on the successor container id
+   recorded in step 2 *and* this attempt's nonce, never on build identity
+   alone (`PLEX_MANAGER_BUILD_ID` derives from the git SHA, so a rebuild of the
+   same SHA, or an orphaned temp successor from a prior attempt, could
+   collide). On timeout it removes the temp successor while still holding the
+   flock and surfaces `updater_refresh_failed`. On match it **releases the
+   flock but keeps running** as a passive watcher — no longer a claimant,
+   still a functioning updater of last resort.
+5. The successor acquires the flock, verifies its own **Docker-socket access**
+   (a self-inspect — the liveness ping proved the secret/network/coordinator-URL
+   replay, not the socket mount), and immediately writes a durable **handoff
+   acknowledgement** into the self-refresh record. The predecessor watches for
+   that ack within a bounded window: on ack, it stops itself **through the
+   Engine API** — a user-initiated stop, so `restart: unless-stopped` does not
+   resurrect it — and exits. On timeout, it **re-acquires the flock**, removes
+   the temp successor, surfaces `updater_refresh_failed`, and resumes as the
+   sole updater.
+6. The successor removes the stopped predecessor (matched by the **container id
+   recorded in step 2**, verified stopped — see the first-predecessor carve-out
+   below) and renames itself to the canonical `plex-manager-updater` name.
 
-- *C1:* **Never zero** — the predecessor stays fully functional until step 4's
-  confirmed heartbeat, and a timeout leaves it running. **Never two claimants**
-  — the existing `flock` bars the successor from driving any operation until the
-  predecessor has exited; the step-3 liveness ping is not a claimant operation.
+- *C1:* Claimancy **is** the `flock`, which never has two holders. **Never
+  zero functioning:** the predecessor is lock-holder through step 4 and stays
+  alive as a watcher through step 5's handoff window, re-acquiring the lock if
+  the successor fails to ack — so a successor that pings once and crashes
+  before taking the lock cannot orphan the deployment; the predecessor
+  reclaims and continues. The pre-lock ping is deliberately **not** sufficient
+  for the predecessor to stop: the stop gate is the durable post-lock ack,
+  which proves the successor completed its entire bootstrap into the driving
+  loop (start, config replay validated by an authenticated coordinator write,
+  record read, lock acquisition, socket check, durable state write). **Honest
+  residual:** after the ack, the predecessor is gone; a successor that then
+  wedges permanently is recovered by `unless-stopped` restarts reconciling
+  from the record, and if it never re-enters service the deployment degrades
+  to "no functioning updater" — surfaced by heartbeat silence (the app already
+  treats >45s as updater-unavailable) plus the refresh-status record, with the
+  documented compose command as last-resort fallback. The ack gate makes that
+  residual require a component that survived full bootstrap and *then* failed,
+  not one that merely managed a single HTTP call.
 - *Bootstrap paradox — real but bounded.* The container replaces itself, so the
-  "healthy" gate cannot be Docker's healthcheck (constraint from §2). Steps 3–4
-  substitute a **coordinator-observed liveness gate**: `touch_updater` is the
-  same signal the app already treats as "updater available" when younger than
-  45s. This reuses machinery that already exists instead of inventing a health
-  protocol. (Implementation note: `StateStore.acquire` today is a fail-fast
-  non-blocking flock; step 3's wait-loop is a retry around it, not a new locking
-  primitive.)
+  "healthy" gate cannot be Docker's healthcheck (constraint from §2). Steps 3–5
+  substitute a **two-stage gate**: a coordinator-observed liveness ping
+  (`touch_updater` is the same freshness signal the app already treats as
+  "updater available" when younger than 45s — though the wire contract needs
+  the liveness-only variant of work item 1, since today's heartbeat would
+  write `phase: "checking"`), then the durable post-lock ack in the state
+  record. (Implementation note: `StateStore.acquire` today is a fail-fast
+  non-blocking flock; step 3's wait-loop is a retry around it, not a new
+  locking primitive.)
 - *Compose desired-state convergence — the subtle win.* Docker forbids two
   containers named `plex-manager-updater`, so the successor is created under a
   temporary name and promoted with the same create→stop→rename dance the app
@@ -157,6 +191,12 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
 - *C5:* Self-refresh is gated to `state.json`-empty (no install/rollback pending)
   and takes no maintenance lease that could block app work; it never rewrites a
   coordinator phase, so it cannot create the unknown-phase wedge #346 guards.
+  Holding that invariant is *why* work item 1's liveness-only heartbeat exists:
+  today's `CoordinatorClient.heartbeat()` posts `phase: "checking"` and
+  `touch_updater` persists it, so the successor pinging through the existing
+  wire contract would itself rewrite phase. (The repository layer already
+  supports a phase-less touch — `touch_updater(phase=None)` writes only
+  `updater_last_seen_at` — it is the wire schema that currently forbids it.)
 - *Authority cost (the real price).* The executor's allowlist must widen from
   "one target" to "one target **plus self**." Mitigation: successor operations
   are constrained to containers bearing the updater's *own* role label + this
@@ -165,51 +205,81 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
   arbitrary target, but the socket-holder can now create/stop/remove a second
   (privileged) container. This is the honest downside and must be disclosed like
   ADR-0024 disclosed the socket mount.
-- *Rollback / C6:* Step 4 mirrors the app's "old stays until new is healthy": if
-  the successor never heartbeats, the predecessor keeps running the
-  old-but-working updater and surfaces a visible `updater_refresh_failed`
-  status. If both die at the seam, the temp-named successor still carries
-  `restart: unless-stopped` (only the predecessor's step-4 stop is
-  user-initiated), so Docker restarts it onto the shared volume and it
-  reconciles from the self-refresh record; the coordinator never wedges because
-  self-refresh touches no phase.
+- *Rollback / C6:* Steps 4–5 mirror the app's "old stays until new is healthy":
+  if the successor never pings, or pings but never acks, the predecessor keeps
+  running (or reclaims the lock) as the old-but-working updater and surfaces a
+  visible `updater_refresh_failed` status. If both die at the seam, the
+  temp-named successor still carries `restart: unless-stopped` (only the
+  predecessor's step-5 stop is user-initiated), so Docker restarts it onto the
+  shared volume and it reconciles from the self-refresh record; the coordinator
+  never wedges because self-refresh touches no phase.
 - *Named crash window — orphaned temp successor.* Between step 2
-  (successor created under the temporary name) and step 5 (rename to canonical),
+  (successor created under the temporary name) and step 6 (rename to canonical),
   a crash can strand a temp-named updater container. The durable self-refresh
   record written **before** the create (step 2) is the recovery anchor — exactly
   the role the app ladder's durable `candidate_renamed`/`old_renamed` stages
   play. On restart, whichever updater reconciles first consults the record: a
-  predecessor that never confirmed the heartbeat removes the orphan and surfaces
+  predecessor that never confirmed ping or ack removes the orphan and surfaces
   `updater_refresh_failed`; a successor that finds the predecessor already
-  stopped completes step 5 (remove + rename). Reconciliation is keyed on the
-  record's operation id (successor side) and recorded container id (predecessor
-  side), so a half-renamed or duplicate-named leftover is never guessed at —
+  stopped completes step 6 (remove + rename). The step-4→5 seam — flock
+  released, ack not yet written — is symmetric by design: predecessor and
+  restarted successor may race for the lock, and **whoever holds it drives**
+  (the predecessor treats "I re-acquired it" as a failed handoff; the successor
+  treats "I acquired it" as license to ack and proceed). Reconciliation is
+  keyed on the record's operation id + nonce (successor side) and recorded
+  container id (predecessor side), so a half-renamed leftover, a rebuild with
+  a colliding build id, or an orphan from a prior attempt is never guessed at —
   unmatched containers are refused, not adopted.
 
 #### New protocol and recovery surface (named work items)
 
 Option (a) is not implementable on today's wire contract and storage alone.
-Three additions are explicit work items, each subject to constraint C7's
-forward-compatibility rule:
+Five additions are explicit work items, each subject to constraint C7's
+forward-compatibility rule where it touches the internal API:
 
-1. **Successor build identity in the heartbeat (protocol + storage).** Step 4's
-   confirmation — and the detect-and-surface companion — require the app to know
-   *which build* is heartbeating. Today `UpdateHeartbeatRequest` carries only
-   `phase` + `action_generation`, and `touch_updater` persists only
-   `updater_last_seen_at`/`phase`; no build identity exists anywhere in the
-   authenticated heartbeat or coordinator storage. The work item: add a sidecar
-   build identity to the heartbeat and persist it in coordinator status storage
-   (alongside `updater_last_seen_at`), exposed on the status surface. Per C7,
-   the app-side model must accept and store the field **at least one release
-   before** any sidecar sends it (`extra="forbid"` would otherwise reject the
-   newer sidecar's first ping) — which is exactly why the detect-and-surface
-   interim doubles as the expand step of this protocol change.
-2. **First-predecessor carve-out (allowlist).** The Compose-created `updater`
+1. **Liveness-only heartbeat with successor identity (protocol + storage).**
+   Step 4's confirmation — and the detect-and-surface companion — require the
+   app to receive a heartbeat that (i) identifies the sender and (ii) writes
+   **no phase**. Today neither exists: `UpdateHeartbeatRequest` carries only
+   `phase: "checking"` + `action_generation`, `touch_updater` persists only
+   `updater_last_seen_at`/`phase`, and because the wire contract *requires*
+   `phase: "checking"`, a successor pinging through it would rewrite
+   coordinator phase — violating this design's own no-phase-writes invariant.
+   The work item: a **liveness-only wire variant** (phase omitted; the
+   repository's `touch_updater(phase=None)` already supports the phase-less
+   write) carrying the sidecar's build identity, its **container id**, and the
+   **per-attempt nonce** from the self-refresh record — build identity alone
+   cannot confirm the exact successor, since `PLEX_MANAGER_BUILD_ID` derives
+   from the git SHA and collides across rebuilds and prior-attempt orphans.
+   Build identity (plus last-seen) is persisted in coordinator status storage
+   and exposed on the status surface. Per C7, the app-side model must accept
+   the variant and its fields **at least one release before** any sidecar
+   sends them (`extra="forbid"` would otherwise reject the newer sidecar's
+   first ping) — which is exactly why the detect-and-surface interim doubles
+   as the expand step of this protocol change.
+2. **Successor service-config capture-and-replay (creation fidelity).**
+   Engine-API container creation inherits **nothing** from the Compose service
+   definition: the Docker-socket bind, state-volume mount, updater secret,
+   private network, entrypoint, coordinator URL and environment, restart
+   policy, and Compose identity labels all come from `docker-compose.yml`, and
+   a successor created bare would silently lack them. The work item: the
+   predecessor self-inspects and clones its own effective
+   `Config`/`HostConfig`/`NetworkingConfig` — the same capture machinery
+   `recreation.py` already implements for the app target — with a **strict
+   allowlist of what may differ**: image, role/operation labels, temporary
+   name, and the successor-bootstrap marker. Failure mode if replay is wrong:
+   a successor missing the secret, network, or coordinator URL cannot emit the
+   authenticated liveness ping, so step 4 times out and the predecessor —
+   still lock-holder — removes it and surfaces `updater_refresh_failed`; a
+   successor missing the *socket* pings fine but fails the step-5 socket check
+   and never acks, so step 5's timeout reclaims. Wrong replay therefore fails
+   closed at the gate stage, before the predecessor has stopped.
+3. **First-predecessor carve-out (allowlist).** The Compose-created `updater`
    service carries **no** role label, and an operation id exists only at
    runtime, so a label-only allowlist could never match the very first stale
    sidecar for stop/remove — existing installs would still need a terminal for
    refresh number one. The carve-out: the predecessor side of the swap is never
-   matched by label at all. The predecessor *stops itself* (step 4), and the
+   matched by label at all. The predecessor *stops itself* (step 5), and the
    successor removes it by the **exact immutable container id the predecessor
    recorded about itself** in the step-2 self-refresh record, cross-checked
    against the canonical container name and the configured image repository
@@ -221,7 +291,7 @@ forward-compatibility rule:
    refresh onward; the carve-out applies only to predecessors, permanently,
    because every predecessor was once a container whose labels this design
    cannot assume.
-3. **Durable refresh-status record (failure persistence).** The coordinator
+4. **Durable refresh-status record (failure persistence).** The coordinator
    records only check/install outcomes today, and a surviving predecessor's
    regular heartbeats would make the updater look perfectly healthy after a
    failed refresh — a silent failure (north star #3). `updater_refresh_failed`
@@ -234,6 +304,20 @@ forward-compatibility rule:
    sidecar's own self-refresh record in the state volume. Ordinary heartbeats
    never clear it; it is cleared only by a later successful refresh or an
    explicit operator acknowledgement.
+5. **Bootstrapping installs whose sidecar predates self-refresh (one-time
+   migration).** The ladder lives in the *sidecar's* image: an already-running
+   updater from before this feature only knows check/install and will never
+   spawn a successor, no matter how many app updates it performs — the exact
+   #299 staleness, one level up. No in-envelope actor can fix this
+   automatically: the app must not gain the socket (C2), and the old sidecar
+   will not run code it does not have. The migration is therefore **one final
+   documented host command per pre-existing install** —
+   `docker compose --profile auto-update up -d updater` after upgrading to the
+   release that ships self-refresh — deliberately the last terminal touch this
+   component requires. Installs created (or sidecars recreated) on or after
+   that release board the ladder automatically. The detect-and-surface interim
+   makes this honest rather than silent: the skew banner tells the operator
+   *that* and *why* the one-time command is needed.
 
 ### (b) Main app recreates the sidecar
 
@@ -261,7 +345,7 @@ moment of destruction, dissolving the "stop kills my own driver" paradox.
   moving part.
 - **Rejected as strictly more surface than (a)** for the same guarantees. Its one
   advantage (supervisor stays alive) is recoverable inside (a) by keeping the
-  predecessor alive until successor liveness is confirmed.
+  predecessor alive until the successor's durable post-lock acknowledgement.
 
 ### (d) Periodic self-exit + restart-policy pull
 
@@ -291,11 +375,15 @@ Keep recreation a host command and make the docs/UI louder about it.
 ## Decision (recommended)
 
 Adopt **option (a), successor-spawn self-replacement**, with these load-bearing
-refinements: the **survive-to-confirm handoff ordering** (steps 1–5 above — the
-predecessor outlives the successor's first confirmed heartbeat and only then
-stops itself; viable precisely because `touch_updater` is an HTTP write the
-successor can emit before it holds the state flock); a coordinator-heartbeat
-liveness gate in place of the Docker healthcheck; the
+refinements: the **survive-to-ack handoff ordering** (steps 1–6 above — the
+predecessor holds its claim through the nonce'd liveness confirmation, demotes
+itself to a passive watcher, and stops only after the successor's durable
+post-lock acknowledgement; viable because the liveness-only ping is an HTTP
+write the successor can emit before it holds the state flock, while the ack
+proves it completed full bootstrap into the driving loop); a two-stage
+coordinator-ping + state-record-ack gate in place of the Docker healthcheck;
+effective-config capture-and-replay so the Engine-created successor faithfully
+inherits the Compose service definition; the
 create→temp-name→stop→rename-to-canonical dance so Compose converges on the
 moving tag rather than regressing; `flock` + lease as the single-claimant
 guarantee; a self-only allowlist widening (labeled successors plus the
@@ -305,9 +393,14 @@ coordinator phase, so it cannot wedge the machine PR #346 hardened.
 
 Adoption carries the explicit prerequisites named in option (a): the internal
 updater API must satisfy C7's forward-compatibility rule before any refreshed
-sidecar exists, the heartbeat must gain a persisted successor build identity,
-and refresh failure needs its own durable status record separate from
-coordinator phase. None of these exist on today's wire contract.
+sidecar exists; the heartbeat must gain the liveness-only variant carrying a
+persisted build identity, the successor container id, and the per-attempt
+nonce (today's contract would both reject the fields and rewrite phase);
+successor creation must replay the predecessor's effective configuration; and
+refresh failure needs its own durable status record separate from coordinator
+phase. None of these exist on today's wire contract. Pre-existing installs
+whose sidecar predates the feature additionally require the one-time
+documented recreate (work item 5) to board the ladder.
 
 Reject (b) (breaks the app/Docker boundary), (d) (non-functional on plain
 Compose), and (c) (more privileged surface than (a) for the same guarantee).
@@ -315,8 +408,9 @@ Reject (e) as a complete answer, but **adopt its detect-and-surface half** as a
 required companion and a safe pre-freeze interim.
 
 When self-refresh cannot complete, recovery is: on a successor that never
-heartbeats, the old-but-working predecessor keeps running and the app shows a
-visible, retryable `updater_refresh_failed` state (persisted in the durable
+pings — or pings but never acks — the old-but-working predecessor keeps running
+(reclaiming the lock where it had released it) and the app shows a visible,
+retryable `updater_refresh_failed` state (persisted in the durable
 refresh-status record, not in coordinator phase); on a crash inside the
 orphaned-temp-successor window, the survivor reconciles from the durable
 self-refresh record as specified in option (a). Because self-refresh
@@ -328,9 +422,11 @@ design note); this ADR references it generically rather than fixing its endpoint
 
 ## Consequences
 
-- The one privileged container keeps itself current from the browser; the
-  standing web-operability gap and updater-side security-staleness liability
-  close.
+- The one privileged container keeps itself current from the browser — **for
+  installs whose sidecar runs the shipping release or later**. Each
+  pre-existing install performs one final documented recreate to board the
+  ladder (work item 5); from then on, and for all new installs, the
+  web-operability gap and updater-side security-staleness liability close.
 - The updater's authority envelope widens from one target to "one target + self."
   This is a real increase in the socket-holder's blast radius and must be
   disclosed in the Compose profile and operator docs exactly as ADR-0024 disclosed
@@ -338,12 +434,17 @@ design note); this ADR references it generically rather than fixing its endpoint
 - The internal updater API acquires C7's forward-compatibility rule as a
   release-process requirement for every release whose sidecar may outpace the
   app — exactly as ADR-0024's N/N-1 migration rule became one for schemas.
-- A new self-recreation ladder acquires its own crash-recovery states and a new
-  liveness gate distinct from the app's Docker health gate; both need dedicated
-  tests (successor promotion, predecessor survival on failed successor, the
-  orphaned-temp-successor window between create and rename, both-die seam,
-  no-two-claimants under flock, the id-pinned first-predecessor carve-out
-  refusing unmatched containers, no-phase-wrote invariant).
+- A new self-recreation ladder acquires its own crash-recovery states and a
+  two-stage gate distinct from the app's Docker health gate; both need
+  dedicated tests (successor promotion; predecessor survival on a successor
+  that never pings; the ping-then-crash-before-lock successor, which must end
+  in predecessor reclaim, not orphaning; wrong config replay failing closed at
+  the ping or socket-check stage; the orphaned-temp-successor window between
+  create and rename; the released-flock/not-yet-acked race; the post-ack
+  wedged successor recovering via restart reconciliation; both-die seam;
+  no-two-claimants under flock; the id-pinned first-predecessor carve-out
+  refusing unmatched containers; nonce rejection of prior-attempt orphans and
+  same-SHA rebuilds; no-phase-writes invariant).
 - The `docker-compose.yml` `#299` limitation note is replaced by the automated
   path; the manual `up -d updater` command remains a documented fallback, not the
   primary route.
@@ -353,28 +454,53 @@ design note); this ADR references it generically rather than fixing its endpoint
 ## Implementation scope
 
 - **Full option (a): Large.** A second recreation ladder with its own durable
-  stages and crash reconciliation, a coordinator-heartbeat liveness gate, the
-  self-only allowlist widening (labeled successors + the id-pinned
+  stages and crash reconciliation, the two-stage liveness-ping +
+  post-lock-ack gate, effective-config capture-and-replay for the successor,
+  the self-only allowlist widening (labeled successors + the id-pinned
   first-predecessor carve-out) with its guard tests, the C7
-  forward-compatibility rule on the internal updater API, the durable
-  refresh-status record, and the Compose rename convergence — plus interaction
-  tests against the #346 phase guard and the #354 recovery action. This is new
-  privileged design surface and should **not** be rushed to land before the
-  **Jul 24** freeze.
+  forward-compatibility rule on the internal updater API (including the
+  liveness-only heartbeat variant), the durable refresh-status record, and the
+  Compose rename convergence — plus interaction tests against the #346 phase
+  guard and the #354 recovery action. This is new privileged design surface
+  and should **not** be rushed to land before the **Jul 24** freeze.
 - **Detect-and-surface interim (companion): Small–Medium.** This interim *is*
-  the expand step C7 requires: add the sidecar build identity to the
-  authenticated heartbeat and coordinator status storage (app-side accept +
-  persist first, sidecar sending it thereafter), compare it to the app's own
-  build id, expose a truthful "updater running older image" status, and keep
-  the documented one-command refresh. Safe to land before the freeze; it adds
-  no privileged authority and pre-pays the protocol change the full ladder
-  depends on.
+  the expand step C7 requires: add app-side acceptance of the liveness-only
+  heartbeat variant and its successor-identity fields (build identity,
+  container id, nonce — accepted and persisted or ignored first, sidecars
+  sending them thereafter), compare the persisted build identity to the app's
+  own build id, expose a truthful "updater running older image" status, and
+  keep the documented one-command refresh. Safe to land before the freeze; it
+  adds no privileged authority and pre-pays the protocol change the full
+  ladder depends on.
 
 **Recommendation for the freeze:** accept this ADR as `Proposed` now, ship the
 Small–Medium detect-and-surface interim before Jul 24 if desired, and schedule the
 Large successor-spawn ladder for the next window after the canary has exercised a
 cross-release phase-vocabulary downgrade (the #354 scenario) so the two designs
 land reconciled.
+
+## Open implementation questions
+
+Deliberately left to the implementing change (and to be settled in the
+`Accepted` revision of this ADR or its implementation PR), because they do not
+change the option choice:
+
+1. **Observation channel for step 4's ping confirmation.** The liveness ping
+   lands at the app's coordinator, which the predecessor cannot read today.
+   Two candidate channels: the internal API exposes an authenticated echo of
+   the last-seen successor identity/nonce (one more C7-governed read), or the
+   successor *also* stamps a bootstrap marker file (nonce + container id) on
+   the shared state volume that the predecessor watches. The ping's value —
+   proving secret/network/coordinator-URL replay — argues for the echo; the
+   stamp is simpler and app-independent. The implementation picks one; the
+   step-5 ack is unaffected (it is already a state-record write the
+   predecessor reads directly).
+2. **Successor-bootstrap marker mechanism.** Whether the successor detects its
+   role via an environment variable, a command argument, or the presence of an
+   unacked self-refresh record naming its own container id — and how that
+   marker interacts with work item 2's replay allowlist (it must be added at
+   create and must not survive into the successor's own future self-refresh
+   capture).
 
 ## Alternatives considered
 
