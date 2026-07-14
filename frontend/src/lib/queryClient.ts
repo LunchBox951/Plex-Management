@@ -47,6 +47,9 @@ export const queryKeys = {
   // Kept OFF the ['settings'] prefix on purpose: a settings save must not
   // invalidate the recovery-key existence check (they are independent facts).
   appKeyStatus: ['app-key', 'status'] as const,
+  // Active browser sessions per user (admin session management). Off the
+  // ['settings'] prefix — an ordinary settings save must not refetch it.
+  activeSessions: ['auth', 'sessions'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
   queue: ['queue'] as const,
