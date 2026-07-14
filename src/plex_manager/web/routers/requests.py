@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.domain.quality_profile import QualityProfile
@@ -462,24 +462,90 @@ async def create_request_endpoint(
     return response_body
 
 
-@router.get("")
+@router.get(
+    "",
+    responses={
+        422: {
+            "model": ErrorDetail,
+            "description": (
+                "``cursor_requires_limit`` -- ``cursor`` was supplied without ``limit`` "
+                "(a cursor only means anything within the paginated mode)"
+            ),
+        },
+    },
+)
 async def list_requests_endpoint(
     auth: Annotated[AuthContext, Depends(require_api_key)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    limit: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            le=200,
+            description=(
+                "Page size for keyset-paginated RAW request history (issue #218). "
+                "Omitted = the legacy whole-list mode (folded, unpaginated) -- "
+                "unchanged for existing clients."
+            ),
+        ),
+    ] = None,
+    cursor: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            description=(
+                "Keyset cursor: the previous page's ``next_cursor``. Only rows with "
+                "``id < cursor`` are returned (newest first). Requires ``limit``."
+            ),
+        ),
+    ] = None,
 ) -> RequestListResponse:
-    """List all media requests."""
-    if auth.is_admin or auth.user_id is None:
+    """List media requests -- whole-list (legacy) or one keyset history page (#218).
+
+    **Paginated mode** (``limit`` supplied): one bounded page of RAW lifetime
+    history rows, newest (highest id) first, plus ``next_cursor`` (``null`` when
+    exhausted). Shared-user visibility is applied IN SQL before any row is
+    materialized, the page is never display-folded (a fold group can span pages;
+    the folded live-state view is issue #218's phase-2 compact lookup), and every
+    batched enrichment below (seasons, episode counts, downloads, subscriber
+    flags) is scoped to exactly the page's ids. ``id`` is unique and monotonic,
+    so the keyset is total (no ties) and no OFFSET or COUNT is ever issued.
+
+    **Legacy mode** (no ``limit``): the pre-#218 behavior byte-for-byte -- the
+    whole visible set, display-folded -- plus an ignorable ``next_cursor: null``,
+    so a cached SPA bundle from before this change keeps working against the new
+    API during a rollout. ``cursor`` without ``limit`` is refused (422
+    ``cursor_requires_limit``) rather than silently ignored.
+    """
+    next_cursor: int | None = None
+    if limit is not None:
+        records, next_cursor = await request_service.list_requests_page(
+            session,
+            # Same visibility scope as the legacy branch below: admins and the
+            # (admin-equivalent) API key see every row; a shared user's page is
+            # subscriber-filtered in SQL.
+            for_user_id=(None if auth.is_admin or auth.user_id is None else auth.user_id),
+            before_id=cursor,
+            limit=limit,
+        )
+    elif cursor is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="cursor_requires_limit"
+        )
+    elif auth.is_admin or auth.user_id is None:
         records = await request_service.list_requests(session)
     else:
         records = await request_service.list_requests_for_user(session, auth.user_id)
-    # Fold duplicate rows for the same media (e.g. a healed-but-not-yet-collapsed
-    # false-``available`` row alongside a genuine re-grab) down to ONE visible
-    # row per the requester's own preference order -- AFTER the per-user filter
-    # above, so a non-admin's own visible row is never folded onto a row they
-    # cannot see. Underlying rows are untouched (see the helper's docstring).
-    records = request_service.fold_requests_for_display(
-        records, subscriber_scoped=not auth.is_admin
-    )
+    if limit is None:
+        # Fold duplicate rows for the same media (e.g. a healed-but-not-yet-collapsed
+        # false-``available`` row alongside a genuine re-grab) down to ONE visible
+        # row per the requester's own preference order -- AFTER the per-user filter
+        # above, so a non-admin's own visible row is never folded onto a row they
+        # cannot see. Underlying rows are untouched (see the helper's docstring).
+        # LEGACY MODE ONLY: a history page is raw rows by contract (see above).
+        records = request_service.fold_requests_for_display(
+            records, subscriber_scoped=not auth.is_admin
+        )
     # Batch active physical downloads only AFTER actor filtering + display folding.
     # This preserves the shared-user boundary and gives every visible request a
     # consistent progress projection without calling the admin-only queue endpoint
@@ -526,7 +592,8 @@ async def list_requests_endpoint(
                 ),
             )
             for r in records
-        ]
+        ],
+        next_cursor=next_cursor,
     )
 
 

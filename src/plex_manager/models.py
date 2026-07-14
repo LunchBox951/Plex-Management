@@ -486,12 +486,22 @@ class RequestSubscriber(Base):
     """
 
     __tablename__ = "request_subscribers"
+    __table_args__ = (
+        # Issue #218: the shared-user history page (``SqlRequestRepository.
+        # list_page``) filters by ``user_id`` equality and range-walks
+        # ``request_id`` DESC under it (``JOIN ... WHERE user_id = :u AND
+        # media_requests.id < :cursor ORDER BY id DESC LIMIT :n``). The composite
+        # serves both the equality and the ordered walk (and, being
+        # leading-column-compatible, every lookup the old single-column
+        # ``ix_request_subscribers_user_id`` served -- which it replaces).
+        Index("ix_request_subscribers_user_id_request_id", "user_id", "request_id"),
+    )
 
     request_id: Mapped[int] = mapped_column(
         ForeignKey("media_requests.id", ondelete="CASCADE"), primary_key=True
     )
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     subscribed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

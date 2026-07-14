@@ -2035,8 +2035,19 @@
         "type": "object"
       },
       "RequestListResponse": {
-        "description": "A list of media requests.",
+        "description": "A list of media requests.\n\n``next_cursor`` (issue #218) is the keyset cursor for the FOLLOWING page of\nraw request history: pass it back as ``GET /requests?limit=...&cursor=...``\nto continue, ``null`` when this response exhausted the history. Always\n``null`` in the legacy unpaginated mode (no ``limit`` supplied), whose\nfolded whole-list behavior is unchanged -- an older client that never sends\n``limit`` sees exactly the pre-#218 response plus this ignorable field.",
         "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
           "requests": {
             "items": {
               "$ref": "#/components/schemas/RequestResponse"
@@ -5913,8 +5924,49 @@
     },
     "/api/v1/requests": {
       "get": {
-        "description": "List all media requests.",
+        "description": "List media requests -- whole-list (legacy) or one keyset history page (#218).\n\n**Paginated mode** (``limit`` supplied): one bounded page of RAW lifetime\nhistory rows, newest (highest id) first, plus ``next_cursor`` (``null`` when\nexhausted). Shared-user visibility is applied IN SQL before any row is\nmaterialized, the page is never display-folded (a fold group can span pages;\nthe folded live-state view is issue #218's phase-2 compact lookup), and every\nbatched enrichment below (seasons, episode counts, downloads, subscriber\nflags) is scoped to exactly the page's ids. ``id`` is unique and monotonic,\nso the keyset is total (no ties) and no OFFSET or COUNT is ever issued.\n\n**Legacy mode** (no ``limit``): the pre-#218 behavior byte-for-byte -- the\nwhole visible set, display-folded -- plus an ignorable ``next_cursor: null``,\nso a cached SPA bundle from before this change keeps working against the new\nAPI during a rollout. ``cursor`` without ``limit`` is refused (422\n``cursor_requires_limit``) rather than silently ignored.",
         "operationId": "list_requests_endpoint_api_v1_requests_get",
+        "parameters": [
+          {
+            "description": "Page size for keyset-paginated RAW request history (issue #218). Omitted = the legacy whole-list mode (folded, unpaginated) -- unchanged for existing clients.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Page size for keyset-paginated RAW request history (issue #218). Omitted = the legacy whole-list mode (folded, unpaginated) -- unchanged for existing clients.",
+              "title": "Limit"
+            }
+          },
+          {
+            "description": "Keyset cursor: the previous page's ``next_cursor``. Only rows with ``id < cursor`` are returned (newest first). Requires ``limit``.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Keyset cursor: the previous page's ``next_cursor``. Only rows with ``id < cursor`` are returned (newest first). Requires ``limit``.",
+              "title": "Cursor"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -5925,6 +5977,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "``cursor_requires_limit`` -- ``cursor`` was supplied without ``limit`` (a cursor only means anything within the paginated mode)"
           }
         },
         "security": [

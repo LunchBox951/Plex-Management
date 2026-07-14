@@ -308,6 +308,30 @@ class SqlRequestRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
+    async def list_page(
+        self, *, for_user_id: int | None, before_id: int | None, limit: int
+    ) -> list[RequestRecord]:
+        """One keyset page of raw request history -- see the port docstring (#218).
+
+        The LIMIT, the ``id < before_id`` keyset predicate, and (for a shared
+        user) the subscriber-visibility JOIN all run in SQL, so at most ``limit``
+        rows are ever materialized regardless of lifetime history size. Newest
+        first (``id DESC``): ``id`` is unique, so the keyset has no ties. The
+        shared-user path is served by ``ix_request_subscribers_user_id_request_id``
+        (``(user_id, request_id)`` -- the leading equality plus a descending
+        request-id range walk).
+        """
+        stmt = select(MediaRequest)
+        if for_user_id is not None:
+            stmt = stmt.join(
+                RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id
+            ).where(RequestSubscriber.user_id == for_user_id)
+        if before_id is not None:
+            stmt = stmt.where(MediaRequest.id < before_id)
+        stmt = stmt.order_by(MediaRequest.id.desc()).limit(limit)
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
     async def get_many(self, request_ids: Sequence[int]) -> dict[int, RequestRecord]:
         """Batch :meth:`get` over MULTIPLE ids in one query (issue #138).
 

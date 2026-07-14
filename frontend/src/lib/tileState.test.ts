@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DiscoverResult, RequestResponse } from '../api/types'
 import { queryClient } from './queryClient'
-import { deriveTileState, resetSettleObservations } from './tileState'
+import { deriveTileState, indexRequestsByTitle, resetSettleObservations } from './tileState'
 
 function result(overrides: Partial<DiscoverResult> = {}): DiscoverResult {
   return {
@@ -494,5 +494,53 @@ describe('deriveTileState — movie/tv correlation isolation', () => {
       [request({ tmdb_id: 5, media_type: 'tv', status: 'partially_available' })],
     )
     expect(state).toEqual({ label: 'Partially available', intent: 'available' })
+  })
+})
+
+describe('indexRequestsByTitle — memoized correlation map (issue #218)', () => {
+  it('builds the index once per requests-array instance (memoized identity)', () => {
+    const rows = [
+      request({ id: 1, tmdb_id: 7, media_type: 'movie' }),
+      request({ id: 2, tmdb_id: 7, media_type: 'movie', status: 'failed' }),
+      request({ id: 3, tmdb_id: 7, media_type: 'tv' }),
+    ]
+    const first = indexRequestsByTitle(rows)
+    const second = indexRequestsByTitle(rows)
+    expect(second).toBe(first) // SAME Map instance: built once, O(U + T) per render
+    // A NEW array instance (a fresh poll snapshot) gets a fresh index.
+    expect(indexRequestsByTitle([...rows])).not.toBe(first)
+  })
+
+  it('groups by the composite media_type:tmdb_id key preserving id order', () => {
+    const rows = [
+      request({ id: 1, tmdb_id: 7, media_type: 'movie' }),
+      request({ id: 2, tmdb_id: 7, media_type: 'tv' }),
+      request({ id: 3, tmdb_id: 7, media_type: 'movie', status: 'failed' }),
+    ]
+    const index = indexRequestsByTitle(rows)
+    expect(index.get('movie:7')?.map((r) => r.id)).toEqual([1, 3]) // id-ascending, tv excluded
+    expect(index.get('tv:7')?.map((r) => r.id)).toEqual([2])
+  })
+
+  it('bounds per-tile correlation to lookups: many tiles never rescan the array', () => {
+    // Comparison-bound proxy: after ONE deriveTileState call builds the index,
+    // the array itself is never re-iterated for further tiles — verified by
+    // freezing iteration via a poisoned filter/find on the array instance.
+    const rows = [
+      request({ id: 1, tmdb_id: 100, media_type: 'movie', status: 'downloading' }),
+      request({ id: 2, tmdb_id: 101, media_type: 'movie', status: 'pending' }),
+    ]
+    deriveTileState(result({ tmdb_id: 100, media_type: 'movie', library_state: 'none' }), rows)
+    rows.filter = () => {
+      throw new Error('per-tile array rescan (O(T x U)) is forbidden after the index is built')
+    }
+    // 50 further tiles resolve purely through the memoized index.
+    for (let i = 0; i < 50; i++) {
+      const state = deriveTileState(
+        result({ tmdb_id: 100 + (i % 2), media_type: 'movie', library_state: 'none' }),
+        rows,
+      )
+      expect(state).not.toBeNull()
+    }
   })
 })
