@@ -14,10 +14,11 @@ CONTRIBUTING.md "Logging request-derived values".
 
 import base64
 import hashlib
+import json
 import re
 from collections.abc import Iterable
 from typing import Final
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 #: The ONLY shape :func:`safe_guid` ever passes through verbatim: a bounded run
 #: of letters, digits, dots, underscores, and hyphens. This covers every benign
@@ -241,6 +242,11 @@ def safe_guid(value: str) -> str:
 #    HASH at rest; qBittorrent's SID lives only in the adapter's in-memory
 #    cookie jar), so :func:`redact_known_secrets`'s value-based pass (below)
 #    can never mask this shape -- this SHAPE rule is the only barrier for it.
+# 5b. The same cookie names rendered as a ``http.cookies.SimpleCookie`` repr --
+#    ``<SimpleCookie: plexmgr.session='SECRET'>`` (unquoted name, ``=``, quoted
+#    value; see :data:`_SIMPLE_COOKIE_RE`) -- which neither the raw-header pass
+#    (5) nor the dict-repr pass (5a) recognizes. Same "cookie token is never a
+#    settings value, so a shape rule is the only barrier" reasoning as 5a.
 #
 # A final, UNCONDITIONAL pass (no key name involved at all) catches a
 # Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
@@ -478,13 +484,43 @@ _COOKIE_JAR_RE: Final = re.compile(
     + r")"
 )
 
+# Cookie/session credentials rendered as a ``http.cookies.SimpleCookie`` repr
+# (#292 item -- SimpleCookie repr leakage) -- ``<SimpleCookie: plexmgr.session=
+# 'SECRET' QBT_SID_8080='SECRET'>`` -- the shape a ``BaseCookie``/``SimpleCookie``
+# object logs as when repr'd whole (space-separated ``name='value'`` pairs, the
+# cookie NAME UNQUOTED, the value QUOTED). Neither ``_COOKIE_RE`` (it requires an
+# UNQUOTED ``name=value`` and its value class stops dead at the opening ``'``) nor
+# ``_COOKIE_JAR_RE`` (it keys on a QUOTED key + ``:`` dict separator) recognizes
+# this unquoted-key/``=``/quoted-value form, so it needs its own pass. Keys on the
+# same ``session``/``sid`` cookie-NAME shape the other two cookie passes accept
+# (reused verbatim), an ``=``, then a quoted value masked through its matching
+# close quote via the shared escape-aware :data:`_QUOTED_VALUE` run. Like every
+# cookie token, this value is never a settings-store value (a ``plexmgr.session``
+# is only ever a hash at rest; qBittorrent's ``SID`` lives only in the adapter's
+# in-memory jar), so this SHAPE rule is the ONLY barrier for the repr form.
+_SIMPLE_COOKIE_RE: Final = re.compile(
+    r"(?i)\b[\w.]*(?:session|sid)(?:[._-][\w.-]*)?=(?P<q>['\"])(?P<value>" + _QUOTED_VALUE + r")"
+)
+
 # ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
 # Group 1 captures ``scheme://user`` (stopping the username at the first
 # ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
 # into the output, only its span is consumed so it can be dropped. The username
 # run is ``*`` (not ``+``) so a valid empty-username basic-auth URL
 # (``https://:token@host``) still masks its token instead of leaking it.
-_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s@'\"]+@")
+#
+# The password run is greedy up to the LAST ``@`` still inside the authority --
+# it excludes only ``/``/``?``/``#`` (the authority terminators, so the host and
+# any path/query ``@`` are never swallowed), NOT ``@`` itself, so a password that
+# CONTAINS a raw ``@`` (``scheme://user:p@ss@host``) is masked WHOLE rather than
+# up to its own first internal ``@`` (issue #270's shape-grammar gap; #292 item
+# 3). Because the run has no length floor of its own, this also masks a SHORT
+# ``@``-bearing password the value-based pass skips (#292 item 4/short-password
+# gap), and re-masks a LEGACY row the old first-``@`` regex already mangled into
+# ``user:<redacted>@ssremainder@host`` -- the greedy run consumes the exposed
+# ``ssremainder`` too, recovering the partially-redacted row (#292 item 3). The
+# class + single required ``@`` is linear (no nested quantifier -> no ReDoS).
+_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s/?#'\"]+@")
 
 # A standalone Fernet-key-shaped blob: 43 urlsafe-base64 characters plus the
 # one trailing ``=`` pad ``Fernet.generate_key()`` always produces (32 raw
@@ -544,6 +580,7 @@ def redact_secrets(text: str) -> str:
     redacted = _SECRET_TUPLE_RE.sub(_mask_value, redacted)
     redacted = _COOKIE_RE.sub(_mask_value, redacted)
     redacted = _COOKIE_JAR_RE.sub(_mask_value, redacted)
+    redacted = _SIMPLE_COOKIE_RE.sub(_mask_value, redacted)
     redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
     return redacted
 
@@ -614,32 +651,99 @@ def redact_secrets(text: str) -> str:
 #: secrets sitting in a recognized ``key=value``/header/cookie shape.
 _MIN_SECRET_VALUE_LENGTH: Final = 8
 
+#: A word/identifier character (matches a ``[\w-]`` run's members). Used by the
+#: key-name guard below to tell whether a value match is embedded WITHIN a larger
+#: identifier rather than standing alone.
+_IDENT_CHAR_RE: Final = re.compile(r"[\w-]")
+#: An assignment separator anchored at the character AFTER a value match: optional
+#: whitespace then ``:`` or ``=``. Used with :func:`re.Match.string` to detect a
+#: value sitting in KEY position.
+_KEY_POSITION_SEP_RE: Final = re.compile(r"\s*[:=]")
+
+
+#: A single ``%XX`` percent-escape. Used to derive a LOWERCASE-hex spelling of a
+#: percent-encoded variant: ``quote``/``quote_plus`` always emit UPPERCASE hex
+#: (``%2F``), but a client/proxy/browser may emit lowercase (``%2f``) -- both are
+#: valid and equivalent per RFC 3986, so both spellings must be masked.
+_PERCENT_ESCAPE_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _lower_percent_escapes(encoded: str) -> str:
+    """Lowercase the hex digits of every ``%XX`` escape, leaving all other
+    characters untouched -- the lowercase-percent spelling of ``encoded``."""
+    return _PERCENT_ESCAPE_RE.sub(lambda m: m.group().lower(), encoded)
+
 
 def _secret_value_variants(value: str) -> frozenset[str]:
-    """Every literal RENDERING of ``value`` this pass will mask: the raw value
-    itself, its URL-percent-encoded form (a password/token embedded in a query
-    string or userinfo often arrives percent-encoded rather than raw -- e.g. a
-    password containing ``@`` or ``&``), and its base64 form (``cryptography``/
-    third-party clients frequently base64-encode a credential for a header or
-    a config dump). Each variant is included only when it actually DIFFERS from
-    the raw value, so a value with no reserved/non-ASCII characters (already
-    identical to its own percent-encoding) contributes exactly one entry rather
-    than three redundant copies for the caller's alternation to consider.
+    """Every literal RENDERING of ``value`` this pass will mask -- the raw value
+    plus the encoded spellings the same secret arrives in when a client, proxy,
+    or serializer re-renders it. The frozenset deduplicates, so a value with no
+    reserved/non-ASCII characters (identical to several of its own encodings)
+    simply contributes fewer distinct entries; empties are dropped. Variants:
 
-    Total -- never raises: ``quote``'s own DEFAULT ``errors="strict"`` UTF-8
-    encode raises ``UnicodeEncodeError`` on a lone UTF-16 surrogate (a JSON log
-    payload permits one; a settings value round-tripped through JSON could
+    * **Percent-encoding** -- a password/token embedded in a query string or
+      userinfo often arrives percent-encoded (e.g. a password containing ``@``
+      or ``&``). Covered in all common spellings (#292 encoding-variant items):
+      canonical ``quote`` (UPPERCASE hex, ``%20`` for space), its LOWERCASE-hex
+      equivalent (``%2f`` -- both are RFC-3986-valid), and ``quote_plus``'s
+      ``+``-for-space query spelling, itself in upper- and lowercase hex.
+    * **base64** -- ``cryptography``/third-party clients frequently base64 a
+      credential for a header or config dump. Covered as STANDARD and URL-SAFE
+      alphabets, each in PADDED and UNPADDED form (a ``=``-stripped/base64url
+      rendering is common in JWT-style and query contexts; #292 items).
+    * **JSON- / repr-escaped string bodies** -- a secret containing a quote or
+      backslash renders ESCAPED inside a JSON-encoded log field
+      (``{"password": "a\\"b"}``) or a Python ``repr()`` (``'a\\'b'``); the raw
+      bytes never appear literally, so the escaped body must be matched too
+      (#292 item). The surrounding delimiters are stripped -- only the escaped
+      body is a substring of the surrounding text.
+
+    Total -- never raises: ``quote``/``quote_plus``'s DEFAULT ``errors="strict"``
+    UTF-8 encode raises ``UnicodeEncodeError`` on a lone UTF-16 surrogate (a JSON
+    log payload permits one; a settings value round-tripped through JSON could
     carry one) -- ``errors="surrogatepass"`` (the same choice :func:`safe_guid`
-    makes for its own digest) absorbs it instead of raising.
+    makes for its own digest) absorbs it; ``json.dumps`` needs no such guard, it
+    escapes a lone surrogate to ``\\uXXXX`` rather than raising.
     """
+    raw_bytes = value.encode("utf-8", "surrogatepass")
     variants = {value}
-    percent_encoded = quote(value, safe="", errors="surrogatepass")
-    if percent_encoded != value:
-        variants.add(percent_encoded)
-    b64_encoded = base64.b64encode(value.encode("utf-8", "surrogatepass")).decode("ascii")
-    if b64_encoded != value:
-        variants.add(b64_encoded)
-    return frozenset(variants)
+    # Percent-encoding: canonical + lowercase-hex, for both ``quote`` (space ->
+    # ``%20``) and ``quote_plus`` (space -> ``+``).
+    for encoded in (
+        quote(value, safe="", errors="surrogatepass"),
+        quote_plus(value, safe="", errors="surrogatepass"),
+    ):
+        variants.add(encoded)
+        variants.add(_lower_percent_escapes(encoded))
+    # base64: standard and URL-safe alphabets, each padded and unpadded.
+    for b64 in (
+        base64.b64encode(raw_bytes).decode("ascii"),
+        base64.urlsafe_b64encode(raw_bytes).decode("ascii"),
+    ):
+        variants.add(b64)
+        variants.add(b64.rstrip("="))
+    # JSON- and repr-escaped string bodies (delimiters stripped). ``json.dumps``
+    # with the default ``ensure_ascii=True`` is total on any ``str`` -- it
+    # escapes even a lone surrogate to ``\\uXXXX`` rather than raising -- so no
+    # guard is needed (mirrors ``safe_guid``'s surrogate handling elsewhere).
+    variants.add(json.dumps(value)[1:-1])
+    variants.add(repr(value)[1:-1])
+    return frozenset(v for v in variants if v)
+
+
+def _mask_known_value(match: re.Match[str]) -> str:
+    """Replace a matched secret-value occurrence with :data:`_REDACTED`, UNLESS it
+    is the tail of a larger identifier sitting in KEY position -- preceded by a
+    word char AND immediately followed by an assignment separator -- in which
+    case masking would rewrite a key NAME rather than a credential (#292 item 4;
+    see :func:`redact_known_secrets`). The spared case is deliberately narrow: a
+    standalone or in-prose value, even one followed by ``=``, is still masked."""
+    text = match.string
+    start, end = match.start(), match.end()
+    embedded_in_identifier = start > 0 and _IDENT_CHAR_RE.fullmatch(text[start - 1]) is not None
+    if embedded_in_identifier and _KEY_POSITION_SEP_RE.match(text, end) is not None:
+        return match.group(0)  # a key name, not a credential value -- leave it
+    return _REDACTED
 
 
 def redact_known_secrets(
@@ -695,6 +799,21 @@ def redact_known_secrets(
     content, load-bearing here. An empty ``text`` or an empty/entirely-
     too-short ``secret_values`` is a no-op, returned byte-identical, exactly
     like an ordinary miss in :func:`redact_secrets`.
+
+    KEY-NAME GUARD (#292 item 4): a value occurrence that is embedded as the tail
+    of a LARGER identifier which is itself in KEY position -- preceded by a word
+    char and immediately followed by an assignment separator (``some_password=X``,
+    where a configured secret's value happens to equal the field-name word
+    ``"password"``, a minimum-length edge case) -- is left intact by
+    :func:`_mask_known_value`. Masking it would rewrite a KEY NAME
+    (``some_<redacted>=X``), eating an identifier operators need (honesty over
+    silence: operators need usable logs), while the ACTUAL credential in that
+    shape sits on the RIGHT of the separator, where this same pass (a later
+    occurrence) and :func:`redact_secrets`'s key-preserving shape grammar both
+    still mask it. The guard is deliberately narrow -- only a value embedded in a
+    larger identifier before a separator is spared, so a standalone or in-prose
+    secret value (even one immediately followed by ``=``) is still masked -- so
+    it forfeits no coverage of a real leak.
     """
     if not text:
         return text
@@ -705,5 +824,6 @@ def redact_known_secrets(
         variants |= _secret_value_variants(value)
     if not variants:
         return text
-    pattern = re.compile("|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True)))
-    return pattern.sub(_REDACTED, text)
+    alternation = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    pattern = re.compile(r"(?:" + alternation + r")")
+    return pattern.sub(_mask_known_value, text)

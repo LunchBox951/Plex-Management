@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -157,6 +158,44 @@ async def test_tail_limit_caps_the_returned_slice(
         response = await client.get("/api/v1/ops/logs/tail", params={"limit": 2}, headers=_HEADERS)
         messages = [e["message"] for e in response.json()["events"]]
         assert messages == ["line 4", "line 3"]
+    finally:
+        log_capture_service.stop_logging(handler, logger=test_logger)
+
+
+async def test_tail_re_redacts_against_current_secrets_not_the_stale_snapshot(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """#292 item 1: the ring buffer's rows were redacted at capture time against
+    the handler's periodically-refreshed secret snapshot, which lags a rotation
+    by up to one drain tick. ``/logs/tail`` must therefore re-redact on read
+    against THIS instant's decrypted secret values -- exactly as the durable
+    read boundaries do -- so a just-rotated/just-configured secret captured
+    while the snapshot was stale does not surface unmasked here.
+
+    Simulated by leaving the handler's ``secret_values`` snapshot empty (its
+    default) while a line containing the configured password lands in the ring
+    buffer: capture-time redaction cannot mask it (empty snapshot, and the value
+    sits in bare prose with no shape to key on), so only the read-time re-pass
+    against the fresh settings value can."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    rotated_secret = "justRotatedQbtPasswordValue0123456789"  # noqa: S105
+    await _configure_qbittorrent_password(sessionmaker_, rotated_secret)
+
+    test_logger = logging.getLogger("plex_manager.test.tail_rotation")
+    test_logger.propagate = False
+    handler = log_capture_service.configure_logging("DEBUG", logger=test_logger)
+    # Handler snapshot deliberately left empty (frozenset()) -- the stale window.
+    app.state.log_handler = handler
+    try:
+        test_logger.warning("qbittorrent rejected login as %s directly", rotated_secret)
+        # Capture-time redaction could not mask it (empty snapshot, bare prose):
+        assert any(rotated_secret in r.message for r in handler.snapshot_tail(10))
+
+        response = await client.get("/api/v1/ops/logs/tail", headers=_HEADERS)
+        assert response.status_code == 200
+        message = response.json()["events"][0]["message"]
+        assert rotated_secret not in message  # masked on read against fresh secrets
+        assert "<redacted>" in message
     finally:
         log_capture_service.stop_logging(handler, logger=test_logger)
 
@@ -449,7 +488,9 @@ async def test_logs_catches_the_basic_auth_raw_at_sign_shape_grammar_gap_via_val
     # No fragment of the password survives either -- guards against exactly
     # the partial-match failure mode #270 describes.
     assert "ssw0rd0123456789" not in message
-    assert "tracker.example.com" in message  # host stays diagnosable
+    # Structural host check (not a substring test) -- host stays diagnosable and
+    # this avoids CodeQL's incomplete-URL-substring-sanitization flag.
+    assert urlsplit(message.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
 
 
 async def test_export_json_value_based_pass_reuses_the_current_secret_not_a_stale_one(
