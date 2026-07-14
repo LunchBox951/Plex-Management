@@ -31,7 +31,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, func, or_, update
+from sqlalchemy import CursorResult, and_, delete, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.models import AuthSession
@@ -177,6 +177,16 @@ async def sweep_dead_sessions(
     survives as an audit record for a while before being reclaimed. A still-live
     session is never touched. The caller owns nothing — this commits the delete
     itself so the background loop stays a single call. Returns the row count.
+
+    The three death signals are NOT independent: once a row has been revoked,
+    ``revoked_at`` alone governs its retention, full stop. (issue #328) Naively
+    OR-ing all three against their own cutoffs let a long-idle session's stale
+    ``last_seen_at`` satisfy the idle branch on its own, so a session revoked
+    *today* — e.g. an admin's mass-revoke sweeping up idle rows too — was reaped
+    on the very next sweep, destroying the fresh revocation's audit trail
+    instead of honoring the retention grace the ``revoked_at`` branch exists to
+    provide. So a revoked row is judged solely by ``revoked_at <= cutoff``; the
+    expiry/idle branches only apply to rows that were never revoked.
     """
     moment = now if now is not None else datetime.now(UTC)
     retention_cutoff = moment - SESSION_SWEEP_RETENTION
@@ -187,9 +197,14 @@ async def sweep_dead_sessions(
             delete(AuthSession).where(
                 or_(
                     AuthSession.revoked_at <= retention_cutoff,
-                    AuthSession.expires_at <= retention_cutoff,
-                    func.coalesce(AuthSession.last_seen_at, AuthSession.created_at)
-                    <= idle_death_cutoff,
+                    and_(
+                        AuthSession.revoked_at.is_(None),
+                        or_(
+                            AuthSession.expires_at <= retention_cutoff,
+                            func.coalesce(AuthSession.last_seen_at, AuthSession.created_at)
+                            <= idle_death_cutoff,
+                        ),
+                    ),
                 )
             )
         ),
