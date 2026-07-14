@@ -109,6 +109,7 @@ from plex_manager.web.events import (
     warn_if_multiworker,
 )
 from plex_manager.web.middleware import CriticalMutationMiddleware, SetupGuardMiddleware
+from plex_manager.web.routers import artwork as artwork_router
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
@@ -1648,6 +1649,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
+    app.include_router(artwork_router.router)
     app.include_router(events_router.router)
     app.include_router(requests_router.router)
     app.include_router(search_preview_router.router)
