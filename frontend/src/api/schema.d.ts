@@ -934,12 +934,16 @@ export interface paths {
          *     docstring for the full matrix.
          *
          *     Returns ``{"settled": bool}`` -- the authoritative under-lock outcome
-         *     (:class:`correction_service.WithdrawOutcome`): ``True`` only for the
-         *     last-participant teardown that removed a torrent and settled the request
-         *     ``cancelled``, ``False`` for a mere removal/handoff. The caller keys its
-         *     success toast off THIS rather than a click-time snapshot a concurrent
-         *     join/withdraw or status advance could have made stale (#351); the caller's
-         *     own row still simply drops out of their next ``GET /requests``.
+         *     (:class:`correction_service.WithdrawOutcome`): ``True`` only when the
+         *     last-participant cancel branch ran and the request settled ``cancelled``
+         *     (any active download, IF one existed, was removed -- a
+         *     pending/searching/no_acceptable_release/waiting_for_air_date row settles
+         *     purely in the DB with no torrent to touch, so ``settled: true`` must never
+         *     be presented as "a download was removed"); ``False`` for a mere
+         *     removal/handoff. The caller keys its success toast off THIS rather than a
+         *     click-time snapshot a concurrent join/withdraw or status advance could have
+         *     made stale (#351); the caller's own row still simply drops out of their
+         *     next ``GET /requests``.
          */
         delete: operations["withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete"];
         options?: never;
@@ -3190,12 +3194,15 @@ export interface components {
          * @description Outcome of ``DELETE /requests/{id}/subscription`` (issue #314 / #351).
          *
          *     ``settled`` echoes ``correction_service.WithdrawOutcome.settled`` -- the value
-         *     the withdraw verb computes under the participant media lock. ``True`` iff this
-         *     was the last-participant teardown that reused ``cancel_request`` (its torrent
-         *     removed, the request settled ``cancelled``); ``False`` for a mere subscription
-         *     removal (an owner handoff to a remaining participant, or the last participant
-         *     leaving an already-settled row). The client keys its success toast off THIS
-         *     authoritative outcome rather than a click-time snapshot a concurrent
+         *     the withdraw verb computes under the participant media lock. ``True`` iff the
+         *     last-participant CANCEL BRANCH ran (via ``cancel_request``) and the request
+         *     settled ``cancelled``. That branch removes any active download IF one exists,
+         *     but a pending/searching/no_acceptable_release/waiting_for_air_date row settles
+         *     purely in the DB with no torrent to touch -- so ``settled: true`` means "the
+         *     request was cancelled", NEVER "a download was removed". ``False`` is a mere
+         *     subscription removal (an owner handoff to a remaining participant, or the last
+         *     participant leaving an already-settled row). The client keys its success toast
+         *     off THIS authoritative outcome rather than a click-time snapshot a concurrent
          *     join/withdraw or status advance could have made stale (#351).
          */
         WithdrawSubscriptionResponse: {

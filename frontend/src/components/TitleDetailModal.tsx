@@ -286,15 +286,18 @@ function withdrawDialogCopy(flags: {
   if (!flags.isSettled) {
     // Sole participant, but the row is ACTIVE and NOT safely cancellable
     // (`import_blocked`/`partially_available`/`completed`, or a cancellable TV
-    // rollup whose season already imported): the backend REFUSES with a 409
-    // (`withdrawal_blocked_active_request` / `not_cancellable`) and removes
-    // nothing (#349). Say so honestly instead of promising a benign removal --
-    // and, since the refusal is KNOWN up front, offer no confirm action at all
-    // (`refusal`): a dialog that says "can't" while wiring a Withdraw button
-    // would just round-trip to the 409 error toast.
+    // rollup whose season already imported): per the CACHED snapshot the backend
+    // will refuse with a 409 (`withdrawal_blocked_active_request` /
+    // `not_cancellable`) and remove nothing (#349). Say so honestly instead of
+    // promising a benign removal -- but the snapshot can be STALE (the row may
+    // have settled, or another participant joined, since the last poll), so the
+    // `refusal` dialog still offers a non-destructive "Withdraw anyway" that
+    // lets the SERVER arbitrate: the client never blocks an action the server
+    // might accept, and never promises one it will refuse. The outcome toast
+    // (keyed off the response / the 409) stays authoritative either way.
     return {
       title: "Can't withdraw yet",
-      body: "This request is still active and can't be withdrawn until it finishes or is resolved. Try again once it settles.",
+      body: "This request looks active and not yet withdrawable — the server will likely refuse until it finishes or is resolved. If this looks out of date, you can try anyway; the server decides.",
       refusal: true,
     }
   }
@@ -1794,10 +1797,25 @@ export function TitleDetailModal({
             {withdrawCopy.body}
           </p>
           {withdrawCopy.refusal ? (
-            // Known-refusal case (#349): the backend will 409 this withdrawal, so
-            // the dialog is informational only -- one dismiss action, no mutation.
-            <div className="flex justify-end">
-              <Button variant="secondary" onClick={() => setWithdrawFor(null)}>
+            // Expected-refusal case (#349): per the cached snapshot the backend
+            // will 409 this withdrawal, so dismissing is the PRIMARY action. But
+            // the snapshot can be stale (the row settled / a participant joined
+            // since the last poll), so a non-destructive "Withdraw anyway" lets
+            // the SERVER arbitrate rather than the client blocking an action the
+            // server might accept -- the outcome/409 toast stays authoritative.
+            <div className="flex justify-end gap-3">
+              <Button
+                variant="secondary"
+                loading={withdrawSubscription.isPending}
+                onClick={() => void runWithdraw()}
+              >
+                Withdraw anyway
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => setWithdrawFor(null)}
+                disabled={withdrawSubscription.isPending}
+              >
                 OK
               </Button>
             </div>
