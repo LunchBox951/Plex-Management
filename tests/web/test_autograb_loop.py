@@ -535,18 +535,48 @@ async def test_autograb_once_leased_threads_db_configured_max_searches(
 
 
 class _StopAutograbLoop(Exception):
-    """Sentinel raised from a patched ``asyncio.sleep`` to end the (real)
+    """Sentinel raised from a patched inter-cycle wait to end the (real)
     ``while True`` in ``_autograb_loop`` after a bounded number of iterations,
-    without the loop ever needing to actually sleep in real time."""
+    without the loop ever needing to actually wait in real time."""
+
+
+def _patch_wait_for_capturing_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeouts: list[float | None], *, stop_after: int
+) -> None:
+    """Patch ``asyncio.wait_for`` so ``_autograb_loop``'s inter-cycle wait
+    records the timeout it was handed and raises :class:`_StopAutograbLoop`
+    after ``stop_after`` iterations.
+
+    Safe to patch globally here ONLY because the paired tests replace
+    ``_autograb_once`` with a no-op: the real tick would spawn the update
+    coordinator's lease-renewal task, whose own ``asyncio.wait_for`` would
+    otherwise be intercepted too. With the tick a no-op, the loop's wake wait is
+    the only ``wait_for`` in flight."""
+
+    async def _fake_wait_for(awaitable: object, timeout: float | None = None) -> None:
+        # Close the un-awaited ``wake_event.wait()`` coroutine so pytest does not
+        # warn about a coroutine that was never awaited.
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        timeouts.append(timeout)
+        if len(timeouts) >= stop_after:
+            raise _StopAutograbLoop
+
+    monkeypatch.setattr(asyncio, "wait_for", _fake_wait_for)
 
 
 async def test_autograb_loop_sleeps_the_db_configured_interval(
     sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_autograb_loop`` reads ``auto_grab_interval_seconds`` fresh every
-    iteration and sleeps THAT value -- a web-edited cadence takes effect on
-    the very next sleep, not the process-lifetime constant."""
-    _patch_adapters(monkeypatch, prowlarr=FakeProwlarr([]), qbt=FakeQbittorrent(), enabled=False)
+    iteration and waits THAT value -- a web-edited cadence takes effect on
+    the very next inter-cycle wait, not the process-lifetime constant."""
+
+    async def _noop_once(_app: FastAPI) -> None:
+        return None
+
+    monkeypatch.setattr(app_module, "_autograb_once", _noop_once)
 
     configured_values = iter([120.0, 45.0])
 
@@ -555,14 +585,8 @@ async def test_autograb_loop_sleeps_the_db_configured_interval(
 
     monkeypatch.setattr(app_module, "get_auto_grab_interval_seconds", _get_interval)
 
-    sleep_calls: list[float] = []
-
-    async def _fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-        if len(sleep_calls) >= 2:
-            raise _StopAutograbLoop
-
-    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    timeouts: list[float | None] = []
+    _patch_wait_for_capturing_timeout(monkeypatch, timeouts, stop_after=2)
 
     app = _build_app(sessionmaker_)
     try:
@@ -571,7 +595,7 @@ async def test_autograb_loop_sleeps_the_db_configured_interval(
     finally:
         await app.state.http_client.aclose()
 
-    assert sleep_calls == [120.0, 45.0]
+    assert timeouts == [120.0, 45.0]
 
 
 async def test_autograb_loop_survives_an_interval_read_failure(
@@ -582,21 +606,19 @@ async def test_autograb_loop_survives_an_interval_read_failure(
     ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT`` and keep the loop alive -- never let
     the exception escape ``_autograb_loop`` and silently kill automatic
     grabbing until a process restart."""
-    _patch_adapters(monkeypatch, prowlarr=FakeProwlarr([]), qbt=FakeQbittorrent(), enabled=False)
+
+    async def _noop_once(_app: FastAPI) -> None:
+        return None
+
+    monkeypatch.setattr(app_module, "_autograb_once", _noop_once)
 
     async def _boom_get_interval(_session: AsyncSession) -> float:
         raise RuntimeError("settings read failed")
 
     monkeypatch.setattr(app_module, "get_auto_grab_interval_seconds", _boom_get_interval)
 
-    sleep_calls: list[float] = []
-
-    async def _fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-        if len(sleep_calls) >= 3:
-            raise _StopAutograbLoop
-
-    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    timeouts: list[float | None] = []
+    _patch_wait_for_capturing_timeout(monkeypatch, timeouts, stop_after=3)
 
     app = _build_app(sessionmaker_)
     try:
@@ -605,7 +627,54 @@ async def test_autograb_loop_survives_an_interval_read_failure(
     finally:
         await app.state.http_client.aclose()
 
-    assert sleep_calls == [AUTO_GRAB_INTERVAL_SECONDS_DEFAULT] * 3
+    assert timeouts == [AUTO_GRAB_INTERVAL_SECONDS_DEFAULT] * 3
+
+
+async def test_autograb_loop_wakes_immediately_when_settings_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relevant settings write (via ``app.state.autograb_wake_event``) must be
+    observed WITHOUT waiting out the old -- possibly hour-long -- interval
+    (issue #332). The interval getter returns a huge value the test never waits
+    out: the second tick can only happen because the wake short-circuits the
+    inter-cycle wait, mirroring ``_watchlist_sync_loop``."""
+    first_tick = asyncio.Event()
+    second_tick = asyncio.Event()
+    calls = 0
+
+    async def _fake_once(_app: FastAPI) -> None:
+        nonlocal calls
+        calls += 1
+        (first_tick if calls == 1 else second_tick).set()
+
+    async def _long_interval(_session: object) -> float:
+        return 3_600.0
+
+    class _SessionContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(app_module, "_autograb_once", _fake_once)
+    monkeypatch.setattr(app_module, "get_auto_grab_interval_seconds", _long_interval)
+
+    app = FastAPI()
+    app.state.sessionmaker = lambda: _SessionContext()
+    app.state.autograb_wake_event = asyncio.Event()
+    task = asyncio.create_task(
+        app_module._autograb_loop(app)  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        await asyncio.wait_for(first_tick.wait(), timeout=1)
+        app.state.autograb_wake_event.set()
+        await asyncio.wait_for(second_tick.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert calls >= 2
 
 
 async def test_autograb_once_leased_max_searches_reflects_stored_setting(

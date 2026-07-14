@@ -23,6 +23,7 @@ __all__ = [
     "AUTO_GRAB_INTERVAL_SECONDS_MAX",
     "AUTO_GRAB_INTERVAL_SECONDS_MIN",
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX",
+    "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN",
     "DISK_PRESSURE_PERCENT_MAX",
     "DISK_PRESSURE_PERCENT_MIN",
     "EVICTION_GRACE_DAYS_MAX",
@@ -77,9 +78,15 @@ LOG_MAX_ROWS_MAX: int = 2_000_000
 # (searches are sequential and capped by the search-cap knob below).
 AUTO_GRAB_INTERVAL_SECONDS_MIN: float = 15.0
 AUTO_GRAB_INTERVAL_SECONDS_MAX: float = 3600.0
-# Floor is enforced separately as a dedicated ``>= 1`` guard (not encoded here
-# as a MIN constant): 0 is a valid ``_resolve_bounded_count`` input that would
-# otherwise silently disable the worker while ``auto_grab_enabled=True`` stays
-# on -- a lie. Ceiling 50 protects the single Prowlarr from a fat-fingered
-# burst; the default is 5 (``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE``).
+# Floor is 2, not 1 (issue #332): a cap of 1 lets Pass 1 spend the only search
+# on a whole-season pack preview, after which ``_attempt_episode_fallback`` sees
+# ``searched >= max_searches`` and reports ``budget_skipped`` FOREVER -- the
+# season-pack-less show can never reach its episode-level fallback, wedged with
+# no visible cause. A floor of 2 guarantees Pass 1's season search plus at least
+# one Pass-2 episode search, so the fallback can always make progress. (0 remains
+# forbidden for the original reason too: it would silently disable the worker
+# while ``auto_grab_enabled=True`` stays on -- a lie.) Ceiling 50 protects the
+# single Prowlarr from a fat-fingered burst; the default is 5
+# (``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE``).
+AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN: int = 2
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX: int = 50

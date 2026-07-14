@@ -29,6 +29,7 @@ from plex_manager.web.deps import (
     AUTO_GRAB_INTERVAL_SECONDS_MIN,
     AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
     AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
     DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
     DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
     EVICTION_ENABLED_DEFAULT,
@@ -1040,6 +1041,60 @@ async def test_non_repoint_edit_does_not_wake_watchlist_worker(
 
     assert put.status_code == 200
     assert not app.state.watchlist_wake_event.is_set()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("auto_grab_enabled", False),
+        ("auto_grab_interval_seconds", 30.0),
+        ("auto_grab_max_searches_per_cycle", 8),
+    ],
+)
+async def test_autograb_timing_change_wakes_autograb_worker(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    field: str,
+    value: object,
+) -> None:
+    """A shortened interval, a changed search cap, or a re-enable must be
+    observed on the next tick, not after the OLD (up to 1h) sleep expires
+    (issue #332): the PUT sets ``app.state.autograb_wake_event``."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    app.state.autograb_wake_event = asyncio.Event()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={field: value},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert app.state.autograb_wake_event.is_set()
+
+
+async def test_non_autograb_edit_does_not_wake_autograb_worker(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    tmp_path: Path,
+) -> None:
+    """The mirror guard: a PUT touching no auto-grab timing field must NOT wake
+    the auto-grab worker, so an unrelated edit can't spam immediate ticks."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    app.state.autograb_wake_event = asyncio.Event()
+    root = tmp_path / "tv"
+    root.mkdir()
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"tv_root": str(root)},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert not app.state.autograb_wake_event.is_set()
 
 
 async def test_put_non_plex_fields_keep_sessions_active(
@@ -2235,10 +2290,14 @@ def test_settings_update_rejects_out_of_range_auto_grab_timing() -> None:
     SettingsUpdate(auto_grab_interval_seconds=AUTO_GRAB_INTERVAL_SECONDS_MAX)  # boundary
     SettingsUpdate(auto_grab_interval_seconds=90.0)  # an ordinary value still works
 
-    for bad_count in (0, -1, AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1):
+    # 1 is now below the floor (issue #332): a cap of 1 wedges whole-season TV.
+    for bad_count in (0, 1, -1, AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1):
         with pytest.raises(ValidationError):
             SettingsUpdate(auto_grab_max_searches_per_cycle=bad_count)
-    SettingsUpdate(auto_grab_max_searches_per_cycle=1)  # floor, inclusive
+    assert AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN == 2
+    SettingsUpdate(
+        auto_grab_max_searches_per_cycle=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN
+    )  # floor, inclusive
     SettingsUpdate(
         auto_grab_max_searches_per_cycle=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
     )  # ceiling, inclusive
@@ -2253,6 +2312,8 @@ def test_settings_update_rejects_out_of_range_auto_grab_timing() -> None:
         ("auto_grab_interval_seconds", AUTO_GRAB_INTERVAL_SECONDS_MIN - 1),
         ("auto_grab_interval_seconds", AUTO_GRAB_INTERVAL_SECONDS_MAX + 1),
         ("auto_grab_max_searches_per_cycle", 0),
+        # 1 is below the raised floor of 2 (issue #332).
+        ("auto_grab_max_searches_per_cycle", 1),
         ("auto_grab_max_searches_per_cycle", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1),
     ],
 )
@@ -2313,13 +2374,13 @@ async def test_put_accepts_boundary_auto_grab_timing(
     headers = {"X-Api-Key": _API_KEY}
     update = {
         "auto_grab_interval_seconds": AUTO_GRAB_INTERVAL_SECONDS_MIN,
-        "auto_grab_max_searches_per_cycle": 1,
+        "auto_grab_max_searches_per_cycle": AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
     }
     put = await client.put("/api/v1/settings", json=update, headers=headers)
     assert put.status_code == 200
     body = put.json()
     assert body["auto_grab_interval_seconds"] == AUTO_GRAB_INTERVAL_SECONDS_MIN
-    assert body["auto_grab_max_searches_per_cycle"] == 1
+    assert body["auto_grab_max_searches_per_cycle"] == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN
 
     update_max = {
         "auto_grab_interval_seconds": AUTO_GRAB_INTERVAL_SECONDS_MAX,
@@ -2403,16 +2464,19 @@ async def test_get_auto_grab_interval_seconds_degrades_out_of_range_stored_value
 @pytest.mark.parametrize(
     ("stored", "expected", "degraded"),
     [
-        # 0 and negative both DEFAULT (never clamp to a floor of 1) -- a 0 cap
-        # would silently disable the worker while auto_grab_enabled stays True.
+        # Below the floor of 2 all DEFAULT (never clamp) -- a 0 cap would
+        # silently disable the worker while auto_grab_enabled stays True, and a
+        # 1 cap wedges whole-season TV at budget_skipped forever (issue #332).
         ("0", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
+        ("1", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
         ("-1", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
         # Above the cap: CLAMPED (a pre-bounds huge value meant "search
         # aggressively", not "revert to the 5-per-cycle default").
         (str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1), AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, True),
         ("10", 10, False),
         (str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX), AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, False),
-        ("1", 1, False),
+        # The floor itself (2) is honored, not degraded.
+        (str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN), AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN, False),
         ("abc", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
     ],
 )

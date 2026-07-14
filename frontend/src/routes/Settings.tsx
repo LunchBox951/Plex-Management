@@ -57,6 +57,9 @@ const AUTO_GRAB_INTERVAL_SECONDS_DEFAULT = 60
 const AUTO_GRAB_INTERVAL_SECONDS_MIN = 15
 const AUTO_GRAB_INTERVAL_SECONDS_MAX = 3600
 const AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT = 5
+// Floor is 2 (issue #332): a cap of 1 lets Pass 1 spend the only search on a
+// whole-season pack preview and wedges the episode-level fallback forever.
+const AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN = 2
 const AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX = 50
 // Automatic container updates (ADR-0024) are opt-in. The scheduling defaults
 // mirror the backend except for timezone: a fresh browser contributes its IANA
@@ -1496,15 +1499,17 @@ export function Settings() {
                 },
               )}
               {numberField('auto_grab_max_searches_per_cycle', 'Auto-grab searches per cycle', {
-                min: 1,
+                min: AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
                 max: AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
                 step: 1,
               })}
             </div>
             <p className="text-xs text-faint">
               How often the worker checks for due requests ({AUTO_GRAB_INTERVAL_SECONDS_MIN}–
-              {AUTO_GRAB_INTERVAL_SECONDS_MAX}s) and how many Prowlarr searches it runs per check
-              (1–{AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX}), protecting the indexer from a burst.
+              {AUTO_GRAB_INTERVAL_SECONDS_MAX}s) and how many Prowlarr searches it runs per check (
+              {AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN}–{AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX}),
+              protecting the indexer from a burst while still leaving room for a whole-season
+              request’s episode-level fallback.
             </p>
             {checkboxField(
               'watchlist_sync_enabled',

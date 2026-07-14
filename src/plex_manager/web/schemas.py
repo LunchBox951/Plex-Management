@@ -22,6 +22,7 @@ from plex_manager.web.settings_bounds import (
     AUTO_GRAB_INTERVAL_SECONDS_MAX,
     AUTO_GRAB_INTERVAL_SECONDS_MIN,
     AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
@@ -798,15 +799,19 @@ class SettingsUpdate(BaseModel):
     auto_grab_enabled: bool | None = Field(default=None)
     # Auto-grab timing (issue #150) — bounded per ``web.settings_bounds`` (see
     # that module for the rationale): the interval floor is the tightest
-    # cadence already in the app, the search-cap floor is 1 (0 would silently
-    # disable the worker while ``auto_grab_enabled`` stays True).
+    # cadence already in the app, the search-cap floor is 2 (issue #332: 1 would
+    # let Pass 1 spend the only search on a season-pack preview and wedge the
+    # episode-level fallback forever; 0 would silently disable the worker while
+    # ``auto_grab_enabled`` stays True).
     auto_grab_interval_seconds: float | None = Field(
         default=None,
         ge=AUTO_GRAB_INTERVAL_SECONDS_MIN,
         le=AUTO_GRAB_INTERVAL_SECONDS_MAX,
     )
     auto_grab_max_searches_per_cycle: int | None = Field(
-        default=None, ge=1, le=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+        default=None,
+        ge=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
+        le=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
     )
     automatic_updates_enabled: bool | None = Field(default=None)
     automatic_update_timezone: str | None = Field(default=None)

@@ -842,7 +842,7 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       '3600',
     )
     expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveValue(5)
-    expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveAttribute('min', '1')
+    expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveAttribute('min', '2')
     expect(screen.getByLabelText('Auto-grab searches per cycle')).toHaveAttribute('max', '50')
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).not.toBeChecked()

@@ -1164,6 +1164,22 @@ async def put_settings_endpoint(
             if isinstance(wake_event, asyncio.Event):
                 wake_event.set()
 
+        # Same immediacy for the auto-grab worker (issue #332): a shortened
+        # interval, a changed per-cycle search cap, or a re-enable must be
+        # observed on the next tick, not after the OLD (up to 1h) sleep expires.
+        # ``_autograb_loop`` re-reads all three fresh when woken; the worker owns
+        # this process-local event.
+        if written_fields.intersection(
+            {
+                "auto_grab_enabled",
+                "auto_grab_interval_seconds",
+                "auto_grab_max_searches_per_cycle",
+            }
+        ):
+            autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
+            if isinstance(autograb_wake_event, asyncio.Event):
+                autograb_wake_event.set()
+
         # Clear backend probe caches before publishing: a listening tab can refetch
         # immediately on the SSE event, so publishing first could race it into the
         # stale pre-update health snapshot.

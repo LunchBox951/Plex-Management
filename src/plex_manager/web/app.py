@@ -798,6 +798,18 @@ async def _autograb_loop(app: FastAPI) -> None:
     (including one that also broke ``_autograb_once`` this same iteration) falls
     back to ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT`` rather than ever wedging the
     loop with an unresolved sleep.
+
+    The inter-cycle sleep is a WAKEABLE wait (issue #332, mirroring
+    ``_watchlist_sync_loop``): a settings write that changes the interval, the
+    per-cycle search cap, or the ``auto_grab_enabled`` toggle sets
+    ``app.state.autograb_wake_event`` so a lowered interval (or a re-enable) is
+    observed immediately instead of after the OLD -- possibly hour-long -- sleep
+    expires. A wake simply returns the ``wait_for`` early and falls through to
+    the next iteration, which re-reads ``auto_grab_enabled`` (inside
+    ``_autograb_once_leased``), the interval, and the search cap all fresh; it
+    never runs a second cycle concurrently (the loop is strictly sequential --
+    the cycle runs only at the top, exactly as the watchlist loop does), so a
+    spurious wake costs at most one extra cadence tick, never a double grab.
     """
     while True:
         try:
@@ -813,7 +825,21 @@ async def _autograb_loop(app: FastAPI) -> None:
                 "auto-grab interval read failed; sleeping the default interval and continuing"
             )
             sleep_seconds = _AUTOGRAB_INTERVAL_SECONDS
-        await asyncio.sleep(sleep_seconds)
+        wake_event = getattr(app.state, "autograb_wake_event", None)
+        if not isinstance(wake_event, asyncio.Event):
+            wake_event = asyncio.Event()
+            app.state.autograb_wake_event = wake_event
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=sleep_seconds)
+        except TimeoutError:
+            # Expected, not an error: the interval elapsed with no manual wake
+            # signal, so it is simply time to run the next cycle. A fired
+            # wake_event (a relevant settings change requesting immediate pickup)
+            # returns normally; both paths fall through to the next iteration, so
+            # there is nothing to log or surface here.
+            pass
+        finally:
+            wake_event.clear()
 
 
 async def _log_drain_loop(app: FastAPI) -> None:
@@ -1462,6 +1488,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.http_client = create_upstream_http_client()
     app.state.reconcile_status = ReconcileStatus()
     app.state.autograb_status = AutograbStatus()
+    # Wakeable inter-cycle sleep for ``_autograb_loop`` (issue #332): a settings
+    # write touching the interval / search-cap / enabled toggle sets this so the
+    # loop observes the change immediately instead of after the old sleep. Mirror
+    # of ``watchlist_wake_event`` below.
+    app.state.autograb_wake_event = asyncio.Event()
     app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
     app.state.watchlist_wake_event = asyncio.Event()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so

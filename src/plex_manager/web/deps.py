@@ -92,6 +92,7 @@ from plex_manager.web.settings_bounds import (
     AUTO_GRAB_INTERVAL_SECONDS_MAX,
     AUTO_GRAB_INTERVAL_SECONDS_MIN,
     AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
@@ -114,6 +115,7 @@ __all__ = [
     "AUTO_GRAB_INTERVAL_SECONDS_MIN",
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT",
     "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX",
+    "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN",
     "CSRF_COOKIE_NAME",
     "CSRF_HEADER_NAME",
     "DISK_PRESSURE_PERCENT_MAX",
@@ -2000,20 +2002,23 @@ def resolve_auto_grab_interval_seconds(raw: str | None) -> tuple[float, bool]:
 
 
 def resolve_auto_grab_max_searches_per_cycle(raw: str | None) -> tuple[int, bool]:
-    """Resolve the per-cycle Prowlarr search budget to ``[1,
-    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX]`` (issue #150).
+    """Resolve the per-cycle Prowlarr search budget to ``[
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN, AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX]``
+    (issue #150; floor raised to 2 in #332).
 
     A DEDICATED resolver rather than :func:`_resolve_bounded_count`: that
     helper's floor is 0 (valid for a day-count/row-count setting, where 0 is
-    just the most aggressive legal value), but 0 auto-grab searches per cycle
-    would silently disable the worker while ``auto_grab_enabled`` stays True --
-    a lie the operator has no way to notice from the toggle. So 0 AND negative
-    values both fall back to the DEFAULT here, never clamp to a floor of 1
-    silently reinterpreting "0" as "1" (the corrupt value already has no safe
-    single meaning to preserve). Above the MAX clamps to it -- a pre-bounds
-    huge value meant "search aggressively", not "revert to the 5-per-cycle
-    default". Unparsable also falls back to the default. Every degradation is
-    a WARNING naming the key.
+    just the most aggressive legal value), but a sub-floor auto-grab budget
+    would either silently disable the worker (0) while ``auto_grab_enabled``
+    stays True -- a lie -- or (1) let Pass 1 spend the only search on a
+    whole-season pack preview and wedge the episode-level fallback at
+    ``budget_skipped`` forever (#332). So anything below the MIN of 2 falls back
+    to the DEFAULT here, never clamps to the floor silently reinterpreting a
+    too-small value as 2 (the corrupt value already has no safe single meaning
+    to preserve). Above the MAX clamps to it -- a pre-bounds huge value meant
+    "search aggressively", not "revert to the 5-per-cycle default". Unparsable
+    also falls back to the default. Every degradation is a WARNING naming the
+    key.
     """
     if raw is None:
         return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True
@@ -2034,10 +2039,11 @@ def resolve_auto_grab_max_searches_per_cycle(raw: str | None) -> tuple[int, bool
             AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
         )
         return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, False
-    if parsed < 1:
+    if parsed < AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN:
         _logger.warning(
-            "setting 'auto_grab_max_searches_per_cycle' is %s, below 1; using default %s",
+            "setting 'auto_grab_max_searches_per_cycle' is %s, below %s; using default %s",
             parsed,
+            AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN,
             AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
         )
         return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, False
