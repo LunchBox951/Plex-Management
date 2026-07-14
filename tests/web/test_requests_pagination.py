@@ -26,6 +26,7 @@ from plex_manager.models import (
     SeasonRequest,
     User,
 )
+from plex_manager.repositories import requests as requests_repo_module
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.web.deps import hash_session_token
@@ -279,15 +280,13 @@ async def test_page_bounds_row_materialization(
 
     calls = {"n": 0}
 
-    import plex_manager.repositories.requests as repo_module
-
-    real_to_record = getattr(repo_module, "_to_record")  # noqa: B009 - private by name, spied deliberately
+    real_to_record = getattr(requests_repo_module, "_to_record")  # noqa: B009 - private, spied deliberately
 
     def counting_to_record(row: MediaRequest) -> object:
         calls["n"] += 1
         return real_to_record(row)
 
-    monkeypatch.setattr(repo_module, "_to_record", counting_to_record)
+    monkeypatch.setattr(requests_repo_module, "_to_record", counting_to_record)
 
     response = await client.get("/api/v1/requests", params={"limit": 10}, headers=_HEADERS)
     assert response.status_code == 200
