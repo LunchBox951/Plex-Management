@@ -502,6 +502,16 @@ class WatchlistItem(Base):
     """One title in a user's last completely synchronized Plex watchlist."""
 
     __tablename__ = "watchlist_items"
+    __table_args__ = (
+        # ``watchlist_service.is_watchlisted`` deliberately queries by
+        # ``(tmdb_id, media_type)`` with NO ``user_id`` predicate (ANY user's
+        # watchlist protects a title from eviction). The composite PK is ordered
+        # ``user_id``-first, so it cannot serve a lookup that omits its leading
+        # column -- every eviction candidate would drive a full scan (up to 2x
+        # per candidate: candidate assembly + the pre-claim re-read). This
+        # secondary index gives that query shape a seekable path.
+        Index("ix_watchlist_items_tmdb_media", "tmdb_id", "media_type"),
+    )
 
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True

@@ -26,6 +26,7 @@ from starlette.responses import JSONResponse, Response
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
 from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent import (
@@ -38,6 +39,7 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.logsafe import safe_int
+from plex_manager.models import User
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -61,6 +63,7 @@ from plex_manager.services.update_coordination_service import (
 from plex_manager.web.deps import (
     CSRF_HEADER_NAME,
     EVICTION_INTERVAL_MINUTES_DEFAULT,
+    PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
     ServiceNotConfiguredError,
     SettingsStore,
@@ -192,8 +195,40 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 _AUTOGRAB_INTERVAL_SECONDS = 60.0
 
 
+async def _resolve_watchlist_server_identity(
+    store: SettingsStore, plex_tv: PlexTvClient
+) -> str | None:
+    """Resolve the configured Plex server's machine identifier, or ``None``.
+
+    Mirrors ``auth._post_init_access``: prefer the identifier cached at setup
+    (:data:`PLEX_MACHINE_ID_SETTING`), else probe the configured server's
+    ``/identity`` with its stored service credentials. Returns ``None`` when no
+    Plex server is configured (nothing to authorize against) or the probe fails.
+    """
+    machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
+    if machine_identifier:
+        return machine_identifier
+    plex_url = await store.get("plex_url")
+    plex_token = await store.get("plex_token")
+    if not plex_url or not plex_token:
+        return None
+    try:
+        return await plex_tv.fetch_server_identity(plex_url, plex_token)
+    except PlexVerifyError:
+        return None
+
+
 async def _watchlist_sync_once(app: FastAPI) -> int:
-    """Synchronize every reusable account token, isolating failures per user."""
+    """Synchronize every reusable account token, isolating failures per user.
+
+    Each candidate token is REVALIDATED against the currently-configured Plex
+    server before its watchlist is synced: a stored token survives a verified
+    server repoint (which only revokes browser sessions), so without this a user
+    from the OLD server would keep having their watchlist create and protect
+    requests on the NEW one. Stale/unauthorized users are skipped (and their
+    count surfaced on the worker status); a transient plex.tv failure retains the
+    previous snapshot rather than being read as a revoked account.
+    """
     maker = app.state.sessionmaker
     client = app.state.http_client
     status = getattr(app.state, "watchlist_status", None)
@@ -203,26 +238,159 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
     status.mark_started()
     async with maker() as session:
         if not await get_watchlist_sync_enabled(session):
+            # Disabling the feature must END watchlist-based eviction protection,
+            # not merely stop future ticks: eviction consults ``is_watchlisted``
+            # unconditionally, so a stale snapshot would keep protecting titles
+            # forever. Clear it (idempotent) so protection ends immediately.
+            cleared = await watchlist_service.clear_snapshots(session)
+            await session.commit()
+            if cleared:
+                _logger.info(
+                    "watchlist sync disabled; cleared %s stale snapshot row(s) so they no "
+                    "longer protect titles from eviction",
+                    cleared,
+                )
             status.mark_skipped("disabled")
             return 0
+        client_identifier = await auth_router._get_or_create_client_identifier(session)  # pyright: ignore[reportPrivateUsage]
+        # Persist a just-minted identifier NOW: ``set_if_absent`` wrote it in this
+        # session, but this block otherwise exits without committing, and a
+        # rolled-back mint (while the minted value is still used below) would
+        # register a fresh plex.tv device on EVERY tick of an install lacking the
+        # setting -- violating the helper's create-once contract. Idempotent when
+        # the identifier already existed (nothing else has been written).
+        await session.commit()
+        plex_tv = PlexTvClient(client, client_identifier=client_identifier)
+        machine_identifier = await _resolve_watchlist_server_identity(
+            SettingsStore(session), plex_tv
+        )
+        if machine_identifier is None:
+            # No configured server to authorize tokens against -- syncing anyone
+            # would protect titles on behalf of accounts we cannot verify.
+            status.mark_skipped("not_configured")
+            return 0
+        users = await watchlist_service.list_sync_users(session)
+
+    # Revalidation + stale cleanup run BEFORE the TMDB gate below: clearing a
+    # stale account's eviction-protection snapshot needs only the stored Plex
+    # tokens and the configured server identity, so a repoint on an install with
+    # no TMDB key must still stop the old server's rows from protecting titles.
+    # Only request CREATION (the sync pass) is TMDB-gated.
+    skipped_users = 0
+    last_error: str | None = None
+    authorized: list[tuple[User, str]] = []
+    for user in users:
+        token = user.encrypted_plex_token
+        if token is None:
+            continue
+        try:
+            authorization = await watchlist_service.revalidate_sync_user(
+                plex_tv, machine_identifier, token=token
+            )
+        except Exception as exc:  # pragma: no cover - defensive; revalidate maps its own errors
+            skipped_users += 1
+            last_error = type(exc).__name__
+            _logger.warning(
+                "watchlist revalidation errored for user_id=%s (%s); skipping this tick",
+                safe_int(user.id),
+                type(exc).__name__,
+            )
+            continue
+        if authorization is watchlist_service.SyncUserAuthorization.STALE:
+            # Rejected token, or the account no longer reaches the configured
+            # server (e.g. after a repoint). Clearing the snapshot stops the stale
+            # account from BOTH creating (skipped sync) and PROTECTING (deleted
+            # rows) requests -- is_watchlisted has no user_id predicate, so its
+            # retained rows would otherwise keep protecting titles from eviction
+            # on the new server forever (#296 finding 1).
+            skipped_users += 1
+            async with maker() as session:
+                # Two races guard this delete, both re-checked inside the deleting
+                # transaction because the STALE decision was made from state loaded
+                # earlier: (a) the SERVER may have been repointed again since this
+                # tick resolved its identity -- the stale verdict belonged to the
+                # PREVIOUS machine identifier, so re-resolve and skip if changed;
+                # (b) the USER may have signed in again -- the expected_token guard
+                # inside clear_user_snapshot skips the delete if their stored token
+                # changed. Either way the rows are retained and the next tick
+                # re-evaluates against the current state.
+                current_identity = await _resolve_watchlist_server_identity(
+                    SettingsStore(session), plex_tv
+                )
+                if current_identity != machine_identifier:
+                    _logger.info(
+                        "watchlist token for user_id=%s revalidated stale, but the "
+                        "configured server changed since; retaining the snapshot for "
+                        "re-evaluation against the new server",
+                        safe_int(user.id),
+                    )
+                    continue
+                cleared = await watchlist_service.clear_user_snapshot(
+                    session, user_id=user.id, expected_token=token
+                )
+                await session.commit()
+            _logger.info(
+                "watchlist token for user_id=%s is stale for the configured server; "
+                "skipped sync and cleared %s snapshot row(s) so they no longer protect "
+                "titles from eviction",
+                safe_int(user.id),
+                cleared,
+            )
+            continue
+        if authorization is not watchlist_service.SyncUserAuthorization.AUTHORIZED:
+            # UNKNOWN: authorization could not be determined (plex.tv unreachable).
+            # Skip this tick but RETAIN the snapshot -- a transient outage must not
+            # be read as a revoked account.
+            skipped_users += 1
+            _logger.info(
+                "skipping watchlist sync for user_id=%s: %s for the configured server; "
+                "retaining the previous snapshot",
+                safe_int(user.id),
+                authorization.value,
+            )
+            continue
+        authorized.append((user, token))
+
+    async with maker() as session:
         try:
             tmdb = await resolve_tmdb(app.state, session, client)
         except ServiceNotConfiguredError:
+            # Stale cleanup already ran above; only request creation needs TMDB.
             status.mark_skipped("not_configured")
             return 0
         library = await get_library_optional(session, client)
-        users = await watchlist_service.list_sync_users(session)
+        # Final identity re-check before the sync pass: ``authorized`` was vetted
+        # against ``machine_identifier``, and an admin repoint since then means
+        # those tokens were authorized for the WRONG server. Unlike snapshot rows
+        # (which a later tick can clear), requests created from the old server's
+        # watchlists cannot be undone by the next tick -- so skip the pass
+        # entirely. The repoint itself wakes this worker, so re-authorization
+        # against the new identity is imminent, and the skipped users keep the
+        # tick honestly "degraded" rather than silently ok.
+        current_identity = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+    if authorized and current_identity != machine_identifier:
+        _logger.info(
+            "configured Plex server changed mid-tick (%s users authorized against "
+            "the previous identity); skipping this sync pass for re-evaluation",
+            len(authorized),
+        )
+        status.mark_completed(
+            fetched=0,
+            created=0,
+            existing=0,
+            failed_users=0,
+            failed_entries=0,
+            error=None,
+            skipped_users=skipped_users + len(authorized),
+        )
+        return 0
 
     created = 0
     fetched = 0
     existing = 0
     failed_users = 0
     failed_entries = 0
-    last_error: str | None = None
-    for user in users:
-        token = user.encrypted_plex_token
-        if token is None:
-            continue
+    for user, token in authorized:
         try:
             async with maker() as session:
                 result = await watchlist_service.sync_user(
@@ -256,6 +424,7 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         failed_users=failed_users,
         failed_entries=failed_entries,
         error=last_error,
+        skipped_users=skipped_users,
     )
     return created
 

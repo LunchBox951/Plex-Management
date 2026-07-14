@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from plex_manager.adapters.plex.oauth import (
+    _ARRAY_BODY_KEY,  # pyright: ignore[reportPrivateUsage]
     PlexAccount,
     PlexResource,
     PlexTvClient,
@@ -162,6 +163,32 @@ async def test_fetch_resources_hits_v2_not_v1() -> None:
     # Regression pin for the shipped bug: the old code hit /api/resources (v1, XML).
     assert seen[0].url.host == "plex.tv"
     assert seen[0].url.path == "/api/v2/resources"
+
+
+async def test_fetch_resources_valid_empty_array_returns_empty_list() -> None:
+    # A genuine empty array is a VALID authorization signal (the account has zero
+    # server resources): it must parse to [] cleanly, not raise. Callers read [] as
+    # "not authorized for the configured server" (#296).
+    resources = await _fetch_resources([])
+    assert resources == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"error": "nope"}, {"resources": []}, {"items": []}, [None], ["error"], [42]],
+)
+async def test_fetch_resources_non_array_shape_is_bad_response(body: object) -> None:
+    # NOTE the {"items": []} case: an OBJECT body carrying a public "items" list
+    # must not impersonate the array wrapper (parse_resources keys off the private
+    # _ARRAY_BODY_KEY sentinel only _request_json can synthesize).
+    # A 2xx body that is NOT the expected JSON array (an error object, a wrapped
+    # shape, HTML that still parsed) is MALFORMED, not "zero resources". It must
+    # raise bad_response rather than silently collapse to [] -- otherwise watchlist
+    # revalidation would read it as STALE and DELETE the user's snapshot on a
+    # transient plex.tv hiccup (#296).
+    with pytest.raises(PlexVerifyError) as excinfo:
+        await _fetch_resources(body)
+    assert excinfo.value.code == "plex_tv_bad_response"
 
 
 async def test_owned_servers_filters_provides_and_owned() -> None:
@@ -425,14 +452,16 @@ def test_parse_resources_owned_boolean_tolerance(raw_owned: object, expected: bo
     encodings (int/str) and fail CLOSED on anything unexpected — the owner check
     must never mis-grant ownership."""
     payload = {
-        "items": [{"name": "S", "clientIdentifier": "id", "provides": "server", "owned": raw_owned}]
+        _ARRAY_BODY_KEY: [
+            {"name": "S", "clientIdentifier": "id", "provides": "server", "owned": raw_owned}
+        ]
     }
     parsed = PlexTvClient.parse_resources(payload)
     assert parsed[0].owned is expected
 
 
 def test_parse_resources_owned_missing_defaults_false() -> None:
-    payload = {"items": [{"name": "S", "clientIdentifier": "id", "provides": "server"}]}
+    payload = {_ARRAY_BODY_KEY: [{"name": "S", "clientIdentifier": "id", "provides": "server"}]}
     parsed = PlexTvClient.parse_resources(payload)
     assert parsed[0].owned is False
 
@@ -440,7 +469,7 @@ def test_parse_resources_owned_missing_defaults_false() -> None:
 def test_parse_connections_skips_entries_without_uri() -> None:
     """Connections must carry a ``uri`` to be usable; entries lacking one are dropped."""
     payload = {
-        "items": [
+        _ARRAY_BODY_KEY: [
             {
                 "name": "S",
                 "clientIdentifier": "id",

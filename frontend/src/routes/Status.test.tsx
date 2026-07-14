@@ -75,6 +75,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       existing: 0,
       failed_users: 0,
       failed_entries: 0,
+      skipped_users: 0,
     },
     ...overrides,
   }
@@ -632,6 +633,7 @@ describe('Status', () => {
           existing: 0,
           failed_users: 0,
           failed_entries: 0,
+          skipped_users: 0,
         },
       }),
       isLoading: false,
@@ -727,6 +729,7 @@ describe('Status', () => {
           existing: 4,
           failed_users: 1,
           failed_entries: 3,
+          skipped_users: 2,
         },
       }),
       isLoading: false,
@@ -751,6 +754,12 @@ describe('Status', () => {
     expect(watchlist.getByText('1')).toBeInTheDocument()
     expect(watchlist.getByText('Failed entries')).toBeInTheDocument()
     expect(watchlist.getByText('3')).toBeInTheDocument()
+    // Skipped users must be visible: they are what explains a skip-driven
+    // degraded tick (stale/unrevalidatable tokens) when failed_users is 0.
+    expect(watchlist.getByText('Skipped users').tagName).toBe('DT')
+    const skippedValue = watchlist.getByText('Skipped users').nextElementSibling
+    expect(skippedValue).toHaveTextContent('2')
+    expect(skippedValue).toHaveClass('font-semibold', 'text-searching')
     expect(watchlist.getByText(/WatchlistEntryError/)).toBeInTheDocument()
 
     const lastRun = watchlist.getByText('Last run').nextElementSibling

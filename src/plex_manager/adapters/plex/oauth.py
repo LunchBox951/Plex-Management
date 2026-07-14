@@ -24,6 +24,7 @@ from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import is_header_safe
 
 __all__ = [
+    "CODE_TOKEN_INVALID",
     "PlexAccount",
     "PlexConnection",
     "PlexResource",
@@ -44,7 +45,17 @@ _HTTP_FORBIDDEN: Final = 403
 # Stable, user-facing error identifiers (see the web error taxonomy).
 _CODE_PLEX_TV_UNREACHABLE: Final = "plex_tv_unreachable_server"
 _CODE_PLEX_TV_BAD_RESPONSE: Final = "plex_tv_bad_response"
-_CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
+
+# Private wrapper key ``_request_json`` uses to carry a top-level JSON ARRAY body.
+# Deliberately not a plausible public wire key: ``parse_resources`` keys off it to
+# distinguish "the body was a real array" from an object body that merely contains
+# an array under a public name like "items" (#296 — a malformed object must never
+# read as an empty resource list, which callers treat as an authorization signal).
+_ARRAY_BODY_KEY: Final = "__plex_manager_array_body__"
+# Public: consumers (e.g. watchlist revalidation) key STALE-vs-UNKNOWN off this
+# exact code, so it must be shared -- not hand-copied -- to stay coupled at
+# import time.
+CODE_TOKEN_INVALID: Final = "plex_token_invalid"  # noqa: S105 - error code, not a secret
 _CODE_IDENTITY_FAILED: Final = "server_identity_failed"
 _CODE_SERVER_UNREACHABLE: Final = "server_unreachable_from_backend"
 
@@ -109,7 +120,7 @@ def _require_header_safe_token(token: str, host: str) -> None:
     """
     if not is_header_safe(token):
         raise PlexVerifyError(
-            _CODE_TOKEN_INVALID,
+            CODE_TOKEN_INVALID,
             "Plex token is not a valid credential value",
             diagnostics={"host": host},
         )
@@ -243,7 +254,7 @@ class PlexTvClient:
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
             bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
-            invalid_token_code=_CODE_TOKEN_INVALID,
+            invalid_token_code=CODE_TOKEN_INVALID,
         )
         return self.parse_account(payload)
 
@@ -256,7 +267,7 @@ class PlexTvClient:
             headers=self._token_headers(auth_token),
             unreachable_code=_CODE_PLEX_TV_UNREACHABLE,
             bad_response_code=_CODE_PLEX_TV_BAD_RESPONSE,
-            invalid_token_code=_CODE_TOKEN_INVALID,
+            invalid_token_code=CODE_TOKEN_INVALID,
         )
         return self.parse_resources(payload)
 
@@ -340,7 +351,7 @@ class PlexTvClient:
                 diagnostics={"host": host},
             ) from exc
         if isinstance(payload, list):
-            return {"items": cast("list[object]", payload)}
+            return {_ARRAY_BODY_KEY: cast("list[object]", payload)}
         return _as_mapping(payload)
 
     def _client_headers(self) -> dict[str, str]:
@@ -375,10 +386,39 @@ class PlexTvClient:
 
     @classmethod
     def parse_resources(cls, payload: Mapping[str, object]) -> list[PlexResource]:
-        # v2 /resources is a JSON array; ``_request_json`` wraps it as {"items": [...]}.
+        # v2 /resources is a JSON array; ``_request_json`` wraps it under the PRIVATE
+        # ``_ARRAY_BODY_KEY`` sentinel. A 2xx body that is NOT that array shape (an
+        # error object, an HTML page that still parsed as JSON, a truncated payload)
+        # is a MALFORMED response, not "an account with zero resources". The
+        # distinction is load-bearing: callers treat a genuinely-empty resource list
+        # as an authorization signal (revalidation maps it to STALE and DELETES the
+        # user's eviction-protection snapshot), so a malformed shape silently
+        # collapsing to ``[]`` would destroy state on a transient plex.tv hiccup
+        # (#296). The sentinel is deliberately not a public wire key: only
+        # ``_request_json`` can synthesize it (exclusively for array bodies), so an
+        # object body that happens to carry a public "items" list can never
+        # impersonate the array wrapper -- fail fatal instead of guessing.
+        raw_items = payload.get(_ARRAY_BODY_KEY)
+        if not isinstance(raw_items, list):
+            raise PlexVerifyError(
+                _CODE_PLEX_TV_BAD_RESPONSE,
+                "plex.tv answered in an unexpected way: resources response was not a JSON array",
+                diagnostics={"host": _PLEX_TV_HOST},
+            )
         resources: list[PlexResource] = []
-        for item in _as_sequence(payload.get("items")):
-            fields = _as_mapping(item)
+        for item in cast("list[object]", raw_items):
+            if not isinstance(item, Mapping):
+                # Same fail-fatal posture one level down: a real /resources array
+                # holds resource OBJECTS, so a non-mapping entry ([null], ["error"])
+                # is a malformed response. Coercing it to an empty resource would
+                # read as "no matching server" -> STALE -> snapshot cleared, on a
+                # response that determined nothing (#296).
+                raise PlexVerifyError(
+                    _CODE_PLEX_TV_BAD_RESPONSE,
+                    "plex.tv answered in an unexpected way: resources entry was not an object",
+                    diagnostics={"host": _PLEX_TV_HOST},
+                )
+            fields = cast("Mapping[str, object]", item)
             resources.append(
                 PlexResource(
                     name=_get_str(fields, "name"),

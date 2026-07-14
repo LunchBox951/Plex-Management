@@ -1125,9 +1125,15 @@ async def put_settings_endpoint(
                 )
         await session.commit()
 
-        # A long configured interval must not postpone an enable/shorten change
-        # until the old sleep expires. The worker owns this process-local event.
-        if written_fields.intersection(
+        # A long configured interval must not postpone an enable/shorten change --
+        # nor a verified repoint's stale-token cleanup -- until the old sleep
+        # expires. A verified repoint (new machine identifier) leaves old-server
+        # tokens STALE for the new server; the watchlist worker is what clears their
+        # snapshots (#296), so wake it immediately instead of letting those rows keep
+        # protecting titles until the next scheduled tick (hours/days away). The
+        # worker owns this process-local event.
+        verified_repoint = plex_identity_changed and machine_identifier is not None
+        if verified_repoint or written_fields.intersection(
             {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
         ):
             wake_event = getattr(request.app.state, "watchlist_wake_event", None)
