@@ -3179,7 +3179,7 @@ export interface components {
              * State
              * @enum {string}
              */
-            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
+            state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "probe_failed" | "error";
         };
     };
     responses: never;

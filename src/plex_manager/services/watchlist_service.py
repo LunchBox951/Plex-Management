@@ -63,9 +63,19 @@ class SyncUserAuthorization(Enum):
 
 @dataclass
 class WatchlistWorkerStatus:
-    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"] = field(
-        default="starting"
-    )
+    state: Literal[
+        "starting", "ok", "degraded", "disabled", "not_configured", "probe_failed", "error"
+    ] = field(default="starting")
+    """``probe_failed`` is distinct from ``not_configured``: the Plex server IS
+    configured (url/token, or a cached identifier) but the live ``/identity``
+    probe failed. Reserving ``not_configured`` for a truly-unconfigured server
+    (no url/token AND no cached identifier) keeps an outage from ever being
+    mislabeled as an absence -- and from clearing eviction-protecting snapshot
+    rows a transient failure has no business touching (issue #327, north
+    star #3). ``probe_failed`` is also distinct from ``error``: the latter is
+    reserved for an unexpected exception that escaped the tick entirely
+    (``_watchlist_sync_loop``'s wrapper), not a known, actionable degraded
+    condition like an unreachable server."""
     last_run_at: datetime | None = field(default=None)
     last_ok_at: datetime | None = field(default=None)
     last_error_type: str | None = field(default=None)
@@ -88,10 +98,41 @@ class WatchlistWorkerStatus:
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
 
-    def mark_skipped(self, state: Literal["disabled", "not_configured"]) -> None:
+    def mark_skipped(
+        self,
+        state: Literal["disabled", "not_configured"],
+        *,
+        skipped_users: int = 0,
+    ) -> None:
+        """Record a tick that intentionally did no sync work.
+
+        ``skipped_users`` defaults to 0 for the common case (nothing ran yet --
+        e.g. sync disabled, or no server configured at the very start of the
+        tick), but a caller that already ran the per-user revalidation/cleanup
+        pass before hitting this skip (e.g. the TMDB-not-configured gate, which
+        runs AFTER stale-snapshot cleanup) must pass its accumulated count
+        through: zeroing it would report a clean ``not_configured`` with no
+        trace of the cleanup that just happened (issue #327 facet 3).
+        """
         self.state = state
         self.last_error_type = None
         self.last_error_at = None
+        self.fetched = self.created = self.existing = 0
+        self.failed_users = self.failed_entries = 0
+        self.skipped_users = skipped_users
+
+    def mark_probe_failed(self, exc: PlexVerifyError) -> None:
+        """The Plex server is configured but the live ``/identity`` probe
+        failed -- an outage, not an absence (issue #327). Distinct from
+        ``not_configured`` (nothing to authorize against) and from ``error``
+        (an unexpected exception that escaped the tick): this is a known,
+        actionable degraded condition that self-heals on the next successful
+        probe. The caller is responsible for retaining any existing watchlist
+        snapshot -- a transient outage must never drop eviction protection.
+        """
+        self.state = "probe_failed"
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = datetime.now(UTC)
         self._reset_counters()
 
     def mark_completed(

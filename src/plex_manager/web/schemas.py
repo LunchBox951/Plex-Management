@@ -1638,7 +1638,9 @@ class AutograbStatusItem(BaseModel):
 class WatchlistStatusItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
+    state: Literal[
+        "starting", "ok", "degraded", "disabled", "not_configured", "probe_failed", "error"
+    ]
     last_run_at: datetime | None = None
     last_ok_at: datetime | None = None
     last_error_type: str | None = None

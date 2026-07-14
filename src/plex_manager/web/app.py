@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Final, Literal, cast
@@ -205,27 +206,51 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 _AUTOGRAB_INTERVAL_SECONDS = AUTO_GRAB_INTERVAL_SECONDS_DEFAULT
 
 
+@dataclass(frozen=True)
+class _ServerIdentityResolution:
+    """Tri-state result of resolving the configured Plex server's identifier.
+
+    ``machine_identifier`` is set only on success (cached, or a live probe that
+    succeeded). When it is ``None``, ``probe_error`` distinguishes WHY -- the
+    distinction this whole helper exists for (issue #327):
+
+    * ``probe_error`` unset: truly unconfigured. No ``plex_url``/``plex_token``
+      AND no cached identifier -- there is nothing to authorize watchlist
+      tokens against, and any existing snapshot rows belong to a server the
+      operator has explicitly walked away from (safe to clear).
+    * ``probe_error`` set: the server IS configured but the live ``/identity``
+      probe failed. This is an outage, not an absence -- existing snapshot
+      rows must be RETAINED (a transient failure must never drop eviction
+      protection) and the worker status must report a distinct state, never
+      ``not_configured`` (north star #3: surface states honestly).
+    """
+
+    machine_identifier: str | None
+    probe_error: PlexVerifyError | None = None
+
+
 async def _resolve_watchlist_server_identity(
     store: SettingsStore, plex_tv: PlexTvClient
-) -> str | None:
-    """Resolve the configured Plex server's machine identifier, or ``None``.
+) -> _ServerIdentityResolution:
+    """Resolve the configured Plex server's machine identifier, tri-state.
 
     Mirrors ``auth._post_init_access``: prefer the identifier cached at setup
     (:data:`PLEX_MACHINE_ID_SETTING`), else probe the configured server's
-    ``/identity`` with its stored service credentials. Returns ``None`` when no
-    Plex server is configured (nothing to authorize against) or the probe fails.
+    ``/identity`` with its stored service credentials. See
+    :class:`_ServerIdentityResolution` for how callers must read the result.
     """
     machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
     if machine_identifier:
-        return machine_identifier
+        return _ServerIdentityResolution(machine_identifier)
     plex_url = await store.get("plex_url")
     plex_token = await store.get("plex_token")
     if not plex_url or not plex_token:
-        return None
+        return _ServerIdentityResolution(None)
     try:
-        return await plex_tv.fetch_server_identity(plex_url, plex_token)
-    except PlexVerifyError:
-        return None
+        identifier = await plex_tv.fetch_server_identity(plex_url, plex_token)
+    except PlexVerifyError as exc:
+        return _ServerIdentityResolution(None, probe_error=exc)
+    return _ServerIdentityResolution(identifier)
 
 
 async def _watchlist_sync_once(app: FastAPI) -> int:
@@ -271,12 +296,49 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         # the identifier already existed (nothing else has been written).
         await session.commit()
         plex_tv = PlexTvClient(client, client_identifier=client_identifier)
-        machine_identifier = await _resolve_watchlist_server_identity(
-            SettingsStore(session), plex_tv
-        )
+        resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        if resolution.probe_error is not None:
+            # Configured but unreachable -- an outage, not an absence. Retain
+            # the existing snapshot (clearing it here would drop eviction
+            # protection for a transient failure) and report a distinct state
+            # so this is never mislabeled as "not configured" (issue #327,
+            # north star #3).
+            status.mark_probe_failed(resolution.probe_error)
+            return 0
+        machine_identifier = resolution.machine_identifier
         if machine_identifier is None:
-            # No configured server to authorize tokens against -- syncing anyone
-            # would protect titles on behalf of accounts we cannot verify.
+            # Truly unconfigured: no url/token AND no cached identifier, so
+            # there is nothing to authorize tokens against. The operator has
+            # explicitly walked away from Plex, so any existing snapshot rows
+            # belong to a server we can never revalidate against again --
+            # clear them so they stop protecting titles from eviction (issue
+            # #327 facet 2). This is the ONLY branch of identity resolution
+            # that clears snapshots; a probe failure above never does.
+            #
+            # Re-confirm immediately before that destructive clear: a
+            # concurrent settings PUT could reconfigure Plex in the gap
+            # between the read above and this delete -- the same class of
+            # race the per-user STALE-clear below guards against by
+            # re-resolving inside its own deleting transaction. Losing this
+            # race would otherwise clear a snapshot out from under a config
+            # that is valid again by the time the delete runs.
+            reconfirm = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+            if reconfirm.machine_identifier is not None:
+                _logger.info(
+                    "watchlist server was reconfigured just before the "
+                    "unconfigured-state snapshot clear; retaining the snapshot "
+                    "for re-evaluation against the new server"
+                )
+                status.mark_skipped("not_configured")
+                return 0
+            cleared = await watchlist_service.clear_snapshots(session)
+            await session.commit()
+            if cleared:
+                _logger.info(
+                    "watchlist server unconfigured; cleared %s stale snapshot "
+                    "row(s) so they no longer protect titles from eviction",
+                    cleared,
+                )
             status.mark_skipped("not_configured")
             return 0
         users = await watchlist_service.list_sync_users(session)
@@ -324,14 +386,15 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 # inside clear_user_snapshot skips the delete if their stored token
                 # changed. Either way the rows are retained and the next tick
                 # re-evaluates against the current state.
-                current_identity = await _resolve_watchlist_server_identity(
+                current_resolution = await _resolve_watchlist_server_identity(
                     SettingsStore(session), plex_tv
                 )
-                if current_identity != machine_identifier:
+                if current_resolution.machine_identifier != machine_identifier:
                     _logger.info(
                         "watchlist token for user_id=%s revalidated stale, but the "
-                        "configured server changed since; retaining the snapshot for "
-                        "re-evaluation against the new server",
+                        "configured server identity could not be re-confirmed as "
+                        "unchanged (repointed, unconfigured, or temporarily "
+                        "unreachable); retaining the snapshot for re-evaluation",
                         safe_int(user.id),
                     )
                     continue
@@ -366,7 +429,11 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             tmdb = await resolve_tmdb(app.state, session, client)
         except ServiceNotConfiguredError:
             # Stale cleanup already ran above; only request creation needs TMDB.
-            status.mark_skipped("not_configured")
+            # Preserve (rather than zero) the skipped-user count accumulated by
+            # that cleanup pass -- a tick that cleared N stale-after-repoint
+            # snapshots must not report a clean ``not_configured`` with no
+            # trace of that cleanup on /health (issue #327 facet 3).
+            status.mark_skipped("not_configured", skipped_users=skipped_users)
             return 0
         library = await get_library_optional(session, client)
         # Final identity re-check before the sync pass: ``authorized`` was vetted
@@ -377,7 +444,9 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         # entirely. The repoint itself wakes this worker, so re-authorization
         # against the new identity is imminent, and the skipped users keep the
         # tick honestly "degraded" rather than silently ok.
-        current_identity = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        current_identity = (
+            await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        ).machine_identifier
     if authorized and current_identity != machine_identifier:
         _logger.info(
             "configured Plex server changed mid-tick (%s users authorized against "

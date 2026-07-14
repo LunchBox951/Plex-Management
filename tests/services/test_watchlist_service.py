@@ -5,7 +5,7 @@ from typing import cast
 import httpx
 from sqlalchemy import Table, select
 
-from plex_manager.adapters.plex.oauth import PlexTvClient
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
 from plex_manager.models import SeasonRequest, User, WatchlistItem
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.watchlist import WatchlistEntry
@@ -241,6 +241,40 @@ def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
     status.mark_skipped("not_configured")
     assert status.state == "not_configured"
     assert status.last_ok_at == first_ok
+
+
+def test_worker_status_probe_failed_is_distinct_from_not_configured_and_error() -> None:
+    """A configured-but-unreachable server must surface its own state -- never
+    ``not_configured`` (that would mislabel an outage as an absence) and never
+    ``error`` (that state is reserved for an exception that escaped the tick
+    entirely) (issue #327)."""
+    status = watchlist_service.WatchlistWorkerStatus()
+    status.mark_started()
+    status.mark_probe_failed(PlexVerifyError("server_unreachable_from_backend", "unreachable"))
+    assert status.state == "probe_failed"
+    assert status.state != "not_configured"
+    assert status.state != "error"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.last_error_at is not None
+    assert status.skipped_users == 0
+
+
+def test_mark_skipped_preserves_caller_supplied_skipped_users() -> None:
+    """The TMDB-not-configured gate runs AFTER the stale-user cleanup pass, so
+    it must be able to report that pass's skip/cleanup count instead of the
+    default zero -- a tick that cleared N stale snapshots must not report a
+    clean ``not_configured`` with no trace of that cleanup (issue #327 facet
+    3)."""
+    status = watchlist_service.WatchlistWorkerStatus()
+    status.mark_started()
+    status.mark_skipped("not_configured", skipped_users=3)
+    assert status.state == "not_configured"
+    assert status.skipped_users == 3
+
+    # The default (no cleanup ran before the skip) still zeroes it.
+    status.mark_started()
+    status.mark_skipped("disabled")
+    assert status.skipped_users == 0
 
 
 async def test_revalidate_authorized_when_account_reaches_configured_server() -> None:

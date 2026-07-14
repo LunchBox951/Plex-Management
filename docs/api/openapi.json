@@ -4224,6 +4224,7 @@
               "degraded",
               "disabled",
               "not_configured",
+              "probe_failed",
               "error"
             ],
             "title": "State",
