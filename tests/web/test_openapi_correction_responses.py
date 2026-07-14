@@ -128,6 +128,52 @@ def test_cancel_request_409_declares_service_not_configured() -> None:
     assert _references_service_not_configured(responses["409"])
 
 
+def test_cancel_request_409_description_names_has_other_participants() -> None:
+    """Issue #339: pin the ``has_other_participants`` literal the cancel
+    endpoint raises verbatim in its 409 ``description`` prose, so a client
+    reading the generated docs can learn the exact ``detail`` token to match
+    on -- not just that a 409 is possible."""
+    schema = _schema()
+    responses = _responses_for(schema, "/api/v1/requests/{request_id}/cancel", "post")
+    assert "has_other_participants" in responses["409"]["description"]
+
+
+def test_withdraw_subscription_declares_404_409() -> None:
+    schema = _schema()
+    responses = _responses_for(schema, "/api/v1/requests/{request_id}/subscription", "delete")
+    assert "404" in responses, responses.keys()
+    assert "409" in responses, responses.keys()
+    assert _references_error_detail(responses["404"])
+    assert _references_error_detail(responses["409"])
+
+
+def test_withdraw_subscription_409_declares_service_not_configured() -> None:
+    schema = _schema()
+    responses = _responses_for(schema, "/api/v1/requests/{request_id}/subscription", "delete")
+    assert _references_service_not_configured(responses["409"])
+
+
+def test_withdraw_subscription_409_description_names_all_literals() -> None:
+    """Issue #339: the withdraw endpoint's 409 can be raised for four distinct
+    reasons (``import_in_progress``, ``not_cancellable``,
+    ``withdrawal_blocked_active_request``, ``service_not_configured`` --
+    see the raise sites in ``withdraw_subscription_endpoint``), but only prose
+    described them without naming the literal ``detail`` tokens. Pin all four
+    in the ``description`` so a client generating error handling from the spec
+    can learn the exact strings to match on, mirroring how the cancel
+    endpoint names ``has_other_participants`` verbatim."""
+    schema = _schema()
+    responses = _responses_for(schema, "/api/v1/requests/{request_id}/subscription", "delete")
+    description = responses["409"]["description"]
+    for literal in (
+        "import_in_progress",
+        "not_cancellable",
+        "withdrawal_blocked_active_request",
+        "service_not_configured",
+    ):
+        assert literal in description, (literal, description)
+
+
 def test_relocate_declares_404_409() -> None:
     schema = _schema()
     responses = _responses_for(schema, "/api/v1/queue/{download_id}/relocate", "post")
