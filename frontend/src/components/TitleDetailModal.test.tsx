@@ -1369,6 +1369,48 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
   })
+
+  it('shows "Withdraw" to an ADMIN who is ALSO a participant of a settled row', () => {
+    // Codex #333 round 2, Finding C: gating on the API's `can_withdraw` (not a
+    // blanket `!isAdmin`) lets an admin-participant remove THEMSELVES from a
+    // settled row instead of being forced to hard-cancel it for everyone. The
+    // admin auth default from beforeEach stands; `can_withdraw: true` marks them
+    // a participant of this row.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+  })
+
+  it('hides "Withdraw" from a NON-participant admin on a settled row', () => {
+    // Finding C boundary: an admin who does NOT subscribe to the row
+    // (`can_withdraw: false`) still sees no Withdraw -- withdrawal is a
+    // participant capability, and the API drives that with `can_withdraw`.
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: false,
+            can_withdraw: false,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.queryByRole('button', { name: /withdraw/i })).not.toBeInTheDocument()
+  })
 })
 
 describe('TitleDetailModal — unknown status fails closed, not open (issue #205)', () => {

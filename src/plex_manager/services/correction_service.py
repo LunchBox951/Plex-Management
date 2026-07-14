@@ -562,18 +562,24 @@ class WithdrawalBlockedActiveError(Exception):
     """The LAST participant cannot withdraw from an ACTIVE, non-cancellable
     request (issue #314, HTTP 409).
 
-    ``import_blocked`` and ``partially_available`` are the two statuses that are
-    neither cancellable (:data:`CANCELLABLE_REQUEST_STATUS_VALUES` -- there is a
-    blocked download or an in-flight season that ``cancel_request`` deliberately
-    will not tear down) NOR genuinely settled
-    (``request_service.TERMINAL_REQUEST_STATUS_VALUES`` -- they still shadow a
-    duplicate via ``uq_media_requests_active``). Letting the last participant
-    withdraw here would strand an ACTIVE, dedup-blocking row with zero
-    subscribers and no owner -- nobody left to resolve the block or the in-flight
-    seasons, yet it keeps blocking a fresh request for the same media. Refused
-    BEFORE anything is touched: the correction path is to resolve the import
-    (retry/report) or let the in-flight seasons settle first, THEN withdraw from
-    the resulting terminal row.
+    ``import_blocked``, ``partially_available``, and ``completed`` are the
+    statuses that are neither cancellable (:data:`CANCELLABLE_REQUEST_STATUS_VALUES`
+    -- there is a blocked download or an in-flight season that ``cancel_request``
+    deliberately will not tear down) NOR genuinely settled
+    (``request_service.SETTLED_REQUEST_STATUS_VALUES`` -- they still shadow a
+    duplicate via ``uq_media_requests_active``). ``completed`` (imported, awaiting
+    Plex confirmation) is the subtle one: it IS in
+    ``TERMINAL_REQUEST_STATUS_VALUES`` but is deliberately EXCLUDED from the
+    settled set, so it keeps dedup-blocking until the reconciler confirms it to
+    ``available`` -- gating on the terminal set instead of the settled set (Codex
+    #333 round 2, Finding B) let the last participant strand it. Letting the last
+    participant withdraw here would strand an ACTIVE, dedup-blocking row with zero
+    subscribers and no owner -- nobody left to resolve the block, the in-flight
+    seasons, or a stalled Plex confirmation, yet it keeps blocking a fresh request
+    for the same media. Refused BEFORE anything is touched: the correction path is
+    to resolve the import (retry/report), let the in-flight seasons settle, or let
+    the Plex confirmation land first, THEN withdraw from the resulting terminal
+    row.
     """
 
     def __init__(self, request_id: int, status: str) -> None:
@@ -1472,10 +1478,28 @@ async def cancel_request_as_owner(
     :class:`HasOtherParticipantsError` -- the correction path for that case is
     collaborative self-removal (:func:`withdraw_participant` via
     ``DELETE /subscription``), which hands ownership off instead.
+
+    The sole-participant decision is taken UNDER the same per-media lock
+    ``withdraw_participant`` and the ``create_request`` dedup-join hold, re-reading
+    the subscriber set FRESH under it (Codex #333 round 2, Finding A). Without the
+    lock the snapshot below races a concurrent dedup-JOIN -- another user's
+    ``POST /requests`` for the same title adding a ``RequestSubscriber`` -- which
+    could land AFTER this count reads "sole participant" but BEFORE
+    ``cancel_request`` commits, so the owner hard-cancels the whole request out
+    from under a co-participant who just joined. Lock ordering is unchanged (media
+    lock FIRST, before any ``MediaRequest``/``Download`` row lock, incl.
+    ``cancel_request``'s), matching every other participant-set path.
     """
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
     if request is None:
+        raise RequestNotFoundError(request_id)
+    # ``tmdb_id``/``media_type`` are immutable, so reading them off the (possibly
+    # stale) identity-map row is safe; the lock + fresh re-read below make the
+    # sole-participant decision authoritative.
+    await request_repo.acquire_media_lock(request.tmdb_id, request.media_type)
+    request = await request_repo.get_fresh(request_id)
+    if request is None:  # pragma: no cover - the locked row cannot vanish
         raise RequestNotFoundError(request_id)
     subscribers = await request_repo.list_subscribers(request_id)
     if any(uid != user_id for uid in subscribers):
@@ -1531,20 +1555,26 @@ async def withdraw_participant(
       ``user_id`` out: the row ends ``cancelled``, ownerless, zero subscribers.
 
     * **Last participant, ACTIVE non-cancellable status** (``import_blocked`` /
-      ``partially_available``) -- refused with
-      :class:`WithdrawalBlockedActiveError` (409). These are the two statuses in
-      NEITHER the cancellable NOR the terminal set: still dedup-blocking, but not
-      safely tearable-down. Stranding such a row ownerless with zero subscribers
-      would leave nobody to correct it, so the caller must resolve the import (or
-      let the in-flight seasons settle) first, then withdraw from the terminal
+      ``partially_available`` / ``completed``) -- refused with
+      :class:`WithdrawalBlockedActiveError` (409). These are the statuses in
+      NEITHER the cancellable NOR the genuinely-settled set
+      (``request_service.SETTLED_REQUEST_STATUS_VALUES``): still dedup-blocking
+      via ``uq_media_requests_active``, but not safely tearable-down.
+      ``completed`` (imported, awaiting Plex confirmation) belongs here even
+      though it is in ``TERMINAL_REQUEST_STATUS_VALUES`` -- it is excluded from
+      the settled set precisely because it still shadows a duplicate. Stranding
+      such a row ownerless with zero subscribers would leave nobody to correct
+      it, so the caller must resolve the import, let the in-flight seasons settle,
+      or let the Plex confirmation land first, then withdraw from the terminal
       row.
 
-    * **Last participant, terminal/settled status**
-      (``available``/``completed``/``failed``/``evicted``/``cancelled`` --
-      ``request_service.TERMINAL_REQUEST_STATUS_VALUES``) -- nothing to tear
-      down. The subscription is removed and, if the withdrawing user was the
-      owner, ``user_id`` is nulled out -- the row becomes ownerless, exactly like
-      automation provenance. The library file is untouched.
+    * **Last participant, genuinely settled status**
+      (``available``/``failed``/``evicted``/``cancelled`` --
+      ``request_service.SETTLED_REQUEST_STATUS_VALUES``, the dedup-INACTIVE set,
+      NOT ``completed``) -- nothing to tear down. The subscription is removed and,
+      if the withdrawing user was the owner, ``user_id`` is nulled out -- the row
+      becomes ownerless, exactly like automation provenance. The library file is
+      untouched.
 
     Every branch writes an ``AuditLog`` row (via :mod:`audit_service`) naming
     the withdrawing user, honesty over silence: a handoff is never a silent
@@ -1647,24 +1677,32 @@ async def withdraw_participant(
             raise RequestNotFoundError(request_id)
         return WithdrawOutcome(record=updated, settled=True)
 
-    if request.status not in request_service.TERMINAL_REQUEST_STATUS_VALUES:
-        # Last participant on an ACTIVE non-cancellable status -- the two
-        # statuses that are in NEITHER CANCELLABLE_REQUEST_STATUS_VALUES nor
-        # TERMINAL_REQUEST_STATUS_VALUES: ``import_blocked`` (a blocked download
-        # awaiting a retry/report) and ``partially_available`` (a TV rollup with
-        # seasons still in flight). Both keep shadowing a duplicate via
-        # ``uq_media_requests_active``, and neither can be safely torn down here.
-        # Removing the last participant would strand an active, dedup-blocking
-        # row ownerless with zero subscribers -- nobody left to correct it.
-        # Refuse (nothing touched); the caller resolves the block / lets the
-        # seasons settle first, then withdraws from the resulting terminal row
-        # (see WithdrawalBlockedActiveError).
+    if request.status not in request_service.SETTLED_REQUEST_STATUS_VALUES:
+        # Last participant on an ACTIVE non-cancellable status -- the statuses in
+        # NEITHER CANCELLABLE_REQUEST_STATUS_VALUES nor the genuinely-settled set
+        # (``request_service.SETTLED_REQUEST_STATUS_VALUES``, i.e. outside
+        # ``uq_media_requests_active``): ``import_blocked`` (a blocked download
+        # awaiting a retry/report), ``partially_available`` (a TV rollup with
+        # seasons still in flight), and ``completed`` (imported, still awaiting
+        # Plex confirmation before it settles ``available``). All three keep
+        # shadowing a duplicate via ``uq_media_requests_active`` (see its
+        # partial-index predicate in ``models.py``), and none can be safely torn
+        # down here. NOTE ``completed`` is in TERMINAL_REQUEST_STATUS_VALUES yet
+        # is deliberately NOT in the settled set -- gating on the terminal set
+        # instead (Codex #333 round 2, Finding B) let the last participant
+        # withdraw from a ``completed`` row and strand it active, ownerless, and
+        # dedup-blocking if Plex confirmation stalled. Removing the last
+        # participant here would leave nobody to correct it. Refuse (nothing
+        # touched); the caller resolves the block / lets the import confirm or
+        # the seasons settle first, then withdraws from the resulting terminal
+        # row (see WithdrawalBlockedActiveError).
         raise WithdrawalBlockedActiveError(request_id, request.status)
 
-    # Last participant, terminal/settled (available/completed/failed/evicted/
-    # cancelled): nothing to tear down. Remove the subscription and, if the
-    # withdrawing user owned it, null the owner out -- an ownerless row like any
-    # other automation-provenance one. The library file is untouched.
+    # Last participant, genuinely settled (available/failed/evicted/cancelled --
+    # the dedup-inactive set, NOT ``completed``): nothing to tear down. Remove the
+    # subscription and, if the withdrawing user owned it, null the owner out -- an
+    # ownerless row like any other automation-provenance one. The library file is
+    # untouched.
     await request_repo.remove_subscriber(request_id, user_id)
     if request.user_id == user_id:
         await request_repo.set_owner(request_id, None)

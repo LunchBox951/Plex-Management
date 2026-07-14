@@ -180,8 +180,9 @@ _CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
 # guard), 409 ``import_in_progress``/``not_cancellable`` (the last-participant
 # settle branch reuses ``cancel_request``'s own refusals verbatim),
 # ``withdrawal_blocked_active_request`` (the last participant tried to withdraw
-# from an ACTIVE non-cancellable row -- ``import_blocked``/``partially_available``
-# -- which is neither tearable-down nor settled), and
+# from an ACTIVE non-cancellable row -- ``import_blocked``/``partially_available``/
+# ``completed`` -- which is still dedup-blocking yet neither tearable-down nor
+# genuinely settled; ``completed`` is imported-but-awaiting-Plex-confirmation), and
 # ``ServiceNotConfiguredError``'s 409 ``service_not_configured`` (same shape/
 # rationale as the cancel endpoint's, above).
 _WITHDRAW_SUBSCRIPTION_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -850,9 +851,10 @@ async def withdraw_subscription_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
     except WithdrawalBlockedActiveError as exc:
         # The last participant tried to withdraw from an ACTIVE non-cancellable row
-        # (import_blocked / partially_available): neither tearable-down nor settled,
-        # and still dedup-blocking. Refused with an honest, actionable 409 -- resolve
-        # the import (or let the in-flight seasons settle) first, then withdraw.
+        # (import_blocked / partially_available / completed): still dedup-blocking,
+        # yet neither tearable-down nor genuinely settled. Refused with an honest,
+        # actionable 409 -- resolve the import, let the in-flight seasons settle, or
+        # let the Plex confirmation land (completed -> available) first, then withdraw.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="withdrawal_blocked_active_request"
         ) from exc

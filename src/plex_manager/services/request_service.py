@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from plex_manager.ports.repositories import RequestRecord
 
 __all__ = [
+    "SETTLED_REQUEST_STATUS_VALUES",
     "TERMINAL_REQUEST_STATUS_VALUES",
     "CreateRequestResult",
     "MediaNotFoundError",
@@ -127,13 +128,24 @@ _PARKABLE_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 # for the requests-list fold (:func:`fold_requests_for_display`) -- that helper
 # works over ``RequestRecord.status`` (already a ``str``, per the DTO), so it
 # needs the string-valued set rather than the SQL-side ``RequestStatus`` enum
-# frozenset. ``completed`` and ``no_acceptable_release`` are deliberately NOT
-# settled here, for the SAME reason the repo module documents: a ``completed``
-# ("Finalizing") row must keep shadowing a stale duplicate rather than being
-# folded away by one. Kept in sync with the repo module's set by
+# frozenset. This is exactly the DEDUP-INACTIVE set: the complement (among
+# request statuses) of ``uq_media_requests_active``'s partial-index predicate,
+# so a row in this set no longer shadows a fresh request for the same media.
+# ``completed`` and ``no_acceptable_release`` are deliberately NOT settled here,
+# for the SAME reason the repo module documents: a ``completed`` ("Finalizing")
+# row must keep shadowing a stale duplicate rather than being folded away by one.
+# Kept in sync with the repo module's set by
 # ``test_settled_status_value_sets_in_sync`` -- if the two ever drift, that test
 # fails loudly rather than the list quietly folding the wrong row.
-_SETTLED_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+#
+# Public (issue #314 / #333 round 2): ``correction_service.withdraw_participant``
+# gates the last participant's plain (no-teardown) settle on this set -- a last
+# withdrawal is only safe from a genuinely settled row, NEVER a still
+# dedup-blocking one like ``completed`` (which would strand an active,
+# participant-less, dedup-blocking row), so it must reason about the SAME
+# boundary this drives, not the broader ``TERMINAL_REQUEST_STATUS_VALUES`` (which
+# includes the still-dedup-active ``completed``).
+SETTLED_REQUEST_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     s.value
     for s in (
         RequestStatus.available,
@@ -683,6 +695,30 @@ async def create_request_result(
 
     repo = SqlRequestRepository(session)
     existing = await repo.find_active(tmdb_id, media_type)
+    if existing is not None:
+        # (Codex #333 round 2, Finding D) Serialize the dedup-JOIN under the SAME
+        # per-media lock ``correction_service.withdraw_participant`` /
+        # ``cancel_request_as_owner`` hold. ``find_active`` above ran BEFORE any
+        # lock, so a concurrent sole-participant withdrawal can settle/cancel this
+        # exact row in the gap before a subscriber is attached below -- and
+        # attaching one to a just-cancelled row would resurrect a dead request as
+        # a zombie subscription (a settled row is participant-less by design).
+        # Take the lock and RE-READ ``find_active`` under it: only join a row that
+        # is STILL active. The ``_subscribe_*`` helpers below commit (releasing the
+        # lock), so the durable subscriber row is written while liveness holds --
+        # a later withdrawal that acquires this lock then sees the subscriber and
+        # falls to a mere removal instead of a teardown. The lock is held only
+        # across the DB re-read + the quick subscriber INSERT (no Plex/TMDB I/O),
+        # matching every other participant-set path's ordering.
+        await repo.acquire_media_lock(tmdb_id, media_type)
+        existing = await repo.find_active(tmdb_id, media_type)
+        if existing is None:
+            # The active row we saw was concurrently settled/cancelled. Release the
+            # lock -- its write transaction must NOT stay open across the Plex/TMDB
+            # I/O the fresh-create path runs below (SQLite single-writer, ADR-0007)
+            # -- and fall through to a normal create, which re-reads + re-locks as
+            # needed and mints a fresh row rather than joining the corpse.
+            await session.rollback()
     if existing is not None:
         # Issue #58: a non-admin authenticated user must not dedup onto an active
         # request OWNED BY A DIFFERENT USER. Falling through would (a) for tv mutate
@@ -1287,7 +1323,7 @@ def fold_requests_for_display(
     chosen: list[RequestRecord] = []
     for key in order:
         group = groups[key]
-        active = next((r for r in group if r.status not in _SETTLED_STATUS_VALUES), None)
+        active = next((r for r in group if r.status not in SETTLED_REQUEST_STATUS_VALUES), None)
         chosen.append(active if active is not None else group[-1])
     return sorted(chosen, key=lambda r: r.id)
 

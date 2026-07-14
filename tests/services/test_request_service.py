@@ -14,7 +14,7 @@ from typing import Literal
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex import PlexLibrary
@@ -24,6 +24,7 @@ from plex_manager.models import (
     MediaType,
     RequestDedupLock,
     RequestStatus,
+    RequestSubscriber,
     SeasonRequest,
     User,
 )
@@ -3156,6 +3157,99 @@ async def test_settled_status_value_sets_in_sync() -> None:
         s.value
         for s in requests_repo_module._SETTLED_REQUEST_STATUSES  # pyright: ignore[reportPrivateUsage]
     }
-    assert (
-        settled_from_repo == request_service._SETTLED_STATUS_VALUES  # pyright: ignore[reportPrivateUsage]
-    )
+    assert settled_from_repo == request_service.SETTLED_REQUEST_STATUS_VALUES
+
+
+async def test_create_request_dedup_join_rechecks_liveness_under_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #333 round 2, Finding D: the dedup-JOIN path now serializes under the
+    per-media lock and RE-READS ``find_active`` under it. A sole-owner withdrawal
+    that settles/cancels the active row between the pre-lock ``find_active`` and
+    the under-lock re-read must NOT leave the joiner attached to the dead row --
+    the joiner falls through to a fresh create instead of subscribing to a corpse.
+
+    SQLite is single-writer (ADR-0007); the interleaving is simulated
+    deterministically. ``find_active``'s first (pre-lock) call returns the live
+    row; its second call -- the one this fix added UNDER the media lock -- commits
+    the 'concurrent' cancellation and reports the row gone, so the join path
+    re-reads None and creates a fresh row rather than joining the cancelled one.
+    Committing from ``find_active``'s own session (not a second one) is deliberate:
+    the media lock is already held here, and SQLite is single-writer, so a
+    separate transaction could not commit until the lock released.
+    """
+    owner_id = await _make_user(sessionmaker_, username="owner")
+    joiner_id = await _make_user(sessionmaker_, username="joiner")
+    async with sessionmaker_() as session:
+        existing = MediaRequest(
+            tmdb_id=990,
+            media_type=MediaType.movie,
+            title="Contact",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+        )
+        session.add(existing)
+        await session.flush()
+        existing_id = existing.id
+        session.add(RequestSubscriber(request_id=existing_id, user_id=owner_id))
+        await session.commit()
+
+    real_find_active = SqlRequestRepository.find_active
+    calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Under the media lock (the fix's re-read): a concurrent sole-owner
+            # withdrawal settles the row 'cancelled' and commits, then reports it
+            # gone. The join must NOT attach to this corpse.
+            await self._session.execute(  # pyright: ignore[reportPrivateUsage]
+                text("UPDATE media_requests SET status = 'cancelled' WHERE id = :r"),
+                {"r": existing_id},
+            )
+            await self._session.commit()  # pyright: ignore[reportPrivateUsage]
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(movies={990: MovieMetadata(tmdb_id=990, title="Contact", year=1997)})
+    async with sessionmaker_() as session:
+        result = await request_service.create_request_result(
+            session, tmdb, tmdb_id=990, media_type="movie", user_id=joiner_id
+        )
+    # The joiner did NOT attach to the cancelled row: a fresh row was created.
+    assert result.created is True
+    assert result.record.id != existing_id
+    assert result.record.user_id == joiner_id
+
+    async with sessionmaker_() as session:
+        old_subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == existing_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        new_subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == result.record.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        old_row = await session.get(MediaRequest, existing_id)
+    assert set(old_subs) == {owner_id}  # joiner NOT added to the corpse
+    assert set(new_subs) == {joiner_id}  # joiner is on the fresh row instead
+    assert old_row is not None and old_row.status == RequestStatus.cancelled

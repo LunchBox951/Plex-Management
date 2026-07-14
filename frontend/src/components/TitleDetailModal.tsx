@@ -1114,22 +1114,26 @@ export function TitleDetailModal({
     ) : null
 
   // Issue #314: collaborative self-removal, the counterpart to Cancel above.
-  // Shown to any non-admin participant EXCEPT where Cancel is their applicable
-  // verb -- i.e. gated on `!canCancel`, the exact mutual-exclusion the two
-  // buttons need: a non-admin SOLE owner of a still-cancellable row uses Cancel
-  // (canCancel true -> Withdraw hidden), but the same sole owner of a SETTLED
-  // row has no Cancel (canCancel false, since CANCELLABLE_STATUSES excludes it)
-  // and MUST be able to withdraw -- the earlier `(!isOwner || hasOtherParticipants)`
-  // gate wrongly hid it there (Codex #333, Finding 2). Deliberately NOT gated on
+  // Shown to ANY participant (`canWithdraw`, the API's own participant flag)
+  // EXCEPT where Cancel is their applicable verb -- i.e. gated on `!canCancel`,
+  // the exact mutual-exclusion the two buttons need: a SOLE owner of a
+  // still-cancellable row uses Cancel (canCancel true -> Withdraw hidden), but the
+  // same sole owner of a SETTLED row has no Cancel (canCancel false, since
+  // CANCELLABLE_STATUSES excludes it) and MUST be able to withdraw. Gating on the
+  // API's `canWithdraw` rather than a blanket `!isAdmin` (Codex #333 round 2,
+  // Finding C): an admin who is ALSO a participant of this row can (and the API's
+  // `can_withdraw` permits) withdraw themselves instead of being forced to
+  // hard-cancel it for everyone -- while a NON-participant admin still sees no
+  // Withdraw (`canWithdraw` is false for them). Deliberately NOT gated on
   // `CANCELLABLE_STATUSES`: withdrawal is valid from any status the caller
   // participates in, including an already-settled row. The backend still owns
   // the last-participant refusal for an ACTIVE non-cancellable row
-  // (import_blocked / partially_available -> 409 `withdrawal_blocked_active_request`);
-  // we deliberately show the button there rather than duplicating that status set
-  // in the client, and `runWithdraw` surfaces the honest 409 message (a sole
-  // participant on such a row is rare; a co-participant's withdrawal always
-  // succeeds as a mere removal).
-  const canWithdrawHere = !isAdmin && canWithdraw && liveRequest != null && !canCancel
+  // (import_blocked / partially_available / completed -> 409
+  // `withdrawal_blocked_active_request`); we deliberately show the button there
+  // rather than duplicating that status set in the client, and `runWithdraw`
+  // surfaces the honest 409 message (a sole participant on such a row is rare; a
+  // co-participant's withdrawal always succeeds as a mere removal).
+  const canWithdrawHere = canWithdraw && liveRequest != null && !canCancel
   const withdrawButton =
     canWithdrawHere && liveRequest ? (
       <Button
@@ -1213,8 +1217,12 @@ export function TitleDetailModal({
       break
     case 'import_blocked':
       // A participant may withdraw from a needs-attention row too (issue #314).
-      // reportButton is admin-only and withdrawButton is non-admin, so they are
-      // mutually exclusive in practice; the fragment keeps both slots honest.
+      // reportButton is admin-only; withdrawButton shows for any participant
+      // (incl. an admin who is also a subscriber -- Codex #333 round 2, Finding C),
+      // so the fragment renders both slots. NB the last participant's withdrawal
+      // here 409s `withdrawal_blocked_active_request` (import_blocked is
+      // dedup-active) -- surfaced honestly by runWithdraw; a co-participant's is a
+      // plain removal.
       actionZone =
         reportButton || withdrawButton ? (
           <>

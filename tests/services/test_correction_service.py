@@ -4153,3 +4153,181 @@ async def test_withdraw_decides_on_fresh_status_not_the_dependency_snapshot(
     assert outcome.record.status == RequestStatus.available.value
     assert outcome.record.user_id is None
     assert qbt.removed == []  # the still-'downloading' Download row is NOT torn down
+
+
+async def test_withdraw_last_participant_on_completed_is_refused(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333 round 2, Finding B: ``completed`` is imported-but-awaiting-Plex-
+    confirmation. It IS in ``TERMINAL_REQUEST_STATUS_VALUES`` yet is deliberately
+    EXCLUDED from ``SETTLED_REQUEST_STATUS_VALUES`` -- it still dedup-blocks via
+    ``uq_media_requests_active`` until the reconciler confirms it ``available``.
+    The prior gate keyed on the terminal set let the last participant plain-settle
+    (withdraw from) a ``completed`` row and strand it ACTIVE, ownerless, and
+    dedup-blocking if Plex confirmation stalled. It must instead be refused with
+    WithdrawalBlockedActiveError (nothing touched).
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.completed,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.WithdrawalBlockedActiveError) as exc_info:
+        async with sessionmaker_() as session:
+            await correction_service.withdraw_participant(
+                session, qbt, request_id=request_id, user_id=owner_id
+            )
+    assert exc_info.value.status == RequestStatus.completed.value
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request_row = await session.get(MediaRequest, request_id)
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Nothing touched: still owned, still subscribed, still completed (dedup-active).
+    assert request_row is not None
+    assert request_row.status == RequestStatus.completed
+    assert request_row.user_id == owner_id
+    assert len(subs) == 1
+
+
+async def test_withdraw_co_participant_on_completed_is_a_mere_removal(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333 round 2, Finding B boundary: the ``completed`` refusal is
+    LAST-PARTICIPANT ONLY. When OTHERS remain, withdrawing from a ``completed``
+    row is a plain removal (with owner handoff) -- the remaining participant keeps
+    the awaiting-confirmation row and its correction path; the row is never
+    stranded participant-less.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        other_id = await _seed_user(session, "other")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.completed,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        session.add(RequestSubscriber(request_id=request_id, user_id=other_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=owner_id
+        )
+    assert outcome.settled is False
+    assert outcome.record.status == RequestStatus.completed.value  # untouched
+    assert outcome.record.user_id == other_id  # handoff to the remaining participant
+    assert qbt.removed == []
+
+
+async def test_cancel_as_owner_rereads_participants_under_lock_after_a_concurrent_join(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #333 round 2, Finding A: ``cancel_request_as_owner`` takes the per-media
+    lock and RE-READS the subscriber set under it before deciding sole-participant.
+    A dedup-JOIN that commits between the owner's pre-lock view and the cancel's
+    commit must flip the verb to a refusal (HasOtherParticipantsError) rather than
+    hard-cancelling a request a co-participant just joined.
+
+    SQLite is single-writer (ADR-0007), so true concurrency isn't reproducible.
+    This injects the 'concurrent' join THROUGH the media-lock acquisition itself:
+    a joiner's ``RequestSubscriber`` commits (in a separate session) just before
+    the real lock is taken, exactly the interleaving the lock is meant to
+    serialize against. Because the injection is tied to ``acquire_media_lock``, an
+    implementation that skipped the lock (the pre-fix behavior) would never see
+    the join and would wrongly hard-cancel as 'sole participant'.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        joiner_id = await _seed_user(session, "joiner")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    state = {"injected": False}
+
+    async def joining_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        if not state["injected"]:
+            state["injected"] = True
+            # A concurrent dedup-join commits (separate transaction) just before we
+            # serialize -- the row now has a co-participant.
+            async with sessionmaker_() as other:
+                await other.execute(
+                    text(
+                        "INSERT INTO request_subscribers (request_id, user_id, subscribed_at) "
+                        "VALUES (:r, :u, :t)"
+                    ),
+                    {"r": request_id, "u": joiner_id, "t": datetime.now(UTC)},
+                )
+                await other.commit()
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", joining_acquire)
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.HasOtherParticipantsError):
+        async with sessionmaker_() as session:
+            await correction_service.cancel_request_as_owner(
+                session, qbt, request_id=request_id, user_id=owner_id
+            )
+    assert state["injected"] is True  # the lock WAS acquired (the fix's serialization point)
+    assert qbt.removed == []  # nothing torn down
+    async with sessionmaker_() as session:
+        request_row = await session.get(MediaRequest, request_id)
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == request_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert request_row is not None and request_row.status == RequestStatus.downloading
+    assert set(subs) == {owner_id, joiner_id}  # the joiner's shared request survives
