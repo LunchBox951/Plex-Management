@@ -1172,6 +1172,54 @@ def test_key_word_secret_spared_in_key_position_composes_to_mask_the_value() -> 
         assert combined == expected
 
 
+def test_key_guard_masks_a_key_word_secret_behind_an_overlong_identifier() -> None:
+    """Round-3 regression (Codex, PR #361): ``_SECRET_KV_RE``'s key prefix is
+    capped at 64 chars, so on ``<65+ char prefix>password=v`` the shape pass can
+    never fire -- sparing ``password`` there rendered the configured secret in
+    clear AND left the pair unrecognized. The spare now SELF-VERIFIES against
+    ``_SECRET_KV_RE`` itself: no shape-pass match containing the occurrence in
+    its key region means mask unconditionally -- any future shape-grammar
+    limitation fails closed the same way."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    for prefix_len in (65, 200):
+        raw = "x" * prefix_len + "password=v"
+        result = redact_known_secrets(raw, [secret])
+        assert "password" not in result
+        assert result == "x" * prefix_len + "<redacted>=v"
+        # And the composition never resurfaces it either:
+        assert "password" not in redact_secrets(result)
+
+
+def test_key_guard_spares_a_prose_colon_prefixed_key_and_the_value_masks() -> None:
+    """Round-3 regression (Codex, PR #361): ``error:password=hunter2`` -- a bare
+    ``:`` before the identifier is a prose/logger prefix, NOT URL authority. The
+    old single-char boundary check masked the key, broke the shape pass's key
+    recognition, and left the VALUE exposed. The authority exception now
+    requires a genuine ``scheme://`` prefix, the spare self-verifies against
+    ``_SECRET_KV_RE``, and the composition masks the value."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "error:password=hunter2"
+    value_first = redact_known_secrets(raw, [secret])
+    assert value_first == raw  # spared: the pair stays intact for the shape pass
+    combined = redact_secrets(value_first)
+    assert combined == "error:password=<redacted>"
+    assert "hunter2" not in combined
+
+
+def test_key_guard_scheme_authority_ambiguity_composes_safely() -> None:
+    """Adversarial (round 3): ``scheme://error:password=x@host`` -- the same
+    ``error:password`` spelling, but INSIDE a genuine authority (userinfo). The
+    narrowed authority exception masks the occurrence, and
+    ``_BASIC_AUTH_URL_RE`` then consumes the surrounding ``:<...>@`` span --
+    neither the secret nor the paired value survives the composition."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "https://error:password=x@tracker.example.com/a"
+    value_first = redact_known_secrets(raw, [secret])
+    assert "password" not in value_first
+    combined = redact_secrets(value_first)
+    assert combined == "https://error:<redacted>@tracker.example.com/a"
+
+
 # --- #292 encoding-variant gaps: unpadded/base64url, percent case + ``+``, --- #
 # --- SimpleCookie repr, JSON/repr string escaping -------------------------- #
 
@@ -1250,6 +1298,41 @@ def test_redact_known_secrets_masks_json_and_repr_escaped_variants() -> None:
         result = redact_known_secrets(line, [secret])
         assert body not in result, body
         assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_case_variant_json_unicode_escapes() -> None:
+    """Round-3 regression (Codex, PR #361): ``json.dumps`` emits lowercase
+    ``\\uXXXX`` hex, but other serializers emit uppercase -- and per-escape
+    MIXES of both -- all decoding to the same secret. ``_variant_regex``
+    compiles each escape's hex digits case-insensitively (the same categorical
+    approach as the percent-escape fix), so every spelling masks. Unescaped
+    characters remain case-significant."""
+    secret = "pässwörd-token-A1"  # two non-ASCII chars -> two \\uXXXX escapes  # noqa: S105
+    body = json.dumps(secret)[1:-1]
+    assert body == "p\\u00e4ssw\\u00f6rd-token-A1"
+    spellings = [
+        body,  # canonical lowercase, as json.dumps emits
+        body.replace("\\u00e4", "\\u00E4"),  # first escape upper, second lower -- a mix
+        body.replace("\\u00f6", "\\u00F6"),  # first lower, second upper -- the reverse mix
+        body.replace("\\u00e4", "\\u00E4").replace("\\u00f6", "\\u00F6"),  # all upper
+    ]
+    for spelling in spellings:
+        line = f'{{"api_key": "{spelling}"}}'
+        result = redact_known_secrets(line, [secret])
+        assert spelling not in result, spelling
+        assert "<redacted>" in result
+    # Case-insensitivity applies to the ESCAPES only: a different unescaped
+    # letter is a different string and must NOT match (no over-redaction).
+    unrelated = f'{{"api_key": "{body.replace("token", "Token")}"}}'
+    assert redact_known_secrets(unrelated, [secret]).count("<redacted>") == 0
+    # ``\\xXX`` repr byte escapes get the same treatment:
+    esc_secret = "p\x1bq-token-12345"  # noqa: S105 -- fixture with an \x1b escape
+    repr_body = repr(esc_secret)[1:-1]
+    assert "\\x1b" in repr_body
+    upper_spelling = repr_body.replace("\\x1b", "\\x1B")
+    result = redact_known_secrets(f"raw={upper_spelling} end", [esc_secret])
+    assert upper_spelling not in result
+    assert "<redacted>" in result
 
 
 def test_simplecookie_repr_session_token_is_masked_by_shape_grammar() -> None:
