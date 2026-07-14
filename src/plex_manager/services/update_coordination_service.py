@@ -345,35 +345,45 @@ class UpdateCoordinationService:
         The service face of the recovery path for the fail-closed unknown-phase
         wedge (issue #354; see
         :meth:`~plex_manager.repositories.update_coordination.SqlUpdateCoordinationRepository.force_reset_phase`
-        for the lock + re-check protocol, why it never touches a known phase,
-        and why an UNEXPIRED drain lease -- a possibly-live newer-generation
-        install -- raises :class:`DrainLeaseActiveError` instead of being torn).
+        for the lock + re-check protocol and the full (phase x requested_action)
+        decision matrix, including the ACTION-ONLY variant -- a KNOWN, non-busy
+        phase paired with an unrecognized queued action -- and why an UNEXPIRED
+        drain lease under an unknown phase raises :class:`DrainLeaseActiveError`
+        instead of being torn).
 
         The reset and its :class:`~plex_manager.models.AuditLog` row commit in ONE
         transaction: a state change that silently reassigned the coordinator out
-        of an unknown phase with no durable record of WHO did it, or when, would
+        of an unknown state with no durable record of WHO did it, or when, would
         violate "honesty over silence" (north star #3). The audit row is written
-        only when a reset actually happened -- a no-op refusal (the phase was
-        already known) or a drain-active refusal changes nothing and records
-        nothing. When the reset also normalized an unrecognized
-        ``requested_action`` to ``none``, the audit row records that too.
+        only when a reset actually happened -- a no-op refusal (nothing this
+        operation may recover) or a drain-active refusal changes nothing and
+        records nothing -- and it names exactly what changed: the re-anchored
+        phase, the cleared unrecognized ``requested_action``, or both.
         ``actor_user_id`` is ``None`` for an API-key / recovery-key admin, which
         has no Plex identity; that honest null actor matches every other admin
         action taken via the break-glass credential.
 
-        Returns the :class:`ForceResetResult` on reset, or ``None`` when the
-        phase was already known and nothing was changed.
+        Returns the :class:`ForceResetResult` on reset, or ``None`` when there
+        was nothing to recover and nothing was changed.
         """
         async with self._sessionmaker() as session:
             repo = SqlUpdateCoordinationRepository(session)
             result = await repo.force_reset_phase(self._now())
             if result is None:
                 return None
-            old_value: dict[str, str] = {"phase": result.old_phase}
-            new_value: dict[str, str] = {"phase": UpdatePhase.idle.value}
+            old_value: dict[str, str] = {}
+            new_value: dict[str, str] = {}
+            if result.old_phase is not None:
+                old_value["phase"] = result.old_phase
+                new_value["phase"] = UpdatePhase.idle.value
             if result.cleared_requested_action is not None:
                 old_value["requested_action"] = result.cleared_requested_action
                 new_value["requested_action"] = "none"
+            description = (
+                "Force-reset an unrecognized update coordinator phase to idle."
+                if result.old_phase is not None
+                else "Cleared an unrecognized queued updater action."
+            )
             await audit_service.record(
                 session,
                 actor_user_id=actor_user_id,
@@ -382,7 +392,7 @@ class UpdateCoordinationService:
                 entity_id=1,
                 old_value=old_value,
                 new_value=new_value,
-                description="Force-reset an unrecognized update coordinator phase to idle.",
+                description=description,
             )
             await session.commit()
             return result

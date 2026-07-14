@@ -1466,33 +1466,35 @@ export interface paths {
         put?: never;
         /**
          * Force Reset Endpoint
-         * @description Break-glass recovery for a wedged/unrecognized coordinator phase (issue #354).
+         * @description Break-glass recovery for a wedged coordinator state (issue #354).
          *
-         *     The in-app exit from the fail-closed unknown-phase guard (PR #346): once a
-         *     version-skew/rollback window leaves the coordinator row in a phase this app
-         *     version does not know, every locked coordination write 409s permanently and
-         *     the app can neither check, install, nor self-heal. This re-anchors that
-         *     unrecognized phase to ``idle`` -- audited, inside the coordination lock, and
-         *     only after re-reading the phase so a state that healed on its own is never
-         *     blindly clobbered (north stars #1/#2: a button, never a terminal).
+         *     The in-app exit from the fail-closed unknown-state guards (PR #346): a
+         *     version-skew/rollback window can leave the coordinator row in a PHASE this
+         *     app version does not know (every locked coordination write then 409s
+         *     permanently), or in a known phase paired with a queued ACTION it does not
+         *     know (every new check/install request is then refused as in-progress).
+         *     Both are recovered here -- audited, inside the coordination lock, and only
+         *     after re-reading the row so a state that healed on its own is never blindly
+         *     clobbered (north stars #1/#2: a button, never a terminal).
          *
-         *     Fail-closed against misuse, twice over:
+         *     The locked decision matrix:
          *
-         *     * If the coordinator is in ANY known phase -- including a live
-         *       ``draining`` / ``installing`` / ``rollback`` -- there is nothing wedged to
-         *       recover, so it refuses with 409 ``coordinator_phase_known`` rather than
-         *       resetting an in-flight update. That refusal is also the honest,
-         *       idempotent answer to a double-click: the second call finds the
-         *       now-``idle`` phase already known.
-         *     * If an UNEXPIRED drain lease exists under the unrecognized phase, a NEWER
-         *       updater generation may be legitimately mid-install in a phase this build
-         *       simply doesn't know; it refuses with 409 ``coordinator_drain_active``
-         *       instead of tearing a possibly-live operation. The lease TTL bounds the
-         *       wait -- an expired lease is swept and a retry then proceeds.
-         *
-         *     A successful reset also normalizes a ``requested_action`` the same skew
-         *     left unrecognized (cleared to ``none``; a known queued action is preserved
-         *     for retry), and is audit-logged.
+         *     * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
+         *       no-op, nothing wedged to recover. Also the honest, idempotent answer to
+         *       a double-click: the second call finds the recovered state already known.
+         *     * Busy phase (``checking``/``draining``/``installing``/``rollback``), any
+         *       action: 409 ``coordinator_phase_known`` -- an operation is in flight and
+         *       its own acknowledgement or lease expiry legitimately resolves the
+         *       action; never reset a live update. Both exits converge on a recoverable
+         *       state if the action remains unrecognized.
+         *     * Known non-busy phase + unrecognized action: clears the action to
+         *       ``none`` (the action-only reset), leaving the phase untouched.
+         *     * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
+         *       -- a NEWER updater generation may be legitimately mid-install in a phase
+         *       this build simply doesn't know; the lease TTL bounds the wait, and an
+         *       expired lease is swept so a retry then proceeds.
+         *     * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
+         *       queued action is preserved for retry, an unrecognized one is cleared.
          */
         post: operations["force_reset_endpoint_api_v1_updates_force_reset_post"];
         delete?: never;

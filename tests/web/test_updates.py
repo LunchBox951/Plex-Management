@@ -1330,3 +1330,46 @@ async def test_force_reset_refuses_while_a_drain_lease_is_live(
         assert lease.kind == "drain"
         assert (await session.execute(select(AuditLog))).scalars().all() == []
     assert (await coordinator.snapshot()).phase == "future_installing"
+
+
+async def test_force_reset_recovers_the_action_only_wedge_end_to_end(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """Codex round 2 on #357: a rollback can leave a KNOWN phase (idle) plus a
+    requested_action this build does not recognize. Status must flag it (else
+    the operator is never shown the recovery button), and force-reset must
+    clear the action rather than refusing with coordinator_phase_known."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="idle", requested_action="future_action")
+        )
+        await session.commit()
+
+    # The wedge is VISIBLE: without this blocker the operator has no way to
+    # know recovery is needed -- request_action 409s every normal action while
+    # the phase looks perfectly healthy.
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["state"] == "unavailable"
+    assert status.json()["blocker"] == "requested_action_unknown"
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.requested_action == "none"
+    async with app.state.sessionmaker() as session:
+        audit = (await session.execute(select(AuditLog))).scalars().all()
+    assert len(audit) == 1
+    assert audit[0].old_value == {"requested_action": "future_action"}
+
+    after = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert after.json()["blocker"] != "requested_action_unknown"

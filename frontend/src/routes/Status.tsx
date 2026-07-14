@@ -74,12 +74,16 @@ function UpdatePanel({
 }) {
   const state = UPDATE_STATE[status.state]
   const operationActive = ['checking', 'draining', 'installing', 'rollback'].includes(status.state)
-  // The coordinator landed in a phase this build doesn't recognize (a
-  // version-skew/rollback window). Every update control fails closed until an
-  // admin re-anchors it — the north-star #1 button, surfaced only here (issue
-  // #354). Keyed off the honest backend blocker, so it appears exactly when the
-  // guard is the thing blocking the controls.
-  const wedged = status.blocker === 'coordinator_state_unknown'
+  // The coordinator landed in a state this build doesn't recognize (a
+  // version-skew/rollback window): either the PHASE itself is unknown, or a
+  // known phase carries a queued ACTION this build can't interpret — which
+  // silently refuses every new check/install as "already in progress". Both
+  // fail closed until an admin re-anchors them — the north-star #1 button,
+  // surfaced only here (issue #354). Keyed off the honest backend blockers, so
+  // the banner appears exactly when a guard is the thing blocking the controls.
+  const phaseWedged = status.blocker === 'coordinator_state_unknown'
+  const actionWedged = status.blocker === 'requested_action_unknown'
+  const wedged = phaseWedged || actionWedged
   // waiting_for_window describes the AUTOMATIC policy. Keep the explicit
   // manual action available there because it intentionally bypasses that
   // window. waiting_for_idle means an install is already queued.
@@ -207,13 +211,15 @@ function UpdatePanel({
       </div>
       {wedged ? (
         <div className="mt-4 rounded-lg border border-error/40 bg-error/5 px-3 py-3 text-xs">
-          <p className="font-semibold text-error">Coordinator in an unrecognized state</p>
+          <p className="font-semibold text-error">
+            {phaseWedged
+              ? 'Coordinator in an unrecognized state'
+              : 'Queued action not recognized by this version'}
+          </p>
           <p className="mt-1 text-muted">
-            Check and install are disabled — they can only fail until this is cleared. It&apos;s
-            usually the aftermath of a version rollback. Recovering re-anchors the coordinator to
-            idle so the controls work again; a queued update is preserved for retry. If an update
-            is still mid-flight, recovery is refused until its maintenance lease expires (a few
-            minutes) — try again shortly.
+            {phaseWedged
+              ? 'Check and install are disabled — they can only fail until this is cleared. It’s usually the aftermath of a version rollback. Recovering re-anchors the coordinator to idle so the controls work again; a queued update is preserved for retry. If an update is still mid-flight, recovery is refused until its maintenance lease expires (a few minutes) — try again shortly.'
+              : 'A queued updater action isn’t recognized by this version — usually the aftermath of a version rollback — so every new check or install is refused as “already in progress”. Recovering clears the unrecognized action so the controls work again; nothing else is changed.'}
           </p>
           <div className="mt-3">
             <Button
@@ -823,13 +829,14 @@ export function Status() {
           if (!next) setConfirmRecover(false)
         }}
         title="Recover the update coordinator?"
-        description="Re-anchors an unrecognized coordinator phase to idle so the updater controls work again. A queued update is preserved for retry; this is refused if the coordinator is already in a recognized state or an update maintenance lease is still active."
+        description="Clears whatever this version can't interpret: an unrecognized coordinator phase is re-anchored to idle, an unrecognized queued action is cleared. A recognizable queued update is preserved for retry; this is refused if there is nothing to recover or an update maintenance lease is still active."
       >
         <div className="flex flex-col gap-4">
           <p className="text-sm text-muted">
-            This clears a stuck coordinator state (typically left by a version rollback) and returns
-            the updater to idle. It does nothing if an update is genuinely in flight — the server
-            refuses unless the phase is truly unrecognized, and refuses while an update maintenance
+            This clears a stuck coordinator state (typically left by a version rollback): an
+            unrecognized phase is re-anchored to idle, and an unrecognized queued action is cleared
+            so new checks and installs are accepted again. It does nothing if an update is genuinely
+            in flight — the server refuses while an operation is running or an update maintenance
             lease is still active (a possibly-live install). If that happens, wait a few minutes for
             the lease to expire and try again.
           </p>

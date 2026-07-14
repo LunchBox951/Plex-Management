@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import (
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.repositories.update_coordination import (
+    _BUSY_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
     _KNOWN_REQUESTED_ACTIONS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -1036,6 +1037,138 @@ async def test_force_reset_double_click_is_idempotent(
 
     assert (await _row(sessionmaker_)).phase == "idle"
     assert len(await _audit_rows(sessionmaker_)) == 1
+
+
+async def _plant_action(sessionmaker_: SessionMaker, phase: str, requested_action: str) -> None:
+    """Write a phase + requested_action pair directly, bypassing the service --
+    models the rollback window where a NEWER version's writes survive in a
+    database an older build now reads (Codex round 2 on #357)."""
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase=phase, requested_action=requested_action)
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    "known_phase", sorted(_KNOWN_COORDINATOR_PHASES - _BUSY_COORDINATOR_PHASES)
+)
+async def test_force_reset_clears_unknown_action_under_every_known_non_busy_phase(
+    sessionmaker_: SessionMaker, known_phase: str
+) -> None:
+    """The action-only wedge (Codex round 2 on #357): a rollback can leave a
+    KNOWN, safe phase paired with a requested_action this build does not know.
+    That action makes request_action refuse ALL new intent as in-progress while
+    meaning nothing to eligibility -- and the phase being known means the full
+    phase reset would refuse before helping. The action-only reset clears just
+    the action, preserves the phase, audits it, and un-wedges request_action."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_action(sessionmaker_, known_phase, "future_action")
+
+    # The quieter wedge: the phase guard passes, but the unrecognized action
+    # reads as in-progress and refuses all new operator intent.
+    with pytest.raises(UpdateOperationInProgressError):
+        await service.request_action(UpdateAction.check)
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase is None
+    assert result.cleared_requested_action == "future_action"
+
+    row = await _row(sessionmaker_)
+    assert row.phase == known_phase
+    assert row.requested_action == "none"
+
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].old_value == {"requested_action": "future_action"}
+    assert audit[0].new_value == {"requested_action": "none"}
+
+    # The wedge is gone: fresh operator intent is accepted again.
+    assert await service.request_action(UpdateAction.check) == row.action_generation + 1
+
+
+@pytest.mark.parametrize("busy_phase", sorted(_BUSY_COORDINATOR_PHASES))
+async def test_force_reset_refuses_unknown_action_while_an_operation_is_in_flight(
+    sessionmaker_: SessionMaker, busy_phase: str
+) -> None:
+    """Busy phase + unrecognized action: the in-flight operation's own
+    acknowledgement (generation CAS) or lease expiry is the legitimate writer
+    of requested_action, so recovery must not race it -- refuse, change
+    nothing, audit nothing. Both of those exits converge on a non-busy phase
+    where the action-only reset (test above) becomes available."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_action(sessionmaker_, busy_phase, "future_action")
+
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+
+    row = await _row(sessionmaker_)
+    assert row.phase == busy_phase
+    assert row.requested_action == "future_action"
+    assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_action_only_force_reset_double_click_is_idempotent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The action-only variant's second click finds requested_action already
+    known ('none') under a known phase -- the true-no-op refusal. One reset,
+    one audit row."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_action(sessionmaker_, "idle", "future_action")
+
+    first = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert first is not None
+    assert first.cleared_requested_action == "future_action"
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "none"
+    assert len(await _audit_rows(sessionmaker_)) == 1
+
+
+async def test_concurrent_action_only_force_resets_have_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    """The same lock + in-lock re-check protocol serializes the action-only
+    variant: the loser re-reads the already-cleared ('none', known) action and
+    refuses. Exactly one reset, one audit row."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'action-reset.db'}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    first = UpdateCoordinationService(maker, token_factory=_tokens("first"))
+    second = UpdateCoordinationService(maker, token_factory=_tokens("second"))
+    await first.initialize()
+    try:
+        async with maker() as session:
+            await session.execute(
+                update(UpdateCoordinatorState)
+                .where(UpdateCoordinatorState.id == 1)
+                .values(phase="idle", requested_action="future_action")
+            )
+            await session.commit()
+
+        results = await asyncio.gather(
+            first.force_reset_coordinator_phase(actor_user_id=None),
+            second.force_reset_coordinator_phase(actor_user_id=None),
+        )
+        assert sorted(r is None for r in results) == [False, True]
+        row = await _row(maker)
+        assert row.phase == "idle"
+        assert row.requested_action == "none"
+        async with maker() as session:
+            audit = (await session.execute(select(AuditLog))).scalars().all()
+        assert len(audit) == 1
+    finally:
+        await engine.dispose()
 
 
 async def test_concurrent_force_resets_have_exactly_one_winner(tmp_path: Path) -> None:

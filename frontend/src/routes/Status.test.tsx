@@ -403,6 +403,37 @@ describe('Status', () => {
     )
   })
 
+  it('offers recovery for an unrecognized queued action with distinct honest copy', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'unavailable',
+        updater_available: true,
+        blocker: 'requested_action_unknown',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // The action-only wedge (a known phase + a queued action this build can't
+    // interpret) gets its own honest banner copy, and the normal controls are
+    // disabled — request_action can only 409 against it.
+    expect(screen.getByText('Queued action not recognized by this version')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Recover coordinator' }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Recover coordinator' }))
+    await waitFor(() => expect(forceResetMutateAsync).toHaveBeenCalledTimes(1))
+  })
+
   it('hides the coordinator recovery affordance for a healthy coordinator', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
@@ -411,6 +442,7 @@ describe('Status', () => {
     render(<Status />, { wrapper: Wrapper })
 
     expect(screen.queryByText('Coordinator in an unrecognized state')).not.toBeInTheDocument()
+    expect(screen.queryByText('Queued action not recognized by this version')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Recover coordinator' })).not.toBeInTheDocument()
   })
 

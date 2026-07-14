@@ -48,6 +48,16 @@ _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
 _KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
+# ``"none"`` plus every operator intent this build understands. Mirrors the
+# repo layer's ``_KNOWN_REQUESTED_ACTIONS`` (which duplicates it for hexagonal
+# layering); derived from the enum here, so it cannot drift.
+_KNOWN_REQUESTED_ACTIONS = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
+# The phases with an operation actively in flight. While one of these holds,
+# its own acknowledgement or lease expiry is the legitimate writer of
+# ``requested_action``, so the action-only wedge below is NOT flagged (nor
+# recoverable) mid-operation -- both exits converge on a non-busy phase where
+# it is.
+_BUSY_PHASES = frozenset({"checking", "draining", "installing", "rollback"})
 
 router = APIRouter(
     prefix="/api/v1/updates",
@@ -136,6 +146,20 @@ def _state_and_blocker(
 ) -> tuple[str, str | None]:
     if snapshot.phase not in _KNOWN_PHASES:
         return "unavailable", "coordinator_state_unknown"
+    # The action-only wedge (issue #354, Codex round 2): a rollback can leave a
+    # perfectly recognizable phase paired with a requested_action this build
+    # does not know, which makes request_action refuse ALL new intent while
+    # meaning nothing to eligibility. Flag it like the unknown-phase wedge --
+    # and, like that check, BEFORE the updater-availability gate, because the
+    # recovery endpoint works without a live sidecar and the operator must be
+    # shown the button either way. Busy phases are exempt: the in-flight
+    # operation's own acknowledgement or lease expiry legitimately rewrites the
+    # action, and force-reset refuses mid-operation for the same reason.
+    if (
+        snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS
+        and snapshot.phase not in _BUSY_PHASES
+    ):
+        return "unavailable", "requested_action_unknown"
     if not updater_available:
         return "unavailable", "updater_unavailable"
     if snapshot.phase == "draining":
@@ -270,33 +294,35 @@ async def force_reset_endpoint(
     settings: Annotated[Settings, Depends(get_settings)],
     _body: Annotated[UpdateActionRequest | None, Body()] = None,
 ) -> UpdateStatusResponse:
-    """Break-glass recovery for a wedged/unrecognized coordinator phase (issue #354).
+    """Break-glass recovery for a wedged coordinator state (issue #354).
 
-    The in-app exit from the fail-closed unknown-phase guard (PR #346): once a
-    version-skew/rollback window leaves the coordinator row in a phase this app
-    version does not know, every locked coordination write 409s permanently and
-    the app can neither check, install, nor self-heal. This re-anchors that
-    unrecognized phase to ``idle`` -- audited, inside the coordination lock, and
-    only after re-reading the phase so a state that healed on its own is never
-    blindly clobbered (north stars #1/#2: a button, never a terminal).
+    The in-app exit from the fail-closed unknown-state guards (PR #346): a
+    version-skew/rollback window can leave the coordinator row in a PHASE this
+    app version does not know (every locked coordination write then 409s
+    permanently), or in a known phase paired with a queued ACTION it does not
+    know (every new check/install request is then refused as in-progress).
+    Both are recovered here -- audited, inside the coordination lock, and only
+    after re-reading the row so a state that healed on its own is never blindly
+    clobbered (north stars #1/#2: a button, never a terminal).
 
-    Fail-closed against misuse, twice over:
+    The locked decision matrix:
 
-    * If the coordinator is in ANY known phase -- including a live
-      ``draining`` / ``installing`` / ``rollback`` -- there is nothing wedged to
-      recover, so it refuses with 409 ``coordinator_phase_known`` rather than
-      resetting an in-flight update. That refusal is also the honest,
-      idempotent answer to a double-click: the second call finds the
-      now-``idle`` phase already known.
-    * If an UNEXPIRED drain lease exists under the unrecognized phase, a NEWER
-      updater generation may be legitimately mid-install in a phase this build
-      simply doesn't know; it refuses with 409 ``coordinator_drain_active``
-      instead of tearing a possibly-live operation. The lease TTL bounds the
-      wait -- an expired lease is swept and a retry then proceeds.
-
-    A successful reset also normalizes a ``requested_action`` the same skew
-    left unrecognized (cleared to ``none``; a known queued action is preserved
-    for retry), and is audit-logged.
+    * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
+      no-op, nothing wedged to recover. Also the honest, idempotent answer to
+      a double-click: the second call finds the recovered state already known.
+    * Busy phase (``checking``/``draining``/``installing``/``rollback``), any
+      action: 409 ``coordinator_phase_known`` -- an operation is in flight and
+      its own acknowledgement or lease expiry legitimately resolves the
+      action; never reset a live update. Both exits converge on a recoverable
+      state if the action remains unrecognized.
+    * Known non-busy phase + unrecognized action: clears the action to
+      ``none`` (the action-only reset), leaving the phase untouched.
+    * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
+      -- a NEWER updater generation may be legitimately mid-install in a phase
+      this build simply doesn't know; the lease TTL bounds the wait, and an
+      expired lease is swept so a retry then proceeds.
+    * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
+      queued action is preserved for retry, an unrecognized one is cleared.
     """
     coordinator = await _coordinator(request)
     try:
