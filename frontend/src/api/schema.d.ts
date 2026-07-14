@@ -1482,11 +1482,17 @@ export interface paths {
          *     * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
          *       no-op, nothing wedged to recover. Also the honest, idempotent answer to
          *       a double-click: the second call finds the recovered state already known.
-         *     * Busy phase (``checking``/``draining``/``installing``/``rollback``), any
+         *     * Leased busy phase (``draining``/``installing``/``rollback``), any
          *       action: 409 ``coordinator_phase_known`` -- an operation is in flight and
          *       its own acknowledgement or lease expiry legitimately resolves the
          *       action; never reset a live update. Both exits converge on a recoverable
          *       state if the action remains unrecognized.
+         *     * ``checking`` + unrecognized action: refused only while the updater
+         *       heartbeat is fresh (the 45s liveness contract) -- a live sidecar could
+         *       be mid-check. ``checking`` holds no lease, so once the heartbeat is
+         *       stale nothing can ever expire it; the action-only reset then proceeds
+         *       (the phase itself stays ``checking`` and heals through the next
+         *       completed check's normal acknowledgement).
          *     * Known non-busy phase + unrecognized action: clears the action to
          *       ``none`` (the action-only reset), leaving the phase untouched.
          *     * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``

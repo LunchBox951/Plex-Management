@@ -109,6 +109,21 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC) if value is not None else None
 
 
+def _updater_heartbeat_fresh(last_seen: datetime | None, now: datetime, max_age: timedelta) -> bool:
+    """Whether the sidecar's last heartbeat is recent enough to call it live.
+
+    Mirrors ``UpdateCoordinationService.updater_available`` exactly (including
+    treating a future timestamp -- clock skew -- as NOT live), so the
+    force-reset checking predicate and the status endpoint's
+    ``updater_available`` can never disagree about the same row.
+    """
+    seen = _as_utc(last_seen)
+    if seen is None:
+        return False
+    age = now - seen
+    return timedelta(0) <= age <= max_age
+
+
 @dataclass(frozen=True)
 class CoordinatorSnapshot:
     """Durable updater status plus the current lease summary."""
@@ -513,7 +528,12 @@ class SqlUpdateCoordinationRepository:
         )
         return True
 
-    async def force_reset_phase(self, now: datetime) -> ForceResetResult | None:
+    async def force_reset_phase(
+        self,
+        now: datetime,
+        *,
+        updater_heartbeat_max_age: timedelta,
+    ) -> ForceResetResult | None:
         """Re-anchor an UNRECOGNIZED coordinator phase to ``idle`` (issue #354).
 
         The recovery counterpart to the fail-closed unknown-phase guard every
@@ -536,13 +556,27 @@ class SqlUpdateCoordinationRepository:
         * KNOWN phase, KNOWN action: ``None`` -- a true no-op refusal, nothing
           wedged to recover (also the idempotent second-click answer once a
           first reset has landed ``idle``/``none``).
-        * KNOWN BUSY phase (:data:`_BUSY_COORDINATOR_PHASES`), any action:
-          ``None`` -- an operation is in flight and its own acknowledgement
-          (generation CAS) or lease expiry is the legitimate writer of
-          ``requested_action``; even an unrecognized action must not be raced
-          here. Both exits converge on a recoverable cell: an ack rewrites the
-          action itself, and lease expiry re-anchors the phase to ``idle``
-          while preserving the action -- the action-only cell below.
+        * KNOWN LEASED-BUSY phase (``draining``/``installing``/``rollback``),
+          any action: ``None`` -- an operation is in flight and its own
+          acknowledgement (generation CAS) or drain-lease expiry is the
+          legitimate writer of ``requested_action``; even an unrecognized
+          action must not be raced here. Both exits converge on a recoverable
+          cell: an ack rewrites the action itself, and lease expiry re-anchors
+          the phase to ``idle`` while preserving the action -- the action-only
+          cell below.
+        * ``checking`` phase, UNRECOGNIZED action (Codex round 3 on #357):
+          ``checking`` is busy but LEASELESS -- nothing ever expires it, so the
+          round-2 "its exits converge" rationale does not hold. The honest
+          in-flight signal in the coordination data is the sidecar heartbeat:
+          only a live sidecar can be mid-check or about to deliver a check
+          outcome. While the heartbeat is FRESH (within
+          ``updater_heartbeat_max_age``, the same 45s contract as
+          ``updater_available``), refuse. Once it is STALE or absent, no check
+          can be in flight: allow the ACTION-ONLY reset. The phase itself is
+          deliberately left ``checking`` (never force-rewritten): with the
+          action cleared, the next completed check -- automatic, or a queued
+          ``check`` the sidecar picks up on reconnect -- acknowledges through
+          the normal generation-CAS path and rewrites the phase legitimately.
         * KNOWN NON-BUSY phase, UNRECOGNIZED action: the ACTION-ONLY reset
           (issue #354, Codex round 2). A rollback can leave a perfectly safe
           phase (e.g. ``idle``) paired with an action this build does not know;
@@ -574,10 +608,19 @@ class SqlUpdateCoordinationRepository:
         """
         state = await self._lock()
         if state.phase in _KNOWN_COORDINATOR_PHASES:
-            if (
-                state.requested_action in _KNOWN_REQUESTED_ACTIONS
-                or state.phase in _BUSY_COORDINATOR_PHASES
-            ):
+            if state.requested_action in _KNOWN_REQUESTED_ACTIONS:
+                return None
+            # An unrecognized action is recoverable in every non-busy phase; in
+            # the leaseless ``checking`` phase only once the sidecar heartbeat
+            # says no check can be in flight (see the matrix above). The leased
+            # busy phases always refuse -- their lease expiry converges.
+            action_recoverable = state.phase not in _BUSY_COORDINATOR_PHASES or (
+                state.phase == "checking"
+                and not _updater_heartbeat_fresh(
+                    state.updater_last_seen_at, now, updater_heartbeat_max_age
+                )
+            )
+            if not action_recoverable:
                 return None
             cleared = state.requested_action
             await self._session.execute(

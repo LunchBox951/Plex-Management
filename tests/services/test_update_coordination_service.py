@@ -1091,15 +1091,17 @@ async def test_force_reset_clears_unknown_action_under_every_known_non_busy_phas
     assert await service.request_action(UpdateAction.check) == row.action_generation + 1
 
 
-@pytest.mark.parametrize("busy_phase", sorted(_BUSY_COORDINATOR_PHASES))
-async def test_force_reset_refuses_unknown_action_while_an_operation_is_in_flight(
+@pytest.mark.parametrize("busy_phase", sorted(_BUSY_COORDINATOR_PHASES - {"checking"}))
+async def test_force_reset_refuses_unknown_action_while_a_leased_operation_is_in_flight(
     sessionmaker_: SessionMaker, busy_phase: str
 ) -> None:
-    """Busy phase + unrecognized action: the in-flight operation's own
-    acknowledgement (generation CAS) or lease expiry is the legitimate writer
-    of requested_action, so recovery must not race it -- refuse, change
-    nothing, audit nothing. Both of those exits converge on a non-busy phase
-    where the action-only reset (test above) becomes available."""
+    """LEASED busy phase + unrecognized action: the in-flight operation's own
+    acknowledgement (generation CAS) or drain-lease expiry is the legitimate
+    writer of requested_action, so recovery must not race it -- refuse, change
+    nothing, audit nothing, regardless of sidecar liveness. Both of those
+    exits converge on a cell where the action-only reset becomes available.
+    ``checking`` is leaseless and is governed by the heartbeat predicate
+    instead (tests below)."""
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
     await _plant_action(sessionmaker_, busy_phase, "future_action")
@@ -1110,6 +1112,79 @@ async def test_force_reset_refuses_unknown_action_while_an_operation_is_in_fligh
     assert row.phase == busy_phase
     assert row.requested_action == "future_action"
     assert await _audit_rows(sessionmaker_) == []
+
+
+async def _plant_checking_wedge(sessionmaker_: SessionMaker, last_seen: datetime | None) -> None:
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="future_action",
+                updater_last_seen_at=last_seen,
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize("staleness", ["never_seen", "stale"])
+async def test_force_reset_clears_checking_action_wedge_once_heartbeat_is_stale(
+    sessionmaker_: SessionMaker, staleness: str
+) -> None:
+    """Codex round 3 on #357: ``checking`` is busy but LEASELESS -- nothing
+    ever expires it, so a blanket busy refusal left checking + unrecognized
+    action permanently unrecoverable with the sidecar gone. Once the heartbeat
+    is stale (or was never seen) beyond the 45s liveness contract, no check
+    can be in flight: the action-only reset proceeds, clearing the action but
+    deliberately leaving the phase ``checking`` -- the next completed check's
+    normal generation-CAS acknowledgement is the legitimate phase writer."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    last_seen = None if staleness == "never_seen" else clock.now - timedelta(minutes=2)
+    await _plant_checking_wedge(sessionmaker_, last_seen)
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase is None
+    assert result.cleared_requested_action == "future_action"
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "checking"
+    assert row.requested_action == "none"
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].old_value == {"requested_action": "future_action"}
+
+
+async def test_force_reset_refuses_checking_action_wedge_with_fresh_heartbeat(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """While the sidecar heartbeat is FRESH, a check could genuinely be in
+    flight (or its outcome about to land), so the checking-phase action wedge
+    is still refused -- nothing changed, nothing audited. The predicate is the
+    same 45s contract updater_available uses, so 'refused' here always
+    coincides with the UI reporting a connected sidecar."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    await _plant_checking_wedge(sessionmaker_, clock.now - timedelta(seconds=10))
+
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "checking"
+    assert row.requested_action == "future_action"
+    assert await _audit_rows(sessionmaker_) == []
+
+    # The same wedge becomes recoverable as soon as the heartbeat crosses the
+    # liveness contract -- the bounded wait the refusal imposes.
+    clock.advance(timedelta(minutes=2))
+    recovered = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert recovered is not None
+    assert recovered.cleared_requested_action == "future_action"
+    assert (await _row(sessionmaker_)).requested_action == "none"
 
 
 async def test_action_only_force_reset_double_click_is_idempotent(

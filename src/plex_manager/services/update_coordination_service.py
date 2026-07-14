@@ -35,6 +35,7 @@ from plex_manager.repositories.update_coordination import (
 from plex_manager.services import audit_service
 
 __all__ = [
+    "UPDATER_HEARTBEAT_MAX_AGE",
     "CoordinatorSnapshot",
     "DrainClaim",
     "DrainLeaseActiveError",
@@ -52,6 +53,12 @@ __all__ = [
 
 _CODE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 _DEFAULT_CRITICAL_TTL = timedelta(minutes=5)
+# The sidecar-liveness contract: a heartbeat older than this means no updater
+# is connected. Single source of truth shared by the updates router (status's
+# ``updater_available`` and the 503 gate on manual actions) and by
+# ``force_reset_coordinator_phase``'s checking-phase predicate, so "is a check
+# plausibly in flight" can never drift from "is the sidecar connected".
+UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
 _logger = logging.getLogger(__name__)
 
 
@@ -338,7 +345,10 @@ class UpdateCoordinationService:
             return released
 
     async def force_reset_coordinator_phase(
-        self, *, actor_user_id: int | None
+        self,
+        *,
+        actor_user_id: int | None,
+        updater_heartbeat_max_age: timedelta = UPDATER_HEARTBEAT_MAX_AGE,
     ) -> ForceResetResult | None:
         """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
 
@@ -368,7 +378,9 @@ class UpdateCoordinationService:
         """
         async with self._sessionmaker() as session:
             repo = SqlUpdateCoordinationRepository(session)
-            result = await repo.force_reset_phase(self._now())
+            result = await repo.force_reset_phase(
+                self._now(), updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age)
+            )
             if result is None:
                 return None
             old_value: dict[str, str] = {}

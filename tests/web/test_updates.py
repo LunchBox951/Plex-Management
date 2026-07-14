@@ -1373,3 +1373,104 @@ async def test_force_reset_recovers_the_action_only_wedge_end_to_end(
 
     after = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert after.json()["blocker"] != "requested_action_unknown"
+
+
+async def test_eligibility_fails_closed_on_unrecognized_requested_action(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 3 P1 on #357: an unrecognized requested_action must never
+    read as ABSENT to eligibility's policy branches. Without the guard, this
+    exact setup (automatic updates on, window open, image available) hands the
+    sidecar an install whose completion would rewrite the unrecognized action
+    -- bypassing the audited recovery path. The sidecar's contract for the
+    refusal is the ordinary action="none" sleep-and-repoll (runner.py returns
+    on action == "none"), identical to the unknown-phase blocker's shape."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _enable_automatic_updates(client)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="idle",
+                requested_action="future_action",
+                available_build="build-new",
+                available_digest="sha256:new",
+            )
+        )
+        await session.commit()
+
+    eligibility = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert eligibility.status_code == 200
+    assert eligibility.json()["action"] == "none"
+    assert eligibility.json()["blocker"] == "requested_action_unknown"
+
+    # Nothing was handed out and nothing was rewritten: the unrecognized
+    # action survives untouched for the audited recovery path.
+    snapshot = await coordinator.snapshot()
+    assert snapshot.requested_action == "future_action"
+    assert snapshot.phase == "idle"
+
+
+async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """Codex round 3 P2 on #357: checking + unrecognized action. With a FRESH
+    heartbeat a check could be in flight -- no wedge flag (status reads
+    'checking'), force-reset refuses. Once the heartbeat crosses the 45s
+    liveness contract, the banner appears and the action-only reset clears
+    the action, leaving phase checking for the normal ack path to heal."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+
+    async def plant(last_seen: datetime) -> None:
+        async with app.state.sessionmaker() as session:
+            await session.execute(
+                update(UpdateCoordinatorState)
+                .where(UpdateCoordinatorState.id == 1)
+                .values(
+                    phase="checking",
+                    requested_action="future_action",
+                    updater_last_seen_at=last_seen,
+                )
+            )
+            await session.commit()
+
+    # Fresh heartbeat: a live sidecar could be mid-check.
+    await plant(datetime.now(UTC))
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["state"] == "checking"
+    assert status.json()["blocker"] != "requested_action_unknown"
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_phase_known"
+    assert (await coordinator.snapshot()).requested_action == "future_action"
+
+    # Stale heartbeat: no check can be in flight; the wedge is flagged and the
+    # action-only reset proceeds.
+    await plant(datetime.now(UTC) - timedelta(minutes=2))
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["state"] == "unavailable"
+    assert status.json()["blocker"] == "requested_action_unknown"
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "checking"
+    assert snapshot.requested_action == "none"
+    async with app.state.sessionmaker() as session:
+        audit = (await session.execute(select(AuditLog))).scalars().all()
+    assert len(audit) == 1
+    assert audit[0].old_value == {"requested_action": "future_action"}
