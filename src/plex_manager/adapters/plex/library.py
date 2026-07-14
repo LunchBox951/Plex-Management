@@ -23,6 +23,7 @@ completes, and a stale "present" answer for a few minutes is harmless.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -30,14 +31,20 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Final, Literal, cast
+from typing import Final, Literal, NamedTuple, cast
 
 import httpx
 
 from plex_manager.adapters.service_url import InvalidServiceUrl, ServiceUrl
 from plex_manager.headersafe import header_value_error
 from plex_manager.logsafe import safe_int
-from plex_manager.ports.library import LibrarySection, WatchState, WatchStateQuery
+from plex_manager.ports.library import (
+    ArtworkImage,
+    ArtworkKind,
+    LibrarySection,
+    WatchState,
+    WatchStateQuery,
+)
 from plex_manager.services import path_visibility
 
 __all__ = ["PlexAuthError", "PlexLibrary", "PlexLibraryError"]
@@ -50,6 +57,11 @@ _HTTP_UNAUTHORIZED: Final = 401
 _HTTP_FORBIDDEN: Final = 403
 _PAGE_SIZE: Final = 100
 _CACHE_TTL_SECONDS: Final = 300.0
+# The proxied artwork body must actually be an image (issue #66): a reverse proxy
+# or auth gate in front of Plex could answer a ``thumb`` GET with an HTML login
+# page at HTTP 200, which we must NOT forward to the browser as if it were a
+# poster. Anything whose Content-Type is not ``image/*`` is treated as a miss.
+_IMAGE_CONTENT_TYPE_PREFIX: Final = "image/"
 
 # Plex stores agent ids as ``<agent>://<id>``. The modern Movie agent uses
 # ``tmdb://``; the legacy "The Movie Database" agent uses ``themoviedb://``. Both
@@ -125,12 +137,57 @@ _PRESENT_SHOW_TMDB_CACHE: _TtlCache[frozenset[int]] = _TtlCache(_CACHE_TTL_SECON
 _TV_SEASONS_CACHE: _TtlCache[dict[int, frozenset[int]]] = _TtlCache(_CACHE_TTL_SECONDS)
 
 
+class _ArtworkKeys(NamedTuple):
+    """The Plex-native artwork PATHS for one library item (issue #66).
+
+    ``poster`` is Plex's ``thumb`` attribute, ``background`` its ``art`` — both
+    server-relative resource paths (e.g. ``/library/metadata/42/thumb/1700000000``),
+    NEVER a full URL and NEVER carrying the token. Either may be ``None`` when Plex
+    has no image of that kind for the item.
+    """
+
+    poster: str | None
+    background: str | None
+
+
+# Plex-native artwork indexes (issue #66): a per-credential map of
+# ``tmdb_id -> _ArtworkKeys`` built from ONE crawl of the movie (resp. show)
+# sections, so the image proxy resolves a poster/background path without re-paging
+# Plex per image. Split by media type — exactly like _PRESENT_TMDB_CACHE vs
+# _PRESENT_SHOW_TMDB_CACHE — so a movie-art request never crawls the show sections
+# (and vice versa), and a cached movie map is never mistaken for "no show art".
+# Unlike the presence caches, a cached ABSENCE here is harmless: a tmdb id missing
+# from the map just means the browser shows TMDB art for up to the TTL (purely
+# cosmetic), never a wrong availability/eviction decision — so the whole map
+# (misses included) is cached with no refresh-absent dance.
+_MOVIE_ARTWORK_CACHE: _TtlCache[dict[int, _ArtworkKeys]] = _TtlCache(_CACHE_TTL_SECONDS)
+_SHOW_ARTWORK_CACHE: _TtlCache[dict[int, _ArtworkKeys]] = _TtlCache(_CACHE_TTL_SECONDS)
+# Serializes the artwork crawl per ``(cache_key, section_type)`` so a page-load
+# that fires many proxy image requests at once (30 in-library tiles => 30
+# concurrent GETs) triggers ONE crawl the rest await, not a thundering herd of
+# full-library crawls. Keyed like the caches (server + token-hash + type); a
+# rotated token adds at most one idle lock, negligible for a single-server
+# install. asyncio is single-threaded, so the get-or-create is race-free.
+_ARTWORK_CRAWL_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _artwork_crawl_lock(key: str) -> asyncio.Lock:
+    lock = _ARTWORK_CRAWL_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ARTWORK_CRAWL_LOCKS[key] = lock
+    return lock
+
+
 def reset_caches() -> None:
     """Clear the module-level caches. Test-isolation helper (not part of the port)."""
     _SECTIONS_CACHE.clear()
     _PRESENT_TMDB_CACHE.clear()
     _PRESENT_SHOW_TMDB_CACHE.clear()
     _TV_SEASONS_CACHE.clear()
+    _MOVIE_ARTWORK_CACHE.clear()
+    _SHOW_ARTWORK_CACHE.clear()
+    _ARTWORK_CRAWL_LOCKS.clear()
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -1630,3 +1687,123 @@ class PlexLibrary:
                         (frozenset(episode_paths), _season_watch_state_from_entry(season_entry))
                     )
         return _resolve_correlated_watch_state(hits)
+
+    async def fetch_artwork(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        kind: ArtworkKind,
+    ) -> ArtworkImage | None:
+        """See :meth:`LibraryPort.fetch_artwork`.
+
+        Resolves the item's Plex-native artwork PATH from the per-credential
+        artwork index (one cached section crawl), then GETs that path through the
+        SAME :meth:`_request` boundary every other Plex call uses — so the token
+        rides the ``X-Plex-Token`` header (never the URL, never a log), the path is
+        re-validated as a server-owned relative path by ``ServiceUrl.endpoint`` (an
+        SSRF-proof boundary: a ``thumb``/``art`` value that somehow carried a scheme
+        or host is rejected there and surfaces as a miss), and redirects are not
+        followed. Returns ``None`` for an absent item, an item with no image of the
+        requested kind, a non-image body, or an unusable artwork path; a genuine
+        transport/credential failure propagates as ``PlexLibraryError``/
+        ``PlexAuthError`` for the web layer to fold into a fallback.
+        """
+        keys = await self._artwork_keys(tmdb_id, media_type)
+        if keys is None:
+            return None
+        path = keys.poster if kind == "poster" else keys.background
+        if path is None or not path.startswith("/") or path.startswith("//"):
+            # Absent, or not a server-relative path we can safely append to the
+            # configured Plex origin: an absolute ``http://host/...`` or a
+            # protocol-relative ``//host/...`` value smuggled into ``thumb``/``art``
+            # is an honest MISS, never fetched — SSRF defense-in-depth on top of
+            # ``ServiceUrl.endpoint``'s own path validation (which would reject
+            # both anyway before any request left this origin). TMDB takes over.
+            return None
+        # ``Accept: image/*`` (overriding _request's JSON default) asks Plex for the
+        # raw image; the token is injected by _request into the header only, and the
+        # path is re-validated as a server-owned relative path by ServiceUrl.endpoint
+        # (a malformed/transcode path there surfaces as a PlexLibraryError the web
+        # layer folds into a fallback, never an off-origin fetch).
+        response = await self._request(path, headers={"Accept": "image/*,*/*;q=0.8"})
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith(_IMAGE_CONTENT_TYPE_PREFIX):
+            # A 200 that isn't actually an image (e.g. a reverse-proxy login HTML
+            # page in front of Plex) must never be proxied to the browser as a
+            # poster — honest miss, TMDB takes over.
+            return None
+        return ArtworkImage(content=response.content, content_type=content_type)
+
+    async def _artwork_keys(
+        self, tmdb_id: int, media_type: Literal["movie", "tv"]
+    ) -> _ArtworkKeys | None:
+        """The cached Plex artwork paths for ``tmdb_id`` in this media type's sections.
+
+        Populates the per-credential artwork index on a miss via ONE crawl of the
+        relevant sections, guarded by :func:`_artwork_crawl_lock` so a burst of
+        concurrent proxy requests (a page of in-library tiles) shares a single
+        crawl. ``None`` when the item is absent from the built map.
+        """
+        if media_type == "movie":
+            cache = _MOVIE_ARTWORK_CACHE
+            section_type: Literal["movie", "show"] = "movie"
+        else:
+            cache = _SHOW_ARTWORK_CACHE
+            section_type = "show"
+        cached = cache.get(self._cache_key)
+        if cached is None:
+            async with _artwork_crawl_lock(f"{self._cache_key}|{section_type}"):
+                # Double-checked: a crawl that completed while we waited for the
+                # lock already populated the cache — don't re-crawl.
+                cached = cache.get(self._cache_key)
+                if cached is None:
+                    cached = await self._collect_present_artwork(section_type)
+                    cache.set(self._cache_key, cached)
+        return cached.get(tmdb_id)
+
+    async def _collect_present_artwork(
+        self, section_type: Literal["movie", "show"]
+    ) -> dict[int, _ArtworkKeys]:
+        """Crawl every section of ``section_type``, mapping tmdb id -> artwork paths."""
+        result: dict[int, _ArtworkKeys] = {}
+        for section in await self.list_sections():
+            if section.type != section_type:
+                continue
+            await self._collect_section_artwork(section.key, result)
+        return result
+
+    async def _collect_section_artwork(self, key: str, result: dict[int, _ArtworkKeys]) -> None:
+        """Page one section, recording each item's ``thumb``/``art`` per tmdb id.
+
+        Uses the same ``/all?includeGuids=1`` walk as the presence crawls (Plex
+        returns ``thumb``/``art`` as top-level attributes on every item, so no extra
+        parameter is needed). First item to claim a tmdb id wins — a rare duplicate
+        entry just keeps the first crawled item's artwork, which is sufficient for
+        a display hint.
+        """
+        start = 0
+        while True:
+            payload = await self._get(
+                f"/library/sections/{key}/all",
+                {"includeGuids": "1"},
+                headers={
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(_PAGE_SIZE),
+                },
+            )
+            items = _as_sequence(_media_container(payload).get("Metadata"))
+            for item in items:
+                entry = _as_mapping(item)
+                tmdb_ids: set[int] = set()
+                _collect_item_tmdb_ids(entry, tmdb_ids)
+                if not tmdb_ids:
+                    continue
+                artwork = _ArtworkKeys(
+                    poster=_get_str(entry, "thumb"),
+                    background=_get_str(entry, "art"),
+                )
+                for tmdb_id in tmdb_ids:
+                    result.setdefault(tmdb_id, artwork)
+            if len(items) < _PAGE_SIZE:
+                break
+            start += _PAGE_SIZE
