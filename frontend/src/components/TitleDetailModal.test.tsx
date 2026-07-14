@@ -82,7 +82,13 @@ vi.mock('./ui/Dialog', () => ({
   }) => (
     <div role="dialog">
       {customChrome ? null : <h2>{title}</h2>}
-      {description ? <p>{description}</p> : null}
+      {/* Faithful to the real Dialog (Dialog.tsx): `description` is rendered
+          sr-only, NOT visibly. A prior mock that rendered it as a plain <p>
+          masked issue #335 -- a destructive warning passed ONLY as
+          `description` was invisible to sighted users yet still found by
+          getByText. Keeping the sr-only class here lets a test assert the
+          warning is rendered VISIBLY (in `children`), not just accessibly. */}
+      {description ? <p className="sr-only">{description}</p> : null}
       {children}
     </div>
   ),
@@ -110,6 +116,19 @@ function mutation(resolved: unknown) {
 
 function idle() {
   return { mutateAsync: vi.fn(), isPending: false }
+}
+
+/**
+ * Assert `pattern` is rendered VISIBLY (issue #335 / Codex Finding 2), not only
+ * as the Dialog's sr-only `description`. The Dialog mock renders `description`
+ * inside a `.sr-only` node just like the real component (Dialog.tsx), so a
+ * warning passed ONLY via `description` would match `getByText` yet fail this
+ * check -- every match would be inside an sr-only ancestor. Passing requires at
+ * least one occurrence outside `.sr-only`, i.e. actually seen by sighted users.
+ */
+function expectWarningVisible(pattern: RegExp): void {
+  const matches = screen.getAllByText(pattern)
+  expect(matches.some((el) => el.closest('.sr-only') === null)).toBe(true)
 }
 
 describe('TitleDetailModal grab gating on the create path (G3)', () => {
@@ -1304,14 +1323,14 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     expect(screen.getByText('Withdraw and hand off?')).toBeInTheDocument()
   })
 
-  it('shows the destructive cancel warning to a sole NON-OWNER subscriber (issue #335)', () => {
-    // Issue #335: the backend's last-participant branch settles like a normal
-    // cancel (teardown + `cancelled`) whenever `has_other_participants` is
-    // false, REGARDLESS of ownership -- e.g. a browser user who subscribed to
-    // an ownerless/API-key-created active request. Keying the dialog off
-    // `isOwner` instead of `hasOtherParticipants` would show the benign
-    // "continues for others" copy here even though withdrawing actually
-    // cancels the request and removes the download.
+  it('shows the destructive cancel warning to a sole NON-OWNER subscriber on an ACTIVE row (issue #335)', () => {
+    // Issue #335: on a cancellable/active status the backend's last-participant
+    // branch tears down (`cancel_request`: torrent + file) and settles
+    // `cancelled` -- REGARDLESS of ownership -- e.g. a browser user who
+    // subscribed to an ownerless/API-key-created request that is still
+    // `searching`. Keying the dialog off `isOwner` would show the benign
+    // "continues for others" copy here even though withdrawing actually cancels
+    // the request and removes the download.
     asSharedUser()
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: {
@@ -1319,7 +1338,10 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
           // Ownerless request (`can_mutate: false`, matching the real API's
           // `_can_mutate_request`: neither admin nor owner) with the caller as
           // its sole subscriber -- Cancel is unavailable to them, only Withdraw.
+          // A cancellable/active status (`searching`) is what makes the
+          // last-participant withdrawal genuinely destructive.
           movieRequest({
+            status: 'searching',
             can_mutate: false,
             is_owner: false,
             can_withdraw: true,
@@ -1333,20 +1355,18 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
     expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
-    expect(
-      screen.getByText(/withdrawing will cancel it and remove the download/i),
-    ).toBeInTheDocument()
+    expectWarningVisible(/withdrawing will cancel it and remove the download/i)
   })
 
-  it('shows "Withdraw" -- and the destructive warning -- to a non-admin SOLE owner of a SETTLED row (Cancel is unavailable there)', () => {
+  it('shows the MERE-REMOVAL copy (never the destructive warning) to a non-admin SOLE owner of a SETTLED row (issue #335)', () => {
     // Codex #333, Finding 2: a settled row has no Cancel (CANCELLABLE_STATUSES
     // excludes it), so gating Withdraw on `(!isOwner || hasOtherParticipants)`
     // wrongly left a sole owner with NO self-removal path. Gating on `!canCancel`
-    // fixes it: Cancel is absent here, so Withdraw appears. Issue #335: the
-    // confirm dialog it opens must ALSO carry the destructive warning -- this
-    // caller is the last participant (`has_other_participants: false`), so the
-    // same backend branch that cancels + tears down for a non-owner (see the
-    // test above) applies here too, regardless of ownership.
+    // fixes it: Cancel is absent here, so Withdraw appears. Issue #335 (Codex
+    // round): the confirm must NOT warn about a teardown here -- the backend's
+    // last-participant branch on an ALREADY-SETTLED status (`available`) is a
+    // MERE subscription removal (`withdraw_participant` reuses `cancel_request`
+    // ONLY on a cancellable status), so the destructive copy would lie.
     asSharedUser()
     ;(useRequests as unknown as Mock).mockReturnValue({
       data: {
@@ -1365,10 +1385,12 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
-    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    expect(screen.getByText('Remove from your requests?')).toBeInTheDocument()
+    expectWarningVisible(/nothing is torn down/i)
+    // The destructive teardown warning must be ABSENT on a settled row.
     expect(
-      screen.getByText(/withdrawing will cancel it and remove the download/i),
-    ).toBeInTheDocument()
+      screen.queryByText(/withdrawing will cancel it and remove the download/i),
+    ).not.toBeInTheDocument()
   })
 
   it.each(['available', 'completed', 'failed', 'cancelled', 'evicted', 'import_blocked'] as const)(

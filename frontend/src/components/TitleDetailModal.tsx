@@ -225,6 +225,57 @@ const CANCELLABLE_STATUSES = new Set([
 ])
 
 /**
+ * Title + body copy for the Withdraw confirm dialog (issue #314, honesty fix
+ * #335). Four cases, mirroring exactly what the backend `withdraw_participant`
+ * verb does:
+ *
+ * - `willCancel` (SOLE participant on a cancellable/active status) — the
+ *   backend reuses `cancel_request`: the download is removed and the request
+ *   settles `cancelled`. This is the ONLY destructive case, so it is the only
+ *   one that warns about the teardown.
+ * - others remain + owner — ownership hands off to the earliest remaining
+ *   subscriber; the download continues.
+ * - others remain + plain subscriber — the download just continues for them.
+ * - SOLE participant on an already-settled status (available/failed/evicted/
+ *   cancelled) — a mere subscription removal; nothing is torn down. (A sole
+ *   participant on an ACTIVE non-cancellable row — import_blocked/
+ *   partially_available/completed — also lands here; the backend 409s that
+ *   case, which `runWithdraw` surfaces as an error toast, so the benign copy
+ *   never over-promises a teardown.)
+ *
+ * The body doubles as the visible in-dialog warning AND the accessible
+ * `description` (the shared Dialog renders `description` sr-only, so a
+ * body-only warning would be invisible to sighted users — see Dialog.tsx).
+ */
+function withdrawDialogCopy(flags: {
+  isOwner: boolean
+  hasOtherParticipants: boolean
+  willCancel: boolean
+}): { title: string; body: string } {
+  if (flags.willCancel) {
+    return {
+      title: 'Withdraw and cancel request?',
+      body: "You're the last person tracking this request. Withdrawing will cancel it and remove the download.",
+    }
+  }
+  if (flags.hasOtherParticipants) {
+    return flags.isOwner
+      ? {
+          title: 'Withdraw and hand off?',
+          body: 'Someone else who requested this becomes the owner. The download continues.',
+        }
+      : {
+          title: 'Remove from your requests?',
+          body: 'The download continues for others who requested it.',
+        }
+  }
+  return {
+    title: 'Remove from your requests?',
+    body: 'This just removes the request from your list; nothing is torn down.',
+  }
+}
+
+/**
  * A request is grabbable only while it is non-terminal: the backend rejects a
  * terminal request id in /queue/grab (`request_not_active`). Positive allowlist
  * (issue #205), not a terminal denylist — an unrecognized status (a future
@@ -481,19 +532,24 @@ export function TitleDetailModal({
   // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
   const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
   // The confirm dialog for withdrawing the caller's OWN subscription (issue
-  // #314) -- the collaborative counterpart to `cancelFor`. Copy is keyed off
-  // `hasOtherParticipants`, NOT ownership (issue #335): the backend's
-  // last-participant branch (`withdraw_subscription_endpoint`) settles like a
-  // normal cancel -- teardown + `cancelled` -- for ANY sole participant,
-  // owner or not. `isOwner` only distinguishes hand-off from mere-removal
-  // copy WHEN others remain; it must never gate the destructive warning
-  // itself, or a sole non-owner subscriber's withdrawal would show the
-  // benign "continues for others" copy while actually cancelling the request
-  // and removing the download.
+  // #314) -- the collaborative counterpart to `cancelFor`. The destructive
+  // copy is keyed off `willCancel`, NOT ownership and NOT bare
+  // `hasOtherParticipants` (issue #335 + Codex round): the backend's
+  // last-participant branch (`withdraw_participant`) only tears down
+  // (`cancel_request` -- torrent + file) when the caller is the SOLE
+  // participant AND the request is in a cancellable/active status
+  // (`CANCELLABLE_REQUEST_STATUS_VALUES`). A sole participant on an already
+  // SETTLED row (available/failed/evicted/cancelled) is a MERE subscription
+  // removal server-side -- nothing torn down -- so warning "this cancels it
+  // and removes the download" there would LIE. `willCancel` mirrors the same
+  // status predicate the backend keys on, captured at click time; `isOwner`
+  // and `hasOtherParticipants` only pick hand-off vs continues-for-others vs
+  // mere-removal copy among the NON-destructive cases.
   const [withdrawFor, setWithdrawFor] = useState<{
     requestId: number
     isOwner: boolean
     hasOtherParticipants: boolean
+    willCancel: boolean
   } | null>(null)
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
@@ -899,21 +955,22 @@ export function TitleDetailModal({
   }, [cancelFor, cancelRequest, toast])
 
   // Withdraw the caller's OWN subscription (issue #314) -- collaborative
-  // self-removal. Never touches what a remaining owner/other subscriber wants;
-  // as the LAST participant it settles like a normal cancel server-side. The
-  // success toast (issue #335) reflects that: `hasOtherParticipants`, captured
-  // on `withdrawFor` at click time, tells us whether this call was a mere
-  // removal or the destructive last-participant branch -- an always-benign
-  // "Removed from your requests" toast would hide the cancel + download
-  // teardown from the one caller who actually triggered it.
+  // self-removal. Never touches what a remaining owner/other subscriber wants.
+  // The success toast (issue #335) reflects what actually happened server-side:
+  // `willCancel`, captured on `withdrawFor` at click time, is true only for the
+  // destructive last-participant-on-active branch that reuses `cancel_request`
+  // (teardown + `cancelled`); every other success is a mere subscription
+  // removal. Keying the toast off bare `hasOtherParticipants` (the earlier bug)
+  // would falsely claim a cancel + download teardown when a SOLE participant
+  // withdrew from an already-settled row, where nothing was torn down.
   const runWithdraw = useCallback(async () => {
     if (!withdrawFor) return
     try {
       await withdrawSubscription.mutateAsync(withdrawFor.requestId)
       toast({
-        title: withdrawFor.hasOtherParticipants
-          ? 'Removed from your requests'
-          : 'Request cancelled and download removed',
+        title: withdrawFor.willCancel
+          ? 'Request cancelled and download removed'
+          : 'Removed from your requests',
         intent: 'success',
       })
       setWithdrawFor(null)
@@ -1157,12 +1214,26 @@ export function TitleDetailModal({
       <Button
         variant="danger"
         onClick={() =>
-          setWithdrawFor({ requestId: liveRequest.id, isOwner, hasOtherParticipants })
+          setWithdrawFor({
+            requestId: liveRequest.id,
+            isOwner,
+            hasOtherParticipants,
+            // Mirror the backend teardown predicate exactly: it reuses
+            // `cancel_request` only for a SOLE participant on a cancellable
+            // status. A settled (or active-non-cancellable) row is a mere
+            // removal (or a 409), never a teardown -- so it must not warn like
+            // one. `CANCELLABLE_STATUSES` already mirrors the backend's
+            // `CANCELLABLE_REQUEST_STATUS_VALUES`.
+            willCancel: !hasOtherParticipants && CANCELLABLE_STATUSES.has(liveRequest.status),
+          })
         }
       >
         Withdraw
       </Button>
     ) : null
+  // Resolved once for the confirm dialog below (title, visible warning, and the
+  // sr-only accessible description all read from the same copy).
+  const withdrawCopy = withdrawFor ? withdrawDialogCopy(withdrawFor) : null
 
   const reSearchNowButton = isAdmin ? (
     <Button
@@ -1651,34 +1722,28 @@ export function TitleDetailModal({
         </Dialog>
       ) : null}
 
-      {/* Withdraw confirm (issue #314, honesty fix #335): copy is keyed off
-          `hasOtherParticipants`, NOT ownership -- the backend's last-participant
-          branch settles like a normal cancel (teardown + `cancelled`) for ANY
-          sole participant, owner or not. With others remaining, an owner hands
-          ownership off and a plain subscriber's download just continues; with
-          NO others remaining, withdrawal is destructive regardless of who the
-          caller is, so that case must plainly warn about it. */}
-      {withdrawFor ? (
+      {/* Withdraw confirm (issue #314, honesty fix #335): the DESTRUCTIVE copy
+          fires only for a SOLE participant on a cancellable/active status
+          (`willCancel`) -- the exact case the backend tears down (torrent +
+          file) via `cancel_request`. A sole participant on an already-settled
+          row is a mere removal, an owner-with-others hands off, and a plain
+          subscriber's download just continues. The body text is rendered
+          VISIBLY below (the shared Dialog keeps `description` sr-only), so
+          sighted users actually see the warning. */}
+      {withdrawFor && withdrawCopy ? (
         <Dialog
           open
           onOpenChange={(next) => {
             if (!next) setWithdrawFor(null)
           }}
-          title={
-            !withdrawFor.hasOtherParticipants
-              ? 'Withdraw and cancel request?'
-              : withdrawFor.isOwner
-                ? 'Withdraw and hand off?'
-                : 'Remove from your requests?'
-          }
-          description={
-            !withdrawFor.hasOtherParticipants
-              ? "You're the last person tracking this request. Withdrawing will cancel it and remove the download."
-              : withdrawFor.isOwner
-                ? 'Someone else who requested this becomes the owner. The download continues.'
-                : 'The download continues for others who requested it.'
-          }
+          title={withdrawCopy.title}
+          description={withdrawCopy.body}
         >
+          {/* Visible warning for sighted users; `aria-hidden` avoids a
+              double-announce alongside the sr-only Dialog `description`. */}
+          <p aria-hidden="true" className="mb-5 text-sm text-muted">
+            {withdrawCopy.body}
+          </p>
           <div className="flex justify-end gap-3">
             <Button
               variant="secondary"
