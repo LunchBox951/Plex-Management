@@ -45,12 +45,14 @@ __all__ = [
     "is_request_visible_to_user",
     "list_requests",
     "list_requests_for_user",
+    "list_requests_page",
     "list_subscribed_request_ids",
     "list_subscribers",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
     "set_keep_forever",
+    "subscribed_request_ids_among",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -1493,6 +1495,32 @@ async def list_requests_for_user(
     return await SqlRequestRepository(session).list_for_user(user_id, status)
 
 
+async def list_requests_page(
+    session: AsyncSession,
+    *,
+    for_user_id: int | None,
+    before_id: int | None,
+    limit: int,
+) -> tuple[list[RequestRecord], int | None]:
+    """One keyset page of raw request history + the next cursor (issue #218).
+
+    Returns ``(page, next_cursor)``: at most ``limit`` rows, newest (highest id)
+    first, and the ``id`` to pass as the next page's ``before_id`` -- or ``None``
+    when this page exhausted the history. Has-more is detected by asking the
+    repository for ``limit + 1`` rows and truncating (one bounded probe row --
+    never an OFFSET, never a COUNT over the whole table). ``for_user_id`` applies
+    the shared-user subscriber-visibility predicate in SQL; ``None`` is the
+    admin/API-key unfiltered scope. Pages are RAW lifetime rows, deliberately not
+    display-folded -- see :meth:`RequestRepository.list_page`.
+    """
+    rows = await SqlRequestRepository(session).list_page(
+        for_user_id=for_user_id, before_id=before_id, limit=limit + 1
+    )
+    page = rows[:limit]
+    next_cursor = page[-1].id if len(rows) > limit and page else None
+    return page, next_cursor
+
+
 async def is_request_visible_to_user(session: AsyncSession, request_id: int, user_id: int) -> bool:
     """Return whether a shared user subscribes to a request."""
     return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
@@ -1524,6 +1552,20 @@ async def list_subscribed_request_ids(session: AsyncSession, user_id: int) -> se
     is not necessarily a subscriber of every row they can see).
     """
     return await SqlRequestRepository(session).list_subscribed_request_ids(user_id)
+
+
+async def subscribed_request_ids_among(
+    session: AsyncSession, user_id: int, request_ids: Sequence[int]
+) -> set[int]:
+    """The subset of ``request_ids`` that ``user_id`` subscribes to (issue #218).
+
+    The page-scoped sibling of :func:`list_subscribed_request_ids` for the
+    paginated history endpoint: membership for exactly the page's rows -- one
+    bounded ``request_id IN (...) AND user_id = :u`` read (served by the
+    ``(user_id, request_id)`` composite index), never the O(all-subscriptions)
+    whole-set scan per page.
+    """
+    return await SqlRequestRepository(session).subscribed_request_ids_among(user_id, request_ids)
 
 
 def fold_requests_for_display(

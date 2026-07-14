@@ -128,6 +128,54 @@ function trackSettleObservations(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Memoized title-correlation index (issue #218, design item 3).
+//
+// `deriveTileState` used to `filter` the WHOLE requests array per tile, making a
+// Discover page's correlation O(T × U) (tiles × visible request groups) per
+// render. The index below is built ONCE per distinct requests-array instance —
+// a WeakMap keyed on the array reference, which react-query keeps stable until
+// a refetch actually produces new data — so correlation is O(U) once + O(1) per
+// tile lookup: O(U + T) per render. Insertion order preserves the array's
+// id-ascending order, so per-key match lists are identical to what the filter
+// produced. A WeakMap (not a Map) so a superseded snapshot's index is
+// garbage-collected with the snapshot itself.
+// ---------------------------------------------------------------------------
+const requestIndexCache = new WeakMap<
+  readonly RequestResponse[],
+  Map<string, RequestResponse[]>
+>()
+
+function titleKey(mediaType: string, tmdbId: number): string {
+  // TMDB movie/tv ids are independent namespaces and collide; the composite key
+  // is the same correlation TitleDetailModal implements.
+  return `${mediaType}:${tmdbId}`
+}
+
+/**
+ * The per-title index for one requests snapshot, memoized on the array
+ * instance. Exported for the O(U + T) comparison-bound test.
+ */
+export function indexRequestsByTitle(
+  requests: readonly RequestResponse[],
+): Map<string, RequestResponse[]> {
+  let index = requestIndexCache.get(requests)
+  if (!index) {
+    index = new Map()
+    for (const r of requests) {
+      const key = titleKey(r.media_type, r.tmdb_id)
+      const group = index.get(key)
+      if (group) {
+        group.push(r)
+      } else {
+        index.set(key, [r])
+      }
+    }
+    requestIndexCache.set(requests, index)
+  }
+  return index
+}
+
 function libraryStateToPresentation(
   state: DiscoverResult['library_state'],
 ): StatusPresentation | null {
@@ -171,10 +219,12 @@ export function deriveTileState(
 ): StatusPresentation | null {
   // The live request for this exact title — identical correlation to
   // TitleDetailModal.tsx: /requests is id-ascending and the backend allows
-  // re-requesting a settled title, so prefer a non-settled match, else the newest.
-  const matches = (requests ?? []).filter(
-    (r) => r.tmdb_id === result.tmdb_id && r.media_type === result.media_type,
-  )
+  // re-requesting a settled title, so prefer a non-settled match, else the
+  // newest. Looked up through the memoized per-snapshot index (#218) instead of
+  // filtering the whole array per tile — same match list, O(1) per tile.
+  const matches = requests
+    ? (indexRequestsByTitle(requests).get(titleKey(result.media_type, result.tmdb_id)) ?? [])
+    : []
   trackSettleObservations(matches, requestsFetchedAt)
   const active = matches.find((r) => !isSettled(r.status))
   const liveRequest = active ?? matches[matches.length - 1] ?? null

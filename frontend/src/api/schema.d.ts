@@ -790,7 +790,22 @@ export interface paths {
         };
         /**
          * List Requests Endpoint
-         * @description List all media requests.
+         * @description List media requests -- whole-list (legacy) or one keyset history page (#218).
+         *
+         *     **Paginated mode** (``limit`` supplied): one bounded page of RAW lifetime
+         *     history rows, newest (highest id) first, plus ``next_cursor`` (``null`` when
+         *     exhausted). Shared-user visibility is applied IN SQL before any row is
+         *     materialized, the page is never display-folded (a fold group can span pages;
+         *     the folded live-state view is issue #218's phase-2 compact lookup), and every
+         *     batched enrichment below (seasons, episode counts, downloads, subscriber
+         *     flags) is scoped to exactly the page's ids. ``id`` is unique and monotonic,
+         *     so the keyset is total (no ties) and no OFFSET or COUNT is ever issued.
+         *
+         *     **Legacy mode** (no ``limit``): the pre-#218 behavior byte-for-byte -- the
+         *     whole visible set, display-folded -- plus an ignorable ``next_cursor: null``,
+         *     so a cached SPA bundle from before this change keeps working against the new
+         *     API during a rollout. ``cursor`` without ``limit`` is refused (422
+         *     ``cursor_requires_limit``) rather than silently ignored.
          */
         get: operations["list_requests_endpoint_api_v1_requests_get"];
         put?: never;
@@ -2531,8 +2546,17 @@ export interface components {
         /**
          * RequestListResponse
          * @description A list of media requests.
+         *
+         *     ``next_cursor`` (issue #218) is the keyset cursor for the FOLLOWING page of
+         *     raw request history: pass it back as ``GET /requests?limit=...&cursor=...``
+         *     to continue, ``null`` when this response exhausted the history. Always
+         *     ``null`` in the legacy unpaginated mode (no ``limit`` supplied), whose
+         *     folded whole-list behavior is unchanged -- an older client that never sends
+         *     ``limit`` sees exactly the pre-#218 response plus this ignorable field.
          */
         RequestListResponse: {
+            /** Next Cursor */
+            next_cursor?: number | null;
             /** Requests */
             requests: components["schemas"]["RequestResponse"][];
         };
@@ -4273,7 +4297,12 @@ export interface operations {
     };
     list_requests_endpoint_api_v1_requests_get: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Page size for keyset-paginated RAW request history (issue #218). Omitted = the legacy whole-list mode (folded, unpaginated) -- unchanged for existing clients. */
+                limit?: number | null;
+                /** @description Keyset cursor: the previous page's ``next_cursor``. Only rows with ``id < cursor`` are returned (newest first). Requires ``limit``. */
+                cursor?: number | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -4287,6 +4316,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RequestListResponse"];
+                };
+            };
+            /** @description Validation error (FastAPI's standard shape -- e.g. ``limit`` outside 1..200 or a non-integer ``cursor``), or ``cursor_requires_limit`` (``cursor`` supplied without ``limit``; a cursor only means anything within the paginated mode) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
                 };
             };
         };

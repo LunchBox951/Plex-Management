@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, case, func, insert, literal, or_, select, update
+from sqlalchemy import CursorResult, Select, case, func, insert, literal, or_, select, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -125,6 +125,43 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         requested_seasons=_season_tuple(row.requested_seasons_json),
         requested_episodes=_episode_map(row.requested_episodes_json),
     )
+
+
+def _page_stmt(
+    *, for_user_id: int | None, before_id: int | None, limit: int
+) -> Select[tuple[MediaRequest]]:
+    """The keyset history-page SELECT (issue #218) -- see :meth:`SqlRequestRepository.list_page`.
+
+    Module-level so the EXPLAIN-QUERY-PLAN test can compile the EXACT production
+    statement rather than a drift-prone replica.
+
+    Shared-user pages (#369 Codex round 2) put the keyset predicate AND the
+    ORDER BY on the SUBSCRIBER side of the join: ``rs.request_id == mr.id``
+    makes the semantics identical (same ids, same order), but SQLite's planner
+    only range-walks ``ix_request_subscribers_user_id_request_id`` when both sit
+    on ``rs.request_id`` -- keyed on ``mr.id`` it used the index for the bare
+    ``user_id = ?`` equality and then TEMP-B-TREE-sorted ALL the user's
+    subscription rows per page. Verified with EXPLAIN QUERY PLAN (pinned by
+    ``test_shared_user_page_plan_range_walks_the_composite_index``):
+
+        before: SEARCH request_subscribers USING COVERING INDEX ...(user_id=?)
+                + USE TEMP B-TREE FOR ORDER BY
+        after:  SEARCH request_subscribers USING COVERING INDEX
+                ...(user_id=? AND request_id<?)          [no sort step]
+    """
+    stmt = select(MediaRequest)
+    if for_user_id is not None:
+        stmt = stmt.join(RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id).where(
+            RequestSubscriber.user_id == for_user_id
+        )
+        if before_id is not None:
+            stmt = stmt.where(RequestSubscriber.request_id < before_id)
+        stmt = stmt.order_by(RequestSubscriber.request_id.desc())
+    else:
+        if before_id is not None:
+            stmt = stmt.where(MediaRequest.id < before_id)
+        stmt = stmt.order_by(MediaRequest.id.desc())
+    return stmt.limit(limit)
 
 
 class SqlRequestRepository:
@@ -280,6 +317,26 @@ class SqlRequestRepository:
         stmt = select(RequestSubscriber.request_id).where(RequestSubscriber.user_id == user_id)
         return set((await self._session.execute(stmt)).scalars().all())
 
+    async def subscribed_request_ids_among(
+        self, user_id: int, request_ids: Sequence[int]
+    ) -> set[int]:
+        """The subset of ``request_ids`` that ``user_id`` subscribes to (issue #218).
+
+        The PAGE-SCOPED sibling of :meth:`list_subscribed_request_ids`: an
+        admin's paginated history view needs ``can_withdraw`` membership for
+        exactly one page of rows, and the whole-set read is O(all the user's
+        subscriptions) per page. The ``(user_id, request_id)`` predicate pair is
+        served by ``ix_request_subscribers_user_id_request_id``. Empty input is
+        a no-op (no query) returning the empty set.
+        """
+        if not request_ids:
+            return set()
+        stmt = select(RequestSubscriber.request_id).where(
+            RequestSubscriber.user_id == user_id,
+            RequestSubscriber.request_id.in_(request_ids),
+        )
+        return set((await self._session.execute(stmt)).scalars().all())
+
     async def get_fresh(self, request_id: int) -> RequestRecord | None:
         """Like :meth:`get`, but bypasses THIS session's identity-map staleness.
 
@@ -305,6 +362,20 @@ class SqlRequestRepository:
         if status is not None:
             stmt = stmt.where(MediaRequest.status == RequestStatus(status))
         stmt = stmt.order_by(MediaRequest.id)
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
+
+    async def list_page(
+        self, *, for_user_id: int | None, before_id: int | None, limit: int
+    ) -> list[RequestRecord]:
+        """One keyset page of raw request history -- see the port docstring (#218).
+
+        The LIMIT, the ``id < before_id`` keyset predicate, and (for a shared
+        user) the subscriber-visibility JOIN all run in SQL, so at most ``limit``
+        rows are ever materialized regardless of lifetime history size. Newest
+        first (``id DESC``): ``id`` is unique, so the keyset has no ties.
+        """
+        stmt = _page_stmt(for_user_id=for_user_id, before_id=before_id, limit=limit)
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 

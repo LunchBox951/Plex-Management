@@ -1337,11 +1337,20 @@ class RequestResponse(BaseModel):
 
 
 class RequestListResponse(BaseModel):
-    """A list of media requests."""
+    """A list of media requests.
+
+    ``next_cursor`` (issue #218) is the keyset cursor for the FOLLOWING page of
+    raw request history: pass it back as ``GET /requests?limit=...&cursor=...``
+    to continue, ``null`` when this response exhausted the history. Always
+    ``null`` in the legacy unpaginated mode (no ``limit`` supplied), whose
+    folded whole-list behavior is unchanged -- an older client that never sends
+    ``limit`` sees exactly the pre-#218 response plus this ignorable field.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     requests: list[RequestResponse]
+    next_cursor: int | None = None
 
 
 class WithdrawSubscriptionResponse(BaseModel):

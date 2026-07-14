@@ -322,6 +322,28 @@ class RequestRepository(Protocol):
         """List requests, optionally filtered by ``status``."""
         raise NotImplementedError
 
+    async def list_page(
+        self, *, for_user_id: int | None, before_id: int | None, limit: int
+    ) -> list[RequestRecord]:
+        """One keyset page of RAW request history, newest (highest ``id``) first.
+
+        Issue #218 phase 1: the bounded alternative to :meth:`list_by_status`'s
+        full-table materialization. ``before_id`` is the exclusive keyset cursor
+        (only rows with ``id < before_id`` are returned; ``None`` = first page) --
+        ``id`` is unique and monotonically assigned, so newest-first keyset
+        pagination on it is total (no ties) and never uses OFFSET. ``for_user_id``
+        (when set) applies the shared-user subscriber-visibility predicate IN SQL,
+        before any row is materialized -- never loaded-then-filtered in Python.
+        At most ``limit`` rows are materialized (the LIMIT is in the query).
+
+        Pages are raw lifetime rows -- deliberately NOT display-folded: the
+        active-else-newest fold (``request_service.fold_requests_for_display``)
+        needs a whole ``(user, tmdb, media_type)`` group to pick its
+        representative, and a group can span pages. Group-level representative
+        reads are issue #218's phase-2 compact live-state lookup, not this page.
+        """
+        raise NotImplementedError
+
     async def get_many(self, request_ids: Sequence[int]) -> dict[int, RequestRecord]:
         """Batch :meth:`get` over MULTIPLE ids in a single query.
 
