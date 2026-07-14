@@ -834,6 +834,14 @@ export interface paths {
          *     not-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue
          *     to redo an imported title instead.
          *
+         *     ``POST /cancel`` is a HARD cancel of the whole request -- it never silently
+         *     removes just the caller. An admin may always hard-cancel. A non-admin owner
+         *     may too, but ONLY when they are the request's sole participant; with other
+         *     subscribers still attached, this refuses 409 ``has_other_participants``
+         *     (issue #314) -- the collaborative correction path for that case is
+         *     ``DELETE /subscription`` (Withdraw), which hands ownership off instead of
+         *     cancelling co-participants' shared request out from under them.
+         *
          *     qBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a
          *     ``pending``/``searching``/``no_acceptable_release`` request with NO active download
          *     rows is a pure DB settle that never touches the client, so it still works on an
@@ -896,6 +904,40 @@ export interface paths {
          */
         post: operations["report_issue_endpoint_api_v1_requests__request_id__report_issue_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/requests/{request_id}/subscription": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Withdraw Subscription Endpoint
+         * @description Withdraw the caller's OWN subscription from a shared request (issue #314).
+         *
+         *     The collaborative counterpart to ``POST /cancel``: removes only the caller's
+         *     participation, never the whole request out from under other subscribers. If
+         *     OTHER subscribers remain, this is a mere subscription removal (with an
+         *     ownership handoff to the earliest remaining subscriber, if the caller was
+         *     the owner) -- nothing else is touched. If the caller is the LAST
+         *     participant, this settles like a normal cancel (teardown + ``cancelled``)
+         *     for a not-yet-imported request, or simply removes the subscription for an
+         *     already-terminal one. See ``correction_service.withdraw_participant``'s
+         *     docstring for the full matrix.
+         *
+         *     Always ``204 No Content`` on success -- the caller removed themselves, so
+         *     there is nothing of theirs left to render; the row simply drops out of
+         *     their next ``GET /requests``.
+         */
+        delete: operations["withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2416,8 +2458,18 @@ export interface components {
              * @default false
              */
             can_mutate: boolean;
+            /**
+             * Can Withdraw
+             * @default false
+             */
+            can_withdraw: boolean;
             /** Download Progress */
             download_progress?: number | null;
+            /**
+             * Has Other Participants
+             * @default false
+             */
+            has_other_participants: boolean;
             /** Id */
             id: number;
             /**
@@ -2425,6 +2477,11 @@ export interface components {
              * @default false
              */
             is_anime: boolean;
+            /**
+             * Is Owner
+             * @default false
+             */
+            is_owner: boolean;
             /**
              * Keep Forever
              * @default false
@@ -4203,7 +4260,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description Not cancellable in its current state, an import is in progress, or qBittorrent is required but not configured */
+            /** @description Not cancellable in its current state, an import is in progress, a non-admin owner has other participants and must withdraw instead (``has_other_participants``), or qBittorrent is required but not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4307,6 +4364,53 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["ErrorDetail"];
+                };
+            };
+        };
+    };
+    withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request not found, or the caller does not subscribe to it */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description An import is in progress, the last-participant settle hit a not-cancellable TV season, or qBittorrent is required but not configured */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorDetail"] | components["schemas"]["ServiceNotConfiguredErrorDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

@@ -28,6 +28,7 @@ vi.mock('../api/hooks', () => ({
   useSetKeepForever: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -89,6 +90,9 @@ function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
     ...overrides,
   }
 }
@@ -103,6 +107,9 @@ function tvRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
     is_anime: false,
     keep_forever: false,
     can_mutate: false,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
     seasons: [
       { season_number: 1, status: 'available' },
       { season_number: 2, status: 'downloading' },

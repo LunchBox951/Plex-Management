@@ -138,6 +138,9 @@ function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
     is_anime: false,
     keep_forever: false,
     can_mutate: true,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
     seasons: [{ season_number: 2, status: 'failed' }],
     ...overrides,
   }

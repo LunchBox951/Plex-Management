@@ -54,6 +54,21 @@ a terminal):
   data and settle the request (and every tracked season) to the terminal
   ``cancelled`` status. The row is kept for history; nothing is re-grabbed.
 
+Subscriber control (issue #314) adds two collaborative-cancellation verbs on top
+of the two above, for a shared (subscriber-having) request:
+
+* :func:`cancel_request_as_owner` — the non-admin flavor of ``POST /cancel``:
+  hard-cancels via :func:`cancel_request` when the caller is the SOLE
+  participant, otherwise refuses (:class:`HasOtherParticipantsError`) rather
+  than nuking co-participants' shared request.
+
+* :func:`withdraw_participant` — "remove ME, not the request" (``DELETE
+  /subscription``): a mere subscription removal when others remain (with an
+  ownership handoff to the earliest remaining subscriber if the withdrawing
+  user was the owner), or -- when the caller is the LAST participant -- the
+  same :func:`cancel_request` teardown reused verbatim for a not-yet-imported
+  row, else a plain ownerless settle for an already-terminal one.
+
 Auto-grab interplay (ADR-0013): both ``reset_for_research`` variants reset the
 per-scope search backoff (``search_attempts`` / ``next_search_at``) -- a
 report-issue re-search must not inherit the failed culprit's accrued backoff,
@@ -89,6 +104,7 @@ from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
+    audit_service,
     blocklist_service,
     decision_service,
     grab_service,
@@ -121,6 +137,7 @@ __all__ = [
     "DownloadClientRequiredError",
     "DownloadNotFoundError",
     "DownloadsRootUnavailableError",
+    "HasOtherParticipantsError",
     "ImportInProgressError",
     "MediaRootUnavailableError",
     "NotCancellableError",
@@ -130,9 +147,12 @@ __all__ = [
     "ReportSeasonRequiredError",
     "RequestNotFoundError",
     "SeasonNotFoundError",
+    "WithdrawOutcome",
     "cancel_request",
+    "cancel_request_as_owner",
     "relocate_stranded_download",
     "report_issue",
+    "withdraw_participant",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -516,6 +536,25 @@ class NotCancellableError(Exception):
         self.request_id = request_id
         self.status = status
         super().__init__(f"request {request_id} is {status!r}, not a cancellable state")
+
+
+class HasOtherParticipantsError(Exception):
+    """A non-admin owner's ``POST /cancel`` would hard-cancel co-participants too
+    (issue #314, HTTP 409).
+
+    ``POST /cancel`` is a hard cancel of the WHOLE request -- never a silent
+    self-removal. When other subscribers still want this title, the owner's
+    correction path is collaborative self-removal (``DELETE /subscription`` ->
+    :func:`withdraw_participant`), which hands ownership off instead of nuking
+    everyone else's shared request. Raised BEFORE anything is touched.
+    """
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request {request_id} has other subscribers; a non-admin owner must "
+            f"withdraw instead of cancelling the whole request"
+        )
 
 
 class MediaRootUnavailableError(Exception):
@@ -1383,6 +1422,183 @@ async def cancel_request(
     if updated is None:  # pragma: no cover - just operated on this row
         raise RequestNotFoundError(request_id)
     return updated
+
+
+async def cancel_request_as_owner(
+    session: AsyncSession,
+    qbt: DownloadClientPort | None,
+    *,
+    request_id: int,
+    user_id: int,
+) -> RequestRecord:
+    """``POST /cancel`` for a non-admin owner (issue #314).
+
+    ``POST /cancel``'s contract is unchanged for a SOLE participant: cancel the
+    whole request via :func:`cancel_request` (teardown + settle ``cancelled``),
+    keeping the caller's own subscription so they see the ``cancelled`` row as
+    history -- exactly like the admin path.
+
+    But when OTHER subscribers still hold this request, a non-admin owner
+    hard-cancelling the whole row would silently kill a download co-participants
+    still want. Refused UP FRONT (before anything is touched) as
+    :class:`HasOtherParticipantsError` -- the correction path for that case is
+    collaborative self-removal (:func:`withdraw_participant` via
+    ``DELETE /subscription``), which hands ownership off instead.
+    """
+    request_repo = SqlRequestRepository(session)
+    request = await request_repo.get(request_id)
+    if request is None:
+        raise RequestNotFoundError(request_id)
+    subscribers = await request_repo.list_subscribers(request_id)
+    if any(uid != user_id for uid in subscribers):
+        raise HasOtherParticipantsError(request_id)
+    return await cancel_request(session, qbt, request_id=request_id)
+
+
+@dataclass(frozen=True)
+class WithdrawOutcome:
+    """Result of :func:`withdraw_participant` (issue #314).
+
+    ``settled`` tells the caller (the router, choosing an SSE ``reason``)
+    whether this withdrawal was a mere subscription removal (``False`` -- no
+    torrent/file touched) or the final-settle branch that reused
+    :func:`cancel_request`'s teardown (``True``).
+    """
+
+    record: RequestRecord
+    settled: bool
+
+
+async def withdraw_participant(
+    session: AsyncSession,
+    qbt: DownloadClientPort | None,
+    *,
+    request_id: int,
+    user_id: int,
+) -> WithdrawOutcome:
+    """Remove ``user_id``'s own subscription from a shared request (issue #314).
+
+    The collaborative counterpart to ``cancel_request_as_owner``'s hard cancel:
+    a participant (owner or subscriber) may always remove THEMSELVES without
+    touching what remaining participants still want. Three cases, driven by who
+    else remains subscribed and (for the last participant) whether the request
+    is still in a not-yet-imported ("cancellable") state:
+
+    * **Others remain** -- a mere subscription removal. No torrent/file touched;
+      remaining participants keep whatever is in flight. If the withdrawing user
+      was the OWNER (``MediaRequest.user_id``), ownership hands off to the
+      earliest-subscribed remaining participant (:meth:`SqlRequestRepository.
+      list_subscribers`'s ``subscribed_at ASC, user_id ASC`` order) -- their
+      admin-only mutation rights (report/pin/cancel) follow automatically.
+      ``user_id`` is the CURRENT owner functionally already (``claim_if_unowned``
+      mutates it on ownerless-dedup claims), so reassigning it here is
+      consistent with existing behavior, not a new hazard.
+
+    * **Last participant, cancellable status** -- withdrawing would otherwise
+      orphan a live download nobody wants. Reuses :func:`cancel_request`
+      VERBATIM (torrent removal, the TV per-season guard, and its
+      :class:`ImportInProgressError` / :class:`DownloadClientRequiredError`
+      refusals all apply unchanged and propagate uncaught), then removes the
+      subscription and -- if the withdrawing user was the owner -- nulls
+      ``user_id`` out: the row ends ``cancelled``, ownerless, zero subscribers.
+
+    * **Last participant, terminal/settled status** (``available``/``completed``
+      /etc.) -- nothing to tear down. The subscription is removed and, if the
+      withdrawing user was the owner, ``user_id`` is nulled out -- the row
+      becomes ownerless, exactly like automation provenance. The library file
+      is untouched.
+
+    Every branch writes an ``AuditLog`` row (via :mod:`audit_service`) naming
+    the withdrawing user, honesty over silence: a handoff is never a silent
+    mutation of who owns the request -- see the extra ``request.owner_handoff``
+    row the first case writes, naming both the old and new owner.
+    """
+    request_repo = SqlRequestRepository(session)
+    request = await request_repo.get(request_id)
+    if request is None:
+        raise RequestNotFoundError(request_id)
+
+    subscribers = await request_repo.list_subscribers(request_id)
+    others = [uid for uid in subscribers if uid != user_id]
+
+    if others:
+        # Mere removal (+ handoff if the withdrawing user is the current owner).
+        # No teardown: remaining participant(s) keep whatever is in flight.
+        await request_repo.remove_subscriber(request_id, user_id)
+        await audit_service.record(
+            session,
+            actor_user_id=user_id,
+            action_type="request.participant_withdrawn",
+            entity_type="media_request",
+            entity_id=request_id,
+            description=f"user {user_id} withdrew from request {request_id}",
+        )
+        if request.user_id == user_id:
+            new_owner = others[0]  # earliest-subscribed remaining (list order)
+            await request_repo.set_owner(request_id, new_owner)
+            await audit_service.record(
+                session,
+                actor_user_id=new_owner,
+                action_type="request.owner_handoff",
+                entity_type="media_request",
+                entity_id=request_id,
+                old_value={"owner_user_id": user_id},
+                new_value={"owner_user_id": new_owner},
+                description=(
+                    f"ownership of request {request_id} handed off from {user_id} "
+                    f"to {new_owner} on withdrawal"
+                ),
+            )
+        await session.commit()
+        updated = await request_repo.get(request_id)
+        if updated is None:  # pragma: no cover - just operated on this row
+            raise RequestNotFoundError(request_id)
+        return WithdrawOutcome(record=updated, settled=False)
+
+    if request.status in CANCELLABLE_REQUEST_STATUS_VALUES:
+        # Last participant, not-yet-imported: withdrawing would otherwise orphan
+        # a live download nobody wants. cancel_request's own refusals
+        # (ImportInProgressError / DownloadClientRequiredError / the TV
+        # per-season NotCancellableError guard) propagate uncaught -- nothing is
+        # removed below if it raises.
+        await cancel_request(session, qbt, request_id=request_id)
+        await request_repo.remove_subscriber(request_id, user_id)
+        if request.user_id == user_id:
+            await request_repo.set_owner(request_id, None)
+        await audit_service.record(
+            session,
+            actor_user_id=user_id,
+            action_type="request.participant_withdrawn",
+            entity_type="media_request",
+            entity_id=request_id,
+            description=f"user {user_id} withdrew from request {request_id}",
+        )
+        await session.commit()
+        updated = await request_repo.get(request_id)
+        if updated is None:  # pragma: no cover - just operated on this row
+            raise RequestNotFoundError(request_id)
+        return WithdrawOutcome(record=updated, settled=True)
+
+    # Last participant, terminal/settled: nothing to tear down. Remove the
+    # subscription and, if the withdrawing user owned it, null the owner out --
+    # an ownerless row like any other automation-provenance one. The library
+    # file is untouched.
+    await request_repo.remove_subscriber(request_id, user_id)
+    if request.user_id == user_id:
+        await request_repo.set_owner(request_id, None)
+    await audit_service.record(
+        session,
+        actor_user_id=user_id,
+        action_type="request.participant_withdrawn",
+        entity_type="media_request",
+        entity_id=request_id,
+        description=f"user {user_id} withdrew from request {request_id}",
+    )
+    await session.commit()
+    updated = await request_repo.get(request_id)
+    if updated is None:  # pragma: no cover - just operated on this row
+        raise RequestNotFoundError(request_id)
+    return WithdrawOutcome(record=updated, settled=False)
 
 
 async def relocate_stranded_download(

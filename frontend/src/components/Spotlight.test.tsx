@@ -84,6 +84,9 @@ function requestResponse(status: RequestResponse['status'] = 'pending'): Request
     is_anime: false,
     keep_forever: false,
     can_mutate: true,
+    is_owner: false,
+    can_withdraw: false,
+    has_other_participants: false,
   }
 }
 

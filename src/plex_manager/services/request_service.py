@@ -22,6 +22,8 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.ports.library import LibraryPort
@@ -34,6 +36,7 @@ __all__ = [
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
+    "count_subscribers",
     "create_request",
     "create_request_result",
     "fold_requests_for_display",
@@ -41,6 +44,8 @@ __all__ = [
     "is_request_visible_to_user",
     "list_requests",
     "list_requests_for_user",
+    "list_subscribed_request_ids",
+    "list_subscribers",
     "mark_available",
     "mark_completed",
     "mark_no_acceptable_release",
@@ -472,9 +477,12 @@ async def _subscribe_user(
 ) -> RequestRecord:
     """Persist shared visibility for an authenticated requester.
 
-    TODO(issue #58): richer subscriber control (withdrawal, collaborative
-    cancellation, per-user intent) belongs in the shared-request policy, not in
-    watchlist synchronization. Until then subscribers remain view-only.
+    Withdrawal + collaborative cancellation shipped in issue #314
+    (``correction_service.withdraw_participant`` / ``cancel_request_as_owner``,
+    ``DELETE /api/v1/requests/{id}/subscription``). TODO(issue #314): per-user
+    TV season-scope intent (differing season sets under one shared request)
+    remains deferred -- this function still just grants VIEW-and-withdraw
+    visibility, never distinct per-subscriber season intent.
     """
     if user_id is None:
         return record
@@ -1207,6 +1215,34 @@ async def list_requests_for_user(
 async def is_request_visible_to_user(session: AsyncSession, request_id: int, user_id: int) -> bool:
     """Return whether a shared user subscribes to a request."""
     return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
+
+
+async def list_subscribers(session: AsyncSession, request_id: int) -> list[int]:
+    """Return every subscribed user id, earliest-subscribed first (issue #314).
+
+    Drives the ``can_withdraw``/``has_other_participants``/``is_owner`` DTO
+    flags (``web/routers/requests.py:_to_response``) for a single-record
+    response; the list endpoint uses the batched :func:`count_subscribers` and
+    :func:`list_subscribed_request_ids` instead to avoid an N+1.
+    """
+    return await SqlRequestRepository(session).list_subscribers(request_id)
+
+
+async def count_subscribers(session: AsyncSession, request_ids: Sequence[int]) -> dict[int, int]:
+    """Batch subscriber counts per request id (issue #314); ``{}`` on empty input."""
+    return await SqlRequestRepository(session).count_subscribers(request_ids)
+
+
+async def list_subscribed_request_ids(session: AsyncSession, user_id: int) -> set[int]:
+    """Return the set of request ids ``user_id`` subscribes to (issue #314).
+
+    Used to compute ``can_withdraw``/``has_other_participants`` on the requests
+    list endpoint without a per-row query: a non-admin's list is already
+    subscriber-filtered (every returned row is in this set by construction),
+    while an admin's unfiltered view needs the real membership check (an admin
+    is not necessarily a subscriber of every row they can see).
+    """
+    return await SqlRequestRepository(session).list_subscribed_request_ids(user_id)
 
 
 def fold_requests_for_display(

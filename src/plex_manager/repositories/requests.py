@@ -192,6 +192,71 @@ class SqlRequestRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
+    async def remove_subscriber(self, request_id: int, user_id: int) -> None:
+        """Drop one user's subscription (issue #314 withdrawal).
+
+        A plain ``DELETE ... WHERE request_id = ? AND user_id = ?`` -- idempotent
+        (removing an already-absent row is a no-op, mirroring ``add_subscriber``'s
+        idempotent insert), so a double-submitted withdrawal never raises.
+        """
+        await self._session.execute(
+            sa_delete(RequestSubscriber).where(
+                RequestSubscriber.request_id == request_id,
+                RequestSubscriber.user_id == user_id,
+            )
+        )
+
+    async def list_subscribers(self, request_id: int) -> list[int]:
+        """Return every subscribed user id, earliest-subscribed first (issue #314).
+
+        Ordered ``subscribed_at ASC, user_id ASC`` -- the earliest remaining
+        subscriber is the deterministic ownership-handoff target when an owner
+        withdraws (:func:`~plex_manager.services.correction_service.
+        withdraw_participant`); the ``user_id`` tiebreak makes the choice
+        reproducible when two rows share a ``subscribed_at`` (sub-second
+        insert races, or a backend without sub-second timestamp resolution).
+        """
+        stmt = (
+            select(RequestSubscriber.user_id)
+            .where(RequestSubscriber.request_id == request_id)
+            .order_by(RequestSubscriber.subscribed_at.asc(), RequestSubscriber.user_id.asc())
+        )
+        return list((await self._session.execute(stmt)).scalars().all())
+
+    async def count_subscribers(self, request_ids: Sequence[int]) -> dict[int, int]:
+        """Batch subscriber counts per request id (issue #314), avoiding an N+1.
+
+        Used by the requests-list DTO mapping to derive ``has_other_participants``
+        for every row in one query. Empty input is a no-op returning ``{}``; a
+        request id with zero subscribers is simply ABSENT from the mapping (never
+        a fabricated ``0``), mirroring :meth:`get_many`'s "absent, not empty"
+        contract.
+        """
+        if not request_ids:
+            return {}
+        stmt = (
+            select(RequestSubscriber.request_id, func.count(RequestSubscriber.user_id))
+            .where(RequestSubscriber.request_id.in_(request_ids))
+            .group_by(RequestSubscriber.request_id)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return {row[0]: row[1] for row in rows}
+
+    async def set_owner(self, request_id: int, user_id: int | None) -> None:
+        """Unconditionally set ``MediaRequest.user_id`` (issue #314 handoff/null-out).
+
+        Distinct from :meth:`claim_if_unowned`, which only ever moves an
+        ownerless row TO an owner: this always writes, including reassigning an
+        ALREADY-owned row to a different owner (withdrawal handoff to the
+        earliest remaining subscriber) or clearing it back to ``None`` (the
+        withdrawing owner was the last participant on a settled/terminal row).
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.user_id = user_id
+        await self._session.flush()
+
     async def list_for_user(self, user_id: int, status: str | None = None) -> list[RequestRecord]:
         """Return requests visible through subscriber membership."""
         stmt = (
@@ -204,6 +269,16 @@ class SqlRequestRepository:
             stmt = stmt.where(MediaRequest.status == RequestStatus(status))
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
+
+    async def list_subscribed_request_ids(self, user_id: int) -> set[int]:
+        """Return the bare set of request ids ``user_id`` subscribes to (issue #314).
+
+        The id-only analogue of :meth:`list_for_user`, for callers that only
+        need SET MEMBERSHIP (e.g. deriving ``can_withdraw`` for an admin's
+        unfiltered requests list) rather than hydrated records.
+        """
+        stmt = select(RequestSubscriber.request_id).where(RequestSubscriber.user_id == user_id)
+        return set((await self._session.execute(stmt)).scalars().all())
 
     async def get_fresh(self, request_id: int) -> RequestRecord | None:
         """Like :meth:`get`, but bypasses THIS session's identity-map staleness.

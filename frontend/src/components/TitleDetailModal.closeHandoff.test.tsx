@@ -13,6 +13,7 @@ import {
   useRequests,
   useSearchPreview,
   useSetKeepForever,
+  useWithdrawSubscription,
 } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
@@ -41,6 +42,7 @@ vi.mock('../api/hooks', () => ({
   useSetKeepForever: vi.fn(),
   useReportIssue: vi.fn(),
   useCancelRequest: vi.fn(),
+  useWithdrawSubscription: vi.fn(),
 }))
 
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -67,6 +69,7 @@ beforeEach(() => {
   ;(useSetKeepForever as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useReportIssue as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useCancelRequest as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
+  ;(useWithdrawSubscription as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { requests: [] } })
   ;(useQueue as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { queue: [] } });
 })
