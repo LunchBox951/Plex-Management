@@ -39,9 +39,8 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
 
-      - name: Validate inputs and promote
+      - name: Validate inputs
         env:
-          IMAGE: ${{ steps.img.outputs.name }}
           SOURCE_TAG: ${{ inputs.source_tag }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -56,7 +55,6 @@ jobs:
             exit 1
           fi
 
-          tags=(--tag "${IMAGE}:stable")
           if [ -n "$VERSION" ]; then
             if [[ "$VERSION" == *[$'\r\n\t']* ]]; then
               echo "::error::Invalid version: contains control characters"
@@ -66,6 +64,65 @@ jobs:
               echo "::error::Invalid version (expected x.y.z): '$VERSION'"
               exit 1
             fi
+          fi
+
+      # Fail-closed version gate (#231 / #114): the promoted edge-<sha> can predate
+      # the current main tree, so this reads the __version__ actually BAKED INTO
+      # that image (org.opencontainers.image.version, stamped by container.yml)
+      # rather than trusting the checked-out repo. Only runs when the operator
+      # supplied a version — a blank version (":stable" re-tag only, no x.y.z
+      # bump) has nothing to compare against and is unchanged legacy behavior.
+      # Every failure path here must be a hard failure, never a silent pass:
+      #   - imagetools inspect errors (bad tag, registry/network issue, no
+      #     provenance-index support) -> non-zero exit, caught below.
+      #   - label present but empty, or absent entirely -> empty string, caught
+      #     by the explicit blank check (Go templates render a missing map key
+      #     as "" with exit 0, so the exit-code check alone is not enough).
+      - name: "Gate: promoted version must match the image's baked label"
+        if: inputs.version != ''
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "Inspecting ${IMAGE}:${SOURCE_TAG} for org.opencontainers.image.version ..."
+
+          # NOTE: build-push-action attaches provenance by default, which wraps
+          # even this single-platform image in an OCI manifest INDEX (an
+          # attestation manifest sits alongside the real linux/amd64 one, tagged
+          # platform "unknown/unknown"). `--format '{{.Config.Labels}}'` errors
+          # on that shape ("can't evaluate field Config in type
+          # imagetools.tplInput") because the index has no single Config.
+          # `.Image` is buildx's platform-resolved single-image view and is what
+          # correctly skips the attestation manifest — verified against the real
+          # ghcr.io/lunchbox951/plex-manager:edge image (see PR description).
+          if ! baked_version=$(docker buildx imagetools inspect "${IMAGE}:${SOURCE_TAG}" \
+              --format '{{index .Image.Config.Labels "org.opencontainers.image.version"}}'); then
+            echo "::error::Could not read the manifest for ${IMAGE}:${SOURCE_TAG} (unreadable image/registry error) — refusing to promote. See the docker output above for details."
+            exit 1
+          fi
+
+          if [ -z "$baked_version" ]; then
+            echo "::error::${IMAGE}:${SOURCE_TAG} has no org.opencontainers.image.version label (or it is empty) — refusing to promote. Rebuild :edge from a commit that includes the OCI-label gate (container.yml) before retrying."
+            exit 1
+          fi
+
+          if [ "$baked_version" != "$VERSION" ]; then
+            echo "::error::Version mismatch: promoting version '${VERSION}' but ${IMAGE}:${SOURCE_TAG} was built with __version__ '${baked_version}'. Promote the edge-<sha> actually built from the commit where src/plex_manager/__init__.py was bumped to ${VERSION}, or correct the version input."
+            exit 1
+          fi
+
+          echo "OK: ${IMAGE}:${SOURCE_TAG} is baked with version '${baked_version}', matches the operator-supplied input."
+
+      - name: Promote (re-tag by reference, no rebuild)
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          tags=(--tag "${IMAGE}:stable")
+          if [ -n "$VERSION" ]; then
             major_minor="${VERSION%.*}"
             tags+=(--tag "${IMAGE}:${VERSION}" --tag "${IMAGE}:${major_minor}")
           fi

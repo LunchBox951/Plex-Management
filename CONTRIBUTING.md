@@ -146,12 +146,14 @@ merge — only when actually preparing a promotion):
 4. Merge to `main`. CI builds `:edge` and the immutable `:edge-<sha>`; let the
    canary host prove the build.
 5. Promote: run the **Promote to stable** workflow with that exact
-   `edge-<sha>` and the same `x.y.z` from step 2. **The `x.y.z` you promote
-   must equal the `__version__` baked into that `edge-<sha>` build** — until an
-   automated image-label gate exists (tracked as a follow-up to #114), this is
-   a human checklist step, not an enforced one. Getting steps 2–5 out of order
-   is exactly how the app-reported version and the release tag end up silently
-   disagreeing.
+   `edge-<sha>` and the same `x.y.z` from step 2. This is enforced, not just a
+   human checklist step (#231): the workflow reads the
+   `org.opencontainers.image.version` OCI label baked into that `edge-<sha>`
+   image at build time (container.yml stamps it from `__version__`) and fails
+   the run before re-tagging if it does not exactly match the `version` input
+   you supply — including when the label is missing or unreadable. Getting
+   steps 2–5 out of order is exactly how the app-reported version and the
+   release tag end up silently disagreeing; the gate exists to catch that.
 6. Remember: promotion re-tags an already-built image without rebuilding it, so
    the promoted image reports whatever `__version__` was baked in at *its*
    build time — bump the version (step 2) and merge it to `main` **before**

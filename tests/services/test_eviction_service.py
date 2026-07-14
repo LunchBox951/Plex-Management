@@ -471,6 +471,218 @@ async def test_assemble_candidates_sizes_each_distinct_path_once(
     assert by_title["Twin A"].size_percent == by_title["Twin B"].size_percent
 
 
+async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_movie_rows(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #304: given a ``grace_cutoff``, a row ``domain.eviction.is_evictable``
+    already rules out (unwatched, pinned, in-flight, or still within grace) must
+    never pay for the ``os.walk`` size lookup -- but it still appears in the
+    RETURNED raw superset (never dropped, per ``assemble_candidates``'s
+    contract), reporting the honest ``size_percent=0.0`` "unknown" fallback."""
+    eligible_path = _movie_file(tmp_path, "Eligible.mkv")
+    unwatched_path = _movie_file(tmp_path, "Unwatched.mkv")
+    pinned_path = _movie_file(tmp_path, "Pinned.mkv")
+    recent_path = _movie_file(tmp_path, "Recent.mkv")
+    in_flight_path = _movie_file(tmp_path, "InFlight.mkv")
+
+    await _movie(sessionmaker_, tmdb_id=1001, title="Eligible", library_path=eligible_path)
+    await _movie(sessionmaker_, tmdb_id=1002, title="Unwatched", library_path=unwatched_path)
+    await _movie(
+        sessionmaker_, tmdb_id=1003, title="Pinned", library_path=pinned_path, keep_forever=True
+    )
+    await _movie(sessionmaker_, tmdb_id=1004, title="Recent", library_path=recent_path)
+    in_flight_id = await _movie(
+        sessionmaker_, tmdb_id=1005, title="InFlight", library_path=in_flight_path
+    )
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="in-flight",
+                status="downloading",
+                media_request_id=in_flight_id,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={
+            (1001, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (1002, "movie", None): WatchState(watched=False, last_viewed_at=None),
+            (1003, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (1004, "movie", None): WatchState(watched=True, last_viewed_at=_RECENT),
+            (1005, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+
+    walked: list[str | None] = []
+    real_sized_path = eviction_service._sized_path  # pyright: ignore[reportPrivateUsage]
+
+    async def _spying_sized_path(
+        library_path: str | None, cache: dict[str, int | None]
+    ) -> int | None:
+        walked.append(library_path)
+        return await real_sized_path(library_path, cache)
+
+    monkeypatch.setattr(eviction_service, "_sized_path", _spying_sized_path)
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(tmp_path / "movies"),
+            root_total_bytes=1_000_000,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    # Only the fully-eligible row ever pays for the walk.
+    assert walked == [eligible_path]
+
+    by_title = {c.title: c for c in candidates}
+    # Every row still appears in the RAW superset -- never dropped by the
+    # walk-skip optimization.
+    assert set(by_title) == {"Eligible", "Unwatched", "Pinned", "Recent", "InFlight"}
+    assert by_title["Eligible"].size_percent == pytest.approx(1024 / 1_000_000 * 100.0)
+    # Ineligible rows report the same honest "unknown size" fallback a missing
+    # breadcrumb already uses, never a fabricated guess and never a real walk.
+    assert by_title["Unwatched"].size_percent == 0.0
+    assert by_title["Pinned"].size_percent == 0.0
+    assert by_title["Recent"].size_percent == 0.0
+    assert by_title["InFlight"].size_percent == 0.0
+
+
+async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_season_rows(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The TV twin of the movie walk-skip test above: an ineligible season row
+    (unwatched, parent-pinned, in-flight, or still within grace) never pays for
+    the walk but still appears in the returned superset."""
+
+    def _season_path(show: str, season: int) -> str:
+        path = tmp_path / "tv" / show / f"Season 0{season}"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "e01.mkv").write_bytes(b"0" * 2048)
+        return str(path)
+
+    eligible_path = _season_path("Eligible Show", 1)
+    unwatched_path = _season_path("Unwatched Show", 1)
+    pinned_path = _season_path("Pinned Show", 1)
+    recent_path = _season_path("Recent Show", 1)
+    in_flight_path = _season_path("InFlight Show", 1)
+
+    await _show_with_seasons(
+        sessionmaker_, tmdb_id=2001, title="Eligible Show", seasons={1: eligible_path}
+    )
+    await _show_with_seasons(
+        sessionmaker_, tmdb_id=2002, title="Unwatched Show", seasons={1: unwatched_path}
+    )
+    await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=2003,
+        title="Pinned Show",
+        seasons={1: pinned_path},
+        keep_forever=True,
+    )
+    await _show_with_seasons(
+        sessionmaker_, tmdb_id=2004, title="Recent Show", seasons={1: recent_path}
+    )
+    in_flight_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=2005, title="InFlight Show", seasons={1: in_flight_path}
+    )
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="in-flight-season",
+                status="downloading",
+                media_request_id=in_flight_show_id,
+                season=1,
+                media_type=MediaType.tv,
+            )
+        )
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={
+            (2001, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+            (2002, "tv", 1): WatchState(watched=False, last_viewed_at=None),
+            (2003, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+            (2004, "tv", 1): WatchState(watched=True, last_viewed_at=_RECENT),
+            (2005, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+
+    walked: list[str | None] = []
+    real_sized_path = eviction_service._sized_path  # pyright: ignore[reportPrivateUsage]
+
+    async def _spying_sized_path(
+        library_path: str | None, cache: dict[str, int | None]
+    ) -> int | None:
+        walked.append(library_path)
+        return await real_sized_path(library_path, cache)
+
+    monkeypatch.setattr(eviction_service, "_sized_path", _spying_sized_path)
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="tv",
+            root_path=str(tmp_path / "tv"),
+            root_total_bytes=1_000_000,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    assert walked == [eligible_path]
+
+    by_title = {c.title: c for c in candidates}
+    assert set(by_title) == {
+        "Eligible Show",
+        "Unwatched Show",
+        "Pinned Show",
+        "Recent Show",
+        "InFlight Show",
+    }
+    assert by_title["Eligible Show"].size_percent == pytest.approx(2048 / 1_000_000 * 100.0)
+    assert by_title["Unwatched Show"].size_percent == 0.0
+    assert by_title["Pinned Show"].size_percent == 0.0
+    assert by_title["Recent Show"].size_percent == 0.0
+    assert by_title["InFlight Show"].size_percent == 0.0
+
+
+async def test_assemble_candidates_walks_every_row_when_grace_cutoff_is_omitted(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backward-compat default: with no ``grace_cutoff`` (the default), every
+    row is walked unconditionally -- exactly the pre-#304 behavior -- since the
+    caller has not opted into the pre-filter optimization."""
+    unwatched_path = _movie_file(tmp_path, "Unwatched.mkv")
+    await _movie(sessionmaker_, tmdb_id=1101, title="Unwatched", library_path=unwatched_path)
+    library = FakeLibrary()  # default: unwatched, no recorded view
+
+    walked: list[str | None] = []
+    real_sized_path = eviction_service._sized_path  # pyright: ignore[reportPrivateUsage]
+
+    async def _spying_sized_path(
+        library_path: str | None, cache: dict[str, int | None]
+    ) -> int | None:
+        walked.append(library_path)
+        return await real_sized_path(library_path, cache)
+
+    monkeypatch.setattr(eviction_service, "_sized_path", _spying_sized_path)
+
+    async with sessionmaker_() as session:
+        await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="movie",
+            root_path=str(tmp_path / "movies"),
+            root_total_bytes=1_000_000,
+        )
+
+    assert walked == [unwatched_path]
+
+
 async def _capture_statements_touching(
     engine: AsyncEngine, needles: tuple[str, ...]
 ) -> tuple[list[str], Callable[[], None]]:

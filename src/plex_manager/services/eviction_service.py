@@ -60,7 +60,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
@@ -68,6 +68,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.domain.eviction import (
     EvictionCandidate,
+    is_evictable,
     pressure_relieved,
     rank_eviction_candidates,
     select_evictions,
@@ -298,6 +299,7 @@ async def _movie_candidates(
     root_total_bytes: int,
     root_path: str,
     all_roots: Sequence[str],
+    grace_cutoff: datetime | None = None,
 ) -> list[tuple[EvictionCandidate, _Pending]]:
     """Every ``available`` movie request OWNED by ``root_path`` as an
     :class:`EvictionCandidate`.
@@ -308,6 +310,19 @@ async def _movie_candidates(
     ``library_path`` is not owned by ``root_path`` — under a different configured
     root, a NESTED more-specific root, or no root at all — are skipped (see
     :func:`_owned_by_root`).
+
+    ``grace_cutoff`` (issue #304), when given, lets this skip the ``os.walk``
+    disk-size lookup for a row that :func:`~plex_manager.domain.eviction.
+    is_evictable` (the SAME pure predicate ``rank_eviction_candidates``/
+    ``select_evictions`` apply downstream, reused rather than re-derived so the
+    two can never drift) already says can never be evicted at this cutoff --
+    pinned, in-flight, unwatched, or still within grace. The row is still
+    returned (the RAW-superset contract every caller of :func:`assemble_candidates`
+    depends on is never narrowed here — see its docstring), just with the honest
+    ``size_percent=0.0`` fallback the module already uses for an unknown size,
+    never a real walk. ``None`` (the default) walks every row exactly like
+    before this optimization existed -- a caller with no grace policy in hand
+    yet (or a test proving the walk itself) gets the old, unconditional behavior.
     """
     request_repo = SqlRequestRepository(session)
     download_repo = SqlDownloadRepository(session)
@@ -336,13 +351,11 @@ async def _movie_candidates(
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row, watch in zip(rows, watch_states, strict=True):
         in_flight = (row.id, None) in active_keys
-        size_bytes = await _sized_path(row.library_path, size_cache)
-        size_percent = (
-            (size_bytes / root_total_bytes) * 100.0
-            if size_bytes is not None and root_total_bytes > 0
-            else 0.0
-        )
-        candidate = EvictionCandidate(
+        # Every field eligibility depends on is resolved BEFORE the size walk
+        # (issue #304): size never enters the predicate, so a candidate built
+        # with the honest ``size_percent=0.0`` placeholder is evaluated exactly
+        # like the real one would be.
+        prospective = EvictionCandidate(
             request_id=row.id,
             media_type="movie",
             title=row.title,
@@ -354,8 +367,19 @@ async def _movie_candidates(
             watchlisted=await watchlist_service.is_watchlisted(session, row.tmdb_id, "movie"),
             in_flight=in_flight,
             library_path=row.library_path,
-            size_percent=size_percent,
+            size_percent=0.0,
         )
+        if grace_cutoff is not None and not is_evictable(prospective, grace_cutoff):
+            size_bytes = None
+            candidate = prospective
+        else:
+            size_bytes = await _sized_path(row.library_path, size_cache)
+            size_percent = (
+                (size_bytes / root_total_bytes) * 100.0
+                if size_bytes is not None and root_total_bytes > 0
+                else 0.0
+            )
+            candidate = replace(prospective, size_percent=size_percent)
         pending = _MoviePending(media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=size_bytes)
         pairs.append((candidate, pending))
     return pairs
@@ -367,6 +391,7 @@ async def _season_candidates(
     root_total_bytes: int,
     root_path: str,
     all_roots: Sequence[str],
+    grace_cutoff: datetime | None = None,
 ) -> list[tuple[EvictionCandidate, _Pending]]:
     """Every ``available`` TV season OWNED by ``root_path`` as an
     :class:`EvictionCandidate`.
@@ -378,6 +403,11 @@ async def _season_candidates(
     call (issue #137/#138) rather than one :meth:`get` per distinct show. Season
     rows whose ``library_path`` is not owned by ``root_path`` (see
     :func:`_owned_by_root`) are skipped.
+
+    ``grace_cutoff`` (issue #304): see :func:`_movie_candidates`'s twin
+    docstring paragraph -- identical walk-skip optimization, same
+    :func:`~plex_manager.domain.eviction.is_evictable` predicate, same RAW
+    superset contract.
     """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -420,13 +450,7 @@ async def _season_candidates(
         if parent is None:  # pragma: no cover - the FK guarantees the parent exists
             continue
         in_flight = (row.media_request_id, row.season_number) in active_keys
-        size_bytes = await _sized_path(row.library_path, size_cache)
-        size_percent = (
-            (size_bytes / root_total_bytes) * 100.0
-            if size_bytes is not None and root_total_bytes > 0
-            else 0.0
-        )
-        candidate = EvictionCandidate(
+        prospective = EvictionCandidate(
             request_id=row.id,
             media_type="tv",
             title=parent.title,
@@ -438,8 +462,19 @@ async def _season_candidates(
             watchlisted=await watchlist_service.is_watchlisted(session, row.tmdb_id, "tv"),
             in_flight=in_flight,
             library_path=row.library_path,
-            size_percent=size_percent,
+            size_percent=0.0,
         )
+        if grace_cutoff is not None and not is_evictable(prospective, grace_cutoff):
+            size_bytes = None
+            candidate = prospective
+        else:
+            size_bytes = await _sized_path(row.library_path, size_cache)
+            size_percent = (
+                (size_bytes / root_total_bytes) * 100.0
+                if size_bytes is not None and root_total_bytes > 0
+                else 0.0
+            )
+            candidate = replace(prospective, size_percent=size_percent)
         pending = _SeasonPending(
             media_request_id=row.media_request_id,
             season_request_id=row.id,
@@ -1741,17 +1776,30 @@ async def assemble_candidates(
     root_path: str,
     root_total_bytes: int,
     all_roots: Sequence[str] | None = None,
+    grace_cutoff: datetime | None = None,
 ) -> list[EvictionCandidate]:
     """Assemble every ``available`` movie / TV-season under ``root_path`` into a
     RAW :class:`~plex_manager.domain.eviction.EvictionCandidate` list -- fresh
-    Plex watch state + a walked on-disk size per row -- with NO grace or
-    eligibility filtering applied. The caller decides what to filter.
+    Plex watch state + an on-disk size per row -- with NO grace or eligibility
+    filtering applied to the RETURNED set. The caller decides what to filter.
 
     This is the raw superset behind BOTH :func:`preview_candidates` (which simply
     ranks it) and the retention-telemetry sweep (which needs the ranked /
     would-evict subsets AND every row with any recorded view -- including a
     started-but-unfinished season the eligibility filter drops -- from one read).
     Read-only: never deletes, never flips a status, never writes history.
+
+    ``grace_cutoff`` (issue #304) is an ORTHOGONAL, purely-internal walk-skip
+    optimization -- NOT a filter on the returned list. When given, a row that
+    :func:`~plex_manager.domain.eviction.is_evictable` already rules out at this
+    cutoff (pinned, in-flight, unwatched, or still within grace) skips the
+    expensive ``os.walk`` size lookup and reports the honest ``size_percent=0.0``
+    fallback instead; it still appears in the returned superset exactly like
+    every other row (see :func:`_movie_candidates`/:func:`_season_candidates`),
+    so the retention-telemetry time-to-watch dataset -- which explicitly wants
+    started-but-unfinished/unwatched/pinned rows -- is never silently narrowed.
+    ``None`` (the default) walks every row unconditionally, exactly like before
+    this optimization existed.
 
     ``root_total_bytes`` is threaded in (rather than read here) so each
     candidate's ``size_percent`` is measured against the right root capacity from
@@ -1771,9 +1819,11 @@ async def assemble_candidates(
     """
     scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
     pairs = (
-        await _movie_candidates(session, library, root_total_bytes, root_path, scope)
+        await _movie_candidates(session, library, root_total_bytes, root_path, scope, grace_cutoff)
         if media_type == "movie"
-        else await _season_candidates(session, library, root_total_bytes, root_path, scope)
+        else await _season_candidates(
+            session, library, root_total_bytes, root_path, scope, grace_cutoff
+        )
     )
     return [candidate for candidate, _pending in pairs]
 
@@ -1812,6 +1862,11 @@ async def preview_candidates(
         )
         return []
 
+    # Computed BEFORE assembly (issue #304) so it can be threaded straight into
+    # ``assemble_candidates``'s walk-skip optimization -- this is the exact
+    # cutoff ``rank_eviction_candidates`` below re-applies, so a row the walk
+    # skipped is always exactly a row this ranking excludes anyway.
+    grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     candidates = await assemble_candidates(
         session=session,
         library=library,
@@ -1819,8 +1874,8 @@ async def preview_candidates(
         root_path=root_path,
         root_total_bytes=disk.total_bytes,
         all_roots=all_roots,
+        grace_cutoff=grace_cutoff,
     )
-    grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     return rank_eviction_candidates(candidates, grace_cutoff)
 
 
@@ -1969,17 +2024,24 @@ async def _run_sweep(
         # pressure -- the common case. A proactive sweep has no pressure gate, so
         # this check is skipped for it (it always needs the full candidate set).
         return []
+    # Computed BEFORE assembly (issue #304) so ``_movie_candidates``/
+    # ``_season_candidates`` can skip the ``os.walk`` size lookup for a row
+    # already ineligible at this exact cutoff -- reused unchanged below for the
+    # real ranking/selection, so a walk-skipped row is always exactly a row
+    # ``rank_eviction_candidates``/``select_evictions`` would exclude anyway.
+    grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
     pairs = (
-        await _movie_candidates(session, library, disk.total_bytes, root_path, scope)
+        await _movie_candidates(session, library, disk.total_bytes, root_path, scope, grace_cutoff)
         if media_type == "movie"
-        else await _season_candidates(session, library, disk.total_bytes, root_path, scope)
+        else await _season_candidates(
+            session, library, disk.total_bytes, root_path, scope, grace_cutoff
+        )
     )
     if not pairs:
         return []
 
     pending_by_id: dict[int, _Pending] = {id(candidate): pending for candidate, pending in pairs}
     candidates = [candidate for candidate, _pending in pairs]
-    grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
 
     # The full stalest-first ranking, computed once: `select_evictions`'s result
     # is always a PREFIX of this same ordering (it ranks internally via this
