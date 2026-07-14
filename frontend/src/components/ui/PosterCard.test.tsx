@@ -115,6 +115,40 @@ describe('PosterCard badge slot placement', () => {
   })
 })
 
+describe('PosterCard artwork fallback chain (issue #66)', () => {
+  it('prefers the Plex-native poster, then falls back to TMDB, then the gradient', () => {
+    const { container } = render(
+      <PosterCard
+        title="Owned"
+        plexPosterUrl="/api/v1/artwork/plex/movie/603/poster"
+        posterUrl="https://image.tmdb.org/t/p/w500/tmdb.jpg"
+        seed={7}
+      />,
+    )
+
+    // Starts on the Plex proxy URL.
+    const img = () => container.querySelector('img')
+    expect(img()?.getAttribute('src')).toBe('/api/v1/artwork/plex/movie/603/poster')
+
+    // Plex art fails to load -> falls back to the TMDB poster.
+    fireEvent.error(img()!)
+    expect(img()?.getAttribute('src')).toBe('https://image.tmdb.org/t/p/w500/tmdb.jpg')
+
+    // TMDB art also fails -> no <img> at all, the gradient placeholder shows.
+    fireEvent.error(img()!)
+    expect(img()).toBeNull()
+  })
+
+  it('uses the TMDB poster when there is no Plex-native art', () => {
+    const { container } = render(
+      <PosterCard title="Not owned" posterUrl="https://image.tmdb.org/t/p/w500/x.jpg" />,
+    )
+    expect(container.querySelector('img')?.getAttribute('src')).toBe(
+      'https://image.tmdb.org/t/p/w500/x.jpg',
+    )
+  })
+})
+
 describe('PosterCard details trigger label', () => {
   it('includes the year in the aria-label when provided', () => {
     render(<PosterCard title="Dune" year={2021} onClick={() => {}} />)

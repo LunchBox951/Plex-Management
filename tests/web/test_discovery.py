@@ -102,10 +102,38 @@ async def test_search_returns_results(
             "overview": None,
             "poster_url": None,
             "backdrop_url": None,
+            # Plex not configured -> no native-artwork proxy links (issue #66).
+            "plex_poster_url": None,
+            "plex_backdrop_url": None,
             # Plex not configured + no request row -> an honest "none" (no fake presence).
             "library_state": "none",
         }
     ]
+
+
+async def test_search_emits_plex_artwork_urls_only_for_in_library_titles(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    # issue #66: a title present in Plex gets backend artwork-proxy links (token
+    # stays server-side); a not-owned title leaves them None -> TMDB art.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    tmdb = FakeTmdb(
+        results=[
+            MediaSearchResult(tmdb_id=603, media_type="movie", title="Owned", year=1999),
+            MediaSearchResult(tmdb_id=604, media_type="movie", title="Not Owned", year=2003),
+        ]
+    )
+    override_adapters(app, tmdb=tmdb, library=FakeLibrary(available={603}))
+
+    response = await client.get(
+        "/api/v1/discover/search", params={"query": "matrix"}, headers=_HEADERS
+    )
+    assert response.status_code == 200
+    by_id = {r["tmdb_id"]: r for r in response.json()["results"]}
+    assert by_id[603]["plex_poster_url"] == "/api/v1/artwork/plex/movie/603/poster"
+    assert by_id[603]["plex_backdrop_url"] == "/api/v1/artwork/plex/movie/603/background"
+    assert by_id[604]["plex_poster_url"] is None
+    assert by_id[604]["plex_backdrop_url"] is None
 
 
 async def test_discovery_requires_api_key(client: httpx.AsyncClient, seed: SeedFn) -> None:
