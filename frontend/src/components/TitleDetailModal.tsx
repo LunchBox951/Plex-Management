@@ -265,7 +265,7 @@ function withdrawDialogCopy(flags: {
   hasOtherParticipants: boolean
   willCancel: boolean
   isSettled: boolean
-}): { title: string; body: string } {
+}): { title: string; body: string; refusal?: boolean } {
   if (flags.willCancel) {
     return {
       title: 'Withdraw and cancel request?',
@@ -288,10 +288,14 @@ function withdrawDialogCopy(flags: {
     // (`import_blocked`/`partially_available`/`completed`, or a cancellable TV
     // rollup whose season already imported): the backend REFUSES with a 409
     // (`withdrawal_blocked_active_request` / `not_cancellable`) and removes
-    // nothing (#349). Say so honestly instead of promising a benign removal.
+    // nothing (#349). Say so honestly instead of promising a benign removal --
+    // and, since the refusal is KNOWN up front, offer no confirm action at all
+    // (`refusal`): a dialog that says "can't" while wiring a Withdraw button
+    // would just round-trip to the 409 error toast.
     return {
       title: "Can't withdraw yet",
       body: "This request is still active and can't be withdrawn until it finishes or is resolved. Try again once it settles.",
+      refusal: true,
     }
   }
   return {
@@ -997,10 +1001,13 @@ export function TitleDetailModal({
     if (!withdrawFor) return
     try {
       const outcome = await withdrawSubscription.mutateAsync(withdrawFor.requestId)
+      // `settled: true` only means the last-participant cancel branch ran --
+      // cancel_request settles a pending/searching/no_acceptable_release/
+      // waiting_for_air_date row purely in the DB with no torrent to remove, so
+      // claiming "download removed" would lie in that common case. The neutral
+      // "Request cancelled" is true whether or not a download existed.
       toast({
-        title: outcome.settled
-          ? 'Request cancelled and download removed'
-          : 'Removed from your requests',
+        title: outcome.settled ? 'Request cancelled' : 'Removed from your requests',
         intent: 'success',
       })
       setWithdrawFor(null)
@@ -1786,22 +1793,32 @@ export function TitleDetailModal({
           <p aria-hidden="true" className="mb-5 text-sm text-muted">
             {withdrawCopy.body}
           </p>
-          <div className="flex justify-end gap-3">
-            <Button
-              variant="secondary"
-              onClick={() => setWithdrawFor(null)}
-              disabled={withdrawSubscription.isPending}
-            >
-              Keep it
-            </Button>
-            <Button
-              variant="danger"
-              loading={withdrawSubscription.isPending}
-              onClick={() => void runWithdraw()}
-            >
-              Withdraw
-            </Button>
-          </div>
+          {withdrawCopy.refusal ? (
+            // Known-refusal case (#349): the backend will 409 this withdrawal, so
+            // the dialog is informational only -- one dismiss action, no mutation.
+            <div className="flex justify-end">
+              <Button variant="secondary" onClick={() => setWithdrawFor(null)}>
+                OK
+              </Button>
+            </div>
+          ) : (
+            <div className="flex justify-end gap-3">
+              <Button
+                variant="secondary"
+                onClick={() => setWithdrawFor(null)}
+                disabled={withdrawSubscription.isPending}
+              >
+                Keep it
+              </Button>
+              <Button
+                variant="danger"
+                loading={withdrawSubscription.isPending}
+                onClick={() => void runWithdraw()}
+              >
+                Withdraw
+              </Button>
+            </div>
+          )}
         </Dialog>
       ) : null}
 

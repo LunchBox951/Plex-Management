@@ -1522,12 +1522,67 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
         ],
       },
     })
+    const withdrawMock = idle()
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
     expect(screen.getByText("Can't withdraw yet")).toBeInTheDocument()
     expectWarningVisible(/still active and can't be withdrawn/i)
     expect(screen.queryByText('Remove from your requests?')).not.toBeInTheDocument()
     expect(screen.queryByText('Withdraw and cancel request?')).not.toBeInTheDocument()
+    // Known refusal -> dismiss-only: no confirm action is offered (the only
+    // remaining "Withdraw" button is the page-level opener, not a dialog confirm),
+    // and dismissing performs no mutation.
+    expect(screen.getAllByRole('button', { name: /^withdraw$/i })).toHaveLength(1)
+    const ok = screen.getByRole('button', { name: /^ok$/i })
+    fireEvent.click(ok)
+    expect(withdrawMock.mutateAsync).not.toHaveBeenCalled()
+    expect(screen.queryByText("Can't withdraw yet")).not.toBeInTheDocument()
+  })
+
+  it('surfaces a backend 409 refusal as the error toast, never a false success', async () => {
+    // The pre-action dialog cannot predict every backend refusal (e.g.
+    // import_in_progress / service_not_configured on a destructive-looking row).
+    // Confirming a withdrawal the backend then 409s must produce the "Withdraw
+    // failed" ERROR toast -- and no success toast of either wording.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            id: 33,
+            status: 'downloading',
+            can_mutate: false,
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = {
+      mutateAsync: vi
+        .fn()
+        .mockRejectedValue(Object.assign(new Error('import_in_progress'), { status: 409 })),
+      isPending: false,
+    }
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    const confirms = screen.getAllByRole('button', { name: /withdraw/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(33))
+    await waitFor(() =>
+      expect(toastState.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Withdraw failed', intent: 'error' }),
+      ),
+    )
+    expect(toastState.toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ intent: 'success' }),
+    )
   })
 
   it('keys the success toast off the server outcome, not the click-time snapshot (#351)', async () => {
@@ -1562,7 +1617,10 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(31))
     expect(toastState.toast).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: 'Request cancelled and download removed',
+        // Neutral teardown copy: `settled: true` proves the cancel branch ran,
+        // NOT that a torrent existed (pending/searching rows settle purely in
+        // the DB) -- so the toast never claims a download removal.
+        title: 'Request cancelled',
         intent: 'success',
       }),
     )
