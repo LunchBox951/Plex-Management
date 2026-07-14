@@ -325,23 +325,16 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             # #327 facet 2). This is the ONLY branch of identity resolution
             # that clears snapshots; a probe failure above never does.
             #
-            # Re-confirm immediately before that destructive clear: a
-            # concurrent settings PUT could reconfigure Plex in the gap
-            # between the read above and this delete -- the same class of
-            # race the per-user STALE-clear below guards against by
-            # re-resolving inside its own deleting transaction. Losing this
-            # race would otherwise clear a snapshot out from under a config
-            # that is valid again by the time the delete runs.
-            #
-            # The re-confirm read is itself tri-state, and the clear requires
-            # BOTH legs empty (genuinely unconfigured): a mid-gap reconfigure
-            # whose live probe fails AT THIS INSTANT resolves to no identifier
-            # WITH a probe error -- configured but unreachable, not absent.
-            # Checking only the identifier would let that state fall through
-            # to the destructive clear, reintroducing through the race guard
-            # the exact transient-outage data loss the tri-state exists to
-            # prevent -- so a probe failure here retains the snapshot and
-            # reports probe_failed, mirroring the primary read's branch above.
+            # Re-confirm before the destructive clear -- for STATUS honesty,
+            # not for safety: a concurrent settings PUT may have reconfigured
+            # Plex since the read above, and this tri-state re-read lets the
+            # tick report that honestly (a mid-gap reconfigure whose live
+            # probe fails AT THIS INSTANT is configured-but-unreachable, so
+            # it must surface probe_failed, never fall through toward the
+            # clear as if absent). Safety does NOT rest on this read: it is
+            # itself racy (any read-then-delete is -- a PUT can commit in the
+            # await between them), which is why the delete below carries its
+            # own atomic predicate.
             reconfirm = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
             if reconfirm.probe_error is not None:
                 _logger.info(
@@ -359,7 +352,20 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 )
                 status.mark_skipped("not_configured")
                 return 0
-            cleared = await watchlist_service.clear_snapshots(session)
+            # The clear itself is a single DELETE predicated on the settings
+            # rows (NOT EXISTS a non-empty plex_machine_identifier/plex_url),
+            # so the DATABASE refuses it if a concurrent PUT committed a
+            # configuration first -- the TOCTOU family is closed by
+            # construction, not by shrinking windows (Codex round 3 on #360).
+            # A PUT that commits after the delete instead is caught by its own
+            # settings-change wake (round 2): the immediate next tick re-syncs,
+            # a one-tick gap identical to any ordinary re-sync. plex_url is the
+            # guard for BOTH url+token halves -- the token column is encrypted
+            # at rest so SQL cannot honestly test it, and a token without a url
+            # can never resolve an identity anyway (see the service docstring).
+            cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+                session, guard_keys=(PLEX_MACHINE_ID_SETTING, "plex_url")
+            )
             await session.commit()
             if cleared:
                 _logger.info(

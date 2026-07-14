@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy import Table, select
 
 from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
-from plex_manager.models import SeasonRequest, User, WatchlistItem
+from plex_manager.models import SeasonRequest, Setting, User, WatchlistItem
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.watchlist import WatchlistEntry
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -173,6 +173,93 @@ async def test_sync_expands_foreign_shared_tv_request_to_whole_show(
         )
         assert await SqlRequestRepository(session).is_subscriber(existing.id, watcher_id)
     assert {season.season_number for season in seasons} == {1, 2, 3}
+
+
+async def _seed_snapshot_row(sessionmaker_: SessionMaker) -> None:
+    async with sessionmaker_() as session:
+        user = User(username="watcher", encrypted_plex_token="token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+
+async def _snapshot_count(sessionmaker_: SessionMaker) -> int:
+    async with sessionmaker_() as session:
+        return len(list((await session.execute(WatchlistItem.__table__.select())).all()))
+
+
+async def _set_setting(sessionmaker_: SessionMaker, key: str, value: str) -> None:
+    async with sessionmaker_() as session:
+        session.add(Setting(key=key, value=value))
+        await session.commit()
+
+
+async def test_guarded_clear_refuses_when_plex_url_configured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The atomic guard: a non-empty ``plex_url`` settings row means "possibly
+    configured", so the single-statement delete must refuse (return 0) and
+    leave every snapshot row in place (#327, Codex round 3 on PR #360)."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_url", "http://plex.example.com:32400")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 0
+    assert await _snapshot_count(sessionmaker_) == 1
+
+
+async def test_guarded_clear_refuses_when_machine_identifier_cached(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 0
+    assert await _snapshot_count(sessionmaker_) == 1
+
+
+async def test_guarded_clear_proceeds_when_unconfigured(sessionmaker_: SessionMaker) -> None:
+    """Empty-string guard values are what an explicit clear-to-"" PUT leaves
+    behind; they must read as unconfigured (the delete proceeds), matching the
+    resolution helper's own falsy-value semantics."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_url", "")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 1
+    assert await _snapshot_count(sessionmaker_) == 0
+
+
+async def test_guarded_clear_ignores_unrelated_settings_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Only the caller's guard keys hold the delete hostage: an unrelated
+    non-empty settings row (e.g. a token-only remnant, which can never resolve
+    an identity by itself) must not block the unconfigured clear."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "tmdb_api_key_hint", "present")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 1
+    assert await _snapshot_count(sessionmaker_) == 0
 
 
 def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:

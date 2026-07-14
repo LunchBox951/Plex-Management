@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, exists, select
 
 from plex_manager.adapters.plex.oauth import (
     CODE_TOKEN_INVALID,
@@ -15,7 +16,7 @@ from plex_manager.adapters.plex.oauth import (
     PlexVerifyError,
     account_server_resource,
 )
-from plex_manager.models import MediaType, User, WatchlistItem
+from plex_manager.models import MediaType, Setting, User, WatchlistItem
 from plex_manager.services import request_service
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ __all__ = [
     "WatchlistSyncResult",
     "WatchlistWorkerStatus",
     "clear_snapshots",
+    "clear_snapshots_unless_settings_present",
     "clear_user_snapshot",
     "is_watchlisted",
     "list_sync_users",
@@ -249,6 +251,58 @@ async def clear_snapshots(session: AsyncSession) -> int:
     Idempotent: a no-op (returns 0) once already cleared.
     """
     result = cast(CursorResult[Any], await session.execute(delete(WatchlistItem)))
+    return result.rowcount or 0
+
+
+async def clear_snapshots_unless_settings_present(
+    session: AsyncSession, *, guard_keys: Sequence[str]
+) -> int:
+    """Delete every snapshot row UNLESS any guard setting has a non-empty value.
+
+    The unconfigured-server clear's race guard, made structural (#327, Codex
+    round 3 on PR #360): any separate read-then-delete leaves a TOCTOU window
+    in which a concurrent ``PUT /settings`` can commit a (re)configuration
+    between the read and the delete, destroying eviction-protection rows out
+    from under a config that is valid again by the time the delete runs. This
+    single ``DELETE ... WHERE NOT EXISTS`` makes the database itself the
+    arbiter: the delete and its is-it-safe predicate are one atomic statement,
+    so under SQLite's single-writer (and PostgreSQL READ COMMITTED's
+    per-statement snapshot) a concurrent configuring PUT either commits FIRST
+    -- its guard row is visible and the delete refuses (returns 0) -- or
+    commits AFTER the delete, where its settings-change wake immediately
+    triggers a fresh tick that re-syncs the snapshot (a one-tick gap, the same
+    recoverable shape as any ordinary re-sync). No interleaving deletes rows
+    while the install is configured.
+
+    ``guard_keys`` are the PLAINTEXT settings keys whose non-empty presence
+    means "possibly configured" (the caller passes the Plex machine-identifier
+    cache and ``plex_url``). ``plex_token`` deliberately cannot be one: it is
+    Fernet-encrypted at rest, so an explicitly-cleared token (the empty string,
+    encrypted) is indistinguishable from a real credential in SQL -- and it
+    does not need to be: no identity can ever be resolved or probed from a
+    token alone (resolution requires the cached identifier, or url AND token),
+    so an install whose guard keys are all empty is unconfigured regardless of
+    what the token column holds. The url-set-but-token-cleared half state
+    therefore REFUSES the delete -- conservative retention for an operator
+    mid-reconfiguration, converged by the next tick once the pair is completed
+    (verified repoint) or the url is cleared too (this delete proceeds).
+
+    Idempotent; returns the number of rows deleted (0 when refused or already
+    clear -- callers needing to distinguish can re-read settings afterwards,
+    but no caller currently does: both outcomes end the tick as
+    ``not_configured`` and the next tick re-evaluates). Does not commit.
+    """
+    guard_row_present = exists(
+        select(Setting.id).where(
+            Setting.key.in_(list(guard_keys)),
+            Setting.value.is_not(None),
+            Setting.value != "",
+        )
+    )
+    result = cast(
+        CursorResult[Any],
+        await session.execute(delete(WatchlistItem).where(~guard_row_present)),
+    )
     return result.rowcount or 0
 
 

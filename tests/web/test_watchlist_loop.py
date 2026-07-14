@@ -223,6 +223,54 @@ async def test_reconfigure_mid_tick_prevents_spurious_snapshot_clear(
     assert len(remaining) == 1
 
 
+async def test_configure_committed_after_reconfirm_still_refuses_clear(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residual TOCTOU (Codex round 3 on #360): the reconfirm read is a
+    plain read and the delete happens in a LATER await, so a settings PUT
+    committing configuration in exactly that window slips past every read-side
+    guard -- both reads honestly said "unconfigured". The delete itself must
+    therefore refuse: it is a single statement predicated on the settings rows,
+    so the committed ``plex_url`` is visible to the DELETE's own snapshot and
+    the rows survive by construction, not by window-shrinking."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    real_resolve = app_module._resolve_watchlist_server_identity  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def resolve_then_configure(
+        store: SettingsStore, plex_tv: PlexTvClient
+    ) -> app_module._ServerIdentityResolution:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        calls += 1
+        result = await real_resolve(store, plex_tv)  # unconfigured, as seeded
+        if calls == 2:
+            # The reconfirm read has ALREADY produced its (stale) answer; a
+            # concurrent PUT now commits a configuration before the tick's
+            # next await reaches the delete statement.
+            async with app.state.sessionmaker() as configure_session:
+                configure_store = SettingsStore(configure_session)
+                await configure_store.set("plex_url", "http://plex.example.com:32400")
+                await configure_store.set("plex_token", "service-token")
+                await configure_session.commit()
+        return result
+
+    monkeypatch.setattr(app_module, "_resolve_watchlist_server_identity", resolve_then_configure)
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    assert calls == 2
+    assert app.state.watchlist_status.state == "not_configured"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_reconfigure_mid_tick_with_failing_probe_retains_snapshot(
     app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
