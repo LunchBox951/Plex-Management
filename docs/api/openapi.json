@@ -7387,6 +7387,64 @@
         ]
       }
     },
+    "/api/v1/updates/force-reset": {
+      "post": {
+        "description": "Break-glass recovery for a wedged coordinator state (issue #354).\n\nThe in-app exit from the fail-closed unknown-state guards (PR #346): a\nversion-skew/rollback window can leave the coordinator row in a PHASE this\napp version does not know (every locked coordination write then 409s\npermanently), or in a known phase paired with a queued ACTION it does not\nknow (every new check/install request is then refused as in-progress).\nBoth are recovered here -- audited, inside the coordination lock, and only\nafter re-reading the row so a state that healed on its own is never blindly\nclobbered (north stars #1/#2: a button, never a terminal).\n\nThe locked decision matrix:\n\n* Known phase + known action: 409 ``coordinator_phase_known`` -- a true\n  no-op, nothing wedged to recover. Also the honest, idempotent answer to\n  a double-click: the second call finds the recovered state already known.\n* Leased busy phase (``draining``/``installing``/``rollback``), any\n  action: 409 ``coordinator_phase_known`` -- an operation is in flight and\n  its own acknowledgement or lease expiry legitimately resolves the\n  action; never reset a live update. Both exits converge on a recoverable\n  state if the action remains unrecognized.\n* ``checking`` + unrecognized action: refused only while the updater\n  heartbeat is fresh (the 45s liveness contract) -- a live sidecar could\n  be mid-check. ``checking`` holds no lease, so once the heartbeat is\n  stale nothing can ever expire it; the action-only reset then proceeds\n  (the phase itself stays ``checking`` and heals through the next\n  completed check's normal acknowledgement).\n* Known non-busy phase + unrecognized action: clears the action to\n  ``none`` (the action-only reset), leaving the phase untouched.\n* Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``\n  -- a NEWER updater generation may be legitimately mid-install in a phase\n  this build simply doesn't know; the lease TTL bounds the wait, and an\n  expired lease is swept so a retry then proceeds.\n* Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN\n  queued action is preserved for retry, an unrecognized one is cleared.",
+        "operationId": "force_reset_endpoint_api_v1_updates_force_reset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Force Reset Endpoint",
+        "tags": [
+          "updates"
+        ]
+      }
+    },
     "/api/v1/updates/status": {
       "get": {
         "operationId": "update_status_endpoint_api_v1_updates_status_get",

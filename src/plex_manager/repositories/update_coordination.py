@@ -15,6 +15,8 @@ from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
 
 __all__ = [
     "CoordinatorSnapshot",
+    "DrainLeaseActiveError",
+    "ForceResetResult",
     "LeaseRecord",
     "SqlUpdateCoordinationRepository",
     "UnknownCoordinatorPhaseError",
@@ -55,10 +57,71 @@ class UnknownCoordinatorPhaseError(RuntimeError):
     """
 
 
+# The requested_action companion to ``_KNOWN_COORDINATOR_PHASES``, duplicated
+# here for the same hexagonal-layering reason (``UpdateAction`` lives in the
+# service layer). ``"none"`` plus every operator intent the sidecar consumes.
+# A drift-guard test asserts this stays equal to
+# ``{"none"} | {action.value for action in UpdateAction}``.
+_KNOWN_REQUESTED_ACTIONS = frozenset({"none", "check", "install"})
+
+# The phases in which the sidecar (or a check) is actively mid-operation and
+# owns the current ``action_generation``. Shared by :meth:`request_action`'s
+# refuse-to-clobber guard and :meth:`force_reset_phase`'s action-only branch:
+# while one of these is in flight, its own acknowledgement (generation CAS) or
+# lease expiry is the legitimate writer of ``requested_action``, so recovery
+# must not race it.
+_BUSY_COORDINATOR_PHASES = frozenset({"checking", "draining", "installing", "rollback"})
+
+
+class DrainLeaseActiveError(RuntimeError):
+    """Raised when a force-reset finds an UNEXPIRED drain lease under the wedge.
+
+    An unrecognized phase paired with a live drain lease is exactly the
+    version-skew shape where a NEWER updater generation legitimately moved into
+    a phase this build does not know while holding its (unexpired) drain -- it
+    may be mid-install right now. Tearing that lease and stamping ``idle``
+    would admit new critical work and drain claims UNDERNEATH a live container
+    replacement, so the reset refuses and the operator waits out the bounded
+    lease TTL instead; expiry (``_cleanup_expired``) then clears the lease and
+    a retry succeeds.
+    """
+
+
+@dataclass(frozen=True)
+class ForceResetResult:
+    """What a successful force-reset changed (for the caller's audit trail).
+
+    ``old_phase`` is the pre-reset phase iff it was itself unrecognized and
+    re-anchored to ``idle``; ``None`` for the ACTION-ONLY reset variant, where
+    the phase was known and untouched. ``cleared_requested_action`` is the
+    pre-reset ``requested_action`` iff it was unrecognized and normalized to
+    ``"none"``; ``None`` when the stored action was known and preserved
+    untouched. At least one field is always set on a successful reset.
+    """
+
+    old_phase: str | None
+    cleared_requested_action: str | None
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     if value is not None and value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC) if value is not None else None
+
+
+def _updater_heartbeat_fresh(last_seen: datetime | None, now: datetime, max_age: timedelta) -> bool:
+    """Whether the sidecar's last heartbeat is recent enough to call it live.
+
+    Mirrors ``UpdateCoordinationService.updater_available`` exactly (including
+    treating a future timestamp -- clock skew -- as NOT live), so the
+    force-reset checking predicate and the status endpoint's
+    ``updater_available`` can never disagree about the same row.
+    """
+    seen = _as_utc(last_seen)
+    if seen is None:
+        return False
+    age = now - seen
+    return timedelta(0) <= age <= max_age
 
 
 @dataclass(frozen=True)
@@ -278,7 +341,7 @@ class SqlUpdateCoordinationRepository:
         # successfully replaced container can be left with an unacknowledgeable
         # updater state file, and a queued install can be silently downgraded to a
         # check. Reject instead; the service surfaces this as a 409 to the caller.
-        if state.phase in {"checking", "draining", "installing", "rollback"}:
+        if state.phase in _BUSY_COORDINATOR_PHASES:
             return None
         if state.requested_action != "none":
             return None
@@ -464,6 +527,124 @@ class SqlUpdateCoordinationRepository:
             .values(phase="idle", updated_at=now)
         )
         return True
+
+    async def force_reset_phase(
+        self,
+        now: datetime,
+        *,
+        updater_heartbeat_max_age: timedelta,
+    ) -> ForceResetResult | None:
+        """Re-anchor an UNRECOGNIZED coordinator phase to ``idle`` (issue #354).
+
+        The recovery counterpart to the fail-closed unknown-phase guard every
+        other phase-rewriting locked write enforces (issue #322 / PR #346). Once
+        a concurrent, newer, or rolled-back generation leaves the singleton row
+        in a phase this app version does not know, all seven locked writes 409
+        permanently and NEITHER writer of ``phase='idle'`` (drain release,
+        expiry cleanup) is reachable -- a wedge whose only prior exit was direct
+        DB surgery, in direct tension with north stars #1 and #2. This is the
+        in-app button that ends it.
+
+        Concurrency contract (the reason this lives in the repo, inside the
+        lock): it runs INSIDE :meth:`_lock` and RE-READS the row after acquiring
+        the lock, exactly like the guards it complements. The wedge may have
+        healed or moved between the caller's snapshot and this transaction; a
+        blind reset would then clobber whatever a concurrent writer legitimately
+        landed. The full (phase x requested_action) matrix, decided under the
+        lock:
+
+        * KNOWN phase, KNOWN action: ``None`` -- a true no-op refusal, nothing
+          wedged to recover (also the idempotent second-click answer once a
+          first reset has landed ``idle``/``none``).
+        * KNOWN LEASED-BUSY phase (``draining``/``installing``/``rollback``),
+          any action: ``None`` -- an operation is in flight and its own
+          acknowledgement (generation CAS) or drain-lease expiry is the
+          legitimate writer of ``requested_action``; even an unrecognized
+          action must not be raced here. Both exits converge on a recoverable
+          cell: an ack rewrites the action itself, and lease expiry re-anchors
+          the phase to ``idle`` while preserving the action -- the action-only
+          cell below.
+        * ``checking`` phase, UNRECOGNIZED action (Codex round 3 on #357):
+          ``checking`` is busy but LEASELESS -- nothing ever expires it, so the
+          round-2 "its exits converge" rationale does not hold. The honest
+          in-flight signal in the coordination data is the sidecar heartbeat:
+          only a live sidecar can be mid-check or about to deliver a check
+          outcome. While the heartbeat is FRESH (within
+          ``updater_heartbeat_max_age``, the same 45s contract as
+          ``updater_available``), refuse. Once it is STALE or absent, no check
+          can be in flight: allow the ACTION-ONLY reset. The phase itself is
+          deliberately left ``checking`` (never force-rewritten): with the
+          action cleared, the next completed check -- automatic, or a queued
+          ``check`` the sidecar picks up on reconnect -- acknowledges through
+          the normal generation-CAS path and rewrites the phase legitimately.
+        * KNOWN NON-BUSY phase, UNRECOGNIZED action: the ACTION-ONLY reset
+          (issue #354, Codex round 2). A rollback can leave a perfectly safe
+          phase (e.g. ``idle``) paired with an action this build does not know;
+          that action makes :meth:`request_action` refuse ALL new intent (any
+          non-``none`` action reads as in-progress) while meaning nothing to
+          eligibility -- a quieter wedge with, previously, no exit. Clear the
+          unrecognized action to ``"none"``, touch nothing else, and return a
+          result with ``old_phase=None``.
+        * UNKNOWN phase, UNEXPIRED drain lease: raises
+          :class:`DrainLeaseActiveError`. That pairing is the version-skew
+          shape where a NEWER updater generation is legitimately mid-operation
+          in a phase this build simply doesn't know; deleting its live lease
+          and stamping ``idle`` would admit new critical work and drain claims
+          underneath a possibly-live container replacement. The lease TTL
+          bounds the wait: :meth:`_cleanup_expired` (run first on this path)
+          clears an EXPIRED drain, so a retry after expiry proceeds. Only a
+          dead lease is ever swept out of the way, never a live one.
+        * UNKNOWN phase otherwise: the full reset -- stamp ``phase='idle'``
+          and normalize ``requested_action`` by the same rule: a KNOWN action
+          (a queued ``install``/``check``) is PRESERVED for retry, exactly as
+          :meth:`_cleanup_expired`'s crash-recovery path preserves it; an
+          UNRECOGNIZED one is cleared to ``"none"``.
+
+        Image and generation fields are always preserved; ``critical`` leases
+        (independent app-side work) are never touched.
+
+        Returns a :class:`ForceResetResult` describing what changed on reset,
+        or ``None`` when there was nothing this operation may recover.
+        """
+        state = await self._lock()
+        if state.phase in _KNOWN_COORDINATOR_PHASES:
+            if state.requested_action in _KNOWN_REQUESTED_ACTIONS:
+                return None
+            # An unrecognized action is recoverable in every non-busy phase; in
+            # the leaseless ``checking`` phase only once the sidecar heartbeat
+            # says no check can be in flight (see the matrix above). The leased
+            # busy phases always refuse -- their lease expiry converges.
+            action_recoverable = state.phase not in _BUSY_COORDINATOR_PHASES or (
+                state.phase == "checking"
+                and not _updater_heartbeat_fresh(
+                    state.updater_last_seen_at, now, updater_heartbeat_max_age
+                )
+            )
+            if not action_recoverable:
+                return None
+            cleared = state.requested_action
+            await self._session.execute(
+                update(UpdateCoordinatorState)
+                .where(UpdateCoordinatorState.id == 1)
+                .values(requested_action="none", updated_at=now)
+            )
+            return ForceResetResult(old_phase=None, cleared_requested_action=cleared)
+        await self._cleanup_expired(now)
+        if await self._active_drain() is not None:
+            raise DrainLeaseActiveError(state.phase)
+        old_phase = state.phase
+        values: dict[str, object] = {"phase": "idle", "updated_at": now}
+        cleared_requested_action: str | None = None
+        if state.requested_action not in _KNOWN_REQUESTED_ACTIONS:
+            cleared_requested_action = state.requested_action
+            values["requested_action"] = "none"
+        await self._session.execute(
+            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
+        )
+        return ForceResetResult(
+            old_phase=old_phase,
+            cleared_requested_action=cleared_requested_action,
+        )
 
     async def acknowledge_action(
         self,
