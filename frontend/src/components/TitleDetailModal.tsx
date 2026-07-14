@@ -225,6 +225,60 @@ const CANCELLABLE_STATUSES = new Set([
 ])
 
 /**
+ * Title + body copy for the Withdraw confirm dialog (issue #314, honesty fix
+ * #335). Four cases, mirroring exactly what the backend `withdraw_participant`
+ * verb does:
+ *
+ * - `willCancel` (SOLE participant on a cancellable/active status) — the
+ *   backend reuses `cancel_request`: the download is removed and the request
+ *   settles `cancelled`. This is the ONLY destructive case, so it is the only
+ *   one that warns about the teardown.
+ * - others remain + owner — ownership hands off to the earliest remaining
+ *   subscriber; the download continues.
+ * - others remain + plain subscriber — the download just continues for them.
+ * - SOLE participant on an already-settled status (available/failed/evicted/
+ *   cancelled) — a mere subscription removal; nothing is torn down. (Two
+ *   backend-refused sole cases also land here rather than in the destructive
+ *   arm: an ACTIVE non-cancellable row — import_blocked/partially_available/
+ *   completed — 409s `withdrawal_blocked_active_request`, and a TV request
+ *   whose rollup reads cancellable while a season is already imported 409s
+ *   via `cancel_request`'s per-season guard. Both surface as an error toast
+ *   from `runWithdraw`, so the benign copy never over-promises a teardown —
+ *   and never claims one the backend will refuse.)
+ *
+ * The body doubles as the visible in-dialog warning AND the accessible
+ * `description` (the shared Dialog renders `description` sr-only, so a
+ * body-only warning would be invisible to sighted users — see Dialog.tsx).
+ */
+function withdrawDialogCopy(flags: {
+  isOwner: boolean
+  hasOtherParticipants: boolean
+  willCancel: boolean
+}): { title: string; body: string } {
+  if (flags.willCancel) {
+    return {
+      title: 'Withdraw and cancel request?',
+      body: "You're the last person tracking this request. Withdrawing will cancel it and remove the download.",
+    }
+  }
+  if (flags.hasOtherParticipants) {
+    return flags.isOwner
+      ? {
+          title: 'Withdraw and hand off?',
+          body: 'Someone else who requested this becomes the owner. The download continues.',
+        }
+      : {
+          title: 'Remove from your requests?',
+          body: 'The download continues for others who requested it.',
+        }
+  }
+  return {
+    title: 'Remove from your requests?',
+    body: 'This just removes the request from your list; nothing is torn down.',
+  }
+}
+
+/**
  * A request is grabbable only while it is non-terminal: the backend rejects a
  * terminal request id in /queue/grab (`request_not_active`). Positive allowlist
  * (issue #205), not a terminal denylist — an unrecognized status (a future
@@ -481,11 +535,24 @@ export function TitleDetailModal({
   // The confirm dialog for cancelling a not-yet-imported request (ADR-0014).
   const [cancelFor, setCancelFor] = useState<{ requestId: number } | null>(null)
   // The confirm dialog for withdrawing the caller's OWN subscription (issue
-  // #314) -- the collaborative counterpart to `cancelFor`. `isOwnerWithOthers`
-  // picks the confirm copy (see `withdrawButton` below).
+  // #314) -- the collaborative counterpart to `cancelFor`. The destructive
+  // copy is keyed off `willCancel`, NOT ownership and NOT bare
+  // `hasOtherParticipants` (issue #335 + Codex round): the backend's
+  // last-participant branch (`withdraw_participant`) only tears down
+  // (`cancel_request` -- torrent + file) when the caller is the SOLE
+  // participant AND the request is in a cancellable/active status
+  // (`CANCELLABLE_REQUEST_STATUS_VALUES`). A sole participant on an already
+  // SETTLED row (available/failed/evicted/cancelled) is a MERE subscription
+  // removal server-side -- nothing torn down -- so warning "this cancels it
+  // and removes the download" there would LIE. `willCancel` mirrors the same
+  // status predicate the backend keys on, captured at click time; `isOwner`
+  // and `hasOtherParticipants` only pick hand-off vs continues-for-others vs
+  // mere-removal copy among the NON-destructive cases.
   const [withdrawFor, setWithdrawFor] = useState<{
     requestId: number
-    isOwnerWithOthers: boolean
+    isOwner: boolean
+    hasOtherParticipants: boolean
+    willCancel: boolean
   } | null>(null)
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
@@ -891,13 +958,24 @@ export function TitleDetailModal({
   }, [cancelFor, cancelRequest, toast])
 
   // Withdraw the caller's OWN subscription (issue #314) -- collaborative
-  // self-removal. Never touches what a remaining owner/other subscriber wants;
-  // as the LAST participant it settles like a normal cancel server-side.
+  // self-removal. Never touches what a remaining owner/other subscriber wants.
+  // The success toast (issue #335) reflects what actually happened server-side:
+  // `willCancel`, captured on `withdrawFor` at click time, is true only for the
+  // destructive last-participant-on-active branch that reuses `cancel_request`
+  // (teardown + `cancelled`); every other success is a mere subscription
+  // removal. Keying the toast off bare `hasOtherParticipants` (the earlier bug)
+  // would falsely claim a cancel + download teardown when a SOLE participant
+  // withdrew from an already-settled row, where nothing was torn down.
   const runWithdraw = useCallback(async () => {
     if (!withdrawFor) return
     try {
       await withdrawSubscription.mutateAsync(withdrawFor.requestId)
-      toast({ title: 'Removed from your requests', intent: 'success' })
+      toast({
+        title: withdrawFor.willCancel
+          ? 'Request cancelled and download removed'
+          : 'Removed from your requests',
+        intent: 'success',
+      })
       setWithdrawFor(null)
     } catch (error) {
       toast({ title: 'Withdraw failed', description: asApiError(error).message, intent: 'error' })
@@ -1139,12 +1217,34 @@ export function TitleDetailModal({
       <Button
         variant="danger"
         onClick={() =>
-          setWithdrawFor({ requestId: liveRequest.id, isOwnerWithOthers: isOwner })
+          setWithdrawFor({
+            requestId: liveRequest.id,
+            isOwner,
+            hasOtherParticipants,
+            // Mirror the backend teardown predicate exactly: it reuses
+            // `cancel_request` only for a SOLE participant on a cancellable
+            // status. A settled (or active-non-cancellable) row is a mere
+            // removal (or a 409), never a teardown -- so it must not warn like
+            // one. `CANCELLABLE_STATUSES` already mirrors the backend's
+            // `CANCELLABLE_REQUEST_STATUS_VALUES`, and `!anySeasonImported`
+            // mirrors `cancel_request`'s own per-season guard (Codex round 2):
+            // a TV rollup can read cancellable (e.g. `downloading`) while an
+            // already-imported sibling season makes the backend's
+            // `cancel_request` deterministically refuse (not_cancellable), so
+            // no teardown happens -- the same exclusion `canCancel` uses above.
+            willCancel:
+              !hasOtherParticipants &&
+              CANCELLABLE_STATUSES.has(liveRequest.status) &&
+              !anySeasonImported,
+          })
         }
       >
         Withdraw
       </Button>
     ) : null
+  // Resolved once for the confirm dialog below (title, visible warning, and the
+  // sr-only accessible description all read from the same copy).
+  const withdrawCopy = withdrawFor ? withdrawDialogCopy(withdrawFor) : null
 
   const reSearchNowButton = isAdmin ? (
     <Button
@@ -1633,22 +1733,28 @@ export function TitleDetailModal({
         </Dialog>
       ) : null}
 
-      {/* Withdraw confirm (issue #314): collaborative self-removal. Copy differs
-          by relationship -- a plain subscriber's download continues for others,
-          while an owner-with-others hands ownership off on the way out. */}
-      {withdrawFor ? (
+      {/* Withdraw confirm (issue #314, honesty fix #335): the DESTRUCTIVE copy
+          fires only for a SOLE participant on a cancellable/active status
+          (`willCancel`) -- the exact case the backend tears down (torrent +
+          file) via `cancel_request`. A sole participant on an already-settled
+          row is a mere removal, an owner-with-others hands off, and a plain
+          subscriber's download just continues. The body text is rendered
+          VISIBLY below (the shared Dialog keeps `description` sr-only), so
+          sighted users actually see the warning. */}
+      {withdrawFor && withdrawCopy ? (
         <Dialog
           open
           onOpenChange={(next) => {
             if (!next) setWithdrawFor(null)
           }}
-          title={withdrawFor.isOwnerWithOthers ? 'Withdraw and hand off?' : 'Remove from your requests?'}
-          description={
-            withdrawFor.isOwnerWithOthers
-              ? 'Someone else who requested this becomes the owner. The download continues.'
-              : 'The download continues for others who requested it.'
-          }
+          title={withdrawCopy.title}
+          description={withdrawCopy.body}
         >
+          {/* Visible warning for sighted users; `aria-hidden` avoids a
+              double-announce alongside the sr-only Dialog `description`. */}
+          <p aria-hidden="true" className="mb-5 text-sm text-muted">
+            {withdrawCopy.body}
+          </p>
           <div className="flex justify-end gap-3">
             <Button
               variant="secondary"
