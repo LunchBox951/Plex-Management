@@ -158,3 +158,11 @@ merge — only when actually preparing a promotion):
    the promoted image reports whatever `__version__` was baked in at *its*
    build time — bump the version (step 2) and merge it to `main` **before**
    the `:edge` build you intend to promote, not after.
+
+> **Only `:edge` builds from PR #344 onward can be version-promoted.** The
+> `org.opencontainers.image.version` label the gate reads was introduced by the
+> OCI-label gate (PR #344, commit `a1f9e7be`). Any `edge-<sha>` built before it
+> carries no such label, so a promotion that supplies a `version` input will
+> fail closed on the missing label (a plain `:stable` re-tag with a blank
+> `version` still works, but you should be promoting a labelled build). Always
+> promote a build produced after that commit.
