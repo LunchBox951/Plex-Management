@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
-from urllib.parse import quote, urlsplit
+from http.cookies import SimpleCookie
+from urllib.parse import quote, quote_plus, urlsplit
 
 import pytest
 
@@ -868,7 +870,9 @@ def test_redact_known_secrets_masks_a_url_percent_encoded_variant() -> None:
     result = redact_known_secrets(raw, [password_with_reserved_chars])
     assert encoded not in result
     assert "<redacted>" in result
-    assert "tracker.example.com" in result
+    # Structural host check (not a substring test) so the parsed authority is
+    # asserted exactly -- avoids CodeQL's incomplete-URL-substring flag.
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
 
 
 def test_redact_known_secrets_masks_a_base64_encoded_variant() -> None:
@@ -975,24 +979,26 @@ def test_cookie_jar_mapping_repr_dump_is_also_caught_by_value_based_pass() -> No
     assert "plexmgr.session" in result  # the cookie NAME survives, diagnosable
 
 
-def test_basic_auth_password_with_raw_at_sign_leaks_past_shape_grammar() -> None:
-    """Regression fixture proving the GAP redact_secrets leaves open:
-    ``_BASIC_AUTH_URL_RE`` stops its password capture at the FIRST ``@``, so a
-    password that itself CONTAINS ``@`` leaks its own remainder past that
-    point instead of being masked whole."""
+def test_basic_auth_password_with_raw_at_sign_is_masked_whole_by_shape_grammar() -> None:
+    """#292 item 3/short-password: ``_BASIC_AUTH_URL_RE``'s password run is now
+    greedy up to the LAST ``@`` inside the authority, so a password that itself
+    CONTAINS a raw ``@`` is masked WHOLE -- no suffix survives -- by the shape
+    grammar ALONE, with no configured value needed (previously it stopped at the
+    first internal ``@`` and leaked the remainder; issue #270's shape gap)."""
     password_with_at = "p@ssw0rd0123456789"  # noqa: S105
     raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
     result = redact_secrets(raw)
-    # Proves the gap: some suffix of the password (everything after its own
-    # first internal '@') survives in the shape-based output.
-    assert "ssw0rd0123456789" in result
+    assert password_with_at not in result
+    assert "ssw0rd0123456789" not in result  # the former leak, now closed
+    assert result == "connecting to https://tracker_user:<redacted>@tracker.example.com/announce"
+    assert urlsplit(result.rsplit(" ", 1)[1]).hostname == "tracker.example.com"
 
 
 def test_basic_auth_password_with_raw_at_sign_is_caught_by_value_based_pass() -> None:
-    """The value-based pass (issue #268) closes issue #270's basic-auth gap:
-    given the actual configured password, the WHOLE value is masked
-    regardless of where an internal ``@`` would have confused the shape
-    grammar's password-boundary heuristic."""
+    """The value-based pass (issue #268) independently closes issue #270's
+    basic-auth gap: given the actual configured password, the WHOLE value is
+    masked regardless of where an internal ``@`` sits -- a categorical guarantee
+    that does not depend on the shape grammar's password-boundary heuristic."""
     password_with_at = "p@ssw0rd0123456789"  # noqa: S105
     raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
     result = redact_known_secrets(raw, [password_with_at])
@@ -1002,16 +1008,51 @@ def test_basic_auth_password_with_raw_at_sign_is_caught_by_value_based_pass() ->
     assert "tracker_user" in result
 
 
+def test_short_at_sign_password_in_basic_auth_url_is_masked_by_shape_grammar() -> None:
+    """#292 short-password gap: a password BELOW the value-based length floor
+    (so ``redact_known_secrets`` skips it entirely) that contains a raw ``@`` is
+    still masked whole by the greedy shape rule -- the shape pass has no length
+    floor, so a short ``@``-bearing credential cannot slip through both passes."""
+    short_at_password = "a@b"  # 3 chars -- under the value-based floor  # noqa: S105
+    raw = f"connecting to https://u:{short_at_password}@tracker.example.com/announce"
+    # Value-based pass alone leaves it (too short to mask):
+    assert redact_known_secrets(raw, [short_at_password]) == raw
+    # Shape pass masks it whole regardless:
+    result = redact_secrets(raw)
+    assert result == "connecting to https://u:<redacted>@tracker.example.com/announce"
+
+
+def test_legacy_partially_redacted_basic_auth_row_is_recovered_by_shape_grammar() -> None:
+    """#292 item 3: a row captured by the OLD first-``@`` regex was persisted
+    already mangled -- ``user:<redacted>@<remainder>@host`` -- with the tail of
+    an ``@``-bearing password exposed after the injected ``<redacted>``. The
+    value-based read pass cannot recover it (the intact value no longer appears),
+    but the greedy shape rule consumes the exposed remainder up to the last
+    authority ``@`` and re-masks the row on read."""
+    legacy_row = (
+        "connecting to https://tracker_user:<redacted>@ssw0rd0123456789"
+        "@tracker.example.com/announce"
+    )
+    result = redact_secrets(legacy_row)
+    assert "ssw0rd0123456789" not in result  # the exposed legacy remainder, recovered
+    assert result == "connecting to https://tracker_user:<redacted>@tracker.example.com/announce"
+
+
+def test_basic_auth_shape_grammar_does_not_swallow_host_or_query() -> None:
+    """Adversarial: the greedy password run must stop at the authority boundary
+    (``/``/``?``/``#``), never swallow the host or a query ``@`` (an email in a
+    ``redirect`` param) -- over-redaction would eat diagnosable log content."""
+    raw = "GET https://user:pass1234@host.example.com/cb?to=https://a@evil.example.com"
+    result = redact_secrets(raw)
+    assert result == "GET https://user:<redacted>@host.example.com/cb?to=https://a@evil.example.com"
+
+
 def test_shape_and_value_passes_compose_to_fully_redact_the_at_sign_case() -> None:
     """End-to-end: running BOTH passes in the order the capture/export
     boundaries actually apply them -- VALUE-based first, then shape -- fully
-    redacts the basic-auth-with-embedded-``@`` case that shape alone leaves
-    partially exposed, proving the two passes are complementary, not
-    redundant. The order is load-bearing, not incidental: running shape FIRST
-    would mangle the password (mask only its leading fragment up to its own
-    internal ``@``) before the value-based pass ever saw the full, pristine
-    value to exact-match against -- see ``log_capture_service._capture``'s
-    docstring for the same reasoning applied at the real call sites."""
+    redacts the basic-auth-with-embedded-``@`` case, and the greedy shape rule
+    now also masks it on its own, so the two passes are complementary and each
+    is independently sufficient for this shape."""
     password_with_at = "p@ssw0rd0123456789"  # noqa: S105
     raw = f"connecting to https://tracker_user:{password_with_at}@tracker.example.com/announce"
     value_first = redact_known_secrets(raw, [password_with_at])
@@ -1019,12 +1060,314 @@ def test_shape_and_value_passes_compose_to_fully_redact_the_at_sign_case() -> No
     combined = redact_secrets(value_first)
     assert password_with_at not in combined
     assert "ssw0rd0123456789" not in combined
+    # Shape alone (no configured value) now also fully masks it -- the former
+    # first-``@`` gap is closed in the shape grammar itself.
+    assert "ssw0rd0123456789" not in redact_secrets(raw)
 
-    # Reversing the order reproduces the gap this test guards against: shape
-    # first leaves a mangled remainder that no longer contains the full
-    # password as one contiguous substring, so the value-based pass (run
-    # second) has nothing left to exact-match.
-    shape_first = redact_secrets(raw)
-    assert "ssw0rd0123456789" in shape_first  # the gap, reconfirmed
-    still_leaking = redact_known_secrets(shape_first, [password_with_at])
-    assert "ssw0rd0123456789" in still_leaking
+
+# --- #292 item 4: value-based redaction must not eat a key NAME ------------- #
+
+
+def test_value_equal_to_a_field_name_word_does_not_rewrite_an_identifier() -> None:
+    """#292 item 4: when a configured secret's VALUE happens to equal a field-name
+    word (an operator setting the qBittorrent password to the literal
+    ``"password"``, a minimum-length edge case), a value occurrence sitting in
+    KEY position (immediately before ``=``/``:``) must be left intact -- masking
+    it would rewrite the identifier ``some_password=X`` -> ``some_<redacted>=X``,
+    eating a key name operators need."""
+    secret = "password"  # 8 chars: passes the length floor  # noqa: S105
+    raw = "field some_password=X was updated"
+    result = redact_known_secrets(raw, [secret])
+    # The key name is preserved -- not rewritten to some_<redacted>=X:
+    assert result == raw
+
+
+def test_value_in_actual_value_position_is_still_masked_despite_the_key_guard() -> None:
+    """The key-position guard must forfeit NO coverage of a real leak: the same
+    field-name-shaped secret, when it appears as an actual VALUE (after the
+    separator), is still masked -- only its KEY-position twin is spared."""
+    secret = "password"  # noqa: S105
+    raw = "qbittorrent_password=password"
+    result = redact_known_secrets(raw, [secret])
+    # Left ``password`` (key) preserved; right ``password`` (value) masked.
+    assert result == "qbittorrent_password=<redacted>"
+
+
+def test_key_guard_is_narrow_bare_value_before_equals_is_still_masked() -> None:
+    """The key-name guard spares ONLY an occurrence that IS exactly a recognized
+    secret key word. A high-entropy secret standing alone in prose -- even
+    immediately followed by ``=`` -- fails that condition and is masked, so the
+    guard opens no leak for this shape (adversarial: a blanket 'skip if followed
+    by =' would have)."""
+    raw = f"computed digest {_FAKE_API_KEY}=trailing"
+    result = redact_known_secrets(raw, [_FAKE_API_KEY])
+    assert _FAKE_API_KEY not in result
+    assert "<redacted>" in result
+
+
+def test_key_guard_masks_a_secret_embedded_in_a_larger_token_before_equals() -> None:
+    """Round-2 regression (Codex, PR #361): a configured secret appearing as the
+    TAIL of a larger unrecognized token immediately before ``=`` must be masked,
+    never treated as a key-name suffix -- the earlier 'embedded in any
+    identifier' rule left exactly this occurrence in clear text."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"payload=x{secret}=v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "payload=x<redacted>=v"
+
+
+def test_key_guard_masks_a_secret_embedded_in_a_larger_token_before_colon() -> None:
+    """Adversarial variant of the round-2 regression: the same embedded-tail
+    shape with ``:`` as the separator."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"payload=x{secret}:v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "payload=x<redacted>:v"
+
+
+def test_key_guard_masks_a_secret_appearing_twice_in_one_token() -> None:
+    """Adversarial variant: the secret twice back-to-back in one token before
+    ``=`` -- BOTH occurrences must mask (the second sits directly before the
+    separator, the position the old rule spared)."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"blob {secret}{secret}=v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "blob <redacted><redacted>=v"
+
+
+def test_key_guard_masks_a_key_word_secret_in_url_userinfo_position() -> None:
+    """Adversarial: even a key-WORD-valued secret is masked when it sits in a
+    URL's userinfo (``https://password:x@host`` -- a USERNAME, not a key name):
+    sparing there would print the secret as a plausible-looking username. The
+    guard's authority-boundary check fails closed."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "https://password:x@tracker.example.com/announce"
+    result = redact_known_secrets(raw, [secret])
+    assert result == "https://<redacted>:x@tracker.example.com/announce"
+    # And the full boundary composition also masks the password half:
+    combined = redact_secrets(result)
+    assert combined == "https://<redacted>:<redacted>@tracker.example.com/announce"
+
+
+def test_key_word_secret_spared_in_key_position_composes_to_mask_the_value() -> None:
+    """The spare is safe BY COMPOSITION: it fires only where the shape pass
+    (which every capture/read boundary runs after the value pass) recognizes the
+    occurrence as a key and masks the value side -- so the pair's actual
+    credential never survives, standalone or prefixed, bare or quoted. (Masking
+    the key instead would BREAK the shape pass's key and leave the credential
+    exposed: ``<redacted>=hunter2value``.)"""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    for raw, expected in (
+        ("some_password=hunter2value", "some_password=<redacted>"),
+        ("password=hunter2value", "password=<redacted>"),
+        ("{'some_password': 'hunter2value'}", "{'some_password': '<redacted>'}"),
+    ):
+        value_first = redact_known_secrets(raw, [secret])
+        assert "hunter2value" in value_first  # value pass spared the key, kept the pair
+        combined = redact_secrets(value_first)
+        assert "hunter2value" not in combined
+        assert combined == expected
+
+
+def test_key_guard_masks_a_key_word_secret_behind_an_overlong_identifier() -> None:
+    """Round-3 regression (Codex, PR #361): ``_SECRET_KV_RE``'s key prefix is
+    capped at 64 chars, so on ``<65+ char prefix>password=v`` the shape pass can
+    never fire -- sparing ``password`` there rendered the configured secret in
+    clear AND left the pair unrecognized. The spare now SELF-VERIFIES against
+    ``_SECRET_KV_RE`` itself: no shape-pass match containing the occurrence in
+    its key region means mask unconditionally -- any future shape-grammar
+    limitation fails closed the same way."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    for prefix_len in (65, 200):
+        raw = "x" * prefix_len + "password=v"
+        result = redact_known_secrets(raw, [secret])
+        assert "password" not in result
+        assert result == "x" * prefix_len + "<redacted>=v"
+        # And the composition never resurfaces it either:
+        assert "password" not in redact_secrets(result)
+
+
+def test_key_guard_spares_a_prose_colon_prefixed_key_and_the_value_masks() -> None:
+    """Round-3 regression (Codex, PR #361): ``error:password=hunter2`` -- a bare
+    ``:`` before the identifier is a prose/logger prefix, NOT URL authority. The
+    old single-char boundary check masked the key, broke the shape pass's key
+    recognition, and left the VALUE exposed. The authority exception now
+    requires a genuine ``scheme://`` prefix, the spare self-verifies against
+    ``_SECRET_KV_RE``, and the composition masks the value."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "error:password=hunter2"
+    value_first = redact_known_secrets(raw, [secret])
+    assert value_first == raw  # spared: the pair stays intact for the shape pass
+    combined = redact_secrets(value_first)
+    assert combined == "error:password=<redacted>"
+    assert "hunter2" not in combined
+
+
+def test_key_guard_scheme_authority_ambiguity_composes_safely() -> None:
+    """Adversarial (round 3): ``scheme://error:password=x@host`` -- the same
+    ``error:password`` spelling, but INSIDE a genuine authority (userinfo). The
+    narrowed authority exception masks the occurrence, and
+    ``_BASIC_AUTH_URL_RE`` then consumes the surrounding ``:<...>@`` span --
+    neither the secret nor the paired value survives the composition."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "https://error:password=x@tracker.example.com/a"
+    value_first = redact_known_secrets(raw, [secret])
+    assert "password" not in value_first
+    combined = redact_secrets(value_first)
+    assert combined == "https://error:<redacted>@tracker.example.com/a"
+
+
+# --- #292 encoding-variant gaps: unpadded/base64url, percent case + ``+``, --- #
+# --- SimpleCookie repr, JSON/repr string escaping -------------------------- #
+
+
+def test_redact_known_secrets_masks_unpadded_and_urlsafe_base64_variants() -> None:
+    """#292: only padded standard base64 was generated before; a credential can
+    render base64url and/or unpadded (JWT-style, query contexts). All four
+    (standard/urlsafe x padded/unpadded) renderings must be masked."""
+    raw_bytes = _FAKE_PASSWORD.encode()
+    renderings = {
+        base64.b64encode(raw_bytes).decode(),
+        base64.b64encode(raw_bytes).decode().rstrip("="),
+        base64.urlsafe_b64encode(raw_bytes).decode(),
+        base64.urlsafe_b64encode(raw_bytes).decode().rstrip("="),
+    }
+    for rendering in renderings:
+        result = redact_known_secrets(f"dumping header token={rendering} end", [_FAKE_PASSWORD])
+        assert rendering not in result, rendering
+        assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_lowercase_percent_and_plus_encoded_variants() -> None:
+    """#292: percent-encoding arrives in case variants (``%2f`` as well as the
+    ``%2F`` ``quote`` emits) and with ``+``-for-space (``quote_plus``). Every
+    such spelling of the same secret must be masked."""
+    password = "p@ss w/d&x=1"  # reserved chars + a space  # noqa: S105
+    spellings = {
+        quote(password, safe=""),
+        quote(password, safe="").lower(),
+        quote_plus(password, safe=""),
+        quote_plus(password, safe="").lower(),
+    }
+    for spelling in spellings:
+        result = redact_known_secrets(f"connecting with pw={spelling} now", [password])
+        assert spelling not in result, spelling
+        assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_per_escape_mixed_case_percent_spellings() -> None:
+    """Round-2 regression (Codex, PR #361): percent-escape case must be handled
+    PER ESCAPE, not by enumerating all-upper/all-lower spellings -- a rendering
+    mixing ``%2f`` next to ``%3D`` in ONE string escaped the enumerated variants.
+    ``_variant_regex`` compiles each escape's hex pair case-insensitively, so
+    every mix masks. Unencoded characters remain case-significant."""
+    password = "p@ss w/d&x=1"  # reserved chars + a space  # noqa: S105
+    canonical = quote(password, safe="")
+    assert canonical == "p%40ss%20w%2Fd%26x%3D1"  # two case-bearing escapes: %2F, %3D
+    mixed_spellings = [
+        "p%40ss%20w%2fd%26x%3D1",  # first escape lower, second upper -- a true mix
+        "p%40ss%20w%2Fd%26x%3d1",  # first upper, second lower -- the reverse mix
+        "p%40ss+w%2fd%26x%3D1",  # quote_plus (+-for-space) spelling, mixed case
+        "p%40ss+w%2Fd%26x%3d1",  # quote_plus, the reverse mix
+    ]
+    for spelling in mixed_spellings:
+        result = redact_known_secrets(f"connecting with pw={spelling} now", [password])
+        assert spelling not in result, spelling
+        assert "<redacted>" in result
+    # Case-insensitivity applies to the ESCAPES only: a different unencoded
+    # letter is a different string and must NOT match (no over-redaction).
+    unrelated = "P%40ss%20w%2Fd%26x%3D1"  # leading literal 'P' != 'p'
+    assert redact_known_secrets(f"pw={unrelated} now", [password]).count("<redacted>") == 0
+
+
+def test_redact_known_secrets_masks_json_and_repr_escaped_variants() -> None:
+    """#292: a secret containing a quote/backslash renders ESCAPED inside a JSON
+    log field or a Python ``repr()`` -- the raw bytes never appear literally, so
+    the escaped body must be matched too."""
+    secret = 'tok"en\\with-quotes-1234'  # contains both a quote and a backslash  # noqa: S105
+    json_body = json.dumps(secret)[1:-1]
+    repr_body = repr(secret)[1:-1]
+    assert json_body != secret and repr_body != secret  # escaping actually happened
+    json_line = f'{{"api_key": "{json_body}"}}'
+    repr_line = f"headers={{'api_key': {secret!r}}}"
+    assert secret not in json_line  # the literal never appears; only the escaped body does
+    for line, body in ((json_line, json_body), (repr_line, repr_body)):
+        result = redact_known_secrets(line, [secret])
+        assert body not in result, body
+        assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_case_variant_json_unicode_escapes() -> None:
+    """Round-3 regression (Codex, PR #361): ``json.dumps`` emits lowercase
+    ``\\uXXXX`` hex, but other serializers emit uppercase -- and per-escape
+    MIXES of both -- all decoding to the same secret. ``_variant_regex``
+    compiles each escape's hex digits case-insensitively (the same categorical
+    approach as the percent-escape fix), so every spelling masks. Unescaped
+    characters remain case-significant."""
+    secret = "pässwörd-token-A1"  # two non-ASCII chars -> two \\uXXXX escapes  # noqa: S105
+    body = json.dumps(secret)[1:-1]
+    assert body == "p\\u00e4ssw\\u00f6rd-token-A1"
+    spellings = [
+        body,  # canonical lowercase, as json.dumps emits
+        body.replace("\\u00e4", "\\u00E4"),  # first escape upper, second lower -- a mix
+        body.replace("\\u00f6", "\\u00F6"),  # first lower, second upper -- the reverse mix
+        body.replace("\\u00e4", "\\u00E4").replace("\\u00f6", "\\u00F6"),  # all upper
+    ]
+    for spelling in spellings:
+        line = f'{{"api_key": "{spelling}"}}'
+        result = redact_known_secrets(line, [secret])
+        assert spelling not in result, spelling
+        assert "<redacted>" in result
+    # Case-insensitivity applies to the ESCAPES only: a different unescaped
+    # letter is a different string and must NOT match (no over-redaction).
+    unrelated = f'{{"api_key": "{body.replace("token", "Token")}"}}'
+    assert redact_known_secrets(unrelated, [secret]).count("<redacted>") == 0
+    # ``\\xXX`` repr byte escapes get the same treatment:
+    esc_secret = "p\x1bq-token-12345"  # noqa: S105 -- fixture with an \x1b escape
+    repr_body = repr(esc_secret)[1:-1]
+    assert "\\x1b" in repr_body
+    upper_spelling = repr_body.replace("\\x1b", "\\x1B")
+    result = redact_known_secrets(f"raw={upper_spelling} end", [esc_secret])
+    assert upper_spelling not in result
+    assert "<redacted>" in result
+
+
+def test_simplecookie_repr_session_token_is_masked_by_shape_grammar() -> None:
+    """#292: ``http.cookies.SimpleCookie``'s repr -- ``<SimpleCookie:
+    plexmgr.session='SECRET'>`` (unquoted name, ``=``, quoted value) -- is
+    matched by neither the raw-header cookie pass nor the dict-repr pass, so its
+    own shape rule masks it. The cookie token is never a settings value, so the
+    shape rule is the ONLY possible barrier."""
+    session_value = "sVeryLongSessionTokenValue123456789"
+    cookie = SimpleCookie()
+    cookie["plexmgr.session"] = session_value
+    raw = f"outgoing {cookie!r}"
+    assert session_value in raw  # the value really is exposed in the repr
+    result = redact_secrets(raw)
+    assert session_value not in result
+    assert "<redacted>" in result
+    assert "plexmgr.session" in result  # the cookie NAME survives, diagnosable
+
+
+def test_simplecookie_repr_qbittorrent_sid_is_masked_by_shape_grammar() -> None:
+    """The same shape rule covers qBittorrent's ``QBT_SID_<port>`` session cookie
+    rendered as a ``SimpleCookie`` repr."""
+    sid_value = "qBTUpstreamSessionIdABCDEF0123456789"
+    cookie = SimpleCookie()
+    cookie["QBT_SID_8080"] = sid_value
+    raw = f"jar {cookie!r}"
+    result = redact_secrets(raw)
+    assert sid_value not in result
+    assert "<redacted>" in result
+    assert "QBT_SID_8080" in result
+
+
+def test_simplecookie_repr_does_not_false_match_non_session_prose() -> None:
+    """Honesty over silence: the SimpleCookie rule keys on a session/sid cookie
+    NAME, so an ordinary quoted assignment for an unrelated cookie/field is left
+    untouched."""
+    raw = "config theme='dark' locale='en-US'"
+    assert redact_secrets(raw) == raw

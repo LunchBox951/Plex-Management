@@ -19,20 +19,24 @@ Every endpoint here is read-only or an idempotent operator action; none of them
 ever return a secret (subsystem ``detail`` strings and log messages carry
 whatever a call site already chose to log — see ``log_capture_service``'s
 module docstring on why that discipline lives upstream of this router, not in
-it). Both durable-store READ boundaries — ``GET /logs`` and ``GET /logs/export``
-— re-apply ``logsafe.redact_secrets`` to every persisted message as a second,
-independent redaction pass (issue #153): capture-time redaction only covers rows
-this build wrote through ``log_capture_service``, so a pre-upgrade row or a
-direct repository write is masked consistently at BOTH read boundaries, not just
-on export. (``GET /logs/tail`` reads the in-memory ring buffer, which is written
-only by the already-redacting capture path, so it needs no second pass.)
+it). All THREE log READ boundaries — ``GET /logs``, ``GET /logs/export``, and
+``GET /logs/tail`` — re-apply ``logsafe.redact_secrets`` to every message as a
+second, independent redaction pass (issue #153): capture-time redaction only
+covers rows this build wrote through ``log_capture_service``, so a pre-upgrade
+row or a direct repository write is masked consistently at every read boundary,
+not just on export.
 
-Both boundaries ALSO re-apply ``logsafe.redact_known_secrets`` (issue #268), the
-value-based pass, against this INSTANT's decrypted secret values (``SettingsStore.
-secret_values()``) — never the possibly-stale set the capture-time handler was
-last refreshed with (see ``log_capture_service``'s module docstring): a secret
-rotated AFTER a row was captured is still masked on every subsequent read, and a
-pre-upgrade row that predates this pass entirely is covered too. Applied FIRST,
+All three boundaries ALSO re-apply ``logsafe.redact_known_secrets`` (issue #268),
+the value-based pass, against this INSTANT's decrypted secret values
+(``SettingsStore.secret_values()``) — never the possibly-stale set the
+capture-time handler was last refreshed with (see ``log_capture_service``'s
+module docstring): a secret rotated AFTER a row was captured is still masked on
+every subsequent read, and a pre-upgrade row that predates this pass entirely is
+covered too. ``GET /logs/tail`` serves the in-memory ring buffer, whose rows were
+redacted at capture time against the handler's periodically-refreshed secret
+snapshot — which lags a rotation by up to one drain tick — so it re-redacts here
+for the same reason the durable boundaries do (issue #292 item 1): the
+capture-time snapshot is a possibly-stale set, not this instant's. Applied FIRST,
 before ``redact_secrets`` — the same order ``log_capture_service._capture`` uses
 and for the same reason: the shape grammar's own masking can mangle a secret
 (e.g. a basic-auth password containing a raw ``@``, issue #270) before the
@@ -303,6 +307,7 @@ async def list_logs_endpoint(
 
 @router.get("/logs/tail")
 async def tail_logs_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
     handler: Annotated[LogCaptureHandler, Depends(get_log_handler)],
     limit: Annotated[int, Query(ge=1, le=RING_BUFFER_MAXLEN)] = 200,
 ) -> LogsTailResponse:
@@ -312,13 +317,20 @@ async def tail_logs_endpoint(
     signal for how many INFO+ records missed durable storage since startup."""
     records = handler.snapshot_tail(limit)
     records.reverse()
+    # Re-redact against THIS instant's decrypted secret values, exactly as the
+    # two durable-read boundaries do (issue #292 item 1). The ring buffer's rows
+    # were redacted at capture time against the handler's periodically-refreshed
+    # secret snapshot, which lags a rotation by up to one drain tick -- so a
+    # just-rotated secret could otherwise surface here unmasked during that
+    # window. Value-based pass FIRST, then shape, matching ``_capture``'s order.
+    secret_values = await SettingsStore(session).secret_values()
     return LogsTailResponse(
         events=[
             LiveLogRecordItem(
                 created_at=r.created_at,
                 level=r.level,
                 logger=r.logger,
-                message=r.message,
+                message=redact_secrets(redact_known_secrets(r.message, secret_values)),
                 context=r.context,
             )
             for r in records

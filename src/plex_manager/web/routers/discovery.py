@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
-from plex_manager.ports.library import LibraryPort
+from plex_manager.ports.library import ArtworkKind, LibraryPort
 from plex_manager.ports.metadata import MediaKind, MediaSearchResult, MetadataPort
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import discovery_service
@@ -49,12 +49,34 @@ router = APIRouter(
 )
 
 
-def _to_result(item: MediaSearchResult, library_state: LibraryState) -> DiscoverResult:
+def _plex_artwork_url(item: MediaSearchResult, kind: ArtworkKind) -> str:
+    """The backend artwork-proxy URL for ``item``'s Plex-native poster/background.
+
+    A relative path so it works under any reverse-proxy prefix the SPA is served
+    from; the browser sends the session cookie with the ``<img>`` request, which
+    the proxy authenticates. Only ever emitted for an in-library title (see
+    :func:`_to_result`), so the endpoint resolves real Plex artwork rather than
+    404ing for every non-owned tile.
+    """
+    return f"/api/v1/artwork/plex/{item.media_type}/{item.tmdb_id}/{kind}"
+
+
+def _to_result(
+    item: MediaSearchResult,
+    library_state: LibraryState,
+    present: frozenset[tuple[int, str]],
+) -> DiscoverResult:
     """Map a metadata search row to the wire DTO (incl. backdrop for the hero).
 
     ``library_state`` is the server-computed tile hint (issue #29): the frozen DTO is
     built with it here rather than mutated after, since ``DiscoverResult`` is frozen.
+
+    ``present`` is the set of ``(tmdb_id, media_type)`` keys confirmed in Plex this
+    page (issue #66): a present title gets ``plex_*_url`` proxy links so the browser
+    shows Plex's own artwork; a not-owned title leaves them ``None`` and falls back
+    to the TMDB ``poster_url``/``backdrop_url``.
     """
+    in_library = (item.tmdb_id, item.media_type) in present
     return DiscoverResult(
         tmdb_id=item.tmdb_id,
         media_type=item.media_type,
@@ -63,6 +85,8 @@ def _to_result(item: MediaSearchResult, library_state: LibraryState) -> Discover
         overview=item.overview,
         poster_url=item.poster_url,
         backdrop_url=item.backdrop_url,
+        plex_poster_url=_plex_artwork_url(item, "poster") if in_library else None,
+        plex_backdrop_url=_plex_artwork_url(item, "background") if in_library else None,
         library_state=library_state,
     )
 
@@ -72,7 +96,7 @@ async def _resolve_states(
     library: LibraryPort | None,
     items: Iterable[MediaSearchResult],
     auth: AuthContext,
-) -> dict[tuple[int, str], LibraryState]:
+) -> tuple[dict[tuple[int, str], LibraryState], frozenset[tuple[int, str]]]:
     """Compute the base library-state for a whole page's tiles in ONE query + ONE crawl.
 
     Collects the full ``(tmdb_id, media_type)`` key set across ALL supplied items (for
@@ -93,7 +117,7 @@ async def _resolve_states(
     """
     keys: list[tuple[int, MediaKind]] = [(item.tmdb_id, item.media_type) for item in items]
     if not keys:
-        return {}
+        return {}, frozenset()
     repo = SqlRequestRepository(session)
     if auth.is_admin:
         statuses = await repo.display_statuses_by_tmdb_ids(keys)
@@ -118,7 +142,7 @@ async def _resolve_states(
     states: dict[tuple[int, str], LibraryState] = {}
     for key in set(keys):
         states[key] = derive_library_state(statuses.get(key), key in present)
-    return states
+    return states, present
 
 
 @router.get("/search")
@@ -132,9 +156,9 @@ async def discover_search(
 ) -> DiscoverSearchResponse:
     """Search TMDB for movies / shows matching ``query`` (optional ``year``)."""
     results = await discovery_service.search(tmdb, query, year)
-    states = await _resolve_states(session, library, results, auth)
+    states, present = await _resolve_states(session, library, results, auth)
     return DiscoverSearchResponse(
-        results=[_to_result(item, _state_for(states, item)) for item in results]
+        results=[_to_result(item, _state_for(states, item), present) for item in results]
     )
 
 
@@ -180,15 +204,17 @@ async def discover_home(
         *feed.spotlights,
         *(item for row in feed.rows for item in row.items),
     ]
-    states = await _resolve_states(session, library, all_items, auth)
+    states, present = await _resolve_states(session, library, all_items, auth)
     return DiscoverHomeResponse(
-        spotlights=[_to_result(item, _state_for(states, item)) for item in feed.spotlights],
+        spotlights=[
+            _to_result(item, _state_for(states, item), present) for item in feed.spotlights
+        ],
         rows=[
             DiscoverHomeRow(
                 row_type=row.row_type,
                 title=row.title,
                 subtitle=row.subtitle,
-                items=[_to_result(item, _state_for(states, item)) for item in row.items],
+                items=[_to_result(item, _state_for(states, item), present) for item in row.items],
             )
             for row in feed.rows
         ],
@@ -206,12 +232,14 @@ async def discover_category(
 ) -> DiscoverListResponse:
     """Return a paginated movie category (``trending`` / ``popular`` / ``upcoming``)."""
     media_page = await discovery_service.list_category(tmdb, category, page)
-    states = await _resolve_states(session, library, media_page.results, auth)
+    states, present = await _resolve_states(session, library, media_page.results, auth)
     return DiscoverListResponse(
         page=media_page.page,
         total_pages=media_page.total_pages,
         total_results=media_page.total_results,
-        results=[_to_result(item, _state_for(states, item)) for item in media_page.results],
+        results=[
+            _to_result(item, _state_for(states, item), present) for item in media_page.results
+        ],
     )
 
 

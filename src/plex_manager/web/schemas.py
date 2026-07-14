@@ -1137,6 +1137,16 @@ class DiscoverResult(BaseModel):
     overview: str | None = None
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # Plex-native artwork proxy URLs (issue #66): populated ONLY for a title the
+    # server confirmed present in Plex, pointing at the backend image proxy
+    # (``/api/v1/artwork/plex/...``) so the browser shows Plex's own selected
+    # poster/background — the token never leaves the server. ``None`` for a
+    # not-in-library title (the client uses ``poster_url``/``backdrop_url`` from
+    # TMDB), and the client falls back the same way if the proxy 404s. Server-
+    # emitted rather than client-constructed so the endpoint contract stays owned
+    # by the backend.
+    plex_poster_url: str | None = None
+    plex_backdrop_url: str | None = None
     # Response-only library-state hint for the tile (issue #29): no DB column, no
     # migration -- computed per page from Plex presence + the request store. Default
     # ``"none"`` keeps construction back-compatible and honestly models a page that
@@ -1341,6 +1351,27 @@ class RequestListResponse(BaseModel):
 
     requests: list[RequestResponse]
     next_cursor: int | None = None
+
+
+class WithdrawSubscriptionResponse(BaseModel):
+    """Outcome of ``DELETE /requests/{id}/subscription`` (issue #314 / #351).
+
+    ``settled`` echoes ``correction_service.WithdrawOutcome.settled`` -- the value
+    the withdraw verb computes under the participant media lock. ``True`` iff the
+    last-participant CANCEL BRANCH ran (via ``cancel_request``) and the request
+    settled ``cancelled``. That branch removes any active download IF one exists,
+    but a pending/searching/no_acceptable_release/waiting_for_air_date row settles
+    purely in the DB with no torrent to touch -- so ``settled: true`` means "the
+    request was cancelled", NEVER "a download was removed". ``False`` is a mere
+    subscription removal (an owner handoff to a remaining participant, or the last
+    participant leaving an already-settled row). The client keys its success toast
+    off THIS authoritative outcome rather than a click-time snapshot a concurrent
+    join/withdraw or status advance could have made stale (#351).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    settled: bool
 
 
 class WithdrawSubscriptionResponse(BaseModel):
@@ -1668,7 +1699,9 @@ class AutograbStatusItem(BaseModel):
 class WatchlistStatusItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
+    state: Literal[
+        "starting", "ok", "degraded", "disabled", "not_configured", "probe_failed", "error"
+    ]
     last_run_at: datetime | None = None
     last_ok_at: datetime | None = None
     last_error_type: str | None = None

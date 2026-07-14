@@ -1043,6 +1043,32 @@ async def test_non_repoint_edit_does_not_wake_watchlist_worker(
     assert not app.state.watchlist_wake_event.is_set()
 
 
+async def test_explicit_unconfigure_wakes_watchlist_worker(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """An explicit clear of plex_url/plex_token (an UNVERIFIABLE identity change:
+    the cached machine-id anchor is dropped, nothing is probed) must wake the
+    watchlist worker just like a verified repoint: the worker's not_configured
+    branch is what clears the now-orphaned snapshot rows (#327), and with a long
+    sync interval they would otherwise keep protecting titles from eviction for
+    hours/days after the operator explicitly walked away from Plex."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    app.state.watchlist_wake_event = asyncio.Event()
+    # An incomplete pair is unverifiable: the PUT must not issue any live probe.
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "", "plex_token": ""},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None  # stale anchor dropped
+    assert app.state.watchlist_wake_event.is_set()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
