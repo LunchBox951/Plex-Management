@@ -278,6 +278,49 @@ async def test_sweep_keeps_live_and_recently_dead_reaps_old_dead(
         }
 
 
+async def test_sweep_keeps_freshly_revoked_row_despite_stale_idle_signal(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A long-idle session revoked TODAY must survive its own retention grace.
+
+    Regression for issue #328: the idle/revoked predicates were independently
+    OR'd, so a session idle well past :data:`SESSION_IDLE_WINDOW` +
+    :data:`SESSION_SWEEP_RETENTION` (satisfying the idle branch on its own)
+    that gets revoked today satisfied the sweep's delete clause on the very
+    next pass, destroying the fresh revocation's audit record instead of
+    honoring the 7-day post-revocation grace.
+    """
+    grace = sl.SESSION_SWEEP_RETENTION
+    stale_last_seen = _NOW - sl.SESSION_IDLE_WINDOW - grace - timedelta(days=10)
+    async with sessionmaker_() as session:
+        user = await _make_user(session, plex_id=9)
+        session.add(
+            _session(
+                user_id=user.id,
+                tag="stale-idle-fresh-revoke",
+                created_at=stale_last_seen,
+                expires_at=_NOW + timedelta(days=30),
+                last_seen_at=stale_last_seen,
+                revoked_at=_NOW - timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+        # Same-day sweep: the revocation is fresh, so the row must survive even
+        # though the idle signal alone would already justify deletion.
+        deleted = await sl.sweep_dead_sessions(session, now=_NOW)
+        assert deleted == 0
+        survivors = await session.execute(select(func.count()).select_from(AuthSession))
+        assert survivors.scalar_one() == 1
+
+        # Once the revocation itself passes its retention cutoff, it's reaped.
+        later = _NOW + grace + timedelta(minutes=1)
+        deleted = await sl.sweep_dead_sessions(session, now=later)
+        assert deleted == 1
+        survivors = await session.execute(select(func.count()).select_from(AuthSession))
+        assert survivors.scalar_one() == 0
+
+
 async def test_sweep_on_empty_table_is_zero(sessionmaker_: SessionMaker) -> None:
     async with sessionmaker_() as session:
         assert await sl.sweep_dead_sessions(session, now=_NOW) == 0
