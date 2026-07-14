@@ -1150,14 +1150,18 @@ async def put_settings_endpoint(
         await session.commit()
 
         # A long configured interval must not postpone an enable/shorten change --
-        # nor a verified repoint's stale-token cleanup -- until the old sleep
-        # expires. A verified repoint (new machine identifier) leaves old-server
-        # tokens STALE for the new server; the watchlist worker is what clears their
-        # snapshots (#296), so wake it immediately instead of letting those rows keep
-        # protecting titles until the next scheduled tick (hours/days away). The
-        # worker owns this process-local event.
-        verified_repoint = plex_identity_changed and machine_identifier is not None
-        if verified_repoint or written_fields.intersection(
+        # nor a Plex identity change's snapshot cleanup -- until the old sleep
+        # expires. BOTH identity-change shapes need the immediate wake: a verified
+        # repoint (new machine identifier) leaves old-server tokens STALE for the
+        # new server and the watchlist worker is what clears their snapshots
+        # (#296); an UNVERIFIABLE change (an explicit clear / incomplete pair,
+        # which dropped the cached anchor above) leaves the install truly
+        # unconfigured, and the worker's not_configured branch is what clears the
+        # now-orphaned snapshot rows (#327) -- without the wake they keep
+        # protecting titles from eviction until the next scheduled tick
+        # (hours/days away) despite the operator explicitly walking away from
+        # Plex. The worker owns this process-local event.
+        if plex_identity_changed or written_fields.intersection(
             {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
         ):
             wake_event = getattr(request.app.state, "watchlist_wake_event", None)
