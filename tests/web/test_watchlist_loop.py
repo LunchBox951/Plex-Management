@@ -320,6 +320,108 @@ async def test_probe_failure_reports_probe_failed_and_retains_snapshot(
     assert len(remaining) == 1
 
 
+def _upgraded_install_transport(
+    resources: list[dict[str, object]], *, identity_successes: int = 1
+) -> httpx.MockTransport:
+    """An upgraded/pre-rework install's transport: ``/identity`` answers
+    successfully for the first ``identity_successes`` calls then becomes
+    unreachable (every un-cached identity resolution probes live, so a mid-tick
+    outage surfaces on a later re-resolution); plex.tv ``/api/v2/resources``
+    answers the given list throughout."""
+    identity_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_calls
+        if request.url.path == "/identity":
+            identity_calls += 1
+            if identity_calls > identity_successes:
+                raise httpx.ConnectError("plex server became unreachable", request=request)
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        if request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=resources)
+        return httpx.Response(200, text="ok")
+
+    return httpx.MockTransport(handler)
+
+
+async def test_final_recheck_probe_failure_reports_probe_failed(app: FastAPI, seed: SeedFn) -> None:
+    """Codex round 2 on #360 (final pre-sync re-check): an upgraded install (url/
+    token, no cached machine id) resolves identity live at the final re-check
+    too. If the server becomes unreachable AFTER users were authorized, the
+    tick must report probe_failed with the PlexVerifyError surfaced -- not the
+    generic "server changed" degraded tick with error=None (nor, with no
+    authorized users, a clean ok). The authorized users count as skipped and
+    the snapshot is retained."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", "tmdb-key")
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await store.set("plex_token", "service-token")
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # Tick-start /identity succeeds; the account is AUTHORIZED for that server;
+    # then the server drops before the final pre-sync-pass re-check.
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(
+        transport=_upgraded_install_transport([_server_resource(_MACHINE_ID)])
+    )
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.skipped_users == 1  # the authorized user whose sync pass did not run
+    assert status.created == 0
+    assert status.last_ok_at is None
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+async def test_stale_delete_guard_probe_failure_reports_probe_failed(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """Codex round 2 on #360 (stale-delete guarded re-check): when the /identity
+    outage hits DURING the delete guard's re-resolution, it must not collapse
+    into the "repointed/unconfigured" retain -- the tick would then exit through
+    a later gate (here: TMDB not configured) without the outage ever reaching
+    /health. The guard surfaces probe_failed (PlexVerifyError, skipped_users
+    preserved) and retains the stale user's snapshot."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await store.set("plex_token", "service-token")
+        user = User(username="stale-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # Tick-start /identity succeeds; the account is STALE for that server (it
+    # only advertises a different one); the server then drops before the delete
+    # guard re-resolves identity. No TMDB key on purpose: without the fix this
+    # tick exits mark_skipped("not_configured") and the outage vanishes.
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(
+        transport=_upgraded_install_transport([_server_resource("some-other-server")])
+    )
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.skipped_users == 1
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_tick_persists_minted_client_identifier(app: FastAPI, seed: SeedFn) -> None:
     """The plex.tv device identifier minted by a tick must be COMMITTED, not rolled
     back when the settings session closes: an uncommitted mint would still be used

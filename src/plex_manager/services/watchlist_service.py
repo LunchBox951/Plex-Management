@@ -121,7 +121,7 @@ class WatchlistWorkerStatus:
         self.failed_users = self.failed_entries = 0
         self.skipped_users = skipped_users
 
-    def mark_probe_failed(self, exc: PlexVerifyError) -> None:
+    def mark_probe_failed(self, exc: PlexVerifyError, *, skipped_users: int = 0) -> None:
         """The Plex server is configured but the live ``/identity`` probe
         failed -- an outage, not an absence (issue #327). Distinct from
         ``not_configured`` (nothing to authorize against) and from ``error``
@@ -129,11 +129,19 @@ class WatchlistWorkerStatus:
         actionable degraded condition that self-heals on the next successful
         probe. The caller is responsible for retaining any existing watchlist
         snapshot -- a transient outage must never drop eviction protection.
+
+        ``skipped_users`` mirrors :meth:`mark_skipped`'s parameter for the same
+        reason (issue #327 facet 3): identity is also re-resolved MID-TICK, so
+        a probe can fail after the per-user revalidation/cleanup pass already
+        skipped (and possibly cleaned up after) users. Zeroing that count would
+        hide the pass's work from /health behind the probe failure.
         """
         self.state = "probe_failed"
         self.last_error_type = type(exc).__name__
         self.last_error_at = datetime.now(UTC)
-        self._reset_counters()
+        self.fetched = self.created = self.existing = 0
+        self.failed_users = self.failed_entries = 0
+        self.skipped_users = skipped_users
 
     def mark_completed(
         self,

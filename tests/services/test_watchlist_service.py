@@ -258,6 +258,17 @@ def test_worker_status_probe_failed_is_distinct_from_not_configured_and_error() 
     assert status.last_error_at is not None
     assert status.skipped_users == 0
 
+    # A probe can also fail on a MID-TICK re-resolution, after the per-user
+    # revalidation/cleanup pass already skipped users: like mark_skipped, a
+    # caller-supplied count must survive so the pass's work stays visible on
+    # /health alongside the probe failure (issue #327 facet 3).
+    status.mark_started()
+    status.mark_probe_failed(
+        PlexVerifyError("server_unreachable_from_backend", "unreachable"), skipped_users=2
+    )
+    assert status.state == "probe_failed"
+    assert status.skipped_users == 2
+
 
 def test_mark_skipped_preserves_caller_supplied_skipped_users() -> None:
     """The TMDB-not-configured gate runs AFTER the stale-user cleanup pass, so

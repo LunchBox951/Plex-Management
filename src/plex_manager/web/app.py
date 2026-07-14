@@ -228,6 +228,16 @@ class _ServerIdentityResolution:
     machine_identifier: str | None
     probe_error: PlexVerifyError | None = None
 
+    def __post_init__(self) -> None:
+        # Pin the invariant every consumer's branch ordering relies on: a probe
+        # error means the identifier could NOT be resolved, so the two legs are
+        # mutually exclusive and "probe_error first, then identifier" checks
+        # can never mask a successful resolution.
+        if self.probe_error is not None and self.machine_identifier is not None:
+            raise ValueError(
+                "_ServerIdentityResolution cannot carry both a machine identifier and a probe error"
+            )
+
 
 async def _resolve_watchlist_server_identity(
     store: SettingsStore, plex_tv: PlexTvClient
@@ -407,12 +417,34 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 current_resolution = await _resolve_watchlist_server_identity(
                     SettingsStore(session), plex_tv
                 )
+                if current_resolution.probe_error is not None:
+                    # Configured but unreachable AT THIS INSTANT (an upgraded
+                    # install with no cached identifier re-probes live on every
+                    # resolution). Retain this user's snapshot and end the tick
+                    # as probe_failed -- collapsing this into the "identity
+                    # changed" retain below would let the tick exit through a
+                    # later gate (e.g. TMDB-not-configured) without ever
+                    # surfacing the outage on /health. Aborting is not lossy:
+                    # every later identity re-resolution this tick would hit
+                    # the same failing probe, so no reachable work is skipped.
+                    # skipped_users (this user included) rides along so the
+                    # cleanup pass's work so far stays visible (facet 3).
+                    _logger.info(
+                        "watchlist token for user_id=%s revalidated stale, but the "
+                        "configured server's identity probe failed during the "
+                        "delete guard; retaining the snapshot and ending the tick "
+                        "as probe_failed",
+                        safe_int(user.id),
+                    )
+                    status.mark_probe_failed(
+                        current_resolution.probe_error, skipped_users=skipped_users
+                    )
+                    return 0
                 if current_resolution.machine_identifier != machine_identifier:
                     _logger.info(
                         "watchlist token for user_id=%s revalidated stale, but the "
-                        "configured server identity could not be re-confirmed as "
-                        "unchanged (repointed, unconfigured, or temporarily "
-                        "unreachable); retaining the snapshot for re-evaluation",
+                        "configured server identity changed since (repointed or "
+                        "unconfigured); retaining the snapshot for re-evaluation",
                         safe_int(user.id),
                     )
                     continue
@@ -462,9 +494,26 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         # entirely. The repoint itself wakes this worker, so re-authorization
         # against the new identity is imminent, and the skipped users keep the
         # tick honestly "degraded" rather than silently ok.
-        current_identity = (
-            await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
-        ).machine_identifier
+        final_resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+    if final_resolution.probe_error is not None:
+        # Configured but unreachable at the final re-check (an upgraded install
+        # with no cached identifier re-probes live here). Reporting this as the
+        # generic "server changed" degraded tick below would surface error=None
+        # -- and with no authorized users it would fall through and mark the
+        # tick ok. Surface the outage as probe_failed instead; authorized users
+        # whose sync pass did not run count as skipped, same as the "changed"
+        # branch below.
+        _logger.info(
+            "configured Plex server's identity probe failed at the final pre-sync "
+            "re-check (%s users authorized); skipping this sync pass and reporting "
+            "probe_failed",
+            len(authorized),
+        )
+        status.mark_probe_failed(
+            final_resolution.probe_error, skipped_users=skipped_users + len(authorized)
+        )
+        return 0
+    current_identity = final_resolution.machine_identifier
     if authorized and current_identity != machine_identifier:
         _logger.info(
             "configured Plex server changed mid-tick (%s users authorized against "
