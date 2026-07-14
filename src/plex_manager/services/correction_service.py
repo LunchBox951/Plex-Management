@@ -1636,7 +1636,7 @@ async def withdraw_participant(
             await request_repo.set_owner(request_id, new_owner)
             await audit_service.record(
                 session,
-                actor_user_id=new_owner,
+                actor_user_id=user_id,
                 action_type="request.owner_handoff",
                 entity_type="media_request",
                 entity_id=request_id,
