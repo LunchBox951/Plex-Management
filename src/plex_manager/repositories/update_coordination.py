@@ -15,6 +15,8 @@ from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
 
 __all__ = [
     "CoordinatorSnapshot",
+    "DrainLeaseActiveError",
+    "ForceResetResult",
     "LeaseRecord",
     "SqlUpdateCoordinationRepository",
     "UnknownCoordinatorPhaseError",
@@ -53,6 +55,41 @@ class UnknownCoordinatorPhaseError(RuntimeError):
     coordination write re-checks the phase itself, inside its own lock, and
     fails closed instead of guessing what an unrecognized phase means.
     """
+
+
+# The requested_action companion to ``_KNOWN_COORDINATOR_PHASES``, duplicated
+# here for the same hexagonal-layering reason (``UpdateAction`` lives in the
+# service layer). ``"none"`` plus every operator intent the sidecar consumes.
+# A drift-guard test asserts this stays equal to
+# ``{"none"} | {action.value for action in UpdateAction}``.
+_KNOWN_REQUESTED_ACTIONS = frozenset({"none", "check", "install"})
+
+
+class DrainLeaseActiveError(RuntimeError):
+    """Raised when a force-reset finds an UNEXPIRED drain lease under the wedge.
+
+    An unrecognized phase paired with a live drain lease is exactly the
+    version-skew shape where a NEWER updater generation legitimately moved into
+    a phase this build does not know while holding its (unexpired) drain -- it
+    may be mid-install right now. Tearing that lease and stamping ``idle``
+    would admit new critical work and drain claims UNDERNEATH a live container
+    replacement, so the reset refuses and the operator waits out the bounded
+    lease TTL instead; expiry (``_cleanup_expired``) then clears the lease and
+    a retry succeeds.
+    """
+
+
+@dataclass(frozen=True)
+class ForceResetResult:
+    """What a successful force-reset changed (for the caller's audit trail).
+
+    ``cleared_requested_action`` is the pre-reset ``requested_action`` iff it
+    was itself unrecognized and therefore normalized to ``"none"``; ``None``
+    when the stored action was known and preserved untouched.
+    """
+
+    old_phase: str
+    cleared_requested_action: str | None
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -465,7 +502,7 @@ class SqlUpdateCoordinationRepository:
         )
         return True
 
-    async def force_reset_phase(self, now: datetime) -> str | None:
+    async def force_reset_phase(self, now: datetime) -> ForceResetResult | None:
         """Re-anchor an UNRECOGNIZED coordinator phase to ``idle`` (issue #354).
 
         The recovery counterpart to the fail-closed unknown-phase guard every
@@ -478,44 +515,59 @@ class SqlUpdateCoordinationRepository:
         in-app button that ends it.
 
         Concurrency contract (the reason this lives in the repo, inside the
-        lock): it runs INSIDE :meth:`_lock` and RE-READS the phase after
-        acquiring the row lock, exactly like the guards it complements. The
-        wedge may have healed or moved between the caller's snapshot and this
-        transaction; a blind reset would then clobber whatever a concurrent
-        writer legitimately landed. So it acts ONLY when the re-read phase is
-        still unrecognized, and returns ``None`` (a no-op refusal) for ANY known
-        phase -- including a live ``draining`` / ``installing`` / ``rollback`` --
-        so it can never be turned into a footgun that resets an in-flight update.
+        lock): it runs INSIDE :meth:`_lock` and RE-READS the row after acquiring
+        the lock, exactly like the guards it complements. The wedge may have
+        healed or moved between the caller's snapshot and this transaction; a
+        blind reset would then clobber whatever a concurrent writer legitimately
+        landed. Two locked refusal predicates apply, in order:
 
-        On reset it mirrors the drain-release idle path (:meth:`release`)
-        exactly: delete any ``drain`` lease -- an unrecognized phase IS the
-        draining/installing/rollback window, so a stale drain row from the
-        wedged generation may linger, and an ``idle`` phase paired with a live
-        drain lease is itself an inconsistent state that would keep
-        :meth:`_active_drain` blocking every new claim/critical acquire until
-        TTL -- then stamp ``phase='idle'``. ``requested_action`` and every
-        image/generation field are PRESERVED, so a queued install survives for
-        retry exactly as :meth:`_cleanup_expired`'s crash-recovery path
-        preserves it. ``critical`` leases (independent app-side work) are never
-        touched.
+        1. A KNOWN phase -- including a live ``draining`` / ``installing`` /
+           ``rollback`` -- returns ``None`` (nothing wedged to recover), so this
+           can never be turned into a footgun that resets an in-flight update.
+        2. An UNEXPIRED drain lease under the unrecognized phase raises
+           :class:`DrainLeaseActiveError`. That pairing is the version-skew
+           shape where a NEWER updater generation is legitimately mid-operation
+           in a phase this build simply doesn't know; deleting its live lease
+           and stamping ``idle`` would admit new critical work and drain claims
+           underneath a possibly-live container replacement. The lease TTL
+           bounds the wait: :meth:`_cleanup_expired` (run here first) clears an
+           EXPIRED drain, so a retry after expiry proceeds. Only a dead lease
+           is ever swept out of the way, never a live one.
 
-        Returns the old unrecognized phase string on reset, or ``None`` when the
-        phase was already known (nothing to recover -- also the idempotent
+        On reset it stamps ``phase='idle'`` and normalizes ``requested_action``:
+        a KNOWN action (a queued ``install``/``check``) is PRESERVED for retry,
+        exactly as :meth:`_cleanup_expired`'s crash-recovery path preserves it,
+        but an action the same skew left UNRECOGNIZED is cleared to ``"none"`` --
+        otherwise the post-reset row would be un-wedged in phase yet still
+        permanently busy to :meth:`request_action` (any non-``none`` action
+        refuses new intent) while meaning nothing to eligibility. Image and
+        generation fields are preserved; ``critical`` leases (independent
+        app-side work) are never touched.
+
+        Returns a :class:`ForceResetResult` naming the old unrecognized phase
+        (and the cleared action, if any) on reset, or ``None`` when the phase
+        was already known (nothing to recover -- also the idempotent
         second-click answer once a first reset has landed ``idle``).
         """
         state = await self._lock()
         if state.phase in _KNOWN_COORDINATOR_PHASES:
             return None
+        await self._cleanup_expired(now)
+        if await self._active_drain() is not None:
+            raise DrainLeaseActiveError(state.phase)
         old_phase = state.phase
+        values: dict[str, object] = {"phase": "idle", "updated_at": now}
+        cleared_requested_action: str | None = None
+        if state.requested_action not in _KNOWN_REQUESTED_ACTIONS:
+            cleared_requested_action = state.requested_action
+            values["requested_action"] = "none"
         await self._session.execute(
-            delete(MaintenanceLease).where(MaintenanceLease.kind == "drain")
+            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
         )
-        await self._session.execute(
-            update(UpdateCoordinatorState)
-            .where(UpdateCoordinatorState.id == 1)
-            .values(phase="idle", updated_at=now)
+        return ForceResetResult(
+            old_phase=old_phase,
+            cleared_requested_action=cleared_requested_action,
         )
-        return old_phase
 
     async def acknowledge_action(
         self,

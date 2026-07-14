@@ -1296,3 +1296,37 @@ async def test_force_reset_requires_admin(
     app.state.update_coordinator = coordinator
     unauthenticated = await client.post("/api/v1/updates/force-reset")
     assert unauthenticated.status_code == 401
+
+
+async def test_force_reset_refuses_while_a_drain_lease_is_live(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """Codex P1 (#357): an unrecognized phase paired with an UNEXPIRED drain
+    lease may be a NEWER updater generation mid-install. The endpoint must
+    refuse with a distinct 409 -- lease intact, phase intact, no audit -- so
+    the operator waits out the bounded TTL instead of tearing a live op."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing")
+        )
+        await session.commit()
+
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_drain_active"
+
+    async with app.state.sessionmaker() as session:
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+        assert lease.kind == "drain"
+        assert (await session.execute(select(AuditLog))).scalars().all() == []
+    assert (await coordinator.snapshot()).phase == "future_installing"

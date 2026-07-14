@@ -177,6 +177,7 @@ function UpdatePanel({
           size="sm"
           loading={checkPending}
           disabled={
+            wedged ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -192,6 +193,7 @@ function UpdatePanel({
           size="sm"
           loading={updatePending}
           disabled={
+            wedged ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -207,9 +209,11 @@ function UpdatePanel({
         <div className="mt-4 rounded-lg border border-error/40 bg-error/5 px-3 py-3 text-xs">
           <p className="font-semibold text-error">Coordinator in an unrecognized state</p>
           <p className="mt-1 text-muted">
-            The updater can&apos;t check or install until this is cleared — usually the aftermath of
-            a version rollback. Recovering re-anchors it to idle so the controls work again; a
-            queued update is preserved for retry.
+            Check and install are disabled — they can only fail until this is cleared. It&apos;s
+            usually the aftermath of a version rollback. Recovering re-anchors the coordinator to
+            idle so the controls work again; a queued update is preserved for retry. If an update
+            is still mid-flight, recovery is refused until its maintenance lease expires (a few
+            minutes) — try again shortly.
           </p>
           <div className="mt-3">
             <Button
@@ -819,13 +823,15 @@ export function Status() {
           if (!next) setConfirmRecover(false)
         }}
         title="Recover the update coordinator?"
-        description="Re-anchors an unrecognized coordinator phase to idle so the updater controls work again. A queued update is preserved for retry; this is refused if the coordinator is already in a recognized state."
+        description="Re-anchors an unrecognized coordinator phase to idle so the updater controls work again. A queued update is preserved for retry; this is refused if the coordinator is already in a recognized state or an update maintenance lease is still active."
       >
         <div className="flex flex-col gap-4">
           <p className="text-sm text-muted">
             This clears a stuck coordinator state (typically left by a version rollback) and returns
             the updater to idle. It does nothing if an update is genuinely in flight — the server
-            refuses unless the phase is truly unrecognized.
+            refuses unless the phase is truly unrecognized, and refuses while an update maintenance
+            lease is still active (a possibly-live install). If that happens, wait a few minutes for
+            the lease to expire and try again.
           </p>
           <div className="flex justify-end gap-3">
             <Button

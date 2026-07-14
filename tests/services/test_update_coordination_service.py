@@ -20,8 +20,10 @@ from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.repositories.update_coordination import (
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
+    _KNOWN_REQUESTED_ACTIONS,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.services.update_coordination_service import (
+    DrainLeaseActiveError,
     MaintenanceDrainingError,
     MaintenanceLeaseLostError,
     UnknownCoordinatorPhaseError,
@@ -878,8 +880,11 @@ async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
         )
         await session.commit()
 
-    old_phase = await service.force_reset_coordinator_phase(actor_user_id=None)
-    assert old_phase == "future_installing"
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase == "future_installing"
+    # The queued action was KNOWN ("install"), so it was preserved, not cleared.
+    assert result.cleared_requested_action is None
 
     row = await _row(sessionmaker_)
     assert row.phase == "idle"
@@ -915,28 +920,104 @@ async def test_force_reset_refuses_every_known_phase_without_touching_state(
     assert await _audit_rows(sessionmaker_) == []
 
 
-async def test_force_reset_clears_drain_lease_but_preserves_critical_work(
+async def test_force_reset_refuses_while_an_unexpired_drain_lease_exists(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """Re-anchoring to idle must not leave the row idle-with-a-live-drain-lease
-    (an inconsistent state that would keep blocking every claim until TTL); the
-    stale drain lease is cleared. Independent app-side critical work is left
-    entirely alone."""
+    """An unrecognized phase paired with a LIVE drain lease is the version-skew
+    shape where a NEWER updater generation may be legitimately mid-install in a
+    phase this build doesn't know. Force-reset must refuse -- lease intact,
+    phase intact, nothing audited -- and let the bounded TTL run out instead of
+    tearing a possibly-live operation."""
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
-    critical = await service.acquire_critical("import", ttl=timedelta(minutes=5))
-    assert critical is not None
     claim = await service.claim_drain(ttl=timedelta(minutes=5))
     assert claim is not None
     await _plant_phase(sessionmaker_, "future_installing")
 
-    assert await service.force_reset_coordinator_phase(actor_user_id=None) == "future_installing"
+    with pytest.raises(DrainLeaseActiveError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_installing"
+    async with sessionmaker_() as session:
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert lease.kind == "drain"
+    assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_force_reset_proceeds_once_the_drain_lease_has_expired(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Once the wedged generation's drain lease expires, its ownership is gone
+    by definition and the reset proceeds: the EXPIRED drain lease is swept, the
+    phase re-anchors to idle, and an independent (unexpired) critical lease is
+    left entirely alone."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    critical = await service.acquire_critical("import", ttl=timedelta(minutes=60))
+    assert critical is not None
+    claim = await service.claim_drain(ttl=timedelta(minutes=1))
+    assert claim is not None
+    await _plant_phase(sessionmaker_, "future_installing")
+
+    clock.advance(timedelta(minutes=2))
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase == "future_installing"
 
     async with sessionmaker_() as session:
         leases = (await session.execute(select(MaintenanceLease))).scalars().all()
     kinds = sorted(lease.kind for lease in leases)
     assert kinds == ["critical"]
     assert (await _row(sessionmaker_)).phase == "idle"
+
+
+def test_known_requested_actions_track_update_action_exactly() -> None:
+    """Drift guard, mirroring the phases guard above: the repo's duplicated
+    known-requested-action literals can never silently diverge from ``"none"``
+    plus the authoritative ``UpdateAction`` enum."""
+    expected = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
+    assert expected == _KNOWN_REQUESTED_ACTIONS
+
+
+async def test_force_reset_clears_an_unrecognized_requested_action(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The same skew that wedges the phase can leave requested_action
+    unrecognized too. After a reset the phase is known again, but any
+    non-``none`` action makes ``request_action`` refuse new intent while
+    eligibility can't interpret it -- a second, quieter wedge. A successful
+    reset therefore normalizes an UNKNOWN action to ``none`` (and audits it);
+    the preserve-known-action case is covered by the recovery test above."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing", requested_action="future_action")
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase == "future_installing"
+    assert result.cleared_requested_action == "future_action"
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "none"
+    # The un-wedged coordinator accepts fresh operator intent again.
+    assert await service.request_action(UpdateAction.check) == row.action_generation + 1
+
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].old_value == {
+        "phase": "future_installing",
+        "requested_action": "future_action",
+    }
+    assert audit[0].new_value == {"phase": "idle", "requested_action": "none"}
 
 
 async def test_force_reset_double_click_is_idempotent(
@@ -948,7 +1029,9 @@ async def test_force_reset_double_click_is_idempotent(
     await service.initialize()
     await _plant_phase(sessionmaker_, "future_checking")
 
-    assert await service.force_reset_coordinator_phase(actor_user_id=None) == "future_checking"
+    first = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert first is not None
+    assert first.old_phase == "future_checking"
     assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
 
     assert (await _row(sessionmaker_)).phase == "idle"

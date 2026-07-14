@@ -13,6 +13,7 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    DrainLeaseActiveError,
     UnknownCoordinatorPhaseError,
     UpdateAction,
     UpdateCoordinationService,
@@ -279,15 +280,35 @@ async def force_reset_endpoint(
     only after re-reading the phase so a state that healed on its own is never
     blindly clobbered (north stars #1/#2: a button, never a terminal).
 
-    Fail-closed against misuse: if the coordinator is in ANY known phase --
-    including a live ``draining`` / ``installing`` / ``rollback`` -- there is
-    nothing wedged to recover, so it refuses with a 409 rather than resetting an
-    in-flight update. That refusal is also the honest, idempotent answer to a
-    double-click: the second call finds the now-``idle`` phase already known.
+    Fail-closed against misuse, twice over:
+
+    * If the coordinator is in ANY known phase -- including a live
+      ``draining`` / ``installing`` / ``rollback`` -- there is nothing wedged to
+      recover, so it refuses with 409 ``coordinator_phase_known`` rather than
+      resetting an in-flight update. That refusal is also the honest,
+      idempotent answer to a double-click: the second call finds the
+      now-``idle`` phase already known.
+    * If an UNEXPIRED drain lease exists under the unrecognized phase, a NEWER
+      updater generation may be legitimately mid-install in a phase this build
+      simply doesn't know; it refuses with 409 ``coordinator_drain_active``
+      instead of tearing a possibly-live operation. The lease TTL bounds the
+      wait -- an expired lease is swept and a retry then proceeds.
+
+    A successful reset also normalizes a ``requested_action`` the same skew
+    left unrecognized (cleared to ``none``; a known queued action is preserved
+    for retry), and is audit-logged.
     """
     coordinator = await _coordinator(request)
-    old_phase = await coordinator.force_reset_coordinator_phase(actor_user_id=auth.user_id)
-    if old_phase is None:
+    try:
+        result = await coordinator.force_reset_coordinator_phase(actor_user_id=auth.user_id)
+    except DrainLeaseActiveError as exc:
+        raise AppError(
+            status_code=409,
+            code="coordinator_drain_active",
+            message="An update maintenance lease is still active; the update may be mid-flight.",
+            hint="Wait for the lease to expire (a few minutes), then try again.",
+        ) from exc
+    if result is None:
         raise AppError(
             status_code=409,
             code="coordinator_phase_known",

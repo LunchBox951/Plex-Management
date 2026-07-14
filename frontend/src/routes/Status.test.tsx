@@ -367,7 +367,9 @@ describe('Status', () => {
     ;(useUpdateStatus as unknown as Mock).mockReturnValue({
       data: updateStatus({
         state: 'unavailable',
-        updater_available: false,
+        // A live heartbeat: the wedge ALONE must disable the normal controls
+        // below — they can only 409 against the fail-closed phase guard.
+        updater_available: true,
         blocker: 'coordinator_state_unknown',
       }),
       isLoading: false,
@@ -382,6 +384,11 @@ describe('Status', () => {
     // is suppressed because the wedge, not the sidecar, is the real blocker.
     expect(screen.getByText('Coordinator in an unrecognized state')).toBeInTheDocument()
     expect(screen.queryByText(/Enable the automatic-update Compose profile/)).not.toBeInTheDocument()
+
+    // The normal controls are disabled while wedged: recovery is the single
+    // actionable path, not a third button next to two that can only fail.
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
 
     // Clicking opens a confirm step — the reset does NOT fire on the first click.
     fireEvent.click(screen.getByRole('button', { name: 'Recover coordinator' }))
