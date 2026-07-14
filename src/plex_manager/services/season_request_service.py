@@ -312,8 +312,21 @@ async def ensure_seasons(
     tmdb_id: int,
     seasons: list[int],
     force_pending: bool = False,
+    present: frozenset[int] | None = None,
 ) -> list[SeasonRequestRecord]:
     """Idempotently create every season row in ``seasons``, then recompute the rollup.
+
+    ``present`` (issue #358 round 2): an optional PRE-FETCHED Plex season-presence
+    snapshot. When supplied (``is None`` check -- an empty frozenset is a real
+    "nothing present" answer), the internal ``_present_seasons`` crawl is skipped
+    entirely, making this call pure DB work. ``request_service``'s dedup-join
+    paths use this to crawl Plex BEFORE re-acquiring the per-media dedup lock and
+    then run this function's writes UNDER that lock -- network I/O must never run
+    inside the lock's open write transaction (SQLite single-writer, ADR-0007),
+    yet the season/rollup writes must be serialized with withdraw/cancel to keep
+    a concurrently-settled row from being resurrected. Callers passing it must
+    apply the SAME gating the internal crawl uses (no crawl when ``library`` is
+    ``None`` or ``force_pending`` -- pass ``frozenset()``/``None`` accordingly).
 
     Per season: when ``library`` is supplied and Plex already has that season
     (it is in the single ``present_seasons`` snapshot taken up front), the row is
@@ -429,11 +442,12 @@ async def ensure_seasons(
     with a LATER ``evicted`` history event for the show -- so stale download
     evidence cannot resurrect a ``completed_at`` that no current import supports.
     """
-    present: frozenset[int] = (
-        await _present_seasons(library, tmdb_id)
-        if library is not None and not force_pending
-        else frozenset()
-    )
+    if present is None:
+        present = (
+            await _present_seasons(library, tmdb_id)
+            if library is not None and not force_pending
+            else frozenset()
+        )
     season_repo = SqlSeasonRequestRepository(session)
     # Never trust a fresh Plex 'present' reading for a season the disk-pressure
     # sweep most recently reclaimed (ADR-0012): its row is committed 'evicted'

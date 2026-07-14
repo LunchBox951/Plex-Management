@@ -1660,8 +1660,25 @@ async def withdraw_participant(
         # per-season NotCancellableError guard) propagate uncaught -- nothing is
         # removed below if it raises.
         await cancel_request(session, qbt, request_id=request_id)
+        # #338: ``cancel_request`` commits the settle mid-body (and then runs its
+        # post-commit torrent-removal I/O), which RELEASES the media lock acquired at
+        # the top of this function. Re-acquire it and re-read the row + participants so
+        # the teardown writes below run under the SAME lock that guarded the decision --
+        # restoring the "decide + mutate under the media lock" invariant (#333 rounds
+        # 1-2) for the WHOLE withdrawal, not just the cancel. Deadlock-free: we hold no
+        # other row lock here (``cancel_request`` committed and released everything), so
+        # this is a fresh single media-lock acquisition, same ordering as every other
+        # path. A settled ``cancelled`` row is dedup-INACTIVE, so a create racing the
+        # released window forks a FRESH row rather than joining this one; the re-read
+        # confirms that (no new participant appears) instead of assuming it, and guards
+        # a future change to ``cancel_request``'s commit boundary from silently racing a
+        # dedup-join here.
+        await request_repo.acquire_media_lock(request.tmdb_id, request.media_type)
+        settled = await request_repo.get_fresh(request_id)
+        if settled is None:  # pragma: no cover - the just-cancelled row cannot vanish
+            raise RequestNotFoundError(request_id)
         await request_repo.remove_subscriber(request_id, user_id)
-        if request.user_id == user_id:
+        if settled.user_id == user_id:
             await request_repo.set_owner(request_id, None)
         await audit_service.record(
             session,
