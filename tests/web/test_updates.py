@@ -1009,6 +1009,37 @@ async def test_release_locked_op_rejects_phase_that_turned_unknown_after_snapsho
     assert lease.token_hash == hashlib.sha256(token.encode()).hexdigest()
 
 
+async def test_check_now_locked_request_action_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    # Heartbeat so the sidecar reads as connected and the request reaches its
+    # locked ``request_action`` write instead of short-circuiting on 503.
+    await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_checking"
+    )
+
+    response = await client.post("/api/v1/updates/check-now", headers=_ADMIN)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+    assert row.phase == "future_checking"
+    # The locked guard fired before any generation/action bump landed.
+    assert row.requested_action == "none"
+    assert row.action_generation == 0
+
+
 async def test_outcome_check_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
     app: FastAPI,
     client: httpx.AsyncClient,

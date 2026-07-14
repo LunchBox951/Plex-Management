@@ -710,6 +710,22 @@ async def test_touch_updater_rejects_unknown_phase_inside_the_lock(
     assert row.updater_last_seen_at is None
 
 
+async def test_request_action_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_phase(sessionmaker_, "future_available")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.request_action(UpdateAction.install)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_available"
+    assert row.requested_action == "none"
+    assert row.action_generation == 0
+
+
 async def test_claim_drain_rejects_unknown_phase_inside_the_lock(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -767,6 +783,29 @@ async def test_release_rejects_unknown_phase_inside_the_lock(
     async with sessionmaker_() as session:
         lease = (await session.execute(select(MaintenanceLease))).scalar_one()
     assert lease.token_hash == hashlib.sha256(claim.lease.token.encode()).hexdigest()
+
+
+async def test_release_of_critical_lease_succeeds_under_unknown_phase(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A critical release never rewrites ``phase``; it must stay reliable even
+    when a concurrent writer has left an unrecognized phase (issue #322). Failing
+    it closed would leak the lease to TTL and needlessly block idle-only claims
+    after the phase recovers, so the lease is cleared and the phase left as-is.
+    """
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    grant = await service.acquire_critical("import", ttl=timedelta(minutes=5))
+    assert grant is not None
+    await _plant_phase(sessionmaker_, "future_available")
+
+    assert await service.release(grant.token) is True
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_available"
+    async with sessionmaker_() as session:
+        leases = (await session.execute(select(MaintenanceLease))).scalars().all()
+    assert leases == []
 
 
 async def test_acknowledge_action_rejects_unknown_phase_inside_the_lock(

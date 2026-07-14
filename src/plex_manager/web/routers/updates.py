@@ -226,8 +226,11 @@ async def _request_action(
             message="The updater sidecar is not connected.",
             hint="Enable the automatic-update Compose profile, then try again.",
         )
+    # ``snapshot.phase not in _KNOWN_PHASES`` was fast-pathed above; this covers
+    # the TOCTOU window where the phase turns unknown between that snapshot and
+    # the locked ``request_action`` write (issue #322).
     try:
-        await coordinator.request_action(action)
+        await _guard_unknown_phase(coordinator.request_action(action))
     except UpdateOperationInProgressError as exc:
         raise AppError(
             status_code=409,
