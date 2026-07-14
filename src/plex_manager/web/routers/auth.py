@@ -37,14 +37,15 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.web.deps import (
-    API_KEY_HEADER_NAME,
     CSRF_COOKIE_NAME,
     PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
     AuthContext,
     AuthMethod,
     SettingsStore,
+    api_key_header,
     api_key_matches,
+    app_key_rotate_lock,
     authenticate_request,
     enforce_pre_init_setup_token,
     ensure_system_settings,
@@ -138,6 +139,7 @@ async def exchange_api_key_endpoint(
     response: Response,
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
+    provided: Annotated[str | None, Depends(api_key_header)],
 ) -> AuthMeResponse:
     """Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.
 
@@ -158,18 +160,47 @@ async def exchange_api_key_endpoint(
     the recovery key gets one.
     """
     _throttle_sign_in(request)
-    system = await load_system_settings(session)
-    expected = system.app_api_key if system is not None else None
-    provided = request.headers.get(API_KEY_HEADER_NAME)
-    if not api_key_matches(provided, expected):
-        raise AppError(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            code="invalid_api_key",
-            message="That access key was not accepted.",
-            hint="Check the recovery key from Settings → Access, then try again.",
-        )
-    await _issue_browser_session(session, response, request=request, user_id=None)
-    return _me_response(AuthContext(method=AuthMethod.api_key, is_admin=True))
+    # Serialize the key check + session mint against the app-key rotate/revoke
+    # critical section on the SAME ``app_key_rotate_lock`` those endpoints hold (issue
+    # #293 P2). Without it the exchange could validate ``provided`` against the OLD
+    # key, a concurrent rotate could then commit a new key while bulk-revoking only
+    # the recovery sessions that EXISTED at that moment, and this exchange would go on
+    # to insert a fresh recovery session minted from the now-stale key — a session that
+    # outlives the key it was born from. Holding the lock across the re-read, the
+    # ``api_key_matches`` check, and ``_issue_browser_session``'s insert+commit makes
+    # the two orderings mutually exclusive: if rotate wins the lock, the re-read below
+    # sees the NEW key and we reject; if the exchange wins, its session is committed
+    # BEFORE rotate runs, so rotate's bulk-revoke sweeps it up like any other. The
+    # ``load_system_settings`` here is the first DB read on this request's session
+    # (``_throttle_sign_in`` is pure in-memory), so it opens a fresh transaction inside
+    # the lock and observes any rotation that already committed.
+    async with app_key_rotate_lock:
+        system = await load_system_settings(session)
+        expected = system.app_api_key if system is not None else None
+        # The header is sourced via the shared ``APIKeyHeader`` dependency (issue #293
+        # finding 5) so the ``X-Api-Key`` requirement appears in the exported OpenAPI —
+        # a raw ``Request.headers.get`` left the contract silent and generated clients
+        # would omit the key and get an undocumented 401.
+        if not api_key_matches(provided, expected):
+            # A DISTINCT code from the generic ``invalid_api_key`` an expired session
+            # yields (issue #293 finding 2): a rejected/mistyped recovery key at this
+            # exchange endpoint must NOT trip the SPA's global "session expired ->
+            # bounce to Plex login" 401 handler, which would yank the operator off the
+            # break-glass key screen. The frontend branches on this code to keep the
+            # KeyEntry screen showing "key rejected" instead.
+            raise AppError(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                code="recovery_key_rejected",
+                message="That access key was not accepted.",
+                hint="Check the recovery key from Settings → Access, then try again.",
+            )
+        await _issue_browser_session(session, response, request=request, user_id=None)
+    # ``via_api_key_header=True``: the header itself authenticated this exchange (the
+    # cookie it just minted has authenticated nothing yet). Later requests ride the
+    # cookie and get ``False`` from ``_session_auth_context``.
+    return _me_response(
+        AuthContext(method=AuthMethod.api_key, is_admin=True, via_api_key_header=True)
+    )
 
 
 @router.get("/me")
@@ -199,13 +230,19 @@ async def logout_endpoint(
 
     token = request.cookies.get(SESSION_COOKIE_NAME)
     revoked_user_id: int | None = None
+    revoked_recovery = False
     if token:
         result = await session.execute(
             select(AuthSession).where(AuthSession.token_hash == hash_session_token(token))
         )
         auth_session = result.scalars().first()
         if auth_session is not None and auth_session.revoked_at is None:
-            revoked_user_id = auth_session.user_id
+            if auth_session.user_id is None:
+                # A recovery/break-glass session (``user_id IS NULL``): it carries
+                # no Plex identity, so it reports as ``api_key`` auth on the hub.
+                revoked_recovery = True
+            else:
+                revoked_user_id = auth_session.user_id
             auth_session.revoked_at = datetime.now(UTC)
             await session.commit()
     if revoked_user_id is not None:
@@ -214,6 +251,18 @@ async def logout_endpoint(
             reason="session_logged_out",
             auth_method=AuthMethod.plex_session.value,
             user_id=revoked_user_id,
+        )
+    elif revoked_recovery:
+        # Proactively close the recovery session's open SSE stream(s) instead of
+        # waiting for reconnect/expiry to catch the revoked cookie (issue #293
+        # finding 1). Recovery sessions carry no per-user identity on the hub, so
+        # this closes every ``api_key`` stream — the same granularity the app-key
+        # rotate/revoke path already uses; a header-authenticated automation client
+        # simply reconnects with its still-valid key.
+        close_realtime_streams(
+            request.app,
+            reason="session_logged_out",
+            auth_method=AuthMethod.api_key.value,
         )
     _clear_session_cookies(response, request=request)
 

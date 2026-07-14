@@ -4064,6 +4064,11 @@
             "description": "Successful Response"
           }
         },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "summary": "Exchange Api Key Endpoint",
         "tags": [
           "auth"

@@ -277,6 +277,23 @@ async def grab_endpoint(
             (row.status for row in season_rows if row.season_number == body.season),
             RequestStatus.pending.value,
         )
+        # issue #295: check cancelled/waiting_for_air_date BEFORE the coarse
+        # terminal-parent gate below, exactly the order grab_service.grab uses
+        # internally. Both are refused unconditionally regardless of the
+        # parent rollup — a cancelled/unaired season is never due — but
+        # `tv_grab_blocked_by_terminal_parent` only inspects `parent_status`
+        # first and returns False outright for a NON-terminal parent (e.g. a
+        # pending sibling elsewhere in the show), so checking it alone here
+        # let a cancelled/unaired season under a non-terminal parent fall
+        # through to `run_preview` below — a wasted indexer search for a
+        # season the operator explicitly stopped or that hasn't aired yet —
+        # before the deeper grab_service gate finally 409s. Rejecting these two
+        # statuses here, up front, closes that gap the same way grab_service
+        # already does.
+        if observed_season_status == RequestStatus.cancelled.value:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
+        if observed_season_status == RequestStatus.waiting_for_air_date.value:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="request_not_active")
         if grab_service.tv_grab_blocked_by_terminal_parent(
             parent_status=request.status,
             observed_season_status=observed_season_status,

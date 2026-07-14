@@ -930,7 +930,10 @@ async def test_api_key_exchange_wrong_key_rejected_no_cookie(
     response = await client.post("/api/v1/auth/api-key", headers={"X-Api-Key": "nope"})
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "invalid_api_key"
+    # A DISTINCT code from the expired-session 401 (issue #293 finding 2): the SPA
+    # branches on it so a mistyped recovery key does not trip the global "session
+    # expired -> bounce to Plex login" handler.
+    assert response.json()["detail"] == "recovery_key_rejected"
     assert response.cookies.get("plexmgr.session") is None
 
 
@@ -942,7 +945,7 @@ async def test_api_key_exchange_missing_key_rejected(
     response = await client.post("/api/v1/auth/api-key")
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "invalid_api_key"
+    assert response.json()["detail"] == "recovery_key_rejected"
 
 
 async def test_api_key_exchange_does_not_accept_plex_session(
@@ -965,7 +968,7 @@ async def test_api_key_exchange_does_not_accept_plex_session(
     # exchange must refuse rather than hand out an admin recovery session.
     response = await client.post("/api/v1/auth/api-key")
     assert response.status_code == 401
-    assert response.json()["detail"] == "invalid_api_key"
+    assert response.json()["detail"] == "recovery_key_rejected"
 
 
 async def test_api_key_exchange_throttled_after_limit(
@@ -1006,3 +1009,23 @@ async def test_openapi_advertises_both_cookie_and_apikey_auth(app: FastAPI) -> N
     # Safe cookie-auth operations do not need CSRF.
     queue_security = schema["paths"]["/api/v1/queue"]["get"]["security"]
     assert {"APIKeyCookie": []} in queue_security
+
+
+async def test_openapi_declares_api_key_header_on_recovery_exchange(app: FastAPI) -> None:
+    """The recovery-key exchange sources ``X-Api-Key`` via the shared
+    ``APIKeyHeader`` dependency (issue #293 finding 5), so the endpoint advertises
+    the requirement in OpenAPI — a raw ``Request.headers.get`` left the contract
+    silent and generated clients would omit the key and hit an undocumented 401.
+
+    It is HEADER-ONLY (issue #293 P2): the endpoint deliberately refuses the session
+    cookie (honouring it would let a non-admin mint an ADMIN recovery session), so the
+    app-wide cookie-security rewrite MUST leave this operation alone. The published
+    contract advertises ONLY ``APIKeyHeader`` — never the ``APIKeyCookie``/``CSRFHeader``
+    OR that every other unsafe operation gets.
+    """
+    schema = app.openapi()
+    security = schema["paths"]["/api/v1/auth/api-key"]["post"]["security"]
+    assert security == [{"APIKeyHeader": []}]
+    flattened = {scheme for requirement in security for scheme in requirement}
+    assert "APIKeyCookie" not in flattened
+    assert "CSRFHeader" not in flattened

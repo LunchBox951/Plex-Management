@@ -60,8 +60,19 @@ const authMiddleware: Middleware = {
     } else if (response.status === 401) {
       // The request relied on the browser session cookie (the only browser
       // credential now), which is missing/expired/revoked. Signal so the gate
-      // re-checks auth and shows the login again.
-      emit(AUTH_EXPIRED_EVENT)
+      // re-checks auth and shows the login again — UNLESS this is a rejected
+      // recovery-key EXCHANGE (`recovery_key_rejected`, issue #293 finding 2). A
+      // mistyped break-glass key is a wrong-secret to re-enter, not a lapsed
+      // session; firing the global "expired" signal there would yank the operator
+      // off the KeyEntry screen back to Plex login. KeyEntry handles that 401
+      // locally, so the global handler must stay silent for that one code.
+      void response
+        .clone()
+        .json()
+        .then((body: unknown) => {
+          if (!isDetail(body, 'recovery_key_rejected')) emit(AUTH_EXPIRED_EVENT)
+        })
+        .catch(() => emit(AUTH_EXPIRED_EVENT))
     }
     return response
   },
