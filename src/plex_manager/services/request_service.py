@@ -750,6 +750,16 @@ async def create_request_result(
         if not foreign:
             existing = await _subscribe_dedup_winner(session, repo, existing, user_id)
         existing = await _subscribe_user(session, repo, existing, user_id)
+        if user_id is None:
+            # API-key/automation caller (#358 Codex round 1): no subscriber row was
+            # written -- the ``_subscribe_*`` helpers are no-ops for a ``None`` user,
+            # so nothing above committed and the media lock taken at the top of this
+            # block would stay held past the quick dedup section: a movie return
+            # below would keep the write transaction open until the session closes,
+            # and the TV branch would carry the lock across ensure_seasons' TMDB/
+            # Plex work. Liveness was already re-read under the lock; release it NOW
+            # (only the lock acquisition is pending in this session here).
+            await session.rollback()
         if media_type == "tv":
             season_plan = await _resolve_tv_season_plan(
                 tmdb,
@@ -896,6 +906,12 @@ async def create_request_result(
                     existing_active = await _subscribe_dedup_winner(
                         session, repo, existing_active, user_id
                     )
+                if user_id is None:
+                    # API-key/automation caller (#358 Codex round 1): the subscribe
+                    # helper above was a no-op (no commit), so the media lock's write
+                    # transaction would stay open past this return until the session
+                    # closes. Nothing but the lock acquisition is pending -- release it.
+                    await session.rollback()
                 return CreateRequestResult(record=existing_active, created=False)
         if not force:
             # ``force`` never consults the eviction guard nor dedups onto a terminal
@@ -952,6 +968,11 @@ async def create_request_result(
                     # And an OWNERLESS in-library row (e.g. an X-Api-Key automation create)
                     # is subscribed for this requester, exactly like the active-dedup path.
                     in_library = await _subscribe_dedup_winner(session, repo, in_library, user_id)
+                    if user_id is None:
+                        # API-key/automation caller (#358 Codex round 1): same release
+                        # as the active-dedup return above -- the helper no-opped, so
+                        # the lock would otherwise be held until the session closes.
+                        await session.rollback()
                     return CreateRequestResult(record=in_library, created=False)
                 initial_status = RequestStatus.available.value
                 # Breadcrumb-gated corroboration (defense-in-depth for a
@@ -1261,6 +1282,17 @@ async def create_request_result(
         # automation provenance into destructive browser authority.
         if not foreign:
             winner = await _subscribe_dedup_winner(session, repo, winner, user_id)
+        if user_id is None:
+            # API-key/automation caller: there is NO subscriber row to write under
+            # the lock -- both ``_subscribe_*`` helpers are no-ops for a ``None``
+            # user, so neither committed, and the lock's write transaction would
+            # otherwise stay open past this quick recovery section (a movie return
+            # below would hold it until the session closes; the TV branch would
+            # carry it across the TMDB/Plex season work -- exactly what every other
+            # lock site here forbids). The liveness re-read is already done and
+            # nothing else is pending (the failed INSERT was rolled back above), so
+            # release the lock NOW; the rollback discards only the lock acquisition.
+            await session.rollback()
         if media_type == "tv":
             season_plan = await _resolve_tv_season_plan(
                 tmdb,

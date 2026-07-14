@@ -2003,6 +2003,182 @@ async def test_movie_in_library_foreign_dedup_subscribes_under_the_media_lock(
     _assert_subscribed_under_lock(events)
 
 
+# --------------------------------------------------------------------------- #
+# #358 Codex round 1: an API-key/automation caller (user_id None) writes NO    #
+# subscriber row -- the _subscribe_* helpers no-op without committing -- so    #
+# every lock-holding join path needs an explicit release before returning (or  #
+# before the TV branch's TMDB/Plex work). Without it the media lock's write    #
+# transaction stays open past the quick under-lock section.                    #
+# --------------------------------------------------------------------------- #
+
+
+async def test_integrity_recovery_api_key_join_releases_the_media_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flagged path: an X-Api-Key movie create loses the UNIQUE race, joins the
+    still-active winner in the IntegrityError recovery, and -- writing no subscriber
+    row -- must roll the lock acquisition back before returning, not hold the write
+    transaction open until the session closes."""
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=905, media_type=MediaType.movie, title="Blade", status=RequestStatus.pending
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    real_find_active = SqlRequestRepository.find_active
+    find_calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(movies={905: MovieMetadata(tmdb_id=905, title="Blade", year=1998)})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=905, media_type="movie"
+        )
+        assert record.id == winner_id  # joined the still-active winner
+        # The recovery released the lock before returning: no open transaction.
+        assert session.in_transaction() is False
+
+    async with sessionmaker_() as session:
+        subs = (await session.execute(select(RequestSubscriber))).scalars().all()
+    assert subs == []  # automation carries no user identity: nothing was subscribed
+
+
+async def test_integrity_recovery_api_key_tv_releases_the_lock_before_tmdb_work(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TV shape of the same leak: after the recovery's under-lock re-read, the
+    API-key path continues into ensure_seasons' TMDB/Plex season work -- the lock
+    must be released FIRST (never hold the lock's write transaction across network
+    I/O; the discipline every other lock site in this module documents)."""
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=906, media_type=MediaType.tv, title="Show", status=RequestStatus.pending
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    real_find_active = SqlRequestRepository.find_active
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    find_calls = {"n": 0}
+    lock_calls = {"n": 0}
+    tmdb_in_txn_after_lock: list[bool] = []
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    async def counting_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        lock_calls["n"] += 1
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", counting_acquire)
+
+    tmdb = FakeTmdb(shows={906: TvMetadata(tmdb_id=906, title="Show", year=2020, season_count=2)})
+    real_get_tv_show = tmdb.get_tv_show
+
+    session_box: dict[str, AsyncSession] = {}
+
+    async def probing_get_tv_show(tmdb_id: int) -> TvMetadata | None:
+        # Record whether the service session holds an open transaction at every
+        # TMDB call made AFTER the recovery lock was taken (pre-lock calls are the
+        # ordinary pre-create metadata resolution and carry no lock).
+        if lock_calls["n"] > 0 and "session" in session_box:
+            tmdb_in_txn_after_lock.append(session_box["session"].in_transaction())
+        return await real_get_tv_show(tmdb_id)
+
+    monkeypatch.setattr(tmdb, "get_tv_show", probing_get_tv_show)
+
+    async with sessionmaker_() as session:
+        session_box["session"] = session
+        record = await request_service.create_request(session, tmdb, tmdb_id=906, media_type="tv")
+    assert record.id == winner_id
+    assert lock_calls["n"] >= 1  # the recovery DID serialize under the lock
+    assert tmdb_in_txn_after_lock, "no post-lock TMDB call observed"
+    # Every TMDB call after the lock ran with the lock transaction already released.
+    assert all(t is False for t in tmdb_in_txn_after_lock)
+
+
+async def test_top_dedup_api_key_join_releases_the_media_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The top-of-function dedup twin: an X-Api-Key movie create deduping onto an
+    existing active row takes the lock, re-reads, writes nothing (no user identity)
+    -- and must not return with the lock's write transaction still open."""
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=907, media_type=MediaType.movie, title="Alien", status=RequestStatus.pending
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    tmdb = FakeTmdb(movies={907: MovieMetadata(tmdb_id=907, title="Alien", year=1979)})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=907, media_type="movie"
+        )
+        assert record.id == winner_id
+        assert session.in_transaction() is False
+
+
+async def test_movie_plex_present_api_key_dedup_releases_the_media_lock(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plex_present under-lock re-read twin: the top find_active misses (the
+    concurrent row commits after it), the in-library short-circuit's under-lock
+    re-read finds the active row, the API-key caller subscribes nothing -- and the
+    return must not hold the lock's write transaction open."""
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=908, media_type=MediaType.movie, title="Heat2", status=RequestStatus.pending
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = winner.id
+
+    real_find_active = SqlRequestRepository.find_active
+    find_calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+
+    tmdb = FakeTmdb(movies={908: MovieMetadata(tmdb_id=908, title="Heat2", year=2025)})
+    library = FakeLibrary(available={908})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=908, media_type="movie", library=library
+        )
+        assert record.id == winner_id  # deduped onto the concurrent active row
+        assert session.in_transaction() is False
+
+
 async def test_admin_dedup_onto_foreign_owned_tv_request_keeps_shared_behavior(
     sessionmaker_: SessionMaker,
 ) -> None:
