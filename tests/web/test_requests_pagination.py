@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.models import (
@@ -265,6 +266,29 @@ async def test_admin_page_membership_is_scoped_to_the_page_ids(
     flags = {r["id"]: r["can_withdraw"] for r in body["requests"]}
     for rid in page_ids:
         assert flags[rid] is (rid in set(subscribed))  # membership still truthful
+
+
+async def test_shared_user_page_plan_range_walks_the_composite_index(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """#369 Codex round 2: the shared-user page query must let SQLite range-walk
+    ``ix_request_subscribers_user_id_request_id`` (keyset + ORDER BY on the
+    subscriber side of the join) -- never index only the ``user_id = ?`` equality
+    and then temp-B-tree-sort ALL the user's subscription rows per page. Compiles
+    the EXACT production statement (module-level ``_page_stmt``) and pins its
+    EXPLAIN QUERY PLAN."""
+    page_stmt = getattr(requests_repo_module, "_page_stmt")  # noqa: B009 - private, pinned deliberately
+    stmt = page_stmt(for_user_id=1, before_id=1000, limit=51)
+    sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    async with sessionmaker_() as session:
+        rows = (await session.execute(sa_text("EXPLAIN QUERY PLAN " + sql))).all()
+    plan = " | ".join(str(row[-1]) for row in rows)
+    # The composite index serves BOTH the user equality and the keyset range...
+    assert "ix_request_subscribers_user_id_request_id" in plan, plan
+    assert "request_id<" in plan.replace(" ", ""), plan
+    # ...and the descending index walk provides the order: no per-page sort of
+    # the user's whole subscription set.
+    assert "USE TEMP B-TREE" not in plan, plan
 
 
 async def test_page_bounds_row_materialization(
