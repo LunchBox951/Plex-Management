@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Final, Literal, cast
 from urllib.parse import quote
@@ -47,6 +48,7 @@ from plex_manager.services import (
     log_capture_service,
     queue_service,
     retention_telemetry_service,
+    session_lifecycle,
     watchlist_service,
 )
 from plex_manager.services.health_service import (
@@ -854,6 +856,31 @@ async def _log_drain_loop(app: FastAPI) -> None:
         await asyncio.sleep(log_capture_service.LOG_DRAIN_INTERVAL_SECONDS)
 
 
+async def _session_sweep_loop(app: FastAPI) -> None:
+    """Sibling background task reaping dead ``auth_sessions`` rows (issue #56).
+
+    Revoked / expired / idle-timed-out sessions are kept inline (never deleted at
+    logout or revocation, so revocation stays auditable), so without this loop the
+    table would grow without bound. :func:`session_lifecycle.sweep_dead_sessions`
+    deletes only rows that are BOTH permanently unusable AND past the retention
+    grace, so a just-revoked session survives as an audit record for a while
+    before being reclaimed. Mirrors ``_log_drain_loop``'s retention prune: one bad
+    cycle is caught and logged, never allowed to kill the loop.
+    """
+    sessionmaker = app.state.sessionmaker
+    while True:
+        try:
+            async with sessionmaker() as session:
+                deleted = await session_lifecycle.sweep_dead_sessions(
+                    session, now=datetime.now(UTC)
+                )
+                if deleted:
+                    _logger.info("swept %d dead auth_session row(s)", deleted)
+        except Exception:
+            _logger.exception("session sweep tick failed; continuing")
+        await asyncio.sleep(session_lifecycle.SESSION_SWEEP_INTERVAL_SECONDS)
+
+
 async def _eviction_tick(app: FastAPI) -> float:
     """Run one destructive eviction pass unless updater maintenance is draining."""
     coordinator = await _ensure_update_coordinator(app)
@@ -1430,12 +1457,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     log_drain_task = asyncio.create_task(_log_drain_loop(app))
     eviction_task = asyncio.create_task(_eviction_loop(app))
     watchlist_task = asyncio.create_task(_watchlist_sync_loop(app))
+    session_sweep_task = asyncio.create_task(_session_sweep_loop(app))
     background_tasks = (
         reconcile_task,
         autograb_task,
         log_drain_task,
         eviction_task,
         watchlist_task,
+        session_sweep_task,
     )
     try:
         yield

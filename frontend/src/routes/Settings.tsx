@@ -1,14 +1,18 @@
 import { type ReactNode, useEffect, useState } from 'react'
 import {
+  useActiveSessions,
   useAppKeyStatus,
   useOpsHealth,
   useRevokeAppKey,
+  useRevokeRecoverySessions,
+  useRevokeUserSessions,
   useRotateAppKey,
   usePlexLibraries,
   useSettings,
   useUpdateSettings,
 } from '../api/hooks'
 import type {
+  ActiveSessionUser,
   AutomaticUpdateWeekday,
   SettingsResponse,
   SettingsUpdate,
@@ -542,6 +546,189 @@ function AccessSection() {
           </Button>
           <Button variant="danger" loading={revoke.isPending} onClick={() => void handleRevoke()}>
             Revoke key
+          </Button>
+        </div>
+      </Dialog>
+    </section>
+  )
+}
+
+/** Format a session's last-seen timestamp, honestly blank when never recorded. */
+function formatLastSeen(value: string | null): string {
+  if (value === null) return 'unknown'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return 'unknown'
+  return parsed.toLocaleString()
+}
+
+/**
+ * Settings → Signed-in sessions (issue #56). ADR-0016 sessions validate LOCALLY
+ * — plex.tv is never on the per-request path — so a removed or demoted Plex user
+ * keeps working until their session is revoked. This is the web-operable lever
+ * for that: the admin sees who is currently signed in and can cut a user's
+ * sessions on demand. Revoking your OWN account (flagged "you") simply signs you
+ * out — never a lockout, since Plex sign-in and the recovery key can always mint
+ * a fresh session.
+ */
+function SessionsSection() {
+  const sessions = useActiveSessions()
+  const revoke = useRevokeUserSessions()
+  const revokeRecovery = useRevokeRecoverySessions()
+  const { toast } = useToast()
+  const [confirmUser, setConfirmUser] = useState<ActiveSessionUser | null>(null)
+  const [confirmRecovery, setConfirmRecovery] = useState(false)
+
+  const handleRevoke = async (user: ActiveSessionUser) => {
+    try {
+      await revoke.mutateAsync(user.user_id)
+      setConfirmUser(null)
+      toast({ title: `Revoked ${user.username}'s sessions`, intent: 'success' })
+    } catch (err) {
+      toast({ title: 'Revoke failed', description: (err as ApiError).message, intent: 'error' })
+    }
+  }
+
+  const handleRevokeRecovery = async () => {
+    try {
+      await revokeRecovery.mutateAsync()
+      setConfirmRecovery(false)
+      toast({ title: 'Revoked recovery sessions', intent: 'success' })
+    } catch (err) {
+      toast({ title: 'Revoke failed', description: (err as ApiError).message, intent: 'error' })
+    }
+  }
+
+  const users = sessions.data?.users ?? []
+  const recovery = sessions.data?.recovery ?? null
+
+  return (
+    <section className="rounded-xl border border-hairline bg-surface p-5">
+      <h2 className="font-display text-sm font-semibold text-ink">Signed-in sessions</h2>
+      <p className="mt-1 text-xs text-faint">
+        Everyone with an active browser session. Sessions are validated locally, so revoking is how
+        you cut off a removed or demoted Plex user before their session expires.
+      </p>
+
+      <div className="mt-4">
+        {sessions.isLoading ? (
+          <p className="text-xs text-faint">Loading sessions…</p>
+        ) : sessions.isError ? (
+          <div className="flex flex-col gap-3">
+            <AuthErrorCard error={sessions.error} />
+            <div>
+              <Button variant="secondary" onClick={() => void sessions.refetch()}>
+                Retry
+              </Button>
+            </div>
+          </div>
+        ) : users.length === 0 && recovery === null ? (
+          <p className="text-xs text-faint">No one is signed in right now.</p>
+        ) : (
+          <ul className="flex flex-col divide-y divide-hairline">
+            {users.map((user) => (
+              <li
+                key={user.user_id}
+                className="flex flex-wrap items-center justify-between gap-3 py-3"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-ink">{user.username}</span>
+                    {user.is_admin ? (
+                      <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                        admin
+                      </span>
+                    ) : null}
+                    {user.is_current_user ? (
+                      <span className="rounded bg-gold/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gold">
+                        you
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-0.5 text-xs text-faint">
+                    {user.session_count} active {user.session_count === 1 ? 'session' : 'sessions'} ·
+                    last seen {formatLastSeen(user.last_seen_at)}
+                  </div>
+                </div>
+                <Button variant="secondary" size="sm" onClick={() => setConfirmUser(user)}>
+                  Revoke
+                </Button>
+              </li>
+            ))}
+            {recovery !== null ? (
+              <li className="flex flex-wrap items-center justify-between gap-3 py-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-ink">Recovery key</span>
+                    <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                      admin
+                    </span>
+                    <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                      no Plex identity
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-xs text-faint">
+                    {recovery.session_count} active{' '}
+                    {recovery.session_count === 1 ? 'session' : 'sessions'} · last seen{' '}
+                    {formatLastSeen(recovery.last_seen_at)}
+                  </div>
+                </div>
+                <Button variant="secondary" size="sm" onClick={() => setConfirmRecovery(true)}>
+                  Revoke
+                </Button>
+              </li>
+            ) : null}
+          </ul>
+        )}
+      </div>
+
+      <Dialog
+        open={confirmUser !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmUser(null)
+        }}
+        title={confirmUser === null ? '' : `Revoke ${confirmUser.username}'s sessions?`}
+      >
+        <p className="text-sm text-muted">
+          {confirmUser?.is_current_user
+            ? 'This is your own account — revoking signs you out of this browser. You can sign back in with Plex (or the recovery key) at any time.'
+            : 'Every one of this user’s active sessions is cut immediately. They can sign in again with Plex whenever access allows.'}
+        </p>
+        <div className="mt-6 flex justify-end gap-3">
+          <Button variant="secondary" onClick={() => setConfirmUser(null)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            loading={revoke.isPending}
+            onClick={() => {
+              if (confirmUser !== null) void handleRevoke(confirmUser)
+            }}
+          >
+            Revoke sessions
+          </Button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={confirmRecovery}
+        onOpenChange={setConfirmRecovery}
+        title="Revoke recovery sessions?"
+      >
+        <p className="text-sm text-muted">
+          Every active recovery session (from exchanging the recovery key) is cut immediately. If
+          you are signed in with the recovery key yourself, this signs you out. Exchange the
+          recovery key again to get back in.
+        </p>
+        <div className="mt-6 flex justify-end gap-3">
+          <Button variant="secondary" onClick={() => setConfirmRecovery(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            loading={revokeRecovery.isPending}
+            onClick={() => void handleRevokeRecovery()}
+          >
+            Revoke sessions
           </Button>
         </div>
       </Dialog>
@@ -1416,6 +1603,8 @@ export function Settings() {
       </div>
 
       <AccessSection />
+
+      <SessionsSection />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <section className="rounded-[10px] border border-hairline bg-surface p-4">

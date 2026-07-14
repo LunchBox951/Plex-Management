@@ -3,8 +3,10 @@ import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
+  ActiveSessionUser,
   HealthResponse,
   PlexLibraryOption,
+  RecoverySessionGroup,
   SettingsResponse,
   SettingsUpdate,
 } from '../api/types'
@@ -27,6 +29,18 @@ const h = vi.hoisted(() => ({
   revokeMutateAsync: vi.fn(),
   rotatePending: false,
   revokePending: false,
+  // Settings → Signed-in sessions (issue #56). Empty active-session list by
+  // default; a test can populate it to exercise the revoke control.
+  activeSessions: [] as ActiveSessionUser[],
+  recoverySessions: null as RecoverySessionGroup | null,
+  sessionsLoading: false,
+  sessionsIsError: false,
+  sessionsError: null as ApiError | null,
+  sessionsRefetch: vi.fn(),
+  revokeSessionsMutateAsync: vi.fn(),
+  revokeSessionsPending: false,
+  revokeRecoveryMutateAsync: vi.fn(),
+  revokeRecoveryPending: false,
   // Settings → Access recovery-key status ({ exists }). A mutable flag so a
   // generate/revoke mock can flip it; the ensuing re-render reflects the new
   // state (the status endpoint only ever reports existence, never the key).
@@ -74,6 +88,24 @@ vi.mock('../api/hooks', () => ({
   }),
   useRotateAppKey: () => ({ mutateAsync: h.rotateMutateAsync, isPending: h.rotatePending }),
   useRevokeAppKey: () => ({ mutateAsync: h.revokeMutateAsync, isPending: h.revokePending }),
+  useActiveSessions: () => ({
+    data:
+      h.sessionsLoading || h.sessionsIsError
+        ? undefined
+        : { users: h.activeSessions, recovery: h.recoverySessions },
+    isLoading: h.sessionsLoading,
+    isError: h.sessionsIsError,
+    error: h.sessionsError,
+    refetch: h.sessionsRefetch,
+  }),
+  useRevokeUserSessions: () => ({
+    mutateAsync: h.revokeSessionsMutateAsync,
+    isPending: h.revokeSessionsPending,
+  }),
+  useRevokeRecoverySessions: () => ({
+    mutateAsync: h.revokeRecoveryMutateAsync,
+    isPending: h.revokeRecoveryPending,
+  }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -91,6 +123,16 @@ beforeEach(() => {
   h.healthError = null
   h.healthFetching = false
   h.healthRefetch.mockReset()
+  h.activeSessions = []
+  h.recoverySessions = null
+  h.sessionsLoading = false
+  h.sessionsIsError = false
+  h.sessionsError = null
+  h.sessionsRefetch.mockReset()
+  h.revokeSessionsMutateAsync.mockReset()
+  h.revokeSessionsPending = false
+  h.revokeRecoveryMutateAsync.mockReset()
+  h.revokeRecoveryPending = false
 })
 
 function lastBody(): SettingsUpdate {
@@ -1292,5 +1334,117 @@ describe('Settings — Access recovery key (opt-in, ADR-0016)', () => {
     )
     // No dead key painted as if the rotation had succeeded.
     expect(screen.queryByText(CAPTION)).not.toBeInTheDocument()
+  })
+})
+
+describe('Settings — Signed-in sessions (issue #56)', () => {
+  beforeEach(() => {
+    h.settingsData = CONFIGURED_SERVICES
+  })
+
+  function sessionsSection() {
+    const section = screen.getByRole('heading', { name: 'Signed-in sessions' }).closest('section')
+    if (section === null) throw new Error('sessions section not found')
+    return within(section)
+  }
+
+  it('lists active users and flags the current admin', () => {
+    h.activeSessions = [
+      {
+        user_id: 1,
+        plex_id: 42,
+        username: 'owner',
+        is_admin: true,
+        session_count: 2,
+        last_seen_at: '2026-07-13T10:00:00Z',
+        is_current_user: true,
+      },
+      {
+        user_id: 2,
+        plex_id: 99,
+        username: 'guest',
+        is_admin: false,
+        session_count: 1,
+        last_seen_at: null,
+        is_current_user: false,
+      },
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    const section = sessionsSection()
+    expect(section.getByText('owner')).toBeInTheDocument()
+    expect(section.getByText('you')).toBeInTheDocument()
+    expect(section.getByText(/2 active sessions/)).toBeInTheDocument()
+    expect(section.getByText(/1 active session/)).toBeInTheDocument()
+    expect(section.getByText(/last seen unknown/)).toBeInTheDocument()
+  })
+
+  it('shows an honest empty state when nobody is signed in', () => {
+    h.activeSessions = []
+    render(<Settings />, { wrapper: Wrapper })
+    expect(sessionsSection().getByText(/No one is signed in/)).toBeInTheDocument()
+  })
+
+  it('confirms then revokes a target user, and toasts success', async () => {
+    h.revokeSessionsMutateAsync.mockResolvedValue(undefined)
+    h.activeSessions = [
+      {
+        user_id: 2,
+        plex_id: 99,
+        username: 'guest',
+        is_admin: false,
+        session_count: 1,
+        last_seen_at: null,
+        is_current_user: false,
+      },
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(sessionsSection().getByRole('button', { name: 'Revoke' }))
+    // The confirm dialog names the user; confirming calls the mutation with the id.
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke sessions' }))
+    await waitFor(() => expect(h.revokeSessionsMutateAsync).toHaveBeenCalledWith(2))
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ intent: 'success' }),
+    )
+  })
+
+  it('warns that revoking your own account signs you out', () => {
+    h.activeSessions = [
+      {
+        user_id: 1,
+        plex_id: 42,
+        username: 'owner',
+        is_admin: true,
+        session_count: 1,
+        last_seen_at: '2026-07-13T10:00:00Z',
+        is_current_user: true,
+      },
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(sessionsSection().getByRole('button', { name: 'Revoke' }))
+    expect(screen.getByText(/signs you out of this browser/)).toBeInTheDocument()
+  })
+
+  it('renders the recovery-session group with no Plex identity', () => {
+    h.activeSessions = []
+    h.recoverySessions = { session_count: 2, last_seen_at: '2026-07-13T10:00:00Z' }
+    render(<Settings />, { wrapper: Wrapper })
+    const section = sessionsSection()
+    expect(section.getByText('Recovery key')).toBeInTheDocument()
+    expect(section.getByText('no Plex identity')).toBeInTheDocument()
+    expect(section.getByText(/2 active sessions/)).toBeInTheDocument()
+    // Not the empty state — the recovery group counts as signed-in.
+    expect(section.queryByText(/No one is signed in/)).not.toBeInTheDocument()
+  })
+
+  it('confirms then revokes the recovery group, and toasts success', async () => {
+    h.revokeRecoveryMutateAsync.mockResolvedValue(undefined)
+    h.recoverySessions = { session_count: 1, last_seen_at: null }
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.click(sessionsSection().getByRole('button', { name: 'Revoke' }))
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText(/Revoke recovery sessions\?/i)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke sessions' }))
+    await waitFor(() => expect(h.revokeRecoveryMutateAsync).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(expect.objectContaining({ intent: 'success' }))
   })
 })

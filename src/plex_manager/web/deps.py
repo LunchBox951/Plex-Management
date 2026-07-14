@@ -47,8 +47,8 @@ import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.datastructures import State
 
@@ -70,7 +70,7 @@ from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
-from plex_manager.services import log_capture_service, path_visibility
+from plex_manager.services import log_capture_service, path_visibility, session_lifecycle
 from plex_manager.services.health_service import (
     AutograbStatus,
     ReconcileStatus,
@@ -275,6 +275,13 @@ class AuthContext:
     is_admin: bool = False
     session_expires_at: datetime | None = None
     via_api_key_header: bool = False
+    # For a browser session, the instant it idles out (effective ``last_seen`` +
+    # ``SESSION_IDLE_WINDOW``), computed at auth time. REST requests enforce the
+    # idle window per-request; a long-lived SSE stream caps its lease at
+    # ``min(session_expires_at, session_idle_deadline)`` so an idle session's
+    # stream cannot outlive the idle window (issue #56). ``None`` for the
+    # stateless header ``X-Api-Key`` path, which has no idle notion.
+    session_idle_deadline: datetime | None = None
 
 
 # The canonical config keys (also the ``settings.key`` values and the wire field
@@ -903,6 +910,65 @@ def _normalize_dt(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+async def _maybe_refresh_last_seen(
+    session: AsyncSession, auth_session: AuthSession, now: datetime
+) -> datetime:
+    """Slide the session's idle window forward, throttled (issue #56).
+
+    Writes ``last_seen_at = now`` only when the stored value is older than
+    ``SESSION_LAST_SEEN_REFRESH_INTERVAL``, so ordinary request traffic costs at
+    most one small UPDATE per interval, not one per request. A targeted UPDATE
+    (not an ORM mutation) keeps this independent of whatever the request's own
+    unit of work later stages; the commit is safe because auth resolves as a
+    dependency BEFORE the endpoint body runs, so nothing else is pending yet.
+    Best-effort: this runs on both the pooled request session and the
+    open-and-close short session used by long-lived SSE streams — on the latter
+    the commit persists just as well since the session is still open here.
+
+    Returns the effective ``last_seen`` the caller should measure the idle window
+    from: ``now`` when the refresh committed, else the stored value.
+
+    A failed refresh (e.g. SQLite write-lock contention) must NEVER fail an
+    otherwise-valid read-only request — the session already passed every validity
+    check above, and this write is pure bookkeeping. So the write is wrapped:
+    on failure we roll back the aborted transaction and log (no secrets), leaving
+    the stored ``last_seen`` untouched (a later request retries the refresh), and
+    return the pre-refresh effective value so the idle deadline stays honest.
+
+    EXPIRY HAZARD: ``rollback()`` expires every ORM instance loaded in the
+    session, including ``auth_session`` — a plain attribute read afterwards
+    triggers an async lazy refresh outside greenlet context and raises
+    ``MissingGreenlet``, i.e. the exact write-lock scenario this handler
+    tolerates would still fail the request, just with a different exception. So
+    every scalar needed after the attempt is captured BEFORE it (``session_id``,
+    ``effective``), and no ``auth_session`` attribute is touched after the
+    rollback — the CALLER must obey the same rule (see ``_session_auth_context``,
+    which snapshots ``user_id`` before invoking this).
+    """
+    effective = session_lifecycle.session_effective_last_seen(auth_session)
+    if now - effective < session_lifecycle.SESSION_LAST_SEEN_REFRESH_INTERVAL:
+        return effective
+    session_id = auth_session.id
+    try:
+        await session.execute(
+            update(AuthSession).where(AuthSession.id == session_id).values(last_seen_at=now)
+        )
+        await session.commit()
+    except SQLAlchemyError:
+        # Best-effort bookkeeping only — do not fail auth. Roll back so the
+        # session is usable for the rest of the request, and keep the old
+        # effective value (the idle window simply hasn't slid this time).
+        await session.rollback()
+        _logger.warning(
+            "failed to refresh session last_seen_at (id=%s); leaving idle window "
+            "unchanged, auth proceeds",
+            session_id,
+            exc_info=True,
+        )
+        return effective
+    return now
+
+
 async def _session_auth_context(
     request: Request,
     session: AsyncSession,
@@ -926,9 +992,27 @@ async def _session_auth_context(
     expires_at = _normalize_dt(auth_session.expires_at)
     if expires_at <= now:
         return None
+    # Sliding idle window (issue #56), enforced ON TOP of the absolute
+    # ``expires_at`` cap: a session that has not been seen within
+    # ``SESSION_IDLE_WINDOW`` is dead even if the 30-day cap has not passed. The
+    # cap still bounds the maximum lifetime; this bounds inactivity.
+    if session_lifecycle.session_is_idle_expired(auth_session, now=now):
+        return None
     if enforce_csrf:
         _require_csrf_for_session(request)
-    if auth_session.user_id is None:
+    # Snapshot every ``auth_session`` scalar read below BEFORE the refresh: its
+    # failure path rolls back, and rollback EXPIRES all loaded instances — a
+    # later plain attribute read would lazy-refresh outside greenlet context and
+    # raise ``MissingGreenlet``, failing the very request the refresh handler
+    # exists to protect (see the EXPIRY HAZARD note on ``_maybe_refresh_last_seen``).
+    user_id = auth_session.user_id
+    # Refresh ``last_seen_at`` on this authenticated activity, throttled so a busy
+    # tab writes at most once per ``SESSION_LAST_SEEN_REFRESH_INTERVAL`` rather
+    # than once per request. Done only after every validity + CSRF check passes,
+    # so a rejected request never slides the window forward.
+    effective_last_seen = await _maybe_refresh_last_seen(session, auth_session, now)
+    idle_deadline = effective_last_seen + session_lifecycle.SESSION_IDLE_WINDOW
+    if user_id is None:
         # A recovery session: minted by exchanging a valid ``X-Api-Key`` for this
         # HTTP-only cookie (``POST /auth/api-key``, CodeQL #263). It carries the
         # recovery key's admin authority with no Plex identity — reported exactly
@@ -944,8 +1028,9 @@ async def _session_auth_context(
             is_admin=True,
             session_expires_at=expires_at,
             via_api_key_header=False,
+            session_idle_deadline=idle_deadline,
         )
-    user = await session.get(User, auth_session.user_id)
+    user = await session.get(User, user_id)
     if user is None:
         # The owning user row was deleted out from under a still-live session
         # (ondelete=CASCADE normally removes both together; this guards the race).
@@ -959,6 +1044,7 @@ async def _session_auth_context(
         avatar_url=user.avatar_url,
         is_admin=user.permissions > 0,
         session_expires_at=expires_at,
+        session_idle_deadline=idle_deadline,
     )
 
 
