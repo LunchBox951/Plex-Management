@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.models import User, WatchlistItem
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import PLEX_MACHINE_ID_SETTING, SettingsStore
@@ -157,6 +158,318 @@ async def test_watchlist_tick_reports_not_configured_without_tmdb(
     assert status.last_ok_at is None
 
 
+async def test_unconfigured_server_clears_stale_snapshot(app: FastAPI, seed: SeedFn) -> None:
+    """A truly unconfigured server (no url/token AND no cached identifier -- an
+    operator explicitly walked away from Plex) must clear existing watchlist
+    snapshot rows: they can never be revalidated against a server that no
+    longer exists in config, so keeping them would protect titles from
+    eviction indefinitely (issue #327 facet 2)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="orphaned-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "not_configured"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert remaining == []
+
+
+async def test_reconfigure_mid_tick_prevents_spurious_snapshot_clear(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent settings PUT that reconfigures Plex in the gap between the
+    tick's ``not_configured`` read and its destructive snapshot clear must not
+    lose the race: the re-confirm immediately before the delete retains the
+    snapshot for the next tick to re-evaluate instead of clearing it out from
+    under a config that is valid again by the time the delete runs (issue
+    #327 adversarial race review)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    real_resolve = app_module._resolve_watchlist_server_identity  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def flaky_resolve(
+        store: SettingsStore, plex_tv: PlexTvClient
+    ) -> app_module._ServerIdentityResolution:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await real_resolve(store, plex_tv)  # unconfigured, as seeded
+        # A concurrent settings PUT reconfigures Plex between the two reads.
+        async with app.state.sessionmaker() as reconfigure_session:
+            await SettingsStore(reconfigure_session).set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+            await reconfigure_session.commit()
+        return await real_resolve(store, plex_tv)
+
+    monkeypatch.setattr(app_module, "_resolve_watchlist_server_identity", flaky_resolve)
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    assert calls == 2
+    assert app.state.watchlist_status.state == "not_configured"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+async def test_configure_committed_after_reconfirm_still_refuses_clear(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residual TOCTOU (Codex round 3 on #360): the reconfirm read is a
+    plain read and the delete happens in a LATER await, so a settings PUT
+    committing configuration in exactly that window slips past every read-side
+    guard -- both reads honestly said "unconfigured". The delete itself must
+    therefore refuse: it is a single statement predicated on the settings rows,
+    so the committed ``plex_url`` is visible to the DELETE's own snapshot and
+    the rows survive by construction, not by window-shrinking."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    real_resolve = app_module._resolve_watchlist_server_identity  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def resolve_then_configure(
+        store: SettingsStore, plex_tv: PlexTvClient
+    ) -> app_module._ServerIdentityResolution:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        calls += 1
+        result = await real_resolve(store, plex_tv)  # unconfigured, as seeded
+        if calls == 2:
+            # The reconfirm read has ALREADY produced its (stale) answer; a
+            # concurrent PUT now commits a configuration before the tick's
+            # next await reaches the delete statement.
+            async with app.state.sessionmaker() as configure_session:
+                configure_store = SettingsStore(configure_session)
+                await configure_store.set("plex_url", "http://plex.example.com:32400")
+                await configure_store.set("plex_token", "service-token")
+                await configure_session.commit()
+        return result
+
+    monkeypatch.setattr(app_module, "_resolve_watchlist_server_identity", resolve_then_configure)
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    assert calls == 2
+    assert app.state.watchlist_status.state == "not_configured"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+async def test_reconfigure_mid_tick_with_failing_probe_retains_snapshot(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Race-guard tri-state (Codex review on #360): a concurrent settings PUT
+    configures ``plex_url``/``plex_token`` in the gap between the tick's
+    unconfigured read and the destructive clear, but the re-confirm read's
+    live probe FAILS at that instant -- resolving to no identifier WITH a
+    probe error. That is configured-but-unreachable, not absent: the guard
+    must require BOTH legs empty before clearing, so the snapshot is retained
+    and the tick reports ``probe_failed`` instead of deleting eviction
+    protection during an outage."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # The server configured mid-gap is unreachable: any /identity probe fails.
+    def _unreachable(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/identity":
+            raise httpx.ConnectError("plex server unreachable", request=request)
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable))
+
+    real_resolve = app_module._resolve_watchlist_server_identity  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def flaky_resolve(
+        store: SettingsStore, plex_tv: PlexTvClient
+    ) -> app_module._ServerIdentityResolution:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await real_resolve(store, plex_tv)  # unconfigured, as seeded
+        # A concurrent settings PUT configures Plex between the two reads --
+        # but the new server is unreachable, so the re-confirm probe fails.
+        async with app.state.sessionmaker() as reconfigure_session:
+            reconfigure_store = SettingsStore(reconfigure_session)
+            await reconfigure_store.set("plex_url", "http://plex.example.com:32400")
+            await reconfigure_store.set("plex_token", "service-token")
+            await reconfigure_session.commit()
+        return await real_resolve(store, plex_tv)
+
+    monkeypatch.setattr(app_module, "_resolve_watchlist_server_identity", flaky_resolve)
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    assert calls == 2
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+async def test_probe_failure_reports_probe_failed_and_retains_snapshot(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """An upgraded/pre-rework install that has ``plex_url``/``plex_token`` but no
+    cached machine identifier yet: a transient ``/identity`` probe failure must
+    surface as a distinct ``probe_failed`` state -- never ``not_configured``,
+    which would mislabel an outage as an absence -- and must RETAIN any
+    existing watchlist snapshot, since a transient failure must never drop
+    eviction protection (issue #327 facets 1 and 2)."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await store.set("plex_token", "service-token")
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    def _unreachable(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/identity":
+            raise httpx.ConnectError("plex server unreachable", request=request)
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable))
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.state != "not_configured"
+    assert status.last_error_type == "PlexVerifyError"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+def _upgraded_install_transport(
+    resources: list[dict[str, object]], *, identity_successes: int = 1
+) -> httpx.MockTransport:
+    """An upgraded/pre-rework install's transport: ``/identity`` answers
+    successfully for the first ``identity_successes`` calls then becomes
+    unreachable (every un-cached identity resolution probes live, so a mid-tick
+    outage surfaces on a later re-resolution); plex.tv ``/api/v2/resources``
+    answers the given list throughout."""
+    identity_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_calls
+        if request.url.path == "/identity":
+            identity_calls += 1
+            if identity_calls > identity_successes:
+                raise httpx.ConnectError("plex server became unreachable", request=request)
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        if request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=resources)
+        return httpx.Response(200, text="ok")
+
+    return httpx.MockTransport(handler)
+
+
+async def test_final_recheck_probe_failure_reports_probe_failed(app: FastAPI, seed: SeedFn) -> None:
+    """Codex round 2 on #360 (final pre-sync re-check): an upgraded install (url/
+    token, no cached machine id) resolves identity live at the final re-check
+    too. If the server becomes unreachable AFTER users were authorized, the
+    tick must report probe_failed with the PlexVerifyError surfaced -- not the
+    generic "server changed" degraded tick with error=None (nor, with no
+    authorized users, a clean ok). The authorized users count as skipped and
+    the snapshot is retained."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", "tmdb-key")
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await store.set("plex_token", "service-token")
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # Tick-start /identity succeeds; the account is AUTHORIZED for that server;
+    # then the server drops before the final pre-sync-pass re-check.
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(
+        transport=_upgraded_install_transport([_server_resource(_MACHINE_ID)])
+    )
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.skipped_users == 1  # the authorized user whose sync pass did not run
+    assert status.created == 0
+    assert status.last_ok_at is None
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
+async def test_stale_delete_guard_probe_failure_reports_probe_failed(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """Codex round 2 on #360 (stale-delete guarded re-check): when the /identity
+    outage hits DURING the delete guard's re-resolution, it must not collapse
+    into the "repointed/unconfigured" retain -- the tick would then exit through
+    a later gate (here: TMDB not configured) without the outage ever reaching
+    /health. The guard surfaces probe_failed (PlexVerifyError, skipped_users
+    preserved) and retains the stale user's snapshot."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.example.com:32400")
+        await store.set("plex_token", "service-token")
+        user = User(username="stale-watcher", encrypted_plex_token="old-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # Tick-start /identity succeeds; the account is STALE for that server (it
+    # only advertises a different one); the server then drops before the delete
+    # guard re-resolves identity. No TMDB key on purpose: without the fix this
+    # tick exits mark_skipped("not_configured") and the outage vanishes.
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(
+        transport=_upgraded_install_transport([_server_resource("some-other-server")])
+    )
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.skipped_users == 1
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_tick_persists_minted_client_identifier(app: FastAPI, seed: SeedFn) -> None:
     """The plex.tv device identifier minted by a tick must be COMMITTED, not rolled
     back when the settings session closes: an uncommitted mint would still be used
@@ -195,11 +508,16 @@ async def test_stale_cleanup_runs_even_without_tmdb_configured(app: FastAPI, see
     )
 
     assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    status = app.state.watchlist_status
     # The tick still ends not_configured (no TMDB key -> no request creation)...
-    assert app.state.watchlist_status.state == "not_configured"
-    # ...but the stale snapshot was cleared BEFORE the TMDB gate.
+    assert status.state == "not_configured"
+    # ...but the stale snapshot was cleared BEFORE the TMDB gate...
     async with app.state.sessionmaker() as session:
         assert list((await session.execute(WatchlistItem.__table__.select())).all()) == []
+    # ...and that cleanup is NOT erased from /health: a tick that actually
+    # cleared a stale-after-repoint snapshot must not report a clean
+    # not_configured with no trace of the cleanup (issue #327 facet 3).
+    assert status.skipped_users == 1
 
 
 async def test_stale_delete_skipped_when_server_repointed_mid_tick(

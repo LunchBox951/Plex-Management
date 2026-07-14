@@ -26,7 +26,14 @@ from plex_manager.ports.download_client import (
     FailureDetail,
 )
 from plex_manager.ports.indexer import IndexerPort
-from plex_manager.ports.library import LibraryPort, LibrarySection, WatchState, WatchStateQuery
+from plex_manager.ports.library import (
+    ArtworkImage,
+    ArtworkKind,
+    LibraryPort,
+    LibrarySection,
+    WatchState,
+    WatchStateQuery,
+)
 from plex_manager.ports.media_probe import (
     MediaProbeError,
     MediaProbePort,
@@ -451,6 +458,8 @@ class FakeLibrary:
         movie_file_paths: Collection[str] | None = None,
         tv_file_paths: Collection[str] | None = None,
         confirm_paths_raises: Exception | None = None,
+        artwork: dict[tuple[int, str, ArtworkKind], ArtworkImage] | None = None,
+        artwork_raises: Exception | None = None,
     ) -> None:
         self.available_ids = available or set()
         self.available_tv_seasons = available_tv_seasons or {}
@@ -506,6 +515,13 @@ class FakeLibrary:
         self.present_ids_refresh_absent_calls: list[bool] = []
         self.season_presence_calls = 0
         self.season_presence_call_ids: list[frozenset[int]] = []
+        # Plex-native artwork (issue #66): canned images keyed by
+        # ``(tmdb_id, media_type, kind)``; a missing key is an honest ``None`` miss.
+        # ``artwork_raises``, when set, makes ``fetch_artwork`` raise (a Plex
+        # outage) so the proxy's fallback-to-404 path is exercisable.
+        self.artwork: dict[tuple[int, str, ArtworkKind], ArtworkImage] = dict(artwork or {})
+        self.artwork_raises = artwork_raises
+        self.fetch_artwork_calls: list[tuple[int, str, ArtworkKind]] = []
 
     async def is_available(
         self,
@@ -647,6 +663,22 @@ class FakeLibrary:
             )
             for query in queries
         ]
+
+    async def fetch_artwork(
+        self,
+        tmdb_id: int,
+        media_type: Literal["movie", "tv"],
+        kind: ArtworkKind,
+    ) -> ArtworkImage | None:
+        # Plex-native artwork (issue #66): answers from the canned ``artwork`` map
+        # keyed by ``(tmdb_id, media_type, kind)``; any key with no entry is an
+        # honest miss (``None``), matching the real adapter's "not in library / no
+        # art" default. ``fetch_artwork_calls`` records every lookup so a route test
+        # can assert the proxy hit the port with the right key.
+        self.fetch_artwork_calls.append((tmdb_id, media_type, kind))
+        if self.artwork_raises is not None:
+            raise self.artwork_raises
+        return self.artwork.get((tmdb_id, media_type, kind))
 
 
 def override_adapters(

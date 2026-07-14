@@ -1137,6 +1137,16 @@ class DiscoverResult(BaseModel):
     overview: str | None = None
     poster_url: str | None = None
     backdrop_url: str | None = None
+    # Plex-native artwork proxy URLs (issue #66): populated ONLY for a title the
+    # server confirmed present in Plex, pointing at the backend image proxy
+    # (``/api/v1/artwork/plex/...``) so the browser shows Plex's own selected
+    # poster/background — the token never leaves the server. ``None`` for a
+    # not-in-library title (the client uses ``poster_url``/``backdrop_url`` from
+    # TMDB), and the client falls back the same way if the proxy 404s. Server-
+    # emitted rather than client-constructed so the endpoint contract stays owned
+    # by the backend.
+    plex_poster_url: str | None = None
+    plex_backdrop_url: str | None = None
     # Response-only library-state hint for the tile (issue #29): no DB column, no
     # migration -- computed per page from Plex presence + the request store. Default
     # ``"none"`` keeps construction back-compatible and honestly models a page that
@@ -1659,7 +1669,9 @@ class AutograbStatusItem(BaseModel):
 class WatchlistStatusItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"]
+    state: Literal[
+        "starting", "ok", "degraded", "disabled", "not_configured", "probe_failed", "error"
+    ]
     last_run_at: datetime | None = None
     last_ok_at: datetime | None = None
     last_error_type: str | None = None
