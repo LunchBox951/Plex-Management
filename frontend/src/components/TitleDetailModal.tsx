@@ -237,11 +237,14 @@ const CANCELLABLE_STATUSES = new Set([
  *   subscriber; the download continues.
  * - others remain + plain subscriber — the download just continues for them.
  * - SOLE participant on an already-settled status (available/failed/evicted/
- *   cancelled) — a mere subscription removal; nothing is torn down. (A sole
- *   participant on an ACTIVE non-cancellable row — import_blocked/
- *   partially_available/completed — also lands here; the backend 409s that
- *   case, which `runWithdraw` surfaces as an error toast, so the benign copy
- *   never over-promises a teardown.)
+ *   cancelled) — a mere subscription removal; nothing is torn down. (Two
+ *   backend-refused sole cases also land here rather than in the destructive
+ *   arm: an ACTIVE non-cancellable row — import_blocked/partially_available/
+ *   completed — 409s `withdrawal_blocked_active_request`, and a TV request
+ *   whose rollup reads cancellable while a season is already imported 409s
+ *   via `cancel_request`'s per-season guard. Both surface as an error toast
+ *   from `runWithdraw`, so the benign copy never over-promises a teardown —
+ *   and never claims one the backend will refuse.)
  *
  * The body doubles as the visible in-dialog warning AND the accessible
  * `description` (the shared Dialog renders `description` sr-only, so a
@@ -1223,8 +1226,16 @@ export function TitleDetailModal({
             // status. A settled (or active-non-cancellable) row is a mere
             // removal (or a 409), never a teardown -- so it must not warn like
             // one. `CANCELLABLE_STATUSES` already mirrors the backend's
-            // `CANCELLABLE_REQUEST_STATUS_VALUES`.
-            willCancel: !hasOtherParticipants && CANCELLABLE_STATUSES.has(liveRequest.status),
+            // `CANCELLABLE_REQUEST_STATUS_VALUES`, and `!anySeasonImported`
+            // mirrors `cancel_request`'s own per-season guard (Codex round 2):
+            // a TV rollup can read cancellable (e.g. `downloading`) while an
+            // already-imported sibling season makes the backend's
+            // `cancel_request` deterministically refuse (not_cancellable), so
+            // no teardown happens -- the same exclusion `canCancel` uses above.
+            willCancel:
+              !hasOtherParticipants &&
+              CANCELLABLE_STATUSES.has(liveRequest.status) &&
+              !anySeasonImported,
           })
         }
       >

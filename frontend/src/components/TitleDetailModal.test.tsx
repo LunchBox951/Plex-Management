@@ -1393,6 +1393,61 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     ).not.toBeInTheDocument()
   })
 
+  it('does NOT warn destructively for a sole participant on a TV row with an imported season under a cancellable rollup (issue #335, Codex round 2)', () => {
+    // season_rollup precedence rolls {available, downloading} up to `downloading`
+    // (in CANCELLABLE_STATUSES), but the backend `cancel_request` -- which
+    // `withdraw_participant`'s last-participant branch reuses -- refuses the
+    // whole request (not_cancellable, per-season guard) because S1 is imported,
+    // so NO teardown happens. `willCancel` must fold in the same
+    // `anySeasonImported` exclusion `canCancel` already uses; keying it off the
+    // rollup status alone would show "cancel it and remove the download" for a
+    // withdrawal the backend deterministically refuses to tear down.
+    asSharedUser()
+    const tvTitle: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 77,
+      title: 'Mixed Show',
+      year: 2022,
+      library_state: 'none',
+    }
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          {
+            id: 20,
+            tmdb_id: 77,
+            media_type: 'tv',
+            title: 'Mixed Show',
+            status: 'downloading',
+            is_anime: false,
+            keep_forever: false,
+            can_mutate: true,
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+            seasons: [
+              { season_number: 1, status: 'available' },
+              { season_number: 2, status: 'downloading' },
+            ],
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+    render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
+
+    // The imported season suppresses Cancel (existing per-season mirror), so
+    // this sole owner's verb is Withdraw.
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+
+    expect(screen.getByText('Remove from your requests?')).toBeInTheDocument()
+    expectWarningVisible(/nothing is torn down/i)
+    expect(screen.queryByText('Withdraw and cancel request?')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/withdrawing will cancel it and remove the download/i),
+    ).not.toBeInTheDocument()
+  })
+
   it.each(['available', 'completed', 'failed', 'cancelled', 'evicted', 'import_blocked'] as const)(
     'offers Withdraw to a participant on a settled/blocked row (%s)',
     (status) => {
