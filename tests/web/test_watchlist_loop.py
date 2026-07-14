@@ -223,6 +223,65 @@ async def test_reconfigure_mid_tick_prevents_spurious_snapshot_clear(
     assert len(remaining) == 1
 
 
+async def test_reconfigure_mid_tick_with_failing_probe_retains_snapshot(
+    app: FastAPI, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Race-guard tri-state (Codex review on #360): a concurrent settings PUT
+    configures ``plex_url``/``plex_token`` in the gap between the tick's
+    unconfigured read and the destructive clear, but the re-confirm read's
+    live probe FAILS at that instant -- resolving to no identifier WITH a
+    probe error. That is configured-but-unreachable, not absent: the guard
+    must require BOTH legs empty before clearing, so the snapshot is retained
+    and the tick reports ``probe_failed`` instead of deleting eviction
+    protection during an outage."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        user = User(username="watcher", encrypted_plex_token="live-token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+    # The server configured mid-gap is unreachable: any /identity probe fails.
+    def _unreachable(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/identity":
+            raise httpx.ConnectError("plex server unreachable", request=request)
+        return httpx.Response(200, text="ok")
+
+    await app.state.http_client.aclose()
+    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(_unreachable))
+
+    real_resolve = app_module._resolve_watchlist_server_identity  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def flaky_resolve(
+        store: SettingsStore, plex_tv: PlexTvClient
+    ) -> app_module._ServerIdentityResolution:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await real_resolve(store, plex_tv)  # unconfigured, as seeded
+        # A concurrent settings PUT configures Plex between the two reads --
+        # but the new server is unreachable, so the re-confirm probe fails.
+        async with app.state.sessionmaker() as reconfigure_session:
+            reconfigure_store = SettingsStore(reconfigure_session)
+            await reconfigure_store.set("plex_url", "http://plex.example.com:32400")
+            await reconfigure_store.set("plex_token", "service-token")
+            await reconfigure_session.commit()
+        return await real_resolve(store, plex_tv)
+
+    monkeypatch.setattr(app_module, "_resolve_watchlist_server_identity", flaky_resolve)
+
+    assert await app_module._watchlist_sync_once(app) == 0  # pyright: ignore[reportPrivateUsage]
+    assert calls == 2
+    status = app.state.watchlist_status
+    assert status.state == "probe_failed"
+    assert status.last_error_type == "PlexVerifyError"
+    async with app.state.sessionmaker() as session:
+        remaining = list((await session.execute(WatchlistItem.__table__.select())).all())
+    assert len(remaining) == 1
+
+
 async def test_probe_failure_reports_probe_failed_and_retains_snapshot(
     app: FastAPI, seed: SeedFn
 ) -> None:

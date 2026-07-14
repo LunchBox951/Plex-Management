@@ -322,7 +322,25 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             # re-resolving inside its own deleting transaction. Losing this
             # race would otherwise clear a snapshot out from under a config
             # that is valid again by the time the delete runs.
+            #
+            # The re-confirm read is itself tri-state, and the clear requires
+            # BOTH legs empty (genuinely unconfigured): a mid-gap reconfigure
+            # whose live probe fails AT THIS INSTANT resolves to no identifier
+            # WITH a probe error -- configured but unreachable, not absent.
+            # Checking only the identifier would let that state fall through
+            # to the destructive clear, reintroducing through the race guard
+            # the exact transient-outage data loss the tri-state exists to
+            # prevent -- so a probe failure here retains the snapshot and
+            # reports probe_failed, mirroring the primary read's branch above.
             reconfirm = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+            if reconfirm.probe_error is not None:
+                _logger.info(
+                    "watchlist server was reconfigured just before the "
+                    "unconfigured-state snapshot clear, but its probe failed; "
+                    "retaining the snapshot and reporting the probe failure"
+                )
+                status.mark_probe_failed(reconfirm.probe_error)
+                return 0
             if reconfirm.machine_identifier is not None:
                 _logger.info(
                     "watchlist server was reconfigured just before the "
