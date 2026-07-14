@@ -13,6 +13,8 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    UPDATER_HEARTBEAT_MAX_AGE,
+    DrainLeaseActiveError,
     UnknownCoordinatorPhaseError,
     UpdateAction,
     UpdateCoordinationService,
@@ -21,7 +23,7 @@ from plex_manager.services.update_coordination_service import (
     UpdateResult,
 )
 from plex_manager.services.update_policy import AutomaticUpdatePolicy, load_update_policy
-from plex_manager.web.deps import require_admin
+from plex_manager.web.deps import AuthContext, require_admin
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import current_build_id, publish_realtime
 from plex_manager.web.schemas import (
@@ -42,11 +44,24 @@ from plex_manager.web.updater_auth import require_updater
 
 __all__ = ["internal_router", "router"]
 
-_UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
+# The liveness contract now lives in the coordination service (round 3 of
+# #354/#357 made force-reset's checking predicate depend on it too); this alias
+# keeps the router's existing call sites while guaranteeing the two cannot drift.
+_UPDATER_HEARTBEAT_MAX_AGE = UPDATER_HEARTBEAT_MAX_AGE
 _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
 _KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
+# ``"none"`` plus every operator intent this build understands. Mirrors the
+# repo layer's ``_KNOWN_REQUESTED_ACTIONS`` (which duplicates it for hexagonal
+# layering); derived from the enum here, so it cannot drift.
+_KNOWN_REQUESTED_ACTIONS = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
+# The phases whose in-flight operation legitimately rewrites ``requested_action``
+# on completion. The LEASED ones (draining/installing/rollback) always suppress
+# the action-only wedge -- lease expiry converges. ``checking`` is leaseless, so
+# it suppresses the wedge only while the sidecar heartbeat says a check could
+# actually be in flight (see ``_state_and_blocker``).
+_BUSY_PHASES = frozenset({"checking", "draining", "installing", "rollback"})
 
 router = APIRouter(
     prefix="/api/v1/updates",
@@ -135,6 +150,22 @@ def _state_and_blocker(
 ) -> tuple[str, str | None]:
     if snapshot.phase not in _KNOWN_PHASES:
         return "unavailable", "coordinator_state_unknown"
+    # The action-only wedge (issue #354, Codex rounds 2-3): a rollback can
+    # leave a perfectly recognizable phase paired with a requested_action this
+    # build does not know, which makes request_action refuse ALL new intent
+    # while eligibility now fails closed on it (never hands the sidecar work
+    # over it). Flag it like the unknown-phase wedge -- and, like that check,
+    # BEFORE the updater-availability gate, because the recovery endpoint works
+    # without a live sidecar and the operator must be shown the button either
+    # way. Exemptions mirror force_reset_phase's matrix exactly: the LEASED
+    # busy phases always suppress it (their lease expiry converges), and the
+    # leaseless ``checking`` suppresses it only while the heartbeat is fresh
+    # enough that a check could genuinely be in flight.
+    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS and (
+        snapshot.phase not in _BUSY_PHASES
+        or (snapshot.phase == "checking" and not updater_available)
+    ):
+        return "unavailable", "requested_action_unknown"
     if not updater_available:
         return "unavailable", "updater_unavailable"
     if snapshot.phase == "draining":
@@ -261,6 +292,73 @@ async def update_when_ready_endpoint(
     return await _request_action(UpdateAction.install, request, session, settings)
 
 
+@router.post("/force-reset")
+async def force_reset_endpoint(
+    request: Request,
+    auth: Annotated[AuthContext, Depends(require_admin)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _body: Annotated[UpdateActionRequest | None, Body()] = None,
+) -> UpdateStatusResponse:
+    """Break-glass recovery for a wedged coordinator state (issue #354).
+
+    The in-app exit from the fail-closed unknown-state guards (PR #346): a
+    version-skew/rollback window can leave the coordinator row in a PHASE this
+    app version does not know (every locked coordination write then 409s
+    permanently), or in a known phase paired with a queued ACTION it does not
+    know (every new check/install request is then refused as in-progress).
+    Both are recovered here -- audited, inside the coordination lock, and only
+    after re-reading the row so a state that healed on its own is never blindly
+    clobbered (north stars #1/#2: a button, never a terminal).
+
+    The locked decision matrix:
+
+    * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
+      no-op, nothing wedged to recover. Also the honest, idempotent answer to
+      a double-click: the second call finds the recovered state already known.
+    * Leased busy phase (``draining``/``installing``/``rollback``), any
+      action: 409 ``coordinator_phase_known`` -- an operation is in flight and
+      its own acknowledgement or lease expiry legitimately resolves the
+      action; never reset a live update. Both exits converge on a recoverable
+      state if the action remains unrecognized.
+    * ``checking`` + unrecognized action: refused only while the updater
+      heartbeat is fresh (the 45s liveness contract) -- a live sidecar could
+      be mid-check. ``checking`` holds no lease, so once the heartbeat is
+      stale nothing can ever expire it; the action-only reset then proceeds
+      (the phase itself stays ``checking`` and heals through the next
+      completed check's normal acknowledgement).
+    * Known non-busy phase + unrecognized action: clears the action to
+      ``none`` (the action-only reset), leaving the phase untouched.
+    * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
+      -- a NEWER updater generation may be legitimately mid-install in a phase
+      this build simply doesn't know; the lease TTL bounds the wait, and an
+      expired lease is swept so a retry then proceeds.
+    * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
+      queued action is preserved for retry, an unrecognized one is cleared.
+    """
+    coordinator = await _coordinator(request)
+    try:
+        result = await coordinator.force_reset_coordinator_phase(
+            actor_user_id=auth.user_id,
+            updater_heartbeat_max_age=_UPDATER_HEARTBEAT_MAX_AGE,
+        )
+    except DrainLeaseActiveError as exc:
+        raise AppError(
+            status_code=409,
+            code="coordinator_drain_active",
+            message="An update maintenance lease is still active; the update may be mid-flight.",
+            hint="Wait for the lease to expire (a few minutes), then try again.",
+        ) from exc
+    if result is None:
+        raise AppError(
+            status_code=409,
+            code="coordinator_phase_known",
+            message="The update coordinator is in a recognized state; there is nothing to recover.",
+        )
+    publish_realtime(request.app, ("updates",), reason="update_coordinator_force_reset")
+    return await _status(request, session, settings)
+
+
 async def _eligibility(
     request: Request,
     session: AsyncSession,
@@ -293,6 +391,31 @@ async def _eligibility(
                 window_open=policy.schedule.is_open(now),
                 idle_only=policy.idle_only,
                 blocker="coordinator_state_unknown",
+                poll_after_seconds=_SIDE_CAR_POLL_SECONDS,
+            ),
+            snapshot,
+        )
+    # Fail closed on an unrecognized requested_action, exactly like the
+    # unknown-phase branch above (issue #354, Codex round 3). Without this, an
+    # action a newer generation queued reads as absent to the policy branches
+    # below, so an older sidecar with automatic updates enabled would be handed
+    # a check -- or an install, with an image available -- whose completion
+    # then rewrites requested_action OVER the state it cannot interpret,
+    # bypassing the audited force-reset recovery path entirely. Withhold all
+    # work (action="none" is the sidecar's ordinary sleep-and-repoll answer,
+    # per the #346 fail-closed contract) until the operator runs the audited
+    # action-only reset.
+    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS:
+        policy = await load_update_policy(session)
+        now = datetime.now(UTC)
+        return (
+            UpdateEligibilityResponse(
+                action="none",
+                action_generation=snapshot.action_generation,
+                automatic_enabled=policy.schedule.enabled,
+                window_open=policy.schedule.is_open(now),
+                idle_only=policy.idle_only,
+                blocker="requested_action_unknown",
                 poll_after_seconds=_SIDE_CAR_POLL_SECONDS,
             ),
             snapshot,

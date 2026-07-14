@@ -26,14 +26,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.repositories.update_coordination import (
     CoordinatorSnapshot,
+    DrainLeaseActiveError,
+    ForceResetResult,
     LeaseKind,
     SqlUpdateCoordinationRepository,
     UnknownCoordinatorPhaseError,
 )
+from plex_manager.services import audit_service
 
 __all__ = [
+    "UPDATER_HEARTBEAT_MAX_AGE",
     "CoordinatorSnapshot",
     "DrainClaim",
+    "DrainLeaseActiveError",
+    "ForceResetResult",
     "LeaseGrant",
     "MaintenanceDrainingError",
     "MaintenanceLeaseLostError",
@@ -47,6 +53,12 @@ __all__ = [
 
 _CODE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 _DEFAULT_CRITICAL_TTL = timedelta(minutes=5)
+# The sidecar-liveness contract: a heartbeat older than this means no updater
+# is connected. Single source of truth shared by the updates router (status's
+# ``updater_available`` and the 503 gate on manual actions) and by
+# ``force_reset_coordinator_phase``'s checking-phase predicate, so "is a check
+# plausibly in flight" can never drift from "is the sidecar connected".
+UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
 _logger = logging.getLogger(__name__)
 
 
@@ -331,6 +343,71 @@ class UpdateCoordinationService:
             )
             await session.commit()
             return released
+
+    async def force_reset_coordinator_phase(
+        self,
+        *,
+        actor_user_id: int | None,
+        updater_heartbeat_max_age: timedelta = UPDATER_HEARTBEAT_MAX_AGE,
+    ) -> ForceResetResult | None:
+        """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
+
+        The service face of the recovery path for the fail-closed unknown-phase
+        wedge (issue #354; see
+        :meth:`~plex_manager.repositories.update_coordination.SqlUpdateCoordinationRepository.force_reset_phase`
+        for the lock + re-check protocol and the full (phase x requested_action)
+        decision matrix, including the ACTION-ONLY variant -- a KNOWN, non-busy
+        phase paired with an unrecognized queued action -- and why an UNEXPIRED
+        drain lease under an unknown phase raises :class:`DrainLeaseActiveError`
+        instead of being torn).
+
+        The reset and its :class:`~plex_manager.models.AuditLog` row commit in ONE
+        transaction: a state change that silently reassigned the coordinator out
+        of an unknown state with no durable record of WHO did it, or when, would
+        violate "honesty over silence" (north star #3). The audit row is written
+        only when a reset actually happened -- a no-op refusal (nothing this
+        operation may recover) or a drain-active refusal changes nothing and
+        records nothing -- and it names exactly what changed: the re-anchored
+        phase, the cleared unrecognized ``requested_action``, or both.
+        ``actor_user_id`` is ``None`` for an API-key / recovery-key admin, which
+        has no Plex identity; that honest null actor matches every other admin
+        action taken via the break-glass credential.
+
+        Returns the :class:`ForceResetResult` on reset, or ``None`` when there
+        was nothing to recover and nothing was changed.
+        """
+        async with self._sessionmaker() as session:
+            repo = SqlUpdateCoordinationRepository(session)
+            result = await repo.force_reset_phase(
+                self._now(), updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age)
+            )
+            if result is None:
+                return None
+            old_value: dict[str, str] = {}
+            new_value: dict[str, str] = {}
+            if result.old_phase is not None:
+                old_value["phase"] = result.old_phase
+                new_value["phase"] = UpdatePhase.idle.value
+            if result.cleared_requested_action is not None:
+                old_value["requested_action"] = result.cleared_requested_action
+                new_value["requested_action"] = "none"
+            description = (
+                "Force-reset an unrecognized update coordinator phase to idle."
+                if result.old_phase is not None
+                else "Cleared an unrecognized queued updater action."
+            )
+            await audit_service.record(
+                session,
+                actor_user_id=actor_user_id,
+                action_type="update.coordinator_phase_force_reset",
+                entity_type="update_coordinator",
+                entity_id=1,
+                old_value=old_value,
+                new_value=new_value,
+                description=description,
+            )
+            await session.commit()
+            return result
 
     async def acknowledge_outcome(
         self,

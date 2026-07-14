@@ -1487,6 +1487,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/updates/force-reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Force Reset Endpoint
+         * @description Break-glass recovery for a wedged coordinator state (issue #354).
+         *
+         *     The in-app exit from the fail-closed unknown-state guards (PR #346): a
+         *     version-skew/rollback window can leave the coordinator row in a PHASE this
+         *     app version does not know (every locked coordination write then 409s
+         *     permanently), or in a known phase paired with a queued ACTION it does not
+         *     know (every new check/install request is then refused as in-progress).
+         *     Both are recovered here -- audited, inside the coordination lock, and only
+         *     after re-reading the row so a state that healed on its own is never blindly
+         *     clobbered (north stars #1/#2: a button, never a terminal).
+         *
+         *     The locked decision matrix:
+         *
+         *     * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
+         *       no-op, nothing wedged to recover. Also the honest, idempotent answer to
+         *       a double-click: the second call finds the recovered state already known.
+         *     * Leased busy phase (``draining``/``installing``/``rollback``), any
+         *       action: 409 ``coordinator_phase_known`` -- an operation is in flight and
+         *       its own acknowledgement or lease expiry legitimately resolves the
+         *       action; never reset a live update. Both exits converge on a recoverable
+         *       state if the action remains unrecognized.
+         *     * ``checking`` + unrecognized action: refused only while the updater
+         *       heartbeat is fresh (the 45s liveness contract) -- a live sidecar could
+         *       be mid-check. ``checking`` holds no lease, so once the heartbeat is
+         *       stale nothing can ever expire it; the action-only reset then proceeds
+         *       (the phase itself stays ``checking`` and heals through the next
+         *       completed check's normal acknowledgement).
+         *     * Known non-busy phase + unrecognized action: clears the action to
+         *       ``none`` (the action-only reset), leaving the phase untouched.
+         *     * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
+         *       -- a NEWER updater generation may be legitimately mid-install in a phase
+         *       this build simply doesn't know; the lease TTL bounds the wait, and an
+         *       expired lease is swept so a retry then proceeds.
+         *     * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
+         *       queued action is preserved for retry, an unrecognized one is cleared.
+         */
+        post: operations["force_reset_endpoint_api_v1_updates_force_reset_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/updates/status": {
         parameters: {
             query?: never;
@@ -5093,6 +5147,39 @@ export interface operations {
         };
     };
     check_now_endpoint_api_v1_updates_check_now_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    force_reset_endpoint_api_v1_updates_force_reset_post: {
         parameters: {
             query?: never;
             header?: never;

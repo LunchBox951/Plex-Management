@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useCheckForUpdate,
   useEvict,
+  useForceResetCoordinator,
   useOpsDisk,
   useOpsHealth,
   useSettings,
@@ -33,6 +34,7 @@ vi.mock('../api/hooks', () => ({
   useUpdateStatus: vi.fn(),
   useCheckForUpdate: vi.fn(),
   useUpdateWhenReady: vi.fn(),
+  useForceResetCoordinator: vi.fn(),
   // Most tests don't care about settings; default to "not loaded yet" so the
   // disk-threshold fallback constants kick in unless a test overrides this.
   useSettings: vi.fn(() => ({ data: undefined, isLoading: false, isError: false })),
@@ -138,6 +140,7 @@ function updateStatus(overrides: Partial<UpdateStatusResponse> = {}): UpdateStat
 
 const checkMutateAsync = vi.fn()
 const updateMutateAsync = vi.fn()
+const forceResetMutateAsync = vi.fn()
 const updatesRefetch = vi.fn()
 
 describe('Status', () => {
@@ -162,8 +165,13 @@ describe('Status', () => {
       mutateAsync: updateMutateAsync,
       isPending: false,
     })
+    ;(useForceResetCoordinator as unknown as Mock).mockReturnValue({
+      mutateAsync: forceResetMutateAsync,
+      isPending: false,
+    })
     checkMutateAsync.mockResolvedValue(updateStatus({ state: 'checking' }))
     updateMutateAsync.mockResolvedValue(updateStatus({ state: 'waiting_for_window' }))
+    forceResetMutateAsync.mockResolvedValue(updateStatus({ state: 'idle' }))
   })
 
   it('uses the shared heading hierarchy and canonical dense card grammar', () => {
@@ -350,6 +358,92 @@ describe('Status', () => {
     expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
     expect(screen.getByText(/Enable the automatic-update Compose profile/)).toBeInTheDocument()
+  })
+
+  it('offers coordinator recovery only when the phase is unrecognized and confirms first', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'unavailable',
+        // A live heartbeat: the wedge ALONE must disable the normal controls
+        // below — they can only 409 against the fail-closed phase guard.
+        updater_available: true,
+        blocker: 'coordinator_state_unknown',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // The honest wedge banner + button appear; the "connect the sidecar" hint
+    // is suppressed because the wedge, not the sidecar, is the real blocker.
+    expect(screen.getByText('Coordinator in an unrecognized state')).toBeInTheDocument()
+    expect(screen.queryByText(/Enable the automatic-update Compose profile/)).not.toBeInTheDocument()
+
+    // The normal controls are disabled while wedged: recovery is the single
+    // actionable path, not a third button next to two that can only fail.
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+
+    // Clicking opens a confirm step — the reset does NOT fire on the first click.
+    fireEvent.click(screen.getByRole('button', { name: 'Recover coordinator' }))
+    expect(forceResetMutateAsync).not.toHaveBeenCalled()
+
+    // Confirm in the dialog actually triggers the recovery mutation.
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Recover coordinator' }))
+    await waitFor(() => expect(forceResetMutateAsync).toHaveBeenCalledTimes(1))
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Coordinator recovered', intent: 'success' }),
+    )
+  })
+
+  it('offers recovery for an unrecognized queued action with distinct honest copy', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        state: 'unavailable',
+        updater_available: true,
+        blocker: 'requested_action_unknown',
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    // The action-only wedge (a known phase + a queued action this build can't
+    // interpret) gets its own honest banner copy, and the normal controls are
+    // disabled — request_action can only 409 against it.
+    expect(screen.getByText('Queued action not recognized by this version')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Recover coordinator' }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Recover coordinator' }))
+    await waitFor(() => expect(forceResetMutateAsync).toHaveBeenCalledTimes(1))
+  })
+
+  it('hides the coordinator recovery affordance for a healthy coordinator', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    expect(screen.queryByText('Coordinator in an unrecognized state')).not.toBeInTheDocument()
+    expect(screen.queryByText('Queued action not recognized by this version')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Recover coordinator' })).not.toBeInTheDocument()
   })
 
   it('describes action acceptance without claiming the check or installation completed', async () => {

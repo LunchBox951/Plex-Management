@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { cn } from '../lib/cn'
 import {
   useCheckForUpdate,
   useEvict,
+  useForceResetCoordinator,
   useOpsDisk,
   useOpsHealth,
   useSettings,
@@ -17,6 +19,7 @@ import type {
 import { AdminEmptyState } from '../components/ui/AdminEmptyState'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
+import { Dialog } from '../components/ui/Dialog'
 import { Dot, type DotTone } from '../components/ui/Dot'
 import { SectionHeader } from '../components/ui/SectionHeader'
 import { adminRowPadding } from '../components/ui/adminStyles'
@@ -56,17 +59,31 @@ function UpdatePanel({
   status,
   checkPending,
   updatePending,
+  recoverPending,
   onCheck,
   onUpdate,
+  onRecover,
 }: {
   status: UpdateStatusResponse
   checkPending: boolean
   updatePending: boolean
+  recoverPending: boolean
   onCheck: () => void
   onUpdate: () => void
+  onRecover: () => void
 }) {
   const state = UPDATE_STATE[status.state]
   const operationActive = ['checking', 'draining', 'installing', 'rollback'].includes(status.state)
+  // The coordinator landed in a state this build doesn't recognize (a
+  // version-skew/rollback window): either the PHASE itself is unknown, or a
+  // known phase carries a queued ACTION this build can't interpret — which
+  // silently refuses every new check/install as "already in progress". Both
+  // fail closed until an admin re-anchors them — the north-star #1 button,
+  // surfaced only here (issue #354). Keyed off the honest backend blockers, so
+  // the banner appears exactly when a guard is the thing blocking the controls.
+  const phaseWedged = status.blocker === 'coordinator_state_unknown'
+  const actionWedged = status.blocker === 'requested_action_unknown'
+  const wedged = phaseWedged || actionWedged
   // waiting_for_window describes the AUTOMATIC policy. Keep the explicit
   // manual action available there because it intentionally bypasses that
   // window. waiting_for_idle means an install is already queued.
@@ -164,6 +181,7 @@ function UpdatePanel({
           size="sm"
           loading={checkPending}
           disabled={
+            wedged ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -179,6 +197,7 @@ function UpdatePanel({
           size="sm"
           loading={updatePending}
           disabled={
+            wedged ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -190,7 +209,32 @@ function UpdatePanel({
           {updateQueued ? 'Update queued' : 'Update when ready'}
         </Button>
       </div>
-      {!status.updater_available ? (
+      {wedged ? (
+        <div className="mt-4 rounded-lg border border-error/40 bg-error/5 px-3 py-3 text-xs">
+          <p className="font-semibold text-error">
+            {phaseWedged
+              ? 'Coordinator in an unrecognized state'
+              : 'Queued action not recognized by this version'}
+          </p>
+          <p className="mt-1 text-muted">
+            {phaseWedged
+              ? 'Check and install are disabled — they can only fail until this is cleared. It’s usually the aftermath of a version rollback. Recovering re-anchors the coordinator to idle so the controls work again; a queued update is preserved for retry. If an update is still mid-flight, recovery is refused until its maintenance lease expires (a few minutes) — try again shortly.'
+              : 'A queued updater action isn’t recognized by this version — usually the aftermath of a version rollback — so every new check or install is refused as “already in progress”. Recovering clears the unrecognized action so the controls work again; nothing else is changed.'}
+          </p>
+          <div className="mt-3">
+            <Button
+              variant="danger"
+              size="sm"
+              loading={recoverPending}
+              disabled={recoverPending}
+              onClick={onRecover}
+            >
+              Recover coordinator
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {!status.updater_available && !wedged ? (
         <p className="mt-3 text-xs text-faint">
           Enable the automatic-update Compose profile to connect the scoped updater sidecar.
         </p>
@@ -619,6 +663,8 @@ export function Status() {
   const updates = useUpdateStatus()
   const checkForUpdate = useCheckForUpdate()
   const updateWhenReady = useUpdateWhenReady()
+  const forceReset = useForceResetCoordinator()
+  const [confirmRecover, setConfirmRecover] = useState(false)
   const { toast } = useToast()
 
   // Same two settings the pressure sweep itself reads (web/deps.py) — falls
@@ -704,6 +750,26 @@ export function Status() {
     }
   }
 
+  const onRecoverCoordinator = async () => {
+    try {
+      await forceReset.mutateAsync()
+      setConfirmRecover(false)
+      toast({
+        title: 'Coordinator recovered',
+        description: 'The updater is back to idle; checks and installs are available again.',
+        intent: 'success',
+      })
+    } catch (error) {
+      // Leave the dialog open on failure so the operator sees why (e.g. a 409
+      // if the phase healed on its own between opening and confirming).
+      toast({
+        title: 'Recovery failed',
+        description: (error as ApiError).message,
+        intent: 'error',
+      })
+    }
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8 lg:px-11">
       <AdminPageHeader
@@ -735,8 +801,10 @@ export function Status() {
               status={updates.data}
               checkPending={checkForUpdate.isPending}
               updatePending={updateWhenReady.isPending}
+              recoverPending={forceReset.isPending}
               onCheck={() => void onCheckForUpdate()}
               onUpdate={() => void onUpdateWhenReady()}
+              onRecover={() => setConfirmRecover(true)}
             />
           </>
         ) : updates.isLoading ? (
@@ -754,6 +822,42 @@ export function Status() {
           />
         )}
       </section>
+
+      <Dialog
+        open={confirmRecover}
+        onOpenChange={(next) => {
+          if (!next) setConfirmRecover(false)
+        }}
+        title="Recover the update coordinator?"
+        description="Clears whatever this version can't interpret: an unrecognized coordinator phase is re-anchored to idle, an unrecognized queued action is cleared. A recognizable queued update is preserved for retry; this is refused if there is nothing to recover or an update maintenance lease is still active."
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-muted">
+            This clears a stuck coordinator state (typically left by a version rollback): an
+            unrecognized phase is re-anchored to idle, and an unrecognized queued action is cleared
+            so new checks and installs are accepted again. It does nothing if an update is genuinely
+            in flight — the server refuses while an operation is running or an update maintenance
+            lease is still active (a possibly-live install). If that happens, wait a few minutes for
+            the lease to expire and try again.
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setConfirmRecover(false)}
+              disabled={forceReset.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              loading={forceReset.isPending}
+              onClick={() => void onRecoverCoordinator()}
+            >
+              Recover coordinator
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <section className="flex flex-col gap-[10px]">
         <SectionHeader>Subsystems</SectionHeader>
