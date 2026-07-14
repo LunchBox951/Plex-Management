@@ -83,22 +83,45 @@ reasons rooted in the current code:
 
 ### (a) Successor-spawn self-replacement *(recommended)*
 
-The sidecar, only while no operation is in flight, pulls the promoted image,
-creates a **successor** updater container from the new bytes, hands off the shared
-state volume, and exits; the successor removes the predecessor. This is the
-Watchtower/`docker-compose` self-update pattern, adapted to our coordinator.
+The sidecar, only while no operation is in flight, pulls the promoted image and
+creates a **successor** updater container from the new bytes; the predecessor
+**survives until it confirms the successor is alive**, then stops itself, and the
+successor — once it holds the state lock — removes the predecessor and takes over
+the canonical identity. This is the Watchtower/`docker-compose` self-update
+pattern, adapted to our coordinator. The handoff is one ordered sequence:
 
-- *C1:* Enforced by the existing `flock`. The predecessor releases any lease,
-  stops its lease-keeper, then creates the successor; the successor blocks on the
-  state lock until the predecessor exits, so only one drives at a time. The
-  predecessor is removed only after the successor proves liveness.
+1. Gate: `state.json` empty (no install/rollback pending) and no lease held.
+2. The predecessor pulls the promoted image, writes a durable **self-refresh
+   record** to the shared state volume (operation id + temporary successor
+   name), and creates + starts the successor under that temporary name.
+3. The successor emits its coordinator heartbeat (`touch_updater`, carrying its
+   build id) and then wait-loops on the state `flock`. The heartbeat is an HTTP
+   write to the app's coordinator, **not** gated by the flock, so the successor
+   can prove liveness while the predecessor still holds the lock. Until it owns
+   the lock, the successor performs *no* Docker mutation and no coordination
+   operation beyond that liveness ping.
+4. The predecessor confirms, within a bounded window, a fresh heartbeat carrying
+   the **new build id**. On timeout it removes the temp-named successor,
+   surfaces a visible `updater_refresh_failed` state, and keeps running
+   (old-but-working). On confirmation it stops itself **through the Engine API**
+   — a user-initiated stop, so `restart: unless-stopped` does not resurrect it —
+   and exits, releasing the flock.
+5. The successor acquires the flock, reconciles the self-refresh record, removes
+   the stopped predecessor, and renames itself to the canonical
+   `plex-manager-updater` name.
+
+- *C1:* **Never zero** — the predecessor stays fully functional until step 4's
+  confirmed heartbeat, and a timeout leaves it running. **Never two claimants**
+  — the existing `flock` bars the successor from driving any operation until the
+  predecessor has exited; the step-3 liveness ping is not a claimant operation.
 - *Bootstrap paradox — real but bounded.* The container replaces itself, so the
-  "healthy" gate cannot be Docker's healthcheck (constraint from §2). Substitute a
-  **coordinator-observed liveness gate**: the successor writes a fresh heartbeat
-  (`touch_updater`, the same signal the app already treats as "updater available"
-  when younger than 45s); the predecessor confirms that heartbeat *from the new
-  build id* before removing itself. This reuses machinery that already exists
-  instead of inventing a health protocol.
+  "healthy" gate cannot be Docker's healthcheck (constraint from §2). Steps 3–4
+  substitute a **coordinator-observed liveness gate**: `touch_updater` is the
+  same signal the app already treats as "updater available" when younger than
+  45s. This reuses machinery that already exists instead of inventing a health
+  protocol. (Implementation note: `StateStore.acquire` today is a fail-fast
+  non-blocking flock; step 3's wait-loop is a retry around it, not a new locking
+  primitive.)
 - *Compose desired-state convergence — the subtle win.* Docker forbids two
   containers named `plex-manager-updater`, so the successor is created under a
   temporary name and promoted with the same create→stop→rename dance the app
@@ -118,12 +141,25 @@ Watchtower/`docker-compose` self-update pattern, adapted to our coordinator.
   arbitrary target, but the socket-holder can now create/stop/remove a second
   (privileged) container. This is the honest downside and must be disclosed like
   ADR-0024 disclosed the socket mount.
-- *Rollback / C6:* The predecessor survives until it confirms successor liveness
-  (mirrors the app's "old stays until new is healthy"). If the successor never
-  heartbeats, the predecessor keeps running the old-but-working updater and
-  surfaces a visible `updater_refresh_failed` status. If both die at the seam,
-  `restart: unless-stopped` brings one back from the shared volume; the coordinator
-  never wedges because self-refresh touches no phase.
+- *Rollback / C6:* Step 4 mirrors the app's "old stays until new is healthy": if
+  the successor never heartbeats, the predecessor keeps running the
+  old-but-working updater and surfaces a visible `updater_refresh_failed`
+  status. If both die at the seam, the temp-named successor still carries
+  `restart: unless-stopped` (only the predecessor's step-4 stop is
+  user-initiated), so Docker restarts it onto the shared volume and it
+  reconciles from the self-refresh record; the coordinator never wedges because
+  self-refresh touches no phase.
+- *Named crash window — orphaned temp successor.* Between step 2
+  (successor created under the temporary name) and step 5 (rename to canonical),
+  a crash can strand a temp-named updater container. The durable self-refresh
+  record written **before** the create (step 2) is the recovery anchor — exactly
+  the role the app ladder's durable `candidate_renamed`/`old_renamed` stages
+  play. On restart, whichever updater reconciles first consults the record: a
+  predecessor that never confirmed the heartbeat removes the orphan and surfaces
+  `updater_refresh_failed`; a successor that finds the predecessor already
+  stopped completes step 5 (remove + rename). Reconciliation is keyed on the
+  record's operation id, so a half-renamed or duplicate-named leftover is never
+  guessed at — unmatched containers are refused, not adopted.
 
 ### (b) Main app recreates the sidecar
 
@@ -180,12 +216,16 @@ Keep recreation a host command and make the docs/UI louder about it.
 ## Decision (recommended)
 
 Adopt **option (a), successor-spawn self-replacement**, with these load-bearing
-refinements: a coordinator-heartbeat liveness gate in place of the Docker
-healthcheck; the create→temp-name→stop→rename-to-canonical dance so Compose
-converges on the moving tag rather than regressing; `flock` + lease as the
-single-claimant guarantee; a self-only allowlist widening (own role label + this
-operation id + the one known updater container name, never an arbitrary target);
-and a self-refresh that is gated to no-operation-in-flight and touches **no**
+refinements: the **survive-to-confirm handoff ordering** (steps 1–5 above — the
+predecessor outlives the successor's first confirmed heartbeat and only then
+stops itself; viable precisely because `touch_updater` is an HTTP write the
+successor can emit before it holds the state flock); a coordinator-heartbeat
+liveness gate in place of the Docker healthcheck; the
+create→temp-name→stop→rename-to-canonical dance so Compose converges on the
+moving tag rather than regressing; `flock` + lease as the single-claimant
+guarantee; a self-only allowlist widening (own role label + this operation id +
+the one known updater container name, never an arbitrary target); and a
+self-refresh that is gated to no-operation-in-flight and touches **no**
 coordinator phase, so it cannot wedge the machine PR #346 hardened.
 
 Reject (b) (breaks the app/Docker boundary), (d) (non-functional on plain
@@ -193,9 +233,11 @@ Compose), and (c) (more privileged surface than (a) for the same guarantee).
 Reject (e) as a complete answer, but **adopt its detect-and-surface half** as a
 required companion and a safe pre-freeze interim.
 
-When self-refresh cannot complete (successor never heartbeats, or both die at the
-seam), recovery is: the old-but-working predecessor keeps running and the app
-shows a visible, retryable `updater_refresh_failed` state. Because self-refresh
+When self-refresh cannot complete, recovery is: on a successor that never
+heartbeats, the old-but-working predecessor keeps running and the app shows a
+visible, retryable `updater_refresh_failed` state; on a crash inside the
+orphaned-temp-successor window, the survivor reconciles from the durable
+self-refresh record as specified in option (a). Because self-refresh
 never rewrites a phase, it cannot by itself produce the unknown-phase wedge; where
 a *cross-release phase-vocabulary change* is the underlying fault, the in-app
 recovery action from **#354** is the web-operable exit. The shape of that action
@@ -213,8 +255,9 @@ design note); this ADR references it generically rather than fixing its endpoint
   the socket mount.
 - A new self-recreation ladder acquires its own crash-recovery states and a new
   liveness gate distinct from the app's Docker health gate; both need dedicated
-  tests (successor promotion, predecessor survival on failed successor, both-die
-  seam, no-two-claimants under flock, no-phase-wrote invariant).
+  tests (successor promotion, predecessor survival on failed successor, the
+  orphaned-temp-successor window between create and rename, both-die seam,
+  no-two-claimants under flock, no-phase-wrote invariant).
 - The `docker-compose.yml` `#299` limitation note is replaced by the automated
   path; the manual `up -d updater` command remains a documented fallback, not the
   primary route.
