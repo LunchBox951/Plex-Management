@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, exists, select
 
 from plex_manager.adapters.plex.oauth import (
     CODE_TOKEN_INVALID,
@@ -15,7 +16,7 @@ from plex_manager.adapters.plex.oauth import (
     PlexVerifyError,
     account_server_resource,
 )
-from plex_manager.models import MediaType, User, WatchlistItem
+from plex_manager.models import MediaType, Setting, User, WatchlistItem
 from plex_manager.services import request_service
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ __all__ = [
     "WatchlistSyncResult",
     "WatchlistWorkerStatus",
     "clear_snapshots",
+    "clear_snapshots_unless_settings_present",
     "clear_user_snapshot",
     "is_watchlisted",
     "list_sync_users",
@@ -63,9 +65,19 @@ class SyncUserAuthorization(Enum):
 
 @dataclass
 class WatchlistWorkerStatus:
-    state: Literal["starting", "ok", "degraded", "disabled", "not_configured", "error"] = field(
-        default="starting"
-    )
+    state: Literal[
+        "starting", "ok", "degraded", "disabled", "not_configured", "probe_failed", "error"
+    ] = field(default="starting")
+    """``probe_failed`` is distinct from ``not_configured``: the Plex server IS
+    configured (url/token, or a cached identifier) but the live ``/identity``
+    probe failed. Reserving ``not_configured`` for a truly-unconfigured server
+    (no url/token AND no cached identifier) keeps an outage from ever being
+    mislabeled as an absence -- and from clearing eviction-protecting snapshot
+    rows a transient failure has no business touching (issue #327, north
+    star #3). ``probe_failed`` is also distinct from ``error``: the latter is
+    reserved for an unexpected exception that escaped the tick entirely
+    (``_watchlist_sync_loop``'s wrapper), not a known, actionable degraded
+    condition like an unreachable server."""
     last_run_at: datetime | None = field(default=None)
     last_ok_at: datetime | None = field(default=None)
     last_error_type: str | None = field(default=None)
@@ -88,11 +100,50 @@ class WatchlistWorkerStatus:
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
 
-    def mark_skipped(self, state: Literal["disabled", "not_configured"]) -> None:
+    def mark_skipped(
+        self,
+        state: Literal["disabled", "not_configured"],
+        *,
+        skipped_users: int = 0,
+    ) -> None:
+        """Record a tick that intentionally did no sync work.
+
+        ``skipped_users`` defaults to 0 for the common case (nothing ran yet --
+        e.g. sync disabled, or no server configured at the very start of the
+        tick), but a caller that already ran the per-user revalidation/cleanup
+        pass before hitting this skip (e.g. the TMDB-not-configured gate, which
+        runs AFTER stale-snapshot cleanup) must pass its accumulated count
+        through: zeroing it would report a clean ``not_configured`` with no
+        trace of the cleanup that just happened (issue #327 facet 3).
+        """
         self.state = state
         self.last_error_type = None
         self.last_error_at = None
-        self._reset_counters()
+        self.fetched = self.created = self.existing = 0
+        self.failed_users = self.failed_entries = 0
+        self.skipped_users = skipped_users
+
+    def mark_probe_failed(self, exc: PlexVerifyError, *, skipped_users: int = 0) -> None:
+        """The Plex server is configured but the live ``/identity`` probe
+        failed -- an outage, not an absence (issue #327). Distinct from
+        ``not_configured`` (nothing to authorize against) and from ``error``
+        (an unexpected exception that escaped the tick): this is a known,
+        actionable degraded condition that self-heals on the next successful
+        probe. The caller is responsible for retaining any existing watchlist
+        snapshot -- a transient outage must never drop eviction protection.
+
+        ``skipped_users`` mirrors :meth:`mark_skipped`'s parameter for the same
+        reason (issue #327 facet 3): identity is also re-resolved MID-TICK, so
+        a probe can fail after the per-user revalidation/cleanup pass already
+        skipped (and possibly cleaned up after) users. Zeroing that count would
+        hide the pass's work from /health behind the probe failure.
+        """
+        self.state = "probe_failed"
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = datetime.now(UTC)
+        self.fetched = self.created = self.existing = 0
+        self.failed_users = self.failed_entries = 0
+        self.skipped_users = skipped_users
 
     def mark_completed(
         self,
@@ -200,6 +251,58 @@ async def clear_snapshots(session: AsyncSession) -> int:
     Idempotent: a no-op (returns 0) once already cleared.
     """
     result = cast(CursorResult[Any], await session.execute(delete(WatchlistItem)))
+    return result.rowcount or 0
+
+
+async def clear_snapshots_unless_settings_present(
+    session: AsyncSession, *, guard_keys: Sequence[str]
+) -> int:
+    """Delete every snapshot row UNLESS any guard setting has a non-empty value.
+
+    The unconfigured-server clear's race guard, made structural (#327, Codex
+    round 3 on PR #360): any separate read-then-delete leaves a TOCTOU window
+    in which a concurrent ``PUT /settings`` can commit a (re)configuration
+    between the read and the delete, destroying eviction-protection rows out
+    from under a config that is valid again by the time the delete runs. This
+    single ``DELETE ... WHERE NOT EXISTS`` makes the database itself the
+    arbiter: the delete and its is-it-safe predicate are one atomic statement,
+    so under SQLite's single-writer (and PostgreSQL READ COMMITTED's
+    per-statement snapshot) a concurrent configuring PUT either commits FIRST
+    -- its guard row is visible and the delete refuses (returns 0) -- or
+    commits AFTER the delete, where its settings-change wake immediately
+    triggers a fresh tick that re-syncs the snapshot (a one-tick gap, the same
+    recoverable shape as any ordinary re-sync). No interleaving deletes rows
+    while the install is configured.
+
+    ``guard_keys`` are the PLAINTEXT settings keys whose non-empty presence
+    means "possibly configured" (the caller passes the Plex machine-identifier
+    cache and ``plex_url``). ``plex_token`` deliberately cannot be one: it is
+    Fernet-encrypted at rest, so an explicitly-cleared token (the empty string,
+    encrypted) is indistinguishable from a real credential in SQL -- and it
+    does not need to be: no identity can ever be resolved or probed from a
+    token alone (resolution requires the cached identifier, or url AND token),
+    so an install whose guard keys are all empty is unconfigured regardless of
+    what the token column holds. The url-set-but-token-cleared half state
+    therefore REFUSES the delete -- conservative retention for an operator
+    mid-reconfiguration, converged by the next tick once the pair is completed
+    (verified repoint) or the url is cleared too (this delete proceeds).
+
+    Idempotent; returns the number of rows deleted (0 when refused or already
+    clear -- callers needing to distinguish can re-read settings afterwards,
+    but no caller currently does: both outcomes end the tick as
+    ``not_configured`` and the next tick re-evaluates). Does not commit.
+    """
+    guard_row_present = exists(
+        select(Setting.id).where(
+            Setting.key.in_(list(guard_keys)),
+            Setting.value.is_not(None),
+            Setting.value != "",
+        )
+    )
+    result = cast(
+        CursorResult[Any],
+        await session.execute(delete(WatchlistItem).where(~guard_row_present)),
+    )
     return result.rowcount or 0
 
 
