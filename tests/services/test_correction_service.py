@@ -47,12 +47,14 @@ from plex_manager.models import (
     User,
 )
 from plex_manager.ports.download_client import AddResult
+from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
     correction_service,
     grab_service,
     queue_service,
+    request_service,
     season_request_service,
 )
 from plex_manager.services.grab_service import (
@@ -61,7 +63,7 @@ from plex_manager.services.grab_service import (
 )
 from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.services.library_roots import LibraryRoots
-from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate
+from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, FakeTmdb, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -3472,6 +3474,95 @@ async def test_withdraw_sole_owner_downloading_tears_down_and_becomes_ownerless(
             .all()
         )
     assert subs == []
+
+
+async def test_withdraw_last_cancellable_reacquires_lock_and_forks_a_racing_create(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#338: the last-participant teardown reuses ``cancel_request``, whose internal
+    commit (and post-commit torrent removal) RELEASES the media lock acquired at the
+    top of ``withdraw_participant``. The teardown then re-acquires the lock and
+    re-reads participant state under it before removing the subscription / nulling the
+    owner.
+
+    SQLite is single-writer (ADR-0007), so true concurrency isn't reproducible; this
+    injects the 'concurrent' create THROUGH the re-acquisition itself -- a different
+    user POSTs the same title (separate session, committed) just before the teardown's
+    re-lock. Because the settle already committed the row ``cancelled`` (dedup-INACTIVE),
+    that create sees no active row and forks a FRESH request rather than joining the
+    corpse; the settled row ends ownerless with zero subscribers, and the re-lock is a
+    real acquisition (a teardown that skipped it would mutate outside the lock)."""
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        latecomer_id = await _seed_user(session, "latecomer")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+
+    tmdb = FakeTmdb(movies={_TMDB: MovieMetadata(tmdb_id=_TMDB, title="Some Movie", year=2020)})
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    state = {"calls": 0, "forked_id": 0}
+
+    async def racing_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        state["calls"] += 1
+        # The SECOND acquisition is the post-cancel re-acquire (#338). By now
+        # cancel_request has committed the row ``cancelled``; a different user POSTing
+        # the same title in the released window forks a fresh row.
+        if state["calls"] == 2:
+            async with sessionmaker_() as other:
+                forked = await request_service.create_request(
+                    other, tmdb, tmdb_id=_TMDB, media_type="movie", user_id=latecomer_id
+                )
+                state["forked_id"] = forked.id
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", racing_acquire)
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=owner_id
+        )
+
+    assert state["calls"] == 2  # the teardown DID re-acquire the lock after cancel
+    assert outcome.settled is True
+    assert outcome.record.status == RequestStatus.cancelled.value
+    assert outcome.record.user_id is None  # ownerless
+    assert (_CULPRIT, True) in qbt.removed  # teardown ran, same as a normal cancel
+
+    forked_id = state["forked_id"]
+    assert forked_id != request_id  # the racing create forked a FRESH row
+    async with sessionmaker_() as session:
+        forked = await session.get(MediaRequest, forked_id)
+        settled_subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert forked is not None and forked.status == RequestStatus.pending  # active, independent
+    assert settled_subs == []  # the cancelled row is participant-less, not joined onto
 
 
 async def test_withdraw_sole_owner_available_is_a_plain_ownerless_settle(
