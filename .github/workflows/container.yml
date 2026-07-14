@@ -105,6 +105,24 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: echo "name=ghcr.io/${OWNER,,}/plex-manager" >> "$GITHUB_OUTPUT"
 
+      # The promote workflow's OCI-label gate (promote.yml) trusts this label as
+      # the source of truth for "what __version__ is baked into this image" — it
+      # must never silently fall back to a placeholder, so an unreadable or empty
+      # __init__.py fails the build rather than publishing an unlabeled image.
+      - name: Resolve app version for the image label
+        id: version
+        run: |
+          set -euo pipefail
+          if ! version=$(grep -oP '(?<=^__version__ = ")[^"]+' src/plex_manager/__init__.py); then
+            echo "::error::Could not extract __version__ from src/plex_manager/__init__.py (expected a line like __version__ = \"x.y.z\")"
+            exit 1
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::__version__ in src/plex_manager/__init__.py resolved to an empty string"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
@@ -130,7 +148,13 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # metadata-action already derives an org.opencontainers.image.version
+          # label from the primary tag (would be the literal string "edge" here,
+          # which is meaningless as a version) — ours is listed last so it wins
+          # and carries the real app version the promote gate checks against.
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
           build-args: |
             PLEX_MANAGER_BUILD_ID=${{ github.sha }}
           cache-from: type=gha

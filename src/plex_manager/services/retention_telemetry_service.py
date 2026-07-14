@@ -721,14 +721,26 @@ async def run_retention_telemetry_sweep(
 
     moment = now if now is not None else datetime.now(UTC)
 
+    # Computed BEFORE assembly (issue #304) so it can be threaded straight into
+    # ``assemble_candidates``'s walk-skip optimization -- this is the EXACT
+    # cutoff ``_classify_candidates`` below re-derives its ``eligible``/
+    # ``would_evict`` subsets against, so a row the walk skipped there is always
+    # exactly a row those subsets exclude anyway. Never narrows the RETURNED
+    # superset (see ``assemble_candidates``'s docstring) -- the time-to-watch
+    # dataset below still sees every started-but-unfinished/unwatched/pinned row,
+    # just with an honest ``size_percent=0.0`` for the ones nothing here ever
+    # sums bytes over.
+    grace_cutoff = moment - timedelta(days=grace_days)
+
     # ONE raw read for ALL products: every available title/season, no grace or
-    # eligibility filter -- the superset from which both the would-evict subsets
-    # (ranked/selected in memory) and the time-to-watch dataset (any recorded
-    # view) are derived. See the module docstring for the full rationale.
-    # ``all_roots`` mirrors ``run_eviction_sweep``'s own nested-root ownership
-    # scope (see ``assemble_candidates``): the telemetry for a parent root must
-    # not count content a nested child root's REAL sweep would own, or the
-    # would-evict numbers double-report the child's bytes under the parent.
+    # eligibility filter ON THE RETURNED SET -- the superset from which both the
+    # would-evict subsets (ranked/selected in memory) and the time-to-watch
+    # dataset (any recorded view) are derived. See the module docstring for the
+    # full rationale. ``all_roots`` mirrors ``run_eviction_sweep``'s own
+    # nested-root ownership scope (see ``assemble_candidates``): the telemetry
+    # for a parent root must not count content a nested child root's REAL sweep
+    # would own, or the would-evict numbers double-report the child's bytes
+    # under the parent.
     candidates = await eviction_service.assemble_candidates(
         session=session,
         library=library,
@@ -736,9 +748,8 @@ async def run_retention_telemetry_sweep(
         root_path=root_path,
         root_total_bytes=disk.total_bytes,
         all_roots=all_roots,
+        grace_cutoff=grace_cutoff,
     )
-
-    grace_cutoff = moment - timedelta(days=grace_days)
 
     # SINGLE classification pass: partition the raw candidates ONCE into the
     # metric-eligible sets and the labelled exclusion counts (no_path / guard_refused
