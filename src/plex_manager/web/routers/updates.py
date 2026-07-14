@@ -468,7 +468,15 @@ async def renew_endpoint(body: UpdateRenewRequest, request: Request) -> UpdateLe
 
 @internal_router.post("/release")
 async def release_endpoint(body: UpdateLeaseRequest, request: Request) -> UpdateLeaseResponse:
-    released = await (await _coordinator(request)).release(body.lease_token)
+    coordinator = await _coordinator(request)
+    snapshot = await coordinator.snapshot()
+    if snapshot.phase not in _KNOWN_PHASES:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
+        )
+    released = await coordinator.release(body.lease_token)
     if released:
         publish_realtime(request.app, ("updates",), reason="update_drain_released")
     return UpdateLeaseResponse(
