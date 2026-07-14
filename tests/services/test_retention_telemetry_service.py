@@ -420,6 +420,85 @@ async def test_sweep_excludes_a_pinned_title_from_eviction_but_tracks_its_watch_
     assert Path(library_path).exists()
 
 
+async def test_sweep_skips_the_size_walk_for_ineligible_rows_without_narrowing_telemetry(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #304: ``assemble_candidates``'s walk-skip optimization must never
+    change what the telemetry sweep reports. A pinned-but-watched title never
+    pays for the ``os.walk`` size lookup, yet it still shows up in the
+    watch-activity dataset exactly like before -- and the genuinely-evictable
+    title's ``eligible``/``would_evict`` bytes are unaffected (it still gets a
+    real walk, since the pre-filter never skips an actually-eligible row)."""
+    evictable_path = _movie_file(tmp_path, "Evictable.mkv", size=4096)
+    pinned_path = _movie_file(tmp_path, "Pinned.mkv", size=4096)
+    await _movie(
+        sessionmaker_,
+        tmdb_id=10,
+        title="Evictable",
+        library_path=evictable_path,
+        completed_at=_STALE - timedelta(days=1),
+    )
+    await _movie(
+        sessionmaker_,
+        tmdb_id=11,
+        title="Pinned",
+        library_path=pinned_path,
+        keep_forever=True,
+    )
+    library = FakeLibrary(
+        watch_states={
+            (10, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (11, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+
+    walked: list[str | None] = []
+    real_sized_path = eviction_service._sized_path  # pyright: ignore[reportPrivateUsage]
+
+    async def _spying_sized_path(
+        library_path: str | None, cache: dict[str, int | None]
+    ) -> int | None:
+        walked.append(library_path)
+        return await real_sized_path(library_path, cache)
+
+    monkeypatch.setattr(eviction_service, "_sized_path", _spying_sized_path)
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    # The walk only ever ran for the genuinely-evictable row; the pinned one
+    # skipped it entirely.
+    assert walked == [evictable_path]
+
+    records = [r for r in caplog.records if r.name == _TELEMETRY_LOGGER]
+    aggregate_message = records[0].getMessage()
+    # Both eligible AND would_evict see exactly the one evictable title -- the
+    # pinned title's skipped walk never leaks a size into either.
+    assert "1 eligible eviction candidate(s)" in aggregate_message
+    assert "1 would_evict now" in aggregate_message
+    assert "4096 byte(s)" in aggregate_message
+    # BOTH titles still feed the decoupled watch-activity dataset -- the
+    # pinned row's skipped walk never narrows it.
+    assert "2 title(s) with recorded watch activity" in aggregate_message
+    per_title_titles = {r.getMessage() for r in records[1:]}
+    assert any("Evictable" in msg for msg in per_title_titles)
+    assert any("Pinned" in msg for msg in per_title_titles)
+
+
 async def test_sweep_resolves_a_tv_season_context_from_the_parent_show(
     sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

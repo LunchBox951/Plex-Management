@@ -41,6 +41,7 @@ from typing import Literal
 
 __all__ = [
     "EvictionCandidate",
+    "is_evictable",
     "pressure_relieved",
     "rank_eviction_candidates",
     "select_evictions",
@@ -126,6 +127,26 @@ def _is_eligible(
         and not candidate.watchlisted
         and not candidate.in_flight
     )
+
+
+def is_evictable(candidate: EvictionCandidate, grace_cutoff: datetime) -> bool:
+    """Public wrapper around the exact pressure-independent eligibility test
+    :func:`rank_eviction_candidates` applies to every candidate (issue #304).
+
+    A caller that wants to pre-filter BEFORE paying for something expensive the
+    domain has no opinion about (e.g. the service layer's ``os.walk`` disk-size
+    lookup) can call this instead of re-deriving the same status/watched/grace/
+    pin/watchlist/in-flight rule — keeping the one true definition of "may ever
+    be evicted, pressure aside" in this module and nowhere else. Handles the
+    ``last_viewed_at is None`` guard the same way :func:`rank_eviction_candidates`
+    does (never eligible: an inconsistent watched=True/no-view pair is honestly
+    excluded, never guessed at), so this and that function can never disagree
+    about which candidates are evictable.
+    """
+    last_viewed_at = candidate.last_viewed_at
+    if last_viewed_at is None:
+        return False
+    return _is_eligible(candidate, last_viewed_at, grace_cutoff)
 
 
 def rank_eviction_candidates(

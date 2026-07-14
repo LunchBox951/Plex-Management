@@ -14,6 +14,7 @@ import pytest
 
 from plex_manager.domain.eviction import (
     EvictionCandidate,
+    is_evictable,
     rank_eviction_candidates,
     select_evictions,
 )
@@ -363,3 +364,63 @@ def test_unwatched_season_is_never_evicted_while_a_watched_sibling_season_is() -
         grace_cutoff=_GRACE_CUTOFF,
     )
     assert result == [watched_season]
+
+
+# --------------------------------------------------------------------------- #
+# is_evictable (issue #304): the exported single-candidate predicate a caller
+# can pre-filter with BEFORE paying for something expensive (e.g. the service
+# layer's os.walk disk-size lookup) -- must never disagree with
+# rank_eviction_candidates over the same inputs.
+# --------------------------------------------------------------------------- #
+
+
+def test_is_evictable_true_for_a_fully_eligible_candidate() -> None:
+    assert is_evictable(_candidate(), _GRACE_CUTOFF) is True
+
+
+def test_is_evictable_false_when_unwatched() -> None:
+    assert is_evictable(_candidate(watched=False), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_false_with_no_recorded_view_even_if_watched_flag_is_set() -> None:
+    assert is_evictable(_candidate(watched=True, last_viewed_at=None), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_false_within_the_grace_window() -> None:
+    assert is_evictable(_candidate(last_viewed_at=_RECENT), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_false_when_keep_forever() -> None:
+    assert is_evictable(_candidate(keep_forever=True), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_false_when_watchlisted() -> None:
+    assert is_evictable(_candidate(watchlisted=True), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_false_when_in_flight() -> None:
+    assert is_evictable(_candidate(in_flight=True), _GRACE_CUTOFF) is False
+
+
+@pytest.mark.parametrize("status", ["pending", "downloading", "evicted"])
+def test_is_evictable_false_for_ineligible_statuses(status: str) -> None:
+    assert is_evictable(_candidate(status=status), _GRACE_CUTOFF) is False
+
+
+def test_is_evictable_agrees_with_rank_eviction_candidates_over_a_mixed_batch() -> None:
+    # No candidate here differs on any field the two funcs could disagree on --
+    # is_evictable applied per-candidate must produce exactly the set
+    # rank_eviction_candidates returns for the batch (order aside).
+    candidates = [
+        _candidate(request_id=1),
+        _candidate(request_id=2, watched=False),
+        _candidate(request_id=3, keep_forever=True),
+        _candidate(request_id=4, in_flight=True),
+        _candidate(request_id=5, last_viewed_at=_RECENT),
+        _candidate(request_id=6, watchlisted=True),
+        _candidate(request_id=7, status="downloading"),
+        _candidate(request_id=8, last_viewed_at=None, watched=True),
+    ]
+    ranked_ids = {c.request_id for c in rank_eviction_candidates(candidates, _GRACE_CUTOFF)}
+    evictable_ids = {c.request_id for c in candidates if is_evictable(c, _GRACE_CUTOFF)}
+    assert evictable_ids == ranked_ids == {1}
