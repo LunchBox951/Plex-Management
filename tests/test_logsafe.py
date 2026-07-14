@@ -1094,14 +1094,82 @@ def test_value_in_actual_value_position_is_still_masked_despite_the_key_guard() 
 
 
 def test_key_guard_is_narrow_bare_value_before_equals_is_still_masked() -> None:
-    """The key-name guard spares ONLY a value embedded in a LARGER identifier
-    before a separator. A high-entropy secret standing alone in prose -- even
-    immediately followed by ``=`` -- is still masked, so the guard opens no leak
-    for that shape (adversarial: a blanket 'skip if followed by =' would have)."""
+    """The key-name guard spares ONLY an occurrence that IS exactly a recognized
+    secret key word. A high-entropy secret standing alone in prose -- even
+    immediately followed by ``=`` -- fails that condition and is masked, so the
+    guard opens no leak for this shape (adversarial: a blanket 'skip if followed
+    by =' would have)."""
     raw = f"computed digest {_FAKE_API_KEY}=trailing"
     result = redact_known_secrets(raw, [_FAKE_API_KEY])
     assert _FAKE_API_KEY not in result
     assert "<redacted>" in result
+
+
+def test_key_guard_masks_a_secret_embedded_in_a_larger_token_before_equals() -> None:
+    """Round-2 regression (Codex, PR #361): a configured secret appearing as the
+    TAIL of a larger unrecognized token immediately before ``=`` must be masked,
+    never treated as a key-name suffix -- the earlier 'embedded in any
+    identifier' rule left exactly this occurrence in clear text."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"payload=x{secret}=v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "payload=x<redacted>=v"
+
+
+def test_key_guard_masks_a_secret_embedded_in_a_larger_token_before_colon() -> None:
+    """Adversarial variant of the round-2 regression: the same embedded-tail
+    shape with ``:`` as the separator."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"payload=x{secret}:v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "payload=x<redacted>:v"
+
+
+def test_key_guard_masks_a_secret_appearing_twice_in_one_token() -> None:
+    """Adversarial variant: the secret twice back-to-back in one token before
+    ``=`` -- BOTH occurrences must mask (the second sits directly before the
+    separator, the position the old rule spared)."""
+    secret = "hunter2hunter2hunter2A"  # noqa: S105 -- fixture
+    raw = f"blob {secret}{secret}=v"
+    result = redact_known_secrets(raw, [secret])
+    assert secret not in result
+    assert result == "blob <redacted><redacted>=v"
+
+
+def test_key_guard_masks_a_key_word_secret_in_url_userinfo_position() -> None:
+    """Adversarial: even a key-WORD-valued secret is masked when it sits in a
+    URL's userinfo (``https://password:x@host`` -- a USERNAME, not a key name):
+    sparing there would print the secret as a plausible-looking username. The
+    guard's authority-boundary check fails closed."""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    raw = "https://password:x@tracker.example.com/announce"
+    result = redact_known_secrets(raw, [secret])
+    assert result == "https://<redacted>:x@tracker.example.com/announce"
+    # And the full boundary composition also masks the password half:
+    combined = redact_secrets(result)
+    assert combined == "https://<redacted>:<redacted>@tracker.example.com/announce"
+
+
+def test_key_word_secret_spared_in_key_position_composes_to_mask_the_value() -> None:
+    """The spare is safe BY COMPOSITION: it fires only where the shape pass
+    (which every capture/read boundary runs after the value pass) recognizes the
+    occurrence as a key and masks the value side -- so the pair's actual
+    credential never survives, standalone or prefixed, bare or quoted. (Masking
+    the key instead would BREAK the shape pass's key and leave the credential
+    exposed: ``<redacted>=hunter2value``.)"""
+    secret = "password"  # noqa: S105 -- the degenerate key-word-valued secret
+    for raw, expected in (
+        ("some_password=hunter2value", "some_password=<redacted>"),
+        ("password=hunter2value", "password=<redacted>"),
+        ("{'some_password': 'hunter2value'}", "{'some_password': '<redacted>'}"),
+    ):
+        value_first = redact_known_secrets(raw, [secret])
+        assert "hunter2value" in value_first  # value pass spared the key, kept the pair
+        combined = redact_secrets(value_first)
+        assert "hunter2value" not in combined
+        assert combined == expected
 
 
 # --- #292 encoding-variant gaps: unpadded/base64url, percent case + ``+``, --- #
@@ -1140,6 +1208,31 @@ def test_redact_known_secrets_masks_lowercase_percent_and_plus_encoded_variants(
         result = redact_known_secrets(f"connecting with pw={spelling} now", [password])
         assert spelling not in result, spelling
         assert "<redacted>" in result
+
+
+def test_redact_known_secrets_masks_per_escape_mixed_case_percent_spellings() -> None:
+    """Round-2 regression (Codex, PR #361): percent-escape case must be handled
+    PER ESCAPE, not by enumerating all-upper/all-lower spellings -- a rendering
+    mixing ``%2f`` next to ``%3D`` in ONE string escaped the enumerated variants.
+    ``_variant_regex`` compiles each escape's hex pair case-insensitively, so
+    every mix masks. Unencoded characters remain case-significant."""
+    password = "p@ss w/d&x=1"  # reserved chars + a space  # noqa: S105
+    canonical = quote(password, safe="")
+    assert canonical == "p%40ss%20w%2Fd%26x%3D1"  # two case-bearing escapes: %2F, %3D
+    mixed_spellings = [
+        "p%40ss%20w%2fd%26x%3D1",  # first escape lower, second upper -- a true mix
+        "p%40ss%20w%2Fd%26x%3d1",  # first upper, second lower -- the reverse mix
+        "p%40ss+w%2fd%26x%3D1",  # quote_plus (+-for-space) spelling, mixed case
+        "p%40ss+w%2Fd%26x%3d1",  # quote_plus, the reverse mix
+    ]
+    for spelling in mixed_spellings:
+        result = redact_known_secrets(f"connecting with pw={spelling} now", [password])
+        assert spelling not in result, spelling
+        assert "<redacted>" in result
+    # Case-insensitivity applies to the ESCAPES only: a different unencoded
+    # letter is a different string and must NOT match (no over-redaction).
+    unrelated = "P%40ss%20w%2Fd%26x%3D1"  # leading literal 'P' != 'p'
+    assert redact_known_secrets(f"pw={unrelated} now", [password]).count("<redacted>") == 0
 
 
 def test_redact_known_secrets_masks_json_and_repr_escaped_variants() -> None:

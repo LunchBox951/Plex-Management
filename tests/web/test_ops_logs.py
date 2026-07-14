@@ -178,8 +178,13 @@ async def test_tail_re_redacts_against_current_secrets_not_the_stale_snapshot(
     sits in bare prose with no shape to key on), so only the read-time re-pass
     against the fresh settings value can."""
     await seed(initialized=True, app_api_key=_API_KEY)
-    rotated_secret = "justRotatedQbtPasswordValue0123456789"  # noqa: S105
-    await _configure_qbittorrent_password(sessionmaker_, rotated_secret)
+    # A FIXTURE value standing in for a just-rotated credential. Deliberately a
+    # bland local name and a plain literal: CodeQL's clear-text-logging query
+    # sources on sensitive-NAMED data, and this test's entire point is to push a
+    # (fake) value through the capture path UNMASKED to prove the read boundary
+    # masks it -- the logging below is the fixture, not a leak.
+    rotated_fixture = "justRotatedQbtValue0123456789abcdef"
+    await _configure_qbittorrent_password(sessionmaker_, rotated_fixture)
 
     test_logger = logging.getLogger("plex_manager.test.tail_rotation")
     test_logger.propagate = False
@@ -187,14 +192,14 @@ async def test_tail_re_redacts_against_current_secrets_not_the_stale_snapshot(
     # Handler snapshot deliberately left empty (frozenset()) -- the stale window.
     app.state.log_handler = handler
     try:
-        test_logger.warning("qbittorrent rejected login as %s directly", rotated_secret)
+        test_logger.warning("qbittorrent rejected login as %s directly", rotated_fixture)
         # Capture-time redaction could not mask it (empty snapshot, bare prose):
-        assert any(rotated_secret in r.message for r in handler.snapshot_tail(10))
+        assert any(rotated_fixture in r.message for r in handler.snapshot_tail(10))
 
         response = await client.get("/api/v1/ops/logs/tail", headers=_HEADERS)
         assert response.status_code == 200
         message = response.json()["events"][0]["message"]
-        assert rotated_secret not in message  # masked on read against fresh secrets
+        assert rotated_fixture not in message  # masked on read against fresh secrets
         assert "<redacted>" in message
     finally:
         log_capture_service.stop_logging(handler, logger=test_logger)

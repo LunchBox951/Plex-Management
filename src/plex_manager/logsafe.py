@@ -652,26 +652,57 @@ def redact_secrets(text: str) -> str:
 _MIN_SECRET_VALUE_LENGTH: Final = 8
 
 #: A word/identifier character (matches a ``[\w-]`` run's members). Used by the
-#: key-name guard below to tell whether a value match is embedded WITHIN a larger
-#: identifier rather than standing alone.
+#: key-name guard below to expand a value match leftward to the start of the
+#: identifier it sits in, so the character BEFORE that identifier can be checked.
 _IDENT_CHAR_RE: Final = re.compile(r"[\w-]")
-#: An assignment separator anchored at the character AFTER a value match: optional
-#: whitespace then ``:`` or ``=``. Used with :func:`re.Match.string` to detect a
-#: value sitting in KEY position.
-_KEY_POSITION_SEP_RE: Final = re.compile(r"\s*[:=]")
+#: An assignment separator anchored at the character AFTER a value match: the
+#: SAME optional-closing-quote + ``:``/``=`` shape :data:`_SECRET_KV_RE` keys on
+#: (:data:`_KV_SEP_PATTERN`, reused verbatim) -- so "the shape pass WILL mask the
+#: value side of this pair" is checked against the shape pass's own grammar, not
+#: an approximation of it. Used with :func:`re.Match.string`.
+_KEY_POSITION_SEP_RE: Final = re.compile(_KV_SEP_PATTERN)
+#: The recognized secret KEY WORDS (the shape grammar's own alternation, plus
+#: ``authorization``), fullmatched case-insensitively against a value occurrence
+#: by the key-name guard (:func:`_mask_known_value`): ONLY an occurrence that IS
+#: exactly one of these words may ever be spared. Any longer or different match
+#: is masked unconditionally, so a secret merely EMBEDDED in a bigger token
+#: before a separator (``payload=x<secret>=v``) can never ride the guard into
+#: clear text.
+_KEY_WORD_FULL_RE: Final = re.compile(r"(?i)(?:" + _SECRET_KEY_PATTERN + r"|authorization)")
+#: Characters that, appearing immediately BEFORE the identifier a spared-candidate
+#: occurrence sits in, mark a URL-authority context (``https://password:x@host`` --
+#: the occurrence is a USERNAME/userinfo component, not a key name) rather than a
+#: key context (start-of-line/whitespace/quote/brace/``?``/``&``/comma). The guard
+#: refuses to spare there: fail closed, mask.
+_URL_AUTHORITY_BOUNDARY: Final = frozenset("/:@")
 
 
-#: A single ``%XX`` percent-escape. Used to derive a LOWERCASE-hex spelling of a
-#: percent-encoded variant: ``quote``/``quote_plus`` always emit UPPERCASE hex
-#: (``%2F``), but a client/proxy/browser may emit lowercase (``%2f``) -- both are
-#: valid and equivalent per RFC 3986, so both spellings must be masked.
+#: A single ``%XX`` percent-escape. ``quote``/``quote_plus`` always emit
+#: UPPERCASE hex (``%2F``), but a client/proxy/browser may emit lowercase
+#: (``%2f``) or ANY per-escape mixed case (``%2f%3D`` next to ``%2F%3d``) -- all
+#: equivalent per RFC 3986. :func:`_variant_regex` therefore compiles each
+#: escape's hex pair into a case-insensitive character-class pair instead of
+#: enumerating spellings (which could never cover per-escape mixes).
 _PERCENT_ESCAPE_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
-def _lower_percent_escapes(encoded: str) -> str:
-    """Lowercase the hex digits of every ``%XX`` escape, leaving all other
-    characters untouched -- the lowercase-percent spelling of ``encoded``."""
-    return _PERCENT_ESCAPE_RE.sub(lambda m: m.group().lower(), encoded)
+def _variant_regex(variant: str) -> str:
+    """A regex source matching ``variant`` literally EXCEPT that every ``%XX``
+    percent-escape's hex digits match case-insensitively (``%2F`` -> ``%2[Ff]``),
+    so every per-escape case mix of a percent-encoded rendering is masked -- not
+    just the all-upper/all-lower spellings (#292 round-2 finding). Non-escape
+    characters are :func:`re.escape`d, so the rest of the value stays an exact
+    literal match (unencoded characters ARE case-significant). Character classes
+    only, no added quantifiers: as linear (ReDoS-free) as the plain escape."""
+    parts: list[str] = []
+    pos = 0
+    for m in _PERCENT_ESCAPE_RE.finditer(variant):
+        parts.append(re.escape(variant[pos : m.start()]))
+        pair = "".join(d if d.isdigit() else f"[{d.upper()}{d.lower()}]" for d in m.group()[1:])
+        parts.append("%" + pair)
+        pos = m.end()
+    parts.append(re.escape(variant[pos:]))
+    return "".join(parts)
 
 
 def _secret_value_variants(value: str) -> frozenset[str]:
@@ -683,10 +714,11 @@ def _secret_value_variants(value: str) -> frozenset[str]:
 
     * **Percent-encoding** -- a password/token embedded in a query string or
       userinfo often arrives percent-encoded (e.g. a password containing ``@``
-      or ``&``). Covered in all common spellings (#292 encoding-variant items):
-      canonical ``quote`` (UPPERCASE hex, ``%20`` for space), its LOWERCASE-hex
-      equivalent (``%2f`` -- both are RFC-3986-valid), and ``quote_plus``'s
-      ``+``-for-space query spelling, itself in upper- and lowercase hex.
+      or ``&``). Two variants are generated -- ``quote`` (``%20`` for space) and
+      ``quote_plus`` (``+`` for space) -- and hex CASE is not enumerated here at
+      all: :func:`_variant_regex` compiles each ``%XX`` escape case-insensitively
+      at match time, covering upper, lower, AND per-escape mixed spellings
+      (#292 encoding-variant items + round-2 mixed-case finding).
     * **base64** -- ``cryptography``/third-party clients frequently base64 a
       credential for a header or config dump. Covered as STANDARD and URL-SAFE
       alphabets, each in PADDED and UNPADDED form (a ``=``-stripped/base64url
@@ -707,14 +739,10 @@ def _secret_value_variants(value: str) -> frozenset[str]:
     """
     raw_bytes = value.encode("utf-8", "surrogatepass")
     variants = {value}
-    # Percent-encoding: canonical + lowercase-hex, for both ``quote`` (space ->
-    # ``%20``) and ``quote_plus`` (space -> ``+``).
-    for encoded in (
-        quote(value, safe="", errors="surrogatepass"),
-        quote_plus(value, safe="", errors="surrogatepass"),
-    ):
-        variants.add(encoded)
-        variants.add(_lower_percent_escapes(encoded))
+    # Percent-encoding: ``quote`` (space -> ``%20``) and ``quote_plus`` (space ->
+    # ``+``). Hex case is handled at match time by ``_variant_regex``.
+    variants.add(quote(value, safe="", errors="surrogatepass"))
+    variants.add(quote_plus(value, safe="", errors="surrogatepass"))
     # base64: standard and URL-safe alphabets, each padded and unpadded.
     for b64 in (
         base64.b64encode(raw_bytes).decode("ascii"),
@@ -732,18 +760,48 @@ def _secret_value_variants(value: str) -> frozenset[str]:
 
 
 def _mask_known_value(match: re.Match[str]) -> str:
-    """Replace a matched secret-value occurrence with :data:`_REDACTED`, UNLESS it
-    is the tail of a larger identifier sitting in KEY position -- preceded by a
-    word char AND immediately followed by an assignment separator -- in which
-    case masking would rewrite a key NAME rather than a credential (#292 item 4;
-    see :func:`redact_known_secrets`). The spared case is deliberately narrow: a
-    standalone or in-prose value, even one followed by ``=``, is still masked."""
+    """Replace a matched secret-value occurrence with :data:`_REDACTED`, UNLESS
+    the occurrence is provably serving as a KEY NAME (#292 item 4; see
+    :func:`redact_known_secrets`), in which case masking it would rewrite an
+    identifier (``some_password=X`` -> ``some_<redacted>=X``) -- destroying a key
+    operators need AND, worse, breaking the very key the shape pass would have
+    used to mask the actual credential ``X``.
+
+    ALL of the following must hold to spare an occurrence -- each condition
+    exists to kill a concrete leak a looser rule allowed:
+
+    * the matched text IS exactly one of the recognized secret KEY WORDS
+      (:data:`_KEY_WORD_FULL_RE`) -- a spare can only ever render bytes that are
+      indistinguishable from ordinary log syntax (``password``, ``auth_token``,
+      ... appear as key names in every deployment's logs regardless of what any
+      secret's value is, so their presence reveals nothing about the configured
+      secret). A secret merely embedded in / equal to some OTHER token before a
+      separator (round-2 finding: ``payload=x<secret>=v``) fails this and is
+      masked unconditionally.
+    * it is immediately followed by the shape grammar's OWN key/value separator
+      (:data:`_KEY_POSITION_SEP_RE` = :data:`_KV_SEP_PATTERN`) -- which, with the
+      first condition, guarantees :func:`redact_secrets`'s ``_SECRET_KV_RE``
+      recognizes this exact span as a key and masks the VALUE side. (Every
+      capture/read boundary runs :func:`redact_secrets` after this pass -- see
+      ``log_capture_service._capture`` and ``web/routers/ops.py`` -- so the pair's
+      credential never survives the composition.)
+    * the identifier the occurrence sits in is NOT preceded by a URL-authority
+      character (:data:`_URL_AUTHORITY_BOUNDARY`): in ``https://password:x@host``
+      the occurrence is a USERINFO component, not a key name, and sparing it
+      would print the secret as a "username". Fail closed: mask.
+    """
+    matched = match.group(0)
+    if _KEY_WORD_FULL_RE.fullmatch(matched) is None:
+        return _REDACTED
     text = match.string
-    start, end = match.start(), match.end()
-    embedded_in_identifier = start > 0 and _IDENT_CHAR_RE.fullmatch(text[start - 1]) is not None
-    if embedded_in_identifier and _KEY_POSITION_SEP_RE.match(text, end) is not None:
-        return match.group(0)  # a key name, not a credential value -- leave it
-    return _REDACTED
+    if _KEY_POSITION_SEP_RE.match(text, match.end()) is None:
+        return _REDACTED
+    ident_start = match.start()
+    while ident_start > 0 and _IDENT_CHAR_RE.fullmatch(text[ident_start - 1]) is not None:
+        ident_start -= 1
+    if ident_start > 0 and text[ident_start - 1] in _URL_AUTHORITY_BOUNDARY:
+        return _REDACTED  # userinfo/authority position, not a key -- fail closed
+    return matched  # a key name the shape pass will key on -- leave it readable
 
 
 def redact_known_secrets(
@@ -800,20 +858,25 @@ def redact_known_secrets(
     too-short ``secret_values`` is a no-op, returned byte-identical, exactly
     like an ordinary miss in :func:`redact_secrets`.
 
-    KEY-NAME GUARD (#292 item 4): a value occurrence that is embedded as the tail
-    of a LARGER identifier which is itself in KEY position -- preceded by a word
-    char and immediately followed by an assignment separator (``some_password=X``,
-    where a configured secret's value happens to equal the field-name word
-    ``"password"``, a minimum-length edge case) -- is left intact by
-    :func:`_mask_known_value`. Masking it would rewrite a KEY NAME
-    (``some_<redacted>=X``), eating an identifier operators need (honesty over
-    silence: operators need usable logs), while the ACTUAL credential in that
-    shape sits on the RIGHT of the separator, where this same pass (a later
-    occurrence) and :func:`redact_secrets`'s key-preserving shape grammar both
-    still mask it. The guard is deliberately narrow -- only a value embedded in a
-    larger identifier before a separator is spared, so a standalone or in-prose
-    secret value (even one immediately followed by ``=``) is still masked -- so
-    it forfeits no coverage of a real leak.
+    KEY-NAME GUARD (#292 item 4): an occurrence is spared -- left readable --
+    ONLY when it is provably serving as a key NAME rather than a credential:
+    the matched text is exactly one of the shape grammar's own secret KEY WORDS
+    (an operator whose configured secret's value equals a field-name word like
+    ``"password"`` is the minimum-length edge case this exists for), it sits in
+    key position before the shape grammar's own separator (so
+    :func:`redact_secrets`, which every boundary runs AFTER this pass, is
+    guaranteed to mask the value side of the pair), and it is not in a
+    URL-userinfo position. Masking such a key would rewrite the identifier
+    (``some_password=X`` -> ``some_<redacted>=X``) -- eating a name operators
+    need (honesty over silence) and breaking the very key the shape pass uses
+    to mask the actual credential ``X``. Anything failing ANY condition --
+    including a secret embedded in a larger unrecognized token immediately
+    before ``=``/``:`` (``payload=x<secret>=v``) -- is masked unconditionally;
+    see :func:`_mask_known_value` for the full condition-by-condition rationale.
+
+    The alternation is built with :func:`_variant_regex`, so a percent-encoded
+    rendering matches its ``%XX`` escapes case-insensitively -- upper, lower,
+    and per-escape MIXED spellings all mask, with no spelling enumeration.
     """
     if not text:
         return text
@@ -824,6 +887,6 @@ def redact_known_secrets(
         variants |= _secret_value_variants(value)
     if not variants:
         return text
-    alternation = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    alternation = "|".join(_variant_regex(v) for v in sorted(variants, key=len, reverse=True))
     pattern = re.compile(r"(?:" + alternation + r")")
     return pattern.sub(_mask_known_value, text)
