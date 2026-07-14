@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -17,10 +17,14 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
-from plex_manager.models import MaintenanceLease
+from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
+from plex_manager.repositories.update_coordination import (
+    _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
+)
 from plex_manager.services.update_coordination_service import (
     MaintenanceDrainingError,
     MaintenanceLeaseLostError,
+    UnknownCoordinatorPhaseError,
     UpdateAction,
     UpdateCoordinationService,
     UpdateOperationInProgressError,
@@ -660,6 +664,154 @@ async def test_heartbeat_freshness_is_bounded(sessionmaker_: SessionMaker) -> No
     assert service.updater_available(snapshot, max_age=timedelta(seconds=30))
     clock.advance(timedelta(seconds=31))
     assert not service.updater_available(snapshot, max_age=timedelta(seconds=30))
+
+
+async def _plant_phase(sessionmaker_: SessionMaker, phase: str) -> None:
+    """Write an unrecognized coordinator phase directly, bypassing the service.
+
+    Models a concurrent writer (a newer/older app version, or the version-skew
+    window issue #308 addressed) that lands a phase this app version's
+    ``UpdatePhase`` enum does not know, independent of any legitimate service
+    call.
+    """
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(phase=phase)
+        )
+        await session.commit()
+
+
+async def _row(sessionmaker_: SessionMaker) -> UpdateCoordinatorState:
+    async with sessionmaker_() as session:
+        return (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+
+
+def test_known_coordinator_phases_track_update_phase_exactly() -> None:
+    """Drift guard: the repo module cannot import ``UpdatePhase`` (repositories/
+    must never depend on services/ -- hexagonal layering), so it keeps its own
+    duplicated frozenset of known phase literals. This asserts the duplicate can
+    never silently diverge from the authoritative enum.
+    """
+    assert frozenset(phase.value for phase in UpdatePhase) == _KNOWN_COORDINATOR_PHASES
+
+
+async def test_touch_updater_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_phase(sessionmaker_, "future_checking")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.touch_updater(phase=UpdatePhase.checking, expected_generation=0)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_checking"
+    assert row.updater_last_seen_at is None
+
+
+async def test_claim_drain_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_phase(sessionmaker_, "future_checking")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.claim_drain(ttl=timedelta(minutes=1))
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_checking"
+    async with sessionmaker_() as session:
+        leases = (await session.execute(select(MaintenanceLease))).scalars().all()
+    assert leases == []
+
+
+async def test_renew_drain_progress_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    await _plant_phase(sessionmaker_, "future_installing")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.renew_drain_progress(
+            claim.lease.token,
+            ttl=timedelta(minutes=5),
+            phase=UpdatePhase.installing,
+        )
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_installing"
+    async with sessionmaker_() as session:
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert lease.expires_at.replace(tzinfo=UTC) == claim.lease.expires_at
+
+
+async def test_release_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    await _plant_phase(sessionmaker_, "future_installing")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.release(claim.lease.token)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_installing"
+    async with sessionmaker_() as session:
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert lease.token_hash == hashlib.sha256(claim.lease.token.encode()).hexdigest()
+
+
+async def test_acknowledge_action_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.check)
+    await _plant_phase(sessionmaker_, "future_checking")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.acknowledge_action(
+            expected_generation=generation,
+            result=UpdateResult.no_update,
+        )
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_checking"
+    assert row.requested_action == "check"
+    assert row.last_result is None
+
+
+async def test_acknowledge_outcome_rejects_unknown_phase_inside_the_lock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.install)
+    claim = await service.claim_drain(ttl=timedelta(minutes=5), action_generation=generation)
+    assert claim is not None
+    await _plant_phase(sessionmaker_, "future_installing")
+
+    with pytest.raises(UnknownCoordinatorPhaseError):
+        await service.acknowledge_outcome(
+            claim.lease.token,
+            expected_generation=generation,
+            result=UpdateResult.success,
+        )
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "future_installing"
+    assert row.requested_action == "install"
+    async with sessionmaker_() as session:
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert lease.token_hash == hashlib.sha256(claim.lease.token.encode()).hexdigest()
 
 
 async def test_concurrent_drain_claims_have_exactly_one_winner(tmp_path: Path) -> None:

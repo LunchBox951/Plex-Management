@@ -28,6 +28,7 @@ from plex_manager.repositories.update_coordination import (
     CoordinatorSnapshot,
     LeaseKind,
     SqlUpdateCoordinationRepository,
+    UnknownCoordinatorPhaseError,
 )
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "LeaseGrant",
     "MaintenanceDrainingError",
     "MaintenanceLeaseLostError",
+    "UnknownCoordinatorPhaseError",
     "UpdateAction",
     "UpdateCoordinationService",
     "UpdateOperationInProgressError",

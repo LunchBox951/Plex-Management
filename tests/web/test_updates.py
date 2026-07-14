@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,13 +10,15 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import update
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
-from plex_manager.models import UpdateCoordinatorState
+from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    UpdateAction,
     UpdateCoordinationService,
     UpdatePhase,
     UpdateResult,
@@ -827,6 +830,260 @@ async def test_known_phase_release_still_succeeds(
     assert released.status_code == 200
     assert released.json()["blocker"] is None
     assert (await coordinator.snapshot()).phase == "idle"
+
+
+def _flip_phase_after_next_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    coordinator: UpdateCoordinationService,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    new_phase: str,
+) -> None:
+    """Make the coordinator's very next ``snapshot()`` call read a real, KNOWN
+    phase while a "concurrent" writer flips the underlying row to an
+    unrecognized ``new_phase`` immediately afterward -- the exact TOCTOU window
+    issue #322 closes. Every endpoint below calls ``snapshot()`` (directly, or
+    via ``_eligibility``) exactly once as its own fast-path pre-check before
+    reaching its locked write, so this reproduces "the row was known-phase when
+    the endpoint snapshotted it, but had already moved to an unrecognized phase
+    by the time the locked repository method re-read it" without needing real
+    concurrent requests. Only the LOCKED write's own guard -- not the fast
+    path, which already saw and approved a known phase -- can catch this.
+    """
+    original_snapshot = coordinator.snapshot
+    flipped = {"done": False}
+
+    async def snapshot_then_flip() -> CoordinatorSnapshot:
+        result = await original_snapshot()
+        if not flipped["done"]:
+            flipped["done"] = True
+            async with sessionmaker() as session:
+                await session.execute(
+                    update(UpdateCoordinatorState)
+                    .where(UpdateCoordinatorState.id == 1)
+                    .values(phase=new_phase)
+                )
+                await session.commit()
+        return result
+
+    monkeypatch.setattr(coordinator, "snapshot", snapshot_then_flip)
+
+
+async def test_heartbeat_locked_touch_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    generation = await coordinator.request_action(UpdateAction.check)
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_checking"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking", "action_generation": generation},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+    assert row.phase == "future_checking"
+    assert row.updater_last_seen_at is None
+
+
+async def test_claim_recovery_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(
+        ttl=timedelta(minutes=5),
+        action_generation=0,
+        materialize_install=True,
+    )
+    assert claim is not None
+    assert claim.lease.action_generation == 1
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_installing"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/claim",
+        headers=updater_headers,
+        json={"recovery": True, "expected_generation": 1},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+        leases = (await session.execute(select(MaintenanceLease))).scalars().all()
+    assert row.phase == "future_installing"
+    # The original (still-live) drain lease must survive the blocked recovery
+    # claim untouched -- no new lease, no released/mutated existing one.
+    assert len(leases) == 1
+    assert leases[0].token_hash == hashlib.sha256(claim.lease.token.encode()).hexdigest()
+
+
+async def test_renew_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    token = claim.lease.token
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_installing"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/renew",
+        headers=updater_headers,
+        json={"lease_token": token, "phase": "installing"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert row.phase == "future_installing"
+    assert lease.token_hash == hashlib.sha256(token.encode()).hexdigest()
+    assert lease.expires_at.replace(tzinfo=UTC) == claim.lease.expires_at
+
+
+async def test_release_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    token = claim.lease.token
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_installing"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/release",
+        headers=updater_headers,
+        json={"lease_token": token},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert row.phase == "future_installing"
+    assert lease.token_hash == hashlib.sha256(token.encode()).hexdigest()
+
+
+async def test_outcome_check_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    generation = await coordinator.request_action(UpdateAction.check)
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_checking"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "operation": "check",
+            "outcome": "no_update",
+            "action_generation": generation,
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+    assert row.phase == "future_checking"
+    assert row.requested_action == "check"
+    assert row.last_result is None
+
+
+async def test_outcome_install_locked_op_rejects_phase_that_turned_unknown_after_snapshot(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    generation = await coordinator.request_action(UpdateAction.install)
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5), action_generation=generation)
+    assert claim is not None
+    token = claim.lease.token
+
+    _flip_phase_after_next_snapshot(
+        monkeypatch, coordinator, app.state.sessionmaker, "future_installing"
+    )
+
+    response = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={
+            "lease_token": token,
+            "operation": "install",
+            "outcome": "succeeded",
+            "action_generation": generation,
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "coordinator_state_unknown"
+
+    async with app.state.sessionmaker() as session:
+        row = (await session.execute(select(UpdateCoordinatorState))).scalar_one()
+        lease = (await session.execute(select(MaintenanceLease))).scalar_one()
+    assert row.phase == "future_installing"
+    assert row.requested_action == "install"
+    assert lease.token_hash == hashlib.sha256(token.encode()).hexdigest()
 
 
 async def test_token_bound_progress_reports_install_and_rollback(
