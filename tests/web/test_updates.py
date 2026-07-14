@@ -53,6 +53,28 @@ async def _enable_automatic_updates(client: httpx.AsyncClient) -> None:
     assert response.status_code == 200
 
 
+def _freeze_router_clock(monkeypatch: pytest.MonkeyPatch, moment: list[datetime]) -> None:
+    """Pin the ``datetime.now(UTC)`` seen by the updates router to ``moment[0]``.
+
+    The window-open checks in ``web/routers/updates.py`` call ``datetime.now(UTC)``
+    directly rather than threading a fake clock, so a real "always open" window
+    (00:00-23:59) genuinely closes for the last minute of the UTC day
+    (``UpdateSchedule.is_open`` is a half-open ``[start, end)`` check). Tests that
+    assume the window is open would then flake once a day. Pin it here instead so
+    window-dependent assertions are deterministic regardless of when the suite
+    runs. Pass a one-element list so callers can advance ``moment[0]`` in lockstep
+    with a coordinator fake clock built the same way.
+    """
+    from plex_manager.web.routers import updates as updates_module
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return moment[0]
+
+    monkeypatch.setattr(updates_module, "datetime", _FrozenDateTime)
+
+
 @pytest.fixture
 def updater_headers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     secret = tmp_path / "updater-token"
@@ -540,10 +562,12 @@ async def test_automatic_claim_survives_expiry_for_exact_recovery(
     client: httpx.AsyncClient,
     seed: SeedFn,
     updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     await _enable_automatic_updates(client)
     now = [datetime(2026, 7, 12, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, now)
     coordinator = UpdateCoordinationService(
         app.state.sessionmaker,
         clock=lambda: now[0],
@@ -787,9 +811,11 @@ async def test_automatic_idle_only_status_matches_claim_blocker(
     client: httpx.AsyncClient,
     seed: SeedFn,
     updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     await _enable_automatic_updates(client)
+    _freeze_router_clock(monkeypatch, [datetime(2026, 7, 12, 12, 0, tzinfo=UTC)])
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
