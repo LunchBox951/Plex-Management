@@ -744,6 +744,91 @@ async def test_unknown_coordinator_phase_blocks_outcome_even_with_matching_gener
     assert after.drain_owner == before.drain_owner
 
 
+async def test_unknown_coordinator_phase_blocks_release_even_with_valid_lease(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """The phase guard alone must block the release, independent of lease validity.
+
+    A currently-valid drain lease token is deliberately paired with an unknown
+    row phase (the post-rollback version-skew window #308 addressed) so the
+    only thing standing between the row and a silent phase-rewrite-to-idle is
+    the phase guard itself.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    token = claim.lease.token
+
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing")
+        )
+        await session.commit()
+
+    before = await coordinator.snapshot()
+    blocked = await client.post(
+        "/api/v1/internal/updates/release",
+        headers=updater_headers,
+        json={"lease_token": token},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "coordinator_state_unknown"
+    after = await coordinator.snapshot()
+    assert after.phase == before.phase == "future_installing"
+
+    # The lease itself must survive the blocked attempt: once the row phase is
+    # known again, releasing the same token still works, proving the guard
+    # rejected the request before any row or lease mutation occurred.
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="draining")
+        )
+        await session.commit()
+    recovered = await client.post(
+        "/api/v1/internal/updates/release",
+        headers=updater_headers,
+        json={"lease_token": token},
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["blocker"] is None
+    assert (await coordinator.snapshot()).phase == "idle"
+
+
+async def test_known_phase_release_still_succeeds(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    claim = await coordinator.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    token = claim.lease.token
+    assert (await coordinator.snapshot()).phase == "draining"
+
+    released = await client.post(
+        "/api/v1/internal/updates/release",
+        headers=updater_headers,
+        json={"lease_token": token},
+    )
+    assert released.status_code == 200
+    assert released.json()["blocker"] is None
+    assert (await coordinator.snapshot()).phase == "idle"
+
+
 async def test_token_bound_progress_reports_install_and_rollback(
     app: FastAPI,
     client: httpx.AsyncClient,
