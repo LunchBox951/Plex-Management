@@ -384,6 +384,7 @@ async def _ensure_tv_season_plan(
     media_request_id: int,
     tmdb_id: int,
     plan: _TvSeasonPlan,
+    present: frozenset[int] | None = None,
 ) -> None:
     await season_request_service.ensure_seasons(
         session,
@@ -392,6 +393,7 @@ async def _ensure_tv_season_plan(
         tmdb_id=tmdb_id,
         seasons=plan.season_numbers,
         force_pending=plan.episode_scoped,
+        present=present,
     )
     for waiting_season in sorted(plan.waiting_seasons):
         await season_request_service.set_status(
@@ -400,6 +402,69 @@ async def _ensure_tv_season_plan(
             season_number=waiting_season,
             status=RequestStatus.waiting_for_air_date.value,
         )
+
+
+async def _grow_tv_dedup_join(
+    session: AsyncSession,
+    repo: SqlRequestRepository,
+    library: LibraryPort | None,
+    *,
+    record: RequestRecord,
+    tmdb_id: int,
+    plan: _TvSeasonPlan,
+    seasons: list[int] | None,
+    episodes: dict[int, list[int]] | None,
+) -> RequestRecord | None:
+    """Grow a deduped-onto TV request's tracked seasons under a re-verified lock.
+
+    Issue #358 round 2: every TV dedup-join site releases the per-media lock
+    before this point (the subscribe helpers' commit, or the explicit no-subscribe
+    rollback -- network I/O must never run under the lock's write transaction). A
+    sole participant's withdrawal (or an admin cancel) can therefore settle the
+    join target ``cancelled`` in that gap, and blindly writing season rows +
+    recomputing the parent rollup afterwards would RESURRECT the settled row to an
+    active status (ownerless, participant-less for the withdraw case). So: crawl
+    Plex for season presence FIRST (network, no lock), then re-acquire the media
+    lock, re-read the row's CURRENT status under it, and only if it is still
+    dedup-ACTIVE run the (now pure-DB, thanks to the pre-fetched ``present``
+    snapshot) season writes under the lock -- the final commit releases it.
+
+    Returns the re-read record after growth, or ``None`` when the join target
+    settled in the gap (the lock acquisition is rolled back; nothing written) --
+    the caller falls back to the same bounded fresh-create retry a create racing
+    a settle uses everywhere else in this module.
+    """
+    # 1. Plex crawl BEFORE the lock (same gating ensure_seasons applies
+    # internally: no crawl for an unconfigured library or an episode-scoped
+    # plan). The defensive rollback first guarantees no caller's pending lock
+    # acquisition is still open across this network call.
+    await session.rollback()
+    present: frozenset[int] | None = None
+    if library is not None and not plan.episode_scoped:
+        present = await _present_seasons_or_empty(library, tmdb_id)
+    # 2. Re-acquire the media lock and re-verify the join target is STILL active
+    # under it. ``get_fresh`` is sound here: nothing has been written in this
+    # transaction, so the SELECT sees the concurrently-committed truth.
+    await repo.acquire_media_lock(tmdb_id, record.media_type)
+    fresh = await repo.get_fresh(record.id)
+    if fresh is None or fresh.status in SETTLED_REQUEST_STATUS_VALUES:
+        await session.rollback()
+        return None
+    # 3. Pure-DB season/rollup/intent writes, serialized under the lock with
+    # withdraw/cancel (which take the same lock); the commit releases it.
+    await _ensure_tv_season_plan(
+        session,
+        library,
+        media_request_id=record.id,
+        tmdb_id=tmdb_id,
+        plan=plan,
+        present=present,
+    )
+    await _merge_tv_request_intent(repo, fresh, seasons, episodes)
+    await session.commit()
+    # Re-read past the rollup ensure_seasons just persisted, so the returned
+    # record's top-level status matches the seasons the response will embed.
+    return await repo.get(record.id) or fresh
 
 
 async def _already_in_library(library: LibraryPort, tmdb_id: int) -> bool:
@@ -767,19 +832,52 @@ async def create_request_result(
                 seasons=seasons,
                 episodes=episodes,
             )
-            await _ensure_tv_season_plan(
+            # #358 round 2: the media lock was released above (the subscribe
+            # helpers' commit, or the API-key rollback), so the join target can be
+            # settled by a concurrent sole-participant withdrawal / cancel before
+            # the season writes land. Grow the tracked set under a RE-VERIFIED
+            # lock; a settled target aborts the join with nothing written and
+            # falls back to the bounded fresh-create retry (the same outcome a
+            # create arriving after the settle would get).
+            grown = await _grow_tv_dedup_join(
                 session,
+                repo,
                 library,
-                media_request_id=existing.id,
+                record=existing,
                 tmdb_id=tmdb_id,
                 plan=season_plan,
+                seasons=seasons,
+                episodes=episodes,
             )
-            await _merge_tv_request_intent(repo, existing, seasons, episodes)
-            await session.commit()
-            # ensure_seasons recomputed + persisted the parent rollup; re-read so the
-            # returned record's top-level status matches the seasons the response will
-            # embed. ``existing`` was captured by find_active BEFORE that rollup write.
-            existing = await repo.get(existing.id) or existing
+            if grown is None:
+                if _attempt + 1 >= _MAX_DEDUP_JOIN_ATTEMPTS:
+                    # Pathological settle/create flapping: surface the CURRENT row
+                    # honestly (no season writes -- never resurrect) instead of
+                    # looping forever; the caller sees the settled status and can
+                    # simply re-request.
+                    _logger.warning(
+                        "tv dedup-join target settled repeatedly; returning its "
+                        "current state without growing season intent",
+                        extra={"tmdb_id": safe_int(tmdb_id)},
+                    )
+                    return CreateRequestResult(
+                        record=await repo.get(existing.id) or existing, created=False
+                    )
+                return await create_request_result(
+                    session,
+                    tmdb,
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    user_id=user_id,
+                    actor_is_admin=actor_is_admin,
+                    library=library,
+                    seasons=seasons,
+                    episodes=episodes,
+                    force=force,
+                    expand_shared_tv=expand_shared_tv,
+                    _attempt=_attempt + 1,
+                )
+            existing = grown
         return CreateRequestResult(record=existing, created=False)
 
     detail = await _resolve_detail(tmdb, tmdb_id, media_type)
@@ -1060,24 +1158,49 @@ async def create_request_result(
                     )
                 # Dedup onto the concurrent re-grab, mirroring the top-of-function
                 # dedup path (grow its tracked season set, re-read past the
-                # rollup). Release the media lock FIRST: ensure_seasons crawls
-                # Plex, and the lock's write transaction must not stay open
-                # across that network call (the rollback discards only the lock
-                # acquisition -- nothing else is pending in this session here).
-                await session.rollback()
-                await _ensure_tv_season_plan(
+                # rollup). ``_grow_tv_dedup_join`` (#358 round 2) owns the lock
+                # discipline: it releases the lock held here BEFORE its Plex
+                # crawl, re-acquires it, re-verifies the target is STILL active,
+                # and runs the season writes under it -- a target settled by a
+                # concurrent withdrawal/cancel in the released gap aborts the
+                # join (nothing written, no resurrection) and falls back to the
+                # bounded fresh-create retry.
+                grown = await _grow_tv_dedup_join(
                     session,
+                    repo,
                     library,
-                    media_request_id=existing_active.id,
+                    record=existing_active,
                     tmdb_id=tmdb_id,
                     plan=season_plan,
+                    seasons=seasons,
+                    episodes=episodes,
                 )
-                await _merge_tv_request_intent(repo, existing_active, seasons, episodes)
-                await session.commit()
-                return CreateRequestResult(
-                    record=await repo.get(existing_active.id) or existing_active,
-                    created=False,
-                )
+                if grown is None:
+                    if _attempt + 1 >= _MAX_DEDUP_JOIN_ATTEMPTS:
+                        _logger.warning(
+                            "tv dedup-join target settled repeatedly; returning its "
+                            "current state without growing season intent",
+                            extra={"tmdb_id": safe_int(tmdb_id)},
+                        )
+                        return CreateRequestResult(
+                            record=await repo.get(existing_active.id) or existing_active,
+                            created=False,
+                        )
+                    return await create_request_result(
+                        session,
+                        tmdb,
+                        tmdb_id=tmdb_id,
+                        media_type=media_type,
+                        user_id=user_id,
+                        actor_is_admin=actor_is_admin,
+                        library=library,
+                        seasons=seasons,
+                        episodes=episodes,
+                        force=force,
+                        expand_shared_tv=expand_shared_tv,
+                        _attempt=_attempt + 1,
+                    )
+                return CreateRequestResult(record=grown, created=False)
             present = present - await SqlSeasonRequestRepository(session).evicted_seasons(tmdb_id)
         if present.issuperset(season_numbers):
             in_library = await repo.find_in_library(
@@ -1300,18 +1423,41 @@ async def create_request_result(
                 seasons=seasons,
                 episodes=episodes,
             )
-            await _ensure_tv_season_plan(
+            # #358 round 2: the lock was released above (subscribe commit /
+            # API-key rollback) -- re-verify the winner is STILL active under a
+            # re-acquired lock before the season writes, exactly like the
+            # top-of-function dedup path. A winner settled in the gap aborts the
+            # join (nothing written) and retries the whole create, bounded; on
+            # exhaustion the original IntegrityError is surfaced honestly, the
+            # same terminal this recovery's winner-vanished arm uses.
+            grown = await _grow_tv_dedup_join(
                 session,
+                repo,
                 library,
-                media_request_id=winner.id,
+                record=winner,
                 tmdb_id=tmdb_id,
                 plan=season_plan,
+                seasons=seasons,
+                episodes=episodes,
             )
-            await _merge_tv_request_intent(repo, winner, seasons, episodes)
-            await session.commit()
-            # Re-read past the rollup ensure_seasons just persisted (``winner`` was
-            # captured before it), so the returned status matches the response's seasons.
-            winner = await repo.get(winner.id) or winner
+            if grown is None:
+                if _attempt + 1 >= _MAX_DEDUP_JOIN_ATTEMPTS:
+                    raise
+                return await create_request_result(
+                    session,
+                    tmdb,
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    user_id=user_id,
+                    actor_is_admin=actor_is_admin,
+                    library=library,
+                    seasons=seasons,
+                    episodes=episodes,
+                    force=force,
+                    expand_shared_tv=expand_shared_tv,
+                    _attempt=_attempt + 1,
+                )
+            winner = grown
         return CreateRequestResult(record=winner, created=False)
     if initial_status == RequestStatus.available.value:
         # Collapse the concurrent movie in-library race (F9) via the shared helper.

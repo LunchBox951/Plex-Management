@@ -32,7 +32,7 @@ from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import RequestRecord
 from plex_manager.repositories import requests as requests_repo_module
 from plex_manager.repositories.requests import SqlRequestRepository
-from plex_manager.services import request_service
+from plex_manager.services import correction_service, request_service
 from tests.web.fakes import FakeLibrary, FakeTmdb
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -2177,6 +2177,199 @@ async def test_movie_plex_present_api_key_dedup_releases_the_media_lock(
         )
         assert record.id == winner_id  # deduped onto the concurrent active row
         assert session.in_transaction() is False
+
+
+async def test_api_key_tv_dedup_racing_sole_owner_withdraw_never_resurrects(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#358 round 2 (site: top-of-function dedup): an API-key TV dedup releases the
+    media lock before its season-plan work. A sole-owner withdrawal in that gap
+    settles the join target ``cancelled`` -- the join must then write NO season
+    rows onto it (no rollup resurrection to an active, ownerless status) and fall
+    back to a fresh create, exactly what a create arriving after the settle gets."""
+    owner_id = await _make_user(sessionmaker_, username="owner-res")
+    async with sessionmaker_() as session:
+        target = MediaRequest(
+            tmdb_id=910,
+            media_type=MediaType.tv,
+            title="Show",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+        )
+        session.add(target)
+        await session.flush()
+        target_id = target.id
+        session.add(RequestSubscriber(request_id=target_id, user_id=owner_id))
+        session.add(
+            SeasonRequest(media_request_id=target_id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    state = {"locks": 0, "in_withdraw": False, "withdrawn": False}
+
+    async def racing_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        if state["in_withdraw"]:
+            await real_acquire(self, tmdb_id, media_type)
+            return
+        state["locks"] += 1
+        # The SECOND acquisition is ``_grow_tv_dedup_join``'s re-acquire -- the
+        # first was the top-of-function dedup lock, released again before the
+        # TMDB/Plex season work. Inject the sole owner's withdrawal into exactly
+        # that released-lock gap (separate session, committed).
+        if state["locks"] == 2 and not state["withdrawn"]:
+            state["withdrawn"] = True
+            state["in_withdraw"] = True
+            try:
+                async with sessionmaker_() as other:
+                    await correction_service.withdraw_participant(
+                        other, None, request_id=target_id, user_id=owner_id
+                    )
+            finally:
+                state["in_withdraw"] = False
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", racing_acquire)
+
+    tmdb = FakeTmdb(shows={910: TvMetadata(tmdb_id=910, title="Show", year=2020, season_count=3)})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=910, media_type="tv", seasons=[2]
+        )
+
+    assert state["withdrawn"] is True  # the race actually ran through the gap
+    assert record.id != target_id  # fell back to a FRESH create, never the corpse
+    assert record.status == RequestStatus.pending.value
+
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, target_id)
+        assert old_row is not None
+        old_seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == target_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == target_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        new_seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # The settled row is untouched: still cancelled (no rollup resurrection),
+    # still ownerless and participant-less, and NO season row was grown onto it.
+    assert old_row.status == RequestStatus.cancelled
+    assert old_row.user_id is None
+    assert subs == []
+    assert {s.season_number: s.status for s in old_seasons} == {1: RequestStatus.cancelled}
+    # The fresh row tracks the requested season instead.
+    assert {s.season_number for s in new_seasons} == {2}
+
+
+async def test_integrity_recovery_tv_join_racing_withdraw_never_resurrects(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#358 round 2 (site: IntegrityError recovery): the identical released-lock gap
+    exists between the recovery's under-lock winner re-read and its season-plan
+    writes. A sole-owner withdrawal in that gap must abort the join (nothing
+    written to the cancelled winner) and retry into a fresh create."""
+    owner_id = await _make_user(sessionmaker_, username="owner-res2")
+    async with sessionmaker_() as session:
+        winner = MediaRequest(
+            tmdb_id=911,
+            media_type=MediaType.tv,
+            title="Show",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+        )
+        session.add(winner)
+        await session.flush()
+        winner_id = winner.id
+        session.add(RequestSubscriber(request_id=winner_id, user_id=owner_id))
+        session.add(
+            SeasonRequest(media_request_id=winner_id, season_number=1, status=RequestStatus.pending)
+        )
+        await session.commit()
+
+    real_find_active = SqlRequestRepository.find_active
+    find_calls = {"n": 0}
+
+    async def racing_find_active(
+        self: SqlRequestRepository, tmdb_id: int, media_type: str
+    ) -> RequestRecord | None:
+        # First (top-of-function) lookup misses so the INSERT loses the UNIQUE
+        # race and enters the recovery; later lookups are real.
+        if find_calls["n"] == 0:
+            find_calls["n"] = 1
+            return None
+        return await real_find_active(self, tmdb_id, media_type)
+
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    state = {"locks": 0, "in_withdraw": False, "withdrawn": False}
+
+    async def racing_acquire(self: SqlRequestRepository, tmdb_id: int, media_type: str) -> None:
+        if state["in_withdraw"]:
+            await real_acquire(self, tmdb_id, media_type)
+            return
+        state["locks"] += 1
+        # Lock #1 is the recovery's winner re-read; lock #2 is the TV join's
+        # re-acquire after the API-key rollback released #1. Inject the sole
+        # owner's withdrawal into that gap.
+        if state["locks"] == 2 and not state["withdrawn"]:
+            state["withdrawn"] = True
+            state["in_withdraw"] = True
+            try:
+                async with sessionmaker_() as other:
+                    await correction_service.withdraw_participant(
+                        other, None, request_id=winner_id, user_id=owner_id
+                    )
+            finally:
+                state["in_withdraw"] = False
+        await real_acquire(self, tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "find_active", racing_find_active)
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", racing_acquire)
+
+    tmdb = FakeTmdb(shows={911: TvMetadata(tmdb_id=911, title="Show", year=2020, season_count=3)})
+    async with sessionmaker_() as session:
+        record = await request_service.create_request(
+            session, tmdb, tmdb_id=911, media_type="tv", seasons=[2]
+        )
+
+    assert state["withdrawn"] is True
+    assert record.id != winner_id  # fresh row, never the cancelled winner
+    async with sessionmaker_() as session:
+        old_row = await session.get(MediaRequest, winner_id)
+        assert old_row is not None
+        old_seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == winner_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert old_row.status == RequestStatus.cancelled  # stayed settled
+    assert old_row.user_id is None
+    assert {s.season_number: s.status for s in old_seasons} == {1: RequestStatus.cancelled}
 
 
 async def test_admin_dedup_onto_foreign_owned_tv_request_keeps_shared_behavior(
