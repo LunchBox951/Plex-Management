@@ -24,6 +24,11 @@ from plex_manager.models import AuthSession, Setting, User
 from plex_manager.services import path_visibility
 from plex_manager.web.deps import (
     AUTO_GRAB_ENABLED_DEFAULT,
+    AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+    AUTO_GRAB_INTERVAL_SECONDS_MAX,
+    AUTO_GRAB_INTERVAL_SECONDS_MIN,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
     DISK_PRESSURE_TARGET_PERCENT_DEFAULT,
     DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT,
     EVICTION_ENABLED_DEFAULT,
@@ -45,6 +50,8 @@ from plex_manager.web.deps import (
     get_anime_movie_root_optional,
     get_anime_tv_root_optional,
     get_auto_grab_enabled,
+    get_auto_grab_interval_seconds,
+    get_auto_grab_max_searches_per_cycle,
     get_disk_pressure_target_percent,
     get_disk_pressure_threshold_percent,
     get_eviction_enabled,
@@ -76,11 +83,13 @@ _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "disk_pressure_target_percent",
     "eviction_interval_minutes",
     "watchlist_sync_interval_minutes",
+    "auto_grab_interval_seconds",
 )
 _INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "eviction_grace_days",
     "log_retention_days",
     "log_max_rows",
+    "auto_grab_max_searches_per_cycle",
 )
 _BOOL_TYPED_SETTING_KEYS: tuple[str, ...] = tuple(_BOOL_SETTING_DEFAULTS)
 _COLLECTION_TYPED_SETTING_KEYS: tuple[str, ...] = ("automatic_update_weekdays",)
@@ -2200,6 +2209,272 @@ async def test_get_settings_preserves_boundary_typed_values(
     assert body["eviction_grace_days"] == EVICTION_GRACE_DAYS_MAX
     assert body["log_retention_days"] == LOG_RETENTION_DAYS_MAX
     assert body["log_max_rows"] == LOG_MAX_ROWS_MAX
+
+
+# --------------------------------------------------------------------------- #
+# Auto-grab timing (issue #150): the cycle interval + per-cycle search cap,
+# web-editable exactly like the operability beta knobs above. Defaults equal
+# the pre-#150 hardcoded constants (60s / 5 searches), so an unset install
+# behaves identically to before this feature existed.
+# --------------------------------------------------------------------------- #
+def test_settings_update_rejects_out_of_range_auto_grab_timing() -> None:
+    """Model-level guard mirroring ``test_settings_update_rejects_non_finite_
+    interval``: every non-finite value and anything outside the closed bound
+    must fail construction; the boundaries themselves and an ordinary value
+    all still construct fine."""
+    for bad in (
+        float("inf"),
+        float("nan"),
+        float("-inf"),
+        AUTO_GRAB_INTERVAL_SECONDS_MIN - 1,
+        AUTO_GRAB_INTERVAL_SECONDS_MAX + 1,
+    ):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(auto_grab_interval_seconds=bad)
+    SettingsUpdate(auto_grab_interval_seconds=AUTO_GRAB_INTERVAL_SECONDS_MIN)  # boundary
+    SettingsUpdate(auto_grab_interval_seconds=AUTO_GRAB_INTERVAL_SECONDS_MAX)  # boundary
+    SettingsUpdate(auto_grab_interval_seconds=90.0)  # an ordinary value still works
+
+    for bad_count in (0, -1, AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(auto_grab_max_searches_per_cycle=bad_count)
+    SettingsUpdate(auto_grab_max_searches_per_cycle=1)  # floor, inclusive
+    SettingsUpdate(
+        auto_grab_max_searches_per_cycle=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+    )  # ceiling, inclusive
+    SettingsUpdate(auto_grab_max_searches_per_cycle=10)  # an ordinary value still works
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("auto_grab_interval_seconds", float("inf")),
+        ("auto_grab_interval_seconds", float("nan")),
+        ("auto_grab_interval_seconds", AUTO_GRAB_INTERVAL_SECONDS_MIN - 1),
+        ("auto_grab_interval_seconds", AUTO_GRAB_INTERVAL_SECONDS_MAX + 1),
+        ("auto_grab_max_searches_per_cycle", 0),
+        ("auto_grab_max_searches_per_cycle", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1),
+    ],
+)
+async def test_put_rejects_out_of_range_auto_grab_timing(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    field: str,
+    bad_value: float,
+) -> None:
+    """Write-time 422 for every out-of-range/non-finite auto-grab timing
+    value -- and it must never persist (mirrors the operability-settings
+    equivalent above)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY, "Content-Type": "application/json"}
+
+    put = await client.put(
+        "/api/v1/settings",
+        content=json.dumps({field: bad_value}).encode(),
+        headers=headers,
+    )
+    assert put.status_code == 422
+
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(field) is None
+
+
+async def test_put_round_trips_auto_grab_timing(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "auto_grab_interval_seconds": 120.0,
+        "auto_grab_max_searches_per_cycle": 10,
+    }
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["auto_grab_interval_seconds"] == 120.0
+    assert body["auto_grab_max_searches_per_cycle"] == 10
+
+    got = (await client.get("/api/v1/settings", headers=headers)).json()
+    assert got == body
+
+    # The typed getters the auto-grab loop actually reads must see the SAME
+    # values -- not just a wire-level round trip.
+    async with sessionmaker_() as session:
+        assert await get_auto_grab_interval_seconds(session) == 120.0
+        assert await get_auto_grab_max_searches_per_cycle(session) == 10
+
+
+async def test_put_accepts_boundary_auto_grab_timing(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The new bounds must not over-reject their own boundary values."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    update = {
+        "auto_grab_interval_seconds": AUTO_GRAB_INTERVAL_SECONDS_MIN,
+        "auto_grab_max_searches_per_cycle": 1,
+    }
+    put = await client.put("/api/v1/settings", json=update, headers=headers)
+    assert put.status_code == 200
+    body = put.json()
+    assert body["auto_grab_interval_seconds"] == AUTO_GRAB_INTERVAL_SECONDS_MIN
+    assert body["auto_grab_max_searches_per_cycle"] == 1
+
+    update_max = {
+        "auto_grab_interval_seconds": AUTO_GRAB_INTERVAL_SECONDS_MAX,
+        "auto_grab_max_searches_per_cycle": AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+    }
+    put_max = await client.put("/api/v1/settings", json=update_max, headers=headers)
+    assert put_max.status_code == 200
+    body_max = put_max.json()
+    assert body_max["auto_grab_interval_seconds"] == AUTO_GRAB_INTERVAL_SECONDS_MAX
+    assert body_max["auto_grab_max_searches_per_cycle"] == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+
+    async with sessionmaker_() as session:
+        assert await get_auto_grab_interval_seconds(session) == AUTO_GRAB_INTERVAL_SECONDS_MAX
+        assert (
+            await get_auto_grab_max_searches_per_cycle(session)
+            == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+        )
+
+
+async def test_get_settings_default_auto_grab_timing_when_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Regression guard: unset keys must resolve to the pre-#150 hardcoded
+    defaults (60s interval, 5 searches/cycle) -- default behavior unchanged."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["auto_grab_interval_seconds"] is None
+    assert body["auto_grab_max_searches_per_cycle"] is None
+
+    async with sessionmaker_() as session:
+        assert await get_auto_grab_interval_seconds(session) == AUTO_GRAB_INTERVAL_SECONDS_DEFAULT
+        assert (
+            await get_auto_grab_max_searches_per_cycle(session)
+            == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT
+        )
+    assert AUTO_GRAB_INTERVAL_SECONDS_DEFAULT == 60.0
+    assert AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT == 5
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        # Below the (closed) floor -- including 0/negative, which would
+        # hot-spin the loop -- falls back to the default (no safe floor-clamp).
+        ("0", AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+        ("-5", AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+        (str(AUTO_GRAB_INTERVAL_SECONDS_MIN - 1), AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+        # At/above the floor and at/below the ceiling: honored verbatim.
+        (str(AUTO_GRAB_INTERVAL_SECONDS_MIN), AUTO_GRAB_INTERVAL_SECONDS_MIN),
+        ("90", 90.0),
+        (str(AUTO_GRAB_INTERVAL_SECONDS_MAX), AUTO_GRAB_INTERVAL_SECONDS_MAX),
+        # Above the ceiling: CLAMPED (a pre-bounds huge interval meant "search
+        # almost never"; the 60s default would suddenly search far more often).
+        (str(AUTO_GRAB_INTERVAL_SECONDS_MAX + 1), AUTO_GRAB_INTERVAL_SECONDS_MAX),
+        # Unparsable / non-finite: default.
+        ("abc", AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+        ("inf", AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+        ("nan", AUTO_GRAB_INTERVAL_SECONDS_DEFAULT),
+    ],
+)
+async def test_get_auto_grab_interval_seconds_degrades_out_of_range_stored_value(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: float,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("auto_grab_interval_seconds", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_auto_grab_interval_seconds(session)
+
+    assert value == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected", "degraded"),
+    [
+        # 0 and negative both DEFAULT (never clamp to a floor of 1) -- a 0 cap
+        # would silently disable the worker while auto_grab_enabled stays True.
+        ("0", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
+        ("-1", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
+        # Above the cap: CLAMPED (a pre-bounds huge value meant "search
+        # aggressively", not "revert to the 5-per-cycle default").
+        (str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 1), AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, True),
+        ("10", 10, False),
+        (str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX), AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, False),
+        ("1", 1, False),
+        ("abc", AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True),
+    ],
+)
+async def test_get_auto_grab_max_searches_per_cycle_degrades_out_of_range_stored_value(
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    stored: str,
+    expected: int,
+    degraded: bool,
+) -> None:
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("auto_grab_max_searches_per_cycle", stored)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+            value = await get_auto_grab_max_searches_per_cycle(session)
+
+    assert value == expected
+    if degraded:
+        assert "auto_grab_max_searches_per_cycle" in caplog.text
+
+
+async def test_get_settings_presents_corrupt_auto_grab_timing_as_effective_value(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """``GET /settings`` must show exactly what the runtime getter is using --
+    the clamped value for an over-ceiling store, never a page-vs-runtime lie."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("auto_grab_interval_seconds", str(AUTO_GRAB_INTERVAL_SECONDS_MAX + 100))
+        await store.set(
+            "auto_grab_max_searches_per_cycle", str(AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX + 5)
+        )
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    body = got.json()
+    assert body["auto_grab_interval_seconds"] == AUTO_GRAB_INTERVAL_SECONDS_MAX
+    assert body["auto_grab_max_searches_per_cycle"] == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+
+    async with sessionmaker_() as session:
+        assert await get_auto_grab_interval_seconds(session) == AUTO_GRAB_INTERVAL_SECONDS_MAX
+        assert (
+            await get_auto_grab_max_searches_per_cycle(session)
+            == AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+        )
+
+
+async def test_get_settings_does_not_500_on_non_finite_stored_auto_grab_interval(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("auto_grab_interval_seconds", "inf")
+        await session.commit()
+
+    got = await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    assert got.status_code == 200
+    assert got.json()["auto_grab_interval_seconds"] is None
 
 
 # --------------------------------------------------------------------------- #

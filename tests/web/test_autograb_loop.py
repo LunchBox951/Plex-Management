@@ -7,6 +7,7 @@ monkeypatched on the app module -- mirroring ``tests/web/test_reconcile_loop.py`
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, timedelta
 
@@ -22,9 +23,11 @@ from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.ports.metadata import EpisodeInfo, MetadataPort, TvMetadata
+from plex_manager.services import auto_grab_service
 from plex_manager.services.health_service import AutograbStatus
 from plex_manager.services.update_coordination_service import UpdateCoordinationService
 from plex_manager.web import app as app_module
+from plex_manager.web.deps import AUTO_GRAB_INTERVAL_SECONDS_DEFAULT, SettingsStore
 from tests.web.fakes import (
     FakeLibrary,
     FakeProwlarr,
@@ -476,3 +479,166 @@ async def test_autograb_once_publishes_on_air_date_woken_even_without_grab(
     status = app.state.autograb_status
     assert status.last_ok_at is not None
     assert status.last_error_type is None
+
+
+# --------------------------------------------------------------------------- #
+# Auto-grab timing (issue #150): the per-cycle search cap and the loop's sleep
+# interval are both read FRESH from the DB every tick -- a web-edited value
+# takes effect on the very next cycle, no restart, no re-instantiation.
+# --------------------------------------------------------------------------- #
+async def test_autograb_once_leased_threads_db_configured_max_searches(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_autograb_once_leased`` reads ``auto_grab_max_searches_per_cycle`` fresh
+    every tick and threads it into ``run_grab_cycle``'s ``max_searches`` --
+    changing the stored value changes what the NEXT cycle passes, with no
+    re-instantiation of anything."""
+    request_id = await _seed_pending_movie(sessionmaker_)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+
+    captured: list[int] = []
+    real_run_grab_cycle = auto_grab_service.run_grab_cycle
+
+    async def _spy_run_grab_cycle(
+        *args: object, max_searches: int, **kwargs: object
+    ) -> auto_grab_service.AutograbCycleResult:
+        captured.append(max_searches)
+        return await real_run_grab_cycle(*args, max_searches=max_searches, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app_module.auto_grab_service, "run_grab_cycle", _spy_run_grab_cycle)
+
+    configured_values = iter([7, 2])
+
+    async def _get_max_searches(_session: AsyncSession) -> int:
+        return next(configured_values)
+
+    monkeypatch.setattr(app_module, "get_auto_grab_max_searches_per_cycle", _get_max_searches)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+        # Put the request back to pending so the second cycle has work to do
+        # too -- proves the SECOND read (2) is what the SECOND cycle uses.
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+            assert request is not None
+            request.status = RequestStatus.pending
+            request.next_search_at = None
+            await session.commit()
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert captured == [7, 2]
+
+
+class _StopAutograbLoop(Exception):
+    """Sentinel raised from a patched ``asyncio.sleep`` to end the (real)
+    ``while True`` in ``_autograb_loop`` after a bounded number of iterations,
+    without the loop ever needing to actually sleep in real time."""
+
+
+async def test_autograb_loop_sleeps_the_db_configured_interval(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_autograb_loop`` reads ``auto_grab_interval_seconds`` fresh every
+    iteration and sleeps THAT value -- a web-edited cadence takes effect on
+    the very next sleep, not the process-lifetime constant."""
+    _patch_adapters(monkeypatch, prowlarr=FakeProwlarr([]), qbt=FakeQbittorrent(), enabled=False)
+
+    configured_values = iter([120.0, 45.0])
+
+    async def _get_interval(_session: AsyncSession) -> float:
+        return next(configured_values)
+
+    monkeypatch.setattr(app_module, "get_auto_grab_interval_seconds", _get_interval)
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise _StopAutograbLoop
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    app = _build_app(sessionmaker_)
+    try:
+        with pytest.raises(_StopAutograbLoop):
+            await app_module._autograb_loop(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert sleep_calls == [120.0, 45.0]
+
+
+async def test_autograb_loop_survives_an_interval_read_failure(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settings-read failure (a transient DB hiccup reading
+    ``auto_grab_interval_seconds``) must fall back to
+    ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT`` and keep the loop alive -- never let
+    the exception escape ``_autograb_loop`` and silently kill automatic
+    grabbing until a process restart."""
+    _patch_adapters(monkeypatch, prowlarr=FakeProwlarr([]), qbt=FakeQbittorrent(), enabled=False)
+
+    async def _boom_get_interval(_session: AsyncSession) -> float:
+        raise RuntimeError("settings read failed")
+
+    monkeypatch.setattr(app_module, "get_auto_grab_interval_seconds", _boom_get_interval)
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 3:
+            raise _StopAutograbLoop
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    app = _build_app(sessionmaker_)
+    try:
+        with pytest.raises(_StopAutograbLoop):
+            await app_module._autograb_loop(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert sleep_calls == [AUTO_GRAB_INTERVAL_SECONDS_DEFAULT] * 3
+
+
+async def test_autograb_once_leased_max_searches_reflects_stored_setting(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end (no monkeypatched getter): storing
+    ``auto_grab_max_searches_per_cycle`` in the DB is what the NEXT cycle's
+    ``run_grab_cycle`` call actually uses -- proves the real
+    ``SettingsStore``-backed path, not just the resolver in isolation."""
+    await _seed_pending_movie(sessionmaker_)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+    qbt = FakeQbittorrent()
+    _patch_adapters(monkeypatch, prowlarr=prowlarr, qbt=qbt, enabled=True)
+
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("auto_grab_max_searches_per_cycle", "3")
+        await session.commit()
+
+    captured: list[int] = []
+    real_run_grab_cycle = auto_grab_service.run_grab_cycle
+
+    async def _spy_run_grab_cycle(
+        *args: object, max_searches: int, **kwargs: object
+    ) -> auto_grab_service.AutograbCycleResult:
+        captured.append(max_searches)
+        return await real_run_grab_cycle(*args, max_searches=max_searches, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app_module.auto_grab_service, "run_grab_cycle", _spy_run_grab_cycle)
+
+    app = _build_app(sessionmaker_)
+    try:
+        await app_module._autograb_once(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert captured == [3]

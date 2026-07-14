@@ -50,6 +50,14 @@ const LOG_RETENTION_DAYS_DEFAULT = 7
 const LOG_MAX_ROWS_DEFAULT = 100000
 // Auto-grab worker (ADR-0013) — mirrors the backend default (web/deps.py).
 const AUTO_GRAB_ENABLED_DEFAULT = true
+// Auto-grab timing (issue #150) — mirrors the backend defaults/bounds
+// (web/deps.py AUTO_GRAB_INTERVAL_SECONDS_DEFAULT /
+// AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, web/settings_bounds.py).
+const AUTO_GRAB_INTERVAL_SECONDS_DEFAULT = 60
+const AUTO_GRAB_INTERVAL_SECONDS_MIN = 15
+const AUTO_GRAB_INTERVAL_SECONDS_MAX = 3600
+const AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT = 5
+const AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX = 50
 // Automatic container updates (ADR-0024) are opt-in. The scheduling defaults
 // mirror the backend except for timezone: a fresh browser contributes its IANA
 // zone when the operator first saves, with UTC as the fail-closed fallback.
@@ -121,6 +129,10 @@ interface FormState {
   log_max_rows: string
   // Auto-grab worker (ADR-0013) — the master on/off switch.
   auto_grab_enabled: boolean
+  // Auto-grab timing (issue #150) — the worker's cycle cadence and per-cycle
+  // Prowlarr search budget.
+  auto_grab_interval_seconds: string
+  auto_grab_max_searches_per_cycle: string
   automatic_updates_enabled: boolean
   automatic_update_timezone: string
   automatic_update_weekdays: AutomaticUpdateWeekday[]
@@ -162,6 +174,12 @@ function initialForm(data: SettingsResponse): FormState {
     log_retention_days: String(data.log_retention_days ?? LOG_RETENTION_DAYS_DEFAULT),
     log_max_rows: String(data.log_max_rows ?? LOG_MAX_ROWS_DEFAULT),
     auto_grab_enabled: data.auto_grab_enabled ?? AUTO_GRAB_ENABLED_DEFAULT,
+    auto_grab_interval_seconds: String(
+      data.auto_grab_interval_seconds ?? AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+    ),
+    auto_grab_max_searches_per_cycle: String(
+      data.auto_grab_max_searches_per_cycle ?? AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
+    ),
     automatic_updates_enabled:
       data.automatic_updates_enabled ?? AUTOMATIC_UPDATES_ENABLED_DEFAULT,
     automatic_update_timezone: data.automatic_update_timezone ?? browserTimezone(),
@@ -201,6 +219,8 @@ type NumberKey =
   | 'watchlist_sync_interval_minutes'
   | 'log_retention_days'
   | 'log_max_rows'
+  | 'auto_grab_interval_seconds'
+  | 'auto_grab_max_searches_per_cycle'
 type BoolKey =
   | 'eviction_enabled'
   | 'eviction_proactive_enabled'
@@ -220,6 +240,8 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   watchlist_sync_interval_minutes: 'Watchlist sync interval (minutes)',
   log_retention_days: 'Log retention (days)',
   log_max_rows: 'Log retention (max rows)',
+  auto_grab_interval_seconds: 'Auto-grab check interval (seconds)',
+  auto_grab_max_searches_per_cycle: 'Auto-grab searches per cycle',
 }
 
 /** ``true`` only for a non-blank string that parses to a finite number.
@@ -1046,6 +1068,8 @@ export function Settings() {
       log_retention_days: Number(form.log_retention_days),
       log_max_rows: Number(form.log_max_rows),
       auto_grab_enabled: form.auto_grab_enabled,
+      auto_grab_interval_seconds: Number(form.auto_grab_interval_seconds),
+      auto_grab_max_searches_per_cycle: Number(form.auto_grab_max_searches_per_cycle),
       automatic_updates_enabled: form.automatic_updates_enabled,
       automatic_update_timezone: form.automatic_update_timezone.trim(),
       automatic_update_weekdays: form.automatic_update_weekdays,
@@ -1461,6 +1485,27 @@ export function Settings() {
               'Automatically search and grab pending requests. Turn off to grab ' +
                 'only via the manual button on each title.',
             )}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {numberField(
+                'auto_grab_interval_seconds',
+                'Auto-grab check interval (seconds)',
+                {
+                  min: AUTO_GRAB_INTERVAL_SECONDS_MIN,
+                  max: AUTO_GRAB_INTERVAL_SECONDS_MAX,
+                  step: 1,
+                },
+              )}
+              {numberField('auto_grab_max_searches_per_cycle', 'Auto-grab searches per cycle', {
+                min: 1,
+                max: AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+                step: 1,
+              })}
+            </div>
+            <p className="text-xs text-faint">
+              How often the worker checks for due requests ({AUTO_GRAB_INTERVAL_SECONDS_MIN}–
+              {AUTO_GRAB_INTERVAL_SECONDS_MAX}s) and how many Prowlarr searches it runs per check
+              (1–{AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX}), protecting the indexer from a burst.
+            </p>
             {checkboxField(
               'watchlist_sync_enabled',
               'Enable Plex watchlist sync',

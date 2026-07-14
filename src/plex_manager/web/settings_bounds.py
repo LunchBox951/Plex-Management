@@ -20,6 +20,9 @@ own, so both sides can depend on it with no ordering hazard, mirroring
 from __future__ import annotations
 
 __all__ = [
+    "AUTO_GRAB_INTERVAL_SECONDS_MAX",
+    "AUTO_GRAB_INTERVAL_SECONDS_MIN",
+    "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX",
     "DISK_PRESSURE_PERCENT_MAX",
     "DISK_PRESSURE_PERCENT_MIN",
     "EVICTION_GRACE_DAYS_MAX",
@@ -58,3 +61,25 @@ LOG_RETENTION_DAYS_MAX: int = 3650  # ~10 years; same overflow-safety rationale.
 # any install this beta targets, comfortably below anything that would make the
 # prune's ordered ``OFFSET`` scan noticeably expensive on SQLite.
 LOG_MAX_ROWS_MAX: int = 2_000_000
+
+# Auto-grab worker timing (issue #150): the cycle interval and per-cycle search
+# cap web-configurable knobs, mirroring the eviction-interval bound pattern
+# above -- both feed directly into ``web/app.py``'s ``_autograb_loop`` sleep /
+# ``auto_grab_service.run_grab_cycle``'s search budget, so both need a floor
+# that can never hot-spin the loop or hammer the single Prowlarr, and a
+# ceiling visible in the UI (north star #3).
+#
+# Floor 15.0s is the tightest cadence already in the app
+# (``_RECONCILE_INTERVAL_SECONDS``); a ``gt=0``-only bound would permit a 1s
+# hot-loop. Ceiling 3600.0s (1h) keeps the worker responsive -- "effectively
+# off" is ``auto_grab_enabled=False``, not a huge interval. The loop sleeps
+# AFTER the cycle completes, so a short interval never overlaps cycles
+# (searches are sequential and capped by the search-cap knob below).
+AUTO_GRAB_INTERVAL_SECONDS_MIN: float = 15.0
+AUTO_GRAB_INTERVAL_SECONDS_MAX: float = 3600.0
+# Floor is enforced separately as a dedicated ``>= 1`` guard (not encoded here
+# as a MIN constant): 0 is a valid ``_resolve_bounded_count`` input that would
+# otherwise silently disable the worker while ``auto_grab_enabled=True`` stays
+# on -- a lie. Ceiling 50 protects the single Prowlarr from a fat-fingered
+# burst; the default is 5 (``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE``).
+AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX: int = 50

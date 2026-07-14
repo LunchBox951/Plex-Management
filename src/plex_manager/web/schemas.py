@@ -19,6 +19,9 @@ from plex_manager.domain.state_machine import DownloadState
 from plex_manager.headersafe import HEADER_VALUE_MESSAGE, header_value_error
 from plex_manager.models import DownloadScopeStatus, RequestStatus
 from plex_manager.web.settings_bounds import (
+    AUTO_GRAB_INTERVAL_SECONDS_MAX,
+    AUTO_GRAB_INTERVAL_SECONDS_MIN,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
@@ -669,6 +672,12 @@ class SettingsResponse(BaseModel):
     # the default applies). Plain boolean config, same wire semantics as
     # ``eviction_enabled`` above.
     auto_grab_enabled: bool | None = None
+    # Auto-grab timing (issue #150) — the worker's cycle cadence and per-cycle
+    # Prowlarr search budget. Same unset/degraded-to-default ``None`` wire
+    # semantics as every other typed operability field above; the backoff
+    # ladder and per-scope grab-attempt cap stay fixed, not exposed here.
+    auto_grab_interval_seconds: float | None = None
+    auto_grab_max_searches_per_cycle: int | None = None
     # Container auto-update policy (ADR-0024). ``None`` means the persisted
     # setting is absent/corrupt and the documented runtime default applies.
     automatic_updates_enabled: bool | None = None
@@ -787,6 +796,18 @@ class SettingsUpdate(BaseModel):
     # Auto-grab worker (ADR-0013) — see ``SettingsResponse``. A plain boolean, no
     # bounds to enforce.
     auto_grab_enabled: bool | None = Field(default=None)
+    # Auto-grab timing (issue #150) — bounded per ``web.settings_bounds`` (see
+    # that module for the rationale): the interval floor is the tightest
+    # cadence already in the app, the search-cap floor is 1 (0 would silently
+    # disable the worker while ``auto_grab_enabled`` stays True).
+    auto_grab_interval_seconds: float | None = Field(
+        default=None,
+        ge=AUTO_GRAB_INTERVAL_SECONDS_MIN,
+        le=AUTO_GRAB_INTERVAL_SECONDS_MAX,
+    )
+    auto_grab_max_searches_per_cycle: int | None = Field(
+        default=None, ge=1, le=AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX
+    )
     automatic_updates_enabled: bool | None = Field(default=None)
     automatic_update_timezone: str | None = Field(default=None)
     automatic_update_weekdays: list[UpdateWeekday] | None = Field(default=None, min_length=1)

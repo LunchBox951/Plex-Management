@@ -71,6 +71,7 @@ from plex_manager.ports.media_probe import MediaProbePort
 from plex_manager.ports.metadata import MetadataPort
 from plex_manager.ports.parser import ParserPort
 from plex_manager.services import log_capture_service, path_visibility, session_lifecycle
+from plex_manager.services.auto_grab_service import AUTO_GRAB_MAX_SEARCHES_PER_CYCLE
 from plex_manager.services.health_service import (
     AutograbStatus,
     ReconcileStatus,
@@ -88,6 +89,9 @@ from plex_manager.services.update_policy import (
 from plex_manager.services.watchlist_service import WatchlistWorkerStatus
 from plex_manager.web.errors import AppError
 from plex_manager.web.settings_bounds import (
+    AUTO_GRAB_INTERVAL_SECONDS_MAX,
+    AUTO_GRAB_INTERVAL_SECONDS_MIN,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
     DISK_PRESSURE_PERCENT_MAX,
     DISK_PRESSURE_PERCENT_MIN,
     EVICTION_GRACE_DAYS_MAX,
@@ -105,6 +109,11 @@ __all__ = [
     "AUTOMATIC_UPDATE_WINDOW_END_DEFAULT",
     "AUTOMATIC_UPDATE_WINDOW_START_DEFAULT",
     "AUTO_GRAB_ENABLED_DEFAULT",
+    "AUTO_GRAB_INTERVAL_SECONDS_DEFAULT",
+    "AUTO_GRAB_INTERVAL_SECONDS_MAX",
+    "AUTO_GRAB_INTERVAL_SECONDS_MIN",
+    "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT",
+    "AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX",
     "CSRF_COOKIE_NAME",
     "CSRF_HEADER_NAME",
     "DISK_PRESSURE_PERCENT_MAX",
@@ -143,6 +152,8 @@ __all__ = [
     "get_anime_movie_root_optional",
     "get_anime_tv_root_optional",
     "get_auto_grab_enabled",
+    "get_auto_grab_interval_seconds",
+    "get_auto_grab_max_searches_per_cycle",
     "get_autograb_status",
     "get_disk_pressure_target_percent",
     "get_disk_pressure_threshold_percent",
@@ -184,6 +195,8 @@ __all__ = [
     "require_api_key",
     "require_api_key_short_session",
     "require_setup_admin",
+    "resolve_auto_grab_interval_seconds",
+    "resolve_auto_grab_max_searches_per_cycle",
     "resolve_bool_setting",
     "resolve_disk_pressure_percents",
     "resolve_eviction_grace_days",
@@ -323,6 +336,17 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # north-star #1 "turn this bot off with a button, never a terminal" switch. The
     # manual Grab button stays the override regardless.
     "auto_grab_enabled",
+    # Auto-grab timing (issue #150): the worker's cycle cadence and per-cycle
+    # Prowlarr search budget, web-editable like every other operability knob.
+    # Defaults equal the pre-#150 hardcoded constants (60s / 5 searches), so an
+    # unset install behaves identically to before this feature existed. Read
+    # every tick -- see get_auto_grab_interval_seconds/
+    # get_auto_grab_max_searches_per_cycle and web/app.py's _autograb_loop/
+    # _autograb_once_leased -- so a web edit takes effect on the next cycle,
+    # no restart (north star #1). The backoff ladder (BACKOFF_SCHEDULE) and
+    # MAX_GRAB_ATTEMPTS_PER_SCOPE stay fixed module constants; not exposed here.
+    "auto_grab_interval_seconds",
+    "auto_grab_max_searches_per_cycle",
     "watchlist_sync_enabled",
     "watchlist_sync_interval_minutes",
     # Anime library routing (ADR-0015): two OPTIONAL roots, mirroring tv_root's
@@ -1689,6 +1713,15 @@ LOG_MAX_ROWS_DEFAULT: int = 100_000
 # Auto-grab worker (ADR-0013): the background request->search->grab loop runs by
 # default; an operator can turn it off from Settings without touching a terminal.
 AUTO_GRAB_ENABLED_DEFAULT: bool = True
+# Auto-grab timing (issue #150): defaults equal the PRE-#150 hardcoded
+# constants exactly, so an unset install behaves identically to before this
+# feature existed. ``AUTO_GRAB_INTERVAL_SECONDS_DEFAULT`` mirrors the former
+# ``web/app.py:_AUTOGRAB_INTERVAL_SECONDS`` literal (60.0);
+# ``AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT`` is the SAME object as
+# ``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE`` -- one source of
+# truth, not a duplicated literal that could drift.
+AUTO_GRAB_INTERVAL_SECONDS_DEFAULT: float = 60.0
+AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT: int = AUTO_GRAB_MAX_SEARCHES_PER_CYCLE
 WATCHLIST_SYNC_ENABLED_DEFAULT: bool = True
 WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT: float = 15.0
 
@@ -1918,6 +1951,96 @@ def resolve_watchlist_sync_interval_minutes(raw: str | None) -> tuple[float, boo
             EVICTION_INTERVAL_MAX_MINUTES,
         )
         return EVICTION_INTERVAL_MAX_MINUTES, False
+    return parsed, True
+
+
+def resolve_auto_grab_interval_seconds(raw: str | None) -> tuple[float, bool]:
+    """Resolve the auto-grab cycle cadence to ``[AUTO_GRAB_INTERVAL_SECONDS_MIN,
+    AUTO_GRAB_INTERVAL_SECONDS_MAX]`` (issue #150).
+
+    Mirrors :func:`resolve_eviction_interval_minutes`'s directional policy,
+    adapted to a CLOSED (not exclusive) floor: above the MAX clamps to it (a
+    huge stored value meant "search almost never", and the MAX already keeps
+    the worker responsive); below the MIN -- including zero/negative, which
+    would hot-spin ``_autograb_loop`` -- falls back to the DEFAULT rather than
+    clamping to the floor, because there is no meaning a pre-bounds sub-15s
+    value could have had that clamping preserves (unlike the day-count
+    settings' "huge value meant never expire" upgrade case). Unparsable /
+    non-finite also falls back to the default. Every degradation is a WARNING
+    naming the key.
+    """
+    if raw is None:
+        return AUTO_GRAB_INTERVAL_SECONDS_DEFAULT, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None:
+        _logger.warning(
+            "setting 'auto_grab_interval_seconds' has an unparsable or non-finite value %r;"
+            " using default %s",
+            raw,
+            AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+        )
+        return AUTO_GRAB_INTERVAL_SECONDS_DEFAULT, False
+    if parsed > AUTO_GRAB_INTERVAL_SECONDS_MAX:
+        _logger.warning(
+            "setting 'auto_grab_interval_seconds' is %s, above %s; clamping to %s",
+            parsed,
+            AUTO_GRAB_INTERVAL_SECONDS_MAX,
+            AUTO_GRAB_INTERVAL_SECONDS_MAX,
+        )
+        return AUTO_GRAB_INTERVAL_SECONDS_MAX, False
+    if parsed < AUTO_GRAB_INTERVAL_SECONDS_MIN:
+        _logger.warning(
+            "setting 'auto_grab_interval_seconds' is %s, below %s; using default %s",
+            parsed,
+            AUTO_GRAB_INTERVAL_SECONDS_MIN,
+            AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
+        )
+        return AUTO_GRAB_INTERVAL_SECONDS_DEFAULT, False
+    return parsed, True
+
+
+def resolve_auto_grab_max_searches_per_cycle(raw: str | None) -> tuple[int, bool]:
+    """Resolve the per-cycle Prowlarr search budget to ``[1,
+    AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX]`` (issue #150).
+
+    A DEDICATED resolver rather than :func:`_resolve_bounded_count`: that
+    helper's floor is 0 (valid for a day-count/row-count setting, where 0 is
+    just the most aggressive legal value), but 0 auto-grab searches per cycle
+    would silently disable the worker while ``auto_grab_enabled`` stays True --
+    a lie the operator has no way to notice from the toggle. So 0 AND negative
+    values both fall back to the DEFAULT here, never clamp to a floor of 1
+    silently reinterpreting "0" as "1" (the corrupt value already has no safe
+    single meaning to preserve). Above the MAX clamps to it -- a pre-bounds
+    huge value meant "search aggressively", not "revert to the 5-per-cycle
+    default". Unparsable also falls back to the default. Every degradation is
+    a WARNING naming the key.
+    """
+    if raw is None:
+        return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, True
+    parsed = _parse_int(raw)
+    if parsed is None:
+        _logger.warning(
+            "setting 'auto_grab_max_searches_per_cycle' has an unparsable value %r; using"
+            " default %s",
+            raw,
+            AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
+        )
+        return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, False
+    if parsed > AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX:
+        _logger.warning(
+            "setting 'auto_grab_max_searches_per_cycle' is %s, above %s; clamping to %s",
+            parsed,
+            AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+            AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX,
+        )
+        return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX, False
+    if parsed < 1:
+        _logger.warning(
+            "setting 'auto_grab_max_searches_per_cycle' is %s, below 1; using default %s",
+            parsed,
+            AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT,
+        )
+        return AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT, False
     return parsed, True
 
 
@@ -2158,6 +2281,36 @@ async def get_auto_grab_enabled(session: AsyncSession) -> bool:
         "auto_grab_enabled",
         await SettingsStore(session).get("auto_grab_enabled"),
         AUTO_GRAB_ENABLED_DEFAULT,
+    )
+    return value
+
+
+async def get_auto_grab_interval_seconds(session: AsyncSession) -> float:
+    """How often the auto-grab worker's cycle runs (issue #150, default 60s).
+
+    Resolved through :func:`resolve_auto_grab_interval_seconds` (shared with
+    the ``GET /settings`` sanitizer), read fresh every tick by
+    ``web.app._autograb_loop`` -- a web-edited interval takes effect on the
+    very next sleep, no restart required.
+    """
+    value, _honored = resolve_auto_grab_interval_seconds(
+        await SettingsStore(session).get("auto_grab_interval_seconds")
+    )
+    return value
+
+
+async def get_auto_grab_max_searches_per_cycle(session: AsyncSession) -> int:
+    """At most this many ACTUAL Prowlarr searches per auto-grab cycle (issue
+    #150, default 5 -- the pre-#150 hardcoded
+    ``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE``).
+
+    Resolved through :func:`resolve_auto_grab_max_searches_per_cycle`, read
+    fresh every tick by ``web.app._autograb_once_leased`` and threaded into
+    :func:`~plex_manager.services.auto_grab_service.run_grab_cycle`'s
+    ``max_searches`` -- a web-edited cap takes effect on the very next cycle.
+    """
+    value, _honored = resolve_auto_grab_max_searches_per_cycle(
+        await SettingsStore(session).get("auto_grab_max_searches_per_cycle")
     )
     return value
 
