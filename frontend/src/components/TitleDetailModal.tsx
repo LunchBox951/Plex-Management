@@ -1114,12 +1114,22 @@ export function TitleDetailModal({
     ) : null
 
   // Issue #314: collaborative self-removal, the counterpart to Cancel above.
-  // Shown to a non-admin who is either a plain subscriber, or the owner with
-  // OTHER participants still attached (their own sole-owner case still uses
-  // Cancel, above -- mutually exclusive with `canCancel` by construction).
-  // Deliberately NOT gated on `CANCELLABLE_STATUSES`: withdrawal is valid from
-  // any status the caller participates in, including an already-settled row.
-  const canWithdrawHere = !isAdmin && canWithdraw && liveRequest != null && (!isOwner || hasOtherParticipants)
+  // Shown to any non-admin participant EXCEPT where Cancel is their applicable
+  // verb -- i.e. gated on `!canCancel`, the exact mutual-exclusion the two
+  // buttons need: a non-admin SOLE owner of a still-cancellable row uses Cancel
+  // (canCancel true -> Withdraw hidden), but the same sole owner of a SETTLED
+  // row has no Cancel (canCancel false, since CANCELLABLE_STATUSES excludes it)
+  // and MUST be able to withdraw -- the earlier `(!isOwner || hasOtherParticipants)`
+  // gate wrongly hid it there (Codex #333, Finding 2). Deliberately NOT gated on
+  // `CANCELLABLE_STATUSES`: withdrawal is valid from any status the caller
+  // participates in, including an already-settled row. The backend still owns
+  // the last-participant refusal for an ACTIVE non-cancellable row
+  // (import_blocked / partially_available -> 409 `withdrawal_blocked_active_request`);
+  // we deliberately show the button there rather than duplicating that status set
+  // in the client, and `runWithdraw` surfaces the honest 409 message (a sole
+  // participant on such a row is rare; a co-participant's withdrawal always
+  // succeeds as a mere removal).
+  const canWithdrawHere = !isAdmin && canWithdraw && liveRequest != null && !canCancel
   const withdrawButton =
     canWithdrawHere && liveRequest ? (
       <Button
@@ -1202,10 +1212,27 @@ export function TitleDetailModal({
       actionZone = cancelButton || withdrawButton
       break
     case 'import_blocked':
-      actionZone = reportButton
+      // A participant may withdraw from a needs-attention row too (issue #314).
+      // reportButton is admin-only and withdrawButton is non-admin, so they are
+      // mutually exclusive in practice; the fragment keeps both slots honest.
+      actionZone =
+        reportButton || withdrawButton ? (
+          <>
+            {reportButton}
+            {withdrawButton}
+          </>
+        ) : null
       break
     case 'completed':
-      actionZone = reportIssueButton
+      // A non-admin OWNER sees BOTH report-issue and Withdraw here, so render a
+      // fragment rather than a single button (issue #314).
+      actionZone =
+        reportIssueButton || withdrawButton ? (
+          <>
+            {reportIssueButton}
+            {withdrawButton}
+          </>
+        ) : null
       break
     case 'available':
       // In the library. The download is terminal (gone from the active queue), so
@@ -1227,6 +1254,8 @@ export function TitleDetailModal({
               re-acquisition is the report-issue verb's job). */}
           {reportIssueButton}
           {reacquireQuiet}
+          {/* A participant may withdraw from an in-library row too (issue #314). */}
+          {withdrawButton}
         </>
       )
       break
@@ -1237,6 +1266,7 @@ export function TitleDetailModal({
               one (re-searching the dead id would show releases that all fail to grab). */}
           {requestAgainButton}
           {reportButton}
+          {withdrawButton}
         </>
       )
       break
@@ -1244,13 +1274,23 @@ export function TitleDetailModal({
       // ADR-0012: honest, retryable — the disk-pressure sweep freed this title's
       // file on purpose (not a failure), and re-requesting grabs it again from
       // scratch (the old id is settled, same as available/failed).
-      actionZone = requestAgainButton
+      actionZone = (
+        <>
+          {requestAgainButton}
+          {withdrawButton}
+        </>
+      )
       break
     case 'cancelled':
       // ADR-0014: the operator cancelled this (not-yet-imported) request. Settled,
       // same as evicted/available/failed — "Request again" makes a fresh, grabbable
       // request (the old id is settled).
-      actionZone = requestAgainButton
+      actionZone = (
+        <>
+          {requestAgainButton}
+          {withdrawButton}
+        </>
+      )
       break
     case 'unknown':
       // issue #205: a runtime-unknown status (a future backend enum member this

@@ -29,6 +29,7 @@ from plex_manager.services.correction_service import (
     NotReportableError,
     ReportSeasonRequiredError,
     SeasonNotFoundError,
+    WithdrawalBlockedActiveError,
 )
 from plex_manager.services.library_roots import LibraryRoots
 from plex_manager.services.request_service import MediaNotFoundError, NoAiredSeasonsError
@@ -177,7 +178,10 @@ _CANCEL_REQUEST_RESPONSES: dict[int | str, dict[str, Any]] = {
 # ``request_not_found`` (unknown id, or the caller is not a subscriber -- the same
 # "hide non-participant existence" posture as the cancel/report-issue mutator
 # guard), 409 ``import_in_progress``/``not_cancellable`` (the last-participant
-# settle branch reuses ``cancel_request``'s own refusals verbatim), and
+# settle branch reuses ``cancel_request``'s own refusals verbatim),
+# ``withdrawal_blocked_active_request`` (the last participant tried to withdraw
+# from an ACTIVE non-cancellable row -- ``import_blocked``/``partially_available``
+# -- which is neither tearable-down nor settled), and
 # ``ServiceNotConfiguredError``'s 409 ``service_not_configured`` (same shape/
 # rationale as the cancel endpoint's, above).
 _WITHDRAW_SUBSCRIPTION_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -189,8 +193,9 @@ _WITHDRAW_SUBSCRIPTION_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorDetail | ServiceNotConfiguredErrorDetail,
         "description": (
             "An import is in progress, the last-participant settle hit a "
-            "not-cancellable TV season, or qBittorrent is required but not "
-            "configured"
+            "not-cancellable TV season, the last participant tried to withdraw "
+            "from an active non-cancellable request, or qBittorrent is required "
+            "but not configured"
         ),
     },
 }
@@ -843,6 +848,14 @@ async def withdraw_subscription_endpoint(
         # which CAN raise this (a done season under an otherwise-cancellable parent
         # rollup) -- surfaced the same honest, retryable 409 the cancel endpoint uses.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not_cancellable") from exc
+    except WithdrawalBlockedActiveError as exc:
+        # The last participant tried to withdraw from an ACTIVE non-cancellable row
+        # (import_blocked / partially_available): neither tearable-down nor settled,
+        # and still dedup-blocking. Refused with an honest, actionable 409 -- resolve
+        # the import (or let the in-flight seasons settle) first, then withdraw.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="withdrawal_blocked_active_request"
+        ) from exc
     except ImportInProgressError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"

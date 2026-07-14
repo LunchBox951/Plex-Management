@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
@@ -3875,3 +3875,281 @@ async def test_admin_cancel_request_keeps_every_subscriber(
             .all()
         )
     assert set(subs) == {owner_id, other_id, third_id}
+
+
+async def test_withdraw_last_participant_on_import_blocked_is_refused(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333, Finding 1: ``import_blocked`` is neither cancellable nor
+    settled -- it still dedup-blocks and needs a retry/report. The LAST
+    participant must not be able to strand it ownerless with zero subscribers;
+    the withdrawal is refused (nothing touched) with WithdrawalBlockedActiveError.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.import_blocked,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.WithdrawalBlockedActiveError) as exc_info:
+        async with sessionmaker_() as session:
+            await correction_service.withdraw_participant(
+                session, qbt, request_id=request_id, user_id=owner_id
+            )
+    assert exc_info.value.status == RequestStatus.import_blocked.value
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        request_row = await session.get(MediaRequest, request_id)
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Nothing touched: still owned, still subscribed, still import_blocked.
+    assert request_row is not None
+    assert request_row.status == RequestStatus.import_blocked
+    assert request_row.user_id == owner_id
+    assert len(subs) == 1
+
+
+async def test_withdraw_last_participant_on_partially_available_is_refused(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333, Finding 1 (the TV rollup half): ``partially_available`` is the
+    other active-non-cancellable status -- seasons are still in flight. The last
+    participant is refused rather than stranding an active, dedup-blocking show.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        show = MediaRequest(
+            tmdb_id=1400,
+            media_type=MediaType.tv,
+            title="Mixed Show",
+            status=RequestStatus.partially_available,
+            user_id=owner_id,
+        )
+        session.add(show)
+        await session.flush()
+        show_id = show.id
+        session.add(RequestSubscriber(request_id=show_id, user_id=owner_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    with pytest.raises(correction_service.WithdrawalBlockedActiveError) as exc_info:
+        async with sessionmaker_() as session:
+            await correction_service.withdraw_participant(
+                session, qbt, request_id=show_id, user_id=owner_id
+            )
+    assert exc_info.value.status == RequestStatus.partially_available.value
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == show_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(subs) == 1  # nothing removed
+
+
+async def test_withdraw_co_participant_on_import_blocked_is_a_mere_removal(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333, Finding 1 boundary: the refusal is LAST-PARTICIPANT ONLY. When
+    OTHERS remain, withdrawing from an ``import_blocked`` row is a plain removal
+    (with owner handoff) -- the remaining participant still owns the blocked
+    import and its correction path.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        other_id = await _seed_user(session, "other")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.import_blocked,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        session.add(RequestSubscriber(request_id=request_id, user_id=other_id))
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=owner_id
+        )
+    assert outcome.settled is False
+    assert outcome.record.status == RequestStatus.import_blocked.value  # untouched
+    assert outcome.record.user_id == other_id  # handoff to the remaining participant
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber.user_id).where(
+                        RequestSubscriber.request_id == request_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert set(subs) == {other_id}
+
+
+async def test_withdraw_rereads_owner_under_lock_after_a_concurrent_handoff(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333, Finding 3: two concurrent withdrawals must not leave the row
+    owned by a user who just withdrew. ``withdraw_participant`` acquires the
+    per-media lock and RE-READS owner + subscribers before choosing a branch, so
+    the SECOND withdrawal decides on the post-first-withdrawal state.
+
+    SQLite is single-writer (ADR-0007) so true concurrency isn't reproducible;
+    this simulates the interleaving deterministically. Session S loads a STALE
+    owner (``a``) into its identity map (as the authz dependency would), then a
+    'concurrent' withdrawal by ``a`` -- which removed ``a`` and handed ownership
+    to ``b`` -- is applied to the DB underneath the stale snapshot via raw SQL.
+    ``b`` then withdraws: the fresh re-read makes ``b`` the LAST participant AND
+    the current owner, so the row settles ownerless rather than being left owned
+    by the withdrawn ``a``.
+    """
+    async with sessionmaker_() as session:
+        a_id = await _seed_user(session, "a")
+        b_id = await _seed_user(session, "b")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            user_id=a_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=a_id))
+        session.add(RequestSubscriber(request_id=request_id, user_id=b_id))
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        # The authz dependency loads a STALE row (owner == a) into this
+        # request-scoped session's identity map.
+        stale = await session.get(MediaRequest, request_id)
+        assert stale is not None and stale.user_id == a_id
+        # A 'concurrent' withdrawal by ``a`` has committed: ``a`` removed, owner
+        # handed to ``b``. Apply it via raw SQL so the pinned ORM instance stays
+        # stale (owner == a).
+        await session.execute(
+            text("DELETE FROM request_subscribers WHERE request_id = :r AND user_id = :u"),
+            {"r": request_id, "u": a_id},
+        )
+        await session.execute(
+            text("UPDATE media_requests SET user_id = :b WHERE id = :r"),
+            {"b": b_id, "r": request_id},
+        )
+        assert stale.user_id == a_id  # identity map is still stale
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=b_id
+        )
+    assert outcome.settled is True
+    assert outcome.record.status == RequestStatus.cancelled.value
+    # The row is ownerless -- NOT left owned by the withdrawn ``a``.
+    assert outcome.record.user_id is None
+    assert (_CULPRIT, True) in qbt.removed
+    async with sessionmaker_() as session:
+        subs = (
+            (
+                await session.execute(
+                    select(RequestSubscriber).where(RequestSubscriber.request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert subs == []
+
+
+async def test_withdraw_decides_on_fresh_status_not_the_dependency_snapshot(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex #333, Finding 4: the authz dependency loads the MediaRequest while it
+    is still ``downloading``; by the time the service runs, an import has settled
+    it ``available``. ``withdraw_participant`` must re-read (populate_existing) and
+    branch on the FRESH status -- a plain ownerless settle -- never tear the row
+    down and settle it ``cancelled`` off the stale pre-import snapshot.
+    """
+    async with sessionmaker_() as session:
+        owner_id = await _seed_user(session, "owner")
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            user_id=owner_id,
+            library_path="/movies/Some Movie (2020)/Some.Movie.2020.mkv",
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        session.add(
+            Download(
+                torrent_hash=_CULPRIT,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=_TMDB,
+            )
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        # Dependency reads the row while it is still 'downloading'.
+        stale = await session.get(MediaRequest, request_id)
+        assert stale is not None and stale.status == RequestStatus.downloading
+        # The import settles the row 'available' underneath the loaded snapshot
+        # (raw SQL so the pinned ORM instance keeps its stale 'downloading').
+        await session.execute(
+            text("UPDATE media_requests SET status = 'available' WHERE id = :r"),
+            {"r": request_id},
+        )
+        assert stale.status == RequestStatus.downloading  # identity map is stale
+        outcome = await correction_service.withdraw_participant(
+            session, qbt, request_id=request_id, user_id=owner_id
+        )
+    # Decided on the FRESH 'available' status: a plain ownerless settle, never a
+    # teardown-to-'cancelled' off the stale 'downloading' snapshot.
+    assert outcome.settled is False
+    assert outcome.record.status == RequestStatus.available.value
+    assert outcome.record.user_id is None
+    assert qbt.removed == []  # the still-'downloading' Download row is NOT torn down

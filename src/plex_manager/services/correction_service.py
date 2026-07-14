@@ -148,6 +148,7 @@ __all__ = [
     "RequestNotFoundError",
     "SeasonNotFoundError",
     "WithdrawOutcome",
+    "WithdrawalBlockedActiveError",
     "cancel_request",
     "cancel_request_as_owner",
     "relocate_stranded_download",
@@ -554,6 +555,33 @@ class HasOtherParticipantsError(Exception):
         super().__init__(
             f"request {request_id} has other subscribers; a non-admin owner must "
             f"withdraw instead of cancelling the whole request"
+        )
+
+
+class WithdrawalBlockedActiveError(Exception):
+    """The LAST participant cannot withdraw from an ACTIVE, non-cancellable
+    request (issue #314, HTTP 409).
+
+    ``import_blocked`` and ``partially_available`` are the two statuses that are
+    neither cancellable (:data:`CANCELLABLE_REQUEST_STATUS_VALUES` -- there is a
+    blocked download or an in-flight season that ``cancel_request`` deliberately
+    will not tear down) NOR genuinely settled
+    (``request_service.TERMINAL_REQUEST_STATUS_VALUES`` -- they still shadow a
+    duplicate via ``uq_media_requests_active``). Letting the last participant
+    withdraw here would strand an ACTIVE, dedup-blocking row with zero
+    subscribers and no owner -- nobody left to resolve the block or the in-flight
+    seasons, yet it keeps blocking a fresh request for the same media. Refused
+    BEFORE anything is touched: the correction path is to resolve the import
+    (retry/report) or let the in-flight seasons settle first, THEN withdraw from
+    the resulting terminal row.
+    """
+
+    def __init__(self, request_id: int, status: str) -> None:
+        self.request_id = request_id
+        self.status = status
+        super().__init__(
+            f"request {request_id} is {status!r}, an active non-cancellable state; "
+            f"resolve it before the last participant withdraws"
         )
 
 
@@ -1502,11 +1530,21 @@ async def withdraw_participant(
       subscription and -- if the withdrawing user was the owner -- nulls
       ``user_id`` out: the row ends ``cancelled``, ownerless, zero subscribers.
 
-    * **Last participant, terminal/settled status** (``available``/``completed``
-      /etc.) -- nothing to tear down. The subscription is removed and, if the
-      withdrawing user was the owner, ``user_id`` is nulled out -- the row
-      becomes ownerless, exactly like automation provenance. The library file
-      is untouched.
+    * **Last participant, ACTIVE non-cancellable status** (``import_blocked`` /
+      ``partially_available``) -- refused with
+      :class:`WithdrawalBlockedActiveError` (409). These are the two statuses in
+      NEITHER the cancellable NOR the terminal set: still dedup-blocking, but not
+      safely tearable-down. Stranding such a row ownerless with zero subscribers
+      would leave nobody to correct it, so the caller must resolve the import (or
+      let the in-flight seasons settle) first, then withdraw from the terminal
+      row.
+
+    * **Last participant, terminal/settled status**
+      (``available``/``completed``/``failed``/``evicted``/``cancelled`` --
+      ``request_service.TERMINAL_REQUEST_STATUS_VALUES``) -- nothing to tear
+      down. The subscription is removed and, if the withdrawing user was the
+      owner, ``user_id`` is nulled out -- the row becomes ownerless, exactly like
+      automation provenance. The library file is untouched.
 
     Every branch writes an ``AuditLog`` row (via :mod:`audit_service`) naming
     the withdrawing user, honesty over silence: a handoff is never a silent
@@ -1516,6 +1554,36 @@ async def withdraw_participant(
     request_repo = SqlRequestRepository(session)
     request = await request_repo.get(request_id)
     if request is None:
+        raise RequestNotFoundError(request_id)
+
+    # Serialize this withdrawal per-media (issue #314). Take the SAME
+    # per-``(tmdb_id, media_type)`` dedup lock ``request_service.create_request``
+    # holds (``acquire_media_lock``): two concurrent withdrawals -- or a
+    # withdrawal racing a create -- must not both read the pre-removal subscriber
+    # snapshot and hand ownership to a user the OTHER just removed, which would
+    # leave an active row owned by a non-participant with zero subscribers.
+    # ``tmdb_id``/``media_type`` are immutable, so reading them off the
+    # (possibly stale) identity-map row above is safe. Lock ordering is
+    # deadlock-free: like ``create_request`` this takes the media lock BEFORE any
+    # MediaRequest/Download row lock (incl. the teardown branch's
+    # ``cancel_request``), so both paths acquire the single media lock first.
+    # Under SQLite (ADR-0007, single-writer) ``FOR UPDATE`` is a no-op so the
+    # race is theoretical today; the lock keeps it correct under PostgreSQL,
+    # where the primitive is real.
+    await request_repo.acquire_media_lock(request.tmdb_id, request.media_type)
+
+    # Re-read the row AUTHORITATIVELY under the lock (issue #314). The authz
+    # dependency (``_require_subscriber``) already loaded this MediaRequest into
+    # the request-scoped session's identity map, possibly BEFORE an import
+    # settled it; ``get_fresh`` (``populate_existing=True``) forces a real SELECT
+    # so every branch below decides on the CURRENT status/owner, never a stale
+    # pre-import snapshot (which could otherwise settle an already-imported row
+    # ``cancelled``). ``list_subscribers`` below is a plain SELECT and is
+    # likewise fresh; because BOTH reads happen under the media lock, a
+    # serialized second withdrawal sees the first's committed subscriber removal
+    # and ownership handoff.
+    request = await request_repo.get_fresh(request_id)
+    if request is None:  # pragma: no cover - the locked row cannot vanish
         raise RequestNotFoundError(request_id)
 
     subscribers = await request_repo.list_subscribers(request_id)
@@ -1579,10 +1647,24 @@ async def withdraw_participant(
             raise RequestNotFoundError(request_id)
         return WithdrawOutcome(record=updated, settled=True)
 
-    # Last participant, terminal/settled: nothing to tear down. Remove the
-    # subscription and, if the withdrawing user owned it, null the owner out --
-    # an ownerless row like any other automation-provenance one. The library
-    # file is untouched.
+    if request.status not in request_service.TERMINAL_REQUEST_STATUS_VALUES:
+        # Last participant on an ACTIVE non-cancellable status -- the two
+        # statuses that are in NEITHER CANCELLABLE_REQUEST_STATUS_VALUES nor
+        # TERMINAL_REQUEST_STATUS_VALUES: ``import_blocked`` (a blocked download
+        # awaiting a retry/report) and ``partially_available`` (a TV rollup with
+        # seasons still in flight). Both keep shadowing a duplicate via
+        # ``uq_media_requests_active``, and neither can be safely torn down here.
+        # Removing the last participant would strand an active, dedup-blocking
+        # row ownerless with zero subscribers -- nobody left to correct it.
+        # Refuse (nothing touched); the caller resolves the block / lets the
+        # seasons settle first, then withdraws from the resulting terminal row
+        # (see WithdrawalBlockedActiveError).
+        raise WithdrawalBlockedActiveError(request_id, request.status)
+
+    # Last participant, terminal/settled (available/completed/failed/evicted/
+    # cancelled): nothing to tear down. Remove the subscription and, if the
+    # withdrawing user owned it, null the owner out -- an ownerless row like any
+    # other automation-provenance one. The library file is untouched.
     await request_repo.remove_subscriber(request_id, user_id)
     if request.user_id == user_id:
         await request_repo.set_owner(request_id, None)

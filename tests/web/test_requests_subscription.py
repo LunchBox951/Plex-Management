@@ -355,6 +355,41 @@ async def test_withdraw_endpoint_409_service_not_configured_last_participant(
     assert row is not None and row.status == RequestStatus.downloading
 
 
+async def test_withdraw_endpoint_409_last_participant_on_import_blocked(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    # Codex #333, Finding 1: the last participant of an ACTIVE non-cancellable
+    # row (import_blocked) cannot withdraw -- the endpoint refuses with an honest,
+    # actionable 409 rather than stranding a dedup-blocking row ownerless.
+    await seed(initialized=True, app_api_key=_API_KEY)
+    owner_id, owner_cookies, owner_headers = await _user_session(app, tag="owner")
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.import_blocked,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        await session.commit()
+
+    response = await client.delete(
+        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "withdrawal_blocked_active_request"
+    # Nothing touched: still owned, still subscribed, still import_blocked.
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.user_id == owner_id
+    assert row.status == RequestStatus.import_blocked
+
+
 async def test_request_response_flags_for_owner_subscriber_and_admin_non_subscriber(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:

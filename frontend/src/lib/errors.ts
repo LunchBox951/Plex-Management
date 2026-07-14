@@ -88,6 +88,8 @@ const DETAIL_MESSAGES: Record<string, string> = {
     'A download for this request is finishing its import — try again in a moment.',
   has_other_participants:
     'Other people have requested this too — withdraw instead of cancelling it for everyone.',
+  withdrawal_blocked_active_request:
+    'This request still needs attention (a blocked import, or seasons still downloading) and you’re the last person on it. Resolve it first, then withdraw.',
 }
 
 export { DETAIL_MESSAGES }

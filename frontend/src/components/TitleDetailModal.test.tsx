@@ -1300,6 +1300,75 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
     expect(screen.getByText('Withdraw and hand off?')).toBeInTheDocument()
   })
+
+  it('shows "Withdraw" to a non-admin SOLE owner of a SETTLED row (Cancel is unavailable there)', () => {
+    // Codex #333, Finding 2: a settled row has no Cancel (CANCELLABLE_STATUSES
+    // excludes it), so gating Withdraw on `(!isOwner || hasOtherParticipants)`
+    // wrongly left a sole owner with NO self-removal path. Gating on `!canCancel`
+    // fixes it: Cancel is absent here, so Withdraw appears.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'available',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+  })
+
+  it.each(['available', 'completed', 'failed', 'cancelled', 'evicted', 'import_blocked'] as const)(
+    'offers Withdraw to a participant on a settled/blocked row (%s)',
+    (status) => {
+      // Codex #333, Finding 2: these switch arms previously omitted the Withdraw
+      // button entirely, stranding a participant of a settled/blocked row with no
+      // self-removal affordance.
+      asSharedUser()
+      ;(useRequests as unknown as Mock).mockReturnValue({
+        data: {
+          requests: [
+            movieRequest({
+              status,
+              is_owner: false,
+              can_withdraw: true,
+              has_other_participants: true,
+            }),
+          ],
+        },
+      })
+      render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+      expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+    },
+  )
+
+  it('still shows Withdraw to a sole participant on import_blocked (backend owns the 409)', () => {
+    // Codex #333, Findings 1+2: we deliberately do NOT re-derive the backend's
+    // active-non-cancellable status set in the client. The button shows; a
+    // last-participant withdrawal from import_blocked / partially_available 409s
+    // `withdrawal_blocked_active_request`, which `runWithdraw` surfaces as a toast.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'import_blocked',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+  })
 })
 
 describe('TitleDetailModal — unknown status fails closed, not open (issue #205)', () => {

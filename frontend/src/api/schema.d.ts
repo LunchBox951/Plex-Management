@@ -4395,7 +4395,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorDetail"];
                 };
             };
-            /** @description An import is in progress, the last-participant settle hit a not-cancellable TV season, or qBittorrent is required but not configured */
+            /** @description An import is in progress, the last-participant settle hit a not-cancellable TV season, the last participant tried to withdraw from an active non-cancellable request, or qBittorrent is required but not configured */
             409: {
                 headers: {
                     [name: string]: unknown;
