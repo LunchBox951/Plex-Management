@@ -14,10 +14,11 @@ CONTRIBUTING.md "Logging request-derived values".
 
 import base64
 import hashlib
+import json
 import re
 from collections.abc import Iterable
 from typing import Final
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 #: The ONLY shape :func:`safe_guid` ever passes through verbatim: a bounded run
 #: of letters, digits, dots, underscores, and hyphens. This covers every benign
@@ -241,6 +242,11 @@ def safe_guid(value: str) -> str:
 #    HASH at rest; qBittorrent's SID lives only in the adapter's in-memory
 #    cookie jar), so :func:`redact_known_secrets`'s value-based pass (below)
 #    can never mask this shape -- this SHAPE rule is the only barrier for it.
+# 5b. The same cookie names rendered as a ``http.cookies.SimpleCookie`` repr --
+#    ``<SimpleCookie: plexmgr.session='SECRET'>`` (unquoted name, ``=``, quoted
+#    value; see :data:`_SIMPLE_COOKIE_RE`) -- which neither the raw-header pass
+#    (5) nor the dict-repr pass (5a) recognizes. Same "cookie token is never a
+#    settings value, so a shape rule is the only barrier" reasoning as 5a.
 #
 # A final, UNCONDITIONAL pass (no key name involved at all) catches a
 # Fernet-key-SHAPED standalone blob wherever it appears: ``cryptography``'s
@@ -478,13 +484,43 @@ _COOKIE_JAR_RE: Final = re.compile(
     + r")"
 )
 
+# Cookie/session credentials rendered as a ``http.cookies.SimpleCookie`` repr
+# (#292 item -- SimpleCookie repr leakage) -- ``<SimpleCookie: plexmgr.session=
+# 'SECRET' QBT_SID_8080='SECRET'>`` -- the shape a ``BaseCookie``/``SimpleCookie``
+# object logs as when repr'd whole (space-separated ``name='value'`` pairs, the
+# cookie NAME UNQUOTED, the value QUOTED). Neither ``_COOKIE_RE`` (it requires an
+# UNQUOTED ``name=value`` and its value class stops dead at the opening ``'``) nor
+# ``_COOKIE_JAR_RE`` (it keys on a QUOTED key + ``:`` dict separator) recognizes
+# this unquoted-key/``=``/quoted-value form, so it needs its own pass. Keys on the
+# same ``session``/``sid`` cookie-NAME shape the other two cookie passes accept
+# (reused verbatim), an ``=``, then a quoted value masked through its matching
+# close quote via the shared escape-aware :data:`_QUOTED_VALUE` run. Like every
+# cookie token, this value is never a settings-store value (a ``plexmgr.session``
+# is only ever a hash at rest; qBittorrent's ``SID`` lives only in the adapter's
+# in-memory jar), so this SHAPE rule is the ONLY barrier for the repr form.
+_SIMPLE_COOKIE_RE: Final = re.compile(
+    r"(?i)\b[\w.]*(?:session|sid)(?:[._-][\w.-]*)?=(?P<q>['\"])(?P<value>" + _QUOTED_VALUE + r")"
+)
+
 # ``scheme://user:pass@host`` -- the PASSWORD half of HTTP basic-auth userinfo.
 # Group 1 captures ``scheme://user`` (stopping the username at the first
 # ``:``/``/``/``@``/quote/whitespace); the password itself is never captured
 # into the output, only its span is consumed so it can be dropped. The username
 # run is ``*`` (not ``+``) so a valid empty-username basic-auth URL
 # (``https://:token@host``) still masks its token instead of leaking it.
-_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s@'\"]+@")
+#
+# The password run is greedy up to the LAST ``@`` still inside the authority --
+# it excludes only ``/``/``?``/``#`` (the authority terminators, so the host and
+# any path/query ``@`` are never swallowed), NOT ``@`` itself, so a password that
+# CONTAINS a raw ``@`` (``scheme://user:p@ss@host``) is masked WHOLE rather than
+# up to its own first internal ``@`` (issue #270's shape-grammar gap; #292 item
+# 3). Because the run has no length floor of its own, this also masks a SHORT
+# ``@``-bearing password the value-based pass skips (#292 item 4/short-password
+# gap), and re-masks a LEGACY row the old first-``@`` regex already mangled into
+# ``user:<redacted>@ssremainder@host`` -- the greedy run consumes the exposed
+# ``ssremainder`` too, recovering the partially-redacted row (#292 item 3). The
+# class + single required ``@`` is linear (no nested quantifier -> no ReDoS).
+_BASIC_AUTH_URL_RE: Final = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@'\"]*):[^\s/?#'\"]+@")
 
 # A standalone Fernet-key-shaped blob: 43 urlsafe-base64 characters plus the
 # one trailing ``=`` pad ``Fernet.generate_key()`` always produces (32 raw
@@ -544,6 +580,7 @@ def redact_secrets(text: str) -> str:
     redacted = _SECRET_TUPLE_RE.sub(_mask_value, redacted)
     redacted = _COOKIE_RE.sub(_mask_value, redacted)
     redacted = _COOKIE_JAR_RE.sub(_mask_value, redacted)
+    redacted = _SIMPLE_COOKIE_RE.sub(_mask_value, redacted)
     redacted = _FERNET_KEY_RE.sub("<redacted-fernet-key>", redacted)
     return redacted
 
@@ -614,32 +651,204 @@ def redact_secrets(text: str) -> str:
 #: secrets sitting in a recognized ``key=value``/header/cookie shape.
 _MIN_SECRET_VALUE_LENGTH: Final = 8
 
+#: A word/identifier character (matches a ``[\w-]`` run's members). Used by the
+#: key-name guard below to expand a value match leftward to the start of the
+#: identifier it sits in, so the character BEFORE that identifier can be checked.
+_IDENT_CHAR_RE: Final = re.compile(r"[\w-]")
+#: An assignment separator anchored at the character AFTER a value match: the
+#: SAME optional-closing-quote + ``:``/``=`` shape :data:`_SECRET_KV_RE` keys on
+#: (:data:`_KV_SEP_PATTERN`, reused verbatim). A cheap PRE-FILTER in
+#: :func:`_mask_known_value` -- the authoritative check is the self-verifying
+#: ``_SECRET_KV_RE`` scan that follows it. Used with :func:`re.Match.string`.
+_KEY_POSITION_SEP_RE: Final = re.compile(_KV_SEP_PATTERN)
+#: The recognized secret KEY WORDS (the shape grammar's own alternation, plus
+#: ``authorization``), fullmatched case-insensitively against a value occurrence
+#: by the key-name guard (:func:`_mask_known_value`): ONLY an occurrence that IS
+#: exactly one of these words may ever be spared. Any longer or different match
+#: is masked unconditionally, so a secret merely EMBEDDED in a bigger token
+#: before a separator (``payload=x<secret>=v``) can never ride the guard into
+#: clear text.
+_KEY_WORD_FULL_RE: Final = re.compile(r"(?i)(?:" + _SECRET_KEY_PATTERN + r"|authorization)")
+#: Detects a genuine URL-AUTHORITY prefix ending exactly where the identifier a
+#: spared-candidate occurrence sits in begins: a ``scheme://`` followed by any
+#: run of non-``/``/non-space/non-quote characters (the userinfo/host region --
+#: ``:`` and ``@`` included), as in ``https://password:x@host``. There the
+#: occurrence is a USERINFO/host component, not a key name, and the guard
+#: refuses to spare: fail closed, mask -- the composition then finishes the job
+#: (``_BASIC_AUTH_URL_RE`` consumes the whole ``:<...>@`` span around the masked
+#: occurrence). Deliberately NARROW (round-3 finding): a bare ``:`` before the
+#: identifier (``error:password=hunter2`` -- a prose/logger prefix) is NOT
+#: authority context; treating it as one masked the key, broke the shape pass's
+#: key recognition, and left the VALUE exposed. Used with
+#: ``search(text, start, endpos=ident_start)`` -- the ``\Z`` anchors the
+#: authority run to end exactly at the identifier.
+_AUTHORITY_PREFIX_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/'\"]*\Z")
+#: How far back from the identifier the authority scan looks. Any real
+#: ``scheme://userinfo`` prefix is far shorter; bounding it keeps the spare
+#: callback O(window), not O(text).
+_AUTHORITY_SCAN_WINDOW: Final = 512
+#: How far back from a spared-candidate occurrence the SELF-VERIFICATION scan
+#: (see :func:`_mask_known_value`) starts its ``_SECRET_KV_RE`` search: a
+#: shape-pass match whose KEY contains the occurrence starts at most the key
+#: prefix cap (64) before it, plus slack.
+_KV_KEY_SCAN_WINDOW: Final = 96
+
+
+#: One hex-bearing escape inside an encoded rendering: a ``%XX`` percent-escape,
+#: a ``\\uXXXX`` JSON/repr unicode escape, or an ``\\xXX`` repr byte escape.
+#: Emitters differ in hex case -- ``quote`` emits ``%2F``, ``json.dumps`` emits
+#: ``\\u00e4``, other serializers emit ``%2f``/``\\u00E4``, and per-escape MIXES
+#: of these are all decode-identical (#292 round-2 percent finding + round-3
+#: unicode-escape finding). :func:`_variant_regex` therefore compiles each
+#: escape's hex digits into case-insensitive character classes instead of
+#: enumerating spellings (which could never cover per-escape mixes).
+_HEX_ESCAPE_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}")
+
+
+def _variant_regex(variant: str) -> str:
+    """A regex source matching ``variant`` literally EXCEPT that every
+    hex-bearing escape's digits match case-insensitively -- ``%2F`` ->
+    ``%2[Ff]``, ``\\u00e4`` -> ``\\u00[Ee]4``-style per-digit classes, ``\\x1b``
+    likewise -- so every per-escape case mix of a percent-encoded or JSON/repr-
+    escaped rendering is masked, not just the spelling the local encoder emits
+    (#292 round-2 + round-3 findings). Non-escape characters are
+    :func:`re.escape`d, so the rest of the value stays an exact literal match
+    (unencoded characters ARE case-significant). Character classes only, no
+    added quantifiers: as linear (ReDoS-free) as the plain escape."""
+    parts: list[str] = []
+    pos = 0
+    for m in _HEX_ESCAPE_RE.finditer(variant):
+        parts.append(re.escape(variant[pos : m.start()]))
+        token = m.group()
+        lead_len = 1 if token.startswith("%") else 2  # "%" vs "\\u" / "\\x"
+        classes = "".join(
+            d if d.isdigit() else f"[{d.upper()}{d.lower()}]" for d in token[lead_len:]
+        )
+        parts.append(re.escape(token[:lead_len]) + classes)
+        pos = m.end()
+    parts.append(re.escape(variant[pos:]))
+    return "".join(parts)
+
 
 def _secret_value_variants(value: str) -> frozenset[str]:
-    """Every literal RENDERING of ``value`` this pass will mask: the raw value
-    itself, its URL-percent-encoded form (a password/token embedded in a query
-    string or userinfo often arrives percent-encoded rather than raw -- e.g. a
-    password containing ``@`` or ``&``), and its base64 form (``cryptography``/
-    third-party clients frequently base64-encode a credential for a header or
-    a config dump). Each variant is included only when it actually DIFFERS from
-    the raw value, so a value with no reserved/non-ASCII characters (already
-    identical to its own percent-encoding) contributes exactly one entry rather
-    than three redundant copies for the caller's alternation to consider.
+    """Every literal RENDERING of ``value`` this pass will mask -- the raw value
+    plus the encoded spellings the same secret arrives in when a client, proxy,
+    or serializer re-renders it. The frozenset deduplicates, so a value with no
+    reserved/non-ASCII characters (identical to several of its own encodings)
+    simply contributes fewer distinct entries; empties are dropped. Variants:
 
-    Total -- never raises: ``quote``'s own DEFAULT ``errors="strict"`` UTF-8
-    encode raises ``UnicodeEncodeError`` on a lone UTF-16 surrogate (a JSON log
-    payload permits one; a settings value round-tripped through JSON could
+    * **Percent-encoding** -- a password/token embedded in a query string or
+      userinfo often arrives percent-encoded (e.g. a password containing ``@``
+      or ``&``). Two variants are generated -- ``quote`` (``%20`` for space) and
+      ``quote_plus`` (``+`` for space) -- and hex CASE is not enumerated here at
+      all: :func:`_variant_regex` compiles each ``%XX`` escape case-insensitively
+      at match time, covering upper, lower, AND per-escape mixed spellings
+      (#292 encoding-variant items + round-2 mixed-case finding).
+    * **base64** -- ``cryptography``/third-party clients frequently base64 a
+      credential for a header or config dump. Covered as STANDARD and URL-SAFE
+      alphabets, each in PADDED and UNPADDED form (a ``=``-stripped/base64url
+      rendering is common in JWT-style and query contexts; #292 items).
+    * **JSON- / repr-escaped string bodies** -- a secret containing a quote,
+      backslash, or non-ASCII character renders ESCAPED inside a JSON-encoded
+      log field (``{"password": "a\\"b"}``, ``p\\u00e4ss...``) or a Python
+      ``repr()`` (``'a\\'b'``); the raw bytes never appear literally, so the
+      escaped body must be matched too (#292 item). The surrounding delimiters
+      are stripped -- only the escaped body is a substring of the surrounding
+      text -- and the hex digits of ``\\uXXXX``/``\\xXX`` escapes match
+      case-insensitively via :func:`_variant_regex` (round-3 finding: another
+      serializer's ``\\u00E4`` spelling decodes to the same secret).
+
+    Total -- never raises: ``quote``/``quote_plus``'s DEFAULT ``errors="strict"``
+    UTF-8 encode raises ``UnicodeEncodeError`` on a lone UTF-16 surrogate (a JSON
+    log payload permits one; a settings value round-tripped through JSON could
     carry one) -- ``errors="surrogatepass"`` (the same choice :func:`safe_guid`
-    makes for its own digest) absorbs it instead of raising.
+    makes for its own digest) absorbs it; ``json.dumps`` needs no such guard, it
+    escapes a lone surrogate to ``\\uXXXX`` rather than raising.
     """
+    raw_bytes = value.encode("utf-8", "surrogatepass")
     variants = {value}
-    percent_encoded = quote(value, safe="", errors="surrogatepass")
-    if percent_encoded != value:
-        variants.add(percent_encoded)
-    b64_encoded = base64.b64encode(value.encode("utf-8", "surrogatepass")).decode("ascii")
-    if b64_encoded != value:
-        variants.add(b64_encoded)
-    return frozenset(variants)
+    # Percent-encoding: ``quote`` (space -> ``%20``) and ``quote_plus`` (space ->
+    # ``+``). Hex case is handled at match time by ``_variant_regex``.
+    variants.add(quote(value, safe="", errors="surrogatepass"))
+    variants.add(quote_plus(value, safe="", errors="surrogatepass"))
+    # base64: standard and URL-safe alphabets, each padded and unpadded.
+    for b64 in (
+        base64.b64encode(raw_bytes).decode("ascii"),
+        base64.urlsafe_b64encode(raw_bytes).decode("ascii"),
+    ):
+        variants.add(b64)
+        variants.add(b64.rstrip("="))
+    # JSON- and repr-escaped string bodies (delimiters stripped). ``json.dumps``
+    # with the default ``ensure_ascii=True`` is total on any ``str`` -- it
+    # escapes even a lone surrogate to ``\\uXXXX`` rather than raising -- so no
+    # guard is needed (mirrors ``safe_guid``'s surrogate handling elsewhere).
+    variants.add(json.dumps(value)[1:-1])
+    variants.add(repr(value)[1:-1])
+    return frozenset(v for v in variants if v)
+
+
+def _mask_known_value(match: re.Match[str]) -> str:
+    """Replace a matched secret-value occurrence with :data:`_REDACTED`, UNLESS
+    the occurrence is provably serving as a KEY NAME (#292 item 4; see
+    :func:`redact_known_secrets`), in which case masking it would rewrite an
+    identifier (``some_password=X`` -> ``some_<redacted>=X``) -- destroying a key
+    operators need AND, worse, breaking the very key the shape pass would have
+    used to mask the actual credential ``X``.
+
+    ALL of the following must hold to spare an occurrence -- each condition
+    exists to kill a concrete leak a looser rule allowed:
+
+    * the matched text IS exactly one of the recognized secret KEY WORDS
+      (:data:`_KEY_WORD_FULL_RE`) -- a spare can only ever render bytes that are
+      indistinguishable from ordinary log syntax (``password``, ``auth_token``,
+      ... appear as key names in every deployment's logs regardless of what any
+      secret's value is, so their presence reveals nothing about the configured
+      secret). A secret merely embedded in / equal to some OTHER token before a
+      separator (round-2 finding: ``payload=x<secret>=v``) fails this and is
+      masked unconditionally.
+    * the identifier the occurrence sits in is NOT immediately preceded by a
+      genuine ``scheme://...`` URL-authority prefix (:data:`_AUTHORITY_PREFIX_RE`):
+      in ``https://password:x@host`` the occurrence is a USERINFO component, not
+      a key name, and sparing it would print the secret as a "username" (the
+      composition then finishes the job -- ``_BASIC_AUTH_URL_RE`` consumes the
+      surrounding ``:<...>@`` span around the masked occurrence). Fail closed:
+      mask. Narrow by design (round-3 finding): a bare ``:`` prose prefix
+      (``error:password=hunter2``) is NOT authority context.
+    * SELF-VERIFICATION (round-3, the structural fix): the spare is only taken
+      when the shape pass PROVABLY masks the value side -- ``_SECRET_KV_RE``
+      itself (the exact grammar :func:`redact_secrets` will run, not an
+      approximation) must produce a match whose KEY region contains this
+      occurrence, i.e. ``kv.start() <= occurrence < occurrence.end <=
+      kv.start("value")``. Every capture/read boundary runs
+      :func:`redact_secrets` after this pass (``log_capture_service._capture``,
+      ``web/routers/ops.py``), so a verified spare's paired credential never
+      survives the composition. Any reason the shape pass would NOT fire --
+      an overlong (>64-char) identifier prefix defeating ``_SECRET_KV_RE``'s
+      bounded key scan (the round-3 leak), a missing/malformed separator, or
+      any FUTURE shape-grammar limitation -- automatically fails this check and
+      masks unconditionally: the whole finding family fails closed by
+      construction instead of needing a new guard per grammar quirk.
+    """
+    matched = match.group(0)
+    if _KEY_WORD_FULL_RE.fullmatch(matched) is None:
+        return _REDACTED
+    text = match.string
+    if _KEY_POSITION_SEP_RE.match(text, match.end()) is None:
+        return _REDACTED  # cheap pre-filter; the kv verification below is authoritative
+    ident_start = match.start()
+    while ident_start > 0 and _IDENT_CHAR_RE.fullmatch(text[ident_start - 1]) is not None:
+        ident_start -= 1
+    authority_from = max(0, ident_start - _AUTHORITY_SCAN_WINDOW)
+    if _AUTHORITY_PREFIX_RE.search(text, authority_from, ident_start) is not None:
+        return _REDACTED  # userinfo/authority position, not a key -- fail closed
+    # Self-verify: find the actual shape-pass match whose key contains this
+    # occurrence; without one, the value side would go unmasked -- fail closed.
+    for kv in _SECRET_KV_RE.finditer(text, max(0, match.start() - _KV_KEY_SCAN_WINDOW)):
+        if kv.start() > match.start():
+            break
+        if match.end() <= kv.start("value"):
+            return matched  # verified: the shape pass masks this pair's value
+    return _REDACTED
 
 
 def redact_known_secrets(
@@ -695,6 +904,29 @@ def redact_known_secrets(
     content, load-bearing here. An empty ``text`` or an empty/entirely-
     too-short ``secret_values`` is a no-op, returned byte-identical, exactly
     like an ordinary miss in :func:`redact_secrets`.
+
+    KEY-NAME GUARD (#292 item 4): an occurrence is spared -- left readable --
+    ONLY when it is provably serving as a key NAME rather than a credential:
+    the matched text is exactly one of the shape grammar's own secret KEY WORDS
+    (an operator whose configured secret's value equals a field-name word like
+    ``"password"`` is the minimum-length edge case this exists for), it is not
+    in a URL-authority/userinfo position, and -- the structural, SELF-VERIFYING
+    condition -- ``_SECRET_KV_RE`` itself matches with this occurrence inside
+    its KEY region, proving :func:`redact_secrets` (which every boundary runs
+    AFTER this pass) masks the pair's value side. Masking such a key would
+    rewrite the identifier (``some_password=X`` -> ``some_<redacted>=X``) --
+    eating a name operators need (honesty over silence) and breaking the very
+    key the shape pass uses to mask the actual credential ``X``. Anything
+    failing ANY condition -- a secret embedded in a larger unrecognized token
+    before ``=``/``:`` (``payload=x<secret>=v``), an overlong identifier the
+    shape grammar's bounded key scan cannot match, or any future shape-pass
+    limitation -- is masked unconditionally; see :func:`_mask_known_value` for
+    the condition-by-condition rationale.
+
+    The alternation is built with :func:`_variant_regex`, so a rendering's
+    hex-bearing escapes (``%XX`` percent, ``\\uXXXX``/``\\xXX`` JSON/repr)
+    match case-insensitively -- upper, lower, and per-escape MIXED spellings
+    all mask, with no spelling enumeration.
     """
     if not text:
         return text
@@ -705,5 +937,6 @@ def redact_known_secrets(
         variants |= _secret_value_variants(value)
     if not variants:
         return text
-    pattern = re.compile("|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True)))
-    return pattern.sub(_REDACTED, text)
+    alternation = "|".join(_variant_regex(v) for v in sorted(variants, key=len, reverse=True))
+    pattern = re.compile(r"(?:" + alternation + r")")
+    return pattern.sub(_mask_known_value, text)
