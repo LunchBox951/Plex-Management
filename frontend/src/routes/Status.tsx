@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { cn } from '../lib/cn'
 import {
   useCheckForUpdate,
   useEvict,
+  useForceResetCoordinator,
   useOpsDisk,
   useOpsHealth,
   useSettings,
@@ -17,6 +19,7 @@ import type {
 import { AdminEmptyState } from '../components/ui/AdminEmptyState'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
 import { Button } from '../components/ui/Button'
+import { Dialog } from '../components/ui/Dialog'
 import { Dot, type DotTone } from '../components/ui/Dot'
 import { SectionHeader } from '../components/ui/SectionHeader'
 import { adminRowPadding } from '../components/ui/adminStyles'
@@ -56,17 +59,27 @@ function UpdatePanel({
   status,
   checkPending,
   updatePending,
+  recoverPending,
   onCheck,
   onUpdate,
+  onRecover,
 }: {
   status: UpdateStatusResponse
   checkPending: boolean
   updatePending: boolean
+  recoverPending: boolean
   onCheck: () => void
   onUpdate: () => void
+  onRecover: () => void
 }) {
   const state = UPDATE_STATE[status.state]
   const operationActive = ['checking', 'draining', 'installing', 'rollback'].includes(status.state)
+  // The coordinator landed in a phase this build doesn't recognize (a
+  // version-skew/rollback window). Every update control fails closed until an
+  // admin re-anchors it — the north-star #1 button, surfaced only here (issue
+  // #354). Keyed off the honest backend blocker, so it appears exactly when the
+  // guard is the thing blocking the controls.
+  const wedged = status.blocker === 'coordinator_state_unknown'
   // waiting_for_window describes the AUTOMATIC policy. Keep the explicit
   // manual action available there because it intentionally bypasses that
   // window. waiting_for_idle means an install is already queued.
@@ -190,7 +203,28 @@ function UpdatePanel({
           {updateQueued ? 'Update queued' : 'Update when ready'}
         </Button>
       </div>
-      {!status.updater_available ? (
+      {wedged ? (
+        <div className="mt-4 rounded-lg border border-error/40 bg-error/5 px-3 py-3 text-xs">
+          <p className="font-semibold text-error">Coordinator in an unrecognized state</p>
+          <p className="mt-1 text-muted">
+            The updater can&apos;t check or install until this is cleared — usually the aftermath of
+            a version rollback. Recovering re-anchors it to idle so the controls work again; a
+            queued update is preserved for retry.
+          </p>
+          <div className="mt-3">
+            <Button
+              variant="danger"
+              size="sm"
+              loading={recoverPending}
+              disabled={recoverPending}
+              onClick={onRecover}
+            >
+              Recover coordinator
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {!status.updater_available && !wedged ? (
         <p className="mt-3 text-xs text-faint">
           Enable the automatic-update Compose profile to connect the scoped updater sidecar.
         </p>
@@ -619,6 +653,8 @@ export function Status() {
   const updates = useUpdateStatus()
   const checkForUpdate = useCheckForUpdate()
   const updateWhenReady = useUpdateWhenReady()
+  const forceReset = useForceResetCoordinator()
+  const [confirmRecover, setConfirmRecover] = useState(false)
   const { toast } = useToast()
 
   // Same two settings the pressure sweep itself reads (web/deps.py) — falls
@@ -704,6 +740,26 @@ export function Status() {
     }
   }
 
+  const onRecoverCoordinator = async () => {
+    try {
+      await forceReset.mutateAsync()
+      setConfirmRecover(false)
+      toast({
+        title: 'Coordinator recovered',
+        description: 'The updater is back to idle; checks and installs are available again.',
+        intent: 'success',
+      })
+    } catch (error) {
+      // Leave the dialog open on failure so the operator sees why (e.g. a 409
+      // if the phase healed on its own between opening and confirming).
+      toast({
+        title: 'Recovery failed',
+        description: (error as ApiError).message,
+        intent: 'error',
+      })
+    }
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-[1160px] flex-col gap-8 px-5 py-8 sm:px-8 lg:px-11">
       <AdminPageHeader
@@ -735,8 +791,10 @@ export function Status() {
               status={updates.data}
               checkPending={checkForUpdate.isPending}
               updatePending={updateWhenReady.isPending}
+              recoverPending={forceReset.isPending}
               onCheck={() => void onCheckForUpdate()}
               onUpdate={() => void onUpdateWhenReady()}
+              onRecover={() => setConfirmRecover(true)}
             />
           </>
         ) : updates.isLoading ? (
@@ -754,6 +812,39 @@ export function Status() {
           />
         )}
       </section>
+
+      <Dialog
+        open={confirmRecover}
+        onOpenChange={(next) => {
+          if (!next) setConfirmRecover(false)
+        }}
+        title="Recover the update coordinator?"
+        description="Re-anchors an unrecognized coordinator phase to idle so the updater controls work again. A queued update is preserved for retry; this is refused if the coordinator is already in a recognized state."
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-muted">
+            This clears a stuck coordinator state (typically left by a version rollback) and returns
+            the updater to idle. It does nothing if an update is genuinely in flight — the server
+            refuses unless the phase is truly unrecognized.
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setConfirmRecover(false)}
+              disabled={forceReset.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              loading={forceReset.isPending}
+              onClick={() => void onRecoverCoordinator()}
+            >
+              Recover coordinator
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <section className="flex flex-col gap-[10px]">
         <SectionHeader>Subsystems</SectionHeader>

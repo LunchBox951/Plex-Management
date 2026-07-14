@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
-from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
+from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.repositories.update_coordination import (
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
 )
@@ -851,6 +851,142 @@ async def test_acknowledge_outcome_rejects_unknown_phase_inside_the_lock(
     async with sessionmaker_() as session:
         lease = (await session.execute(select(MaintenanceLease))).scalar_one()
     assert lease.token_hash == hashlib.sha256(claim.lease.token.encode()).hexdigest()
+
+
+async def _audit_rows(sessionmaker_: SessionMaker) -> list[AuditLog]:
+    async with sessionmaker_() as session:
+        result = await session.execute(select(AuditLog).order_by(AuditLog.id))
+        return list(result.scalars().all())
+
+
+async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The in-app exit from the wedge (issue #354): an unrecognized phase that
+    would otherwise 409 every locked write forever is re-anchored to idle, and
+    the recovery is durably recorded (north star #3)."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    # A queued install must survive the reset for retry, exactly as expiry
+    # cleanup preserves it.
+    generation = await service.request_action(UpdateAction.install)
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing", available_digest="sha256:new")
+        )
+        await session.commit()
+
+    old_phase = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert old_phase == "future_installing"
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "install"
+    assert row.action_generation == generation
+    assert row.available_digest == "sha256:new"
+
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].action_type == "update.coordinator_phase_force_reset"
+    assert audit[0].entity_type == "update_coordinator"
+    assert audit[0].entity_id == 1
+    assert audit[0].user_id is None
+    assert audit[0].old_value == {"phase": "future_installing"}
+    assert audit[0].new_value == {"phase": "idle"}
+
+
+@pytest.mark.parametrize("known_phase", sorted(_KNOWN_COORDINATOR_PHASES))
+async def test_force_reset_refuses_every_known_phase_without_touching_state(
+    sessionmaker_: SessionMaker, known_phase: str
+) -> None:
+    """The footgun guard: force-reset acts ONLY on an unrecognized phase. A
+    known phase -- including a live draining/installing/rollback -- is a no-op
+    refusal, never a reset of an in-flight update, and is never audited."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_phase(sessionmaker_, known_phase)
+
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+
+    row = await _row(sessionmaker_)
+    assert row.phase == known_phase
+    assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_force_reset_clears_drain_lease_but_preserves_critical_work(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Re-anchoring to idle must not leave the row idle-with-a-live-drain-lease
+    (an inconsistent state that would keep blocking every claim until TTL); the
+    stale drain lease is cleared. Independent app-side critical work is left
+    entirely alone."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    critical = await service.acquire_critical("import", ttl=timedelta(minutes=5))
+    assert critical is not None
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    await _plant_phase(sessionmaker_, "future_installing")
+
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) == "future_installing"
+
+    async with sessionmaker_() as session:
+        leases = (await session.execute(select(MaintenanceLease))).scalars().all()
+    kinds = sorted(lease.kind for lease in leases)
+    assert kinds == ["critical"]
+    assert (await _row(sessionmaker_)).phase == "idle"
+
+
+async def test_force_reset_double_click_is_idempotent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A double-submit is honest: the first click recovers, the second finds a
+    now-known (idle) phase and refuses. Exactly one reset, one audit row."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_phase(sessionmaker_, "future_checking")
+
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) == "future_checking"
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+
+    assert (await _row(sessionmaker_)).phase == "idle"
+    assert len(await _audit_rows(sessionmaker_)) == 1
+
+
+async def test_concurrent_force_resets_have_exactly_one_winner(tmp_path: Path) -> None:
+    """The lock + in-lock re-check serialize recovery: two admins clicking at
+    once produce exactly one reset (and one audit row), never a double-reset or
+    a second reset clobbering a phase the first already re-anchored."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'reset.db'}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    first = UpdateCoordinationService(maker, token_factory=_tokens("first"))
+    second = UpdateCoordinationService(maker, token_factory=_tokens("second"))
+    await first.initialize()
+    try:
+        async with maker() as session:
+            await session.execute(
+                update(UpdateCoordinatorState)
+                .where(UpdateCoordinatorState.id == 1)
+                .values(phase="future_installing")
+            )
+            await session.commit()
+
+        results = await asyncio.gather(
+            first.force_reset_coordinator_phase(actor_user_id=None),
+            second.force_reset_coordinator_phase(actor_user_id=None),
+        )
+        assert sorted(r is None for r in results) == [False, True]
+        assert (await _row(maker)).phase == "idle"
+        async with maker() as session:
+            audit = (await session.execute(select(AuditLog))).scalars().all()
+        assert len(audit) == 1
+    finally:
+        await engine.dispose()
 
 
 async def test_concurrent_drain_claims_have_exactly_one_winner(tmp_path: Path) -> None:

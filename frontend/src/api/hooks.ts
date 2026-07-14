@@ -803,6 +803,25 @@ export function useUpdateWhenReady() {
   })
 }
 
+/** Break-glass recovery for a wedged coordinator (issue #354). When a
+ * version-skew/rollback window leaves the coordinator in a phase this app
+ * version doesn't recognize, every update control fails closed permanently;
+ * this re-anchors that unrecognized phase to idle so the loop is operable
+ * again — a button, never a terminal (north stars #1/#2). The backend refuses
+ * (409) unless the phase is genuinely unrecognized, so it can never reset a
+ * live update. */
+export function useForceResetCoordinator() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (): Promise<UpdateStatusResponse> =>
+      unwrap(await client.POST('/api/v1/updates/force-reset')),
+    onSuccess: (data) => {
+      qc.setQueryData(queryKeys.updateStatus, data)
+      void qc.invalidateQueries({ queryKey: queryKeys.updateStatus })
+    },
+  })
+}
+
 /* --------------------------------------------------------------------- ops -- */
 // ADR-0012 — Status page (health/reconcile/disk) + Logs page.
 

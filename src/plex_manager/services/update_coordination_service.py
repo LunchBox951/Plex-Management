@@ -30,6 +30,7 @@ from plex_manager.repositories.update_coordination import (
     SqlUpdateCoordinationRepository,
     UnknownCoordinatorPhaseError,
 )
+from plex_manager.services import audit_service
 
 __all__ = [
     "CoordinatorSnapshot",
@@ -331,6 +332,45 @@ class UpdateCoordinationService:
             )
             await session.commit()
             return released
+
+    async def force_reset_coordinator_phase(self, *, actor_user_id: int | None) -> str | None:
+        """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
+
+        The service face of the recovery path for the fail-closed unknown-phase
+        wedge (issue #354; see
+        :meth:`~plex_manager.repositories.update_coordination.SqlUpdateCoordinationRepository.force_reset_phase`
+        for the lock + re-check protocol and why it never touches a known phase).
+
+        The reset and its :class:`~plex_manager.models.AuditLog` row commit in ONE
+        transaction: a state change that silently reassigned the coordinator out
+        of an unknown phase with no durable record of WHO did it, or when, would
+        violate "honesty over silence" (north star #3). The audit row is written
+        only when a reset actually happened -- a no-op refusal (the phase was
+        already known) changes nothing and records nothing. ``actor_user_id`` is
+        ``None`` for an API-key / recovery-key admin, which has no Plex identity;
+        that honest null actor matches every other admin action taken via the
+        break-glass credential.
+
+        Returns the old unrecognized phase on reset, or ``None`` when the phase
+        was already known and nothing was changed.
+        """
+        async with self._sessionmaker() as session:
+            repo = SqlUpdateCoordinationRepository(session)
+            old_phase = await repo.force_reset_phase(self._now())
+            if old_phase is None:
+                return None
+            await audit_service.record(
+                session,
+                actor_user_id=actor_user_id,
+                action_type="update.coordinator_phase_force_reset",
+                entity_type="update_coordinator",
+                entity_id=1,
+                old_value={"phase": old_phase},
+                new_value={"phase": UpdatePhase.idle.value},
+                description="Force-reset an unrecognized update coordinator phase to idle.",
+            )
+            await session.commit()
+            return old_phase
 
     async def acknowledge_outcome(
         self,

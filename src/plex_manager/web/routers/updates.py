@@ -21,7 +21,7 @@ from plex_manager.services.update_coordination_service import (
     UpdateResult,
 )
 from plex_manager.services.update_policy import AutomaticUpdatePolicy, load_update_policy
-from plex_manager.web.deps import require_admin
+from plex_manager.web.deps import AuthContext, require_admin
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import current_build_id, publish_realtime
 from plex_manager.web.schemas import (
@@ -259,6 +259,42 @@ async def update_when_ready_endpoint(
     _body: Annotated[UpdateActionRequest | None, Body()] = None,
 ) -> UpdateStatusResponse:
     return await _request_action(UpdateAction.install, request, session, settings)
+
+
+@router.post("/force-reset")
+async def force_reset_endpoint(
+    request: Request,
+    auth: Annotated[AuthContext, Depends(require_admin)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _body: Annotated[UpdateActionRequest | None, Body()] = None,
+) -> UpdateStatusResponse:
+    """Break-glass recovery for a wedged/unrecognized coordinator phase (issue #354).
+
+    The in-app exit from the fail-closed unknown-phase guard (PR #346): once a
+    version-skew/rollback window leaves the coordinator row in a phase this app
+    version does not know, every locked coordination write 409s permanently and
+    the app can neither check, install, nor self-heal. This re-anchors that
+    unrecognized phase to ``idle`` -- audited, inside the coordination lock, and
+    only after re-reading the phase so a state that healed on its own is never
+    blindly clobbered (north stars #1/#2: a button, never a terminal).
+
+    Fail-closed against misuse: if the coordinator is in ANY known phase --
+    including a live ``draining`` / ``installing`` / ``rollback`` -- there is
+    nothing wedged to recover, so it refuses with a 409 rather than resetting an
+    in-flight update. That refusal is also the honest, idempotent answer to a
+    double-click: the second call finds the now-``idle`` phase already known.
+    """
+    coordinator = await _coordinator(request)
+    old_phase = await coordinator.force_reset_coordinator_phase(actor_user_id=auth.user_id)
+    if old_phase is None:
+        raise AppError(
+            status_code=409,
+            code="coordinator_phase_known",
+            message="The update coordinator is in a recognized state; there is nothing to recover.",
+        )
+    publish_realtime(request.app, ("updates",), reason="update_coordinator_force_reset")
+    return await _status(request, session, settings)
 
 
 async def _eligibility(

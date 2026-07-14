@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
-from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
+from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
@@ -1217,3 +1217,82 @@ async def test_automatic_idle_only_status_matches_claim_blocker(
     assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()[
         "state"
     ] == "update_available"
+
+
+async def test_force_reset_recovers_a_wedged_coordinator_via_admin_button(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """The in-app exit from the unknown-phase wedge (issue #354). Before the
+    reset every locked write 409s; the admin button re-anchors to idle, records
+    an audit row, and the previously-permanently-blocked controls work again --
+    correction without a terminal (north stars #1/#2)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="future_installing")
+        )
+        await session.commit()
+
+    # The wedge: the phase guard 409s the admin control.
+    assert (await client.post("/api/v1/updates/check-now", headers=_ADMIN)).status_code == 409
+    assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()["blocker"] == (
+        "coordinator_state_unknown"
+    )
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    assert (await coordinator.snapshot()).phase == "idle"
+
+    async with app.state.sessionmaker() as session:
+        audit = (await session.execute(select(AuditLog))).scalars().all()
+    assert len(audit) == 1
+    assert audit[0].action_type == "update.coordinator_phase_force_reset"
+    assert audit[0].old_value == {"phase": "future_installing"}
+
+    # The guard no longer fires: the control is reachable again.
+    assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()["blocker"] != (
+        "coordinator_state_unknown"
+    )
+
+
+async def test_force_reset_refuses_when_phase_is_already_known(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """No footgun: with the coordinator in a recognized (idle) state there is
+    nothing wedged to recover, so the endpoint refuses with a 409 and writes no
+    audit row. This is also the honest idempotent answer to a double-click."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    assert (await coordinator.snapshot()).phase == "idle"
+
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_phase_known"
+    assert (await coordinator.snapshot()).phase == "idle"
+    async with app.state.sessionmaker() as session:
+        assert (await session.execute(select(AuditLog))).scalars().all() == []
+
+
+async def test_force_reset_requires_admin(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    unauthenticated = await client.post("/api/v1/updates/force-reset")
+    assert unauthenticated.status_code == 401

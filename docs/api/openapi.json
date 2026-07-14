@@ -7194,6 +7194,64 @@
         ]
       }
     },
+    "/api/v1/updates/force-reset": {
+      "post": {
+        "description": "Break-glass recovery for a wedged/unrecognized coordinator phase (issue #354).\n\nThe in-app exit from the fail-closed unknown-phase guard (PR #346): once a\nversion-skew/rollback window leaves the coordinator row in a phase this app\nversion does not know, every locked coordination write 409s permanently and\nthe app can neither check, install, nor self-heal. This re-anchors that\nunrecognized phase to ``idle`` -- audited, inside the coordination lock, and\nonly after re-reading the phase so a state that healed on its own is never\nblindly clobbered (north stars #1/#2: a button, never a terminal).\n\nFail-closed against misuse: if the coordinator is in ANY known phase --\nincluding a live ``draining`` / ``installing`` / ``rollback`` -- there is\nnothing wedged to recover, so it refuses with a 409 rather than resetting an\nin-flight update. That refusal is also the honest, idempotent answer to a\ndouble-click: the second call finds the now-``idle`` phase already known.",
+        "operationId": "force_reset_endpoint_api_v1_updates_force_reset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UpdateActionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": " Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Force Reset Endpoint",
+        "tags": [
+          "updates"
+        ]
+      }
+    },
     "/api/v1/updates/status": {
       "get": {
         "operationId": "update_status_endpoint_api_v1_updates_status_get",

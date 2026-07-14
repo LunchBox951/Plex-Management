@@ -1455,6 +1455,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/updates/force-reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Force Reset Endpoint
+         * @description Break-glass recovery for a wedged/unrecognized coordinator phase (issue #354).
+         *
+         *     The in-app exit from the fail-closed unknown-phase guard (PR #346): once a
+         *     version-skew/rollback window leaves the coordinator row in a phase this app
+         *     version does not know, every locked coordination write 409s permanently and
+         *     the app can neither check, install, nor self-heal. This re-anchors that
+         *     unrecognized phase to ``idle`` -- audited, inside the coordination lock, and
+         *     only after re-reading the phase so a state that healed on its own is never
+         *     blindly clobbered (north stars #1/#2: a button, never a terminal).
+         *
+         *     Fail-closed against misuse: if the coordinator is in ANY known phase --
+         *     including a live ``draining`` / ``installing`` / ``rollback`` -- there is
+         *     nothing wedged to recover, so it refuses with a 409 rather than resetting an
+         *     in-flight update. That refusal is also the honest, idempotent answer to a
+         *     double-click: the second call finds the now-``idle`` phase already known.
+         */
+        post: operations["force_reset_endpoint_api_v1_updates_force_reset_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/updates/status": {
         parameters: {
             query?: never;
@@ -4994,6 +5028,39 @@ export interface operations {
         };
     };
     check_now_endpoint_api_v1_updates_check_now_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateActionRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    force_reset_endpoint_api_v1_updates_force_reset_post: {
         parameters: {
             query?: never;
             header?: never;
