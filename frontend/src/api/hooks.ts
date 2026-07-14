@@ -38,6 +38,7 @@ import type {
   SetupCompleteRequest,
   SetupStatusResponse,
   UpdateStatusResponse,
+  WithdrawSubscriptionResponse,
 } from './types'
 import {
   LOG_TAIL_POLL_INTERVAL_MS,
@@ -594,22 +595,23 @@ export function useCancelRequest() {
  * the collaborative counterpart to `useCancelRequest`. Removes only the
  * caller's participation — with other subscribers still attached this hands
  * ownership off instead of cancelling their shared request out from under
- * them; as the LAST participant it settles like a normal cancel. Always
- * `204 No Content` on success, so there is nothing to render — the row simply
- * drops out of the caller's next requests list. Invalidates requests + queue
- * + discover so every surface (including tiles, whose `can_mutate`/ownership
- * badge derive from the same rows) reflects the change at once.
+ * them; as the LAST participant it settles like a normal cancel. Returns the
+ * authoritative under-lock outcome (`{ settled }`) so the caller can word its
+ * success toast off what actually happened server-side rather than a stale
+ * click-time snapshot (#351); the caller's own row simply drops out of their
+ * next requests list. Invalidates requests + queue + discover so every surface
+ * (including tiles, whose `can_mutate`/ownership badge derive from the same
+ * rows) reflects the change at once.
  */
 export function useWithdrawSubscription() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (requestId: number): Promise<void> => {
-      ensureOk(
+    mutationFn: async (requestId: number): Promise<WithdrawSubscriptionResponse> =>
+      unwrap(
         await client.DELETE('/api/v1/requests/{request_id}/subscription', {
           params: { path: { request_id: requestId } },
         }),
-      )
-    },
+      ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: queryKeys.requests })
       void qc.invalidateQueries({ queryKey: queryKeys.queue })

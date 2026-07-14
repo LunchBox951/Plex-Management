@@ -933,9 +933,13 @@ export interface paths {
          *     already-terminal one. See ``correction_service.withdraw_participant``'s
          *     docstring for the full matrix.
          *
-         *     Always ``204 No Content`` on success -- the caller removed themselves, so
-         *     there is nothing of theirs left to render; the row simply drops out of
-         *     their next ``GET /requests``.
+         *     Returns ``{"settled": bool}`` -- the authoritative under-lock outcome
+         *     (:class:`correction_service.WithdrawOutcome`): ``True`` only for the
+         *     last-participant teardown that removed a torrent and settled the request
+         *     ``cancelled``, ``False`` for a mere removal/handoff. The caller keys its
+         *     success toast off THIS rather than a click-time snapshot a concurrent
+         *     join/withdraw or status advance could have made stale (#351); the caller's
+         *     own row still simply drops out of their next ``GET /requests``.
          */
         delete: operations["withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete"];
         options?: never;
@@ -3181,6 +3185,23 @@ export interface components {
              */
             state: "starting" | "ok" | "degraded" | "disabled" | "not_configured" | "error";
         };
+        /**
+         * WithdrawSubscriptionResponse
+         * @description Outcome of ``DELETE /requests/{id}/subscription`` (issue #314 / #351).
+         *
+         *     ``settled`` echoes ``correction_service.WithdrawOutcome.settled`` -- the value
+         *     the withdraw verb computes under the participant media lock. ``True`` iff this
+         *     was the last-participant teardown that reused ``cancel_request`` (its torrent
+         *     removed, the request settled ``cancelled``); ``False`` for a mere subscription
+         *     removal (an owner handoff to a remaining participant, or the last participant
+         *     leaving an already-settled row). The client keys its success toast off THIS
+         *     authoritative outcome rather than a click-time snapshot a concurrent
+         *     join/withdraw or status advance could have made stale (#351).
+         */
+        WithdrawSubscriptionResponse: {
+            /** Settled */
+            settled: boolean;
+        };
     };
     responses: never;
     parameters: never;
@@ -4380,11 +4401,13 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            204: {
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["WithdrawSubscriptionResponse"];
+                };
             };
             /** @description Request not found, or the caller does not subscribe to it */
             404: {

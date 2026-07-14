@@ -147,6 +147,18 @@ def test_withdraw_subscription_declares_404_409() -> None:
     assert _references_error_detail(responses["409"])
 
 
+def test_withdraw_subscription_200_declares_settled_outcome() -> None:
+    """#351: the withdraw endpoint is body-bearing (no longer 204) so the client can
+    key its success toast off the authoritative ``settled`` outcome."""
+    schema = _schema()
+    responses = _responses_for(schema, "/api/v1/requests/{request_id}/subscription", "delete")
+    assert "200" in responses, responses.keys()
+    ref = responses["200"]["content"]["application/json"]["schema"]["$ref"]
+    assert ref.endswith("/WithdrawSubscriptionResponse"), ref
+    props = schema["components"]["schemas"]["WithdrawSubscriptionResponse"]["properties"]
+    assert props["settled"]["type"] == "boolean"
+
+
 def test_withdraw_subscription_409_declares_service_not_configured() -> None:
     schema = _schema()
     responses = _responses_for(schema, "/api/v1/requests/{request_id}/subscription", "delete")

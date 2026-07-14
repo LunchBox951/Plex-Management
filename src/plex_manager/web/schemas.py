@@ -1334,6 +1334,24 @@ class RequestListResponse(BaseModel):
     requests: list[RequestResponse]
 
 
+class WithdrawSubscriptionResponse(BaseModel):
+    """Outcome of ``DELETE /requests/{id}/subscription`` (issue #314 / #351).
+
+    ``settled`` echoes ``correction_service.WithdrawOutcome.settled`` -- the value
+    the withdraw verb computes under the participant media lock. ``True`` iff this
+    was the last-participant teardown that reused ``cancel_request`` (its torrent
+    removed, the request settled ``cancelled``); ``False`` for a mere subscription
+    removal (an owner handoff to a remaining participant, or the last participant
+    leaving an already-settled row). The client keys its success toast off THIS
+    authoritative outcome rather than a click-time snapshot a concurrent
+    join/withdraw or status advance could have made stale (#351).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    settled: bool
+
+
 # --------------------------------------------------------------------------- #
 # Search preview (decision-engine dry run) — the headline endpoint
 # --------------------------------------------------------------------------- #

@@ -328,10 +328,10 @@ describe('useMarkFailed', () => {
 })
 
 describe('useWithdrawSubscription', () => {
-  it('DELETEs the subscription path and invalidates requests, queue, and discover', async () => {
+  it('DELETEs the subscription path, returns the settled outcome, and invalidates requests, queue, and discover', async () => {
     ;(client.DELETE as unknown as Mock).mockResolvedValue({
-      data: undefined,
-      response: { status: 204 },
+      data: { settled: true },
+      response: { status: 200 },
     })
 
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
@@ -340,7 +340,8 @@ describe('useWithdrawSubscription', () => {
     const { result } = renderHook(() => useWithdrawSubscription(), {
       wrapper: createWrapper(qc),
     })
-    await result.current.mutateAsync(42)
+    const outcome = await result.current.mutateAsync(42)
+    expect(outcome).toEqual({ settled: true })
 
     expect(client.DELETE).toHaveBeenCalledWith('/api/v1/requests/{request_id}/subscription', {
       params: { path: { request_id: 42 } },

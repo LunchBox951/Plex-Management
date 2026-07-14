@@ -225,6 +225,16 @@ const CANCELLABLE_STATUSES = new Set([
 ])
 
 /**
+ * The genuinely-settled (dedup-INACTIVE) request statuses. Mirrors the backend
+ * `request_service.SETTLED_REQUEST_STATUS_VALUES`. A sole participant withdrawing
+ * from one of these is a MERE removal (nothing torn down); a sole participant on a
+ * row that is NEITHER cancellable NOR settled (`import_blocked`/`partially_available`/
+ * `completed`, or a cancellable TV rollup with an already-imported season) is a
+ * REFUSAL server-side (409), never a mere removal — see `withdrawDialogCopy` (#349).
+ */
+const SETTLED_STATUSES = new Set(['available', 'failed', 'evicted', 'cancelled'])
+
+/**
  * Title + body copy for the Withdraw confirm dialog (issue #314, honesty fix
  * #335). Four cases, mirroring exactly what the backend `withdraw_participant`
  * verb does:
@@ -254,6 +264,7 @@ function withdrawDialogCopy(flags: {
   isOwner: boolean
   hasOtherParticipants: boolean
   willCancel: boolean
+  isSettled: boolean
 }): { title: string; body: string } {
   if (flags.willCancel) {
     return {
@@ -271,6 +282,17 @@ function withdrawDialogCopy(flags: {
           title: 'Remove from your requests?',
           body: 'The download continues for others who requested it.',
         }
+  }
+  if (!flags.isSettled) {
+    // Sole participant, but the row is ACTIVE and NOT safely cancellable
+    // (`import_blocked`/`partially_available`/`completed`, or a cancellable TV
+    // rollup whose season already imported): the backend REFUSES with a 409
+    // (`withdrawal_blocked_active_request` / `not_cancellable`) and removes
+    // nothing (#349). Say so honestly instead of promising a benign removal.
+    return {
+      title: "Can't withdraw yet",
+      body: "This request is still active and can't be withdrawn until it finishes or is resolved. Try again once it settles.",
+    }
   }
   return {
     title: 'Remove from your requests?',
@@ -547,12 +569,15 @@ export function TitleDetailModal({
   // and removes the download" there would LIE. `willCancel` mirrors the same
   // status predicate the backend keys on, captured at click time; `isOwner`
   // and `hasOtherParticipants` only pick hand-off vs continues-for-others vs
-  // mere-removal copy among the NON-destructive cases.
+  // mere-removal copy among the NON-destructive cases. `isSettled` distinguishes
+  // the two remaining sole-participant cases: a genuinely settled row (a real mere
+  // removal) from an active-non-cancellable one the backend REFUSES (#349).
   const [withdrawFor, setWithdrawFor] = useState<{
     requestId: number
     isOwner: boolean
     hasOtherParticipants: boolean
     willCancel: boolean
+    isSettled: boolean
   } | null>(null)
   // The confirm dialog for Re-acquire (issue #131) -- movie-only, force-creates a
   // fresh grabbable request even though the title still reads present in Plex.
@@ -959,19 +984,21 @@ export function TitleDetailModal({
 
   // Withdraw the caller's OWN subscription (issue #314) -- collaborative
   // self-removal. Never touches what a remaining owner/other subscriber wants.
-  // The success toast (issue #335) reflects what actually happened server-side:
-  // `willCancel`, captured on `withdrawFor` at click time, is true only for the
-  // destructive last-participant-on-active branch that reuses `cancel_request`
-  // (teardown + `cancelled`); every other success is a mere subscription
-  // removal. Keying the toast off bare `hasOtherParticipants` (the earlier bug)
-  // would falsely claim a cancel + download teardown when a SOLE participant
-  // withdrew from an already-settled row, where nothing was torn down.
+  // The success toast (issue #335 / #351) reflects what actually happened
+  // server-side: the mutation echoes `WithdrawOutcome.settled`, computed under
+  // the participant media lock -- `true` only for the destructive
+  // last-participant teardown that reused `cancel_request` (torrent removed,
+  // request `cancelled`), `false` for a mere removal/handoff. Keying off the
+  // returned outcome rather than the click-time `willCancel` snapshot closes the
+  // #351 lie: between snapshot and confirm a co-participant can join/withdraw or
+  // the status can advance, so the snapshot could promise a teardown the backend
+  // did not do (or miss one it did) -- the server outcome cannot.
   const runWithdraw = useCallback(async () => {
     if (!withdrawFor) return
     try {
-      await withdrawSubscription.mutateAsync(withdrawFor.requestId)
+      const outcome = await withdrawSubscription.mutateAsync(withdrawFor.requestId)
       toast({
-        title: withdrawFor.willCancel
+        title: outcome.settled
           ? 'Request cancelled and download removed'
           : 'Removed from your requests',
         intent: 'success',
@@ -1221,6 +1248,10 @@ export function TitleDetailModal({
             requestId: liveRequest.id,
             isOwner,
             hasOtherParticipants,
+            // Genuinely-settled row (mere removal) vs active-non-cancellable
+            // (backend refuses, #349) -- the two sole-participant, non-teardown
+            // cases the dialog copy must tell apart.
+            isSettled: SETTLED_STATUSES.has(liveRequest.status),
             // Mirror the backend teardown predicate exactly: it reuses
             // `cancel_request` only for a SOLE participant on a cancellable
             // status. A settled (or active-non-cancellable) row is a mere

@@ -60,7 +60,7 @@ async def _user_session(
     return user_id, {"plexmgr.session": token, "plexmgr.csrf": csrf}, {"X-CSRF-Token": csrf}
 
 
-async def test_withdraw_endpoint_subscriber_gets_204_and_drops_off_their_list(
+async def test_withdraw_endpoint_subscriber_gets_settled_false_and_drops_off_their_list(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
@@ -92,8 +92,9 @@ async def test_withdraw_endpoint_subscriber_gets_204_and_drops_off_their_list(
     response = await client.delete(
         f"/api/v1/requests/{request_id}/subscription", cookies=sub_cookies, headers=sub_headers
     )
-    assert response.status_code == 204
-    assert response.content == b""
+    assert response.status_code == 200
+    # Mere subscription removal -- others remain, nothing torn down (#351).
+    assert response.json() == {"settled": False}
 
     list_response = await client.get("/api/v1/requests", cookies=sub_cookies, headers=sub_headers)
     assert list_response.status_code == 200
@@ -105,6 +106,42 @@ async def test_withdraw_endpoint_subscriber_gets_204_and_drops_off_their_list(
     assert row is not None
     assert row.user_id == owner_id
     assert row.status == RequestStatus.downloading
+
+
+async def test_withdraw_endpoint_last_participant_teardown_returns_settled_true(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The sole participant on a cancellable row settles it (#351): a ``pending``
+    request with no active downloads is a pure-DB cancel (no qBittorrent needed),
+    and the endpoint echoes ``{"settled": true}`` so the client can word its toast
+    off the real outcome rather than a click-time snapshot."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    owner_id, owner_cookies, owner_headers = await _user_session(app, tag="owner")
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.pending,
+            user_id=owner_id,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
+        await session.commit()
+
+    response = await client.delete(
+        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+    )
+    assert response.status_code == 200
+    assert response.json() == {"settled": True}
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status == RequestStatus.cancelled  # torn down + settled
+    assert row.user_id is None  # ownerless, zero subscribers
 
 
 async def test_withdraw_endpoint_404_for_non_subscriber(
@@ -190,7 +227,9 @@ async def test_withdraw_endpoint_owner_with_others_hands_off_ownership(
     response = await client.delete(
         f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
     )
-    assert response.status_code == 204
+    assert response.status_code == 200
+    # Owner handoff to the remaining participant -- a mere removal, not a teardown.
+    assert response.json() == {"settled": False}
 
     get_response = await client.get(
         f"/api/v1/requests/{request_id}", cookies=other_cookies, headers=other_headers
