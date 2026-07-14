@@ -78,6 +78,24 @@ reasons rooted in the current code:
 - **C6 — Honest recovery when refresh itself fails.** A failed sidecar refresh
   must leave a working updater and a *visible, retryable* state, never a silent
   `failed` or a terminal-only escape (north star #3).
+- **C7 — Sidecar↔app version-skew tolerance (internal API forward
+  compatibility).** Any self-refresh advances the sidecar *ahead of* the app in
+  real states: a sidecar-only fix release, an app update that failed and rolled
+  back to N-1 while the sidecar already runs N+1, or a refresh racing the app's
+  own update. The internal updater API today rejects anything it does not
+  literally know: request models are fixed-literal with `extra="forbid"`
+  (`UpdateHeartbeatRequest` accepts exactly `phase: "checking"` +
+  `action_generation`, nothing more), so any new field, phase value, or
+  operation from a newer sidecar is rejected outright by an older app.
+  **Prerequisite:** before self-refresh ships, the internal updater API must be
+  made forward-compatible under one explicit rule — either (i) *expand-first*,
+  symmetric to ADR-0024's N/N-1 schema rule: a newer sidecar sends only what the
+  oldest-supported app accepts, and every new field/phase/operation lands
+  app-side (accepted, and persisted or ignored) at least one release before any
+  sidecar emits it; or (ii) a *capability handshake* in which the sidecar first
+  asks what the app accepts and degrades to the older vocabulary. A mechanism
+  that skips this prerequisite strands a refreshed sidecar unable to even report
+  liveness to the app it serves.
 
 ## Options considered
 
@@ -92,14 +110,18 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
 
 1. Gate: `state.json` empty (no install/rollback pending) and no lease held.
 2. The predecessor pulls the promoted image, writes a durable **self-refresh
-   record** to the shared state volume (operation id + temporary successor
-   name), and creates + starts the successor under that temporary name.
-3. The successor emits its coordinator heartbeat (`touch_updater`, carrying its
-   build id) and then wait-loops on the state `flock`. The heartbeat is an HTTP
-   write to the app's coordinator, **not** gated by the flock, so the successor
-   can prove liveness while the predecessor still holds the lock. Until it owns
-   the lock, the successor performs *no* Docker mutation and no coordination
-   operation beyond that liveness ping.
+   record** to the shared state volume (operation id, **its own container id**,
+   and the temporary successor name), and creates + starts the successor under
+   that temporary name.
+3. The successor starts in a new **successor-bootstrap mode**: it emits its
+   coordinator heartbeat (`touch_updater`, carrying its build identity — a new
+   protocol field, see below) **before** taking the state lock, then wait-loops
+   on the `flock`. This inverts today's startup order, in which the process
+   acquires the state lock fail-fast before doing anything. The heartbeat is an
+   HTTP write to the app's coordinator, **not** gated by the flock, so the
+   successor can prove liveness while the predecessor still holds the lock.
+   Until it owns the lock, the successor performs *no* Docker mutation and no
+   coordination operation beyond that liveness ping.
 4. The predecessor confirms, within a bounded window, a fresh heartbeat carrying
    the **new build id**. On timeout it removes the temp-named successor,
    surfaces a visible `updater_refresh_failed` state, and keeps running
@@ -107,8 +129,9 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
    — a user-initiated stop, so `restart: unless-stopped` does not resurrect it —
    and exits, releasing the flock.
 5. The successor acquires the flock, reconciles the self-refresh record, removes
-   the stopped predecessor, and renames itself to the canonical
-   `plex-manager-updater` name.
+   the stopped predecessor (matched by the **container id recorded in step 2**,
+   verified stopped — see the first-predecessor carve-out below), and renames
+   itself to the canonical `plex-manager-updater` name.
 
 - *C1:* **Never zero** — the predecessor stays fully functional until step 4's
   confirmed heartbeat, and a timeout leaves it running. **Never two claimants**
@@ -135,9 +158,10 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
   and takes no maintenance lease that could block app work; it never rewrites a
   coordinator phase, so it cannot create the unknown-phase wedge #346 guards.
 - *Authority cost (the real price).* The executor's allowlist must widen from
-  "one target" to "one target **plus self**." Mitigation: the successor/predecessor
-  operations are constrained to containers bearing the updater's *own* role label
-  + this operation id and the single known updater container name — still no
+  "one target" to "one target **plus self**." Mitigation: successor operations
+  are constrained to containers bearing the updater's *own* role label + this
+  operation id; the predecessor is matched only by the exact container id it
+  recorded about itself (see the first-predecessor carve-out below) — still no
   arbitrary target, but the socket-holder can now create/stop/remove a second
   (privileged) container. This is the honest downside and must be disclosed like
   ADR-0024 disclosed the socket mount.
@@ -158,8 +182,58 @@ pattern, adapted to our coordinator. The handoff is one ordered sequence:
   predecessor that never confirmed the heartbeat removes the orphan and surfaces
   `updater_refresh_failed`; a successor that finds the predecessor already
   stopped completes step 5 (remove + rename). Reconciliation is keyed on the
-  record's operation id, so a half-renamed or duplicate-named leftover is never
-  guessed at — unmatched containers are refused, not adopted.
+  record's operation id (successor side) and recorded container id (predecessor
+  side), so a half-renamed or duplicate-named leftover is never guessed at —
+  unmatched containers are refused, not adopted.
+
+#### New protocol and recovery surface (named work items)
+
+Option (a) is not implementable on today's wire contract and storage alone.
+Three additions are explicit work items, each subject to constraint C7's
+forward-compatibility rule:
+
+1. **Successor build identity in the heartbeat (protocol + storage).** Step 4's
+   confirmation — and the detect-and-surface companion — require the app to know
+   *which build* is heartbeating. Today `UpdateHeartbeatRequest` carries only
+   `phase` + `action_generation`, and `touch_updater` persists only
+   `updater_last_seen_at`/`phase`; no build identity exists anywhere in the
+   authenticated heartbeat or coordinator storage. The work item: add a sidecar
+   build identity to the heartbeat and persist it in coordinator status storage
+   (alongside `updater_last_seen_at`), exposed on the status surface. Per C7,
+   the app-side model must accept and store the field **at least one release
+   before** any sidecar sends it (`extra="forbid"` would otherwise reject the
+   newer sidecar's first ping) — which is exactly why the detect-and-surface
+   interim doubles as the expand step of this protocol change.
+2. **First-predecessor carve-out (allowlist).** The Compose-created `updater`
+   service carries **no** role label, and an operation id exists only at
+   runtime, so a label-only allowlist could never match the very first stale
+   sidecar for stop/remove — existing installs would still need a terminal for
+   refresh number one. The carve-out: the predecessor side of the swap is never
+   matched by label at all. The predecessor *stops itself* (step 4), and the
+   successor removes it by the **exact immutable container id the predecessor
+   recorded about itself** in the step-2 self-refresh record, cross-checked
+   against the canonical container name and the configured image repository
+   lineage, and verified stopped before removal. Security rationale: a
+   self-recorded container id persisted in the private state volume is a
+   *narrower* authority than any label or name match — it can only ever
+   designate the one container that wrote it. Successors are created *with*
+   role/operation labels (step 2), so the label discipline holds from the first
+   refresh onward; the carve-out applies only to predecessors, permanently,
+   because every predecessor was once a container whose labels this design
+   cannot assume.
+3. **Durable refresh-status record (failure persistence).** The coordinator
+   records only check/install outcomes today, and a surviving predecessor's
+   regular heartbeats would make the updater look perfectly healthy after a
+   failed refresh — a silent failure (north star #3). `updater_refresh_failed`
+   therefore needs its own persistence, **distinct from coordinator phase** to
+   preserve the no-phase-writes invariant: a small app-side refresh-status
+   record (at ADR altitude: last refresh outcome, bounded detail code,
+   from/to build identities, timestamp) written through a dedicated
+   authenticated internal endpoint (again under C7's expand-first rule), read
+   by the admin status surface, and mirrored crash-consistently by the
+   sidecar's own self-refresh record in the state volume. Ordinary heartbeats
+   never clear it; it is cleared only by a later successful refresh or an
+   explicit operator acknowledgement.
 
 ### (b) Main app recreates the sidecar
 
@@ -208,10 +282,11 @@ Keep recreation a host command and make the docs/UI louder about it.
 
 - **Violates C3 and north stars #1/#2 as a *sole* answer:** refresh stays a
   terminal command on the install host.
-- *But* one component of it is worth keeping regardless of mechanism: the app can
-  already detect the skew (its own build id vs. the sidecar heartbeat's build id)
-  and **surface it honestly** (north star #3). Detect-and-surface is adopted below
-  as a companion + pre-freeze interim, not as the resolution.
+- *But* one component of it is worth keeping regardless of mechanism: the app is
+  the natural place to detect the skew (its own build id vs. the sidecar's) and
+  **surface it honestly** (north star #3) — once the heartbeat carries a build
+  identity, which is itself a named work item under option (a). Detect-and-surface
+  is adopted below as a companion + pre-freeze interim, not as the resolution.
 
 ## Decision (recommended)
 
@@ -223,10 +298,16 @@ successor can emit before it holds the state flock); a coordinator-heartbeat
 liveness gate in place of the Docker healthcheck; the
 create→temp-name→stop→rename-to-canonical dance so Compose converges on the
 moving tag rather than regressing; `flock` + lease as the single-claimant
-guarantee; a self-only allowlist widening (own role label + this operation id +
-the one known updater container name, never an arbitrary target); and a
+guarantee; a self-only allowlist widening (labeled successors plus the
+id-pinned first-predecessor carve-out, never an arbitrary target); and a
 self-refresh that is gated to no-operation-in-flight and touches **no**
 coordinator phase, so it cannot wedge the machine PR #346 hardened.
+
+Adoption carries the explicit prerequisites named in option (a): the internal
+updater API must satisfy C7's forward-compatibility rule before any refreshed
+sidecar exists, the heartbeat must gain a persisted successor build identity,
+and refresh failure needs its own durable status record separate from
+coordinator phase. None of these exist on today's wire contract.
 
 Reject (b) (breaks the app/Docker boundary), (d) (non-functional on plain
 Compose), and (c) (more privileged surface than (a) for the same guarantee).
@@ -235,7 +316,8 @@ required companion and a safe pre-freeze interim.
 
 When self-refresh cannot complete, recovery is: on a successor that never
 heartbeats, the old-but-working predecessor keeps running and the app shows a
-visible, retryable `updater_refresh_failed` state; on a crash inside the
+visible, retryable `updater_refresh_failed` state (persisted in the durable
+refresh-status record, not in coordinator phase); on a crash inside the
 orphaned-temp-successor window, the survivor reconciles from the durable
 self-refresh record as specified in option (a). Because self-refresh
 never rewrites a phase, it cannot by itself produce the unknown-phase wedge; where
@@ -253,11 +335,15 @@ design note); this ADR references it generically rather than fixing its endpoint
   This is a real increase in the socket-holder's blast radius and must be
   disclosed in the Compose profile and operator docs exactly as ADR-0024 disclosed
   the socket mount.
+- The internal updater API acquires C7's forward-compatibility rule as a
+  release-process requirement for every release whose sidecar may outpace the
+  app — exactly as ADR-0024's N/N-1 migration rule became one for schemas.
 - A new self-recreation ladder acquires its own crash-recovery states and a new
   liveness gate distinct from the app's Docker health gate; both need dedicated
   tests (successor promotion, predecessor survival on failed successor, the
   orphaned-temp-successor window between create and rename, both-die seam,
-  no-two-claimants under flock, no-phase-wrote invariant).
+  no-two-claimants under flock, the id-pinned first-predecessor carve-out
+  refusing unmatched containers, no-phase-wrote invariant).
 - The `docker-compose.yml` `#299` limitation note is replaced by the automated
   path; the manual `up -d updater` command remains a documented fallback, not the
   primary route.
@@ -268,14 +354,21 @@ design note); this ADR references it generically rather than fixing its endpoint
 
 - **Full option (a): Large.** A second recreation ladder with its own durable
   stages and crash reconciliation, a coordinator-heartbeat liveness gate, the
-  self-only allowlist widening with its guard tests, and the Compose rename
-  convergence — plus interaction tests against the #346 phase guard and the #354
-  recovery action. This is new privileged design surface and should **not** be
-  rushed to land before the **Jul 24** freeze.
-- **Detect-and-surface interim (companion): Small–Medium.** Compare app build id
-  to the sidecar heartbeat build id, expose a truthful "updater running older
-  image" status, and keep the documented one-command refresh. Safe to land before
-  the freeze; it adds no privileged authority.
+  self-only allowlist widening (labeled successors + the id-pinned
+  first-predecessor carve-out) with its guard tests, the C7
+  forward-compatibility rule on the internal updater API, the durable
+  refresh-status record, and the Compose rename convergence — plus interaction
+  tests against the #346 phase guard and the #354 recovery action. This is new
+  privileged design surface and should **not** be rushed to land before the
+  **Jul 24** freeze.
+- **Detect-and-surface interim (companion): Small–Medium.** This interim *is*
+  the expand step C7 requires: add the sidecar build identity to the
+  authenticated heartbeat and coordinator status storage (app-side accept +
+  persist first, sidecar sending it thereafter), compare it to the app's own
+  build id, expose a truthful "updater running older image" status, and keep
+  the documented one-command refresh. Safe to land before the freeze; it adds
+  no privileged authority and pre-pays the protocol change the full ladder
+  depends on.
 
 **Recommendation for the freeze:** accept this ADR as `Proposed` now, ship the
 Small–Medium detect-and-surface interim before Jul 24 if desired, and schedule the
