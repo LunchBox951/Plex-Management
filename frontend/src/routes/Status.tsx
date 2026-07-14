@@ -423,7 +423,7 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
   const tone: DotTone =
     watchlist.state === 'ok'
       ? 'ok'
-      : watchlist.state === 'degraded'
+      : watchlist.state === 'degraded' || watchlist.state === 'probe_failed'
         ? 'warn'
         : watchlist.state === 'error'
           ? 'error'

@@ -60,6 +60,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "pip-audit>=2.7",
     "pre-commit>=3.7",
+    # tests/test_promote_workflow.py parses the promote workflow YAML directly,
+    # so pyyaml is a declared test dep here rather than leaned on as pre-commit's
+    # transitive install; the stubs keep pyright --strict happy on safe_load.
+    "pyyaml>=6.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]

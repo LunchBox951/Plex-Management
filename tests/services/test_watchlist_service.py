@@ -5,8 +5,8 @@ from typing import cast
 import httpx
 from sqlalchemy import Table, select
 
-from plex_manager.adapters.plex.oauth import PlexTvClient
-from plex_manager.models import SeasonRequest, User, WatchlistItem
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
+from plex_manager.models import SeasonRequest, Setting, User, WatchlistItem
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.watchlist import WatchlistEntry
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -175,6 +175,93 @@ async def test_sync_expands_foreign_shared_tv_request_to_whole_show(
     assert {season.season_number for season in seasons} == {1, 2, 3}
 
 
+async def _seed_snapshot_row(sessionmaker_: SessionMaker) -> None:
+    async with sessionmaker_() as session:
+        user = User(username="watcher", encrypted_plex_token="token")  # noqa: S106
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=603, media_type="movie"))
+        await session.commit()
+
+
+async def _snapshot_count(sessionmaker_: SessionMaker) -> int:
+    async with sessionmaker_() as session:
+        return len(list((await session.execute(WatchlistItem.__table__.select())).all()))
+
+
+async def _set_setting(sessionmaker_: SessionMaker, key: str, value: str) -> None:
+    async with sessionmaker_() as session:
+        session.add(Setting(key=key, value=value))
+        await session.commit()
+
+
+async def test_guarded_clear_refuses_when_plex_url_configured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The atomic guard: a non-empty ``plex_url`` settings row means "possibly
+    configured", so the single-statement delete must refuse (return 0) and
+    leave every snapshot row in place (#327, Codex round 3 on PR #360)."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_url", "http://plex.example.com:32400")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 0
+    assert await _snapshot_count(sessionmaker_) == 1
+
+
+async def test_guarded_clear_refuses_when_machine_identifier_cached(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 0
+    assert await _snapshot_count(sessionmaker_) == 1
+
+
+async def test_guarded_clear_proceeds_when_unconfigured(sessionmaker_: SessionMaker) -> None:
+    """Empty-string guard values are what an explicit clear-to-"" PUT leaves
+    behind; they must read as unconfigured (the delete proceeds), matching the
+    resolution helper's own falsy-value semantics."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "plex_url", "")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 1
+    assert await _snapshot_count(sessionmaker_) == 0
+
+
+async def test_guarded_clear_ignores_unrelated_settings_rows(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Only the caller's guard keys hold the delete hostage: an unrelated
+    non-empty settings row (e.g. a token-only remnant, which can never resolve
+    an identity by itself) must not block the unconfigured clear."""
+    await _seed_snapshot_row(sessionmaker_)
+    await _set_setting(sessionmaker_, "tmdb_api_key_hint", "present")
+
+    async with sessionmaker_() as session:
+        cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+            session, guard_keys=("plex_machine_identifier", "plex_url")
+        )
+        await session.commit()
+    assert cleared == 1
+    assert await _snapshot_count(sessionmaker_) == 0
+
+
 def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
     status = watchlist_service.WatchlistWorkerStatus()
     assert status.state == "starting"
@@ -241,6 +328,51 @@ def test_worker_status_distinguishes_success_degraded_error_and_skips() -> None:
     status.mark_skipped("not_configured")
     assert status.state == "not_configured"
     assert status.last_ok_at == first_ok
+
+
+def test_worker_status_probe_failed_is_distinct_from_not_configured_and_error() -> None:
+    """A configured-but-unreachable server must surface its own state -- never
+    ``not_configured`` (that would mislabel an outage as an absence) and never
+    ``error`` (that state is reserved for an exception that escaped the tick
+    entirely) (issue #327)."""
+    status = watchlist_service.WatchlistWorkerStatus()
+    status.mark_started()
+    status.mark_probe_failed(PlexVerifyError("server_unreachable_from_backend", "unreachable"))
+    assert status.state == "probe_failed"
+    assert status.state != "not_configured"
+    assert status.state != "error"
+    assert status.last_error_type == "PlexVerifyError"
+    assert status.last_error_at is not None
+    assert status.skipped_users == 0
+
+    # A probe can also fail on a MID-TICK re-resolution, after the per-user
+    # revalidation/cleanup pass already skipped users: like mark_skipped, a
+    # caller-supplied count must survive so the pass's work stays visible on
+    # /health alongside the probe failure (issue #327 facet 3).
+    status.mark_started()
+    status.mark_probe_failed(
+        PlexVerifyError("server_unreachable_from_backend", "unreachable"), skipped_users=2
+    )
+    assert status.state == "probe_failed"
+    assert status.skipped_users == 2
+
+
+def test_mark_skipped_preserves_caller_supplied_skipped_users() -> None:
+    """The TMDB-not-configured gate runs AFTER the stale-user cleanup pass, so
+    it must be able to report that pass's skip/cleanup count instead of the
+    default zero -- a tick that cleared N stale snapshots must not report a
+    clean ``not_configured`` with no trace of that cleanup (issue #327 facet
+    3)."""
+    status = watchlist_service.WatchlistWorkerStatus()
+    status.mark_started()
+    status.mark_skipped("not_configured", skipped_users=3)
+    assert status.state == "not_configured"
+    assert status.skipped_users == 3
+
+    # The default (no cleanup ran before the skip) still zeroes it.
+    status.mark_started()
+    status.mark_skipped("disabled")
+    assert status.skipped_users == 0
 
 
 async def test_revalidate_authorized_when_account_reaches_configured_server() -> None:

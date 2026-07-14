@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Final, Literal, cast
@@ -109,6 +110,7 @@ from plex_manager.web.events import (
     warn_if_multiworker,
 )
 from plex_manager.web.middleware import CriticalMutationMiddleware, SetupGuardMiddleware
+from plex_manager.web.routers import artwork as artwork_router
 from plex_manager.web.routers import auth as auth_router
 from plex_manager.web.routers import blocklist as blocklist_router
 from plex_manager.web.routers import discovery as discovery_router
@@ -205,27 +207,61 @@ _RECONCILE_INTERVAL_SECONDS = 15.0
 _AUTOGRAB_INTERVAL_SECONDS = AUTO_GRAB_INTERVAL_SECONDS_DEFAULT
 
 
+@dataclass(frozen=True)
+class _ServerIdentityResolution:
+    """Tri-state result of resolving the configured Plex server's identifier.
+
+    ``machine_identifier`` is set only on success (cached, or a live probe that
+    succeeded). When it is ``None``, ``probe_error`` distinguishes WHY -- the
+    distinction this whole helper exists for (issue #327):
+
+    * ``probe_error`` unset: truly unconfigured. No ``plex_url``/``plex_token``
+      AND no cached identifier -- there is nothing to authorize watchlist
+      tokens against, and any existing snapshot rows belong to a server the
+      operator has explicitly walked away from (safe to clear).
+    * ``probe_error`` set: the server IS configured but the live ``/identity``
+      probe failed. This is an outage, not an absence -- existing snapshot
+      rows must be RETAINED (a transient failure must never drop eviction
+      protection) and the worker status must report a distinct state, never
+      ``not_configured`` (north star #3: surface states honestly).
+    """
+
+    machine_identifier: str | None
+    probe_error: PlexVerifyError | None = None
+
+    def __post_init__(self) -> None:
+        # Pin the invariant every consumer's branch ordering relies on: a probe
+        # error means the identifier could NOT be resolved, so the two legs are
+        # mutually exclusive and "probe_error first, then identifier" checks
+        # can never mask a successful resolution.
+        if self.probe_error is not None and self.machine_identifier is not None:
+            raise ValueError(
+                "_ServerIdentityResolution cannot carry both a machine identifier and a probe error"
+            )
+
+
 async def _resolve_watchlist_server_identity(
     store: SettingsStore, plex_tv: PlexTvClient
-) -> str | None:
-    """Resolve the configured Plex server's machine identifier, or ``None``.
+) -> _ServerIdentityResolution:
+    """Resolve the configured Plex server's machine identifier, tri-state.
 
     Mirrors ``auth._post_init_access``: prefer the identifier cached at setup
     (:data:`PLEX_MACHINE_ID_SETTING`), else probe the configured server's
-    ``/identity`` with its stored service credentials. Returns ``None`` when no
-    Plex server is configured (nothing to authorize against) or the probe fails.
+    ``/identity`` with its stored service credentials. See
+    :class:`_ServerIdentityResolution` for how callers must read the result.
     """
     machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
     if machine_identifier:
-        return machine_identifier
+        return _ServerIdentityResolution(machine_identifier)
     plex_url = await store.get("plex_url")
     plex_token = await store.get("plex_token")
     if not plex_url or not plex_token:
-        return None
+        return _ServerIdentityResolution(None)
     try:
-        return await plex_tv.fetch_server_identity(plex_url, plex_token)
-    except PlexVerifyError:
-        return None
+        identifier = await plex_tv.fetch_server_identity(plex_url, plex_token)
+    except PlexVerifyError as exc:
+        return _ServerIdentityResolution(None, probe_error=exc)
+    return _ServerIdentityResolution(identifier)
 
 
 async def _watchlist_sync_once(app: FastAPI) -> int:
@@ -271,12 +307,73 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         # the identifier already existed (nothing else has been written).
         await session.commit()
         plex_tv = PlexTvClient(client, client_identifier=client_identifier)
-        machine_identifier = await _resolve_watchlist_server_identity(
-            SettingsStore(session), plex_tv
-        )
+        resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        if resolution.probe_error is not None:
+            # Configured but unreachable -- an outage, not an absence. Retain
+            # the existing snapshot (clearing it here would drop eviction
+            # protection for a transient failure) and report a distinct state
+            # so this is never mislabeled as "not configured" (issue #327,
+            # north star #3).
+            status.mark_probe_failed(resolution.probe_error)
+            return 0
+        machine_identifier = resolution.machine_identifier
         if machine_identifier is None:
-            # No configured server to authorize tokens against -- syncing anyone
-            # would protect titles on behalf of accounts we cannot verify.
+            # Truly unconfigured: no url/token AND no cached identifier, so
+            # there is nothing to authorize tokens against. The operator has
+            # explicitly walked away from Plex, so any existing snapshot rows
+            # belong to a server we can never revalidate against again --
+            # clear them so they stop protecting titles from eviction (issue
+            # #327 facet 2). This is the ONLY branch of identity resolution
+            # that clears snapshots; a probe failure above never does.
+            #
+            # Re-confirm before the destructive clear -- for STATUS honesty,
+            # not for safety: a concurrent settings PUT may have reconfigured
+            # Plex since the read above, and this tri-state re-read lets the
+            # tick report that honestly (a mid-gap reconfigure whose live
+            # probe fails AT THIS INSTANT is configured-but-unreachable, so
+            # it must surface probe_failed, never fall through toward the
+            # clear as if absent). Safety does NOT rest on this read: it is
+            # itself racy (any read-then-delete is -- a PUT can commit in the
+            # await between them), which is why the delete below carries its
+            # own atomic predicate.
+            reconfirm = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+            if reconfirm.probe_error is not None:
+                _logger.info(
+                    "watchlist server was reconfigured just before the "
+                    "unconfigured-state snapshot clear, but its probe failed; "
+                    "retaining the snapshot and reporting the probe failure"
+                )
+                status.mark_probe_failed(reconfirm.probe_error)
+                return 0
+            if reconfirm.machine_identifier is not None:
+                _logger.info(
+                    "watchlist server was reconfigured just before the "
+                    "unconfigured-state snapshot clear; retaining the snapshot "
+                    "for re-evaluation against the new server"
+                )
+                status.mark_skipped("not_configured")
+                return 0
+            # The clear itself is a single DELETE predicated on the settings
+            # rows (NOT EXISTS a non-empty plex_machine_identifier/plex_url),
+            # so the DATABASE refuses it if a concurrent PUT committed a
+            # configuration first -- the TOCTOU family is closed by
+            # construction, not by shrinking windows (Codex round 3 on #360).
+            # A PUT that commits after the delete instead is caught by its own
+            # settings-change wake (round 2): the immediate next tick re-syncs,
+            # a one-tick gap identical to any ordinary re-sync. plex_url is the
+            # guard for BOTH url+token halves -- the token column is encrypted
+            # at rest so SQL cannot honestly test it, and a token without a url
+            # can never resolve an identity anyway (see the service docstring).
+            cleared = await watchlist_service.clear_snapshots_unless_settings_present(
+                session, guard_keys=(PLEX_MACHINE_ID_SETTING, "plex_url")
+            )
+            await session.commit()
+            if cleared:
+                _logger.info(
+                    "watchlist server unconfigured; cleared %s stale snapshot "
+                    "row(s) so they no longer protect titles from eviction",
+                    cleared,
+                )
             status.mark_skipped("not_configured")
             return 0
         users = await watchlist_service.list_sync_users(session)
@@ -324,14 +421,37 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
                 # inside clear_user_snapshot skips the delete if their stored token
                 # changed. Either way the rows are retained and the next tick
                 # re-evaluates against the current state.
-                current_identity = await _resolve_watchlist_server_identity(
+                current_resolution = await _resolve_watchlist_server_identity(
                     SettingsStore(session), plex_tv
                 )
-                if current_identity != machine_identifier:
+                if current_resolution.probe_error is not None:
+                    # Configured but unreachable AT THIS INSTANT (an upgraded
+                    # install with no cached identifier re-probes live on every
+                    # resolution). Retain this user's snapshot and end the tick
+                    # as probe_failed -- collapsing this into the "identity
+                    # changed" retain below would let the tick exit through a
+                    # later gate (e.g. TMDB-not-configured) without ever
+                    # surfacing the outage on /health. Aborting is not lossy:
+                    # every later identity re-resolution this tick would hit
+                    # the same failing probe, so no reachable work is skipped.
+                    # skipped_users (this user included) rides along so the
+                    # cleanup pass's work so far stays visible (facet 3).
                     _logger.info(
                         "watchlist token for user_id=%s revalidated stale, but the "
-                        "configured server changed since; retaining the snapshot for "
-                        "re-evaluation against the new server",
+                        "configured server's identity probe failed during the "
+                        "delete guard; retaining the snapshot and ending the tick "
+                        "as probe_failed",
+                        safe_int(user.id),
+                    )
+                    status.mark_probe_failed(
+                        current_resolution.probe_error, skipped_users=skipped_users
+                    )
+                    return 0
+                if current_resolution.machine_identifier != machine_identifier:
+                    _logger.info(
+                        "watchlist token for user_id=%s revalidated stale, but the "
+                        "configured server identity changed since (repointed or "
+                        "unconfigured); retaining the snapshot for re-evaluation",
                         safe_int(user.id),
                     )
                     continue
@@ -366,7 +486,11 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
             tmdb = await resolve_tmdb(app.state, session, client)
         except ServiceNotConfiguredError:
             # Stale cleanup already ran above; only request creation needs TMDB.
-            status.mark_skipped("not_configured")
+            # Preserve (rather than zero) the skipped-user count accumulated by
+            # that cleanup pass -- a tick that cleared N stale-after-repoint
+            # snapshots must not report a clean ``not_configured`` with no
+            # trace of that cleanup on /health (issue #327 facet 3).
+            status.mark_skipped("not_configured", skipped_users=skipped_users)
             return 0
         library = await get_library_optional(session, client)
         # Final identity re-check before the sync pass: ``authorized`` was vetted
@@ -377,7 +501,26 @@ async def _watchlist_sync_once(app: FastAPI) -> int:
         # entirely. The repoint itself wakes this worker, so re-authorization
         # against the new identity is imminent, and the skipped users keep the
         # tick honestly "degraded" rather than silently ok.
-        current_identity = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        final_resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+    if final_resolution.probe_error is not None:
+        # Configured but unreachable at the final re-check (an upgraded install
+        # with no cached identifier re-probes live here). Reporting this as the
+        # generic "server changed" degraded tick below would surface error=None
+        # -- and with no authorized users it would fall through and mark the
+        # tick ok. Surface the outage as probe_failed instead; authorized users
+        # whose sync pass did not run count as skipped, same as the "changed"
+        # branch below.
+        _logger.info(
+            "configured Plex server's identity probe failed at the final pre-sync "
+            "re-check (%s users authorized); skipping this sync pass and reporting "
+            "probe_failed",
+            len(authorized),
+        )
+        status.mark_probe_failed(
+            final_resolution.probe_error, skipped_users=skipped_users + len(authorized)
+        )
+        return 0
+    current_identity = final_resolution.machine_identifier
     if authorized and current_identity != machine_identifier:
         _logger.info(
             "configured Plex server changed mid-tick (%s users authorized against "
@@ -1648,6 +1791,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router)
     app.include_router(settings_router.router)
     app.include_router(discovery_router.router)
+    app.include_router(artwork_router.router)
     app.include_router(events_router.router)
     app.include_router(requests_router.router)
     app.include_router(search_preview_router.router)
