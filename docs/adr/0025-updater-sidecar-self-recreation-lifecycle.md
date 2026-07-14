@@ -144,19 +144,28 @@ nonce'd liveness ping, then a post-lock acknowledgement.
    acknowledgement** into the self-refresh record. The predecessor watches for
    that ack within a bounded window: on ack, it stops itself **through the
    Engine API** — a user-initiated stop, so `restart: unless-stopped` does not
-   resurrect it — and exits. On timeout, it **re-acquires the flock**, removes
-   the temp successor, surfaces `updater_refresh_failed`, and resumes as the
-   sole updater.
+   resurrect it — and exits. On timeout, it first **stops and removes the
+   exact temp successor** — the container id recorded in step 2; an
+   Engine-API operation that is *not* flock-gated, and that releases the
+   flock by construction if a successor that took the lock wedged before
+   acking — and only then re-acquires the flock, surfaces
+   `updater_refresh_failed`, and resumes as the sole updater.
+   Removal-before-reacquire is safe because its target is only ever the
+   recorded temp container id, never a canonical updater.
 6. The successor removes the stopped predecessor (matched by the **container id
    recorded in step 2**, verified stopped — see the first-predecessor carve-out
    below) and renames itself to the canonical `plex-manager-updater` name.
 
 - *C1:* Claimancy **is** the `flock`, which never has two holders. **Never
   zero functioning:** the predecessor is lock-holder through step 4 and stays
-  alive as a watcher through step 5's handoff window, re-acquiring the lock if
-  the successor fails to ack — so a successor that pings once and crashes
-  before taking the lock cannot orphan the deployment; the predecessor
-  reclaims and continues. The pre-lock ping is deliberately **not** sufficient
+  alive as a watcher through step 5's handoff window; on ack timeout it
+  removes the recorded temp successor **before** re-acquiring the lock —
+  removal is an Engine-API action, not flock-gated, so even a successor that
+  acquired the flock and then wedged before acking cannot deadlock the
+  watcher (killing it releases the flock by construction). A successor that
+  pings once and crashes before taking the lock likewise cannot orphan the
+  deployment; the predecessor reclaims and continues. The pre-lock ping is
+  deliberately **not** sufficient
   for the predecessor to stop: the stop gate is the durable post-lock ack,
   which proves the successor completed its entire bootstrap into the driving
   loop (start, config replay validated by an authenticated coordinator write,
@@ -222,10 +231,12 @@ nonce'd liveness ping, then a post-lock acknowledgement.
   predecessor that never confirmed ping or ack removes the orphan and surfaces
   `updater_refresh_failed`; a successor that finds the predecessor already
   stopped completes step 6 (remove + rename). The step-4→5 seam — flock
-  released, ack not yet written — is symmetric by design: predecessor and
-  restarted successor may race for the lock, and **whoever holds it drives**
-  (the predecessor treats "I re-acquired it" as a failed handoff; the successor
-  treats "I acquired it" as license to ack and proceed). Reconciliation is
+  released, ack not yet written — resolves through the **record**, not the
+  lock alone: a successor that acquires the flock acks and proceeds; a
+  predecessor whose ack window expires re-checks the record once for a late
+  ack, then follows step 5's timeout path — remove the recorded temp
+  container id first (not flock-gated; releases any wedged hold), re-acquire
+  the lock second, and treat the handoff as failed. Reconciliation is
   keyed on the record's operation id + nonce (successor side) and recorded
   container id (predecessor side), so a half-renamed leftover, a rebuild with
   a colliding build id, or an orphan from a prior attempt is never guessed at —
@@ -501,6 +512,30 @@ change the option choice:
    marker interacts with work item 2's replay allowlist (it must be added at
    create and must not survive into the successor's own future self-refresh
    capture).
+3. **Digest-based skew detection.** Codex review of PR #355 observed that
+   detect-and-surface should compare image **digests**, not only
+   `PLEX_MANAGER_BUILD_ID`: same-SHA rebuilds share a build id while differing
+   in bytes. The implementation should pick the digest (or digest + build id)
+   as the staleness signal, which also feeds work item 1's field choice.
+4. **Image-owned metadata carve-out in config replay.** Codex review of
+   PR #355 observed that work item 2's clone must advance image-owned metadata
+   with the *new* image — parallel to the app ladder's `_IMAGE_OWNED_ENV` and
+   `com.docker.compose.image` handling in `recreation.py` — or the successor
+   would report the predecessor's old build/image metadata as its own.
+5. **Record-before-start ordering for the successor id.** Codex review of
+   PR #355 observed that Docker returns the container id at *create*, so the
+   self-refresh record should be extended with the successor id **before**
+   the container is started (create → record → start), closing a
+   spurious-bootstrap race where a started successor finds no record naming
+   it. Step 2's "extends the record … returned by the create call" should be
+   implemented with that ordering.
+6. **Gate predicate: coordinator phase + requested action.** Codex review of
+   PR #355 observed that step 1's `state.json`-empty + no-lease gate
+   under-approximates C5: a check can be in flight holding neither state file
+   nor lease, and a queued `requested_action=install` may predate any lease.
+   The gate should additionally require an idle coordinator phase and
+   `requested_action == none`; the exact predicate is chosen against the #346
+   phase vocabulary at implementation time.
 
 ## Alternatives considered
 
