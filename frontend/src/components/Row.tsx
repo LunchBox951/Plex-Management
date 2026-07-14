@@ -241,6 +241,7 @@ export function Row({
                     <PosterCard
                       title={item.title}
                       year={item.year ?? null}
+                      plexPosterUrl={item.plex_poster_url ?? null}
                       posterUrl={item.poster_url ?? null}
                       seed={item.tmdb_id}
                       // Real tiles get the native focusable trigger. Clones omit

@@ -709,6 +709,28 @@
             ],
             "title": "Overview"
           },
+          "plex_backdrop_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Backdrop Url"
+          },
+          "plex_poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plex Poster Url"
+          },
           "poster_url": {
             "anyOf": [
               {
@@ -4265,6 +4287,86 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/artwork/plex/{media_type}/{tmdb_id}/{kind}": {
+      "get": {
+        "description": "Proxy a library item's Plex-native ``poster``/``background`` image.\n\n404 (so the browser falls back to TMDB) whenever Plex is unconfigured, the\ntitle is not in the library, it has no artwork of that kind, or Plex is\ndown/rejects the token \u2014 never a 500 that would break the tile.",
+        "operationId": "plex_artwork_api_v1_artwork_plex__media_type___tmdb_id___kind__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "media_type",
+            "required": true,
+            "schema": {
+              "enum": [
+                "movie",
+                "tv"
+              ],
+              "title": "Media Type",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tmdb_id",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "title": "Tmdb Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "poster",
+                "background"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "image/*": {}
+            },
+            "description": "The Plex-native artwork image."
+          },
+          "404": {
+            "description": "No Plex artwork for this item; the client falls back to TMDB."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "Plex Artwork",
+        "tags": [
+          "artwork"
+        ]
+      }
+    },
     "/api/v1/auth/api-key": {
       "post": {
         "description": "Exchange a valid ``X-Api-Key`` for the SAME HTTP-only session cookie.\n\nThe recovery / automation key (ADR-0005, ADR-0016) is the terminal-free\nbreak-glass credential that authenticates when plex.tv is unreachable. Before\nthis endpoint the browser had to keep the raw key in JS-readable\n``localStorage`` so the break-glass path survived a reload \u2014 exactly the\ncleartext-storage pattern CodeQL #263 flags. Exchanging the key ONCE for the\nsame cookie the Plex sign-in flow mints means the key never needs JS-readable\nstorage: the resulting session is an admin-authority recovery session with no\nPlex identity (``auth_sessions.user_id`` NULL), and every later request\nauthenticates by the HTTP-only cookie exactly like a Plex session does.\n\nThe key is validated against the stored ``SystemSettings.app_api_key`` with a\nconstant-time compare \u2014 accepting a Plex session cookie here (as\n``require_api_key`` would) is deliberately NOT done: that would let any\nsigned-in NON-admin mint an ADMIN recovery session. Only a caller who proves\nthe recovery key gets one.",
