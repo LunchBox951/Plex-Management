@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
@@ -12,6 +13,7 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    UnknownCoordinatorPhaseError,
     UpdateAction,
     UpdateCoordinationService,
     UpdateOperationInProgressError,
@@ -66,6 +68,25 @@ async def _coordinator(request: Request) -> UpdateCoordinationService:
             status_code=503,
             code="updater_coordinator_unavailable",
             message="The update coordinator is not available.",
+        ) from exc
+
+
+async def _guard_unknown_phase[T](operation: Awaitable[T]) -> T:
+    """Translate a locked repo write's fail-closed unknown-phase refusal to a 409.
+
+    Each endpoint below already fast-paths a 409 from its own pre-call
+    ``snapshot()`` check (below); this covers the narrow TOCTOU window where the
+    row's phase changes AFTER that snapshot but before the locked write commits
+    (issue #322) by catching the identical guard the repository now enforces
+    inside its own lock, and rendering it exactly like the fast path does.
+    """
+    try:
+        return await operation
+    except UnknownCoordinatorPhaseError as exc:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
         ) from exc
 
 
@@ -205,8 +226,11 @@ async def _request_action(
             message="The updater sidecar is not connected.",
             hint="Enable the automatic-update Compose profile, then try again.",
         )
+    # ``snapshot.phase not in _KNOWN_PHASES`` was fast-pathed above; this covers
+    # the TOCTOU window where the phase turns unknown between that snapshot and
+    # the locked ``request_action`` write (issue #322).
     try:
-        await coordinator.request_action(action)
+        await _guard_unknown_phase(coordinator.request_action(action))
     except UpdateOperationInProgressError as exc:
         raise AppError(
             status_code=409,
@@ -245,7 +269,14 @@ async def _eligibility(
 ) -> tuple[UpdateEligibilityResponse, CoordinatorSnapshot]:
     coordinator = await _coordinator(request)
     if touch:
-        touched = await coordinator.touch_updater()
+        # A locked-write refusal here is the SAME unknown-phase condition the
+        # ``except ValueError`` below already reports as a soft
+        # ``coordinator_state_unknown`` blocker for this polling endpoint -- fall
+        # back to reading the (untouched) row instead of hard-failing the poll.
+        try:
+            touched = await coordinator.touch_updater()
+        except UnknownCoordinatorPhaseError:
+            touched = None
         snapshot = touched if touched is not None else await coordinator.snapshot()
     else:
         snapshot = await coordinator.snapshot()
@@ -324,9 +355,11 @@ async def heartbeat_endpoint(body: UpdateHeartbeatRequest, request: Request) -> 
             code="coordinator_state_unknown",
             message="The update coordinator is in an unrecognized state.",
         )
-    after = await coordinator.touch_updater(
-        phase=UpdatePhase(body.phase),
-        expected_generation=body.action_generation,
+    after = await _guard_unknown_phase(
+        coordinator.touch_updater(
+            phase=UpdatePhase(body.phase),
+            expected_generation=body.action_generation,
+        )
     )
     if after is None:
         raise AppError(
@@ -402,13 +435,15 @@ async def claim_endpoint(
             lease_seconds=int(_DRAIN_TTL.total_seconds()),
             blocker="active_critical_work",
         )
-    claim = await (await _coordinator(request)).claim_drain(
-        ttl=_DRAIN_TTL,
-        action_generation=snapshot.action_generation,
-        materialize_install=(
-            not (body is not None and body.recovery) and snapshot.requested_action == "none"
-        ),
-        require_idle=eligibility.idle_only,
+    claim = await _guard_unknown_phase(
+        (await _coordinator(request)).claim_drain(
+            ttl=_DRAIN_TTL,
+            action_generation=snapshot.action_generation,
+            materialize_install=(
+                not (body is not None and body.recovery) and snapshot.requested_action == "none"
+            ),
+            require_idle=eligibility.idle_only,
+        )
     )
     if claim is None:
         latest = await (await _coordinator(request)).snapshot()
@@ -444,10 +479,12 @@ async def renew_endpoint(body: UpdateRenewRequest, request: Request) -> UpdateLe
             message="The update coordinator is in an unrecognized state.",
         )
     phase = UpdatePhase(body.phase) if body.phase is not None else None
-    ready = await coordinator.renew_drain_progress(
-        body.lease_token,
-        ttl=_DRAIN_TTL,
-        phase=phase,
+    ready = await _guard_unknown_phase(
+        coordinator.renew_drain_progress(
+            body.lease_token,
+            ttl=_DRAIN_TTL,
+            phase=phase,
+        )
     )
     if ready is None:
         raise AppError(
@@ -476,7 +513,7 @@ async def release_endpoint(body: UpdateLeaseRequest, request: Request) -> Update
             code="coordinator_state_unknown",
             message="The update coordinator is in an unrecognized state.",
         )
-    released = await coordinator.release(body.lease_token)
+    released = await _guard_unknown_phase(coordinator.release(body.lease_token))
     if released:
         publish_realtime(request.app, ("updates",), reason="update_drain_released")
     return UpdateLeaseResponse(
@@ -510,19 +547,24 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
     result = _service_result(body.outcome)
     if body.operation == "check":
         has_update = result is UpdateResult.update_available
-        acknowledged = await coordinator.acknowledge_action(
-            expected_generation=body.action_generation,
-            result=result,
-            error_code=body.detail_code,
-            current_build=body.current_build or snapshot.current_build or current_build_id(),
-            current_digest=(
-                body.current_digest if body.current_digest is not None else snapshot.current_digest
-            ),
-            available_build=body.available_build if has_update else None,
-            available_digest=body.available_digest if has_update else None,
-            preserve_action=(
-                snapshot.requested_action == "install" and result is UpdateResult.update_available
-            ),
+        acknowledged = await _guard_unknown_phase(
+            coordinator.acknowledge_action(
+                expected_generation=body.action_generation,
+                result=result,
+                error_code=body.detail_code,
+                current_build=body.current_build or snapshot.current_build or current_build_id(),
+                current_digest=(
+                    body.current_digest
+                    if body.current_digest is not None
+                    else snapshot.current_digest
+                ),
+                available_build=body.available_build if has_update else None,
+                available_digest=body.available_digest if has_update else None,
+                preserve_action=(
+                    snapshot.requested_action == "install"
+                    and result is UpdateResult.update_available
+                ),
+            )
         )
         if not acknowledged:
             raise AppError(
@@ -538,18 +580,21 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
                 code="missing_update_lease",
                 message="An install outcome requires a lease.",
             )
-        if not await coordinator.acknowledge_outcome(
-            token,
-            result=result,
-            expected_generation=body.action_generation,
-            error_code=body.detail_code,
-            from_build=body.from_build,
-            to_build=body.to_build,
-            current_build=body.current_build,
-            current_digest=body.current_digest,
-            available_build=body.available_build,
-            available_digest=body.available_digest,
-        ):
+        outcome_acknowledged = await _guard_unknown_phase(
+            coordinator.acknowledge_outcome(
+                token,
+                result=result,
+                expected_generation=body.action_generation,
+                error_code=body.detail_code,
+                from_build=body.from_build,
+                to_build=body.to_build,
+                current_build=body.current_build,
+                current_digest=body.current_digest,
+                available_build=body.available_build,
+                available_digest=body.available_digest,
+            )
+        )
+        if not outcome_acknowledged:
             raise AppError(
                 status_code=409,
                 code="update_lease_expired",

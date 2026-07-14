@@ -17,9 +17,42 @@ __all__ = [
     "CoordinatorSnapshot",
     "LeaseRecord",
     "SqlUpdateCoordinationRepository",
+    "UnknownCoordinatorPhaseError",
 ]
 
 LeaseKind = Literal["critical", "drain"]
+
+# Duplicated rather than imported: ``UpdatePhase`` lives in the service layer,
+# and importing it here would invert the hexagonal repo -> service layering
+# (ADR: domain/repositories never import an adapter/service). A drift-guard
+# test (tests/services/test_update_coordination_service.py) asserts this set
+# stays equal to ``frozenset(phase.value for phase in UpdatePhase)`` so the two
+# copies cannot silently diverge.
+_KNOWN_COORDINATOR_PHASES = frozenset(
+    {
+        "idle",
+        "checking",
+        "available",
+        "draining",
+        "installing",
+        "rollback",
+        "succeeded",
+        "failed",
+        "rolled_back",
+    }
+)
+
+
+class UnknownCoordinatorPhaseError(RuntimeError):
+    """Raised when a locked write finds the row already in an unrecognized phase.
+
+    A phase written by a concurrent process (a version-skew/rollback window,
+    or a newer coordinator generation) between a caller's snapshot and this
+    method's own locked transaction must never be silently consumed by an
+    unconditional business-state rewrite -- see issue #322. Every locked
+    coordination write re-checks the phase itself, inside its own lock, and
+    fails closed instead of guessing what an unrecognized phase means.
+    """
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -204,7 +237,9 @@ class SqlUpdateCoordinationRepository:
         expected_generation: int | None = None,
     ) -> bool:
         """Refresh sidecar liveness without replaying stale image observations."""
-        await self._lock()
+        state = await self._lock()
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         values: dict[str, object] = {"updater_last_seen_at": now, "updated_at": now}
         if phase is not None:
             values["phase"] = phase
@@ -219,6 +254,17 @@ class SqlUpdateCoordinationRepository:
 
     async def request_action(self, action: str, now: datetime) -> int | None:
         state = await self._lock()
+        # Fail closed on an unrecognized phase, exactly like every other locked
+        # write in this module (issue #322). The busy-phase/requested-action
+        # refusal below only reasons about phases THIS app version knows; a phase
+        # a concurrent (newer) coordinator landed between a caller's snapshot and
+        # this locked transaction is not in the hardcoded busy set and may still
+        # carry ``requested_action == "none"``, so without this guard a stale
+        # caller could bump ``action_generation``/``requested_action`` on top of
+        # coordinator state it cannot interpret -- the same TOCTOU fail-open the
+        # guard closes elsewhere. Refuse instead and let the service surface it.
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         # Refuse to clobber an update that is already in flight. Two windows both
         # strand in-flight work if we bump ``action_generation`` here:
         #   * an active lease phase - the sidecar is mid check/drain/install/
@@ -291,6 +337,8 @@ class SqlUpdateCoordinationRepository:
     ) -> tuple[LeaseRecord, bool] | None:
         state = await self._lock()
         await self._cleanup_expired(now)
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         if await self._active_drain() is not None:
             return None
         generation = state.action_generation if action_generation is None else action_generation
@@ -368,6 +416,8 @@ class SqlUpdateCoordinationRepository:
         """Renew one exact drain and atomically refresh its bounded active phase."""
         state = await self._lock()
         await self._cleanup_expired(now)
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         drain = await self._lease_for_token(token_hash, "drain")
         if drain is None:
             return None
@@ -388,19 +438,31 @@ class SqlUpdateCoordinationRepository:
         return ready
 
     async def release(self, token_hash: str, now: datetime) -> bool:
-        await self._lock()
+        state = await self._lock()
         await self._cleanup_expired(now)
         lease = await self._lease_for_token(token_hash)
         if lease is None:
             return False
-        was_drain = lease.kind == "drain"
+        if lease.kind != "drain":
+            # A critical release only deletes its own lease row and never touches
+            # ``phase``. It must stay reliable even under an unrecognized phase
+            # (issue #322): failing it closed here would leak the critical lease
+            # until TTL and needlessly block idle-only update claims once the
+            # phase recovers -- a fail-closed guard manufacturing a new failure
+            # mode. Guard only the drain path below, which rewrites ``phase``.
+            await self._session.delete(lease)
+            return True
+        # Drain release rewrites ``phase`` -> ``idle``. Refuse to stamp that on
+        # top of a phase a concurrent writer left unrecognized, and leave the
+        # drain lease untouched so a caller that understands the state can act.
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         await self._session.delete(lease)
-        if was_drain:
-            await self._session.execute(
-                update(UpdateCoordinatorState)
-                .where(UpdateCoordinatorState.id == 1)
-                .values(phase="idle", updated_at=now)
-            )
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="idle", updated_at=now)
+        )
         return True
 
     async def acknowledge_action(
@@ -415,6 +477,8 @@ class SqlUpdateCoordinationRepository:
         now: datetime,
     ) -> bool:
         state = await self._lock()
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         if state.action_generation != expected_generation:
             return False
         values: dict[str, object] = {
@@ -465,6 +529,8 @@ class SqlUpdateCoordinationRepository:
     ) -> bool:
         state = await self._lock()
         await self._cleanup_expired(now)
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
         drain = await self._lease_for_token(token_hash, "drain")
         if drain is None:
             # The acknowledgement transaction may have committed while its HTTP
