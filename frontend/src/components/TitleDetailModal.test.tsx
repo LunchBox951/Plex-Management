@@ -62,11 +62,14 @@ vi.mock('../api/hooks', () => ({
   useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
 
+const toastState = vi.hoisted(() => ({ toast: vi.fn() }))
+
 beforeEach(() => {
   authState.current = authState.admin
+  toastState.toast.mockClear()
 })
 
-vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
+vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: toastState.toast }) }))
 
 vi.mock('./ui/Dialog', () => ({
   Dialog: ({
@@ -1440,8 +1443,14 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
 
-    expect(screen.getByText('Remove from your requests?')).toBeInTheDocument()
-    expectWarningVisible(/nothing is torn down/i)
+    // #349/#351: the backend deterministically REFUSES this teardown
+    // (`not_cancellable`, per-season guard) and removes nothing, so the copy is
+    // the honest refusal variant -- neither the destructive warning (#335) nor the
+    // benign "nothing is torn down", which would have over-promised a mere removal
+    // the backend will 409.
+    expect(screen.getByText("Can't withdraw yet")).toBeInTheDocument()
+    expectWarningVisible(/the server will likely refuse/i)
+    expect(screen.queryByText('Remove from your requests?')).not.toBeInTheDocument()
     expect(screen.queryByText('Withdraw and cancel request?')).not.toBeInTheDocument()
     expect(
       screen.queryByText(/withdrawing will cancel it and remove the download/i),
@@ -1492,6 +1501,202 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.getByRole('button', { name: /withdraw/i })).toBeInTheDocument()
+  })
+
+  it('shows the refusal-specific confirm copy for a sole participant on import_blocked (#349)', () => {
+    // A sole participant on an ACTIVE non-cancellable row (import_blocked): the
+    // backend 409s `withdrawal_blocked_active_request` and removes nothing. The
+    // dialog must NOT fall into the benign "nothing is torn down" mere-removal
+    // copy (which over-promises a removal that will be refused) nor the
+    // destructive teardown copy -- it uses the honest refusal variant.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            status: 'import_blocked',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = idle()
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: /^withdraw$/i }))
+    expect(screen.getByText("Can't withdraw yet")).toBeInTheDocument()
+    expectWarningVisible(/the server will likely refuse/i)
+    expect(screen.queryByText('Remove from your requests?')).not.toBeInTheDocument()
+    expect(screen.queryByText('Withdraw and cancel request?')).not.toBeInTheDocument()
+    // Expected refusal -> no DESTRUCTIVE confirm (the only bare "Withdraw"
+    // button is the page-level opener), dismissing is the primary action and
+    // performs no mutation -- but a server-arbitrated "Withdraw anyway" IS
+    // offered (the snapshot could be stale; the server decides).
+    expect(screen.getAllByRole('button', { name: /^withdraw$/i })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /withdraw anyway/i })).toBeInTheDocument()
+    const ok = screen.getByRole('button', { name: /^ok$/i })
+    fireEvent.click(ok)
+    expect(withdrawMock.mutateAsync).not.toHaveBeenCalled()
+    expect(screen.queryByText("Can't withdraw yet")).not.toBeInTheDocument()
+  })
+
+  it('lets the server accept a stale refusal snapshot via "Withdraw anyway" (#349 stale direction)', async () => {
+    // The cached row says sole-participant + import_blocked (expected refusal),
+    // but between the last poll and the click the row settled (or a participant
+    // joined) -- the backend ACCEPTS the DELETE as a mere removal. The dialog
+    // must not block that: "Withdraw anyway" round-trips and the authoritative
+    // outcome produces the honest success toast.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            id: 34,
+            status: 'import_blocked',
+            is_owner: true,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = mutation({ settled: false })
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^withdraw$/i }))
+    expect(screen.getByText("Can't withdraw yet")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /withdraw anyway/i }))
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(34))
+    expect(toastState.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Removed from your requests', intent: 'success' }),
+    )
+  })
+
+  it('surfaces a backend 409 refusal as the error toast, never a false success', async () => {
+    // The pre-action dialog cannot predict every backend refusal (e.g.
+    // import_in_progress / service_not_configured on a destructive-looking row).
+    // Confirming a withdrawal the backend then 409s must produce the "Withdraw
+    // failed" ERROR toast -- and no success toast of either wording.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            id: 33,
+            status: 'downloading',
+            can_mutate: false,
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = {
+      mutateAsync: vi
+        .fn()
+        .mockRejectedValue(Object.assign(new Error('import_in_progress'), { status: 409 })),
+      isPending: false,
+    }
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    const confirms = screen.getAllByRole('button', { name: /withdraw/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(33))
+    await waitFor(() =>
+      expect(toastState.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Withdraw failed', intent: 'error' }),
+      ),
+    )
+    expect(toastState.toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ intent: 'success' }),
+    )
+  })
+
+  it('keys the success toast off the server outcome, not the click-time snapshot (#351)', async () => {
+    // Snapshot at click time shows a co-participant remaining (benign "continues
+    // for others" copy). Between snapshot and confirm that participant withdrew, so
+    // the backend made THIS caller the sole participant on a cancellable row and
+    // tore it down -- returning `settled: true`. The success toast must reflect the
+    // REAL teardown, not the now-stale benign snapshot (the #351 lie).
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            id: 31,
+            status: 'downloading',
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: true,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = mutation({ settled: true })
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    expectWarningVisible(/the download continues for others who requested it/i)
+    const confirms = screen.getAllByRole('button', { name: /withdraw/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(31))
+    expect(toastState.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        // Neutral teardown copy: `settled: true` proves the cancel branch ran,
+        // NOT that a torrent existed (pending/searching rows settle purely in
+        // the DB) -- so the toast never claims a download removal.
+        title: 'Request cancelled',
+        intent: 'success',
+      }),
+    )
+  })
+
+  it('does NOT claim a teardown when the server merely removed the subscription (#351)', async () => {
+    // The reverse stale-snapshot direction: the click-time snapshot looks
+    // destructive (sole participant on a cancellable row), but the row settled
+    // between snapshot and confirm so the backend did a MERE removal
+    // (`settled: false`). The toast must not falsely claim a cancel + download
+    // removal that did not happen.
+    asSharedUser()
+    ;(useRequests as unknown as Mock).mockReturnValue({
+      data: {
+        requests: [
+          movieRequest({
+            id: 32,
+            status: 'downloading',
+            can_mutate: false,
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: false,
+          }),
+        ],
+      },
+    })
+    const withdrawMock = mutation({ settled: false })
+    ;(useWithdrawSubscription as unknown as Mock).mockReturnValue(withdrawMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /withdraw/i }))
+    // Destructive snapshot copy -- what the caller was shown pre-action.
+    expect(screen.getByText('Withdraw and cancel request?')).toBeInTheDocument()
+    const confirms = screen.getAllByRole('button', { name: /withdraw/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() => expect(withdrawMock.mutateAsync).toHaveBeenCalledWith(32))
+    expect(toastState.toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Removed from your requests', intent: 'success' }),
+    )
   })
 
   it('shows "Withdraw" to an ADMIN who is ALSO a participant of a settled row', () => {

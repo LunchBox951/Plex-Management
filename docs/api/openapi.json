@@ -4258,6 +4258,20 @@
         ],
         "title": "WatchlistStatusItem",
         "type": "object"
+      },
+      "WithdrawSubscriptionResponse": {
+        "description": "Outcome of ``DELETE /requests/{id}/subscription`` (issue #314 / #351).\n\n``settled`` echoes ``correction_service.WithdrawOutcome.settled`` -- the value\nthe withdraw verb computes under the participant media lock. ``True`` iff the\nlast-participant CANCEL BRANCH ran (via ``cancel_request``) and the request\nsettled ``cancelled``. That branch removes any active download IF one exists,\nbut a pending/searching/no_acceptable_release/waiting_for_air_date row settles\npurely in the DB with no torrent to touch -- so ``settled: true`` means \"the\nrequest was cancelled\", NEVER \"a download was removed\". ``False`` is a mere\nsubscription removal (an owner handoff to a remaining participant, or the last\nparticipant leaving an already-settled row). The client keys its success toast\noff THIS authoritative outcome rather than a click-time snapshot a concurrent\njoin/withdraw or status advance could have made stale (#351).",
+        "properties": {
+          "settled": {
+            "title": "Settled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "settled"
+        ],
+        "title": "WithdrawSubscriptionResponse",
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -6404,7 +6418,7 @@
     },
     "/api/v1/requests/{request_id}/subscription": {
       "delete": {
-        "description": "Withdraw the caller's OWN subscription from a shared request (issue #314).\n\nThe collaborative counterpart to ``POST /cancel``: removes only the caller's\nparticipation, never the whole request out from under other subscribers. If\nOTHER subscribers remain, this is a mere subscription removal (with an\nownership handoff to the earliest remaining subscriber, if the caller was\nthe owner) -- nothing else is touched. If the caller is the LAST\nparticipant, this settles like a normal cancel (teardown + ``cancelled``)\nfor a not-yet-imported request, or simply removes the subscription for an\nalready-terminal one. See ``correction_service.withdraw_participant``'s\ndocstring for the full matrix.\n\nAlways ``204 No Content`` on success -- the caller removed themselves, so\nthere is nothing of theirs left to render; the row simply drops out of\ntheir next ``GET /requests``.",
+        "description": "Withdraw the caller's OWN subscription from a shared request (issue #314).\n\nThe collaborative counterpart to ``POST /cancel``: removes only the caller's\nparticipation, never the whole request out from under other subscribers. If\nOTHER subscribers remain, this is a mere subscription removal (with an\nownership handoff to the earliest remaining subscriber, if the caller was\nthe owner) -- nothing else is touched. If the caller is the LAST\nparticipant, this settles like a normal cancel (teardown + ``cancelled``)\nfor a not-yet-imported request, or simply removes the subscription for an\nalready-terminal one. See ``correction_service.withdraw_participant``'s\ndocstring for the full matrix.\n\nReturns ``{\"settled\": bool}`` -- the authoritative under-lock outcome\n(:class:`correction_service.WithdrawOutcome`): ``True`` only when the\nlast-participant cancel branch ran and the request settled ``cancelled``\n(any active download, IF one existed, was removed -- a\npending/searching/no_acceptable_release/waiting_for_air_date row settles\npurely in the DB with no torrent to touch, so ``settled: true`` must never\nbe presented as \"a download was removed\"); ``False`` for a mere\nremoval/handoff. The caller keys its success toast off THIS rather than a\nclick-time snapshot a concurrent join/withdraw or status advance could have\nmade stale (#351); the caller's own row still simply drops out of their\nnext ``GET /requests``.",
         "operationId": "withdraw_subscription_endpoint_api_v1_requests__request_id__subscription_delete",
         "parameters": [
           {
@@ -6418,7 +6432,14 @@
           }
         ],
         "responses": {
-          "204": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WithdrawSubscriptionResponse"
+                }
+              }
+            },
             "description": "Successful Response"
           },
           "404": {

@@ -15,6 +15,7 @@ export type DiscoverListResponse = Schemas['DiscoverListResponse']
 
 export type RequestResponse = Schemas['RequestResponse']
 export type RequestListResponse = Schemas['RequestListResponse']
+export type WithdrawSubscriptionResponse = Schemas['WithdrawSubscriptionResponse']
 export type CreateRequestBody = Schemas['CreateRequestBody']
 export type SeasonStatus = Schemas['SeasonStatus']
 
