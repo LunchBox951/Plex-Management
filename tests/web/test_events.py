@@ -559,7 +559,7 @@ async def test_events_stream_closes_at_idle_deadline(
         timeouts.append(timeout)
         wait_calls += 1
         if wait_calls == 1:
-            await getter
+            assert (await getter).reason == "connected"
             return True
         if wait_calls == 2:
             assert not getter.done()
