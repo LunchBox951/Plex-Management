@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated
@@ -21,6 +22,15 @@ router = APIRouter(
 )
 
 _HEARTBEAT_SECONDS = 15.0
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+async def _wait_for_getter(getter: asyncio.Task[RealtimeEvent], *, timeout: float) -> bool:
+    done, _pending = await asyncio.wait({getter}, timeout=timeout)
+    return getter in done
 
 
 @router.get("", response_class=EventSourceResponse)
@@ -57,7 +67,6 @@ async def events_endpoint(
     # REST call from the same session already 401s. Connect counts as activity
     # (the auth dependency just slid ``last_seen`` forward, throttled), so a
     # continuously-open stream re-leases on each reconnect. The tighter bound wins.
-    loop = asyncio.get_running_loop()
     now = datetime.now(UTC)
     session_deadlines = [
         deadline
@@ -67,7 +76,7 @@ async def events_endpoint(
     lease_deadline: float | None = None
     if session_deadlines:
         remaining = (min(session_deadlines) - now).total_seconds()
-        lease_deadline = loop.time() + max(0.0, remaining)
+        lease_deadline = _monotonic() + max(0.0, remaining)
     getter: asyncio.Task[RealtimeEvent] | None = None
     try:
         while True:
@@ -75,15 +84,14 @@ async def events_endpoint(
                 break
             timeout = _HEARTBEAT_SECONDS
             if lease_deadline is not None:
-                lease_remaining = lease_deadline - loop.time()
+                lease_remaining = lease_deadline - _monotonic()
                 if lease_remaining <= 0:
                     break
                 timeout = min(timeout, lease_remaining)
             if getter is None:
                 getter = asyncio.ensure_future(subscription.get())
-            done, _pending = await asyncio.wait({getter}, timeout=timeout)
-            if getter not in done:
-                if lease_deadline is not None and loop.time() >= lease_deadline:
+            if not await _wait_for_getter(getter, timeout=timeout):
+                if lease_deadline is not None and _monotonic() >= lease_deadline:
                     break
                 # Heartbeat: the getter stays pending for the next iteration, so
                 # no enqueued event is ever discarded by a timeout cancellation.

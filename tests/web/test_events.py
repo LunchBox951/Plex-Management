@@ -30,12 +30,14 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.events import (
     EventHub,
+    RealtimeEvent,
     close_realtime_streams,
     current_build_id,
     get_event_hub,
     publish_realtime,
     warn_if_multiworker,
 )
+from plex_manager.web.routers import events as events_router
 from tests.web.fakes import FakeTmdb, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -534,16 +536,36 @@ async def test_events_stream_closes_at_browser_session_expiry(
 async def test_events_stream_closes_at_idle_deadline(
     app: FastAPI,
     seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The SSE lease is also capped at the session's IDLE deadline (issue #56).
 
     REST requests die at the idle window, but a long-lived stream that only
     enforced the 30-day absolute cap would keep delivering admin topics for weeks
-    past when the session stopped authenticating for REST. Here the idle deadline
-    is much nearer than the absolute expiry, so the stream must close at the idle
-    deadline, not wait for the absolute cap.
+    past when the session stopped authenticating for REST. The fake clock keeps
+    the test on the intended sync-then-idle-close path under CI load.
     """
     await seed(initialized=True)
+
+    clock = [1000.0]
+    wait_calls = 0
+    timeouts: list[float] = []
+
+    def _fake_monotonic() -> float:
+        return clock[0]
+
+    async def _fake_wait_for_getter(getter: asyncio.Task[RealtimeEvent], *, timeout: float) -> bool:
+        nonlocal wait_calls
+        timeouts.append(timeout)
+        wait_calls += 1
+        if wait_calls == 1:
+            await getter
+            return True
+        if wait_calls == 2:
+            assert not getter.done()
+            clock[0] = 1006.0
+            return False
+        raise AssertionError(f"unexpected waiter call {wait_calls}")
 
     async def _idle_soon_admin() -> AuthContext:
         now = datetime.now(UTC)
@@ -552,20 +574,26 @@ async def test_events_stream_closes_at_idle_deadline(
             user_id=78,
             is_admin=True,
             session_expires_at=now + timedelta(days=30),
-            session_idle_deadline=now + timedelta(seconds=0.5),
+            session_idle_deadline=now + timedelta(seconds=5),
         )
 
     app.dependency_overrides[require_admin_short_session] = _idle_soon_admin
+    monkeypatch.setattr(events_router, "_monotonic", _fake_monotonic)
+    monkeypatch.setattr(events_router, "_wait_for_getter", _fake_wait_for_getter)
     try:
         async with _AsgiStream(app, {}) as stream:
             assert stream.status == 200
             sync = _data_json(await stream.next_frame())
+            assert sync["topics"] == ["sync"]
             assert sync["reason"] == "connected"
 
-            await stream.expect_body_end(timeout=2.0)
+            await stream.expect_body_end()
     finally:
         app.dependency_overrides.pop(require_admin_short_session, None)
 
+    assert wait_calls == 2
+    assert timeouts[0] == pytest.approx(5.0, abs=0.1)
+    assert 0.0 < timeouts[0] < events_router._HEARTBEAT_SECONDS  # pyright: ignore[reportPrivateUsage]
     await _wait_subscribers_zero(app)
 
 
