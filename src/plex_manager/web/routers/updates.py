@@ -469,8 +469,10 @@ async def _eligibility(
         # reports as ``coordinator_state_unknown`` for this polling endpoint,
         # so swallow it rather than hard-failing the poll. This write touches
         # only the identity columns -- never ``updater_last_seen_at`` -- so it
-        # adds no second pre-snapshot write of the heartbeat anchor that
-        # issue #387 already tracks against ``touch_updater`` below.
+        # adds no second pre-snapshot write of the heartbeat anchor:
+        # ``touch_updater`` below now backfills the legacy busy-row anchor
+        # BEFORE its own liveness write under the same lock (issue #387), so
+        # there is only ever the one heartbeat write to reason about here.
         with contextlib.suppress(UnknownCoordinatorPhaseError):
             await coordinator.record_updater_identity(observed_build=None, observed_digest=None)
         # A locked-write refusal here is the SAME unknown-phase condition the
