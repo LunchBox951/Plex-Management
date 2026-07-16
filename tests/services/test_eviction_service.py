@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
@@ -4285,6 +4286,133 @@ async def test_operator_rearmed_former_regrab_season_survives_an_unrelated_resto
 # Recovery is keyed on the BREADCRUMB (not only the 'evicted' status), and a
 # breadcrumb whose path another live row claims is released, never restored.
 # --------------------------------------------------------------------------- #
+
+
+class _BlockedDeleteFileSystem(LocalFileSystem):
+    """A real, root-guarded :class:`LocalFileSystem` whose ``delete`` blocks (in
+    the ``asyncio.to_thread`` worker) until the test releases it -- lets a test
+    cancel a sweep while its purge delete is still physically running, the
+    exact window issue #128 needs exercised."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__([str(root)])
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.deleted: list[str] = []
+
+    def delete(self, path: str) -> None:
+        self.started.set()
+        self.release.wait(timeout=5)
+        super().delete(path)
+        self.deleted.append(path)
+
+
+async def test_cancelled_sweep_keeps_latch_busy_until_the_delete_worker_settles(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #128: cancelling a sweep mid-purge must not release
+    ``_sweep_latch`` (nor the purge's ``_ACTIVE_PURGE_PATHS`` registration)
+    until the background delete thread genuinely settles. Before the fix, the
+    ``CancelledError`` raised by a bare ``await asyncio.to_thread(fs.delete,
+    ...)`` propagated through ``purge_library_path`` and ``run_eviction_sweep``
+    immediately -- releasing the latch and the registration while the
+    ``rmtree``/unlink kept running in its executor thread in the background. A
+    second sweep landing right after cancellation could then run
+    ``_resume_interrupted_evictions`` concurrently with that orphaned delete,
+    stat the still-present file, and restore the row to 'available' a moment
+    before the delete finally removed it -- an 'available' row over no file,
+    with no re-grab trigger. This test proves the second sweep instead no-ops
+    (the latch is still busy) for as long as the delete is in flight, and only
+    a THIRD sweep -- run after the delete has genuinely settled -- correctly
+    finalizes the interrupted eviction."""
+    library_path = _movie_file(tmp_path, "Cancelled Delete.mkv")
+    movie_id = await _movie(
+        sessionmaker_, tmdb_id=654, title="Cancelled Delete", library_path=library_path
+    )
+    library = FakeLibrary(
+        watch_states={(654, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = _BlockedDeleteFileSystem(tmp_path)
+
+    async def _sweep(threshold_pct: float) -> list[eviction_service.EvictionOutcome]:
+        async with sessionmaker_() as session:
+            return await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=threshold_pct,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    first_sweep = asyncio.create_task(_sweep(0.0))
+    cancelled = False
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        first_sweep.cancel()
+        # Give the cancellation a chance to be delivered into the shielded
+        # settlement wait; the sweep task must NOT be done yet -- the delete
+        # worker is still blocked on ``fs.release``.
+        await asyncio.sleep(0)
+        assert not first_sweep.done()
+
+        # The latch is still busy, the purge registration is still held, and
+        # the row is claimed-but-not-finalized ('evicted' + breadcrumb still
+        # set) -- exactly the interrupted-eviction signature a second sweep's
+        # crash recovery would otherwise race against the still-running delete.
+        assert cast(dict[str, bool], eviction_service.__dict__["_sweep_latch"])["busy"] is True
+        assert eviction_service.purge_service.begin_placement(library_path) is False
+        assert Path(library_path).exists()
+        async with sessionmaker_() as session:
+            claimed = await session.get(MediaRequest, movie_id)
+        assert claimed is not None
+        assert claimed.status is RequestStatus.evicted
+        assert claimed.library_path == library_path
+
+        # A second sweep landing right now -- while the delete is STILL
+        # running -- must no-op rather than run crash recovery concurrently
+        # with it.
+        with caplog.at_level(logging.INFO, logger="plex_manager.services.eviction_service"):
+            assert await _sweep(101.0) == []
+        assert "already in progress" in caplog.text
+
+        # Unchanged: the second sweep's no-op must not have touched anything.
+        async with sessionmaker_() as session:
+            still_claimed = await session.get(MediaRequest, movie_id)
+        assert still_claimed is not None
+        assert still_claimed.status is RequestStatus.evicted
+        assert still_claimed.library_path == library_path
+        assert Path(library_path).exists()
+    finally:
+        fs.release.set()
+        try:
+            await first_sweep
+        except asyncio.CancelledError:
+            cancelled = True
+
+    assert cancelled is True
+    assert fs.deleted == [library_path]
+    assert not Path(library_path).exists()
+    # Only NOW -- after the delete worker genuinely settled -- is the purge
+    # registration released and the latch free for a real recovery pass.
+    assert eviction_service.purge_service.begin_placement(library_path) is True
+    eviction_service.purge_service.end_placement(library_path)
+
+    outcomes = await _sweep(101.0)
+    assert outcomes == []  # recovery, not a fresh eviction
+    async with sessionmaker_() as session:
+        recovered = await session.get(MediaRequest, movie_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 654)))
+            .scalars()
+            .all()
+        )
+    assert recovered is not None
+    assert recovered.status is RequestStatus.evicted
+    assert recovered.library_path is None  # finalized: breadcrumb cleared
+    assert [row.event_type for row in history] == [DownloadHistoryEvent.evicted]
 
 
 async def test_second_sweep_invocation_no_ops_while_one_is_running(

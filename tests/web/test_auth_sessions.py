@@ -144,6 +144,34 @@ async def test_list_sessions_excludes_idle_and_revoked(
     assert [u["user_id"] for u in response.json()["users"]] == [admin_id]
 
 
+async def test_list_sessions_excludes_absolute_expiry(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """``AuthSession.expires_at > now`` is a THIRD, independent predicate on the
+    listing's active-session filter (alongside not-revoked and not-idle) -- until
+    now covered by neither ``test_list_sessions_excludes_idle_and_revoked`` (which
+    only varies revoked/idle) nor any other test (issue #380 finding 3).
+
+    ``last_seen_at`` is left at its default (``now``, via ``_mint_session``) so
+    the idle predicate ALONE would still admit this session -- only the absolute
+    ``expires_at`` cap excludes it, isolating that specific predicate the same
+    way ``test_list_sessions_excludes_idle_and_revoked`` isolates idle/revoked.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    admin_id, admin_cookies, _ = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
+    await _mint_session(
+        app,
+        plex_id=500,
+        tag="expired",
+        is_admin=False,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    assert response.status_code == 200
+    assert [u["user_id"] for u in response.json()["users"]] == [admin_id]
+
+
 async def test_list_sessions_includes_recovery_group(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
 ) -> None:

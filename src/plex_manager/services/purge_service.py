@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.logsafe import safe_text
 from plex_manager.services import path_visibility
 
 if TYPE_CHECKING:
@@ -192,6 +193,64 @@ class PurgeResult:
     detail: str | None = None
 
 
+async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
+    """Run ``fs.delete`` to completion, holding any caller cancellation until it does.
+
+    ``await asyncio.to_thread(fs.delete, library_path)`` cancels by detaching
+    the awaiting coroutine from the executor future — the ``rmtree``/unlink
+    already handed to the thread pool keeps running in the background
+    regardless, since a thread cannot be interrupted from outside. A bare
+    ``to_thread`` await would let a cancelled :func:`purge_library_path`
+    unwind through its ``finally`` (releasing its ``_ACTIVE_PURGE_PATHS``
+    registration) — and, transitively, let a cancelled eviction sweep release
+    ``_sweep_latch`` — while that background thread is still mutating the
+    filesystem. That is exactly the window issue #128 exploits: a *later*
+    sweep's crash-recovery pass can then stat the still-present path, restore
+    the row to ``available``, and watch the file vanish out from under it a
+    moment later when the orphaned delete finally finishes.
+
+    The delete instead runs in its own child task that is never cancelled;
+    this coroutine ``asyncio.shield``s a wait on that task's completion, so a
+    cancellation delivered here is caught and RE-DELIVERED only once the
+    worker has truly settled (success or error) — never before. Every caller's
+    registration release / ``finally`` therefore always observes a settled
+    filesystem, never a still-running delete.
+    """
+    worker: asyncio.Task[None] = asyncio.create_task(asyncio.to_thread(fs.delete, library_path))
+    settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    worker_error: BaseException | None = None
+
+    def _consume_worker_result(done: asyncio.Task[None]) -> None:
+        nonlocal worker_error
+        if not done.cancelled():
+            worker_error = done.exception()
+        settled.set_result(None)
+
+    worker.add_done_callback(_consume_worker_result)
+
+    was_cancelled = False
+    while not settled.done():
+        try:
+            await asyncio.shield(settled)
+        except asyncio.CancelledError:
+            was_cancelled = True
+    if was_cancelled:
+        if worker_error is not None:
+            # Cancellation wins: the caller is already unwinding on
+            # CancelledError and will never read a classified PurgeResult, so a
+            # worker error that ALSO happened during that unwind is logged here
+            # (honesty over silence) rather than raised over the cancellation.
+            _logger.warning(
+                "purge delete of %r failed (%s) while the caller was being "
+                "cancelled; the delete did not complete",
+                safe_text(library_path),
+                type(worker_error).__name__,
+            )
+        raise asyncio.CancelledError
+    if worker_error is not None:
+        raise worker_error
+
+
 async def purge_library_path(
     fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool = False
 ) -> PurgeResult:
@@ -200,7 +259,14 @@ async def purge_library_path(
     Both the size accounting and the delete are real, synchronous disk I/O
     (``os.stat``/``os.walk``/``shutil.rmtree``), so each runs off the event loop
     via ``asyncio.to_thread`` — mirroring every other blocking FS primitive in the
-    services layer (see ``eviction_service._size_bytes``/``_evict_one``).
+    services layer (see ``eviction_service._size_bytes``/``_evict_one``). The
+    delete specifically goes through :func:`_delete_to_settlement`, which shields
+    the wait so a caller's cancellation is never observed until the underlying
+    delete thread has genuinely finished (issue #128) — the registration this
+    function holds in ``_ACTIVE_PURGE_PATHS`` (below) spans that full worker
+    lifetime, including any cancellation settlement, so a concurrent
+    ``begin_placement`` / a later sweep's crash-recovery can never see this
+    path as free while a delete for it is still physically running.
 
     The delete goes through :meth:`FileSystemPort.delete`, whose implementation
     refuses (raises :class:`LocalFileSystemError`) any path resolving outside a
@@ -245,7 +311,7 @@ async def purge_library_path(
             freed_bytes = 0
 
         try:
-            await asyncio.to_thread(fs.delete, library_path)
+            await _delete_to_settlement(fs, library_path)
         except LocalFileSystemError as exc:
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
         except OSError as exc:

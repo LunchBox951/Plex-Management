@@ -13,7 +13,8 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -26,7 +27,8 @@ from plex_manager.models import (
     RequestSubscriber,
     User,
 )
-from plex_manager.web.deps import hash_session_token
+from plex_manager.web.deps import AuthContext, AuthMethod, hash_session_token
+from plex_manager.web.routers import requests as requests_router
 from tests.web.fakes import FakeQbittorrent, override_adapters
 
 SeedFn = Callable[..., Awaitable[None]]
@@ -184,8 +186,13 @@ async def test_withdraw_endpoint_404_for_unknown_request(
 async def test_withdraw_endpoint_404_for_admin_api_key_no_user_identity(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
-    # The legacy app API key carries no user identity -- it can never withdraw,
-    # even from a request it created via automation. Admins use POST /cancel.
+    """The legacy app API key carries no user identity -- it can never withdraw,
+    even from a request it created via automation. Admins use POST /cancel.
+
+    This is an observable, black-box pin on the WHOLE endpoint's behavior; see
+    ``test_require_subscriber_none_identity_disjunct_is_load_bearing`` below for
+    the disjunct-level fidelity this test alone cannot provide (issue #380
+    finding 2)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     async with sessionmaker_() as session:
         request = MediaRequest(
@@ -201,6 +208,69 @@ async def test_withdraw_endpoint_404_for_admin_api_key_no_user_identity(
     response = await client.delete(f"/api/v1/requests/{request_id}/subscription", headers=_HEADERS)
     assert response.status_code == 404
     assert response.json()["detail"] == "request_not_found"
+
+
+async def test_require_subscriber_none_identity_disjunct_is_load_bearing(
+    sessionmaker_: SessionMaker, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directly pins ``_require_subscriber``'s ``auth.user_id is None`` disjunct
+    in isolation (issue #380 finding 2) -- something no HTTP-level test of
+    ``DELETE /subscription`` can do.
+
+    ``_require_subscriber``'s guard ORs three disjuncts: ``record is None``,
+    ``auth.user_id is None``, and ``not is_request_visible_to_user(...)``. A
+    black-box HTTP test cannot isolate the middle one: a zero-subscriber request
+    makes the visibility disjunct ALSO 404 any caller (``is_request_visible_to_
+    user(..., None)`` is provably ``False`` regardless of subscriber population,
+    since a subscriber row's ``user_id`` is NOT NULL and can never match
+    ``None``) -- and even populating real subscribers plus forcing the
+    visibility check to always succeed does not help, because
+    ``withdraw_subscription_endpoint`` carries its OWN defensive
+    ``auth.user_id is None`` re-check (``# pragma: no cover``, requests.py
+    :~943) that produces the exact same 404 if this dependency's guard is ever
+    weakened. Both were verified directly (not merely asserted) before writing
+    this test.
+
+    This test therefore calls ``_require_subscriber`` itself, bypassing the
+    endpoint's second safety net entirely, with the visibility check
+    monkeypatched to ALWAYS succeed -- so the ``auth.user_id is None`` disjunct
+    is the ONLY thing left able to raise. If it is ever removed, this test (and
+    only this test) goes red.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        other = User(username="other-real-subscriber", permissions=0)
+        session.add(other)
+        await session.flush()
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        session.add(RequestSubscriber(request_id=request_id, user_id=other.id))
+        await session.commit()
+
+    async def _always_visible(session: AsyncSession, request_id: int, user_id: int) -> bool:
+        del session, request_id, user_id
+        return True
+
+    monkeypatch.setattr(
+        requests_router.request_service, "is_request_visible_to_user", _always_visible
+    )
+
+    admin_auth = AuthContext(method=AuthMethod.api_key, is_admin=True, via_api_key_header=True)
+    assert admin_auth.user_id is None
+    async with sessionmaker_() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await requests_router._require_subscriber(  # pyright: ignore[reportPrivateUsage]
+                request_id, admin_auth, session
+            )
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "request_not_found"
 
 
 async def test_withdraw_endpoint_owner_with_others_hands_off_ownership(
