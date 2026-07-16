@@ -1621,6 +1621,80 @@ async def test_automatic_dispatch_gates_on_non_busy_phase_keeping_recovery_bound
     assert handed.json()["blocker"] is None
 
 
+async def test_blocked_install_handout_never_moves_the_recovery_clock(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An install answer carrying the advisory active_critical_work blocker is
+    a do-nothing to the runner (it returns without Docker work or a drain
+    claim), so it must not restamp a stale busy row's anchor: the recovery
+    exit stays bounded while critical work persists, and the stamp fires only
+    once the blocker clears and the handout truly starts work."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await _enable_automatic_updates(client)  # idle_only=True
+    critical = await coordinator.acquire_critical("import", ttl=timedelta(hours=1))
+    assert critical is not None
+    anchor = moment[0] - timedelta(minutes=30)
+
+    async def plant_stale_queued_install() -> None:
+        async with app.state.sessionmaker() as session:
+            await session.execute(
+                update(UpdateCoordinatorState)
+                .where(UpdateCoordinatorState.id == 1)
+                .values(
+                    phase="checking",
+                    requested_action="install",
+                    action_generation=1,
+                    last_started_at=anchor,
+                    available_build="new-build",
+                    available_digest="sha256:new",
+                )
+            )
+            await session.commit()
+
+    await plant_stale_queued_install()
+
+    # Blocked polls: the install is handed out but advisory-blocked, so the
+    # runner will not act -- the anchor must not move.
+    for _ in range(3):
+        polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+        assert polled.status_code == 200
+        assert polled.json()["action"] == "install"
+        assert polled.json()["blocker"] == "active_critical_work"
+    assert (await coordinator.snapshot()).last_started_at == anchor
+
+    # The exit stays bounded while critical work persists: the reset works,
+    # preserving the queued install and its generation.
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.requested_action == "install"
+    assert snapshot.action_generation == 1
+
+    # Once the critical lease clears, the same handout over a (re-planted)
+    # stale busy row is actionable: it stamps a fresh recovery window and the
+    # button correctly waits for the work that just started.
+    await plant_stale_queued_install()
+    assert await coordinator.release(critical.token) is True
+    handed = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert handed.status_code == 200
+    assert handed.json()["action"] == "install"
+    assert handed.json()["blocker"] is None
+    assert (await coordinator.snapshot()).last_started_at == moment[0]
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
+
+
 async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(
     app: FastAPI,
     client: httpx.AsyncClient,

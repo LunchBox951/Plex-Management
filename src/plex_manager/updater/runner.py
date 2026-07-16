@@ -9,6 +9,7 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from typing import Any, Literal, cast
 
+from plex_manager.domain.update_recovery import dispatch_starts_work
 from plex_manager.updater.config import (
     IMAGE_REF_LABEL,
     OPERATION_LABEL,
@@ -196,12 +197,13 @@ class UpdaterRunner:
             await self._run_with_lease_keeper(pending, lease.lease_seconds, self._recover(pending))
             return
         eligibility = await self.coordinator.eligibility()
-        if eligibility.action == "none":
-            return
         # Eligibility blockers are advisory snapshots; the claim below remains
         # the atomic race check. Avoid expensive Docker work when the coordinator
         # already knows an idle-only install cannot currently acquire that claim.
-        if eligibility.action == "install" and eligibility.blocker is not None:
+        # This guard and the coordinator's work-dispatch anchor stamp share ONE
+        # predicate (``dispatch_starts_work``) so "the runner will act" and
+        # "the recovery clock restarts" can never drift apart.
+        if not dispatch_starts_work(eligibility.action, eligibility.blocker):
             return
         try:
             preflight = await self._run_with_check_heartbeat(

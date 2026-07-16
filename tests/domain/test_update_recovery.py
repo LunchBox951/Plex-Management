@@ -9,6 +9,7 @@ from plex_manager.domain.update_recovery import (
     RecoveryAction,
     RecoveryDecision,
     decide_recovery,
+    dispatch_starts_work,
 )
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
@@ -203,6 +204,32 @@ def test_recovery_truth_table_is_exhaustive() -> None:
                         )
                         assert complementary, cell
     assert cells == len(_TABLE_PHASES) * len(_TABLE_ACTIONS) * len(_TABLE_ANCHORS) * 2
+
+
+@pytest.mark.parametrize(
+    ("action", "blocker", "starts_work"),
+    [
+        # Every (action, blocker) shape the eligibility endpoint can emit,
+        # asserted against whether the runner's guard lets work start. The
+        # recovery-clock stamp uses this same predicate, so this table IS the
+        # "stamp exactly when work starts" contract.
+        ("none", None, False),
+        ("none", "coordinator_state_unknown", False),
+        ("none", "requested_action_unknown", False),
+        ("none", "coordinator_phase_busy", False),
+        ("none", "outside_update_window", False),
+        ("check", None, True),
+        # A queued install still awaiting its check: informational only, the
+        # runner performs the check.
+        ("check", "checking_for_update", True),
+        ("install", None, True),
+        # idle_only + active critical work: advisory, the runner returns
+        # without Docker work or a drain claim -- no work starts, no stamp.
+        ("install", "active_critical_work", False),
+    ],
+)
+def test_dispatch_actionability_table(action: str, blocker: str | None, starts_work: bool) -> None:
+    assert dispatch_starts_work(action, blocker) is starts_work
 
 
 @pytest.mark.parametrize("phase", sorted(KNOWN_COORDINATOR_PHASES - BUSY_COORDINATOR_PHASES))

@@ -48,6 +48,29 @@ class RecoveryDecision:
     fence_generation: bool
 
 
+def dispatch_starts_work(action: str, blocker: str | None) -> bool:
+    """Whether the sidecar runner will actually START work for this handout.
+
+    The single source of truth shared by the runner's early-return guard
+    (``plex_manager.updater.runner.UpdateRunner`` consumes eligibility with
+    exactly this predicate) and the eligibility endpoint's work-dispatch
+    anchor stamp, so the two can never drift: the recovery clock must restart
+    exactly when work truly begins, and never for a handout the runner treats
+    as advisory do-nothing.
+
+    * ``action="none"`` hands out nothing.
+    * ``action="install"`` with ANY blocker (e.g. ``active_critical_work``)
+      is advisory: the runner returns without Docker work or a drain claim,
+      so no work starts.
+    * ``action="check"`` always starts a check -- its only blocker shape
+      (``checking_for_update``, a queued install still awaiting its check) is
+      informational and does not stop the runner.
+    """
+    if action == "none":
+        return False
+    return not (action == "install" and blocker is not None)
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
