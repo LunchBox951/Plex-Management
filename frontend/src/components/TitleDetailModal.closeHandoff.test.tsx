@@ -70,7 +70,7 @@ beforeEach(() => {
   ;(useReportIssue as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useCancelRequest as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useWithdrawSubscription as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
-  ;(useTitleRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { requests: [] } })
+  ;(useTitleRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ authoritative: true, data: { requests: [] } })
   ;(useQueue as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { queue: [] } });
 })
 

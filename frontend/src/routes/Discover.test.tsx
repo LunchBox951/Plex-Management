@@ -35,7 +35,7 @@ vi.mock('../api/hooks', () => ({
   useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   // The modal's title-scoped read (issue #370 phase 2) — this suite never opens
   // it with pre-existing request state, so an idle empty read is enough.
-  useTitleRequests: vi.fn(() => ({ data: { requests: [] }, isSuccess: true })),
+  useTitleRequests: vi.fn(() => ({ data: { requests: [] }, authoritative: true })),
 }))
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -119,15 +119,22 @@ function mockHome(items: DiscoverResult[] = [MOVIE], spotlights: DiscoverResult[
   })
 }
 
-/** `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map. */
+/**
+ * `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map.
+ *
+ * `authoritative` mirrors the ONE shared freshness predicate the real
+ * `useTileLiveStates` computes (`useLiveStateAuthority`, issue #397): false
+ * for a cold/invalidated/stale-epoch cache, true once a fetch of the current
+ * observation epoch has settled. The predicate's own truth table is pinned in
+ * api/hooks.test.tsx; these tests pin that the consumer HONORS it.
+ */
 function mockLiveStates(
   states: Record<string, CompactStateField>,
-  options?: { invalidated?: boolean },
+  options?: { authoritative?: boolean },
 ) {
   ;(useTileLiveStates as unknown as Mock).mockReturnValue({
     data: { states },
-    isSuccess: true,
-    invalidated: options?.invalidated ?? false,
+    authoritative: options?.authoritative ?? true,
     dataUpdatedAt: Date.now(),
   })
 }
@@ -255,10 +262,11 @@ describe('Discover — hero-first home (issue #188)', () => {
 describe('Discover — quick-request freshness gate (Codex P2)', () => {
   it('hides the quick-request action while the live-state query is invalidated, even though derived state is null', () => {
     // The bug window: useCreateRequest has invalidated the live-state query after
-    // a season-scoped tv request, but the refetch has not landed. The invalidated
-    // flag is set, so the still-null tile must NOT expose a Request button (a click
-    // would POST a seasons-less, whole-series body).
-    mockLiveStates({}, { invalidated: true })
+    // a season-scoped tv request, but the refetch has not landed. The shared
+    // predicate folds the invalidated flag into `authoritative: false`, so the
+    // still-null tile must NOT expose a Request button (a click would POST a
+    // seasons-less, whole-series body).
+    mockLiveStates({}, { authoritative: false })
     render(<Discover />)
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
@@ -268,8 +276,7 @@ describe('Discover — quick-request freshness gate (Codex P2)', () => {
     // data, which is not proof the title is unrequested. Suppress until we know.
     ;(useTileLiveStates as unknown as Mock).mockReturnValue({
       data: undefined,
-      isSuccess: false,
-      invalidated: false,
+      authoritative: false,
       dataUpdatedAt: 0,
     })
     render(<Discover />)
@@ -277,24 +284,37 @@ describe('Discover — quick-request freshness gate (Codex P2)', () => {
   })
 
   it('hides the quick-request action when the live-state query is in ERROR state', () => {
-    // isFetched would be true here (the fetch COMPLETED — with an error) while
-    // data is still undefined, so every tile derives null with zero request
-    // knowledge. The gate must demand a SUCCESSFUL fetch, not just a finished one.
+    // The fetch COMPLETED — with an error — while data is still undefined, so
+    // every tile derives null with zero request knowledge. The predicate fails
+    // CLOSED on no-data regardless of the fetch having finished.
     ;(useTileLiveStates as unknown as Mock).mockReturnValue({
       data: undefined,
-      isSuccess: false,
       isError: true,
-      isFetched: true,
-      invalidated: false,
+      authoritative: false,
       dataUpdatedAt: 0,
     })
     render(<Discover />)
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
+  it('hides the quick-request action while a reopened surface still serves a STALE cached live-state (issue #397 round 2)', () => {
+    // The round-2 window: this surface previously cached an EMPTY compact
+    // result; a request was created meanwhile from another client with SSE
+    // down, which never invalidates this nested key (Layout's safety-net poll
+    // refetches only its own ['requests'] document). On reopen React Query
+    // serves the old success data while the epoch's refetch runs — cached
+    // data present, `authoritative` false. Trusting it would offer the
+    // seasons-less TV QuickRequestButton for an already-requested show.
+    mockHome([MOVIE, SHOW])
+    mockLiveStates({}, { authoritative: false })
+    render(<Discover />)
+    expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: REQUEST_SHOW })).not.toBeInTheDocument()
+  })
+
   it('shows the quick-request action once the live-state query has settled and the title is still unrequested', () => {
-    // Fetched successfully and not invalidated: the null state is now trustworthy,
-    // so the one-click Request is safe to offer.
+    // A fetch of the current epoch settled and nothing is invalidated: the
+    // null state is now trustworthy, so the one-click Request is safe to offer.
     mockLiveStates({})
     render(<Discover />)
     // getByRole (singular) doubles as a honesty check: the looping row exposes the

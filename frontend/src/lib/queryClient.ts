@@ -27,12 +27,21 @@ export const UPDATE_STATUS_POLL_INTERVAL_MS = 15000
 // store poll above, since the ring buffer is meant to feel "live".
 export const LOG_TAIL_POLL_INTERVAL_MS = 3000
 
+// The app-wide query staleTime. Named (rather than inlined) because the
+// live-state authority predicate (`useLiveStateAuthority`, api/hooks.ts)
+// leans on the SAME freshness judgment via React Query's `isStale`: data
+// younger than this is never refetched on (re)subscribe, so the predicate
+// trusts it at epoch start instead of waiting for a refetch that is never
+// coming — and its tests construct QueryClients with this exact value so
+// they exercise the app's real fresh/stale boundary.
+export const QUERY_STALE_TIME_MS = 1000
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
       refetchOnWindowFocus: false,
-      staleTime: 1000,
+      staleTime: QUERY_STALE_TIME_MS,
     },
   },
 })

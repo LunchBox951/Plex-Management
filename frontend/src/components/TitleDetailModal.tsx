@@ -100,15 +100,18 @@ function asApiError(error: unknown): ApiError {
  */
 type DerivedState =
   | { kind: 'none' }
-  // Issue #397 Codex P2: the title-scoped `requestsQuery` (GET /requests/by-title)
-  // starts cold under its own per-title cache key even when the modal was opened
-  // from a caller that already knows a request exists — a clicked Requests row
-  // (`boundRequestId`) or a badged Discover/Search tile (whose badge comes from
-  // the SEPARATELY-cached `useTileLiveStates` compact poll). Until that query's
-  // first fetch settles, `liveRequest` reads exactly like a genuinely
+  // Issue #397 Codex P2 (rounds 1–2): the title-scoped `requestsQuery`
+  // (GET /requests/by-title) can be non-AUTHORITATIVE even when the modal was
+  // opened from a caller that already knows a request exists — a clicked
+  // Requests row (`boundRequestId`) or a badged Discover/Search tile (whose
+  // badge comes from the SEPARATELY-cached `useTileLiveStates` compact poll):
+  // cold under its own per-title cache key on first open, OR serving a stale
+  // cached answer from a previous open while the reopen's refetch is still in
+  // flight. In both windows `liveRequest` reads exactly like a genuinely
   // title-with-no-request case; folding that into `none` would flash a live,
   // clickable '+ Request' (TV defaulting to the whole series) for a title that
-  // may already have one, risking a duplicate. See the `state` derivation below.
+  // may already have one, risking a duplicate. See the `state` derivation
+  // below — gated on the shared authority predicate, not raw query flags.
   | { kind: 'checking' }
   | { kind: 'pending' }
   | { kind: 'searching' }
@@ -413,9 +416,9 @@ function stateSentence(
 ): string {
   switch (state.kind) {
     case 'checking':
-      // Issue #397: the title-scoped request query hasn't resolved its FIRST
-      // fetch yet — deliberately noncommittal, never "Not in the library and
-      // not requested" (that's `none`'s honest claim once the query settles).
+      // Issue #397: the title-scoped request query isn't authoritative yet —
+      // deliberately noncommittal, never "Not in the library and not
+      // requested" (that's `none`'s honest claim once the query settles).
       return 'Checking for an existing request…'
     case 'none':
       // Presence without a tracked request (issue #131): the discovery
@@ -783,17 +786,26 @@ export function TitleDetailModal({
     return matches.length > 0 ? matches[matches.length - 1]! : null
   }, [queueQuery.data, title, effectiveRequestId, currentSeason, isAdmin])
 
-  // Issue #397 Codex P2: only fold into `deriveState`'s 'none' once the
-  // title-scoped query has had a chance to answer. `isLoading` (react-query:
-  // pending AND in flight) is true only for that FIRST-fetch window — it
-  // flips false as soon as the query settles, success or error, so a failed
-  // fetch still falls through to the ordinary derivation rather than wedging
-  // the action zone shut forever (honesty over silence, north star #3).
+  // Issue #397 Codex P2 (rounds 1–2): only fold into `deriveState`'s 'none'
+  // once the title-scoped query is AUTHORITATIVE — the one shared freshness
+  // predicate computed inside `useTitleRequests` (see `useLiveStateAuthority`,
+  // api/hooks.ts), the same rule the tile quick-request gate reads. Round 1
+  // gated on `isLoading`, which only covers the cold-cache first fetch; a
+  // REOPENED title serves its old cached rows with `isLoading === false`
+  // while the epoch's refetch is still in flight, so a request created
+  // meanwhile (tile quick-request, realtime, another client) would fall
+  // through to 'none' and re-expose '+ Request'. The authority predicate
+  // holds 'checking' through exactly the windows where the cache may be
+  // lying, and releases once a fetch of the current epoch completes —
+  // success or error, so an unreachable backend degrades to best-known state
+  // plus the poll's retries rather than wedging the action zone shut
+  // (honesty over silence, north star #3).
   // `requestId !== null` / `liveRequest !== null` both mean this modal
-  // instance already has a concrete answer (a just-created row, or a poll
-  // that already landed) and skip the gate even mid-fetch.
+  // instance already has a concrete answer (a just-created row, or cached
+  // rows — even slightly stale ones are REAL requests, never a spurious
+  // '+ Request') and skip the gate even mid-fetch.
   const titleRequestsUnresolved =
-    requestId === null && liveRequest === null && requestsQuery.isLoading
+    requestId === null && liveRequest === null && !requestsQuery.authoritative
   const state: DerivedState = titleRequestsUnresolved
     ? { kind: 'checking' }
     : deriveState(
@@ -1358,10 +1370,11 @@ export function TitleDetailModal({
   switch (state.kind) {
     case 'checking':
       // Issue #397 Codex P2: render a neutral, disabled loading affordance —
-      // never '+ Request' — while the title-scoped query's first fetch is
-      // still in flight. A caller-known row/tile can resolve to an ACTIVE
-      // request here; offering a live '+ Request' in that window risks a
-      // duplicate (TV defaults to the whole series).
+      // never '+ Request' — while the title-scoped query is not yet
+      // authoritative (cold first fetch, or a reopen's stale cache still
+      // refetching). A caller-known row/tile can resolve to an ACTIVE request
+      // here; offering a live '+ Request' in that window risks a duplicate
+      // (TV defaults to the whole series).
       actionZone = (
         <Button loading disabled>
           Checking…

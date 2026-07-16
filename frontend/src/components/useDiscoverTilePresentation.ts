@@ -30,7 +30,19 @@ export function useDiscoverTilePresentation(
   const enabled = options?.enabled ?? true
   const liveStates = useTileLiveStates(items, { poll: enabled, enabled })
   const states = liveStates.data?.states
-  const liveSettled = liveStates.isSuccess && !liveStates.invalidated
+  // Issue #397 Codex P2 round 2: `authoritative` is the ONE shared freshness
+  // predicate, computed inside useTileLiveStates (`useLiveStateAuthority`) —
+  // the same rule the title-detail modal gates on. The previous local fold
+  // (`isSuccess && !invalidated`) missed caches that went stale WITHOUT an
+  // invalidation: with SSE down, a request created by another client never
+  // marks this nested live-state key (Layout's safety-net poll refetches only
+  // its own `['requests']` document), so a reopened Search/remounted Discover
+  // would trust the old empty compact result while its refetch was still in
+  // flight — and a TV tile could offer the seasons-less QuickRequestButton
+  // for an already-requested show. `authoritative` additionally requires a
+  // fetch completed in the CURRENT observation epoch, holding the gate shut
+  // through exactly that reopen window.
+  const liveSettled = liveStates.authoritative
 
   const tileState = useCallback(
     (item: DiscoverResult) =>

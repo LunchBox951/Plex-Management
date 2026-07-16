@@ -172,15 +172,18 @@ function setSearch(overrides: Record<string, unknown> = {}) {
   })
 }
 
-/** `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map. */
+/**
+ * `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map.
+ * `authoritative` mirrors the shared freshness predicate the real
+ * `useTileLiveStates` computes (`useLiveStateAuthority`, issue #397).
+ */
 function setLiveStates(
   states: Record<string, CompactStateField> = {},
   overrides: Record<string, unknown> = {},
 ) {
   ;(useTileLiveStates as unknown as Mock).mockReturnValue({
     data: { states },
-    isSuccess: true,
-    invalidated: false,
+    authoritative: true,
     dataUpdatedAt: 300,
     ...overrides,
   })

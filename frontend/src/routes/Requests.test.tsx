@@ -23,7 +23,10 @@ vi.mock('../api/hooks', () => {
   const useRequests = vi.fn()
   return {
     useRequests,
-    useTitleRequests: vi.fn(() => useRequests()),
+    // `authoritative: true` mirrors the settled state of the shared freshness
+    // predicate (issue #397): these tests always click a row that the mocked
+    // list already contains, i.e. the by-title read has "landed".
+    useTitleRequests: vi.fn(() => ({ ...(useRequests() as object), authoritative: true })),
     // Admin context: these route tests exercise the full (admin) modal surface.
     useAuthMe: vi.fn(() => ({
       data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
