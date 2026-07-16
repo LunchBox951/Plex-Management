@@ -41,8 +41,8 @@ from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
 from plex_manager.services.log_capture_service import (
     LogCaptureHandler,
-    redact_log_context,
-    redact_log_message,
+    redact_retired_log_context,
+    redact_retired_log_message,
 )
 from plex_manager.services.update_policy import (
     UPDATE_POLICY_SETTING_KEYS,
@@ -232,8 +232,8 @@ async def _rewrite_before_secret_replacement(
     if not old_values:
         return 0
     return await SqlLogEventRepository(session).rewrite_redactable_fields(
-        lambda message: redact_log_message(message, old_values),
-        lambda context: redact_log_context(context, old_values),
+        lambda message: redact_retired_log_message(message, old_values),
+        lambda context: redact_retired_log_context(context, old_values),
     )
 
 
@@ -241,14 +241,36 @@ async def _rewrite_before_secret_replacement(
 async def _secret_rotation(
     session: AsyncSession,
     request: Request,
-    transition_values: frozenset[str],
-    old_values: frozenset[str],
+    *,
+    retiring_values: frozenset[str],
+    incoming_values: frozenset[str] = frozenset(),
 ) -> AsyncGenerator[None]:
+    """The single transactional boundary for every in-scope secret mutation (ADR-0026).
+
+    All three mutation paths (generic ``PUT /settings`` secret replacement,
+    app-key rotation, app-key revocation) run their historical rewrite and
+    their write (the ``yield`` body) through here, so the lock/rewrite/commit
+    sequence cannot drift between them. ``retiring_values`` are the values
+    leaving ``secret_values()``; ``incoming_values`` are new values the body is
+    about to write (so in-flight emits mask them before they are committed).
+    """
     handler = _log_handler(request)
     async with secret_rotation_lock:
+        # End the request's pre-lock transaction (the same idiom the /logs read
+        # endpoints use): the drain loop may have held the lock first and
+        # committed rows carrying the retiring value AFTER this session already
+        # began reading -- a retained pre-lock snapshot would let the rewrite
+        # below miss those rows, and the final secret_values() read would
+        # regress the handler snapshot to stale values. The rewrite, the
+        # caller's writes, and the final read then share ONE fresh transaction,
+        # committed once -- the write/rewrite atomicity is unchanged.
+        await session.rollback()
+        transition_values = (
+            (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
+        )
         previous_values = handler.begin_secret_rotation(transition_values)
         try:
-            await _rewrite_before_secret_replacement(session, old_values)
+            await _rewrite_before_secret_replacement(session, retiring_values)
             yield
             current_values = await SettingsStore(session).secret_values()
             await session.commit()
@@ -264,7 +286,9 @@ async def _secret_rotation(
             await session.rollback()
             handler.abort_secret_rotation(previous_values)
             raise
-        handler.complete_secret_rotation(previous_values | old_values, current_values)
+        handler.complete_secret_rotation(
+            previous_values, current_values, retired_values=retiring_values
+        )
 
 
 def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:
@@ -797,36 +821,27 @@ async def rotate_app_key_endpoint(
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         old_key = system.app_api_key
         retired_values = frozenset({old_key}) if old_key is not None else frozenset[str]()
-        handler = _log_handler(request)
-        async with secret_rotation_lock:
-            previous_values = handler.begin_secret_rotation(
-                (await SettingsStore(session).secret_values()) | frozenset({new_key})
-            )
-            try:
-                if old_key is not None:
-                    await _rewrite_before_secret_replacement(session, frozenset({old_key}))
-                system.app_api_key = new_key
-                # Invalidate every recovery-cookie session born from the OLD key,
-                # except the acting recovery-cookie admin.
-                await _revoke_recovery_sessions(
-                    session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
-                )
-                current_values = await SettingsStore(session).secret_values()
-                await session.commit()
-            except asyncio.CancelledError:
-                # Restore the snapshot first, then shield the rollback so a
-                # half-cancelled aiosqlite rollback cannot close and poison the
-                # connection shared with the drain loop.
-                handler.abort_secret_rotation(previous_values)
-                await asyncio.shield(session.rollback())
-                raise
-            except Exception:
-                await session.rollback()
-                handler.abort_secret_rotation(previous_values)
-                raise
-            handler.complete_secret_rotation(
-                previous_values | retired_values,
-                current_values,
+        # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
+        # that is safe because every app-key writer holds ``_rotate_lock``
+        # (held here), so the DB value cannot move under us.
+        async with _secret_rotation(
+            session,
+            request,
+            retiring_values=retired_values,
+            incoming_values=frozenset({new_key}),
+        ):
+            # Re-read the row in the boundary's FRESH transaction: the rollback
+            # expired the pre-lock instance, and on a pathological
+            # never-initialized install it would have discarded an uncommitted
+            # ensure_system_settings insert entirely -- refresh() then raises
+            # loudly (the instance is no longer persistent) instead of letting
+            # the key write silently miss the committed transaction.
+            await session.refresh(system)
+            system.app_api_key = new_key
+            # Invalidate every recovery-cookie session born from the OLD key,
+            # except the acting recovery-cookie admin.
+            await _revoke_recovery_sessions(
+                session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
             )
     close_realtime_streams(
         request.app,
@@ -883,31 +898,15 @@ async def revoke_app_key_endpoint(
             await _revoke_recovery_sessions(session)
             await session.commit()
         else:
-            handler = _log_handler(request)
-            async with secret_rotation_lock:
-                previous_values = handler.begin_secret_rotation(
-                    await SettingsStore(session).secret_values()
-                )
-                try:
-                    await _rewrite_before_secret_replacement(session, frozenset({old_key}))
-                    system.app_api_key = None
-                    await _revoke_recovery_sessions(session)
-                    current_values = await SettingsStore(session).secret_values()
-                    await session.commit()
-                except asyncio.CancelledError:
-                    # Restore the snapshot first, then shield the rollback so a
-                    # half-cancelled aiosqlite rollback cannot close and poison
-                    # the connection shared with the drain loop.
-                    handler.abort_secret_rotation(previous_values)
-                    await asyncio.shield(session.rollback())
-                    raise
-                except Exception:
-                    await session.rollback()
-                    handler.abort_secret_rotation(previous_values)
-                    raise
-                handler.complete_secret_rotation(
-                    previous_values | frozenset({old_key}), current_values
-                )
+            # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
+            # safe for the same reason as the rotate path -- every app-key
+            # writer holds ``_rotate_lock`` (held here).
+            async with _secret_rotation(session, request, retiring_values=frozenset({old_key})):
+                # Re-read in the boundary's fresh transaction (see the rotate
+                # path's comment).
+                await session.refresh(system)
+                system.app_api_key = None
+                await _revoke_recovery_sessions(session)
     close_realtime_streams(
         request.app,
         reason="app_key_revoked",
@@ -1240,7 +1239,13 @@ async def put_settings_endpoint(
                 if old_value:
                     old_secret_values_list.append(old_value)
         old_secret_values = frozenset(old_secret_values_list)
-        transition_values = (await store.secret_values()) | frozenset(
+        # Deliberately NOT reading store.secret_values() here: a PUT touching
+        # only non-secret fields must never decrypt stored credentials (codex
+        # #382) -- an unrelated corrupt encrypted value would otherwise 500 a
+        # save of, say, log_retention_days. The rotation boundary reads the
+        # full decrypted set itself, fresh, under the lock -- and only when a
+        # secret actually changes.
+        incoming_secret_values = frozenset(
             _to_stored_string(field, getattr(body, field)) for field in changing_secret_fields
         )
 
@@ -1267,7 +1272,12 @@ async def put_settings_endpoint(
                     )
 
         if changing_secret_fields:
-            async with _secret_rotation(session, request, transition_values, old_secret_values):
+            async with _secret_rotation(
+                session,
+                request,
+                retiring_values=old_secret_values,
+                incoming_values=incoming_secret_values,
+            ):
                 await write_settings()
         else:
             await write_settings()

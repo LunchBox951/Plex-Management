@@ -70,7 +70,7 @@ import contextlib
 import logging
 import threading
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -97,6 +97,8 @@ __all__ = [
     "prune_once",
     "redact_log_context",
     "redact_log_message",
+    "redact_retired_log_context",
+    "redact_retired_log_message",
     "resolve_log_level",
     "stop_logging",
 ]
@@ -259,28 +261,72 @@ def redact_log_message(message: str, secret_values: Iterable[str]) -> str:
     return redact_secrets(redact_known_secrets(message, secret_values))
 
 
-def redact_log_context(
-    context: dict[str, Any] | None, secret_values: Iterable[str]
+def _redact_context_strings(
+    context: dict[str, Any] | None, redact_string: Callable[[str], str]
 ) -> dict[str, Any] | None:
-    """Recursively redact every string leaf and mapping key in JSON context."""
+    """Apply ``redact_string`` to every string leaf and mapping key in JSON context."""
     if context is None:
         return None
-    values = frozenset(secret_values)
 
     def redact(value: object) -> object:
         if isinstance(value, str):
-            return redact_log_message(value, values)
+            return redact_string(value)
         if isinstance(value, list):
             items = cast("list[object]", value)
             return [redact(item) for item in items]
         if isinstance(value, dict):
             mapping = cast("dict[object, object]", value)
-            return {
-                redact_log_message(str(key), values): redact(item) for key, item in mapping.items()
-            }
+            return {redact_string(str(key)): redact(item) for key, item in mapping.items()}
         return value
 
     return cast("dict[str, Any]", redact(context))
+
+
+def redact_log_context(
+    context: dict[str, Any] | None, secret_values: Iterable[str]
+) -> dict[str, Any] | None:
+    """Recursively redact every string leaf and mapping key in JSON context."""
+    values = frozenset(secret_values)
+    return _redact_context_strings(context, lambda value: redact_log_message(value, values))
+
+
+def redact_retired_log_message(
+    message: str,
+    retired_values: Iterable[str],
+    current_values: Iterable[str] = frozenset(),
+) -> str:
+    """Value-first redaction for a rotation rewrite's RETIRING values (ADR-0026).
+
+    ``redact_known_secrets``'s 8-character floor exists so live reads against
+    *currently configured* values never over-redact incidental short strings.
+    A rotation rewrite is the opposite situation: it targets a SPECIFIC value
+    that is leaving ``secret_values()`` forever, so the retiring values are
+    masked exactly, with NO length floor (``min_length=1``). For a very short
+    retiring value (1-3 characters) this deliberately masks every occurrence
+    of that substring in history -- acceptable over-redaction for a retiring
+    credential, versus leaving a real (if short) secret readable once the old
+    value can no longer be redacted at read time. ``current_values`` then get
+    the standard floored value pass, and the shape grammar runs last, matching
+    the established value-first ordering everywhere else.
+    """
+    retired = frozenset(retired_values)
+    return redact_log_message(
+        redact_known_secrets(message, retired, min_length=1),
+        retired | frozenset(current_values),
+    )
+
+
+def redact_retired_log_context(
+    context: dict[str, Any] | None,
+    retired_values: Iterable[str],
+    current_values: Iterable[str] = frozenset(),
+) -> dict[str, Any] | None:
+    """:func:`redact_retired_log_message` applied to every string leaf and key."""
+    retired = frozenset(retired_values)
+    current = frozenset(current_values)
+    return _redact_context_strings(
+        context, lambda value: redact_retired_log_message(value, retired, current)
+    )
 
 
 def _extract_context(record: logging.LogRecord) -> dict[str, Any] | None:
@@ -427,10 +473,19 @@ class LogCaptureHandler(logging.Handler):
         self.secret_values = previous_values
 
     def complete_secret_rotation(
-        self, previous_values: frozenset[str], current_values: frozenset[str]
+        self,
+        previous_values: frozenset[str],
+        current_values: frozenset[str],
+        *,
+        retired_values: frozenset[str] = frozenset(),
     ) -> None:
-        """Redact queued/ring records after commit, then retain current values only."""
-        union = previous_values | current_values
+        """Redact queued/ring records after commit, then retain current values only.
+
+        ``retired_values`` (the values the rotation just removed) are masked
+        with the exact, floorless pass -- see :func:`redact_retired_log_message`
+        -- while the rest of the union keeps the standard floored treatment.
+        """
+        union = previous_values | current_values | retired_values
         queued: list[CapturedLogRecord] = []
         while True:
             try:
@@ -440,8 +495,8 @@ class LogCaptureHandler(logging.Handler):
             queued.append(
                 replace(
                     record,
-                    message=redact_log_message(record.message, union),
-                    context=redact_log_context(record.context, union),
+                    message=redact_retired_log_message(record.message, retired_values, union),
+                    context=redact_retired_log_context(record.context, retired_values, union),
                 )
             )
         for record in queued:
@@ -451,8 +506,8 @@ class LogCaptureHandler(logging.Handler):
                 (
                     replace(
                         record,
-                        message=redact_log_message(record.message, union),
-                        context=redact_log_context(record.context, union),
+                        message=redact_retired_log_message(record.message, retired_values, union),
+                        context=redact_retired_log_context(record.context, retired_values, union),
                     )
                     for record in self.ring_buffer
                 ),

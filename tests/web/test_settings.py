@@ -5258,3 +5258,137 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
         _mutation_request(client, "generic", next_secret), timeout=5.0
     )
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
+async def test_mutation_reopens_transaction_under_lock_before_rewrite(
+    kind: Literal["generic", "rotate", "revoke"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every mutation path ends its pre-lock transaction AFTER acquiring the
+    rotation lock and BEFORE the rewrite (codex #382): a drain that held the
+    lock first may have committed rows carrying the retiring secret, and a
+    retained pre-lock snapshot would let the rewrite miss them and the final
+    ``secret_values()`` read regress the handler snapshot."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_value = f"old-{kind}-fresh-snapshot-secret"
+    new_secret = "new-generic-fresh-snapshot-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source(kind, seed, sessionmaker_, old_value)
+    app.state.log_handler = log_capture_service.LogCaptureHandler()
+    events: list[str] = []
+
+    class _RecordingLock(asyncio.Lock):
+        async def acquire(self) -> Literal[True]:
+            result = await super().acquire()
+            events.append("locked")
+            return result
+
+    lock = _RecordingLock()
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    real_rollback = AsyncSession.rollback
+
+    async def recording_rollback(self: AsyncSession) -> None:
+        events.append("rollback")
+        await real_rollback(self)
+
+    monkeypatch.setattr(AsyncSession, "rollback", recording_rollback)
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+    async def recording_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        events.append("rewrite")
+        return await real_rewrite(session, values)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", recording_rewrite)
+
+    app_key = old_value if kind != "generic" else _API_KEY
+    response = await _mutation_request(client, kind, new_secret, app_key=app_key)
+
+    assert response.status_code == (204 if kind == "revoke" else 200)
+    locked_at = events.index("locked")
+    assert "rewrite" not in events[:locked_at]
+    assert events[locked_at + 1 : locked_at + 3] == ["rollback", "rewrite"]
+
+
+async def test_non_secret_put_never_decrypts_stored_credentials(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PUT touching only non-secret fields must succeed without ever calling
+    ``SettingsStore.secret_values()`` (codex #382): an unrelated corrupt or
+    undecryptable stored credential must not 500 a save of log retention or
+    eviction tuning -- the rotation boundary decrypts only when a secret
+    actually changes."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async def poisoned(self: SettingsStore) -> frozenset[str]:
+        raise RuntimeError("corrupt encrypted credential")
+
+    monkeypatch.setattr(SettingsStore, "secret_values", poisoned)
+    response = await client.put(
+        "/api/v1/settings",
+        json={"log_retention_days": 12},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert response.status_code == 200
+    assert response.json()["log_retention_days"] == 12
+
+
+async def test_short_retired_secret_is_masked_despite_read_floor(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Rotating a secret SHORTER than the 8-char value-redaction floor (e.g. a
+    5-char qBittorrent password) still erases bare occurrences from durable
+    rows, the live ring, and the queue (codex #382): the rewrite's exact-match
+    pass has no floor -- the floor guards live reads against over-redaction,
+    which does not apply to a specific retiring value."""
+    old_value = "abc12"  # 5 chars: below _MIN_SECRET_VALUE_LENGTH
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("qbittorrent_password", old_value)
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=f"durable bare {old_value} occurrence",
+                context_json={old_value: [f"nested {old_value}"]},
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    live_record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live bare {old_value} occurrence",
+        context={"retiring": old_value},
+    )
+    handler.queue.put_nowait(live_record)
+    handler.ring_buffer.append(live_record)
+    app.state.log_handler = handler
+
+    response = await client.put(
+        "/api/v1/settings",
+        json={"qbittorrent_password": "new-longer-password-123"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert response.status_code == 200
+
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert old_value not in row.message
+    assert old_value not in json.dumps(row.context_json)
+    for record in (*tuple(handler.queue._queue), *handler.snapshot_tail(10)):  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+        assert old_value not in record.message
+        assert old_value not in json.dumps(record.context)
