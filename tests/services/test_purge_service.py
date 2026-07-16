@@ -27,6 +27,7 @@ from plex_manager.ports.download_client import (
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
+from tests.support import assert_task_raises
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
 
@@ -138,8 +139,7 @@ async def test_cancelled_purge_with_a_failing_worker_raises_cancelled_not_the_wo
         await asyncio.sleep(0)
         assert not purge_task.done()
         fs.release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await purge_task
+        await assert_task_raises(purge_task, asyncio.CancelledError)
         # Let any deferred "exception never retrieved" callback run.
         await asyncio.sleep(0)
     finally:
