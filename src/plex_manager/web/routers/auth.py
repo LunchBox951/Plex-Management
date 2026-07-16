@@ -134,9 +134,7 @@ async def plex_sign_in_endpoint(
     # ``EncryptedStr`` decrypts transparently on load, so this is the plaintext
     # value the redact-at-rotation pass (ADR-0026) must erase from log history.
     old_token = user.encrypted_plex_token
-    user.email = account.email
-    user.avatar_url = account.avatar_url
-    user.last_login = datetime.now(UTC)
+    staged_permissions = user.permissions  # what _upsert_user just computed/staged
 
     # The commit (below, either shape) persists the staged user-row writes
     # (including any demotion) alongside the new session. Only AFTER that commit
@@ -154,7 +152,7 @@ async def plex_sign_in_endpoint(
         # per-tick ``secret_values()`` refresh picks the new token up exactly as
         # it always has. Neither takes the rotation lock, so the ordinary
         # sign-in path never queues behind a log read/drain/rotation.
-        user.encrypted_plex_token = body.auth_token
+        _apply_signin_fields(user, account, permissions=staged_permissions, token=body.auth_token)
         await _issue_browser_session(session, response, request=request, user_id=user.id)
     else:
         # The stored token VALUE is changing (issue #374): replace it inside the
@@ -177,7 +175,6 @@ async def plex_sign_in_endpoint(
         # safe because only THIS user's sign-in replaces THIS user's token, and
         # two same-account sign-ins racing on the row serialize at the database
         # write — the loser fails closed and can simply retry.
-        staged_permissions = user.permissions  # what _upsert_user just staged
         async with secret_rotation(
             session,
             request,
@@ -201,14 +198,12 @@ async def plex_sign_in_endpoint(
             await SettingsStore(session).set_if_absent(_CLIENT_ID_SETTING, client_identifier)
             # Re-read the user row fresh (raises loudly if it went transient
             # rather than silently dropping the writes), then re-apply this
-            # sign-in's full set of user-row updates.
+            # sign-in's FULL set of user-row updates through the same single
+            # helper the ordinary path uses — the two paths cannot diverge.
             await session.refresh(user)
-            user.username = account.username
-            user.permissions = staged_permissions
-            user.email = account.email
-            user.avatar_url = account.avatar_url
-            user.encrypted_plex_token = body.auth_token
-            user.last_login = datetime.now(UTC)
+            _apply_signin_fields(
+                user, account, permissions=staged_permissions, token=body.auth_token
+            )
             staged = _stage_browser_session(session, user_id=user.id)
             # Deterministically flush the staged token so the boundary's fresh
             # post-yield ``secret_values()`` read narrows to the NEW value.
@@ -715,6 +710,26 @@ async def find_user_by_plex_id(session: AsyncSession, plex_id: int) -> User | No
     """
     result = await session.execute(select(User).where(User.plex_id == plex_id))
     return result.scalars().first()
+
+
+def _apply_signin_fields(user: User, account: PlexAccount, *, permissions: int, token: str) -> None:
+    """Apply EVERY user-row field a sign-in writes — the single source of truth.
+
+    Both sign-in shapes funnel through here: the ordinary path applies it once
+    after :func:`_upsert_user`, and the token-rotation path applies it AGAIN
+    inside the ADR-0026 boundary's fresh transaction (issue #374), whose
+    in-lock rollback discards all pre-lock staging. Keeping the field list in
+    one function means a future user-row field cannot be added to one path and
+    silently dropped from the other — add it here and both paths carry it.
+    (:func:`_upsert_user` also stages ``username``/``permissions`` while
+    computing the demotion flag; re-applying the same values here is a no-op.)
+    """
+    user.username = account.username
+    user.permissions = permissions
+    user.email = account.email
+    user.avatar_url = account.avatar_url
+    user.encrypted_plex_token = token
+    user.last_login = datetime.now(UTC)
 
 
 async def _upsert_user(

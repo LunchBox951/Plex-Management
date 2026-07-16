@@ -1230,17 +1230,21 @@ async def _seed_user_with_token(
     username: str,
     token: str,
     permissions: int = 1,
-) -> None:
+    email: str | None = None,
+    avatar_url: str | None = None,
+) -> int:
     async with sessionmaker_() as session:
-        session.add(
-            User(
-                plex_id=plex_id,
-                username=username,
-                permissions=permissions,
-                encrypted_plex_token=token,
-            )
+        user = User(
+            plex_id=plex_id,
+            username=username,
+            permissions=permissions,
+            encrypted_plex_token=token,
+            email=email,
+            avatar_url=avatar_url,
         )
+        session.add(user)
         await session.commit()
+        return user.id
 
 
 async def _seed_rotation_fixture(
@@ -1628,6 +1632,60 @@ async def test_concurrent_sign_ins_for_two_users_serialize_and_keep_each_other_m
     assert user_a.encrypted_plex_token == a_new
     assert user_b.encrypted_plex_token == b_new
     assert {a_new, b_new}.issubset(handler.secret_values)
+
+
+async def test_rotating_sign_in_reapplies_every_user_field_and_demotes(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Divergence guard for the rotation branch's re-staged writes (issue #374):
+    the seeded row differs from the sign-in-computed value on EVERY mutable
+    field (stale username/email/avatar, admin permissions against a now
+    shared-only account, old token), the token rotates in the SAME sign-in,
+    and the committed row must reflect ALL the new values — a re-apply dropped
+    from the boundary's fresh transaction fails loudly here instead of being
+    masked by ``session.refresh()`` restoring a coincidentally-equal value.
+    The demotion stream-close must still fire post-commit."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    user_id = await _seed_user_with_token(
+        sessionmaker_,
+        plex_id=42,
+        username="stale-name",
+        token=_OLD_PLEX_TOKEN,
+        permissions=1,
+        email="stale@example.test",
+        avatar_url="https://stale.example/avatar",
+    )
+    fresh_account: dict[str, object] = {
+        "id": 42,
+        "uuid": "owner-uuid",
+        "username": "fresh-name",
+        "title": "fresh-name",
+        "email": "fresh@example.test",
+        "thumb": "https://plex.tv/users/owner-uuid/avatar?c=2",
+    }
+    # Only SHARED (not owned) access to the configured server now: admin -> non-admin.
+    await _use_transport(app, _plex_tv_transport(user=fresh_account, resources=[_shared_server()]))
+    subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=user_id)
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+
+    assert response.status_code == 200
+    assert response.json()["user"]["is_admin"] is False
+    # The demotion committed inside the rotation boundary still closes the
+    # user's realtime streams afterwards (issue #183 ordering preserved).
+    assert subscription.closed is True
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+    assert user.username == "fresh-name"
+    assert user.permissions == 0
+    assert user.email == "fresh@example.test"
+    assert user.avatar_url == "https://plex.tv/users/owner-uuid/avatar?c=2"
+    assert user.encrypted_plex_token == _NEW_PLEX_TOKEN
+    assert user.last_login is not None
 
 
 async def test_short_retired_token_is_erased_despite_read_floor(
