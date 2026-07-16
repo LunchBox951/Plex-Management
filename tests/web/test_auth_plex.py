@@ -21,13 +21,14 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
 from plex_manager.models import AuthSession, Setting, SystemSettings, User
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
+from plex_manager.web.errors import AppError
 from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers import auth as auth_module
 
@@ -626,9 +627,184 @@ async def test_error_body_never_leaks_token(
     assert distinctive not in response.text
 
 
+def _throttle_request(host: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/auth/plex",
+            "headers": [],
+            "client": (host, 12345),
+            "scheme": "http",
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Cookie security
+# --------------------------------------------------------------------------- #
+def _cookie_header(headers: list[str], name: str) -> str:
+    return next(header for header in headers if header.startswith(f"{name}="))
+
+
+async def _sign_in_for_cookie_test(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> httpx.Response:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert response.status_code == 200
+    return response
+
+
+async def test_cookie_secure_unset_ignores_forwarded_https_on_direct_http(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", raising=False)
+    get_settings.cache_clear()
+    client.headers["X-Forwarded-Proto"] = "https"
+    response = await _sign_in_for_cookie_test(app, client, seed, sessionmaker_)
+
+    headers = response.headers.get_list("set-cookie")
+    assert "Secure" not in _cookie_header(headers, "plexmgr.session")
+    assert "Secure" not in _cookie_header(headers, "plexmgr.csrf")
+
+
+async def test_cookie_secure_follows_https_scheme_when_unset(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", raising=False)
+    get_settings.cache_clear()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://localhost") as client:
+        response = await _sign_in_for_cookie_test(app, client, seed, sessionmaker_)
+
+    headers = response.headers.get_list("set-cookie")
+    assert "Secure" in _cookie_header(headers, "plexmgr.session")
+    assert "Secure" in _cookie_header(headers, "plexmgr.csrf")
+
+
+async def test_cookie_secure_true_overrides_http_scheme(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", "true")
+    get_settings.cache_clear()
+    response = await _sign_in_for_cookie_test(app, client, seed, sessionmaker_)
+
+    headers = response.headers.get_list("set-cookie")
+    assert "Secure" in _cookie_header(headers, "plexmgr.session")
+    assert "Secure" in _cookie_header(headers, "plexmgr.csrf")
+
+
+async def test_cookie_secure_false_overrides_https_scheme(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", "false")
+    get_settings.cache_clear()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://localhost") as client:
+        response = await _sign_in_for_cookie_test(app, client, seed, sessionmaker_)
+
+    headers = response.headers.get_list("set-cookie")
+    assert "Secure" not in _cookie_header(headers, "plexmgr.session")
+    assert "Secure" not in _cookie_header(headers, "plexmgr.csrf")
+
+
+async def test_logout_cookie_deletion_matches_explicit_secure_setting(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", "true")
+    get_settings.cache_clear()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://localhost"
+    ) as secure_client:
+        signin = await _sign_in_for_cookie_test(app, secure_client, seed, sessionmaker_)
+        logout = await secure_client.post(
+            "/api/v1/auth/logout",
+            headers={"X-CSRF-Token": signin.cookies["plexmgr.csrf"]},
+        )
+    assert logout.status_code == 204
+    headers = logout.headers.get_list("set-cookie")
+    assert "Secure" in _cookie_header(headers, "plexmgr.session")
+    assert "Secure" in _cookie_header(headers, "plexmgr.csrf")
+    assert "Max-Age=0" in _cookie_header(headers, "plexmgr.session")
+    assert "Max-Age=0" in _cookie_header(headers, "plexmgr.csrf")
+
+
 # --------------------------------------------------------------------------- #
 # Throttle
 # --------------------------------------------------------------------------- #
+def test_sign_in_throttle_evicts_stale_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: now)
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.1"))  # pyright: ignore[reportPrivateUsage]
+
+    now += auth_module._SIGN_IN_WINDOW_SECONDS + 1  # pyright: ignore[reportPrivateUsage]
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.2"))  # pyright: ignore[reportPrivateUsage]
+
+    assert "198.51.100.1" not in auth_module._sign_in_attempts  # pyright: ignore[reportPrivateUsage]
+    assert "198.51.100.2" in auth_module._sign_in_attempts  # pyright: ignore[reportPrivateUsage]
+
+
+def test_sign_in_throttle_preserves_active_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: now)
+    request = _throttle_request("198.51.100.1")
+    for _ in range(10):
+        auth_module._throttle_sign_in(request)  # pyright: ignore[reportPrivateUsage]
+
+    now += auth_module._SIGN_IN_WINDOW_SECONDS - 1  # pyright: ignore[reportPrivateUsage]
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.2"))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(AppError) as error:
+        auth_module._throttle_sign_in(request)  # pyright: ignore[reportPrivateUsage]
+
+    assert error.value.code == "sign_in_throttled"
+    assert "198.51.100.1" in auth_module._sign_in_attempts  # pyright: ignore[reportPrivateUsage]
+
+
+def test_sign_in_throttle_allows_new_window_after_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: now)
+    request = _throttle_request("198.51.100.1")
+    for _ in range(10):
+        auth_module._throttle_sign_in(request)  # pyright: ignore[reportPrivateUsage]
+
+    now += auth_module._SIGN_IN_WINDOW_SECONDS + 1  # pyright: ignore[reportPrivateUsage]
+    auth_module._throttle_sign_in(request)  # pyright: ignore[reportPrivateUsage]
+    assert auth_module._sign_in_attempts["198.51.100.1"] == [now]  # pyright: ignore[reportPrivateUsage]
+
+
+def test_sign_in_throttle_does_not_evict_live_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: now)
+    for index in range(100):
+        auth_module._throttle_sign_in(_throttle_request(f"198.51.100.{index}"))  # pyright: ignore[reportPrivateUsage]
+
+    assert len(auth_module._sign_in_attempts) == 100  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_sign_in_throttled_after_limit(
     client: httpx.AsyncClient,
     app: FastAPI,

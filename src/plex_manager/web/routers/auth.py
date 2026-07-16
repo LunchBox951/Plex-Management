@@ -80,7 +80,9 @@ _COOKIE_PATH = "/"
 # In-process, per-client-IP sign-in throttle. A best-effort abuse brake for the
 # ONE unauthenticated write endpoint, not a security boundary: it is deliberately
 # simple (a sliding 60s window in a module-level dict), resets on restart, and is
-# per-process. Tests clear it via ``reset_sign_in_throttle``.
+# per-process. Stale-key cleanup reclaims expired bookkeeping but cannot cap the
+# number of simultaneously live keys without changing per-key admission behavior.
+# Tests clear it via ``reset_sign_in_throttle``.
 _SIGN_IN_MAX_PER_MINUTE = 10
 _SIGN_IN_WINDOW_SECONDS = 60.0
 _sign_in_attempts: dict[str, list[float]] = {}
@@ -567,10 +569,23 @@ def _sign_in_throttle_key(request: Request) -> str:
     return trusted_suffix[0]
 
 
+def _evict_stale_sign_in_throttle_keys(now: float) -> None:
+    """Drop keys whose complete attempt history is outside the active window."""
+    window_start = now - _SIGN_IN_WINDOW_SECONDS
+    stale_keys = [
+        key
+        for key, attempts in _sign_in_attempts.items()
+        if not any(stamp > window_start for stamp in attempts)
+    ]
+    for key in stale_keys:
+        del _sign_in_attempts[key]
+
+
 def _throttle_sign_in(request: Request) -> None:
     """Reject a client IP that exceeds the sliding-window sign-in budget."""
-    key = _sign_in_throttle_key(request)
     now = time.monotonic()
+    _evict_stale_sign_in_throttle_keys(now)
+    key = _sign_in_throttle_key(request)
     window_start = now - _SIGN_IN_WINDOW_SECONDS
     attempts = [stamp for stamp in _sign_in_attempts.get(key, []) if stamp > window_start]
     if len(attempts) >= _SIGN_IN_MAX_PER_MINUTE:
@@ -769,8 +784,8 @@ def _cookie_secure(request: Request) -> bool:
     """Whether the session/CSRF cookies carry the ``Secure`` attribute.
 
     An explicit ``auth_cookie_secure`` override wins; otherwise the flag follows
-    the request scheme, so a plain-http LAN install does not set ``Secure`` (the
-    browser would silently refuse to send it back) while an https deployment does.
+    the direct request scheme. The app deliberately does not trust
+    ``X-Forwarded-Proto``; TLS-terminating proxies must set the explicit override.
     """
     configured = get_settings().auth_cookie_secure
     if configured is not None:

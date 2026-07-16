@@ -132,7 +132,8 @@ class Settings(BaseSettings):
     downloads_root: str | None = None
 
     # Override auth-cookie Secure handling for TLS-terminating reverse proxies.
-    # ``None`` means infer from the request scheme.
+    # ``None`` means infer only from the direct request scheme; it does not trust
+    # ``X-Forwarded-Proto``. Set true explicitly when a proxy terminates TLS.
     auth_cookie_secure: bool | None = None
 
     # How many trusted reverse-proxy hops sit in front of this app. ``0`` (default)
