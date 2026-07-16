@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -114,6 +115,8 @@ from plex_manager.web.setup_validation import (
 )
 
 __all__ = ["router", "secret_rotation"]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -246,8 +249,8 @@ async def _commit_and_complete(
 ) -> None:
     """Read the post-write secret set, commit, then run the completion sweep.
 
-    The one indivisible unit :func:`secret_rotation` shields against
-    cancellation (issue #389 facet 1): the ``secret_values()`` read sees this
+    The one indivisible unit :func:`secret_rotation` protects from cancellation
+    (issue #389 facet 1): the ``secret_values()`` read sees this
     request's flushed-but-uncommitted new values, the commit makes them durable,
     and only then does :meth:`~plex_manager.services.log_capture_service.
     LogCaptureHandler.complete_secret_rotation` rewrite the queue/ring and narrow
@@ -303,12 +306,13 @@ async def secret_rotation(
        possibly-stale pre-lock read; the ``yield`` body is where a caller
        re-reads settings and re-evaluates any access decision (facet 4).
 
-    c. **Shielded commit + cleanup.** The post-write ``secret_values()`` read,
+    c. **Protected commit + cleanup.** The post-write ``secret_values()`` read,
        the commit, and the completion sweep run as one non-cancellable unit
-       (:func:`_commit_and_complete`, shielded below), so a cancellation that
-       arrives once the commit is durable can never skip the sweep and strand a
-       retired value in the queue/ring after it has left ``secret_values()``
-       (facet 1).
+       (:func:`_commit_and_complete`, awaited to completion below with any
+       request cancellation remembered and re-raised only afterwards), so a
+       cancellation that arrives once the commit is durable can never skip the
+       sweep and strand a retired value in the queue/ring after it has left
+       ``secret_values()`` (facet 1).
     """
     handler = _log_handler(request)
     # (a) Release any pre-lock write transaction BEFORE we start waiting on the
@@ -345,27 +349,81 @@ async def secret_rotation(
             await session.rollback()
             handler.abort_secret_rotation(previous_values)
             raise
-        # (c) Commit + completion sweep as one shielded, non-cancellable unit. A
+        # (c) Commit + completion sweep as one non-cancellable unit. A
         # cancellation delivered while this runs is REMEMBERED and re-raised only
         # AFTER the unit finishes, so the commit and its sweep are never torn
-        # apart. ``ensure_future`` gives a single stable task to re-shield across
+        # apart. ``ensure_future`` gives a single stable task to re-await across
         # repeated cancellations; the loop exits only when it is ``done()``.
+        #
+        # ``asyncio.wait`` -- deliberately NOT ``asyncio.shield`` -- observes the
+        # unit's completion WITHOUT retrieving its outcome and WITHOUT
+        # propagating cancellation into it (cancelling this await leaves
+        # ``commit_task`` running untouched, the same protection shield gave).
+        # ``shield`` would additionally re-raise the unit's exception out of
+        # whichever await happened to be watching, and -- once a previous await
+        # had been cancelled -- have its internal done-callback report
+        # "exception in shielded future" through the loop's exception handler: a
+        # second, unordered consumption path for the same outcome. With ``wait``
+        # the unit's outcome has exactly ONE consumer, the check below.
         commit_task = asyncio.ensure_future(
             _commit_and_complete(session, handler, previous_values, retiring_values=retiring_values)
         )
         pending_cancel: asyncio.CancelledError | None = None
         while not commit_task.done():
             try:
-                await asyncio.shield(commit_task)
+                await asyncio.wait({commit_task})
             except asyncio.CancelledError as exc:
+                # The REQUEST was cancelled, never the unit: remember it and
+                # keep waiting for the unit to settle.
                 pending_cancel = exc
-            except Exception:
-                # Commit (or the pre-commit read) failed: no rotation landed, so
-                # roll back and restore the snapshot exactly like a pre-commit
-                # failure. The sweep inside the unit never ran.
+        # Consume the unit's outcome exactly once, HERE, by inspecting the task
+        # itself -- never by trusting what some await happened to re-raise
+        # (codex #399 round 1). The interleaving that made this mandatory: a
+        # cancellation is remembered above while the unit is still in flight,
+        # then the unit FAILS -- the loop exits via its ``done()`` condition
+        # without any await having raised the failure. Falling through to
+        # ``raise pending_cancel`` at that point would skip the rollback +
+        # snapshot restore (leaving the in-memory redaction set widened with
+        # the rotation rolled back) AND bury the real commit failure behind a
+        # silent cancellation (an "exception was never retrieved" warning at
+        # best) -- both honesty violations. ``commit_task`` itself is never
+        # cancelled (nothing cancels it; the awaits above absorb the request's
+        # cancellation), so ``exception()`` cannot raise ``CancelledError``.
+        unit_error = commit_task.exception()
+        if unit_error is not None:
+            # Commit (or the pre-commit read) failed: no rotation landed. The
+            # sweep inside the unit never ran. Restore the in-memory snapshot
+            # FIRST -- synchronous, so it runs even when a delivered
+            # cancellation is being re-raised at every await below (an anyio
+            # cancel scope re-cancels each checkpoint until the request task
+            # unwinds).
+            handler.abort_secret_rotation(previous_values)
+            if pending_cancel is None:
                 await session.rollback()
-                handler.abort_secret_rotation(previous_values)
-                raise
+                raise unit_error
+            # BOTH happened: the request was cancelled AND the unit failed.
+            # Cancellation must still win the re-raise -- the server's task
+            # machinery expects a cancelled request task to end cancelled, and
+            # replacing the CancelledError with another exception would break
+            # that protocol mid-teardown. But a bare CancelledError is exactly
+            # the silent path cancelled requests get (nothing renders it), so
+            # the failure is surfaced FIRST through the durable log pipeline
+            # (state, not silence; synchronous, immune to the re-delivery),
+            # and chained as the cancellation's cause for any consumer that
+            # does render the traceback.
+            _logger.error(
+                "secret rotation commit failed while the request was being "
+                "cancelled; the rotation was rolled back",
+                exc_info=unit_error,
+            )
+            # SHIELD the rollback so its DB op completes even though this very
+            # await is (re-)cancelled under the caller's cancel scope -- the
+            # same pattern as the pre-yield cancel handler above. When the
+            # scope re-cancels here, the escaping CancelledError IS the
+            # honored cancellation (cleanup already done); otherwise the
+            # explicit re-raise below honors the remembered one.
+            await asyncio.shield(session.rollback())
+            raise pending_cancel from unit_error
         if pending_cancel is not None:
             raise pending_cancel
 

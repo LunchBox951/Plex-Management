@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Literal
@@ -2161,6 +2162,104 @@ async def test_cancel_during_commit_still_runs_the_completion_sweep(
         assert _OLD_PLEX_TOKEN not in json.dumps(record.context)
     assert _OLD_PLEX_TOKEN not in handler.secret_values  # snapshot narrowed
     assert _NEW_PLEX_TOKEN in handler.secret_values
+
+
+async def test_cancel_plus_commit_failure_restores_snapshot_and_surfaces_the_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex #399 round 1: a cancellation remembered while the commit unit is in
+    flight, followed by the unit FAILING, must not fall through to the bare
+    re-raised ``CancelledError``. The boundary inspects the unit's outcome
+    before honoring the cancellation: the rollback + ``abort_secret_rotation``
+    failure path runs (snapshot restored, retiring set cleared — the widened
+    in-memory redaction state never outlives the rolled-back rotation), the
+    real failure is surfaced through the log pipeline with its traceback (its
+    retrieval here is also what prevents an 'exception was never retrieved'
+    warning), and the request still ends CANCELLED — cancellation wins the
+    re-raise (the server's task machinery expects a cancelled task to end
+    cancelled), with the failure chained as its ``__cause__``."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    await _insert_log_event(sessionmaker_, _OLD_PLEX_TOKEN)
+    handler = _live_handler_with(_OLD_PLEX_TOKEN)
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    before_queue = tuple(_drain_queue(handler))
+    for record in before_queue:
+        handler.queue.put_nowait(record)
+    before_ring = tuple(handler.ring_buffer)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    lock = _ObservableLock()
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
+    rewrite_finished = False
+    entered_commit = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def failing_paused_commit(self: AsyncSession) -> None:
+        if not rewrite_finished:
+            await real_commit(self)
+            return
+        # The boundary's commit unit is now in flight. Pause so the test can
+        # deliver (and have the loop REMEMBER) a cancellation first, then FAIL.
+        entered_commit.set()
+        await _wait_for_event(release_commit)
+        raise RuntimeError("rotation commit failed")
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", failing_paused_commit)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    )
+    await _wait_for_event(entered_commit)
+    task.cancel()
+    # Let the cancellation reach the boundary's shield await and be remembered
+    # (pending_cancel) while the unit is still paused -- the exact interleaving
+    # the finding describes.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger=settings_router.__name__):
+        release_commit.set()
+        await assert_task_raises(task, asyncio.CancelledError)
+    await asyncio.wait_for(lock.releases.get(), timeout=5.0)
+
+    # The real failure was surfaced (state, not silence), traceback attached.
+    failure_records = [
+        record
+        for record in caplog.records
+        if "secret rotation commit failed" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    exc_info = failure_records[0].exc_info
+    assert exc_info is not None and isinstance(exc_info[1], RuntimeError)
+    # The failure path ran: snapshot restored, retiring set cleared, live
+    # surfaces byte-identical, lock released and reusable.
+    assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})
+    assert handler.retiring_values == frozenset()
+    assert tuple(_drain_queue(handler)) == before_queue
+    assert tuple(handler.ring_buffer) == before_ring
+    assert lock.locked() is False
+    # Nothing durable landed: token, sessions, and history are untouched.
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        sessions = (await db.execute(select(AuthSession))).scalars().all()
+        row = (await db.execute(select(LogEvent))).scalars().one()
+    assert user.encrypted_plex_token == _OLD_PLEX_TOKEN
+    assert sessions == []
+    assert row.message == f"durable {_OLD_PLEX_TOKEN}"
 
 
 async def test_concurrent_same_account_rotations_retire_the_current_stored_token(
