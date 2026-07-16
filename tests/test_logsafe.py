@@ -1595,6 +1595,78 @@ def test_redact_known_secrets_masks_bounded_two_stage_percent_and_base64_variant
     )
 
 
+def test_redact_known_secrets_masks_base64_of_lowercase_percent_variant() -> None:
+    """#381: the base64-of-percent nested family (see
+    ``_secret_value_variants``) only base64'd the CANONICAL uppercase-hex
+    ``quote``/``quote_plus`` spelling -- once base64-wrapped, ``_variant_regex``'s
+    case-insensitive hex classes can no longer reach the escapes (they operate
+    on literal ``%XX`` text, not an opaque base64 blob), so a client that
+    lowercases its percent-hex (``%2f``) BEFORE base64-ing produced a rendering
+    outside the generated set and leaked. A uniform-lowercase percent spelling
+    must be base64'd alongside the canonical uppercase one (standard/urlsafe x
+    padded/unpadded, all four forms, for both ``quote`` and ``quote_plus``)."""
+    value = "sample /?=A9-marker"
+
+    def _b64_spellings(data: bytes) -> set[str]:
+        standard = base64.b64encode(data).decode("ascii")
+        urlsafe = base64.urlsafe_b64encode(data).decode("ascii")
+        return {standard, standard.rstrip("="), urlsafe, urlsafe.rstrip("=")}
+
+    canonical_percent = {
+        quote(value, safe="", errors="surrogatepass"),
+        quote_plus(value, safe="", errors="surrogatepass"),
+    }
+    assert any(re.search(r"%[0-9A-Fa-f]{2}", spelling) for spelling in canonical_percent)
+
+    lowercase_percent = {
+        re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group().lower(), spelling)
+        for spelling in canonical_percent
+    }
+    # The lowercase spellings really do differ from the canonical ones -- else
+    # this test would pass vacuously against the pre-fix behavior too.
+    assert lowercase_percent.isdisjoint(canonical_percent)
+
+    base64_of_lowercase_percent = {
+        spelling
+        for lower in lowercase_percent
+        for spelling in _b64_spellings(lower.encode("ascii"))
+    }
+    assert base64_of_lowercase_percent
+    for rendering in base64_of_lowercase_percent:
+        result = redact_known_secrets(f"before:{rendering}:after", [value])
+        assert rendering not in result, rendering
+        assert result == "before:<redacted>:after"
+
+
+def test_redact_known_secrets_masks_base64_of_lowercase_percent_plus_variant() -> None:
+    """Same #381 gap, isolated to ``quote_plus``'s ``+``-for-space spelling
+    (rather than ``quote``'s ``%20``) to pin both first-percent encoders are
+    covered, not just one."""
+    value = "two words/and-a-slash"
+    lower_plus = quote_plus(value, safe="", errors="surrogatepass").lower()
+    assert "%2f" in lower_plus  # a real lowercase escape, not a vacuous case
+    rendering = base64.b64encode(lower_plus.encode("ascii")).decode("ascii")
+    result = redact_known_secrets(f"payload={rendering} end", [value])
+    assert rendering not in result
+    assert "<redacted>" in result
+
+
+def test_redact_known_secrets_still_respects_nested_candidate_bounds() -> None:
+    """#376's ``_MAX_NESTED_CANDIDATE_LENGTH``/``_MAX_NESTED_CANDIDATES`` bounds
+    must still hold after #381 widens the base64-of-percent family: a long
+    value's depth-two candidates (now including the lowercase-percent leg) stay
+    unmasked, exactly as before #381. A ``/`` near the front forces a genuine
+    percent escape (else ``quote`` would leave the value -- all letters/digits/
+    ``-`` -- byte-identical, collapsing this into the always-generated raw-base64
+    one-step variant instead of exercising the depth-two length cap)."""
+    value = "long/secret-" + "x" * 17000
+    lower_percent = quote(value, safe="", errors="surrogatepass").lower()
+    assert lower_percent != value  # a real percent escape was actually produced
+    base64_of_lower_percent = base64.b64encode(lower_percent.encode("ascii")).decode("ascii")
+    assert len(base64_of_lower_percent) > 16 * 1024  # exceeds _MAX_NESTED_CANDIDATE_LENGTH
+    assert redact_known_secrets(base64_of_lower_percent, [value]) == base64_of_lower_percent
+
+
 def test_simplecookie_repr_session_token_is_masked_by_shape_grammar() -> None:
     """#292: ``http.cookies.SimpleCookie``'s repr -- ``<SimpleCookie:
     plexmgr.session='SECRET'>`` (unquoted name, ``=``, quoted value) -- is

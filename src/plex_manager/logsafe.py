@@ -760,6 +760,14 @@ def _variant_regex(variant: str) -> str:
     return "".join(parts)
 
 
+#: Bare ``%XX`` escape used to GENERATE a concrete lowercase-hex percent
+#: spelling (see :func:`_secret_value_variants`'s nested base64-of-percent
+#: family). Distinct from :data:`_HEX_ESCAPE_RE`, which is used to build a
+#: case-INSENSITIVE matcher at scan time -- this one substitutes into an actual
+#: candidate string, so it only needs the plain percent form.
+_PERCENT_HEX_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
 def _secret_value_variants(value: str) -> frozenset[str]:
     """Every literal RENDERING of ``value`` this pass will mask -- the raw value
     plus the encoded spellings the same secret arrives in when a client, proxy,
@@ -781,8 +789,15 @@ def _secret_value_variants(value: str) -> frozenset[str]:
       contexts; #292 items).
     * **Bounded composed encodings** -- each first-layer percent spelling also
       gets one explicit second percent transform and one base64 transform; each
-      raw base64 spelling gets one percent transform. No derived value is
-      transformed outside these listed depth-two paths.
+      raw base64 spelling gets one percent transform. The base64-of-percent leg
+      base64s BOTH the canonical (``quote``/``quote_plus``) uppercase-hex
+      spelling and a uniform-lowercase-hex spelling of the same percent text --
+      unlike the pure-percent legs, this one wraps the ``%XX`` escapes in
+      base64, which turns them into an opaque blob :func:`_variant_regex`'s
+      case-insensitive hex classes can no longer reach at match time, so the
+      lowercase spelling a client that emits lowercase percent-hex (``%2f``)
+      before base64-ing must be generated explicitly up front (#381). No
+      derived value is transformed outside these listed depth-two paths.
     * **JSON- / repr-escaped string bodies** -- a secret containing a quote,
       backslash, or non-ASCII character renders ESCAPED inside a JSON-encoded
       log field (``{"password": "a\\"b"}``, ``p\\u00e4ss...``) or a Python
@@ -813,6 +828,16 @@ def _secret_value_variants(value: str) -> frozenset[str]:
         urlsafe = base64.urlsafe_b64encode(data).decode("ascii")
         return (standard, standard.rstrip("="), urlsafe, urlsafe.rstrip("="))
 
+    def _lowercase_percent_hex(spelling: str) -> str:
+        # A uniform-lowercase-hex percent spelling of an already percent-
+        # encoded string: only the ``%XX`` escapes' hex digits are lowered,
+        # non-escape characters (which ARE case-significant) are untouched.
+        # ``quote``/``quote_plus`` always emit uppercase hex, so this is the
+        # concrete second spelling the base64-of-percent nested family needs
+        # (#381) -- deliberately scoped to this one spelling, not full 2^k
+        # mixed-case enumeration.
+        return _PERCENT_HEX_RE.sub(lambda m: m.group().lower(), spelling)
+
     variants = {value}
     first_percent = _percent_spellings(value)
     variants.update(first_percent)
@@ -821,12 +846,22 @@ def _secret_value_variants(value: str) -> frozenset[str]:
     variants.add(json.dumps(value)[1:-1])
     variants.add(repr(value)[1:-1])
 
+    # dict.fromkeys, not a set: dedupes value==lowercase(value) cases while
+    # keeping candidate order deterministic (str hash randomization would
+    # otherwise make the _MAX_NESTED_CANDIDATES cut non-reproducible).
+    percent_hex_spellings = tuple(
+        dict.fromkeys(
+            spelling
+            for first in first_percent
+            for spelling in (first, _lowercase_percent_hex(first))
+        )
+    )
     nested_families: tuple[tuple[str, ...], ...] = (
         tuple(candidate for first in first_percent for candidate in _percent_spellings(first)),
         tuple(
             candidate
-            for first in first_percent
-            for candidate in _base64_spellings(first.encode("ascii"))
+            for spelling in percent_hex_spellings
+            for candidate in _base64_spellings(spelling.encode("ascii"))
         ),
         tuple(candidate for spelling in raw_base64 for candidate in _percent_spellings(spelling)),
     )
