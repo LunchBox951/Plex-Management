@@ -74,6 +74,7 @@ from plex_manager.web.routers.settings import (
     _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.web.schemas import SettingsResponse, SettingsUpdate
+from tests.support import assert_task_raises
 
 # The float/int typed-key groups MIRROR the explicit per-key resolver branches in
 # ``_sanitize_typed_settings`` (each key has its own resolver + default, so the
@@ -5094,8 +5095,7 @@ async def test_drain_holds_rotation_lock_before_mutation_and_retired_row_is_rewr
     await _wait_for_event(lock.second_acquire_started)
     assert not mutation.done()
     release_drain.set()
-    with pytest.raises(_StopDrainLoop):
-        await drain
+    await assert_task_raises(drain, _StopDrainLoop)
     response = await asyncio.wait_for(mutation, timeout=5.0)
 
     assert response.status_code == (204 if kind == "revoke" else 200)
@@ -5150,8 +5150,7 @@ async def test_mutation_holds_rotation_lock_before_drain_and_drain_reads_final_s
     assert response.status_code == (204 if kind == "revoke" else 200)
     await _wait_for_event(entered_drain)
     release_drain.set()
-    with pytest.raises(_StopDrainLoop):
-        await drain
+    await assert_task_raises(drain, _StopDrainLoop)
 
     assert old_value not in handler.secret_values
     if kind == "generic":
@@ -5228,8 +5227,7 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
         cancelled = asyncio.create_task(_mutation_request(client, "generic", next_secret))
         await _wait_for_event(entered)
         cancelled.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await cancelled
+        await assert_task_raises(cancelled, asyncio.CancelledError)
         await asyncio.wait_for(lock.releases.get(), timeout=5.0)
         monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", real_rewrite)
     else:
@@ -5251,8 +5249,7 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
     drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
     await _wait_for_event(entered_drain)
     release_drain.set()
-    with pytest.raises(_StopDrainLoop):
-        await drain
+    await assert_task_raises(drain, _StopDrainLoop)
 
     response = await asyncio.wait_for(
         _mutation_request(client, "generic", next_secret), timeout=5.0
