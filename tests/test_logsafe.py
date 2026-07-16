@@ -16,11 +16,13 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from http.cookies import SimpleCookie
 from urllib.parse import quote, quote_plus, urlsplit
 
 import pytest
 
+import plex_manager.logsafe as logsafe
 from plex_manager.logsafe import (
     redact_known_secrets,
     redact_secrets,
@@ -1229,6 +1231,58 @@ def test_key_word_secret_spared_in_non_kv_shape_positions_composes_to_mask_the_v
 
     assert "paired-sample-000" not in combined
     assert combined == expected
+
+
+def test_key_guard_bounds_every_shape_grammar_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RecordingPattern:
+        def __init__(self) -> None:
+            self.end_positions: list[int] = []
+
+        def finditer(
+            self, string: str, pos: int = 0, endpos: int | None = None
+        ) -> Iterator[re.Match[str]]:
+            del string, pos
+            assert endpos is not None
+            self.end_positions.append(endpos)
+            return iter(())
+
+    recorder = RecordingPattern()
+    monkeypatch.setattr(logsafe, "_SELF_VERIFY_SHAPE_RES", (recorder,))
+    text = "password=paired-sample-000" + "x" * 10_000
+    assert redact_known_secrets(text, ["password"]).startswith("<redacted>=")
+    assert recorder.end_positions
+    assert max(recorder.end_positions) < len(text)
+    assert max(recorder.end_positions) <= 1_000
+
+
+def test_key_guard_requires_a_bounded_local_shape_suffix() -> None:
+    gap = " " * 1_000
+    text = f"password{gap}=paired-sample-000"
+    assert redact_known_secrets(text, ["password"]) == f"<redacted>{gap}=paired-sample-000"
+
+
+def test_key_guard_handles_thousands_of_unshaped_keyword_occurrences() -> None:
+    text = "password " * 2_000
+    result = redact_known_secrets(text, ["password"])
+    assert result == "<redacted> " * 2_000
+
+
+def test_key_guard_prefilter_never_undercuts_the_self_verification_scan() -> None:
+    """Codex PR #376 regression: the cheap prose-reject prefilter must accept a
+    ``key<sep>value`` pair for as far as the self-verification scan can spare it.
+    A tighter prefilter window would MASK the ``password`` key here (a configured
+    secret whose value equals a key word), destroying the anchor
+    ``redact_secrets`` keys the value off of and LEAKING that value. With the
+    prefilter window pinned equal to ``_SHAPE_VALUE_SCAN_WINDOW`` the pair is
+    spared and the composed pass masks the value, never the reverse.
+    """
+    # Gaps well within the shared prefilter/self-verify window (512).
+    for gap_len in (10, 200, 500):
+        gap = " " * gap_len
+        text = f"password{gap}=hunter2longvalue"
+        composed = redact_secrets(redact_known_secrets(text, ["password"]))
+        assert "hunter2longvalue" not in composed, gap_len
+        assert composed == f"password{gap}=<redacted>", gap_len
 
 
 def test_key_guard_masks_a_key_word_secret_behind_an_overlong_identifier() -> None:

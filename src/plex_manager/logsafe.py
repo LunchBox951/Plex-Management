@@ -684,6 +684,26 @@ _AUTHORITY_SCAN_WINDOW: Final = 512
 #: starts its applicable shape search. A shape-pass match whose KEY contains the
 #: occurrence starts at most the key prefix cap (64) before it, plus slack.
 _SHAPE_KEY_SCAN_WINDOW: Final = 96
+#: Maximum text span after the candidate key included in each exact grammar
+#: search. All five grammars accept a truncated value, so this is enough to prove
+#: the later whole-line shape pass starts at this key without scanning its full
+#: (possibly very long) value.
+_SHAPE_VALUE_SCAN_WINDOW: Final = 512
+#: Maximum suffix span inspected by the cheap anchored prose-reject test before
+#: attempting the heavier exact shape grammars. It rejects ordinary prose
+#: occurrences such as ``password password ...`` without searching any grammar.
+#: DELIBERATELY EQUAL to :data:`_SHAPE_VALUE_SCAN_WINDOW`: the prefilter must
+#: never reject a case the self-verification scan below would SPARE, or the
+#: keyword (a configured secret whose value equals a key word) is masked, its
+#: paired value loses the key ``redact_secrets`` anchors on, and that value
+#: LEAKS. A ``key<sep>`` pair separated only by ``\s*`` (the sole thing that can
+#: sit between the key word and its ``:``/``=`` in ``_SECRET_KV_RE``'s grammar)
+#: is thus accepted for exactly as far as self-verification can confirm it --
+#: no realistic rendering ever puts hundreds of blanks there, and any gap beyond
+#: this shared bound fails BOTH tests identically (fail-closed, but consistently
+#: so, never a prefilter-only regression).
+_KEY_SHAPE_SUFFIX_WINDOW: Final = _SHAPE_VALUE_SCAN_WINDOW
+_KEY_SHAPE_SUFFIX_RE: Final = re.compile(r"(?:['\"]?\s*[:=]|['\"]\s*,)")
 
 
 #: Maximum length for a newly generated depth-2 candidate. Baseline raw and
@@ -882,12 +902,19 @@ def _mask_known_value(match: re.Match[str]) -> str:
     authority_from = max(0, ident_start - _AUTHORITY_SCAN_WINDOW)
     if _AUTHORITY_PREFIX_RE.search(text, authority_from, ident_start) is not None:
         return _REDACTED  # userinfo/authority position, not a key -- fail closed
+    # Reject ordinary prose occurrences before invoking a shape grammar. The
+    # anchored suffix check and every authoritative grammar search have explicit
+    # local end bounds, so repeated keyword misses remain linear in message size.
+    suffix_end = min(len(text), match.end() + _KEY_SHAPE_SUFFIX_WINDOW)
+    if _KEY_SHAPE_SUFFIX_RE.match(text, match.end(), suffix_end) is None:
+        return _REDACTED
     # Self-verify against the same non-cookie shape objects that redact_secrets()
-    # will run later. If no named value boundary proves the pair will be masked,
-    # fail closed and mask this configured occurrence too.
+    # will run later. The grammars accept truncated values, so the bounded slice
+    # proves the key/value start while the later whole-line pass masks the value.
     scan_from = max(0, match.start() - _SHAPE_KEY_SCAN_WINDOW)
+    scan_to = min(len(text), match.end() + _SHAPE_VALUE_SCAN_WINDOW)
     for shape_re in _SELF_VERIFY_SHAPE_RES:
-        for shape in shape_re.finditer(text, scan_from):
+        for shape in shape_re.finditer(text, scan_from, scan_to):
             if shape.start() > match.start():
                 break
             if (
