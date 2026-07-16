@@ -2283,6 +2283,73 @@ async def test_cancel_during_commit_still_runs_the_completion_sweep(
     assert _NEW_PLEX_TOKEN in handler.secret_values
 
 
+async def test_cancel_during_commit_still_closes_demoted_streams(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #399 round 4 (finding 1), the DEMOTION shape (issues #56/#183):
+    a rotation sign-in that also demotes the user (admin -> shared-only) must
+    close the demoted user's realtime streams even when the request is
+    cancelled while the commit unit is mid-flight. The close runs via the
+    boundary's ``on_committed`` hook; before that hook, the remembered
+    cancellation was re-raised before control returned to the post-``with``
+    close, leaving the demoted user's ADMIN streams open until lease expiry
+    with the demotion already durable."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    # The rotation sign-in carries only SHARED access now: admin -> non-admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_shared_server()]))
+
+    async with sessionmaker_() as db:
+        seeded = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        assert seeded.permissions == 1  # currently an admin
+    subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=seeded.id)
+
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
+    rewrite_finished = False
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        if rewrite_finished:
+            committed.set()
+            await _wait_for_event(release)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    )
+    await _wait_for_event(committed)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    await assert_task_raises(task, asyncio.CancelledError)
+
+    # The demotion landed durably AND the admin stream is gone -- no window in
+    # which a demoted account keeps its already-open admin streams.
+    assert subscription.closed is True
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+    assert user.permissions == 0
+    assert user.encrypted_plex_token == _NEW_PLEX_TOKEN
+
+
 async def test_cancel_plus_commit_failure_restores_snapshot_and_surfaces_the_failure(
     client: httpx.AsyncClient,
     app: FastAPI,

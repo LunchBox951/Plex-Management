@@ -331,6 +331,10 @@ def redact_retired_log_message(
     floor_eligible_current = frozenset(
         value for value in current if len(value) >= MIN_SECRET_VALUE_LENGTH
     )
+    # ``redact_log_message``'s own floored value pass finds nothing new after
+    # the combined call above (every value it could match was already masked);
+    # it is kept for the ``redact_secrets`` shape-grammar step it also runs,
+    # preserving the established value-first-then-shape ordering.
     return redact_log_message(
         redact_known_secrets(message, retired | floor_eligible_current, min_length=1),
         retired | current,

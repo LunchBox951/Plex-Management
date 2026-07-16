@@ -175,7 +175,10 @@ async def plex_sign_in_endpoint(
     # an inline post-``with`` close could be skipped with the demotion already
     # durable -- leaving the demoted user's admin streams open until lease
     # expiry. Reads ``demoted``/``user`` at call time, after the body below has
-    # recomputed them under the lock.
+    # recomputed them under the lock -- the rotation body REBINDS ``demoted``
+    # (a shared closure cell with this function), so any refactor that moves
+    # that rebinding into a nested function must add ``nonlocal demoted`` or
+    # this closure would silently see the stale pre-lock value.
     def _close_demoted_streams() -> None:
         if demoted:
             close_realtime_streams(
