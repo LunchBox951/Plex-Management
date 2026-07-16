@@ -1277,30 +1277,62 @@ async def test_api_key_exchange_missing_key_rejected(
     assert response.json()["detail"] == "recovery_key_rejected"
 
 
+async def test_api_key_exchange_does_not_accept_plex_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A non-owner Plex session must NOT be able to mint an ADMIN recovery session
+    by calling the exchange with no key: the endpoint validates the recovery key
+    specifically, never falling back to whatever cookie is already in the jar.
+
+    This is the RUNTIME half of a two-test pair (issue #380 finding 1, PR #398
+    review): it pins observed behavior end-to-end, including any auth performed
+    INSIDE the endpoint body (a hand-rolled ``authenticate_request(...)`` call or
+    a direct ``request.cookies`` read would slip past the dependency-graph shape
+    test below, whose view ends at the declared dependency surface). Its known
+    limitation is the converse: on today's implementation the cookie is inert by
+    construction, so this test's outcome is indistinguishable from
+    ``test_api_key_exchange_missing_key_rejected`` -- it only gains teeth the
+    moment someone wires cookie auth in. The shape test covers that gap from the
+    structural side; together they close both regression paths."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    # A shared (non-owner) account signs in: it holds a limited (non-admin) session.
+    await _use_transport(app, _plex_tv_transport(user=_SECOND_USER, resources=[_shared_server()]))
+    signin = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert signin.json()["is_admin"] is False
+
+    # With that non-admin session cookie in the jar but NO recovery key header, the
+    # exchange must refuse rather than hand out an admin recovery session.
+    response = await client.post("/api/v1/auth/api-key")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "recovery_key_rejected"
+
+
 async def test_api_key_exchange_dependency_shape_forbids_cookie_auth() -> None:
     """A signed-in caller's Plex session cookie must NEVER be able to mint an ADMIN
     recovery session by calling the exchange with no key (issue #380 finding 1).
 
-    A behavioral test that dropped a session cookie in the client jar and asserted
-    401 (the prior form of this test) is a DUPLICATE of
-    ``test_api_key_exchange_missing_key_rejected``: the exchange's ``provided``
-    parameter is sourced exclusively via ``Depends(api_key_header)`` -- an
-    ``APIKeyHeader`` security scheme FastAPI resolves ONLY from
-    ``request.headers``, never ``request.cookies`` -- so the cookie is inert BY
-    CONSTRUCTION and both tests flip together on any mutation to the recovery-key
-    guard (``api_key_matches`` in ``exchange_api_key_endpoint``). That gives the
-    cookie setup zero incremental coverage.
+    The STRUCTURAL half of the pair with
+    ``test_api_key_exchange_does_not_accept_plex_session`` above. On today's
+    implementation the exchange's ``provided`` parameter is sourced exclusively
+    via ``Depends(api_key_header)`` -- an ``APIKeyHeader`` security scheme
+    FastAPI resolves ONLY from ``request.headers``, never ``request.cookies`` --
+    so a cookie in the jar is inert BY CONSTRUCTION and the behavioral test
+    alone cannot distinguish "cookie refused" from "cookie never consulted".
 
-    This pins the STRUCTURAL invariant directly instead: nothing that can resolve
-    an ``AuthContext`` from a session cookie (``authenticate_request`` /
-    ``require_api_key`` / ``require_admin``) is reachable anywhere in this route's
-    FastAPI dependant graph. Unlike the behavioral form, THIS test catches the
-    regression the endpoint's docstring warns against -- wiring in
-    ``require_api_key`` (as every cookie-or-key protected route does) so a
-    signed-in NON-admin could mint an ADMIN recovery session -- because that
-    regression adds a new callable to the dependant tree without necessarily
-    changing the 401/`recovery_key_rejected` response the old test asserted on a
-    cookie-less request.
+    This pins that construction directly: nothing that can resolve an
+    ``AuthContext`` from a session cookie (``authenticate_request`` /
+    ``require_api_key`` / ``require_admin``) is reachable anywhere in this
+    route's FastAPI dependant graph. It catches the regression the endpoint's
+    docstring warns against -- wiring in ``require_api_key`` (as every
+    cookie-or-key protected route does) so a signed-in NON-admin could mint an
+    ADMIN recovery session -- even in variants that keep a cookie-less request's
+    401/``recovery_key_rejected`` response unchanged. Its own blind spot -- auth
+    performed inside the endpoint BODY, invisible to the dependant graph -- is
+    exactly what the runtime test above exists to catch.
     """
     (route,) = [
         r
