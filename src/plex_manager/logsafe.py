@@ -686,10 +686,6 @@ _AUTHORITY_SCAN_WINDOW: Final = 512
 _SHAPE_KEY_SCAN_WINDOW: Final = 96
 
 
-#: Maximum composed-encoding depth. Raw values are depth 0, existing
-#: one-step renderings are depth 1, and only the explicitly listed compositions
-#: below are depth 2; no recursive depth-3 expansion is attempted.
-_NESTED_COMPOSITION_DEPTH: Final = 2
 #: Maximum length for a newly generated depth-2 candidate. Baseline raw and
 #: one-step variants are never filtered by this limit.
 _MAX_NESTED_CANDIDATE_LENGTH: Final = 16 * 1024
@@ -820,9 +816,9 @@ def _secret_value_variants(value: str) -> frozenset[str]:
     return frozenset(variant for variant in variants if variant)
 
 
-def _json_body_regex(value: str) -> str:
-    """Match a JSON string body, accepting each valid solidus spelling."""
-    body = json.dumps(value)[1:-1]
+def _solidus_tolerant_regex(variant: str) -> str:
+    """Match ``variant``, accepting either JSON spelling at each solidus."""
+    body = variant
     parts: list[str] = []
     start = 0
     for index, character in enumerate(body):
@@ -987,8 +983,7 @@ def redact_known_secrets(
         variants |= _secret_value_variants(value)
     if not variants:
         return text
-    patterns = [_variant_regex(v) for v in variants]
-    patterns.extend(_json_body_regex(value) for value in values)
+    patterns = [_solidus_tolerant_regex(variant) for variant in variants]
     alternation = "|".join(sorted(set(patterns), key=len, reverse=True))
     pattern = re.compile(r"(?:" + alternation + r")")
     return pattern.sub(_mask_known_value, text)

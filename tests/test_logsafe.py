@@ -1401,6 +1401,30 @@ def test_redact_known_secrets_matches_mixed_json_solidus_spellings() -> None:
         assert redact_known_secrets(text, [value]) == '{"detail":"<redacted>"}'
 
 
+def test_redact_known_secrets_matches_json_solidus_in_derived_base64_variants() -> None:
+    for value in ("secret12?00", "secret12?00?"):
+        standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        assert "/" in standard
+        spellings = {standard.replace("/", "\\/", 1), standard.replace("/", "\\/")}
+        for spelling in spellings:
+            assert redact_known_secrets(f"before:{spelling}:after", [value]) == (
+                "before:<redacted>:after"
+            )
+
+
+def test_redact_known_secrets_treats_configured_backslash_solidus_as_literal() -> None:
+    value = r"abc\/defgh"
+    text = '{"detail":"abc/defgh"}'
+    assert redact_known_secrets(text, [value]) == text
+
+
+def test_redact_known_secrets_does_not_overmatch_derived_base64_solidus_control() -> None:
+    value = "secret12?00"
+    standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    different = standard.replace("MDA", "MDB").replace("/", "\\/")
+    assert redact_known_secrets(different, [value]) == different
+
+
 def test_redact_known_secrets_does_not_match_different_json_literal() -> None:
     text = '{"detail":"abc\\/defXghi"}'
     assert redact_known_secrets(text, ["abc/def/ghi"]) == text
