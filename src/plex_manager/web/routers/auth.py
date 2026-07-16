@@ -43,6 +43,7 @@ from plex_manager.web.deps import (
     SESSION_COOKIE_NAME,
     AuthContext,
     AuthMethod,
+    Cell,
     SettingsStore,
     api_key_header,
     api_key_matches,
@@ -89,7 +90,12 @@ _COOKIE_PATH = "/"
 _SIGN_IN_MAX_PER_MINUTE = 10
 _SIGN_IN_WINDOW_SECONDS = 60.0
 _sign_in_attempts: dict[str, list[float]] = {}
-_last_stale_key_eviction = float("-inf")
+# Wrapped in ``Cell`` (see its docstring in ``web.deps``) rather than a bare
+# ``global``-rebound float: the only reader of a given write is the NEXT call to
+# ``_evict_stale_sign_in_throttle_keys``, a cross-invocation liveness CodeQL's
+# py/unused-global-variable dead-store analysis doesn't track (alert #358, issue
+# #385).
+_last_stale_key_eviction = Cell(float("-inf"))
 
 
 @router.post("/plex")
@@ -656,10 +662,9 @@ def _evict_stale_sign_in_throttle_keys(now: float) -> None:
     one extra window, which only costs memory — per-key admission filters its own
     timestamps and never reads other keys' bookkeeping.
     """
-    global _last_stale_key_eviction
-    if now - _last_stale_key_eviction < _SIGN_IN_WINDOW_SECONDS:
+    if now - _last_stale_key_eviction.value < _SIGN_IN_WINDOW_SECONDS:
         return
-    _last_stale_key_eviction = now
+    _last_stale_key_eviction.value = now
     window_start = now - _SIGN_IN_WINDOW_SECONDS
     # Attempt lists are appended in ``time.monotonic`` order, so the last stamp is
     # the newest: a key is stale exactly when that one stamp has aged out — an O(1)
@@ -699,12 +704,11 @@ def reset_sign_in_throttle() -> None:
     an autouse fixture to stay order-independent. Named without a leading underscore
     so tests reference it without tripping pyright's private-usage check.
     """
-    global _last_stale_key_eviction
     _sign_in_attempts.clear()
     # Rewind the eviction cadence too: throttle tests pin ``time.monotonic`` to
     # small fake values, and a real (large) timestamp left behind by an earlier
     # test would silently disable eviction for the whole faked-clock test.
-    _last_stale_key_eviction = float("-inf")
+    _last_stale_key_eviction.value = float("-inf")
 
 
 # --------------------------------------------------------------------------- #
