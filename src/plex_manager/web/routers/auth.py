@@ -14,11 +14,12 @@ browser access uses this Plex sign-in plus an HTTP-only session cookie.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, NamedTuple, cast
+from typing import Annotated, Any, Final, NamedTuple, cast
 
 import httpx
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -77,6 +78,18 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 _CLIENT_ID_SETTING = "plex_oauth_client_identifier"
 _SESSION_DAYS = 30
 _COOKIE_PATH = "/"
+
+# Upper bound on the token-rotation sign-in's IN-BOUNDARY access recompute
+# (issue #389 facet 4). The recompute runs while holding the process-global
+# ``secret_rotation_lock``, and on the pre-rework fallback path (no stored
+# ``plex_machine_identifier``) it issues a live ``/identity`` probe whose only
+# other bound is the shared HTTP client's 30-second timeout -- long enough for a
+# hung Plex server to stall every other rotation AND the durable log drain
+# (which takes the same lock every tick). A few seconds is generous for a LAN
+# ``/identity`` round trip; on expiry the sign-in fails CLOSED with an honest,
+# retryable envelope (``server_identity_recheck_timeout``) and the boundary
+# rolls back -- never an unbounded lock hold, never an unverified admission.
+_IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS: Final = 5.0
 
 # In-process, per-client-IP sign-in throttle. A best-effort abuse brake for the
 # ONE unauthenticated write endpoint, not a security boundary: it is deliberately
@@ -214,10 +227,33 @@ async def plex_sign_in_endpoint(
             # with access only to the OLD server now fails closed (``_post_init_
             # access`` raises, the boundary rolls back) instead of minting a
             # session against a server it cannot reach.
+            #
+            # The recompute is TIME-BOUNDED because it runs under the shared
+            # rotation lock: ``_post_init_access``'s pre-rework fallback (no
+            # stored machine id) probes the Plex server's ``/identity`` live,
+            # and an unresponsive server must not hold the process-global lock
+            # for the HTTP client's full 30s timeout (stalling every rotation
+            # and the log drain). On expiry the sign-in fails CLOSED -- the
+            # boundary rolls back, nothing was minted -- with a distinct,
+            # retryable envelope rather than a silent fallback to the stale
+            # pre-lock decision (which is exactly what facet 4 forbids).
             if not initialized:
                 is_admin = await _claim_or_resume_setup(session, account, resources)
             else:
-                is_admin = await _post_init_access(session, account, resources, client=plex_tv)
+                try:
+                    async with asyncio.timeout(_IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS):
+                        is_admin = await _post_init_access(
+                            session, account, resources, client=plex_tv
+                        )
+                except TimeoutError as exc:
+                    raise AppError(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        code="server_identity_recheck_timeout",
+                        message=(
+                            "Could not re-verify your access to the configured Plex server in time."
+                        ),
+                        hint="Check that the Plex server is reachable, then sign in again.",
+                    ) from exc
             # Re-stage the plex.tv client identifier in case THIS request minted
             # it (its uncommitted insert was discarded by the rollback):
             # re-asserting the SAME value is create-once idempotent and a no-op

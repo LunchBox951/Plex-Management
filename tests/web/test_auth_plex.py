@@ -2358,3 +2358,73 @@ async def test_rotation_boundary_revalidates_access_against_repointed_server(
     assert sessions == []
     assert _OLD_PLEX_TOKEN in row.message  # rewrite rolled back -> unchanged
     assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})
+
+
+async def test_hung_identity_probe_cannot_hold_the_rotation_lock_beyond_the_bound(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facet 4's in-boundary access recompute is TIME-BOUNDED: on the fallback
+    path (no stored machine id) it probes the Plex server's ``/identity`` while
+    holding the process-global rotation lock, and a hung server must not pin
+    that lock for the HTTP client's full 30s timeout (stalling every rotation
+    and the log drain). The bound expires, the sign-in fails CLOSED with the
+    distinct retryable envelope, the boundary rolls back, and the lock is
+    released -- never a silent fallback to the stale pre-lock decision."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # No plex_machine_identifier stored -> both access checks take the
+    # /identity fallback; the boundary's recompute is the SECOND probe.
+    await _store_setting(sessionmaker_, "plex_url", "http://plex.local:32400")
+    await _store_setting(sessionmaker_, "plex_token", "service-token")
+    await _seed_user_with_token(
+        sessionmaker_, plex_id=42, username="plex-owner", token=_OLD_PLEX_TOKEN
+    )
+    await _insert_log_event(sessionmaker_, _OLD_PLEX_TOKEN)
+    handler = _live_handler_with(_OLD_PLEX_TOKEN)
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+
+    identity_calls = 0
+
+    async def routing_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_calls
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/user":
+            return httpx.Response(200, json=_OWNER_USER)
+        if request.url.host == "plex.tv" and request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=[_owned_server()])
+        if request.url.path == "/identity":
+            identity_calls += 1
+            if identity_calls == 1:  # the PRE-lock decision resolves normally
+                return httpx.Response(
+                    200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}}
+                )
+            # The IN-LOCK recompute's probe hangs until cancelled by the bound.
+            await asyncio.Event().wait()
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    await _use_transport(app, httpx.MockTransport(routing_handler))
+    lock = _ObservableLock()
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    # Shrink the bound so the test proves the mechanism without a real wait.
+    monkeypatch.setattr(auth_module, "_IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS", 0.05)
+
+    response = await asyncio.wait_for(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN}), timeout=5.0
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "server_identity_recheck_timeout"
+    assert identity_calls == 2  # the recompute genuinely re-probed under the lock
+    assert lock.locked() is False  # the bound released the shared boundary
+    # Fails CLOSED: token not rotated, no session minted, history + snapshot intact.
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        sessions = (await db.execute(select(AuthSession))).scalars().all()
+        row = (await db.execute(select(LogEvent))).scalars().one()
+    assert user.encrypted_plex_token == _OLD_PLEX_TOKEN
+    assert sessions == []
+    assert _OLD_PLEX_TOKEN in row.message
+    assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})
