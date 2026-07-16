@@ -70,9 +70,10 @@ import contextlib
 import logging
 import threading
 from collections import deque
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from plex_manager.logsafe import redact_known_secrets, redact_secrets
 from plex_manager.ports.repositories import LOG_EVENT_CORRELATION_KEYS, LogEventCreate
@@ -94,6 +95,8 @@ __all__ = [
     "configure_logging",
     "drain_once",
     "prune_once",
+    "redact_log_context",
+    "redact_log_message",
     "resolve_log_level",
     "stop_logging",
 ]
@@ -251,6 +254,35 @@ class CapturedLogRecord:
     context: dict[str, Any] | None
 
 
+def redact_log_message(message: str, secret_values: Iterable[str]) -> str:
+    """Apply value-based redaction before the established shape grammar."""
+    return redact_secrets(redact_known_secrets(message, secret_values))
+
+
+def redact_log_context(
+    context: dict[str, Any] | None, secret_values: Iterable[str]
+) -> dict[str, Any] | None:
+    """Recursively redact every string leaf and mapping key in JSON context."""
+    if context is None:
+        return None
+    values = frozenset(secret_values)
+
+    def redact(value: object) -> object:
+        if isinstance(value, str):
+            return redact_log_message(value, values)
+        if isinstance(value, list):
+            items = cast("list[object]", value)
+            return [redact(item) for item in items]
+        if isinstance(value, dict):
+            mapping = cast("dict[object, object]", value)
+            return {
+                redact_log_message(str(key), values): redact(item) for key, item in mapping.items()
+            }
+        return value
+
+    return cast("dict[str, Any]", redact(context))
+
+
 def _extract_context(record: logging.LogRecord) -> dict[str, Any] | None:
     """Pull any of :data:`LOG_EVENT_CORRELATION_KEYS` off ``record`` as ``extra``.
 
@@ -305,14 +337,13 @@ def _capture(
     message = record.getMessage()
     if record.exc_info:
         message = f"{message}\n{_EXC_FORMATTER.formatException(record.exc_info)}"
-    message = redact_known_secrets(message, secret_values)
-    message = redact_secrets(message)
+    message = redact_log_message(message, secret_values)
     return CapturedLogRecord(
         created_at=datetime.fromtimestamp(record.created, tz=UTC),
         level=record.levelname,
         logger=record.name,
         message=message,
-        context=_extract_context(record),
+        context=redact_log_context(_extract_context(record), secret_values),
     )
 
 
@@ -384,6 +415,50 @@ class LogCaptureHandler(logging.Handler):
         # brief synchronous lock is never held long enough to matter, even when
         # acquired from the event-loop thread inside ``snapshot_tail``.
         self._lock = threading.Lock()
+
+    def begin_secret_rotation(self, secret_values: frozenset[str]) -> frozenset[str]:
+        """Widen capture redaction temporarily and return the old snapshot."""
+        previous = self.secret_values
+        self.secret_values = previous | secret_values
+        return previous
+
+    def abort_secret_rotation(self, previous_values: frozenset[str]) -> None:
+        """Restore the exact capture snapshot after a failed transaction."""
+        self.secret_values = previous_values
+
+    def complete_secret_rotation(
+        self, previous_values: frozenset[str], current_values: frozenset[str]
+    ) -> None:
+        """Redact queued/ring records after commit, then retain current values only."""
+        union = previous_values | current_values
+        queued: list[CapturedLogRecord] = []
+        while True:
+            try:
+                record = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queued.append(
+                replace(
+                    record,
+                    message=redact_log_message(record.message, union),
+                    context=redact_log_context(record.context, union),
+                )
+            )
+        for record in queued:
+            self.queue.put_nowait(record)
+        with self._lock:
+            self.ring_buffer = deque(
+                (
+                    replace(
+                        record,
+                        message=redact_log_message(record.message, union),
+                        context=redact_log_context(record.context, union),
+                    )
+                    for record in self.ring_buffer
+                ),
+                maxlen=self.ring_buffer.maxlen,
+            )
+        self.secret_values = current_values
 
     def emit(self, record: logging.LogRecord) -> None:
         # Never let a capture bug break logging itself (north star: honesty over

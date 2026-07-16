@@ -58,7 +58,6 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
-from plex_manager.logsafe import redact_known_secrets, redact_secrets
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service, watchlist_service
@@ -73,7 +72,12 @@ from plex_manager.services.health_service import (
     collect_health_snapshot,
     read_disk_usage,
 )
-from plex_manager.services.log_capture_service import RING_BUFFER_MAXLEN, LogCaptureHandler
+from plex_manager.services.log_capture_service import (
+    RING_BUFFER_MAXLEN,
+    LogCaptureHandler,
+    redact_log_context,
+    redact_log_message,
+)
 from plex_manager.web.deps import (
     SettingsStore,
     get_anime_movie_root_optional,
@@ -94,6 +98,7 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
     get_watchlist_status,
     require_admin,
+    secret_rotation_lock,
 )
 from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
@@ -265,44 +270,31 @@ async def list_logs_endpoint(
     """Paginated, filtered read of the durable ``log_events`` store, newest
     first. ``correlation_id`` matches a ``request_id``/``download_id``/
     ``tmdb_id`` carried in a record's context."""
-    page = await SqlLogEventRepository(session).list_events(
-        level=level,
-        since=since,
-        logger=logger,
-        correlation_id=correlation_id,
-        limit=limit,
-        offset=offset,
-    )
-    # Fetched once per request, reused for every row below (issue #268) --
-    # this instant's decrypted secret values, not the capture-time handler's
-    # possibly-stale snapshot (see the module docstring).
-    secret_values = await SettingsStore(session).secret_values()
-    return LogsResponse(
-        total=page.total,
-        events=[
-            LogEventItem(
-                id=r.id,
-                created_at=r.created_at,
-                level=r.level,
-                logger=r.logger,
-                # Value-based pass FIRST, then shape (issues #268/#153) --
-                # matching ``log_capture_service._capture``'s own order: the
-                # shape grammar's masking can otherwise mangle a secret (e.g.
-                # a basic-auth password containing ``@``, issue #270) before
-                # the value-based exact-match search ever sees it whole. See
-                # that function's docstring for the concrete failure this
-                # ordering prevents. Capture-time redaction only covers rows
-                # THIS build wrote through log_capture_service, and only with
-                # the secret values known AT CAPTURE TIME; a pre-upgrade row, a
-                # direct repository write, or a since-rotated secret is still
-                # masked here, just as on /logs/export, so both durable-read
-                # boundaries are secret-safe.
-                message=redact_secrets(redact_known_secrets(r.message, secret_values)),
-                context=r.context,
-            )
-            for r in page.results
-        ],
-    )
+    async with secret_rotation_lock:
+        await session.rollback()
+        page = await SqlLogEventRepository(session).list_events(
+            level=level,
+            since=since,
+            logger=logger,
+            correlation_id=correlation_id,
+            limit=limit,
+            offset=offset,
+        )
+        secret_values = await SettingsStore(session).secret_values()
+        return LogsResponse(
+            total=page.total,
+            events=[
+                LogEventItem(
+                    id=r.id,
+                    created_at=r.created_at,
+                    level=r.level,
+                    logger=r.logger,
+                    message=redact_log_message(r.message, secret_values),
+                    context=redact_log_context(r.context, secret_values),
+                )
+                for r in page.results
+            ],
+        )
 
 
 @router.get("/logs/tail")
@@ -315,28 +307,24 @@ async def tail_logs_endpoint(
     restart, never persisted (only INFO+ reaches durable ``log_events``, see
     ``GET /logs`` above). ``dropped_count`` is the capture handler's own honest
     signal for how many INFO+ records missed durable storage since startup."""
-    records = handler.snapshot_tail(limit)
-    records.reverse()
-    # Re-redact against THIS instant's decrypted secret values, exactly as the
-    # two durable-read boundaries do (issue #292 item 1). The ring buffer's rows
-    # were redacted at capture time against the handler's periodically-refreshed
-    # secret snapshot, which lags a rotation by up to one drain tick -- so a
-    # just-rotated secret could otherwise surface here unmasked during that
-    # window. Value-based pass FIRST, then shape, matching ``_capture``'s order.
-    secret_values = await SettingsStore(session).secret_values()
-    return LogsTailResponse(
-        events=[
-            LiveLogRecordItem(
-                created_at=r.created_at,
-                level=r.level,
-                logger=r.logger,
-                message=redact_secrets(redact_known_secrets(r.message, secret_values)),
-                context=r.context,
-            )
-            for r in records
-        ],
-        dropped_count=handler.dropped_count,
-    )
+    async with secret_rotation_lock:
+        await session.rollback()
+        records = handler.snapshot_tail(limit)
+        records.reverse()
+        secret_values = await SettingsStore(session).secret_values()
+        return LogsTailResponse(
+            events=[
+                LiveLogRecordItem(
+                    created_at=r.created_at,
+                    level=r.level,
+                    logger=r.logger,
+                    message=redact_log_message(r.message, secret_values),
+                    context=redact_log_context(r.context, secret_values),
+                )
+                for r in records
+            ],
+            dropped_count=handler.dropped_count,
+        )
 
 
 def _export_filename(fmt: Literal["text", "json"]) -> str:
@@ -398,53 +386,58 @@ async def export_logs_endpoint(
     containing ``@``, concretely) before the value-based exact-match search
     ever sees it whole.
     """
-    repo = SqlLogEventRepository(session)
-    secret_values = await SettingsStore(session).secret_values()
-    if correlation_id is not None:
-        page = await repo.list_events(
-            correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS, oldest_first=True
-        )
-    else:
-        window_start = (
-            since
-            if since is not None
-            else datetime.now(UTC) - timedelta(hours=_DEFAULT_EXPORT_WINDOW_HOURS)
-        )
-        page = await repo.list_events(since=window_start, limit=_MAX_EXPORT_ROWS, oldest_first=True)
+    async with secret_rotation_lock:
+        await session.rollback()
+        repo = SqlLogEventRepository(session)
+        if correlation_id is not None:
+            page = await repo.list_events(
+                correlation_id=correlation_id, limit=_MAX_EXPORT_ROWS, oldest_first=True
+            )
+        else:
+            window_start = (
+                since
+                if since is not None
+                else datetime.now(UTC) - timedelta(hours=_DEFAULT_EXPORT_WINDOW_HOURS)
+            )
+            page = await repo.list_events(
+                since=window_start,
+                limit=_MAX_EXPORT_ROWS,
+                oldest_first=True,
+            )
+        secret_values = await SettingsStore(session).secret_values()
+        events = page.results
+        truncated = page.total > len(page.results)
+        headers = {"Content-Disposition": f'attachment; filename="{_export_filename(format)}"'}
 
-    events = page.results  # repo already returns oldest-first
-    truncated = page.total > len(page.results)
-    headers = {"Content-Disposition": f'attachment; filename="{_export_filename(format)}"'}
+        if format == "json":
+            body = LogsResponse(
+                total=page.total,
+                events=[
+                    LogEventItem(
+                        id=e.id,
+                        created_at=e.created_at,
+                        level=e.level,
+                        logger=e.logger,
+                        message=redact_log_message(e.message, secret_values),
+                        context=redact_log_context(e.context, secret_values),
+                    )
+                    for e in events
+                ],
+            )
+            return JSONResponse(content=body.model_dump(mode="json"), headers=headers)
 
-    if format == "json":
-        body = LogsResponse(
-            total=page.total,
-            events=[
-                LogEventItem(
-                    id=e.id,
-                    created_at=e.created_at,
-                    level=e.level,
-                    logger=e.logger,
-                    message=redact_secrets(redact_known_secrets(e.message, secret_values)),
-                    context=e.context,
-                )
-                for e in events
-            ],
-        )
-        return JSONResponse(content=body.model_dump(mode="json"), headers=headers)
-
-    lines = [
-        f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: "
-        f"{redact_secrets(redact_known_secrets(e.message, secret_values))}"
-        for e in events
-    ]
-    if truncated:
-        dropped = page.total - len(page.results)
-        lines.append(
-            f"... truncated: {dropped} newer row(s) not shown "
-            f"(export capped at the {_MAX_EXPORT_ROWS} oldest matching rows) ..."
-        )
-    return PlainTextResponse("\n".join(lines) + "\n", headers=headers)
+        lines = [
+            f"{e.created_at.isoformat()} {e.level:<8} {e.logger}: "
+            f"{redact_log_message(e.message, secret_values)}"
+            for e in events
+        ]
+        if truncated:
+            dropped = page.total - len(page.results)
+            lines.append(
+                f"... truncated: {dropped} newer row(s) not shown "
+                f"(export capped at the {_MAX_EXPORT_ROWS} oldest matching rows) ..."
+            )
+        return PlainTextResponse("\n".join(lines) + "\n", headers=headers)
 
 
 # --------------------------------------------------------------------------- #

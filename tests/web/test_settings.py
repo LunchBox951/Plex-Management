@@ -20,8 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
 from plex_manager.domain.eviction import EvictionCandidate, select_evictions
-from plex_manager.models import AuthSession, Setting, User
-from plex_manager.services import path_visibility
+from plex_manager.models import AuthSession, LogEvent, Setting, User
+from plex_manager.repositories.log_events import SqlLogEventRepository
+from plex_manager.services import log_capture_service, path_visibility
 from plex_manager.web.deps import (
     AUTO_GRAB_ENABLED_DEFAULT,
     AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
@@ -106,6 +107,34 @@ _API_KEY = "settings-key"
 # (what the repoint ownership check presents to plex.tv).
 _SEED_PLEX_TOKEN = "seed-plex-token"  # noqa: S105 — test fixture value, not a credential
 _SEED_OAUTH_TOKEN = "seed-admin-oauth-token"  # noqa: S105 — test fixture value, not a credential
+
+
+class _OrderingLock(asyncio.Lock):
+    """Event-observable lock used to prove the real shared-lock ordering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.acquire_count = 0
+        self.second_acquire_started = asyncio.Event()
+        self.releases: asyncio.Queue[None] = asyncio.Queue()
+
+    async def acquire(self) -> Literal[True]:
+        self.acquire_count += 1
+        if self.acquire_count == 2:
+            self.second_acquire_started.set()
+        return await super().acquire()
+
+    def release(self) -> None:
+        super().release()
+        self.releases.put_nowait(None)
+
+
+class _StopDrainLoop(Exception):
+    """End one exercised drain tick without a real-time sleep."""
+
+
+async def _wait_for_event(event: asyncio.Event) -> None:
+    await asyncio.wait_for(event.wait(), timeout=5.0)
 
 
 def test_every_known_setting_key_has_a_response_and_update_field() -> None:
@@ -3036,6 +3065,455 @@ async def test_normal_settings_response_is_unaffected_by_no_store_headers(
     assert "pragma" not in response.headers
 
 
+async def test_generic_secret_replacement_rewrites_durable_and_live_logs(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    old_secret = "old-generic-secret-for-rotation"  # noqa: S105 -- fixture credential
+    new_secret = "new-generic-secret-for-rotation"  # noqa: S105 -- fixture credential
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tmdb_api_key", old_secret)
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=f"durable {old_secret}",
+                context_json={old_secret: {"nested": [old_secret]}},
+            )
+        )
+        await session.commit()
+
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({old_secret})
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live {old_secret}",
+        context={"nested": old_secret},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+
+    response = await client.put(
+        "/api/v1/settings", json={"tmdb_api_key": new_secret}, headers=_HEALTH_HEADERS
+    )
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(LogEvent))).scalar_one()
+        assert old_secret not in row.message
+        assert old_secret not in json.dumps(row.context_json)
+    queued = handler.queue.get_nowait()
+    assert old_secret not in queued.message
+    assert old_secret not in json.dumps(queued.context)
+    ring = handler.snapshot_tail(1)[0]
+    assert old_secret not in ring.message
+    assert old_secret not in json.dumps(ring.context)
+    assert new_secret in handler.secret_values
+    assert old_secret not in handler.secret_values
+
+
+async def test_generic_two_secret_replacement_rewrites_both_retired_values(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    old_tmdb = "old-tmdb-secret-for-rotation"
+    old_prowlarr = "old-prowlarr-secret-for-rotation"
+    new_tmdb = "new-tmdb-secret-for-rotation"
+    new_prowlarr = "new-prowlarr-secret-for-rotation"
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("tmdb_api_key", old_tmdb)
+        await store.set("prowlarr_api_key", old_prowlarr)
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=f"durable {old_tmdb} {old_prowlarr}",
+                context_json={old_tmdb: [old_prowlarr]},
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live {old_tmdb} {old_prowlarr}",
+        context={old_tmdb: [old_prowlarr]},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+
+    response = await client.put(
+        "/api/v1/settings",
+        json={"tmdb_api_key": new_tmdb, "prowlarr_api_key": new_prowlarr},
+        headers=_HEALTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(LogEvent))).scalar_one()
+        persisted = await SettingsStore(session).secret_values()
+    for retired in (old_tmdb, old_prowlarr):
+        assert retired not in row.message
+        assert retired not in json.dumps(row.context_json)
+        assert retired not in handler.queue.get_nowait().message
+        handler.queue.put_nowait(handler.snapshot_tail(1)[0])
+        assert retired not in handler.snapshot_tail(1)[0].message
+        assert retired not in persisted
+    assert {new_tmdb, new_prowlarr}.issubset(handler.secret_values)
+
+
+async def test_generic_first_secret_replacement_uses_rotation_completion(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    first_secret = "first-generic-secret-for-rotation"  # noqa: S105 -- fixture credential
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    app.state.log_handler = handler
+
+    response = await client.put(
+        "/api/v1/settings", json={"tmdb_api_key": first_secret}, headers=_HEALTH_HEADERS
+    )
+
+    assert response.status_code == 200
+    assert first_secret in handler.secret_values
+
+
+async def test_masked_generic_secret_does_not_start_a_rotation(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plex_manager.web.routers import settings as settings_router
+
+    old_secret = "unchanged-generic-secret"  # noqa: S105 -- fixture credential
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tmdb_api_key", old_secret)
+        session.add(LogEvent(level="INFO", logger="test", message=old_secret))
+        await session.commit()
+    called = False
+
+    async def must_not_rewrite(*_args: object, **_kwargs: object) -> int:
+        nonlocal called
+        called = True
+        return 0
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", must_not_rewrite)
+    response = await client.put(
+        "/api/v1/settings", json={"tmdb_api_key": "***"}, headers=_HEALTH_HEADERS
+    )
+
+    assert response.status_code == 200
+    assert called is False
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("tmdb_api_key") == old_secret
+        assert (await session.execute(select(LogEvent))).scalar_one().message == old_secret
+
+
+async def test_generic_secret_clear_rewrites_retired_value(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    retired_value = "generic-value-cleared-at-runtime"
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tmdb_api_key", retired_value)
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=retired_value,
+                context_json={retired_value: [retired_value]},
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=retired_value,
+        context={retired_value: retired_value},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+
+    response = await client.put(
+        "/api/v1/settings", json={"tmdb_api_key": ""}, headers=_HEALTH_HEADERS
+    )
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("tmdb_api_key") == ""
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    for rendered in (
+        row.message,
+        json.dumps(row.context_json),
+        handler.queue.get_nowait().message,
+        str(handler.snapshot_tail(1)[0]),
+    ):
+        assert retired_value not in rendered
+
+
+@pytest.mark.parametrize("failure", ["rewrite", "commit"])
+async def test_generic_secret_replacement_failure_restores_database_and_handler_exactly(
+    failure: str,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plex_manager.web.routers import settings as settings_router
+
+    old_secret = "generic-secret-before-failure"  # noqa: S105 -- fixture credential
+    new_secret = "generic-secret-after-failure"  # noqa: S105 -- fixture credential
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tmdb_api_key", old_secret)
+        session.add(
+            LogEvent(
+                level="INFO", logger="test", message=old_secret, context_json={"secret": old_secret}
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({old_secret})
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=old_secret,
+        context={"secret": old_secret},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+    before_queue = handler.queue.get_nowait()
+    handler.queue.put_nowait(before_queue)
+    before_ring = tuple(handler.ring_buffer)
+    if failure == "rewrite":
+
+        async def failing_rewrite(*_args: object, **_kwargs: object) -> int:
+            raise RuntimeError("rewrite failed")
+
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", failing_rewrite)
+    else:
+
+        async def failing_commit(self: AsyncSession) -> None:
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+
+    if failure == "rewrite":
+        with pytest.raises(RuntimeError):
+            await client.put(
+                "/api/v1/settings", json={"tmdb_api_key": new_secret}, headers=_HEALTH_HEADERS
+            )
+    else:
+        response = await client.put(
+            "/api/v1/settings", json={"tmdb_api_key": new_secret}, headers=_HEALTH_HEADERS
+        )
+        assert response.status_code == 503
+
+    assert handler.secret_values == frozenset({old_secret})
+    assert handler.queue.get_nowait() == before_queue
+    assert tuple(handler.ring_buffer) == before_ring
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("tmdb_api_key") == old_secret
+        row = (await session.execute(select(LogEvent))).scalar_one()
+        assert row.message == old_secret
+        assert row.context_json == {"secret": old_secret}
+
+
+async def test_rotate_app_key_rewrites_durable_and_live_logs(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=f"durable {_API_KEY}",
+                context_json={"nested": [_API_KEY]},
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live {_API_KEY}",
+        context={"nested": _API_KEY},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+
+    response = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+
+    assert response.status_code == 200
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(LogEvent))).scalar_one()
+        assert _API_KEY not in row.message
+        assert _API_KEY not in json.dumps(row.context_json)
+    assert _API_KEY not in handler.queue.get_nowait().message
+    assert _API_KEY not in handler.snapshot_tail(1)[0].message
+
+
+async def test_revoke_app_key_rewrites_durable_and_live_logs(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        session.add(
+            LogEvent(
+                level="INFO",
+                logger="test",
+                message=f"durable {_API_KEY}",
+                context_json={_API_KEY: {"nested": [_API_KEY]}},
+            )
+        )
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live {_API_KEY}",
+        context={_API_KEY: [_API_KEY]},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+
+    response = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+
+    assert response.status_code == 204
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert system is not None and system.app_api_key is None
+    for record in (row, handler.queue.get_nowait(), handler.snapshot_tail(1)[0]):
+        assert _API_KEY not in record.message
+        assert _API_KEY not in json.dumps(
+            record.context_json if isinstance(record, LogEvent) else record.context
+        )
+
+
+@pytest.mark.parametrize("path", ["/api/v1/settings/app-key/rotate", "/api/v1/settings/app-key"])
+async def test_app_key_rewrite_failure_restores_handler_and_recovery_session(
+    path: str,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _recovery_session_cookies(app, tag=f"failure-{path.rsplit('/', 1)[-1]}")
+    async with sessionmaker_() as session:
+        session.add(LogEvent(level="INFO", logger="test", message=_API_KEY))
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC), level="INFO", logger="test", message=_API_KEY, context=None
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+    before_queue = handler.queue.get_nowait()
+    handler.queue.put_nowait(before_queue)
+    before_ring = tuple(handler.ring_buffer)
+
+    async def failing_rewrite(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("rewrite failed")
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", failing_rewrite)
+    with pytest.raises(RuntimeError):
+        await (client.post if path.endswith("rotate") else client.delete)(
+            path, headers={"X-Api-Key": _API_KEY}
+        )
+
+    assert handler.secret_values == frozenset({_API_KEY})
+    assert handler.queue.get_nowait() == before_queue
+    assert tuple(handler.ring_buffer) == before_ring
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert system is not None and system.app_api_key == _API_KEY
+    assert row.message == _API_KEY
+    assert (
+        await _recovery_session_revoked(sessionmaker_, tag=f"failure-{path.rsplit('/', 1)[-1]}")
+        is False
+    )
+
+
+async def test_app_key_commit_failure_restores_handler_and_recovery_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _recovery_session_cookies(app, tag="commit-failure")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC), level="INFO", logger="test", message=_API_KEY, context=None
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+    app.state.log_handler = handler
+    before_queue = handler.queue.get_nowait()
+    handler.queue.put_nowait(before_queue)
+    before_ring = tuple(handler.ring_buffer)
+
+    async def fail_key_mutation_commit(self: AsyncSession) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_key_mutation_commit)
+    response = await client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+
+    assert response.status_code == 503
+    assert handler.secret_values == frozenset({_API_KEY})
+    assert handler.queue.get_nowait() == before_queue
+    assert tuple(handler.ring_buffer) == before_ring
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+    assert system is not None and system.app_api_key == _API_KEY
+    assert await _recovery_session_revoked(sessionmaker_, tag="commit-failure") is False
+
+
 async def test_rotate_app_key_mints_a_new_key_and_invalidates_the_old_one(
     client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
@@ -4379,3 +4857,397 @@ async def test_revoke_app_key_via_session_auth_clears_present_key(
         system = await load_system_settings(session)
         assert system is not None
         assert system.app_api_key is None
+
+
+async def _mutation_request(
+    client: httpx.AsyncClient,
+    kind: Literal["generic", "rotate", "revoke"],
+    new_secret: str,
+    *,
+    app_key: str = _API_KEY,
+) -> httpx.Response:
+    headers = {"X-Api-Key": app_key}
+    if kind == "generic":
+        return await client.put(
+            "/api/v1/settings", json={"tmdb_api_key": new_secret}, headers=headers
+        )
+    if kind == "rotate":
+        return await client.post("/api/v1/settings/app-key/rotate", headers=headers)
+    return await client.delete("/api/v1/settings/app-key", headers=headers)
+
+
+async def _seed_rotation_source(
+    kind: Literal["generic", "rotate", "revoke"],
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    old_value: str,
+) -> None:
+    await seed(initialized=True, app_api_key=old_value if kind != "generic" else _API_KEY)
+    if kind == "generic":
+        async with sessionmaker_() as session:
+            await SettingsStore(session).set("tmdb_api_key", old_value)
+            await session.commit()
+
+
+async def _run_one_drain(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    entered_drain: asyncio.Event,
+    release_drain: asyncio.Event,
+) -> None:
+    from plex_manager.web import app as app_module
+
+    real_drain_once = app_module.log_capture_service.drain_once
+
+    async def paused_drain(*args: object, **kwargs: object) -> int:
+        entered_drain.set()
+        await _wait_for_event(release_drain)
+        return await real_drain_once(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def stop_after_tick(_seconds: float) -> None:
+        raise _StopDrainLoop
+
+    monkeypatch.setattr(app_module.log_capture_service, "drain_once", paused_drain)
+    monkeypatch.setattr(app_module.asyncio, "sleep", stop_after_tick)
+    await app_module._log_drain_loop(app)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
+async def test_capture_before_rotation_and_drain_after_commit_redacts_retired_record(
+    kind: Literal["generic", "rotate", "revoke"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued capture survives the boundary only in redacted form after commit."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_value = f"old-{kind}-capture-boundary-secret"
+    new_secret = "new-generic-capture-boundary-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source(kind, seed, sessionmaker_, old_value)
+    handler = log_capture_service.LogCaptureHandler()
+    captured = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"captured {old_value}",
+        context={old_value: [old_value]},
+    )
+    handler.queue.put_nowait(captured)
+    handler.ring_buffer.append(captured)
+    app.state.log_handler = handler
+    lock = _OrderingLock()
+    real_release = lock.release
+
+    def release_after_live_cleanup() -> None:
+        for record in (*tuple(handler.queue._queue), *handler.snapshot_tail(10)):  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+            assert old_value not in record.message
+            assert old_value not in json.dumps(record.context)
+        real_release()
+
+    monkeypatch.setattr(lock, "release", release_after_live_cleanup)
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    response = await _mutation_request(
+        client,
+        kind,
+        new_secret,
+        app_key=old_value if kind != "generic" else _API_KEY,
+    )
+
+    assert response.status_code == (204 if kind == "revoke" else 200)
+    assert lock.locked() is False
+    queued = handler.queue.get_nowait()
+    handler.queue.put_nowait(queued)
+    ring = handler.snapshot_tail(1)[0]
+    for record in (queued, ring):
+        assert old_value not in record.message
+        assert old_value not in json.dumps(record.context)
+    async with sessionmaker_() as session:
+        inserted = await log_capture_service.drain_once(
+            handler.queue, SqlLogEventRepository(session), handler=handler
+        )
+        await session.commit()
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert inserted == 1
+    assert old_value not in row.message
+    assert old_value not in json.dumps(row.context_json)
+
+
+@pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
+async def test_capture_during_rotation_cannot_commit_retired_secret(
+    kind: Literal["generic", "rotate", "revoke"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widened handler snapshot redacts emits before a paused rewrite can commit."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_value = f"old-{kind}-capture-during-secret"
+    new_secret = "new-generic-capture-during-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source(kind, seed, sessionmaker_, old_value)
+    handler = log_capture_service.LogCaptureHandler()
+    app.state.log_handler = handler
+    lock = _OrderingLock()
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    rotation_ready = asyncio.Event()
+    release_rotation = asyncio.Event()
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+    async def paused_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        rotation_ready.set()
+        await _wait_for_event(release_rotation)
+        return await real_rewrite(session, values)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", paused_rewrite)
+    mutation = asyncio.create_task(
+        _mutation_request(
+            client,
+            kind,
+            new_secret,
+            app_key=old_value if kind != "generic" else _API_KEY,
+        )
+    )
+    await _wait_for_event(rotation_ready)
+    assert old_value in handler.secret_values
+    logger = logging.getLogger(f"test.capture-during-{kind}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    try:
+        logger.info("captured %s", old_value, extra={"request_id": old_value})
+        await asyncio.sleep(0)
+    finally:
+        logger.removeHandler(handler)
+    release_rotation.set()
+    response = await asyncio.wait_for(mutation, timeout=5.0)
+
+    assert response.status_code == (204 if kind == "revoke" else 200)
+    assert lock.locked() is False
+    async with sessionmaker_() as session:
+        inserted = await log_capture_service.drain_once(
+            handler.queue, SqlLogEventRepository(session), handler=handler
+        )
+        await session.commit()
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert inserted == 1
+    assert old_value not in row.message
+    assert old_value not in json.dumps(row.context_json)
+    ring = handler.snapshot_tail(1)[0]
+    assert old_value not in ring.message
+    assert old_value not in json.dumps(ring.context)
+
+
+@pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
+async def test_drain_holds_rotation_lock_before_mutation_and_retired_row_is_rewritten(
+    kind: Literal["generic", "rotate", "revoke"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drain committed before each mutation is still rewritten before it returns."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_value = f"old-{kind}-drain-ordering-secret"
+    new_secret = "new-generic-drain-ordering-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source(kind, seed, sessionmaker_, old_value)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.queue.put_nowait(
+        log_capture_service.CapturedLogRecord(
+            created_at=datetime.now(UTC),
+            level="INFO",
+            logger="test",
+            message=f"drained {old_value}",
+            context={"retired": old_value},
+        )
+    )
+    app.state.log_handler = handler
+    lock = _OrderingLock()
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    entered_drain = asyncio.Event()
+    release_drain = asyncio.Event()
+    drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
+    await _wait_for_event(entered_drain)
+
+    app_key = old_value if kind != "generic" else _API_KEY
+    mutation = asyncio.create_task(_mutation_request(client, kind, new_secret, app_key=app_key))
+    await _wait_for_event(lock.second_acquire_started)
+    assert not mutation.done()
+    release_drain.set()
+    with pytest.raises(_StopDrainLoop):
+        await drain
+    response = await asyncio.wait_for(mutation, timeout=5.0)
+
+    assert response.status_code == (204 if kind == "revoke" else 200)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert old_value not in row.message
+    assert old_value not in json.dumps(row.context_json)
+
+
+@pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
+async def test_mutation_holds_rotation_lock_before_drain_and_drain_reads_final_snapshot(
+    kind: Literal["generic", "rotate", "revoke"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drain waiting behind a mutation refreshes only after its final commit."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_value = f"old-{kind}-mutation-ordering-secret"
+    new_secret = "new-generic-mutation-ordering-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source(kind, seed, sessionmaker_, old_value)
+    handler = log_capture_service.LogCaptureHandler()
+    app.state.log_handler = handler
+    lock = _OrderingLock()
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    mutation_entered = asyncio.Event()
+    release_mutation = asyncio.Event()
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+    async def paused_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        mutation_entered.set()
+        await _wait_for_event(release_mutation)
+        return await real_rewrite(session, values)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", paused_rewrite)
+    app_key = old_value if kind != "generic" else _API_KEY
+    mutation = asyncio.create_task(_mutation_request(client, kind, new_secret, app_key=app_key))
+    await _wait_for_event(mutation_entered)
+
+    entered_drain = asyncio.Event()
+    release_drain = asyncio.Event()
+    drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
+    await _wait_for_event(lock.second_acquire_started)
+    assert not drain.done()
+    release_mutation.set()
+    response = await asyncio.wait_for(mutation, timeout=5.0)
+    assert response.status_code == (204 if kind == "revoke" else 200)
+    await _wait_for_event(entered_drain)
+    release_drain.set()
+    with pytest.raises(_StopDrainLoop):
+        await drain
+
+    assert old_value not in handler.secret_values
+    if kind == "generic":
+        assert new_secret in handler.secret_values
+
+
+@pytest.mark.parametrize("failure", ["rewrite", "commit", "cancel", "endpoint"])
+async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_and_rotation(
+    failure: Literal["rewrite", "commit", "cancel", "endpoint"],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every exceptional mutation exit leaves the shared boundary usable."""
+    from plex_manager.web import app as app_module
+    from plex_manager.web.routers import settings as settings_router
+
+    old_secret = "old-lock-release-secret"  # noqa: S105 -- fixture credential
+    next_secret = "next-lock-release-secret"  # noqa: S105 -- fixture credential
+    await _seed_rotation_source("generic", seed, sessionmaker_, old_secret)
+    app.state.log_handler = log_capture_service.LogCaptureHandler()
+    app.state.log_handler.secret_values = frozenset({old_secret})
+    lock = _OrderingLock()
+    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    if failure == "rewrite":
+        real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+        async def failing_rewrite(_session: AsyncSession, _values: frozenset[str]) -> int:
+            raise RuntimeError("rewrite failed")
+
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", failing_rewrite)
+        with pytest.raises(RuntimeError, match="rewrite failed"):
+            await _mutation_request(client, "generic", next_secret)
+        await asyncio.wait_for(lock.releases.get(), timeout=5.0)
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", real_rewrite)
+    elif failure == "commit":
+        real_commit = AsyncSession.commit
+        real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+        rewrite_finished = False
+
+        async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+            nonlocal rewrite_finished
+            result = await real_rewrite(session, values)
+            rewrite_finished = True
+            return result
+
+        async def failing_once(self: AsyncSession) -> None:
+            if rewrite_finished:
+                raise RuntimeError("commit failed")
+            await real_commit(self)
+
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+        monkeypatch.setattr(AsyncSession, "commit", failing_once)
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await _mutation_request(client, "generic", next_secret)
+        await asyncio.wait_for(lock.releases.get(), timeout=5.0)
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", real_rewrite)
+        monkeypatch.setattr(AsyncSession, "commit", real_commit)
+    elif failure == "cancel":
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+        async def blocked_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+            entered.set()
+            await _wait_for_event(release)
+            return await real_rewrite(session, values)
+
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", blocked_rewrite)
+        cancelled = asyncio.create_task(_mutation_request(client, "generic", next_secret))
+        await _wait_for_event(entered)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await asyncio.wait_for(lock.releases.get(), timeout=5.0)
+        monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", real_rewrite)
+    else:
+        real_set = SettingsStore.set
+
+        async def failing_endpoint_write(self: SettingsStore, key: str, value: str) -> None:
+            if key == "tmdb_api_key" and value == next_secret:
+                raise RuntimeError("endpoint write failed")
+            await real_set(self, key, value)
+
+        monkeypatch.setattr(SettingsStore, "set", failing_endpoint_write)
+        with pytest.raises(RuntimeError, match="endpoint write failed"):
+            await _mutation_request(client, "generic", next_secret)
+        await asyncio.wait_for(lock.releases.get(), timeout=5.0)
+        monkeypatch.setattr(SettingsStore, "set", real_set)
+
+    entered_drain = asyncio.Event()
+    release_drain = asyncio.Event()
+    drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
+    await _wait_for_event(entered_drain)
+    release_drain.set()
+    with pytest.raises(_StopDrainLoop):
+        await drain
+
+    response = await asyncio.wait_for(
+        _mutation_request(client, "generic", next_secret), timeout=5.0
+    )
+    assert response.status_code == 200

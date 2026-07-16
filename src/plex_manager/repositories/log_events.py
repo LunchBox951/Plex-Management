@@ -46,7 +46,7 @@ from plex_manager.ports.repositories import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -182,6 +182,24 @@ class SqlLogEventRepository:
         stmt = stmt.limit(limit).offset(offset)
         rows = (await self._session.execute(stmt)).scalars().all()
         return LogEventPage(total=total, results=tuple(_to_record(row) for row in rows))
+
+    async def rewrite_redactable_fields(
+        self,
+        message_rewriter: Callable[[str], str],
+        context_rewriter: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> int:
+        rows = (await self._session.execute(select(LogEvent))).scalars().all()
+        changed = 0
+        for row in rows:
+            message = message_rewriter(row.message)
+            context = context_rewriter(row.context_json)
+            if message != row.message or context != row.context_json:
+                row.message = message
+                row.context_json = context
+                changed += 1
+        if changed:
+            await self._session.flush()
+        return changed
 
     async def prune_older_than(
         self,
