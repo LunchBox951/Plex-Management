@@ -31,8 +31,10 @@ the bad release — a correction verb calls :func:`remove_torrent` AND
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -206,34 +208,82 @@ class PurgeResult:
     detail: str | None = None
 
 
+def _run_delete_on_abandonable_thread(
+    fs: FileSystemPort, library_path: str
+) -> asyncio.Future[None]:
+    """Run ``fs.delete`` on a dedicated DAEMON thread, future-ifying its outcome.
+
+    Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401):
+    ``to_thread`` borrows the event loop's default ``ThreadPoolExecutor``,
+    whose workers are non-daemon and are JOINED at interpreter shutdown (by
+    ``asyncio.run``'s ``shutdown_default_executor`` and again by
+    ``concurrent.futures``' atexit hook). A delete wedged on a dead mount
+    would therefore still block process exit forever even after
+    ``web.app``'s bounded shutdown wait has logged and "proceeded" — the
+    issue #401 bound would be honest only until the last line of ``main``. A
+    dedicated daemon thread is abandonable by construction: nothing ever
+    joins it, so a hung delete can outlive the bounded wait without
+    outliving the process. Abandonment at exit is equivalent to crashing
+    mid-delete, which the sweep's crash-recovery pass already handles (issue
+    #128's whole subject). Deletes are infrequent (eviction sweeps,
+    report-issue purges) and serialized per path by ``_ACTIVE_PURGE_PATHS``,
+    so a fresh thread per delete costs nothing worth pooling.
+    """
+    loop = asyncio.get_running_loop()
+    settled_outcome: asyncio.Future[None] = loop.create_future()
+
+    def _deliver(error: BaseException | None) -> None:
+        if error is None:
+            settled_outcome.set_result(None)
+        else:
+            settled_outcome.set_exception(error)
+
+    def _worker() -> None:
+        error: BaseException | None = None
+        try:
+            fs.delete(library_path)
+        except BaseException as exc:  # delivered to the awaiter, never swallowed
+            error = exc
+        # RuntimeError here means the loop already closed: the process is
+        # exiting and nobody is left to await this outcome — the OS reclaims
+        # the thread. (This is the abandonment path the docstring describes;
+        # the disk state is whatever the delete reached, exactly like a crash.)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_deliver, error)
+
+    threading.Thread(target=_worker, name="purge-delete", daemon=True).start()
+    return settled_outcome
+
+
 async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
     """Run ``fs.delete`` to completion, holding any caller cancellation until it does.
 
-    ``await asyncio.to_thread(fs.delete, library_path)`` cancels by detaching
-    the awaiting coroutine from the executor future — the ``rmtree``/unlink
-    already handed to the thread pool keeps running in the background
-    regardless, since a thread cannot be interrupted from outside. A bare
-    ``to_thread`` await would let a cancelled :func:`purge_library_path`
-    unwind through its ``finally`` (releasing its ``_ACTIVE_PURGE_PATHS``
-    registration) — and, transitively, let a cancelled eviction sweep release
-    ``_sweep_latch`` — while that background thread is still mutating the
-    filesystem. That is exactly the window issue #128 exploits: a *later*
-    sweep's crash-recovery pass can then stat the still-present path, restore
-    the row to ``available``, and watch the file vanish out from under it a
-    moment later when the orphaned delete finally finishes.
+    A plain awaited thread hand-off cancels by detaching the awaiting
+    coroutine — the ``rmtree``/unlink already handed to its thread keeps
+    running in the background regardless, since a thread cannot be
+    interrupted from outside. A bare await would let a cancelled
+    :func:`purge_library_path` unwind through its ``finally`` (releasing its
+    ``_ACTIVE_PURGE_PATHS`` registration) — and, transitively, let a
+    cancelled eviction sweep release ``_sweep_latch`` — while that background
+    thread is still mutating the filesystem. That is exactly the window issue
+    #128 exploits: a *later* sweep's crash-recovery pass can then stat the
+    still-present path, restore the row to ``available``, and watch the file
+    vanish out from under it a moment later when the orphaned delete finally
+    finishes.
 
-    The delete instead runs in its own child task that is never cancelled;
-    this coroutine ``asyncio.shield``s a wait on that task's completion, so a
-    cancellation delivered here is caught and RE-DELIVERED only once the
-    worker has truly settled (success or error) — never before. Every caller's
-    registration release / ``finally`` therefore always observes a settled
-    filesystem, never a still-running delete.
+    The delete instead runs on its own daemon thread
+    (:func:`_run_delete_on_abandonable_thread`) whose outcome future is never
+    cancelled; this coroutine ``asyncio.shield``s a wait on that future's
+    completion, so a cancellation delivered here is caught and RE-DELIVERED
+    only once the worker has truly settled (success or error) — never before.
+    Every caller's registration release / ``finally`` therefore always
+    observes a settled filesystem, never a still-running delete.
     """
-    worker: asyncio.Task[None] = asyncio.create_task(asyncio.to_thread(fs.delete, library_path))
+    worker: asyncio.Future[None] = _run_delete_on_abandonable_thread(fs, library_path)
     settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     worker_error: BaseException | None = None
 
-    def _consume_worker_result(done: asyncio.Task[None]) -> None:
+    def _consume_worker_result(done: asyncio.Future[None]) -> None:
         nonlocal worker_error
         if not done.cancelled():
             worker_error = done.exception()
@@ -270,10 +320,12 @@ async def purge_library_path(
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
     Both the size accounting and the delete are real, synchronous disk I/O
-    (``os.stat``/``os.walk``/``shutil.rmtree``), so each runs off the event loop
-    via ``asyncio.to_thread`` — mirroring every other blocking FS primitive in the
-    services layer (see ``eviction_service._size_bytes``/``_evict_one``). The
-    delete specifically goes through :func:`_delete_to_settlement`, which shields
+    (``os.stat``/``os.walk``/``shutil.rmtree``), so each runs off the event loop:
+    the size accounting via ``asyncio.to_thread`` — mirroring every other
+    blocking FS primitive in the services layer (see ``eviction_service.
+    _size_bytes``/``_evict_one``) — and the delete on a dedicated abandonable
+    daemon thread (issue #401; see :func:`_run_delete_on_abandonable_thread`).
+    The delete specifically goes through :func:`_delete_to_settlement`, which shields
     the wait so a caller's cancellation is never observed until the underlying
     delete thread has genuinely finished (issue #128) — the registration this
     function holds in ``_ACTIVE_PURGE_PATHS`` (below) spans that full worker

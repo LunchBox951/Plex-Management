@@ -15,7 +15,6 @@ return so shutdown can proceed.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import threading
@@ -76,6 +75,34 @@ async def test_fast_settling_tasks_are_unaffected_by_the_bound(
     assert caplog.text == ""
 
 
+async def test_delete_runs_on_a_daemon_thread_the_interpreter_cannot_rejoin(
+    tmp_path: Path,
+) -> None:
+    """Codex #406 P1: the bounded wait only truly bounds shutdown if the hung
+    delete thread can never be re-joined later. ``asyncio.to_thread``'s
+    default-executor workers are non-daemon and ARE joined at interpreter
+    shutdown (``asyncio.run``'s ``shutdown_default_executor`` plus
+    ``concurrent.futures``' atexit hook) -- on that substrate the process
+    would still block on a wedged mount after the bound "proceeded". Pin the
+    substrate: the in-flight delete runs on a dedicated named DAEMON thread,
+    abandonable by construction."""
+    target = tmp_path / "movies" / "Stuck Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+
+    task = asyncio.create_task(_purge_worker(fs, str(target)))
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        delete_threads = [t for t in threading.enumerate() if t.name == "purge-delete"]
+        assert delete_threads, "the purge delete must run on its own dedicated thread"
+        assert all(thread.daemon for thread in delete_threads)
+    finally:
+        fs.release.set()
+        assert await task is None  # no cancellation here: the purge completes
+    assert purge_service.active_purge_paths() == ()
+
+
 async def test_a_hung_shielded_delete_times_out_and_names_the_stuck_path(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -123,6 +150,10 @@ async def test_a_hung_shielded_delete_times_out_and_names_the_stuck_path(
         # ``CancelledError`` out of the task -- expected, not a failure; see
         # ``tests.services.test_purge_service``'s identical cleanup pattern.
         fs.release.set()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # Once settled, ``_delete_to_settlement`` honours the earlier
+        # cancellation, so the task's outcome IS a CancelledError -- assert
+        # that contract (which also gives this await an effect CodeQL can
+        # see) rather than merely suppressing it.
+        (outcome,) = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
     assert purge_service.active_purge_paths() == ()

@@ -1620,9 +1620,14 @@ async def _await_background_tasks_shutdown(
     while a delete is still mutating disk. On a shutdown timeout the still-
     running delete thread is simply abandoned here: the OS reclaims it when the
     process exits regardless, so no delete durability is lost, only how long
-    shutdown blocks on it. The still-active purge path(s), if any, are named in
-    the warning (honesty over silence, never a silent stall) via
-    :func:`purge_service.active_purge_paths`.
+    shutdown blocks on it. That abandonment is real, not aspirational, because
+    the delete runs on a dedicated DAEMON thread
+    (:func:`purge_service._run_delete_on_abandonable_thread`, codex #406 P1)
+    -- were it on ``asyncio.to_thread``'s default executor, whose non-daemon
+    workers the interpreter re-joins at exit, the process would still block on
+    the hung delete after this wait "proceeded". The still-active purge
+    path(s), if any, are named in the warning (honesty over silence, never a
+    silent stall) via :func:`purge_service.active_purge_paths`.
 
     Deliberately uses :func:`asyncio.wait` rather than
     ``asyncio.wait_for(asyncio.gather(...), timeout=...)``: ``wait_for``
