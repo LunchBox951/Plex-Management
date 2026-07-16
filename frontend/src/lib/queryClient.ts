@@ -27,12 +27,21 @@ export const UPDATE_STATUS_POLL_INTERVAL_MS = 15000
 // store poll above, since the ring buffer is meant to feel "live".
 export const LOG_TAIL_POLL_INTERVAL_MS = 3000
 
+// The app-wide query staleTime. Named (rather than inlined) because the
+// live-state authority predicate (`useLiveStateAuthority`, api/hooks.ts)
+// leans on the SAME freshness judgment via React Query's `isStale`: data
+// younger than this is never refetched on (re)subscribe, so the predicate
+// trusts it at epoch start instead of waiting for a refetch that is never
+// coming — and its tests construct QueryClients with this exact value so
+// they exercise the app's real fresh/stale boundary.
+export const QUERY_STALE_TIME_MS = 1000
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
       refetchOnWindowFocus: false,
-      staleTime: 1000,
+      staleTime: QUERY_STALE_TIME_MS,
     },
   },
 })
@@ -52,6 +61,16 @@ export const queryKeys = {
   activeSessions: ['auth', 'sessions'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
+  // Issue #370 phase 2 — nested UNDER the ['requests'] prefix on purpose: every
+  // existing request-mutation `invalidateQueries({ queryKey: queryKeys.requests })`
+  // call (default `exact: false`, prefix match) ALREADY invalidates these too,
+  // with no mutation call site needing to know these queries exist. This is a
+  // structural guarantee, not a per-call-site convention to remember — the same
+  // pattern `request(id)` above already relies on.
+  requestsLiveState: (sortedKeys: readonly string[]) =>
+    ['requests', 'live-state', ...sortedKeys] as const,
+  requestsByTitle: (mediaType: string, tmdbId: number) =>
+    ['requests', 'by-title', mediaType, tmdbId] as const,
   queue: ['queue'] as const,
   blocklist: (tmdbId?: number) => ['blocklist', tmdbId ?? 'all'] as const,
   qualityProfile: ['quality-profile'] as const,

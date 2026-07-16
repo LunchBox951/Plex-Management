@@ -24,6 +24,7 @@ __all__ = [
     "LOG_EVENT_CORRELATION_KEYS",
     "BlocklistRecord",
     "BlocklistRepository",
+    "CompactRequestState",
     "DownloadRecord",
     "DownloadRepository",
     "DownloadScopeRecord",
@@ -90,6 +91,33 @@ class RequestRecord(BaseModel):
     tv_request_mode: str | None = None
     requested_seasons: tuple[int, ...] | None = None
     requested_episodes: dict[int, tuple[int, ...]] | None = None
+
+
+class CompactRequestState(BaseModel):
+    """The folded (active-else-newest) live-state view for one title (issue #370).
+
+    Phase 2 of #218: the client-facing analogue of ``display_statuses_by_tmdb_ids``
+    (used for Discover/Search tile decoration) but for the tile OVERLAY's
+    freshness polling -- richer than a bare status string, and addressed
+    per-title rather than embedded in a Discover page. Modeled as a pydantic
+    ``BaseModel`` (not a plain dataclass) to match every other cross-boundary
+    read-model in this module (``RequestRecord``, ``DownloadRecord``, ...).
+
+    A key is present in the ``compact_states_by_tmdb_ids`` result mapping iff
+    that title has at least one visible request row -- ``has_history`` on the
+    wire DTO (``web.schemas.CompactStateField``) makes that explicit rather than
+    relying on callers to infer it from key-presence.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: str
+    request_id: int
+    # A NON-representative row with ``status == 'available'`` also exists for
+    # this title (movie-only presence-contradiction signal -- e.g. a settled
+    # available row alongside an active re-request). Always ``False`` for tv,
+    # where a parent row's rollup status already encodes partial availability.
+    has_coexisting_available: bool
 
 
 class DownloadRecord(BaseModel):
@@ -452,6 +480,44 @@ class RequestRepository(Protocol):
         requests list/get filtering exactly (``user_id == for_user_id``; ownerless
         rows are excluded too, just as the list hides them). ``None`` (the
         default) is unscoped: admins and API-key automation see every row.
+        """
+        raise NotImplementedError
+
+    async def compact_states_by_tmdb_ids(
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
+    ) -> dict[tuple[int, str], CompactRequestState]:
+        """Batch the FOLDED live-state view per ``(tmdb_id, media_type)`` (issue #370).
+
+        Phase 2 of #218: the richer sibling of :meth:`display_statuses_by_tmdb_ids`
+        for the client tile-overlay's freshness poll (``POST /requests/live-state``)
+        -- same fold rule (a non-settled/active row wins, else the newest by id),
+        same batched ``tmdb_id IN (...)`` scan, same ``for_user_id`` visibility
+        scoping, but returns :class:`CompactRequestState` (status + the
+        representative's own id for settle-observation + the movie
+        presence-contradiction bit) instead of a bare status string. A separate
+        method rather than widening ``display_statuses_by_tmdb_ids`` -- that method
+        sits on the Discover tile-decoration hot path and returns a bare status
+        map; this keeps its shape and callers undisturbed. Keys with no request row
+        are simply ABSENT from the mapping (never a fabricated state).
+
+        Fold-across-page-boundaries is inherently safe here: this scan is keyed by
+        ``tmdb_id``, never by a keyset page (:meth:`list_page`) -- it always
+        considers a title's WHOLE history, so a fold representative can never be
+        split across two calls the way it could across two raw history pages.
+        """
+        raise NotImplementedError
+
+    async def list_for_title(
+        self, tmdb_id: int, media_type: str, *, for_user_id: int | None = None
+    ) -> list[RequestRecord]:
+        """Every visible RAW request row for one title, id-ascending (issue #370).
+
+        Backs ``GET /requests/by-title`` -- the title-detail modal's full match
+        list (bound-request resolution, per-season status, download progress,
+        subscriber flags), which needs every row for the title, never a folded
+        representative. Bounded by one title's lifetime history (small);
+        ``for_user_id`` applies the same shared-user visibility scope as every
+        other request read here.
         """
         raise NotImplementedError
 

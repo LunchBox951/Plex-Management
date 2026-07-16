@@ -10,7 +10,7 @@ import {
   useMarkFailed,
   useQueue,
   useReportIssue,
-  useRequests,
+  useTitleRequests,
   useSearchPreview,
   useSetKeepForever,
   useWithdrawSubscription,
@@ -37,7 +37,7 @@ vi.mock('../api/hooks', () => ({
   useGrab: vi.fn(),
   useMarkFailed: vi.fn(),
   useImportDownload: vi.fn(),
-  useRequests: vi.fn(),
+  useTitleRequests: vi.fn(),
   useQueue: vi.fn(),
   useSetKeepForever: vi.fn(),
   useReportIssue: vi.fn(),
@@ -70,7 +70,7 @@ beforeEach(() => {
   ;(useReportIssue as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useCancelRequest as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
   ;(useWithdrawSubscription as unknown as ReturnType<typeof vi.fn>).mockReturnValue(idle())
-  ;(useRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { requests: [] } })
+  ;(useTitleRequests as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ authoritative: true, data: { requests: [] } })
   ;(useQueue as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ data: { queue: [] } });
 })
 

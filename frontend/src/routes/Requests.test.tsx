@@ -12,24 +12,38 @@ import { Requests } from './Requests'
 // guard — so the mock must cover the modal's full hook surface, not just
 // `useRequests`, or an unmocked hook returns undefined and the modal throws
 // before the read-only cases below even get a chance to NOT mount it.
-vi.mock('../api/hooks', () => ({
-  useRequests: vi.fn(),
-  // Admin context: these route tests exercise the full (admin) modal surface.
-  useAuthMe: vi.fn(() => ({
-    data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
-    isLoading: false,
-  })),
-  useQueue: vi.fn(() => ({ data: { queue: [] } })),
-  useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useGrab: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useMarkFailed: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useImportDownload: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useSetKeepForever: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-  useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
-}))
+//
+// `useTitleRequests` (issue #370 phase 2) is the modal's OWN title-scoped read
+// -- a distinct hook from this route's whole-list `useRequests`, but every test
+// below already arranges `useRequests`' rows to include whichever row it
+// clicks to open the modal, so delegating to the SAME mock keeps every
+// existing `useRequests.mockReturnValue(...)` call governing the modal's data
+// too, with no per-test duplication.
+vi.mock('../api/hooks', () => {
+  const useRequests = vi.fn()
+  return {
+    useRequests,
+    // `authoritative: true` mirrors the settled state of the shared freshness
+    // predicate (issue #397): these tests always click a row that the mocked
+    // list already contains, i.e. the by-title read has "landed".
+    useTitleRequests: vi.fn(() => ({ ...(useRequests() as object), authoritative: true })),
+    // Admin context: these route tests exercise the full (admin) modal surface.
+    useAuthMe: vi.fn(() => ({
+      data: { authenticated: true, auth_method: 'api_key', is_admin: true, user: null },
+      isLoading: false,
+    })),
+    useQueue: vi.fn(() => ({ data: { queue: [] } })),
+    useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useSearchPreview: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useGrab: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useMarkFailed: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useImportDownload: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useSetKeepForever: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+    useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  }
+})
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
 

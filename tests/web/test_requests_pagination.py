@@ -182,7 +182,12 @@ async def test_shared_user_page_visibility_is_enforced_in_sql(
 ) -> None:
     """A shared user's page contains ONLY their subscribed rows, and the paginated
     mode never touches the unbounded list paths -- the subscriber predicate rides
-    in the page query itself, not a Python post-filter over a full scan."""
+    in the page query itself, not a Python post-filter over a full scan.
+
+    Issue #370 Stage B retired the old whole-set ``list_subscribed_request_ids``
+    entirely (subsumed by the page-scoped ``subscribed_request_ids_among``), so
+    "never runs the whole-set read" is now guaranteed by construction -- the
+    method no longer exists to poison."""
     await seed(initialized=True, app_api_key=_API_KEY)
     user_id, cookies, headers = await _user_session(app, tag="shared")
     mine = await _seed_movies(sessionmaker_, 4, tmdb_base=43000, user_id=user_id)
@@ -191,14 +196,8 @@ async def test_shared_user_page_visibility_is_enforced_in_sql(
     async def full_scan_forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("paginated mode must never materialize the full list")
 
-    async def whole_set_forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError(
-            "paginated mode must never run the O(all-subscriptions) whole-set membership read"
-        )
-
     monkeypatch.setattr(SqlRequestRepository, "list_by_status", full_scan_forbidden)
     monkeypatch.setattr(SqlRequestRepository, "list_for_user", full_scan_forbidden)
-    monkeypatch.setattr(SqlRequestRepository, "list_subscribed_request_ids", whole_set_forbidden)
 
     seen: list[int] = []
     cursor: int | None = None
@@ -230,17 +229,15 @@ async def test_admin_page_membership_is_scoped_to_the_page_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An admin's paginated page derives ``can_withdraw`` from ONE membership read
-    scoped to exactly the page's ids (the composite-index lookup), never the
-    O(all-subscriptions) whole-set read the legacy mode uses (#218 Codex round 1)."""
+    scoped to exactly the page's ids (the composite-index lookup), never an
+    O(all-subscriptions) whole-set read (#218 Codex round 1; issue #370 Stage B
+    retired the old whole-set ``list_subscribed_request_ids`` entirely, so this
+    is now guaranteed by construction -- both the page and the legacy list route
+    through this same page-scoped read)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     admin_id, cookies, headers = await _user_session(app, tag="admin", permissions=1)
     subscribed = await _seed_movies(sessionmaker_, 2, tmdb_base=49000, user_id=admin_id)
     unsubscribed = await _seed_movies(sessionmaker_, 4, tmdb_base=49100)
-
-    async def whole_set_forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError(
-            "paginated mode must never run the O(all-subscriptions) whole-set membership read"
-        )
 
     real_among = SqlRequestRepository.subscribed_request_ids_among
     seen_batches: list[list[int]] = []
@@ -251,7 +248,6 @@ async def test_admin_page_membership_is_scoped_to_the_page_ids(
         seen_batches.append(list(request_ids))
         return await real_among(self, user_id, request_ids)
 
-    monkeypatch.setattr(SqlRequestRepository, "list_subscribed_request_ids", whole_set_forbidden)
     monkeypatch.setattr(SqlRequestRepository, "subscribed_request_ids_among", spying_among)
 
     response = await client.get(

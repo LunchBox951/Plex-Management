@@ -24,7 +24,7 @@ from plex_manager.models import (
     SeasonRequest,
     WatchlistItem,
 )
-from plex_manager.ports.repositories import RequestRecord
+from plex_manager.ports.repositories import CompactRequestState, RequestRecord
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -162,6 +162,29 @@ def _page_stmt(
             stmt = stmt.where(MediaRequest.id < before_id)
         stmt = stmt.order_by(MediaRequest.id.desc())
     return stmt.limit(limit)
+
+
+def _tmdb_scan_stmt(tmdb_ids: set[int], *, for_user_id: int | None) -> Select[tuple[MediaRequest]]:
+    """The ``tmdb_id IN (...)`` scan shared by ``display_statuses_by_tmdb_ids`` /
+    ``compact_states_by_tmdb_ids`` (issue #370) -- see
+    :meth:`SqlRequestRepository._rows_grouped_by_tmdb_ids`.
+
+    Module-level so the EXPLAIN-QUERY-PLAN test can compile the EXACT production
+    statement (mirrors ``_page_stmt`` above). ``tmdb_id IN (...)`` never filters
+    on ``media_type`` in SQL (that split happens in Python -- see the port
+    docstring), so it is served by AN existing index leading on ``tmdb_id``:
+    either the single-column ``ix_media_requests_tmdb_id`` or the composite
+    ``ix_media_requests_tmdb_media`` (the query planner's call; both exist, no
+    new index ships with issue #370). The optional shared-user JOIN is served by
+    ``ix_request_subscribers_user_id_request_id`` (phase 1, issue #218). Rows
+    are id-ascending -- the fold's representative-selection order.
+    """
+    stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
+    if for_user_id is not None:
+        stmt = stmt.join(RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id).where(
+            RequestSubscriber.user_id == for_user_id
+        )
+    return stmt.order_by(MediaRequest.id)
 
 
 class SqlRequestRepository:
@@ -307,27 +330,19 @@ class SqlRequestRepository:
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_to_record(row) for row in rows]
 
-    async def list_subscribed_request_ids(self, user_id: int) -> set[int]:
-        """Return the bare set of request ids ``user_id`` subscribes to (issue #314).
-
-        The id-only analogue of :meth:`list_for_user`, for callers that only
-        need SET MEMBERSHIP (e.g. deriving ``can_withdraw`` for an admin's
-        unfiltered requests list) rather than hydrated records.
-        """
-        stmt = select(RequestSubscriber.request_id).where(RequestSubscriber.user_id == user_id)
-        return set((await self._session.execute(stmt)).scalars().all())
-
     async def subscribed_request_ids_among(
         self, user_id: int, request_ids: Sequence[int]
     ) -> set[int]:
         """The subset of ``request_ids`` that ``user_id`` subscribes to (issue #218).
 
-        The PAGE-SCOPED sibling of :meth:`list_subscribed_request_ids`: an
-        admin's paginated history view needs ``can_withdraw`` membership for
-        exactly one page of rows, and the whole-set read is O(all the user's
-        subscriptions) per page. The ``(user_id, request_id)`` predicate pair is
-        served by ``ix_request_subscribers_user_id_request_id``. Empty input is
-        a no-op (no query) returning the empty set.
+        The PAGE-SCOPED sibling of the old whole-set ``list_subscribed_request_ids``
+        (retired in issue #370 Stage B once this method subsumed its one caller):
+        both the paginated history view AND the legacy unpaginated list derive
+        ``can_withdraw`` membership for exactly their visible rows here, never an
+        O(all the user's subscriptions) whole-set read. The ``(user_id,
+        request_id)`` predicate pair is served by
+        ``ix_request_subscribers_user_id_request_id``. Empty input is a no-op (no
+        query) returning the empty set.
         """
         if not request_ids:
             return set()
@@ -686,31 +701,23 @@ class SqlRequestRepository:
         )
         await self._session.execute(stmt)
 
-    async def display_statuses_by_tmdb_ids(
-        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
-    ) -> dict[tuple[int, str], str]:
-        """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring.
+    async def _rows_grouped_by_tmdb_ids(
+        self, key_set: set[tuple[int, str]], *, for_user_id: int | None
+    ) -> dict[tuple[int, str], list[MediaRequest]]:
+        """Shared scan + group for the display-status / compact-live-state batch reads (#370).
 
-        ONE ``SELECT ... WHERE tmdb_id IN (...)`` over the distinct tmdb ids, then
-        the pairs are grouped in Python: a composite ``(tmdb_id, media_type)`` tuple
+        The pairs are grouped in Python: a composite ``(tmdb_id, media_type)`` tuple
         IN is deliberately avoided (SQLite/PostgreSQL differ on tuple IN, and the
-        backend is a config swap). Rows come back ``id``-ascending, so per key the
-        first non-settled row is the lowest-id ACTIVE one (matching ``find_active``)
-        and ``group[-1]`` is the newest fallback when every row is settled.
+        backend is a config swap). Rows come back ``id``-ascending, so per key
+        ``group[0]`` is the lowest-id row and ``group[-1]`` is the newest.
 
         ``for_user_id`` (when set) restricts the scan to that user's own rows —
-        the shared-session visibility scope; see the port docstring.
+        the shared-session visibility scope; see the callers' port docstrings.
         """
-        key_set = set(keys)
         if not key_set:
             return {}
         tmdb_ids = {tmdb_id for tmdb_id, _ in key_set}
-        stmt = select(MediaRequest).where(MediaRequest.tmdb_id.in_(tmdb_ids))
-        if for_user_id is not None:
-            stmt = stmt.join(
-                RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id
-            ).where(RequestSubscriber.user_id == for_user_id)
-        stmt = stmt.order_by(MediaRequest.id)
+        stmt = _tmdb_scan_stmt(tmdb_ids, for_user_id=for_user_id)
         rows = (await self._session.execute(stmt)).scalars().all()
         grouped: dict[tuple[int, str], list[MediaRequest]] = {}
         for row in rows:
@@ -718,6 +725,13 @@ class SqlRequestRepository:
             if key not in key_set:
                 continue  # a tmdb id shared across movie/tv namespaces, other type
             grouped.setdefault(key, []).append(row)
+        return grouped
+
+    async def display_statuses_by_tmdb_ids(
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
+    ) -> dict[tuple[int, str], str]:
+        """Batch the DISPLAY status per ``(tmdb_id, media_type)`` — see the port docstring."""
+        grouped = await self._rows_grouped_by_tmdb_ids(set(keys), for_user_id=for_user_id)
         result: dict[tuple[int, str], str] = {}
         for key, group in grouped.items():
             # Prefer a non-settled (active) row so a stale settled row never shadows
@@ -726,6 +740,58 @@ class SqlRequestRepository:
             chosen = active if active is not None else group[-1]
             result[key] = chosen.status.value
         return result
+
+    async def compact_states_by_tmdb_ids(
+        self, keys: Sequence[tuple[int, str]], *, for_user_id: int | None = None
+    ) -> dict[tuple[int, str], CompactRequestState]:
+        """Batch the FOLDED live-state view per ``(tmdb_id, media_type)`` -- see the port docstring.
+
+        Same scan + fold as :meth:`display_statuses_by_tmdb_ids` (identical
+        representative-selection rule, sharing :meth:`_rows_grouped_by_tmdb_ids`),
+        extended with the representative's own id (the client's settle-observation
+        key) and the movie presence-contradiction bit: a NON-representative row
+        settled ``available`` alongside the chosen representative (e.g. a genuine
+        re-request next to an already-available prior grab). Never set for tv,
+        whose parent row already carries a persisted per-season rollup status.
+        """
+        key_set = set(keys)
+        grouped = await self._rows_grouped_by_tmdb_ids(key_set, for_user_id=for_user_id)
+        result: dict[tuple[int, str], CompactRequestState] = {}
+        for key, group in grouped.items():
+            active = next((r for r in group if r.status not in _SETTLED_REQUEST_STATUSES), None)
+            chosen = active if active is not None else group[-1]
+            has_coexisting_available = key[1] == MediaType.movie.value and any(
+                r is not chosen and r.status == RequestStatus.available for r in group
+            )
+            result[key] = CompactRequestState(
+                status=chosen.status.value,
+                request_id=chosen.id,
+                has_coexisting_available=has_coexisting_available,
+            )
+        return result
+
+    async def list_for_title(
+        self, tmdb_id: int, media_type: str, *, for_user_id: int | None = None
+    ) -> list[RequestRecord]:
+        """Every visible RAW request row for one title, id-ascending -- see the port docstring.
+
+        Bounded by one title's lifetime history (never the whole table): a plain
+        ``tmdb_id = ? AND media_type = ?`` scan, served by
+        ``ix_media_requests_tmdb_media``, plus the same shared-user subscriber
+        JOIN every other visibility-scoped read here uses. Deliberately NOT
+        folded -- the title-detail modal needs every row to resolve bound-request
+        matches and per-row mutation state.
+        """
+        stmt = select(MediaRequest).where(
+            MediaRequest.tmdb_id == tmdb_id, MediaRequest.media_type == MediaType(media_type)
+        )
+        if for_user_id is not None:
+            stmt = stmt.join(
+                RequestSubscriber, RequestSubscriber.request_id == MediaRequest.id
+            ).where(RequestSubscriber.user_id == for_user_id)
+        stmt = stmt.order_by(MediaRequest.id)
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_to_record(row) for row in rows]
 
     async def list_false_available_movies(self, *, limit: int) -> list[RequestRecord]:
         """Movie rows ``status='available' AND library_path IS NULL AND

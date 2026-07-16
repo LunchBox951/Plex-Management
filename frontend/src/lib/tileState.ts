@@ -5,9 +5,11 @@
  *   1. the SERVER base state on `DiscoverResult.library_state` — Plex presence +
  *      the request store, computed per page (only the server can crawl Plex, so
  *      "owned but never requested through the app" can only come from here);
- *   2. the CLIENT overlay — the live request lifecycle from the `useRequests()`
- *      poll the app already runs, so a tile animates pending→downloading→available
- *      without re-fetching Discover.
+ *   2. the CLIENT overlay — the live request lifecycle from the `useTileLiveStates()`
+ *      poll (issue #370 phase 2), so a tile animates pending→downloading→available
+ *      without re-fetching Discover AND without fetching the whole raw request
+ *      history — the poll returns each tile's ALREADY-FOLDED (active-else-newest)
+ *      representative directly from the server.
  *
  * The client overlay WINS for a live active/available request, using the exact
  * `(tmdb_id, media_type)` correlation `TitleDetailModal` implements. A settled
@@ -53,9 +55,18 @@
  * This status→state table mirrors the server's `derive_library_state`
  * (services/discovery_service.py); a drift makes base and overlay disagree on a tile.
  */
-import type { DiscoverResult, RequestResponse } from '../api/types'
+import type { CompactStateField, DiscoverResult } from '../api/types'
 import { queryClient } from './queryClient'
 import { requestStatus, type StatusPresentation } from './status'
+
+/**
+ * A tile's folded live-state, as the compact endpoint returns it (issue #370
+ * phase 2) — the representative row's status/id plus the two derived bits
+ * `deriveTileState` needs. `undefined` means "no live-state entry for this
+ * tile yet" (the poll hasn't landed, or the tile genuinely has no request
+ * history — both degrade the same way: fall through to the server base).
+ */
+export type TileLiveState = CompactStateField
 
 // Settled, non-available request statuses. A row in one of these is "done and gone"
 // and must never overlay the server base (mirrors the backend `_SETTLED_REQUEST_STATUSES`
@@ -88,92 +99,54 @@ export function resetSettleObservations(): void {
   settleObservedAt.clear()
 }
 
+/**
+ * Track settle observation for ONE tile's representative row (issue #370
+ * phase 2: the compact endpoint already picked the active-else-newest
+ * representative server-side, so there is exactly one id to observe per
+ * tile — never a whole match array). `live` is `undefined` when this tile
+ * currently has no live-state entry (nothing to observe).
+ */
 function trackSettleObservations(
-  matches: RequestResponse[],
+  live: TileLiveState | undefined,
   requestsFetchedAt: number | undefined,
 ): void {
+  if (!live) return
   // The poll snapshot's own receipt time is tighter than render-time Date.now()
   // (same clock domain either way); fall back when the caller doesn't have it.
   const observed = requestsFetchedAt ?? Date.now()
-  for (const r of matches) {
-    if (!OVERLAY_SUPPRESSED.has(r.status)) {
-      // Active (or available) again — e.g. an ADR-0014 report-issue re-arm. Any
-      // previous settle observation is history; a future settle is a new event.
-      settleObservedAt.delete(r.id)
-    } else if (!settleObservedAt.has(r.id)) {
-      // First time this session sees the row settled — either a watched transition
-      // or already settled at first sighting; both record (see the registry
-      // comment on why first sighting counts).
-      settleObservedAt.set(r.id, observed)
-      // Ask react-query to refetch every discover query: invalidateQueries with the
-      // ['discover'] prefix (same call shape as useUpdateSettings) marks ALL sibling
-      // caches stale — active ones refetch immediately, inactive ones on their next
-      // activation — so every base snapshot heals, not just the one this call
-      // happens to render with. Fired UNCONDITIONALLY (wave 7): gating it on the
-      // calling query's own freshness broke the healing twice over — (a) the
-      // receipt-time race: `baseFetchedAt` is client RECEIPT time, but the server
-      // read the request rows up to one RTT earlier, so a base that RESOLVED after
-      // the observation can still have been COMPUTED pre-settle (wrongly trusted;
-      // gated, nothing ever healed it), and (b) sibling caches: an older cached
-      // discover query still predates the settle, but the per-row once-guard meant
-      // the skipped invalidation could never fire again (stuck unbadged). One extra
-      // discover refetch per settled row per session is the whole cost.
-      // Deferred to a microtask: deriveTileState runs during render, and scheduling
-      // refetches synchronously mid-render is a React anti-pattern. Fires at most
-      // once per row per session (guarded by the `has` check above).
-      queueMicrotask(() => {
-        void queryClient.invalidateQueries({ queryKey: ['discover'] })
-      })
-    }
+  if (!OVERLAY_SUPPRESSED.has(live.status)) {
+    // Active (or available) again — e.g. an ADR-0014 report-issue re-arm. Any
+    // previous settle observation is history; a future settle is a new event.
+    settleObservedAt.delete(live.request_id)
+  } else if (!settleObservedAt.has(live.request_id)) {
+    // First time this session sees the row settled — either a watched transition
+    // or already settled at first sighting; both record (see the registry
+    // comment on why first sighting counts).
+    settleObservedAt.set(live.request_id, observed)
+    // Ask react-query to refetch every discover query: invalidateQueries with the
+    // ['discover'] prefix (same call shape as useUpdateSettings) marks ALL sibling
+    // caches stale — active ones refetch immediately, inactive ones on their next
+    // activation — so every base snapshot heals, not just the one this call
+    // happens to render with. Fired UNCONDITIONALLY (wave 7): gating it on the
+    // calling query's own freshness broke the healing twice over — (a) the
+    // receipt-time race: `baseFetchedAt` is client RECEIPT time, but the server
+    // read the request rows up to one RTT earlier, so a base that RESOLVED after
+    // the observation can still have been COMPUTED pre-settle (wrongly trusted;
+    // gated, nothing ever healed it), and (b) sibling caches: an older cached
+    // discover query still predates the settle, but the per-row once-guard meant
+    // the skipped invalidation could never fire again (stuck unbadged). One extra
+    // discover refetch per settled row per session is the whole cost.
+    // Deferred to a microtask: deriveTileState runs during render, and scheduling
+    // refetches synchronously mid-render is a React anti-pattern. Fires at most
+    // once per row per session (guarded by the `has` check above).
+    //
+    // A superseded representative id (e.g. a re-request supersedes an older
+    // settled row as the fold's pick) simply lingers in this map, never read
+    // again — harmless and session-bounded, same as the array-scan version.
+    queueMicrotask(() => {
+      void queryClient.invalidateQueries({ queryKey: ['discover'] })
+    })
   }
-}
-
-// ---------------------------------------------------------------------------
-// Memoized title-correlation index (issue #218, design item 3).
-//
-// `deriveTileState` used to `filter` the WHOLE requests array per tile, making a
-// Discover page's correlation O(T × U) (tiles × visible request groups) per
-// render. The index below is built ONCE per distinct requests-array instance —
-// a WeakMap keyed on the array reference, which react-query keeps stable until
-// a refetch actually produces new data — so correlation is O(U) once + O(1) per
-// tile lookup: O(U + T) per render. Insertion order preserves the array's
-// id-ascending order, so per-key match lists are identical to what the filter
-// produced. A WeakMap (not a Map) so a superseded snapshot's index is
-// garbage-collected with the snapshot itself.
-// ---------------------------------------------------------------------------
-const requestIndexCache = new WeakMap<
-  readonly RequestResponse[],
-  Map<string, RequestResponse[]>
->()
-
-function titleKey(mediaType: string, tmdbId: number): string {
-  // TMDB movie/tv ids are independent namespaces and collide; the composite key
-  // is the same correlation TitleDetailModal implements.
-  return `${mediaType}:${tmdbId}`
-}
-
-/**
- * The per-title index for one requests snapshot, memoized on the array
- * instance. Exported for the O(U + T) comparison-bound test.
- */
-export function indexRequestsByTitle(
-  requests: readonly RequestResponse[],
-): Map<string, RequestResponse[]> {
-  let index = requestIndexCache.get(requests)
-  if (!index) {
-    index = new Map()
-    for (const r of requests) {
-      const key = titleKey(r.media_type, r.tmdb_id)
-      const group = index.get(key)
-      if (group) {
-        group.push(r)
-      } else {
-        index.set(key, [r])
-      }
-    }
-    requestIndexCache.set(requests, index)
-  }
-  return index
 }
 
 function libraryStateToPresentation(
@@ -213,26 +186,20 @@ function libraryStateToPresentation(
  */
 export function deriveTileState(
   result: DiscoverResult,
-  requests: RequestResponse[] | undefined,
+  live: TileLiveState | undefined,
   baseFetchedAt?: number,
   requestsFetchedAt?: number,
 ): StatusPresentation | null {
-  // The live request for this exact title — identical correlation to
-  // TitleDetailModal.tsx: /requests is id-ascending and the backend allows
-  // re-requesting a settled title, so prefer a non-settled match, else the
-  // newest. Looked up through the memoized per-snapshot index (#218) instead of
-  // filtering the whole array per tile — same match list, O(1) per tile.
-  const matches = requests
-    ? (indexRequestsByTitle(requests).get(titleKey(result.media_type, result.tmdb_id)) ?? [])
-    : []
-  trackSettleObservations(matches, requestsFetchedAt)
-  const active = matches.find((r) => !isSettled(r.status))
-  const liveRequest = active ?? matches[matches.length - 1] ?? null
+  // The representative is already resolved server-side (issue #370 phase 2:
+  // `POST /requests/live-state` picks active-else-newest per tile key — the
+  // exact same rule `TitleDetailModal.tsx` implements over its own title-scoped
+  // read), so there is no client-side match array to select from anymore.
+  trackSettleObservations(live, requestsFetchedAt)
 
-  if (liveRequest) {
+  if (live) {
     // Overlay wins for a live active/available request.
-    if (!OVERLAY_SUPPRESSED.has(liveRequest.status)) {
-      return requestStatus(liveRequest.status)
+    if (!OVERLAY_SUPPRESSED.has(live.status)) {
+      return requestStatus(live.status)
     }
 
     // A settled-bad row (failed/cancelled/evicted) never badges the tile itself.
@@ -247,30 +214,26 @@ export function deriveTileState(
     //    portion. First-sighting observations (wave 6) land here too: the settle
     //    happened at or before the poll that first carried the row, so a base
     //    older than that poll may predate the settle.
-    // A settled liveRequest ALWAYS has an observation (recorded just above);
+    // A settled `live` state ALWAYS has an observation (recorded just above);
     // `?? Infinity` merely keeps the comparison total for the type system.
-    const observedAt = settleObservedAt.get(liveRequest.id) ?? Number.POSITIVE_INFINITY
+    const observedAt = settleObservedAt.get(live.request_id) ?? Number.POSITIVE_INFINITY
     if (baseFetchedAt !== undefined && baseFetchedAt > observedAt) {
       return libraryStateToPresentation(result.library_state)
     }
 
-    // MOVIE re-request contradiction: a settled liveRequest that coexists with an
-    // OLDER `available` row proves the pre-settle `available` base stale too. The
-    // movie create path (request_service.create_request) NEVER creates a second row
-    // while Plex still has the title — its fresh `is_available(use_cache=False)`
-    // check dedups to the existing in-library row instead — so the newer request's
-    // very existence means the title read ABSENT at create time (the G7
-    // removed-then-re-requested path). Not applied to tv: a season-level re-request
-    // (e.g. a newly aired season) is legitimately created while the show remains
-    // partially/fully present, so its failure says nothing about the seasons on disk.
-    const rerequestContradictsPresence =
-      result.media_type === 'movie' &&
-      matches.some((r) => r !== liveRequest && r.status === 'available')
-    return settledBaseFallback(
-      result.library_state,
-      liveRequest.status,
-      rerequestContradictsPresence,
-    )
+    // MOVIE re-request contradiction: a settled representative that coexists
+    // with an OLDER `available` row proves the pre-settle `available` base
+    // stale too. The movie create path (request_service.create_request) NEVER
+    // creates a second row while Plex still has the title — its fresh
+    // `is_available(use_cache=False)` check dedups to the existing in-library
+    // row instead — so the newer request's very existence means the title read
+    // ABSENT at create time (the G7 removed-then-re-requested path). Not
+    // applied to tv: a season-level re-request (e.g. a newly aired season) is
+    // legitimately created while the show remains partially/fully present, so
+    // its failure says nothing about the seasons on disk. The server already
+    // scopes `has_coexisting_available` to movies only (see
+    // `CompactRequestState`), so no client-side media-type re-check is needed.
+    return settledBaseFallback(result.library_state, live.status, live.has_coexisting_available)
   }
 
   // No live row for this title: the server base is the only source of truth.
@@ -322,9 +285,4 @@ function settledBaseFallback(
 ): StatusPresentation | null {
   if (settledStatus === 'evicted' || presenceContradicted) return null
   return state === 'available' ? libraryStateToPresentation(state) : null
-}
-
-/** A settled request status — matches the backend `_SETTLED_REQUEST_STATUSES`. */
-function isSettled(status: string): boolean {
-  return status === 'available' || OVERLAY_SUPPRESSED.has(status)
 }
