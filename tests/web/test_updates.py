@@ -1374,6 +1374,54 @@ async def test_legacy_busy_status_and_reset_agree_on_stale_heartbeat_anchor(
     assert snapshot.action_generation == 1
 
 
+async def test_eligibility_touch_anchors_legacy_busy_row_to_the_pre_touch_heartbeat(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for issue #387: a legacy pre-anchor busy row FIRST
+    observed through an eligibility poll's liveness touch -- rather than a
+    direct status/snapshot read -- must anchor to the stale STORED heartbeat,
+    exactly like the direct-snapshot path above, not to the touch's own poll
+    timestamp. ``_eligibility(touch=True)`` used to call ``touch_updater()``
+    (which overwrites ``updater_last_seen_at``) before the backfill that
+    later ran inside its own trailing ``snapshot()`` could see the old value,
+    costing one full ``COORDINATOR_RECOVERY_MAX_AGE`` window before
+    force-reset was allowed."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    heartbeat = moment[0] - timedelta(minutes=12)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert polled.status_code == 200
+    assert polled.json()["action"] == "none"
+    snapshot = await coordinator.snapshot()
+    # The recovery anchor uses the OLD stored heartbeat, matching the
+    # direct-snapshot path -- while the touch itself still legitimately
+    # refreshed liveness to the current poll time.
+    assert snapshot.last_started_at == heartbeat
+    assert snapshot.updater_last_seen_at == moment[0]
+
+
 @pytest.mark.parametrize(
     "heartbeat",
     [None, datetime(2026, 7, 14, 12, 1, tzinfo=UTC)],
@@ -1961,3 +2009,467 @@ async def test_checking_action_wedge_recovery_is_bounded_despite_live_polling(
         "requested_action": "none",
         "action_generation": 1,
     }
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0025 stage 0: sidecar identity + self-refresh observability (issue #299)
+# --------------------------------------------------------------------------- #
+async def _fresh_coordinator(app: FastAPI) -> UpdateCoordinationService:
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    return coordinator
+
+
+async def test_old_sidecar_checking_heartbeat_still_validates(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """C7 backward-compat: the pre-expand ``{phase, action_generation}`` beat works."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    generation = await coordinator.request_action(UpdateAction.check)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking", "action_generation": generation},
+    )
+    assert response.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "checking"
+    assert snapshot.updater_last_seen_at is not None
+
+
+async def test_phaseless_liveness_heartbeat_writes_no_phase(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """The C7 expand direction: a phase-less beat refreshes liveness only."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    generation = await coordinator.request_action(UpdateAction.check)
+    before = await coordinator.snapshot()
+    assert before.phase == "idle"
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={},
+    )
+    assert response.status_code == 200
+    after = await coordinator.snapshot()
+    # Liveness refreshed, but phase / action / generation are untouched.
+    assert after.updater_last_seen_at is not None
+    assert after.phase == "idle"
+    assert after.requested_action == "check"
+    assert after.action_generation == generation
+
+
+async def test_heartbeat_persists_and_surfaces_sidecar_identity(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={
+            "updater_build": "sidecar-build",
+            "updater_digest": "sha256:" + "a" * 64,
+            "updater_container_id": "deadBEEF01",
+            "refresh_nonce": "nonce-1_A",
+        },
+    )
+    assert response.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "sidecar-build"
+    assert body["updater_observed_digest"] == "sha256:" + "a" * 64
+
+
+async def test_heartbeat_rejects_unknown_field_and_bare_checking(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    # extra="forbid" stays in force for genuinely unknown fields.
+    extra = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking", "action_generation": 0, "bogus": 1},
+    )
+    assert extra.status_code == 422
+    # The pre-expand contract is preserved: a checking beat needs its generation.
+    bare = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking"},
+    )
+    assert bare.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["updater_build", "updater_digest", "updater_container_id", "refresh_nonce"],
+)
+async def test_heartbeat_empty_string_identity_field_is_an_honest_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    field: str,
+) -> None:
+    """PR #384 review M1: "absent" is ``None``/omitted, never ``""``.
+
+    Without ``min_length=1`` (build/digest) / the one-or-more patterns
+    (container id/nonce), ``""`` passes schema validation, sails past the
+    endpoint's ``is not None`` gate, and blows up in the service's
+    ``_bounded_text`` as a bare ``ValueError`` -- an HTTP 500 where north star
+    #3 demands an honest 4xx at the edge.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={field: ""},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["updater_build", "updater_digest"])
+async def test_heartbeat_control_character_identity_field_is_an_honest_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    field: str,
+) -> None:
+    """PR #384 review P2: a control character must 422, not 500.
+
+    ``updater_build``/``updater_digest`` were only length-checked before this
+    fix, so a build id with an embedded control character (e.g. a newline
+    copied into it) passed schema validation and reached
+    ``record_updater_identity()``'s ``_bounded_text()``, whose bare
+    ``ValueError`` surfaced as an HTTP 500 for an authenticated internal
+    request instead of the honest 422 north star #3 demands. The pattern now
+    matches ``UpdateRefreshOutcomeRequest.from_build``/``to_build``.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={field: "bad\nbuild"},
+    )
+    assert response.status_code == 422
+
+
+async def test_status_null_observed_identity_reads_stale(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2: absent observed identity is unknown (None), never a clean match."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # The runtime id is real and stamped -- the None below is driven purely by
+    # the sidecar never having reported its identity.
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-runtime-build")
+    await _fresh_coordinator(app)
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is None
+    assert body["updater_observed_build"] is None
+
+
+async def test_status_sidecar_ahead_reads_mismatch_not_older(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3: a differing observed build is a direction-free mismatch (False)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-runtime-n")
+    coordinator = await _fresh_coordinator(app)
+    # The sidecar reports it is running N+1 (ahead) -- still just a mismatch.
+    await coordinator.record_updater_identity(
+        observed_build="sidecar-build-n1plus",
+        observed_digest="sha256:" + "2" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is False
+
+
+async def test_status_matches_running_app_not_stale_target_observation(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex round 1: the comparison anchor is the RUNNING app, not the row.
+
+    The rollback shape: the coordinator row's ``current_build`` is the last
+    TARGET observation (N+1, from before the operator rolled the app back to
+    N), and the sidecar also still runs N+1. Comparing against the row would
+    read as a clean match while the running app is actually on N -- the match
+    must anchor on the process's own build id and report the mismatch.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # The RUNNING process is N...
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "build-n")
+    coordinator = await _fresh_coordinator(app)
+    # ...but the row's last target observation (pre-rollback) says N+1.
+    generation = await coordinator.request_action(UpdateAction.check)
+    assert await coordinator.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.no_update,
+        current_build="build-n-plus-1",
+        current_digest="sha256:" + "9" * 64,
+    )
+    # The sidecar (still on the pre-rollback image) matches the ROW, not the app.
+    await coordinator.record_updater_identity(
+        observed_build="build-n-plus-1",
+        observed_digest="sha256:" + "9" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is False
+
+
+async def test_status_same_runtime_build_reads_match(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
+    await coordinator.record_updater_identity(
+        observed_build="app-build",
+        observed_digest="sha256:" + "f" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is True
+
+
+async def test_status_unstamped_runtime_build_reads_unknown_not_a_lie(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstamped runtime id (dev "0.0.0") cannot distinguish builds -> None."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "0.0.0")
+    coordinator = await _fresh_coordinator(app)
+    await coordinator.record_updater_identity(
+        observed_build="0.0.0",
+        observed_digest="sha256:" + "a" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    # Even an equal-looking "0.0.0" pair is honestly unknown, never a match.
+    assert body["updater_build_matches_app"] is None
+
+
+@pytest.mark.parametrize("beat", [{}, {"phase": "checking", "action_generation": None}])
+async def test_identityless_heartbeat_clears_stored_identity(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    beat: dict[str, object],
+) -> None:
+    """Codex round 1: identity is per-heartbeat self-description, never inherited.
+
+    A sidecar replaced/downgraded to an image that doesn't report identity
+    (every pre-stage-1 sidecar) must not keep wearing its predecessor's stored
+    identity: its first identity-less beat clears the observation and the match
+    state reverts to unknown (None -> no banner).
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
+
+    # A newer sidecar reported identity...
+    identified = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"updater_build": "stage1-build", "updater_digest": "sha256:" + "b" * 64},
+    )
+    assert identified.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "stage1-build"
+    assert body["updater_build_matches_app"] is False
+
+    # ...then the container was replaced by one that doesn't (e.g. a checking
+    # beat from an old sidecar). Its beat clears the stale identity.
+    payload = {key: value for key, value in beat.items() if value is not None}
+    if payload.get("phase") == "checking":
+        generation = await coordinator.request_action(UpdateAction.check)
+        payload["action_generation"] = generation
+    cleared = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json=payload,
+    )
+    assert cleared.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] is None
+    assert body["updater_observed_digest"] is None
+    assert body["updater_build_matches_app"] is None
+
+
+async def test_eligibility_touch_clears_stale_identity_from_replaced_sidecar(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #384 review P2: a legacy idle poll must not keep wearing a dead sidecar's identity.
+
+    ``/eligibility`` never carries a sidecar-reported build/digest -- the
+    current updater idle loop only calls it (``updater/runner.py:198``). If an
+    identity-reporting sidecar is replaced/downgraded by one whose idle loop
+    only polls eligibility, that poll's touch refreshes liveness (looking
+    fresh) but must ALSO clear the previous sidecar's stale observed identity,
+    mirroring the heartbeat endpoint's absence-clears contract -- otherwise
+    status keeps asserting a match/mismatch banner for a container that no
+    longer exists.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
+    before = await coordinator.snapshot()
+
+    # A newer sidecar reported identity via a heartbeat...
+    identified = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"updater_build": "stage1-build", "updater_digest": "sha256:" + "c" * 64},
+    )
+    assert identified.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "stage1-build"
+    assert body["updater_build_matches_app"] is False
+
+    # ...then it was replaced/downgraded by one whose idle loop only polls
+    # eligibility (no identity fields exist on this endpoint at all).
+    polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert polled.status_code == 200
+
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] is None
+    assert body["updater_observed_digest"] is None
+    assert body["updater_build_matches_app"] is None
+    # The touch still did its ordinary job: liveness moved forward.
+    after = await coordinator.snapshot()
+    assert after.updater_last_seen_at is not None
+    assert before.updater_last_seen_at is None
+
+
+async def test_refresh_outcome_route_accepts_and_surfaces(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """Codex round 1: the accept-side refresh-outcome contract ships with the expand."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json={
+            "result": "failed",
+            "detail_code": "successor_never_pinged",
+            "from_build": "old-build",
+            "to_build": "new-build",
+        },
+    )
+    assert response.status_code == 200
+    # The route's own response and a later status read both surface the record.
+    assert response.json()["last_refresh"]["result"] == "failed"
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "failed"
+    assert body["last_refresh"]["detail_code"] == "successor_never_pinged"
+    assert body["last_refresh"]["from_build"] == "old-build"
+    assert body["last_refresh"]["to_build"] == "new-build"
+    assert body["last_refresh"]["at"] is not None
+
+    # A later successful refresh is the only thing that overwrites it.
+    succeeded = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json={"result": "succeeded", "from_build": "old-build", "to_build": "new-build"},
+    )
+    assert succeeded.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "succeeded"
+    assert body["last_refresh"]["detail_code"] is None
+
+
+async def test_refresh_outcome_route_requires_sidecar_secret(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, updater_headers: dict[str, str]
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+    # The public admin credential must NOT reach the internal updater surface.
+    refused = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=_ADMIN,
+        json={"result": "failed"},
+    )
+    assert refused.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"result": "Not A Code"},  # pattern violation
+        {"result": "9leading_digit"},  # must start [a-z] (matches _bounded_code)
+        {"result": "failed", "detail_code": ""},  # empty string is not "absent"
+        {"result": "failed", "from_build": ""},  # ditto
+        {"result": "failed", "from_build": "has\ncontrol"},  # control chars
+        {"result": "failed", "bogus": 1},  # extra="forbid"
+    ],
+)
+async def test_refresh_outcome_route_rejects_malformed_bodies_with_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    payload: dict[str, object],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+    response = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json=payload,
+    )
+    assert response.status_code == 422
+
+
+async def test_status_surfaces_failed_refresh_record(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """north star #3: a durable failed self-refresh is shown, not masked."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    await coordinator.record_refresh_outcome(
+        result="failed",
+        detail_code="successor_never_pinged",
+        from_build="old",
+        to_build="new",
+    )
+    # A later ordinary identity heartbeat must not clear the record.
+    await coordinator.record_updater_identity(observed_build="old", observed_digest="sha256:old")
+
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "failed"
+    assert body["last_refresh"]["detail_code"] == "successor_never_pinged"
+    assert body["last_refresh"]["from_build"] == "old"
+    assert body["last_refresh"]["to_build"] == "new"

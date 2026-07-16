@@ -251,6 +251,106 @@ describe('Status', () => {
     expect(screen.getByRole('button', { name: 'Update queued' })).toBeDisabled()
   })
 
+  it('shows a direction-free build-mismatch banner with the refresh command', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ updater_build_matches_app: false }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText('Updater is running a different build')).toBeInTheDocument()
+    expect(
+      screen.getByText('docker compose --profile auto-update up -d updater'),
+    ).toBeInTheDocument()
+    // Direction-free (R3): never claims the sidecar is older or newer.
+    expect(screen.queryByText(/older|newer/i)).not.toBeInTheDocument()
+  })
+
+  it('shows no build-mismatch banner when identity is unknown or matching', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    // `null` is the expected pre-stage-1 state (sidecar hasn't reported its
+    // identity) — it must NOT raise a permanent banner on a healthy install.
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ updater_build_matches_app: null }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.queryByText('Updater is running a different build')).not.toBeInTheDocument()
+  })
+
+  it('renders a failed sidecar self-refresh even when the build match is unknown', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    // The dangerous shape (Codex round 1): the failed predecessor survived and
+    // keeps heartbeating (identity unknown, no mismatch banner) — the durable
+    // last_refresh record must still be shown, or the failure is masked.
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        updater_build_matches_app: null,
+        last_refresh: {
+          result: 'failed',
+          detail_code: 'successor_never_pinged',
+          from_build: '1.4.0',
+          to_build: '1.5.0',
+          at: '2026-07-15T12:00:00Z',
+        },
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText('Updater self-refresh failed')).toBeInTheDocument()
+    expect(screen.getByText('successor never pinged')).toBeInTheDocument()
+    expect(screen.getByText(/1\.4\.0 → 1\.5\.0/)).toBeInTheDocument()
+    // The failure carries its correction path (north star #1).
+    expect(
+      screen.getByText('docker compose --profile auto-update up -d updater'),
+    ).toBeInTheDocument()
+    // And no mismatch banner is fabricated from the unknown match state.
+    expect(screen.queryByText('Updater is running a different build')).not.toBeInTheDocument()
+  })
+
+  it('renders a non-failed self-refresh record neutrally, without the refresh command', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({
+        updater_build_matches_app: true,
+        last_refresh: {
+          result: 'succeeded',
+          detail_code: null,
+          from_build: '1.4.0',
+          to_build: '1.5.0',
+          at: '2026-07-15T12:00:00Z',
+        },
+      }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText('Updater self-refresh')).toBeInTheDocument()
+    expect(screen.getByText(/succeeded/)).toBeInTheDocument()
+    expect(
+      screen.queryByText('docker compose --profile auto-update up -d updater'),
+    ).not.toBeInTheDocument()
+  })
+
   it.each([
     ['installing', 'Installing update'],
     ['rollback', 'Rolling back'],
