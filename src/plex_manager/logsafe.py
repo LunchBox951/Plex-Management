@@ -320,12 +320,12 @@ _KV_SEP_PATTERN: Final = r"['\"]?\s*[:=]\s*"
 # a multi-line/truncated value). Mutually exclusive branches -> linear, no ReDoS.
 _QUOTED_VALUE: Final = r"(?:\\[\s\S]|(?!(?P=q))[^\\])*"
 _SECRET_KV_RE: Final = re.compile(
-    r"(?i)\b[\w-]{0,64}?"
+    r"(?i)\b(?P<key>[\w-]{0,64}?"
     + r"(?:(?P<fkey>"
     + _FREEFORM_KEY_PATTERN
     + r")|(?:"
     + _TOKEN_KEY_PATTERN
-    + r"))\b"
+    + r"))\b)"
     + _KV_SEP_PATTERN
     + _BYTES_PREFIX
     + r"(?P<q>['\"])?(?P<value>(?(q)"
@@ -351,7 +351,7 @@ _SECRET_KV_RE: Final = re.compile(
 # IS the rest of the line. Over-redacting trailing prose is accepted; leaking
 # any Authorization parameter is not.
 _AUTHORIZATION_RE: Final = re.compile(
-    r"(?i)\bauthorization\b['\"]?\s*[:=]\s*"
+    r"(?i)\b(?P<key>authorization)\b['\"]?\s*[:=]\s*"
     + _BYTES_PREFIX
     + r"(?P<q>['\"])?(?P<value>(?(q)"
     + _QUOTED_VALUE
@@ -375,9 +375,9 @@ _AUTHORIZATION_RE: Final = re.compile(
 # through the value's opening quote; the closing quote sits outside the match
 # and survives: ``('X-Api-Key', '<redacted>')``.
 _SECRET_TUPLE_RE: Final = re.compile(
-    r"(?i)b?(?P<kq>['\"])[\w-]{0,64}?(?:"
+    r"(?i)b?(?P<kq>['\"])(?P<key>[\w-]{0,64}?(?:"
     + _SECRET_KEY_PATTERN
-    + r"|authorization)(?P=kq)\s*,\s*b?(?P<q>['\"])(?P<value>"
+    + r"|authorization))(?P=kq)\s*,\s*b?(?P<q>['\"])(?P<value>"
     + _QUOTED_VALUE
     + r")"
 )
@@ -410,9 +410,9 @@ _SECRET_TUPLE_RE: Final = re.compile(
 _CONTAINER_ELEM: Final = r"(?:\"(?:[^\"\\]|\\.)*+\"?+|'(?:[^'\\]|\\.)*+'?+|[^'\"\[\]\(\)])"
 _CONTAINER_BODY: Final = r"(?:" + _CONTAINER_ELEM + r"|[\[\(]" + _CONTAINER_ELEM + r"*+[\]\)]?+)*+"
 _SECRET_CONTAINER_RE: Final = re.compile(
-    r"(?i)\b[\w-]{0,64}?(?:"
+    r"(?i)\b(?P<key>[\w-]{0,64}?(?:"
     + _SECRET_KEY_PATTERN
-    + r"|authorization)\b"
+    + r"|authorization)\b)"
     + _KV_SEP_PATTERN
     + r"(?P<value>[\[\(]"
     + _CONTAINER_BODY
@@ -423,11 +423,19 @@ _SECRET_CONTAINER_RE: Final = re.compile(
 # ``('X-Api-Key', ('SECRET',))`` -- mirroring :data:`_SECRET_TUPLE_RE` but
 # with a bracketed value (and the same optional bytes ``b`` key prefix).
 _SECRET_CONTAINER_TUPLE_RE: Final = re.compile(
-    r"(?i)b?(?P<kq>['\"])[\w-]{0,64}?(?:"
+    r"(?i)b?(?P<kq>['\"])(?P<key>[\w-]{0,64}?(?:"
     + _SECRET_KEY_PATTERN
-    + r"|authorization)(?P=kq)\s*,\s*(?P<value>[\[\(]"
+    + r"|authorization))(?P=kq)\s*,\s*(?P<value>[\[\(]"
     + _CONTAINER_BODY
     + r"[\]\)]?)"
+)
+
+_SELF_VERIFY_SHAPE_RES: Final[tuple[re.Pattern[str], ...]] = (
+    _SECRET_CONTAINER_RE,
+    _SECRET_CONTAINER_TUPLE_RE,
+    _AUTHORIZATION_RE,
+    _SECRET_KV_RE,
+    _SECRET_TUPLE_RE,
 )
 
 # Cookie/session credentials (issue #153 follow-up): a Cookie/Set-Cookie header
@@ -655,12 +663,6 @@ _MIN_SECRET_VALUE_LENGTH: Final = 8
 #: key-name guard below to expand a value match leftward to the start of the
 #: identifier it sits in, so the character BEFORE that identifier can be checked.
 _IDENT_CHAR_RE: Final = re.compile(r"[\w-]")
-#: An assignment separator anchored at the character AFTER a value match: the
-#: SAME optional-closing-quote + ``:``/``=`` shape :data:`_SECRET_KV_RE` keys on
-#: (:data:`_KV_SEP_PATTERN`, reused verbatim). A cheap PRE-FILTER in
-#: :func:`_mask_known_value` -- the authoritative check is the self-verifying
-#: ``_SECRET_KV_RE`` scan that follows it. Used with :func:`re.Match.string`.
-_KEY_POSITION_SEP_RE: Final = re.compile(_KV_SEP_PATTERN)
 #: The recognized secret KEY WORDS (the shape grammar's own alternation, plus
 #: ``authorization``), fullmatched case-insensitively against a value occurrence
 #: by the key-name guard (:func:`_mask_known_value`): ONLY an occurrence that IS
@@ -671,27 +673,28 @@ _KEY_POSITION_SEP_RE: Final = re.compile(_KV_SEP_PATTERN)
 _KEY_WORD_FULL_RE: Final = re.compile(r"(?i)(?:" + _SECRET_KEY_PATTERN + r"|authorization)")
 #: Detects a genuine URL-AUTHORITY prefix ending exactly where the identifier a
 #: spared-candidate occurrence sits in begins: a ``scheme://`` followed by any
-#: run of non-``/``/non-space/non-quote characters (the userinfo/host region --
-#: ``:`` and ``@`` included), as in ``https://password:x@host``. There the
-#: occurrence is a USERINFO/host component, not a key name, and the guard
-#: refuses to spare: fail closed, mask -- the composition then finishes the job
-#: (``_BASIC_AUTH_URL_RE`` consumes the whole ``:<...>@`` span around the masked
-#: occurrence). Deliberately NARROW (round-3 finding): a bare ``:`` before the
-#: identifier (``error:password=hunter2`` -- a prose/logger prefix) is NOT
-#: authority context; treating it as one masked the key, broke the shape pass's
-#: key recognition, and left the VALUE exposed. Used with
-#: ``search(text, start, endpos=ident_start)`` -- the ``\Z`` anchors the
-#: authority run to end exactly at the identifier.
-_AUTHORITY_PREFIX_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/'\"]*\Z")
-#: How far back from the identifier the authority scan looks. Any real
-#: ``scheme://userinfo`` prefix is far shorter; bounding it keeps the spare
-#: callback O(window), not O(text).
+#: run of non-terminator characters (the userinfo/host region -- ``:`` and ``@``
+#: included), as in ``https://password:x@host``. There the occurrence is a
+#: USERINFO/host component, not a key name, and the guard refuses to spare.
+_AUTHORITY_PREFIX_RE: Final = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/'\"?#]*\Z")
+#: How far back from the identifier the authority scan looks. Any real basic-
+#: auth URL prefix is far shorter; bounding it keeps the spare callback O(window).
 _AUTHORITY_SCAN_WINDOW: Final = 512
 #: How far back from a spared-candidate occurrence the SELF-VERIFICATION scan
-#: (see :func:`_mask_known_value`) starts its ``_SECRET_KV_RE`` search: a
-#: shape-pass match whose KEY contains the occurrence starts at most the key
-#: prefix cap (64) before it, plus slack.
-_KV_KEY_SCAN_WINDOW: Final = 96
+#: starts its applicable shape search. A shape-pass match whose KEY contains the
+#: occurrence starts at most the key prefix cap (64) before it, plus slack.
+_SHAPE_KEY_SCAN_WINDOW: Final = 96
+
+
+#: Maximum composed-encoding depth. Raw values are depth 0, existing
+#: one-step renderings are depth 1, and only the explicitly listed compositions
+#: below are depth 2; no recursive depth-3 expansion is attempted.
+_NESTED_COMPOSITION_DEPTH: Final = 2
+#: Maximum length for a newly generated depth-2 candidate. Baseline raw and
+#: one-step variants are never filtered by this limit.
+_MAX_NESTED_CANDIDATE_LENGTH: Final = 16 * 1024
+#: Maximum number of newly generated depth-2 candidates per configured secret.
+_MAX_NESTED_CANDIDATES: Final = 64
 
 
 #: One hex-bearing escape inside an encoded rendering: a ``%XX`` percent-escape,
@@ -702,7 +705,9 @@ _KV_KEY_SCAN_WINDOW: Final = 96
 #: unicode-escape finding). :func:`_variant_regex` therefore compiles each
 #: escape's hex digits into case-insensitive character classes instead of
 #: enumerating spellings (which could never cover per-escape mixes).
-_HEX_ESCAPE_RE: Final = re.compile(r"%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}")
+_HEX_ESCAPE_RE: Final = re.compile(
+    r"%25[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}"
+)
 
 
 def _variant_regex(variant: str) -> str:
@@ -710,11 +715,13 @@ def _variant_regex(variant: str) -> str:
     hex-bearing escape's digits match case-insensitively -- ``%2F`` ->
     ``%2[Ff]``, ``\\u00e4`` -> ``\\u00[Ee]4``-style per-digit classes, ``\\x1b``
     likewise -- so every per-escape case mix of a percent-encoded or JSON/repr-
-    escaped rendering is masked, not just the spelling the local encoder emits
-    (#292 round-2 + round-3 findings). Non-escape characters are
-    :func:`re.escape`d, so the rest of the value stays an exact literal match
-    (unencoded characters ARE case-significant). Character classes only, no
-    added quantifiers: as linear (ReDoS-free) as the plain escape."""
+    escaped rendering is masked, not just the spelling the local encoder emits.
+    A nested ``%25XX`` spelling is recognized as an outer percent escape wrapping
+    an inner escape, so the inner hex digits vary in case without making ordinary
+    literal characters case-insensitive. No generic recursive decoding is used.
+    Non-escape characters are :func:`re.escape`d, so the rest of the value stays
+    an exact literal match (unencoded characters ARE case-significant). Character
+    classes only, no added quantifiers: as linear (ReDoS-free) as the plain escape."""
     parts: list[str] = []
     pos = 0
     for m in _HEX_ESCAPE_RE.finditer(variant):
@@ -744,10 +751,15 @@ def _secret_value_variants(value: str) -> frozenset[str]:
       all: :func:`_variant_regex` compiles each ``%XX`` escape case-insensitively
       at match time, covering upper, lower, AND per-escape mixed spellings
       (#292 encoding-variant items + round-2 mixed-case finding).
-    * **base64** -- ``cryptography``/third-party clients frequently base64 a
-      credential for a header or config dump. Covered as STANDARD and URL-SAFE
-      alphabets, each in PADDED and UNPADDED form (a ``=``-stripped/base64url
-      rendering is common in JWT-style and query contexts; #292 items).
+    * **Base64** -- ``cryptography``/third-party clients frequently base64 a
+      credential for a header or config dump. Raw and first-layer percent inputs
+      are covered as STANDARD and URL-SAFE alphabets, each in PADDED and UNPADDED
+      form (a ``=``-stripped/base64url rendering is common in JWT-style and query
+      contexts; #292 items).
+    * **Bounded composed encodings** -- each first-layer percent spelling also
+      gets one explicit second percent transform and one base64 transform; each
+      raw base64 spelling gets one percent transform. No derived value is
+      transformed outside these listed depth-two paths.
     * **JSON- / repr-escaped string bodies** -- a secret containing a quote,
       backslash, or non-ASCII character renders ESCAPED inside a JSON-encoded
       log field (``{"password": "a\\"b"}``, ``p\\u00e4ss...``) or a Python
@@ -766,25 +778,60 @@ def _secret_value_variants(value: str) -> frozenset[str]:
     escapes a lone surrogate to ``\\uXXXX`` rather than raising.
     """
     raw_bytes = value.encode("utf-8", "surrogatepass")
+
+    def _percent_spellings(text: str) -> tuple[str, str]:
+        return (
+            quote(text, safe="", errors="surrogatepass"),
+            quote_plus(text, safe="", errors="surrogatepass"),
+        )
+
+    def _base64_spellings(data: bytes) -> tuple[str, str, str, str]:
+        standard = base64.b64encode(data).decode("ascii")
+        urlsafe = base64.urlsafe_b64encode(data).decode("ascii")
+        return (standard, standard.rstrip("="), urlsafe, urlsafe.rstrip("="))
+
     variants = {value}
-    # Percent-encoding: ``quote`` (space -> ``%20``) and ``quote_plus`` (space ->
-    # ``+``). Hex case is handled at match time by ``_variant_regex``.
-    variants.add(quote(value, safe="", errors="surrogatepass"))
-    variants.add(quote_plus(value, safe="", errors="surrogatepass"))
-    # base64: standard and URL-safe alphabets, each padded and unpadded.
-    for b64 in (
-        base64.b64encode(raw_bytes).decode("ascii"),
-        base64.urlsafe_b64encode(raw_bytes).decode("ascii"),
-    ):
-        variants.add(b64)
-        variants.add(b64.rstrip("="))
-    # JSON- and repr-escaped string bodies (delimiters stripped). ``json.dumps``
-    # with the default ``ensure_ascii=True`` is total on any ``str`` -- it
-    # escapes even a lone surrogate to ``\\uXXXX`` rather than raising -- so no
-    # guard is needed (mirrors ``safe_guid``'s surrogate handling elsewhere).
+    first_percent = _percent_spellings(value)
+    variants.update(first_percent)
+    raw_base64 = _base64_spellings(raw_bytes)
+    variants.update(raw_base64)
     variants.add(json.dumps(value)[1:-1])
     variants.add(repr(value)[1:-1])
-    return frozenset(v for v in variants if v)
+
+    nested_families: tuple[tuple[str, ...], ...] = (
+        tuple(candidate for first in first_percent for candidate in _percent_spellings(first)),
+        tuple(
+            candidate
+            for first in first_percent
+            for candidate in _base64_spellings(first.encode("ascii"))
+        ),
+        tuple(candidate for spelling in raw_base64 for candidate in _percent_spellings(spelling)),
+    )
+    accepted_nested: set[str] = set()
+    for family in nested_families:
+        for candidate in family:
+            if len(accepted_nested) >= _MAX_NESTED_CANDIDATES:
+                break
+            if len(candidate) <= _MAX_NESTED_CANDIDATE_LENGTH:
+                accepted_nested.add(candidate)
+        if len(accepted_nested) >= _MAX_NESTED_CANDIDATES:
+            break
+    variants.update(accepted_nested)
+    return frozenset(variant for variant in variants if variant)
+
+
+def _json_body_regex(value: str) -> str:
+    """Match a JSON string body, accepting each valid solidus spelling."""
+    body = json.dumps(value)[1:-1]
+    parts: list[str] = []
+    start = 0
+    for index, character in enumerate(body):
+        if character == "/":
+            parts.append(_variant_regex(body[start:index]))
+            parts.append(r"(?:/|\\/)")
+            start = index + 1
+    parts.append(_variant_regex(body[start:]))
+    return "".join(parts)
 
 
 def _mask_known_value(match: re.Match[str]) -> str:
@@ -833,21 +880,25 @@ def _mask_known_value(match: re.Match[str]) -> str:
     if _KEY_WORD_FULL_RE.fullmatch(matched) is None:
         return _REDACTED
     text = match.string
-    if _KEY_POSITION_SEP_RE.match(text, match.end()) is None:
-        return _REDACTED  # cheap pre-filter; the kv verification below is authoritative
     ident_start = match.start()
     while ident_start > 0 and _IDENT_CHAR_RE.fullmatch(text[ident_start - 1]) is not None:
         ident_start -= 1
     authority_from = max(0, ident_start - _AUTHORITY_SCAN_WINDOW)
     if _AUTHORITY_PREFIX_RE.search(text, authority_from, ident_start) is not None:
         return _REDACTED  # userinfo/authority position, not a key -- fail closed
-    # Self-verify: find the actual shape-pass match whose key contains this
-    # occurrence; without one, the value side would go unmasked -- fail closed.
-    for kv in _SECRET_KV_RE.finditer(text, max(0, match.start() - _KV_KEY_SCAN_WINDOW)):
-        if kv.start() > match.start():
-            break
-        if match.end() <= kv.start("value"):
-            return matched  # verified: the shape pass masks this pair's value
+    # Self-verify against the same non-cookie shape objects that redact_secrets()
+    # will run later. If no named value boundary proves the pair will be masked,
+    # fail closed and mask this configured occurrence too.
+    scan_from = max(0, match.start() - _SHAPE_KEY_SCAN_WINDOW)
+    for shape_re in _SELF_VERIFY_SHAPE_RES:
+        for shape in shape_re.finditer(text, scan_from):
+            if shape.start() > match.start():
+                break
+            if (
+                shape.start("key") <= match.start() < match.end() <= shape.end("key")
+                and shape.start("value") >= match.end()
+            ):
+                return matched
     return _REDACTED
 
 
@@ -930,13 +981,14 @@ def redact_known_secrets(
     """
     if not text:
         return text
+    values = [value for value in secret_values if value and len(value) >= min_length]
     variants: set[str] = set()
-    for value in secret_values:
-        if not value or len(value) < min_length:
-            continue
+    for value in values:
         variants |= _secret_value_variants(value)
     if not variants:
         return text
-    alternation = "|".join(_variant_regex(v) for v in sorted(variants, key=len, reverse=True))
+    patterns = [_variant_regex(v) for v in variants]
+    patterns.extend(_json_body_regex(value) for value in values)
+    alternation = "|".join(sorted(set(patterns), key=len, reverse=True))
     pattern = re.compile(r"(?:" + alternation + r")")
     return pattern.sub(_mask_known_value, text)
