@@ -21,7 +21,10 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.ports.library import ArtworkKind, LibraryPort
 from plex_manager.ports.metadata import MediaKind
-from plex_manager.web.deps import get_library_optional, require_api_key
+from plex_manager.web.deps import (
+    get_library_optional_short_session,
+    require_api_key_short_session,
+)
 
 __all__ = ["router"]
 
@@ -32,11 +35,10 @@ _logger = logging.getLogger(__name__)
 # adapter's own short TTL already re-resolves the path, and a changed poster in
 # Plex is cosmetic.
 _CACHE_CONTROL = "private, max-age=86400"
-
 router = APIRouter(
     prefix="/api/v1/artwork",
     tags=["artwork"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key_short_session)],
 )
 
 
@@ -48,7 +50,7 @@ router = APIRouter(
     },
 )
 async def plex_artwork(
-    library: Annotated[LibraryPort | None, Depends(get_library_optional)],
+    library: Annotated[LibraryPort | None, Depends(get_library_optional_short_session)],
     media_type: Annotated[MediaKind, Path()],
     tmdb_id: Annotated[int, Path(ge=1)],
     kind: Annotated[ArtworkKind, Path()],

@@ -62,6 +62,8 @@ _CACHE_TTL_SECONDS: Final = 300.0
 # page at HTTP 200, which we must NOT forward to the browser as if it were a
 # poster. Anything whose Content-Type is not ``image/*`` is treated as a miss.
 _IMAGE_CONTENT_TYPE_PREFIX: Final = "image/"
+_MAX_ARTWORK_BYTES: Final = 10 * 1024 * 1024
+_MAX_CONCURRENT_ARTWORK_OPERATIONS: Final = 4
 
 # Plex stores agent ids as ``<agent>://<id>``. The modern Movie agent uses
 # ``tmdb://``; the legacy "The Movie Database" agent uses ``themoviedb://``. Both
@@ -169,6 +171,14 @@ _SHOW_ARTWORK_CACHE: _TtlCache[dict[int, _ArtworkKeys]] = _TtlCache(_CACHE_TTL_S
 # rotated token adds at most one idle lock, negligible for a single-server
 # install. asyncio is single-threaded, so the get-or-create is race-free.
 _ARTWORK_CRAWL_LOCKS: dict[str, asyncio.Lock] = {}
+_artwork_operation_semaphore: asyncio.Semaphore | None = None
+
+
+def _artwork_semaphore() -> asyncio.Semaphore:
+    global _artwork_operation_semaphore
+    if _artwork_operation_semaphore is None:
+        _artwork_operation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ARTWORK_OPERATIONS)
+    return _artwork_operation_semaphore
 
 
 def _artwork_crawl_lock(key: str) -> asyncio.Lock:
@@ -188,6 +198,8 @@ def reset_caches() -> None:
     _MOVIE_ARTWORK_CACHE.clear()
     _SHOW_ARTWORK_CACHE.clear()
     _ARTWORK_CRAWL_LOCKS.clear()
+    global _artwork_operation_semaphore
+    _artwork_operation_semaphore = None
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -670,12 +682,65 @@ class PlexLibrary:
         try:
             payload = response.json()
         except (json.JSONDecodeError, ValueError) as exc:
-            # A 200 with a non-JSON body (a reverse-proxy / auth HTML page in front
-            # of Plex) would otherwise raise a raw JSONDecodeError that bypasses the
-            # PlexLibraryError handler and surfaces as an opaque 500. Convert it at
-            # the boundary — the message names the path only, never the url or token.
             raise PlexLibraryError(f"Plex returned a non-JSON body for {path}") from exc
         return _as_mapping(payload)
+
+    async def _stream_artwork(self, path: str) -> tuple[bytes, str] | None:
+        """Stream one Plex-owned image path into a complete bounded body."""
+        if header_value_error(self._token) is not None:
+            raise PlexAuthError(
+                "Plex rejected the request: the stored token is not a valid credential value"
+            )
+        request_headers = {
+            "X-Plex-Token": self._token,
+            "Accept": "image/*,*/*;q=0.8",
+            "Accept-Encoding": "identity",
+        }
+        try:
+            url = self._service_url.endpoint(path)
+            async with self._client.stream(
+                "GET", url, headers=request_headers, follow_redirects=False
+            ) as response:
+                response_status = response.status_code
+                if response_status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
+                    raise PlexAuthError(
+                        f"Plex rejected the request to {path} (HTTP {response_status}): "
+                        "the token is missing or invalid"
+                    )
+                if not (_HTTP_OK <= response_status < _HTTP_MULTIPLE_CHOICES):
+                    raise PlexLibraryError(
+                        f"Plex request to {path} failed (HTTP {response_status})"
+                    )
+
+                content_type = (
+                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                )
+                if not content_type.startswith(_IMAGE_CONTENT_TYPE_PREFIX):
+                    return None
+
+                content_encoding = response.headers.get("content-encoding")
+                if content_encoding is not None and content_encoding.strip().lower() != "identity":
+                    return None
+
+                raw_content_length = response.headers.get("content-length")
+                if raw_content_length is not None:
+                    try:
+                        declared_length = int(raw_content_length)
+                    except ValueError:
+                        declared_length = -1
+                    if declared_length > _MAX_ARTWORK_BYTES:
+                        return None
+
+                content = bytearray()
+                async for chunk in response.aiter_raw():
+                    if len(chunk) > _MAX_ARTWORK_BYTES - len(content):
+                        return None
+                    content.extend(chunk)
+                return bytes(content), content_type
+        except InvalidServiceUrl as exc:
+            raise PlexLibraryError("plex request path is invalid") from exc
+        except httpx.RequestError as exc:
+            raise PlexLibraryError(f"plex request to {path} failed") from exc
 
     async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
         """Return the configured library sections (movie / show), cached briefly.
@@ -1697,42 +1762,23 @@ class PlexLibrary:
         """See :meth:`LibraryPort.fetch_artwork`.
 
         Resolves the item's Plex-native artwork PATH from the per-credential
-        artwork index (one cached section crawl), then GETs that path through the
-        SAME :meth:`_request` boundary every other Plex call uses — so the token
-        rides the ``X-Plex-Token`` header (never the URL, never a log), the path is
-        re-validated as a server-owned relative path by ``ServiceUrl.endpoint`` (an
-        SSRF-proof boundary: a ``thumb``/``art`` value that somehow carried a scheme
-        or host is rejected there and surfaces as a miss), and redirects are not
-        followed. Returns ``None`` for an absent item, an item with no image of the
-        requested kind, a non-image body, or an unusable artwork path; a genuine
-        transport/credential failure propagates as ``PlexLibraryError``/
-        ``PlexAuthError`` for the web layer to fold into a fallback.
+        artwork index (one cached section crawl), then streams the final image
+        through the dedicated bounded helper. The index crawl uses the normal
+        ``_get``/``_request`` JSON boundary.
         """
-        keys = await self._artwork_keys(tmdb_id, media_type)
-        if keys is None:
-            return None
-        path = keys.poster if kind == "poster" else keys.background
-        if path is None or not path.startswith("/") or path.startswith("//"):
-            # Absent, or not a server-relative path we can safely append to the
-            # configured Plex origin: an absolute ``http://host/...`` or a
-            # protocol-relative ``//host/...`` value smuggled into ``thumb``/``art``
-            # is an honest MISS, never fetched — SSRF defense-in-depth on top of
-            # ``ServiceUrl.endpoint``'s own path validation (which would reject
-            # both anyway before any request left this origin). TMDB takes over.
-            return None
-        # ``Accept: image/*`` (overriding _request's JSON default) asks Plex for the
-        # raw image; the token is injected by _request into the header only, and the
-        # path is re-validated as a server-owned relative path by ServiceUrl.endpoint
-        # (a malformed/transcode path there surfaces as a PlexLibraryError the web
-        # layer folds into a fallback, never an off-origin fetch).
-        response = await self._request(path, headers={"Accept": "image/*,*/*;q=0.8"})
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if not content_type.startswith(_IMAGE_CONTENT_TYPE_PREFIX):
-            # A 200 that isn't actually an image (e.g. a reverse-proxy login HTML
-            # page in front of Plex) must never be proxied to the browser as a
-            # poster — honest miss, TMDB takes over.
-            return None
-        return ArtworkImage(content=response.content, content_type=content_type)
+        async with _artwork_semaphore():
+            keys = await self._artwork_keys(tmdb_id, media_type)
+            if keys is None:
+                return None
+            path = keys.poster if kind == "poster" else keys.background
+            if path is None or not path.startswith("/") or path.startswith("//"):
+                # Absent or unsafe server-relative metadata is an honest miss.
+                return None
+            streamed = await self._stream_artwork(path)
+            if streamed is None:
+                return None
+            content, content_type = streamed
+            return ArtworkImage(content=content, content_type=content_type)
 
     async def _artwork_keys(
         self, tmdb_id: int, media_type: Literal["movie", "tv"]

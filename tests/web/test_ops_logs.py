@@ -5,10 +5,11 @@ tail, and the LLM-diagnosis export bundle.
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import pytest
@@ -522,6 +523,119 @@ async def test_export_json_value_based_pass_reuses_the_current_secret_not_a_stal
     assert response.status_code == 200
     body = response.json()
     assert _QBT_PASSWORD_WITH_AT not in body["events"][0]["message"]
+
+
+async def test_logs_read_boundary_masks_composed_and_mixed_json_secret(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    value = "boundary/secret-value"
+    await _configure_qbittorrent_password(sessionmaker_, value)
+    nested = quote(quote(value, safe="", errors="surrogatepass"), safe="", errors="surrogatepass")
+    scalar_container = f"password=['{value}']"
+    tuple_container = f"('password', ['{value}'])"
+    message = (
+        f"http://host?password={value} authorization: Bearer {value} "
+        f"('password', '{value}') {scalar_container} {tuple_container} nested={nested}"
+    )
+    await _insert_event(sessionmaker_, level="INFO", message=message, created_at=_NOW)
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message='json={"detail":"boundary\\/secret-value"}',
+        created_at=_NOW + timedelta(seconds=1),
+    )
+
+    response = await client.get("/api/v1/ops/logs", headers=_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    redacted = "\n".join(event["message"] for event in body["events"])
+    assert value not in redacted
+    assert nested not in redacted
+    assert scalar_container not in redacted
+    assert tuple_container not in redacted
+    assert "password" in redacted
+    assert "detail" in redacted
+
+    for params in ({}, {"format": "json"}):
+        exported = await client.get("/api/v1/ops/logs/export", params=params, headers=_HEADERS)
+        assert exported.status_code == 200
+        assert value not in exported.text
+        assert nested not in exported.text
+        assert scalar_container not in exported.text
+        assert tuple_container not in exported.text
+
+
+async def test_logs_and_exports_mask_json_solidus_in_derived_base64(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    value = "secret12?00?"
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure_qbittorrent_password(sessionmaker_, value)
+    standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    escaped = standard.replace("/", "\\/")
+    assert escaped.count("\\/") == 2
+    await _insert_event(
+        sessionmaker_, level="INFO", message=f'json={{"detail":"{escaped}"}}', created_at=_NOW
+    )
+
+    response = await client.get("/api/v1/ops/logs", headers=_HEADERS)
+    assert response.status_code == 200
+    assert escaped not in response.text
+    assert standard not in response.text
+    assert "<redacted>" in response.json()["events"][0]["message"]
+
+    for params in ({}, {"format": "json"}):
+        exported = await client.get("/api/v1/ops/logs/export", params=params, headers=_HEADERS)
+        assert exported.status_code == 200
+        assert escaped not in exported.text
+        assert standard not in exported.text
+
+
+async def test_tail_read_boundary_masks_fresh_composed_secret(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    value = "tail/boundary-secret"
+    await _configure_qbittorrent_password(sessionmaker_, value)
+    logger = logging.getLogger("plex_manager.test.tail_composed")
+    logger.propagate = False
+    handler = log_capture_service.configure_logging("DEBUG", logger=logger)
+    app.state.log_handler = handler
+    nested = quote(quote(value, safe="", errors="surrogatepass"), safe="", errors="surrogatepass")
+    try:
+        logger.warning('{"detail":"tail\\/boundary-secret"} %s', nested)
+        response = await client.get("/api/v1/ops/logs/tail", headers=_HEADERS)
+        assert response.status_code == 200
+        message = response.json()["events"][0]["message"]
+        assert value not in message
+        assert nested not in message
+    finally:
+        log_capture_service.stop_logging(handler, logger=logger)
+
+
+async def test_tail_masks_json_solidus_in_fresh_derived_base64(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    value = "secret12?00?"
+    await _configure_qbittorrent_password(sessionmaker_, value)
+    logger = logging.getLogger("plex_manager.test.tail_derived_solidus")
+    logger.propagate = False
+    handler = log_capture_service.configure_logging("DEBUG", logger=logger)
+    app.state.log_handler = handler
+    standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    escaped = standard.replace("/", "\\/")
+    try:
+        logger.warning('{"detail":"%s"}', escaped)
+        response = await client.get("/api/v1/ops/logs/tail", headers=_HEADERS)
+        assert response.status_code == 200
+        message = response.json()["events"][0]["message"]
+        assert escaped not in message
+        assert standard not in message
+        assert "<redacted>" in message
+    finally:
+        log_capture_service.stop_logging(handler, logger=logger)
 
 
 async def test_logs_min_length_guard_does_not_over_redact_a_short_configured_value(

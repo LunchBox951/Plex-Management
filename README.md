@@ -100,6 +100,27 @@ set `PLEX_MANAGER_SETUP_TOKEN` before starting and send it from the setup UI
 (`X-Setup-Token`). Use an SSH tunnel or reverse proxy for first setup; only set
 `PLEX_MANAGER_HOST_BIND=0.0.0.0` when the host is intentionally exposed.
 
+### TLS-terminating reverse proxies
+
+For direct HTTP/LAN access, leave `PLEX_MANAGER_AUTH_COOKIE_SECURE` unset so
+cookies follow the direct request scheme. If a reverse proxy terminates TLS and
+forwards HTTP to Plex Manager, set this before startup:
+
+```dotenv
+PLEX_MANAGER_AUTH_COOKIE_SECURE=true
+```
+
+This explicit setting is mandatory for that topology. Plex Manager itself never
+reads `X-Forwarded-Proto`: when the variable is unset, the Secure flag follows
+whatever request scheme the ASGI server reports, and uvicorn's own
+forwarded-header handling trusts loopback peers only by default — so scheme
+inference behind a TLS terminator is topology-dependent. Choose the explicit
+value for your trusted proxy/browser topology instead of relying on it
+(`PLEX_MANAGER_AUTH_COOKIE_SECURE=false` likewise forces non-Secure cookies for
+an unusual direct-https setup). Preserve the original `Host` and configure
+`PLEX_MANAGER_ALLOWED_HOSTS` for a public proxy hostname as described in
+`.env.example`.
+
 ### Optional automatic container updates
 
 Automatic updates require two separate opt-ins: deploy the `auto-update`

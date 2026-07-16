@@ -16,11 +16,13 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from http.cookies import SimpleCookie
 from urllib.parse import quote, quote_plus, urlsplit
 
 import pytest
 
+from plex_manager import logsafe
 from plex_manager.logsafe import (
     redact_known_secrets,
     redact_secrets,
@@ -1172,6 +1174,135 @@ def test_key_word_secret_spared_in_key_position_composes_to_mask_the_value() -> 
         assert combined == expected
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "deauthorization: unrelated diagnostic text",
+        "preauthorization: unrelated diagnostic text",
+    ],
+)
+def test_authorization_key_word_secret_is_not_spared_inside_larger_identifier(raw: str) -> None:
+    value_first = redact_known_secrets(raw, ["authorization"])
+    assert "authorization" not in value_first
+    assert "unrelated diagnostic text" in value_first
+    assert redact_secrets(value_first) == value_first
+
+
+@pytest.mark.parametrize(
+    ("key_word", "raw", "expected"),
+    [
+        (
+            "password",
+            "https://host.example/path?password=paired-sample-000",
+            "https://host.example/path?password=<redacted>",
+        ),
+        (
+            "authorization",
+            "authorization: Bearer paired-sample-000",
+            "authorization: <redacted>",
+        ),
+        (
+            "password",
+            "('password', 'paired-sample-000')",
+            "('password', '<redacted>')",
+        ),
+        (
+            "password",
+            "password=['paired-sample-000']",
+            "password=<redacted>",
+        ),
+        (
+            "password",
+            "('password', ['paired-sample-000'])",
+            "('password', <redacted>)",
+        ),
+    ],
+)
+def test_key_word_secret_spared_in_non_kv_shape_positions_composes_to_mask_the_value(
+    key_word: str,
+    raw: str,
+    expected: str,
+) -> None:
+    value_first = redact_known_secrets(raw, [key_word])
+    assert key_word in value_first
+    assert "paired-sample-000" in value_first
+
+    combined = redact_secrets(value_first)
+
+    assert "paired-sample-000" not in combined
+    assert combined == expected
+
+
+def test_key_guard_bounds_every_shape_grammar_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RecordingPattern:
+        def __init__(self) -> None:
+            self.end_positions: list[int] = []
+
+        def finditer(
+            self, string: str, pos: int = 0, endpos: int | None = None
+        ) -> Iterator[re.Match[str]]:
+            del string, pos
+            assert endpos is not None
+            self.end_positions.append(endpos)
+            return iter(())
+
+    recorder = RecordingPattern()
+    monkeypatch.setattr(logsafe, "_SELF_VERIFY_SHAPE_RES", (recorder,))
+    text = "password=paired-sample-000" + "x" * 10_000
+    assert redact_known_secrets(text, ["password"]).startswith("<redacted>=")
+    assert recorder.end_positions
+    assert max(recorder.end_positions) < len(text)
+    assert max(recorder.end_positions) <= 1_000
+
+
+def test_key_guard_requires_an_anchored_separator_probe() -> None:
+    """The prose-reject probe is anchored at the occurrence's end: a key word
+    followed by anything other than the grammars' own separator region
+    (optional quote + whitespace + ``:``/``=``, or quote + comma) is masked
+    without any grammar search -- but text between the occurrence and a REAL
+    separator never disqualifies it, however long (see the over-window test)."""
+    assert redact_known_secrets("password stored ok", ["password"]) == "<redacted> stored ok"
+    assert redact_known_secrets("password; then prose", ["password"]) == "<redacted>; then prose"
+
+
+def test_key_guard_handles_thousands_of_unshaped_keyword_occurrences() -> None:
+    # Guards WALL-CLOCK behavior only: the unbounded parent produced this exact
+    # byte-identical output too, just quadratically slower (~10s at this size).
+    # This pins the miss path staying linear, not a redaction-output change.
+    text = "password " * 2_000
+    result = redact_known_secrets(text, ["password"])
+    assert result == "<redacted> " * 2_000
+
+
+def test_key_guard_spares_a_paired_key_across_any_separator_gap() -> None:
+    """Codex PR #376 rounds 1+2: the linearity bound must never reject a
+    ``key<sep>value`` pair the shape grammars themselves accept. Masking the
+    ``password`` key here (a configured secret whose value equals a key word)
+    would destroy the anchor ``redact_secrets`` keys the paired value off of
+    and LEAK that value -- for ANY whitespace run a renderer or attacker can
+    insert around the separator, not just gaps inside some fixed window. The
+    anchored separator probe tolerates the gap end-to-end (it is what the
+    grammars' own ``\\s*`` admits), so the pair is spared and the composed pass
+    masks the value, never the reverse.
+    """
+    for gap_len in (0, 10, 200, 500, 513, 1_000, 5_000):
+        gap = " " * gap_len
+        for text, masked in (
+            # gap BEFORE the separator (round-2 report's exact shape)
+            (f"password{gap}=hunter2longvalue", f"password{gap}=<redacted>"),
+            # gap AFTER the separator (same mechanism, other side)
+            (f"password ={gap}hunter2longvalue", f"password ={gap}<redacted>"),
+        ):
+            composed = redact_secrets(redact_known_secrets(text, ["password"]))
+            assert "hunter2longvalue" not in composed, (gap_len, text[:24])
+            assert composed == masked, (gap_len, text[:24])
+    # Tuple rendering with an over-window gap around the comma separator.
+    tuple_text = "('password'" + " " * 1_000 + ", 'hunter2longvalue')"
+    composed = redact_secrets(redact_known_secrets(tuple_text, ["password"]))
+    assert "hunter2longvalue" not in composed
+    assert composed == "('password'" + " " * 1_000 + ", '<redacted>')"
+
+
 def test_key_guard_masks_a_key_word_secret_behind_an_overlong_identifier() -> None:
     """Round-3 regression (Codex, PR #361): ``_SECRET_KV_RE``'s key prefix is
     capped at 64 chars, so on ``<65+ char prefix>password=v`` the shape pass can
@@ -1333,6 +1464,135 @@ def test_redact_known_secrets_masks_case_variant_json_unicode_escapes() -> None:
     result = redact_known_secrets(f"raw={upper_spelling} end", [esc_secret])
     assert upper_spelling not in result
     assert "<redacted>" in result
+
+
+def test_redact_known_secrets_matches_mixed_json_solidus_spellings() -> None:
+    value = "abc/def/ghi"
+    for body in ("abc\\/def/ghi", "abc/def\\/ghi", "abc\\/def\\/ghi"):
+        text = f'{{"detail":"{body}"}}'
+        assert redact_known_secrets(text, [value]) == '{"detail":"<redacted>"}'
+
+
+def test_redact_known_secrets_matches_json_solidus_in_derived_base64_variants() -> None:
+    for value in ("secret12?00", "secret12?00?"):
+        standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        assert "/" in standard
+        spellings = {standard.replace("/", "\\/", 1), standard.replace("/", "\\/")}
+        for spelling in spellings:
+            assert redact_known_secrets(f"before:{spelling}:after", [value]) == (
+                "before:<redacted>:after"
+            )
+
+
+def test_redact_known_secrets_treats_configured_backslash_solidus_as_literal() -> None:
+    value = r"abc\/defgh"
+    text = '{"detail":"abc/defgh"}'
+    assert redact_known_secrets(text, [value]) == text
+
+
+def test_redact_known_secrets_does_not_overmatch_derived_base64_solidus_control() -> None:
+    value = "secret12?00"
+    standard = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    different = standard.replace("MDA", "MDB").replace("/", "\\/")
+    assert redact_known_secrets(different, [value]) == different
+
+
+def test_redact_known_secrets_does_not_match_different_json_literal() -> None:
+    text = '{"detail":"abc\\/defXghi"}'
+    assert redact_known_secrets(text, ["abc/def/ghi"]) == text
+
+
+def test_redact_known_secrets_preserves_raw_and_one_step_for_long_values() -> None:
+    value = "long-secret-" + "x" * 17000
+    raw_bytes = value.encode("utf-8", "surrogatepass")
+    standard = base64.b64encode(raw_bytes).decode("ascii")
+    urlsafe = base64.urlsafe_b64encode(raw_bytes).decode("ascii")
+    spellings = {
+        value,
+        quote(value, safe="", errors="surrogatepass"),
+        quote_plus(value, safe="", errors="surrogatepass"),
+        standard,
+        standard.rstrip("="),
+        urlsafe,
+        urlsafe.rstrip("="),
+        json.dumps(value)[1:-1],
+        repr(value)[1:-1],
+    }
+    for spelling in spellings:
+        assert (
+            redact_known_secrets(f"before:{spelling}:after", [value]) == "before:<redacted>:after"
+        )
+
+
+def test_redact_known_secrets_does_not_expand_depth_three() -> None:
+    value = "depth-two-secret/marker"
+    depth_one = quote(value, safe="", errors="surrogatepass")
+    depth_two = quote(depth_one, safe="", errors="surrogatepass")
+    depth_three = quote(depth_two, safe="", errors="surrogatepass")
+    assert redact_known_secrets(depth_one, [value]) == "<redacted>"
+    assert redact_known_secrets(depth_two, [value]) == "<redacted>"
+    assert redact_known_secrets(depth_three, [value]) == depth_three
+
+
+def test_redact_known_secrets_handles_lone_surrogates() -> None:
+    value = "surrogate-" + "\\ud800" + "-secret"
+    rendered = quote(value, safe="", errors="surrogatepass")
+    assert redact_known_secrets(rendered, [value]) == "<redacted>"
+
+
+def test_redact_known_secrets_masks_bounded_two_stage_percent_and_base64_variants() -> None:
+    value = "sample /?=A9-marker"
+    raw_bytes = value.encode("utf-8", "surrogatepass")
+
+    def _b64_spellings(data: bytes) -> set[str]:
+        standard = base64.b64encode(data).decode("ascii")
+        urlsafe = base64.urlsafe_b64encode(data).decode("ascii")
+        return {standard, standard.rstrip("="), urlsafe, urlsafe.rstrip("=")}
+
+    first_percent = {
+        quote(value, safe="", errors="surrogatepass"),
+        quote_plus(value, safe="", errors="surrogatepass"),
+    }
+    second_percent = {
+        encoder(first, safe="", errors="surrogatepass")
+        for first in first_percent
+        for encoder in (quote, quote_plus)
+    }
+    base64_of_percent = {
+        spelling for first in first_percent for spelling in _b64_spellings(first.encode("ascii"))
+    }
+    raw_base64 = _b64_spellings(raw_bytes)
+    percent_of_base64 = {
+        encoder(spelling, safe="", errors="surrogatepass")
+        for spelling in raw_base64
+        for encoder in (quote, quote_plus)
+    }
+    renderings = second_percent | base64_of_percent | percent_of_base64
+
+    assert renderings
+    for rendering in renderings:
+        result = redact_known_secrets(f"before:{rendering}:after", [value])
+        assert rendering not in result
+        assert result == "before:<redacted>:after"
+
+    canonical_double_percent = quote(
+        quote(value, safe="", errors="surrogatepass"),
+        safe="",
+        errors="surrogatepass",
+    )
+    assert "%252F" in canonical_double_percent
+    mixed_inner_hex = canonical_double_percent.replace("%252F", "%252f")
+    assert (
+        redact_known_secrets(f"before:{mixed_inner_hex}:after", [value])
+        == "before:<redacted>:after"
+    )
+
+    literal_case_changed = canonical_double_percent.replace("sample", "Sample", 1)
+    assert literal_case_changed != canonical_double_percent
+    assert (
+        redact_known_secrets(f"before:{literal_case_changed}:after", [value]).count("<redacted>")
+        == 0
+    )
 
 
 def test_simplecookie_repr_session_token_is_masked_by_shape_grammar() -> None:

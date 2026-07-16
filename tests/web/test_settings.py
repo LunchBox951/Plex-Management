@@ -69,6 +69,7 @@ from plex_manager.web.deps import (
     require_api_key,
 )
 from plex_manager.web.events import get_event_hub
+from plex_manager.web.routers import auth as auth_module
 from plex_manager.web.routers.settings import (
     _BOOL_SETTING_DEFAULTS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -97,6 +98,18 @@ _COLLECTION_TYPED_SETTING_KEYS: tuple[str, ...] = ("automatic_update_weekdays",)
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
+
+
+@pytest.fixture(autouse=True)
+def reset_throttle() -> None:
+    """Clear the in-process sign-in throttle so tests never leak attempt counts.
+
+    This suite exercises ``POST /api/v1/auth/api-key``, which shares the
+    module-level sign-in throttle: attempts left by another suite within the
+    real 60s window would otherwise 429 the exchange here (order-dependence).
+    """
+    auth_module.reset_sign_in_throttle()
+
 
 _API_KEY = "settings-key"
 # Throwaway Plex credentials for the identity-cache/repoint tests. Held in NAMES

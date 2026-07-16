@@ -12,10 +12,12 @@ URL. The module-level caches are cleared between tests by an autouse fixture.
 
 from __future__ import annotations
 
+import asyncio
+import gzip
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -24,10 +26,12 @@ from plex_manager.adapters.plex import PlexLibrary
 from plex_manager.adapters.plex.library import (
     PlexAuthError,
     PlexLibraryError,
+    _ArtworkKeys,  # pyright: ignore[reportPrivateUsage]
     _resolve_correlated_watch_state,  # pyright: ignore[reportPrivateUsage]
     reset_caches,
 )
-from plex_manager.ports.library import WatchState, WatchStateQuery
+from plex_manager.ports.library import ArtworkImage, WatchState, WatchStateQuery
+from tests.support import assert_task_raises
 
 PLEX_URL = "http://plex:32400"
 TOKEN = "super-secret-plex-token"  # noqa: S105
@@ -2981,6 +2985,53 @@ MOVIES_WITH_ART: dict[str, Any] = {
         ],
     }
 }
+_MAX_TEST_ARTWORK_BYTES = 10 * 1024 * 1024
+
+
+class _ObservedByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes], *, raises: Exception | None = None) -> None:
+        self.chunks = chunks
+        self.raises = raises
+        self.iterated = 0
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            self.iterated += 1
+            yield chunk
+        if self.raises is not None:
+            raise self.raises
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _streaming_artwork_handler(
+    stream: _ObservedByteStream,
+    *,
+    content_type: str = "image/png",
+    content_length: str | None = None,
+    content_encoding: str | None = None,
+    status_code: int = 200,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Plex-Token"] == TOKEN
+        if request.url.path == "/library/sections":
+            return httpx.Response(200, json=SECTIONS)
+        if request.url.path == "/library/sections/1/all":
+            return httpx.Response(200, json=MOVIES_WITH_ART)
+        if request.url.path == "/library/metadata/27205/thumb/1700":
+            assert request.headers["Accept"] == "image/*,*/*;q=0.8"
+            assert request.headers["Accept-Encoding"] == "identity"
+            headers = {"Content-Type": content_type}
+            if content_length is not None:
+                headers["Content-Length"] = content_length
+            if content_encoding is not None:
+                headers["Content-Encoding"] = content_encoding
+            return httpx.Response(status_code, headers=headers, stream=stream)
+        return httpx.Response(404)
+
+    return handler
 
 
 def _artwork_handler(
@@ -3008,13 +3059,277 @@ def _artwork_handler(
         if path == "/library/metadata/27205/thumb/1700":
             assert request.headers.get("Accept", "").startswith("image/")
             return httpx.Response(
-                200, content=_POSTER_BYTES, headers={"Content-Type": thumb_content_type}
+                200,
+                stream=_ObservedByteStream([_POSTER_BYTES]),
+                headers={"Content-Type": thumb_content_type},
             )
         if path == "/library/metadata/27205/art/1700":
-            return httpx.Response(200, content=_ART_BYTES, headers={"Content-Type": "image/jpeg"})
+            return httpx.Response(
+                200,
+                stream=_ObservedByteStream([_ART_BYTES]),
+                headers={"Content-Type": "image/jpeg"},
+            )
         return httpx.Response(404, json={})
 
     return handler
+
+
+async def _blocked_artwork_result(
+    adapter: PlexLibrary,
+    entered: asyncio.Queue[int],
+    release: asyncio.Event,
+    tmdb_id: int,
+) -> ArtworkImage | None:
+    async def blocked_keys(
+        _tmdb_id: int, _media_type: Literal["movie", "tv"]
+    ) -> _ArtworkKeys | None:
+        await entered.put(tmdb_id)
+        await release.wait()
+        return None
+
+    adapter._artwork_keys = blocked_keys  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue]
+    return await adapter.fetch_artwork(tmdb_id, "movie", "poster")
+
+
+async def test_fetch_artwork_limits_complete_operations_to_four() -> None:
+    entered: asyncio.Queue[int] = asyncio.Queue()
+    release = asyncio.Event()
+    adapters = [_adapter(_artwork_handler(), f"http://limit-{index}:32400") for index in range(8)]
+    tasks = [
+        asyncio.create_task(_blocked_artwork_result(adapter, entered, release, index))
+        for index, adapter in enumerate(adapters)
+    ]
+    try:
+        admitted = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
+        assert len(admitted) == 4
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(entered.get(), timeout=0.05)
+        release.set()
+        assert await asyncio.gather(*tasks) == [None] * 8
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_fetch_artwork_typed_failure_releases_permit() -> None:
+    entered: asyncio.Queue[int] = asyncio.Queue()
+    release = asyncio.Event()
+    adapters = [
+        _adapter(_artwork_handler(), f"http://error-limit-{index}:32400") for index in range(5)
+    ]
+
+    async def operation(adapter: PlexLibrary, index: int) -> None:
+        async def keys(_tmdb_id: int, _media_type: Literal["movie", "tv"]) -> _ArtworkKeys | None:
+            await entered.put(index)
+            if index == 0:
+                raise PlexLibraryError("synthetic typed failure")
+            await release.wait()
+            return None
+
+        adapter._artwork_keys = keys  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue]
+        await adapter.fetch_artwork(index + 1, "movie", "poster")
+
+    tasks = [
+        asyncio.create_task(operation(adapter, index)) for index, adapter in enumerate(adapters)
+    ]
+    try:
+        first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
+        assert 0 in first_four
+        await assert_task_raises(tasks[0], PlexLibraryError)
+        fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
+        assert fifth not in first_four
+        release.set()
+        await asyncio.gather(*tasks[1:])
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_fetch_artwork_cancellation_releases_permit() -> None:
+    entered: asyncio.Queue[int] = asyncio.Queue()
+    release = asyncio.Event()
+    adapters = [
+        _adapter(_artwork_handler(), f"http://cancel-limit-{index}:32400") for index in range(5)
+    ]
+    tasks = [
+        asyncio.create_task(_blocked_artwork_result(adapter, entered, release, index))
+        for index, adapter in enumerate(adapters)
+    ]
+    try:
+        first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
+        cancelled = first_four[0]
+        tasks[cancelled].cancel()
+        await assert_task_raises(tasks[cancelled], asyncio.CancelledError)
+        fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
+        assert fifth not in first_four
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert isinstance(results[cancelled], asyncio.CancelledError)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_fetch_artwork_rejects_encoded_gzip_before_decoding_or_iteration() -> None:
+    encoded = gzip.compress(b"x" * (20 * 1024 * 1024))
+    assert len(encoded) < _MAX_TEST_ARTWORK_BYTES
+    stream = _ObservedByteStream([encoded])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_encoding="gzip"),
+        base_url="http://art-gzip:32400",
+    )
+
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 0
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type"),
+    [(401, PlexAuthError), (403, PlexAuthError), (500, PlexLibraryError)],
+)
+async def test_fetch_artwork_status_rejection_closes_without_body_iteration(
+    status_code: int, error_type: type[Exception]
+) -> None:
+    stream = _ObservedByteStream([b"must-not-read"])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, status_code=status_code),
+        base_url=f"http://art-status-{status_code}:32400",
+    )
+
+    with pytest.raises(error_type):
+        await adapter.fetch_artwork(27205, "movie", "poster")
+    assert stream.iterated == 0
+    assert stream.closed is True
+
+
+async def test_fetch_artwork_iteration_failure_closes_response_and_releases_limiter() -> None:
+    failing = _ObservedByteStream([], raises=httpx.ReadError("synthetic raw read failure"))
+    blocked = _ObservedByteStream([b"image"])
+    first = _adapter(_streaming_artwork_handler(failing), "http://art-read-fail:32400")
+    others = [
+        _adapter(_streaming_artwork_handler(blocked), f"http://art-read-{index}:32400")
+        for index in range(4)
+    ]
+
+    with pytest.raises(PlexLibraryError):
+        await first.fetch_artwork(27205, "movie", "poster")
+    assert failing.closed is True
+    results = await asyncio.wait_for(
+        asyncio.gather(*(adapter.fetch_artwork(27205, "movie", "poster") for adapter in others)),
+        timeout=1.0,
+    )
+    assert all(result is not None for result in results)
+
+
+async def test_fetch_artwork_cancellation_closes_stream_and_releases_limiter() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            entered.set()
+            await release.wait()
+            yield b"image"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = BlockingStream()
+    adapter = _adapter(
+        _streaming_artwork_handler(stream),  # type: ignore[arg-type]
+        "http://art-stream-cancel:32400",
+    )
+    task = asyncio.create_task(adapter.fetch_artwork(27205, "movie", "poster"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        task.cancel()
+        await assert_task_raises(task, asyncio.CancelledError)
+        assert stream.closed is True
+        follow_up = _adapter(_artwork_handler(), "http://art-after-cancel:32400")
+        assert (
+            await asyncio.wait_for(follow_up.fetch_artwork(27205, "movie", "poster"), timeout=1.0)
+            is not None
+        )
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_fetch_artwork_non_image_response_is_rejected_before_body_iteration() -> None:
+    stream = _ObservedByteStream([b"<html>login</html>"])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_type="text/html; charset=utf-8"),
+        base_url="http://art-non-image-stream:32400",
+    )
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 0
+    assert stream.closed is True
+
+
+async def test_fetch_artwork_declared_oversize_is_rejected_before_body_iteration() -> None:
+    stream = _ObservedByteStream([b"must-not-be-read"])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_length=str(_MAX_TEST_ARTWORK_BYTES + 1)),
+        base_url="http://art-declared-oversize:32400",
+    )
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 0
+    assert stream.closed is True
+
+
+async def test_fetch_artwork_unknown_length_stops_on_first_overflowing_chunk() -> None:
+    stream = _ObservedByteStream(
+        [b"a" * (_MAX_TEST_ARTWORK_BYTES - 1), b"bc", b"must-not-be-consumed"]
+    )
+    adapter = _adapter(
+        _streaming_artwork_handler(stream), base_url="http://art-chunk-overflow:32400"
+    )
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 2
+    assert stream.closed is True
+
+
+async def test_fetch_artwork_exactly_ten_mib_preserves_every_byte() -> None:
+    expected = b"a" * _MAX_TEST_ARTWORK_BYTES
+    stream = _ObservedByteStream([expected[:5_000_000], expected[5_000_000:]])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_length=str(_MAX_TEST_ARTWORK_BYTES)),
+        base_url="http://art-exact-limit:32400",
+    )
+    image = await adapter.fetch_artwork(27205, "movie", "poster")
+    assert image is not None
+    assert image.content == expected
+    assert image.content_type == "image/png"
+    assert stream.iterated == 2
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize("content_length", [None, "not-a-number", "-1"])
+async def test_fetch_artwork_invalid_or_absent_length_is_bounded_incrementally(
+    content_length: str | None,
+) -> None:
+    stream = _ObservedByteStream([b"x" * _MAX_TEST_ARTWORK_BYTES, b"overflow", b"unread"])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_length=content_length),
+        base_url=f"http://art-invalid-length-{content_length!s}:32400",
+    )
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 2
+    assert stream.closed is True
+
+
+async def test_fetch_artwork_declared_under_limit_cannot_bypass_incremental_cap() -> None:
+    stream = _ObservedByteStream([b"x" * _MAX_TEST_ARTWORK_BYTES, b"overflow", b"unread"])
+    adapter = _adapter(
+        _streaming_artwork_handler(stream, content_length="1"),
+        base_url="http://art-lying-length:32400",
+    )
+    assert await adapter.fetch_artwork(27205, "movie", "poster") is None
+    assert stream.iterated == 2
+    assert stream.closed is True
 
 
 async def test_fetch_artwork_poster_returns_bytes_and_content_type() -> None:
