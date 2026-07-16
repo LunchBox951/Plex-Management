@@ -170,6 +170,7 @@ __all__ = [
     "get_http_client",
     "get_library",
     "get_library_optional",
+    "get_library_optional_short_session",
     "get_log_handler",
     "get_log_max_rows",
     "get_log_retention_days",
@@ -1568,6 +1569,24 @@ async def get_library_optional(
         return await get_library(session, client)
     except ServiceNotConfiguredError:
         return None
+
+
+async def get_library_optional_short_session(
+    request: Request,
+    client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
+) -> LibraryPort | None:
+    """Build optional Plex wiring without retaining a request-scoped DB session."""
+    maker_obj = getattr(request.app.state, "sessionmaker", None)
+    maker: async_sessionmaker[AsyncSession]
+    if isinstance(maker_obj, async_sessionmaker):
+        maker = cast("async_sessionmaker[AsyncSession]", maker_obj)
+    else:
+        maker = get_sessionmaker()
+    async with maker() as session:
+        try:
+            return await get_library(session, client)
+        except ServiceNotConfiguredError:
+            return None
 
 
 def _blank_to_none(value: str | None) -> str | None:
