@@ -448,6 +448,22 @@ class SqlUpdateCoordinationRepository:
         state = await self._lock()
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
+        # Backfill the legacy busy-row anchor BEFORE this call's own liveness
+        # write, under the SAME lock -- mirroring the lock -> backfill ->
+        # refresh ordering ``snapshot()``/``force_reset_phase()`` already use
+        # (issue #387). ``_backfill_legacy_busy_anchor``'s heartbeat fallback
+        # reads ``updater_last_seen_at``; every caller of ``touch_updater``
+        # (eligibility's liveness touch, the phase-less heartbeat, a
+        # same-phase CAS heartbeat) chains straight into a ``snapshot()``
+        # afterward, so writing the fresh heartbeat first would make that
+        # later backfill anchor to THIS call's own poll time instead of the
+        # true stale heartbeat -- costing a legacy pre-anchor row one full
+        # ``COORDINATOR_RECOVERY_MAX_AGE`` window before force-reset is
+        # allowed. A genuine phase transition (``resulting_phase`` below)
+        # still unconditionally re-anchors to ``now`` afterward, same as
+        # always -- that IS a real work-start event, not a passive touch.
+        await self._backfill_legacy_busy_anchor(state, now)
+        await self._session.refresh(state)
         resulting_phase = phase if phase is not None else state.phase
         values: dict[str, object] = {"updater_last_seen_at": now, "updated_at": now}
         values.update(self._phase_timestamp_values(state.phase, resulting_phase, now))

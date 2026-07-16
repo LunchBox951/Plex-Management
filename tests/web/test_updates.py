@@ -1374,6 +1374,54 @@ async def test_legacy_busy_status_and_reset_agree_on_stale_heartbeat_anchor(
     assert snapshot.action_generation == 1
 
 
+async def test_eligibility_touch_anchors_legacy_busy_row_to_the_pre_touch_heartbeat(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for issue #387: a legacy pre-anchor busy row FIRST
+    observed through an eligibility poll's liveness touch -- rather than a
+    direct status/snapshot read -- must anchor to the stale STORED heartbeat,
+    exactly like the direct-snapshot path above, not to the touch's own poll
+    timestamp. ``_eligibility(touch=True)`` used to call ``touch_updater()``
+    (which overwrites ``updater_last_seen_at``) before the backfill that
+    later ran inside its own trailing ``snapshot()`` could see the old value,
+    costing one full ``COORDINATOR_RECOVERY_MAX_AGE`` window before
+    force-reset was allowed."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    heartbeat = moment[0] - timedelta(minutes=12)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert polled.status_code == 200
+    assert polled.json()["action"] == "none"
+    snapshot = await coordinator.snapshot()
+    # The recovery anchor uses the OLD stored heartbeat, matching the
+    # direct-snapshot path -- while the touch itself still legitimately
+    # refreshed liveness to the current poll time.
+    assert snapshot.last_started_at == heartbeat
+    assert snapshot.updater_last_seen_at == moment[0]
+
+
 @pytest.mark.parametrize(
     "heartbeat",
     [None, datetime(2026, 7, 14, 12, 1, tzinfo=UTC)],
