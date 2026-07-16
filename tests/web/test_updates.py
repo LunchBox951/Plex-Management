@@ -1325,6 +1325,97 @@ async def test_force_reset_refuses_live_actionless_checking_even_when_request_is
         assert (await session.execute(select(AuditLog))).scalars().all() == []
 
 
+async def test_legacy_busy_status_and_reset_agree_on_stale_heartbeat_anchor(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status upgrades a legacy row from trustworthy evidence, and reset uses
+    the same persisted anchor rather than a lock-mutated timestamp."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    heartbeat = moment[0] - timedelta(minutes=12)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.status_code == 200
+    assert status.json()["blocker"] == "coordinator_state_stale"
+    assert (await coordinator.snapshot()).last_started_at == heartbeat
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.action_generation == 1
+
+
+@pytest.mark.parametrize(
+    "heartbeat",
+    [None, datetime(2026, 7, 14, 12, 1, tzinfo=UTC)],
+)
+async def test_legacy_busy_status_and_reset_fail_closed_then_agree_after_bound(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+    heartbeat: datetime | None,
+) -> None:
+    """Missing or future legacy evidence receives one durable now-anchor. Both
+    status and reset wait until that anchor reaches the recovery bound."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    waiting = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert waiting.status_code == 200
+    assert waiting.json()["blocker"] == "coordinator_recovery_not_ready"
+    assert (await coordinator.snapshot()).last_started_at == moment[0]
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
+
+    moment[0] += timedelta(minutes=10)
+    stale = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert stale.status_code == 200
+    assert stale.json()["blocker"] == "coordinator_state_stale"
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    assert (await coordinator.snapshot()).phase == "idle"
+
+
 async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -1355,7 +1446,7 @@ async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to
     assert recovered.status_code == 200
     snapshot = await coordinator.snapshot()
     assert snapshot.phase == "idle"
-    assert snapshot.action_generation == 0
+    assert snapshot.action_generation == 1
     assert snapshot.requested_at is None
 
 

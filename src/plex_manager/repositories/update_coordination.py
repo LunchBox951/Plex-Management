@@ -18,9 +18,6 @@ from plex_manager.domain.update_recovery import (
     KNOWN_COORDINATOR_PHASES as _DOMAIN_KNOWN_COORDINATOR_PHASES,
 )
 from plex_manager.domain.update_recovery import (
-    KNOWN_REQUESTED_ACTIONS as _DOMAIN_KNOWN_REQUESTED_ACTIONS,
-)
-from plex_manager.domain.update_recovery import (
     RecoveryAction,
     decide_recovery,
 )
@@ -45,7 +42,6 @@ LeaseKind = Literal["critical", "drain"]
 # stays equal to ``frozenset(phase.value for phase in UpdatePhase)`` so the two
 # copies cannot silently diverge.
 _KNOWN_COORDINATOR_PHASES = _DOMAIN_KNOWN_COORDINATOR_PHASES
-_KNOWN_REQUESTED_ACTIONS = _DOMAIN_KNOWN_REQUESTED_ACTIONS
 _BUSY_COORDINATOR_PHASES = _DOMAIN_BUSY_COORDINATOR_PHASES
 
 
@@ -261,6 +257,8 @@ class SqlUpdateCoordinationRepository:
         state = await self._lock()
         await self._cleanup_expired(now)
         await self._session.refresh(state)
+        await self._backfill_legacy_busy_anchor(state, now)
+        await self._session.refresh(state)
         critical_count = await self._critical_count()
         drain = await self._active_drain()
         return CoordinatorSnapshot(
@@ -285,6 +283,29 @@ class SqlUpdateCoordinationRepository:
             active_critical_operations=critical_count,
             drain_owner=drain.owner if drain is not None else None,
             drain_expires_at=_as_utc(drain.expires_at) if drain is not None else None,
+        )
+
+    async def _backfill_legacy_busy_anchor(
+        self, state: UpdateCoordinatorState, now: datetime
+    ) -> None:
+        """Give pre-anchor busy rows one durable, fail-closed recovery clock."""
+        if (
+            state.phase not in _BUSY_COORDINATOR_PHASES
+            or state.last_started_at is not None
+            or state.requested_at is not None
+        ):
+            return
+        heartbeat = _as_utc(state.updater_last_seen_at)
+        anchor = heartbeat if heartbeat is not None and heartbeat <= now else now
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(
+                UpdateCoordinatorState.id == 1,
+                UpdateCoordinatorState.phase == state.phase,
+                UpdateCoordinatorState.last_started_at.is_(None),
+                UpdateCoordinatorState.requested_at.is_(None),
+            )
+            .values(last_started_at=anchor, updated_at=now)
         )
 
     @staticmethod
@@ -554,6 +575,8 @@ class SqlUpdateCoordinationRepository:
         state = await self._lock()
         await self._cleanup_expired(now)
         await self._session.refresh(state)
+        await self._backfill_legacy_busy_anchor(state, now)
+        await self._session.refresh(state)
         drain = await self._active_drain()
         phase_started_at = None
         if state.phase in _BUSY_COORDINATOR_PHASES:
@@ -583,11 +606,18 @@ class SqlUpdateCoordinationRepository:
         if decision.action is RecoveryAction.REANCHOR:
             old_phase = state.phase
             values.update(phase="idle", last_started_at=None)
-        if decision.clear_unknown_action:
-            cleared_action = state.requested_action
+        if decision.clear_unknown_action or (
+            decision.action is RecoveryAction.REANCHOR
+            and state.phase in _BUSY_COORDINATOR_PHASES
+            and state.requested_action == "none"
+        ):
+            if decision.clear_unknown_action:
+                cleared_action = state.requested_action
             old_generation = state.action_generation
             new_generation = old_generation + 1
-            values.update(requested_action="none", action_generation=new_generation)
+            values.update(action_generation=new_generation)
+            if decision.clear_unknown_action:
+                values["requested_action"] = "none"
         await self._session.execute(
             update(UpdateCoordinatorState)
             .where(

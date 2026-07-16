@@ -17,11 +17,11 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
+from plex_manager.domain.update_recovery import KNOWN_REQUESTED_ACTIONS
 from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.repositories.update_coordination import (
     _BUSY_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
-    _KNOWN_REQUESTED_ACTIONS,  # pyright: ignore[reportPrivateUsage]
     _as_utc,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.services.update_coordination_service import (
@@ -557,7 +557,12 @@ async def test_phase_timestamp_uses_exact_persisted_transitions(
     assert checking is not None
     assert checking.last_started_at == clock.now
     async with sessionmaker_() as session:
-        await session.execute(update(UpdateCoordinatorState).values(last_started_at=None))
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                last_started_at=None,
+                requested_at=clock.now - timedelta(minutes=5),
+            )
+        )
         await session.commit()
     clock.advance(timedelta(minutes=1))
     same_checking = await service.touch_updater(phase=UpdatePhase.checking)
@@ -941,6 +946,101 @@ async def _audit_rows(sessionmaker_: SessionMaker) -> list[AuditLog]:
         return list(result.scalars().all())
 
 
+@pytest.mark.parametrize(
+    ("heartbeat_offset", "expected_anchor_offset"),
+    [
+        (-timedelta(minutes=12), -timedelta(minutes=12)),
+        (None, timedelta(0)),
+        (timedelta(minutes=1), timedelta(0)),
+    ],
+)
+async def test_legacy_busy_snapshot_backfills_one_durable_age_anchor(
+    sessionmaker_: SessionMaker,
+    heartbeat_offset: timedelta | None,
+    expected_anchor_offset: timedelta,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    heartbeat = None if heartbeat_offset is None else clock.now + heartbeat_offset
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                last_started_at=None,
+                requested_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    snapshot = await service.snapshot()
+    assert snapshot.last_started_at == clock.now + expected_anchor_offset
+    clock.advance(timedelta(minutes=1))
+    assert (await service.snapshot()).last_started_at == snapshot.last_started_at
+
+
+async def test_actionless_busy_reanchor_fences_late_worker_and_audits_generation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                action_generation=7,
+                last_started_at=clock.now - timedelta(minutes=10),
+                updater_last_seen_at=clock.now - timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_action_generation == 7
+    assert result.new_action_generation == 8
+    assert not await service.acknowledge_action(
+        expected_generation=7, result=UpdateResult.update_available
+    )
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.action_generation == 8
+    audit = await _audit_rows(sessionmaker_)
+    assert audit[0].old_value == {"phase": "checking", "action_generation": 7}
+    assert audit[0].new_value == {"phase": "idle", "action_generation": 8}
+
+
+@pytest.mark.parametrize("action", ["check", "install"])
+async def test_busy_reanchor_preserves_real_queued_action_generation(
+    sessionmaker_: SessionMaker, action: str
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action=action,
+                action_generation=7,
+                last_started_at=clock.now - timedelta(minutes=10),
+                updater_last_seen_at=clock.now - timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_action_generation is None
+    assert result.new_action_generation is None
+    row = await _row(sessionmaker_)
+    assert row.requested_action == action
+    assert row.action_generation == 7
+
+
 async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1061,7 +1161,7 @@ def test_known_requested_actions_track_update_action_exactly() -> None:
     known-requested-action literals can never silently diverge from ``"none"``
     plus the authoritative ``UpdateAction`` enum."""
     expected = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
-    assert expected == _KNOWN_REQUESTED_ACTIONS
+    assert expected == KNOWN_REQUESTED_ACTIONS
 
 
 async def test_force_reset_clears_an_unrecognized_requested_action(
@@ -1482,20 +1582,20 @@ async def test_force_reset_recovers_null_requested_at_abandoned_actionless_check
 
     assert result is not None
     assert result.old_phase == "checking"
-    assert result.old_action_generation is None
-    assert result.new_action_generation is None
+    assert result.old_action_generation == 0
+    assert result.new_action_generation == 1
     row = await _row(sessionmaker_)
     assert row.phase == "idle"
-    assert row.action_generation == 0
+    assert row.action_generation == 1
     assert row.requested_at is None
-    assert await service.acknowledge_action(
+    assert not await service.acknowledge_action(
         expected_generation=0,
         result=UpdateResult.update_available,
     )
     audit = await _audit_rows(sessionmaker_)
     assert len(audit) == 1
-    assert audit[0].old_value == {"phase": "checking"}
-    assert audit[0].new_value == {"phase": "idle"}
+    assert audit[0].old_value == {"phase": "checking", "action_generation": 0}
+    assert audit[0].new_value == {"phase": "idle", "action_generation": 1}
 
 
 async def test_force_reset_refuses_recent_actionless_checking_with_stale_heartbeat(
@@ -1564,21 +1664,27 @@ async def test_force_reset_reanchors_abandoned_actionless_checking_and_fences_ol
     assert result is not None
     assert result.old_phase == "checking"
     assert result.cleared_requested_action is None
-    assert result.old_action_generation is None
-    assert result.new_action_generation is None
+    assert result.old_action_generation == generation
+    assert result.new_action_generation == generation + 1
     row = await _row(sessionmaker_)
     assert row.phase == "idle"
     assert row.requested_action == "none"
-    assert row.action_generation == generation
+    assert row.action_generation == generation + 1
     assert _as_utc(row.requested_at) == requested_at
-    assert await service.acknowledge_action(
+    assert not await service.acknowledge_action(
         expected_generation=generation,
         result=UpdateResult.update_available,
     )
     audit = await _audit_rows(sessionmaker_)
     assert len(audit) == 1
-    assert audit[0].old_value == {"phase": "checking"}
-    assert audit[0].new_value == {"phase": "idle"}
+    assert audit[0].old_value == {
+        "phase": "checking",
+        "action_generation": generation,
+    }
+    assert audit[0].new_value == {
+        "phase": "idle",
+        "action_generation": generation + 1,
+    }
 
 
 async def test_force_reset_refuses_every_recovery_shape_while_drain_is_live(

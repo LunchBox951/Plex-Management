@@ -13,6 +13,7 @@ from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
 from plex_manager.domain.update_recovery import (
     BUSY_COORDINATOR_PHASES,
+    KNOWN_REQUESTED_ACTIONS,
     RecoveryAction,
     decide_recovery,
 )
@@ -60,10 +61,6 @@ _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
 _COORDINATOR_RECOVERY_MAX_AGE = COORDINATOR_RECOVERY_MAX_AGE
 _KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
-# ``"none"`` plus every operator intent this build understands. Mirrors the
-# repo layer's ``_KNOWN_REQUESTED_ACTIONS`` (which duplicates it for hexagonal
-# layering); derived from the enum here, so it cannot drift.
-_KNOWN_REQUESTED_ACTIONS = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
 # The phases whose in-flight operation legitimately rewrites ``requested_action``
 # on completion. The LEASED ones (draining/installing/rollback) always suppress
 # the action-only wedge -- lease expiry converges. ``checking`` is leaseless, so
@@ -172,11 +169,11 @@ def _state_and_blocker(
     )
     if decision.action is RecoveryAction.LIVE_DRAIN and (
         snapshot.phase not in _KNOWN_PHASES
-        or snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS
+        or snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS
     ):
         return "unavailable", "coordinator_drain_active"
     if decision.action is RecoveryAction.WAIT and (
-        snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS or not updater_available
+        snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS or not updater_available
     ):
         return "unavailable", "coordinator_recovery_not_ready"
     if decision.action is RecoveryAction.REANCHOR and snapshot.phase not in _KNOWN_PHASES:
@@ -431,7 +428,7 @@ async def _eligibility(
     # work (action="none" is the sidecar's ordinary sleep-and-repoll answer,
     # per the #346 fail-closed contract) until the operator runs the audited
     # action-only reset.
-    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS:
+    if snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS:
         policy = await load_update_policy(session)
         now = datetime.now(UTC)
         return (
