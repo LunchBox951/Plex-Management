@@ -2102,6 +2102,35 @@ async def test_heartbeat_empty_string_identity_field_is_an_honest_422(
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("field", ["updater_build", "updater_digest"])
+async def test_heartbeat_control_character_identity_field_is_an_honest_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    field: str,
+) -> None:
+    """PR #384 review P2: a control character must 422, not 500.
+
+    ``updater_build``/``updater_digest`` were only length-checked before this
+    fix, so a build id with an embedded control character (e.g. a newline
+    copied into it) passed schema validation and reached
+    ``record_updater_identity()``'s ``_bounded_text()``, whose bare
+    ``ValueError`` surfaced as an HTTP 500 for an authenticated internal
+    request instead of the honest 422 north star #3 demands. The pattern now
+    matches ``UpdateRefreshOutcomeRequest.from_build``/``to_build``.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={field: "bad\nbuild"},
+    )
+    assert response.status_code == 422
+
+
 async def test_status_null_observed_identity_reads_stale(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2241,6 +2270,55 @@ async def test_identityless_heartbeat_clears_stored_identity(
     assert body["updater_observed_build"] is None
     assert body["updater_observed_digest"] is None
     assert body["updater_build_matches_app"] is None
+
+
+async def test_eligibility_touch_clears_stale_identity_from_replaced_sidecar(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #384 review P2: a legacy idle poll must not keep wearing a dead sidecar's identity.
+
+    ``/eligibility`` never carries a sidecar-reported build/digest -- the
+    current updater idle loop only calls it (``updater/runner.py:198``). If an
+    identity-reporting sidecar is replaced/downgraded by one whose idle loop
+    only polls eligibility, that poll's touch refreshes liveness (looking
+    fresh) but must ALSO clear the previous sidecar's stale observed identity,
+    mirroring the heartbeat endpoint's absence-clears contract -- otherwise
+    status keeps asserting a match/mismatch banner for a container that no
+    longer exists.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
+    before = await coordinator.snapshot()
+
+    # A newer sidecar reported identity via a heartbeat...
+    identified = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"updater_build": "stage1-build", "updater_digest": "sha256:" + "c" * 64},
+    )
+    assert identified.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "stage1-build"
+    assert body["updater_build_matches_app"] is False
+
+    # ...then it was replaced/downgraded by one whose idle loop only polls
+    # eligibility (no identity fields exist on this endpoint at all).
+    polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert polled.status_code == 200
+
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] is None
+    assert body["updater_observed_digest"] is None
+    assert body["updater_build_matches_app"] is None
+    # The touch still did its ordinary job: liveness moved forward.
+    after = await coordinator.snapshot()
+    assert after.updater_last_seen_at is not None
+    assert before.updater_last_seen_at is None
 
 
 async def test_refresh_outcome_route_accepts_and_surfaces(

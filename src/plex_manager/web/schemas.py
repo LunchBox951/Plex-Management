@@ -1112,14 +1112,19 @@ class UpdateHeartbeatRequest(BaseModel):
     # The sidecar's OWN running image identity (stage 0 accepts; stage 1 emits).
     # Bounded exactly like the ``UpdateOutcomeRequest`` image fields and the
     # ``String(400)`` storage columns so a long ``@sha256`` digest round-trips.
-    # ``min_length=1`` makes an empty string an honest 422 at the edge (north
-    # star #3): "absent" is spelled ``None``/omitted, never ``""`` -- without
-    # it, ``""`` sails past the endpoint's ``is not None`` gate into the
+    # The pattern (mirrors ``UpdateRefreshOutcomeRequest.from_build``/
+    # ``to_build``, and is a strict subset of the service's ``_bounded_text``
+    # predicate) makes both an empty string AND a control character an honest
+    # 422 at the edge (north star #3): "absent" is spelled ``None``/omitted,
+    # never ``""``, and a stray control character (e.g. a newline pasted into
+    # a build id) never reaches ``record_updater_identity()`` -- without it,
+    # either shape sails past the endpoint's ``is not None`` gate into the
     # service's ``_bounded_text``, whose bare ``ValueError`` would surface as a
-    # 500. The container-id/nonce fields below get the same non-emptiness from
-    # their ``+`` patterns (one-or-more), which reject ``""`` outright.
-    updater_build: str | None = Field(default=None, min_length=1, max_length=400)
-    updater_digest: str | None = Field(default=None, min_length=1, max_length=400)
+    # 500 instead of a 422. The container-id/nonce fields below get the same
+    # non-emptiness from their ``+`` patterns (one-or-more), which reject
+    # ``""`` outright.
+    updater_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
+    updater_digest: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
     # A self-inspected container id (hex) and a self-refresh nonce, carried by a
     # stage-1 successor's authenticated liveness ping. Accepted and bounded here
     # so the app never 422s a newer sidecar; unused by stage 0 beyond validation.

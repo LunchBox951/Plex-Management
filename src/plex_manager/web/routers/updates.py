@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
@@ -452,6 +453,26 @@ async def _eligibility(
 ) -> tuple[UpdateEligibilityResponse, CoordinatorSnapshot]:
     coordinator = await _coordinator(request)
     if touch:
+        # This endpoint is legacy/pre-identity: neither ``/eligibility`` nor
+        # ``/claim`` ever carries a sidecar-reported build/digest, so an
+        # authenticated contact through here is definitionally an
+        # identity-less beat. Clear any previously stored identity FIRST,
+        # mirroring the heartbeat endpoint's absence-clears contract (Codex
+        # round 1 on PR #384) -- otherwise a sidecar that reported identity
+        # and is later replaced/downgraded by one whose idle loop only calls
+        # ``coordinator.eligibility()`` (``updater/runner.py``) would keep
+        # liveness looking fresh via the touch below while
+        # ``updater_observed_*`` still describes the dead container, so
+        # status keeps asserting a stale match/mismatch. Best-effort, exactly
+        # like the touch below: an unknown-phase refusal here is the SAME
+        # soft condition the ``except ValueError`` further down already
+        # reports as ``coordinator_state_unknown`` for this polling endpoint,
+        # so swallow it rather than hard-failing the poll. This write touches
+        # only the identity columns -- never ``updater_last_seen_at`` -- so it
+        # adds no second pre-snapshot write of the heartbeat anchor that
+        # issue #387 already tracks against ``touch_updater`` below.
+        with contextlib.suppress(UnknownCoordinatorPhaseError):
+            await coordinator.record_updater_identity(observed_build=None, observed_digest=None)
         # A locked-write refusal here is the SAME unknown-phase condition the
         # ``except ValueError`` below already reports as a soft
         # ``coordinator_state_unknown`` blocker for this polling endpoint -- fall
@@ -606,8 +627,10 @@ async def heartbeat_endpoint(body: UpdateHeartbeatRequest, request: Request) -> 
     # CAS-guarded phase touch below: the identity claim is orthogonal to the
     # check-generation CAS, so a stale-generation ``checking`` beat still
     # updates/clears identity even though its phase touch is refused.
-    # Eligibility polls deliberately do NOT touch identity -- only this
-    # endpoint carries the self-description contract.
+    # ``/eligibility`` and ``/claim`` also clear (never set) identity on their
+    # own liveness touch, per ``_eligibility`` above -- this remains the ONLY
+    # endpoint that can ever WRITE a non-``None`` observed build/digest, since
+    # it is the only body shape that carries one.
     await _guard_unknown_phase(
         coordinator.record_updater_identity(
             observed_build=body.updater_build,

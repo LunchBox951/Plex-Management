@@ -3740,8 +3740,7 @@
           "updater_build": {
             "anyOf": [
               {
-                "maxLength": 400,
-                "minLength": 1,
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
                 "type": "string"
               },
               {
@@ -3766,8 +3765,7 @@
           "updater_digest": {
             "anyOf": [
               {
-                "maxLength": 400,
-                "minLength": 1,
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
                 "type": "string"
               },
               {
