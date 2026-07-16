@@ -587,10 +587,13 @@ def _evict_stale_sign_in_throttle_keys(now: float) -> None:
         return
     _last_stale_key_eviction = now
     window_start = now - _SIGN_IN_WINDOW_SECONDS
+    # Attempt lists are appended in ``time.monotonic`` order, so the last stamp is
+    # the newest: a key is stale exactly when that one stamp has aged out — an O(1)
+    # check per key instead of scanning every timestamp.
     stale_keys = [
         key
         for key, attempts in _sign_in_attempts.items()
-        if not any(stamp > window_start for stamp in attempts)
+        if not attempts or attempts[-1] <= window_start
     ]
     for key in stale_keys:
         del _sign_in_attempts[key]
@@ -804,8 +807,11 @@ def _cookie_secure(request: Request) -> bool:
     """Whether the session/CSRF cookies carry the ``Secure`` attribute.
 
     An explicit ``auth_cookie_secure`` override wins; otherwise the flag follows
-    the direct request scheme. The app deliberately does not trust
-    ``X-Forwarded-Proto``; TLS-terminating proxies must set the explicit override.
+    the request scheme as the ASGI server reports it, so a plain-http LAN install
+    does not set ``Secure`` (the browser would silently refuse to send the cookie
+    back). The app itself never reads ``X-Forwarded-Proto``; whether the server
+    layer honors it is deployment-dependent (uvicorn trusts loopback peers only,
+    by default), so TLS-terminating proxies must set the explicit override.
     """
     configured = get_settings().auth_cookie_secure
     if configured is not None:

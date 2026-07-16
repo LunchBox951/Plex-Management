@@ -668,6 +668,11 @@ async def test_cookie_secure_unset_ignores_forwarded_https_on_direct_http(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pins APP-level behavior: the application never reads X-Forwarded-Proto, so
+    # with the override unset the Secure flag follows the ASGI scope's scheme.
+    # The server layer is out of scope here — httpx.ASGITransport bypasses
+    # uvicorn's ProxyHeadersMiddleware, which (for trusted peers, loopback by
+    # default) rewrites the scope scheme from this header before the app sees it.
     monkeypatch.delenv("PLEX_MANAGER_AUTH_COOKIE_SECURE", raising=False)
     get_settings.cache_clear()
     client.headers["X-Forwarded-Proto"] = "https"

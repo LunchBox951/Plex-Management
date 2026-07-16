@@ -110,11 +110,16 @@ forwards HTTP to Plex Manager, set this before startup:
 PLEX_MANAGER_AUTH_COOKIE_SECURE=true
 ```
 
-This explicit setting is mandatory for that topology. Plex Manager deliberately
-does not trust `X-Forwarded-Proto`; choose the value for your trusted
-proxy/browser topology instead of relying on forwarded-header scheme inference.
-Preserve the original `Host` and configure `PLEX_MANAGER_ALLOWED_HOSTS` for a
-public proxy hostname as described in `.env.example`.
+This explicit setting is mandatory for that topology. Plex Manager itself never
+reads `X-Forwarded-Proto`: when the variable is unset, the Secure flag follows
+whatever request scheme the ASGI server reports, and uvicorn's own
+forwarded-header handling trusts loopback peers only by default — so scheme
+inference behind a TLS terminator is topology-dependent. Choose the explicit
+value for your trusted proxy/browser topology instead of relying on it
+(`PLEX_MANAGER_AUTH_COOKIE_SECURE=false` likewise forces non-Secure cookies for
+an unusual direct-https setup). Preserve the original `Host` and configure
+`PLEX_MANAGER_ALLOWED_HOSTS` for a public proxy hostname as described in
+`.env.example`.
 
 ### Optional automatic container updates
 
