@@ -1875,6 +1875,102 @@ async def test_cancel_during_pre_lock_rollback_completes_and_leaves_boundary_usa
     assert _NEW_PLEX_TOKEN in handler.secret_values
 
 
+async def test_commit_failure_rollback_survives_disconnect_and_surfaces_the_failure(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex #399 round 5: when the commit unit fails with NO prior
+    cancellation, the failure-path rollback must also be driven to
+    completion. A client disconnect landing while that rollback awaited used
+    to cancel the DB op mid-flight (the same close/rollback race the helper
+    exists to prevent) and bury the real commit failure behind a bare
+    ``CancelledError``. Now the rollback settles first, the commit failure is
+    surfaced through the durable log (honesty over silence), and the
+    cancellation wins the re-raise with the failure chained as its cause --
+    the both-happened protocol, entered late."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
+    real_rollback = AsyncSession.rollback
+    rewrite_finished = False
+    commit_failed = False
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def failing_commit(self: AsyncSession) -> None:
+        nonlocal commit_failed
+        if rewrite_finished:
+            commit_failed = True
+            raise RuntimeError("commit failed")
+        await real_commit(self)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    rollback_completed = asyncio.Event()
+
+    async def paused_failure_path_rollback(self: AsyncSession) -> None:
+        # Pause exactly ONE rollback: the first to start after the commit
+        # failure IS the boundary's ``pending_cancel is None`` error-path
+        # rollback (nothing else on this path rolls back between the raise
+        # and it).
+        if commit_failed and not entered.is_set():
+            entered.set()
+            await _wait_for_event(release)
+            await real_rollback(self)
+            rollback_completed.set()
+            return
+        await real_rollback(self)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+    monkeypatch.setattr(AsyncSession, "rollback", paused_failure_path_rollback)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    )
+    await _wait_for_event(entered)
+    task.cancel()
+    # The request must NOT end while the failure-path rollback is still
+    # running: ending early is the close/rollback race. The cancellation is
+    # remembered, not delivered into the op.
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert not rollback_completed.is_set()
+    with caplog.at_level(logging.ERROR, logger=settings_router.__name__):
+        release.set()
+        await _wait_for_event(rollback_completed)  # it RAN TO COMPLETION...
+        # ...and only then did the request end, still honoring the cancellation.
+        await assert_task_raises(task, asyncio.CancelledError)
+    # The commit failure was NOT buried: it reached the durable log pipeline.
+    assert "secret rotation commit failed" in caplog.text
+
+    assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})  # snapshot restored
+    assert handler.retiring_values == frozenset()
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+    assert user.encrypted_plex_token == _OLD_PLEX_TOKEN
+    # The connection was not poisoned: a clean retry succeeds end-to-end.
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", real_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", real_commit)
+    monkeypatch.setattr(AsyncSession, "rollback", real_rollback)
+    retry = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    assert retry.status_code == 200
+    assert _NEW_PLEX_TOKEN in handler.secret_values
+
+
 async def test_rotation_sign_in_recomputes_access_before_the_rewrite_flush(
     client: httpx.AsyncClient,
     app: FastAPI,

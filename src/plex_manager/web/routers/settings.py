@@ -471,8 +471,18 @@ async def secret_rotation(
             await _rollback_to_completion(session)
             raise
         except Exception:
-            await session.rollback()
+            # Same discipline as the cancel handler above (codex #399 round
+            # 5): restore the snapshot first (synchronous, always runs), then
+            # drive the rollback to completion. A client disconnect landing
+            # while a plain ``session.rollback()`` awaited would cancel the
+            # rollback mid-flight -- the exact rollback-vs-session-close race
+            # ``_rollback_to_completion`` exists to prevent -- and would bury
+            # the real failure behind the ``CancelledError``. If a
+            # cancellation does arrive during the rollback, the helper
+            # re-raises it only after the rollback settles, with this
+            # failure chained as its ``__context__``.
             handler.abort_secret_rotation(previous_values)
+            await _rollback_to_completion(session)
             raise
         # (c) Commit + completion sweep as one non-cancellable unit. A
         # cancellation delivered while this runs is REMEMBERED and re-raised only
@@ -524,7 +534,31 @@ async def secret_rotation(
             # unwinds).
             handler.abort_secret_rotation(previous_values)
             if pending_cancel is None:
-                await session.rollback()
+                # Drive this rollback to completion too (codex #399 round 5):
+                # a client disconnect landing while a plain rollback awaited
+                # here would cancel it mid-flight (the session/close race
+                # again) and hide ``unit_error`` behind the CancelledError.
+                try:
+                    await _rollback_to_completion(session)
+                except asyncio.CancelledError as exc:
+                    # The cancellation arrived DURING the rollback: from here
+                    # the both-happened protocol below applies -- surface the
+                    # commit failure through the durable log first, then let
+                    # the cancellation win the re-raise with the failure
+                    # chained as its cause.
+                    _logger.error(
+                        "secret rotation commit failed while the request was "
+                        "being cancelled; the rotation was rolled back",
+                        exc_info=unit_error,
+                    )
+                    raise exc from unit_error
+                except Exception as rollback_error:
+                    # The rollback ALSO failed on top of the commit failure.
+                    # The commit failure stays the primary error, with the
+                    # rollback failure chained onto it (a plain propagate here
+                    # would replace it and bury the reason the operator
+                    # actually needs).
+                    raise unit_error from rollback_error
                 raise unit_error
             # BOTH happened: the request was cancelled AND the unit failed.
             # Cancellation must still win the re-raise -- the server's task
@@ -1504,8 +1538,11 @@ async def put_settings_endpoint(
         # that waited behind another PUT cannot retain a pre-lock database
         # snapshot while validating its effective destination/credential pair.
         # The dependencies leave only primitive AuthContext data and make no
-        # writes, so rolling their read transaction back is safe.
-        await session.rollback()
+        # writes, so rolling their read transaction back is safe. Driven to
+        # completion like every other rollback in this module: a client
+        # disconnect landing mid-rollback must not tear the DB op and leave it
+        # racing the dependency scope's session close.
+        await _rollback_to_completion(session)
         await _validate_disk_pressure_pair(body, session)
         await _validate_update_window_pair(body, session)
 
