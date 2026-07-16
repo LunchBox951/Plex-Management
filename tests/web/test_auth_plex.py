@@ -805,6 +805,27 @@ def test_sign_in_throttle_does_not_evict_live_keys(monkeypatch: pytest.MonkeyPat
     assert len(auth_module._sign_in_attempts) == 100  # pyright: ignore[reportPrivateUsage]
 
 
+def test_sign_in_throttle_eviction_scan_runs_at_most_once_per_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: now)
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.1"))  # pyright: ignore[reportPrivateUsage]
+    assert auth_module._last_stale_key_eviction == 100.0  # pyright: ignore[reportPrivateUsage]
+
+    now += auth_module._SIGN_IN_WINDOW_SECONDS - 1  # pyright: ignore[reportPrivateUsage]
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.2"))  # pyright: ignore[reportPrivateUsage]
+    # Inside the cadence: the full-dict scan did not rerun.
+    assert auth_module._last_stale_key_eviction == 100.0  # pyright: ignore[reportPrivateUsage]
+
+    now += auth_module._SIGN_IN_WINDOW_SECONDS - 1  # pyright: ignore[reportPrivateUsage]
+    auth_module._throttle_sign_in(_throttle_request("198.51.100.3"))  # pyright: ignore[reportPrivateUsage]
+    assert auth_module._last_stale_key_eviction == now  # pyright: ignore[reportPrivateUsage]
+    # The rescan reclaimed the key that aged out while the cadence held it back.
+    assert "198.51.100.1" not in auth_module._sign_in_attempts  # pyright: ignore[reportPrivateUsage]
+    assert "198.51.100.2" in auth_module._sign_in_attempts  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_sign_in_throttled_after_limit(
     client: httpx.AsyncClient,
     app: FastAPI,

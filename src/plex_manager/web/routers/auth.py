@@ -80,12 +80,15 @@ _COOKIE_PATH = "/"
 # In-process, per-client-IP sign-in throttle. A best-effort abuse brake for the
 # ONE unauthenticated write endpoint, not a security boundary: it is deliberately
 # simple (a sliding 60s window in a module-level dict), resets on restart, and is
-# per-process. Stale-key cleanup reclaims expired bookkeeping but cannot cap the
+# per-process. Stale-key cleanup reclaims expired bookkeeping — at most one
+# full-dict scan per window, so a flood of distinct IPs cannot turn every sign-in
+# request into an O(live keys) scan on the event loop — but it cannot cap the
 # number of simultaneously live keys without changing per-key admission behavior.
 # Tests clear it via ``reset_sign_in_throttle``.
 _SIGN_IN_MAX_PER_MINUTE = 10
 _SIGN_IN_WINDOW_SECONDS = 60.0
 _sign_in_attempts: dict[str, list[float]] = {}
+_last_stale_key_eviction = float("-inf")
 
 
 @router.post("/plex")
@@ -570,7 +573,19 @@ def _sign_in_throttle_key(request: Request) -> str:
 
 
 def _evict_stale_sign_in_throttle_keys(now: float) -> None:
-    """Drop keys whose complete attempt history is outside the active window."""
+    """Drop keys whose complete attempt history is outside the active window.
+
+    Runs the full-dict scan at most once per window (amortized O(1) per request):
+    the throttle guards the unauthenticated sign-in endpoints on the event loop,
+    so a per-request scan would hand a many-IP flood an O(live keys) stall on the
+    very endpoint the throttle protects. A stale key can therefore linger up to
+    one extra window, which only costs memory — per-key admission filters its own
+    timestamps and never reads other keys' bookkeeping.
+    """
+    global _last_stale_key_eviction
+    if now - _last_stale_key_eviction < _SIGN_IN_WINDOW_SECONDS:
+        return
+    _last_stale_key_eviction = now
     window_start = now - _SIGN_IN_WINDOW_SECONDS
     stale_keys = [
         key
@@ -607,7 +622,12 @@ def reset_sign_in_throttle() -> None:
     an autouse fixture to stay order-independent. Named without a leading underscore
     so tests reference it without tripping pyright's private-usage check.
     """
+    global _last_stale_key_eviction
     _sign_in_attempts.clear()
+    # Rewind the eviction cadence too: throttle tests pin ``time.monotonic`` to
+    # small fake values, and a real (large) timestamp left behind by an earlier
+    # test would silently disable eviction for the whole faked-clock test.
+    _last_stale_key_eviction = float("-inf")
 
 
 # --------------------------------------------------------------------------- #
