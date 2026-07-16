@@ -699,9 +699,16 @@ _SHAPE_VALUE_SCAN_WINDOW: Final = 512
 #: LEAKS. A ``key<sep>`` pair separated only by ``\s*`` (the sole thing that can
 #: sit between the key word and its ``:``/``=`` in ``_SECRET_KV_RE``'s grammar)
 #: is thus accepted for exactly as far as self-verification can confirm it --
-#: no realistic rendering ever puts hundreds of blanks there, and any gap beyond
-#: this shared bound fails BOTH tests identically (fail-closed, but consistently
-#: so, never a prefilter-only regression).
+#: no realistic rendering ever puts hundreds of blanks there (only ``['\"]?\s*``
+#: is legal in that gap, and no serializer emits hundreds of blanks), and any
+#: gap beyond this shared bound fails BOTH tests identically, never a
+#: prefilter-only inconsistency. Beyond the bound the behavior is fail-closed
+#: for the KEY occurrence (the configured key-word secret is masked) but does
+#: FORFEIT the shape pass's coverage of the PAIRED value: masking the key strips
+#: the anchor ``redact_secrets`` would have keyed that value off of, so a
+#: non-configured value past 512 blanks goes unmasked where the unbounded parent
+#: masked it. That trade is deliberate -- the linearity bound has to stop
+#: somewhere, and the forfeited region is unreachable for any real rendering.
 _KEY_SHAPE_SUFFIX_WINDOW: Final = _SHAPE_VALUE_SCAN_WINDOW
 _KEY_SHAPE_SUFFIX_RE: Final = re.compile(r"(?:['\"]?\s*[:=]|['\"]\s*,)")
 

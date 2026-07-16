@@ -22,7 +22,7 @@ from urllib.parse import quote, quote_plus, urlsplit
 
 import pytest
 
-import plex_manager.logsafe as logsafe
+from plex_manager import logsafe
 from plex_manager.logsafe import (
     redact_known_secrets,
     redact_secrets,
@@ -1262,6 +1262,9 @@ def test_key_guard_requires_a_bounded_local_shape_suffix() -> None:
 
 
 def test_key_guard_handles_thousands_of_unshaped_keyword_occurrences() -> None:
+    # Guards WALL-CLOCK behavior only: the unbounded parent produced this exact
+    # byte-identical output too, just quadratically slower (~10s at this size).
+    # This pins the miss path staying linear, not a redaction-output change.
     text = "password " * 2_000
     result = redact_known_secrets(text, ["password"])
     assert result == "<redacted> " * 2_000
