@@ -347,7 +347,9 @@ def _extract_context(record: logging.LogRecord) -> dict[str, Any] | None:
 
 
 def _capture(
-    record: logging.LogRecord, secret_values: frozenset[str] = frozenset()
+    record: logging.LogRecord,
+    secret_values: frozenset[str] = frozenset(),
+    retiring_values: frozenset[str] = frozenset(),
 ) -> CapturedLogRecord:
     """Render one stdlib ``LogRecord`` into the pipeline's own frozen shape.
 
@@ -379,17 +381,38 @@ def _capture(
     through (both the ring-buffer live tail and the durable-store queue read
     from this same :class:`CapturedLogRecord`), so both redaction passes
     happen exactly once, upstream of both destinations.
+
+    ``retiring_values`` (issue #389 facet 5) is non-empty ONLY while a secret
+    rotation is in flight (published by :meth:`begin_secret_rotation`, cleared
+    at :meth:`complete_secret_rotation`/:meth:`abort_secret_rotation`). When
+    set, this record is masked with the EXACT, FLOORLESS retired-value pass
+    (:func:`redact_retired_log_message`) instead of the standard floored value
+    pass: the standard pass skips any value shorter than
+    :func:`redact_known_secrets`' 8-character floor, so a short retiring secret
+    would otherwise be captured VERBATIM during the rotation window and could
+    land in the ring/queue AFTER the completion sweep has already run -- with the
+    value already gone from ``secret_values()``, nothing would ever rewrite it.
+    Masking floorlessly HERE, as the record is built (before it reaches the ring
+    or the queue), closes that window by construction. ``secret_values`` (the
+    widened transition set during rotation) is still applied as the floored
+    ``current_values`` companion, so the ordering matches every other pass.
     """
     message = record.getMessage()
     if record.exc_info:
         message = f"{message}\n{_EXC_FORMATTER.formatException(record.exc_info)}"
-    message = redact_log_message(message, secret_values)
+    context = _extract_context(record)
+    if retiring_values:
+        message = redact_retired_log_message(message, retiring_values, secret_values)
+        context = redact_retired_log_context(context, retiring_values, secret_values)
+    else:
+        message = redact_log_message(message, secret_values)
+        context = redact_log_context(context, secret_values)
     return CapturedLogRecord(
         created_at=datetime.fromtimestamp(record.created, tz=UTC),
         level=record.levelname,
         logger=record.name,
         message=message,
-        context=redact_log_context(_extract_context(record), secret_values),
+        context=context,
     )
 
 
@@ -453,6 +476,13 @@ class LogCaptureHandler(logging.Handler):
         self.queue: asyncio.Queue[CapturedLogRecord] = asyncio.Queue(maxsize=queue_maxsize)
         self.dropped_count = 0
         self.secret_values: frozenset[str] = frozenset()
+        # Non-empty ONLY between :meth:`begin_secret_rotation` and its matching
+        # complete/abort -- the values a rotation is retiring, published to the
+        # capture path for the exact, FLOORLESS pass in :func:`_capture` (issue
+        # #389 facet 5). Reassigned to a NEW frozenset on every transition (never
+        # mutated in place) so the lock-free read in :meth:`emit` stays atomic
+        # under the GIL, exactly like ``secret_values``.
+        self.retiring_values: frozenset[str] = frozenset()
         self._loop = loop if loop is not None else asyncio.get_running_loop()
         # Guards ``ring_buffer`` against the concurrent-iteration hazard above.
         # A ``threading.Lock`` (not ``asyncio.Lock``): ``emit`` can run from a
@@ -462,8 +492,28 @@ class LogCaptureHandler(logging.Handler):
         # acquired from the event-loop thread inside ``snapshot_tail``.
         self._lock = threading.Lock()
 
-    def begin_secret_rotation(self, secret_values: frozenset[str]) -> frozenset[str]:
-        """Widen capture redaction temporarily and return the old snapshot."""
+    def begin_secret_rotation(
+        self, secret_values: frozenset[str], *, retiring_values: frozenset[str] = frozenset()
+    ) -> frozenset[str]:
+        """Widen capture redaction temporarily and return the old snapshot.
+
+        ``retiring_values`` (issue #389 facet 5) are published to the capture
+        path so every record built WHILE the rotation is in flight masks them
+        with the exact, floorless retired-value pass (see :func:`_capture`) --
+        covering a retiring secret too short for the standard floored value
+        pass, and covering it at capture time so a record that lands after the
+        completion sweep is still clean.
+
+        ``retiring_values`` is published BEFORE ``secret_values`` is widened,
+        the mirror of :meth:`complete_secret_rotation`'s narrow-then-clear
+        withdrawal. Together with :meth:`emit` reading ``retiring_values`` before
+        ``secret_values``, this keeps the floorless retiring coverage in force
+        for the whole span in which the widened (floored) ``secret_values`` could
+        expose a short retiring value -- no emit can observe the widened set
+        without also observing the floorless retiring set. A rotation is
+        serialized by ``secret_rotation_lock``, so the retiring set is always
+        empty on entry (no nesting)."""
+        self.retiring_values = retiring_values
         previous = self.secret_values
         self.secret_values = previous | secret_values
         return previous
@@ -471,6 +521,7 @@ class LogCaptureHandler(logging.Handler):
     def abort_secret_rotation(self, previous_values: frozenset[str]) -> None:
         """Restore the exact capture snapshot after a failed transaction."""
         self.secret_values = previous_values
+        self.retiring_values = frozenset()
 
     def complete_secret_rotation(
         self,
@@ -513,7 +564,14 @@ class LogCaptureHandler(logging.Handler):
                 ),
                 maxlen=self.ring_buffer.maxlen,
             )
+        # Narrow ``secret_values`` BEFORE clearing ``retiring_values`` (the
+        # mirror of :meth:`begin_secret_rotation`'s order): the transient window
+        # then has ``secret_values`` narrowed but the retiring set still live, so
+        # ``emit`` keeps floorless-masking the retired value until it is fully
+        # withdrawn -- never the reverse (retiring cleared while the value still
+        # sits, floored, in the widened set).
         self.secret_values = current_values
+        self.retiring_values = frozenset()
 
     def emit(self, record: logging.LogRecord) -> None:
         # Never let a capture bug break logging itself (north star: honesty over
@@ -521,7 +579,19 @@ class LogCaptureHandler(logging.Handler):
         # in the first place). ``handleError`` is the stdlib's own "a handler
         # failed" escape hatch (prints to stderr, respects ``logging.raiseExceptions``).
         try:
-            captured = _capture(record, self.secret_values)
+            # Read ``retiring_values`` BEFORE ``secret_values`` (both atomic
+            # attribute reads under the GIL). Paired with the write orders in
+            # :meth:`begin_secret_rotation` (retiring set first) and
+            # :meth:`complete_secret_rotation` (secret narrowed first, retiring
+            # cleared last), this makes the short-retiring-value coverage
+            # race-free by construction: whenever ``secret_values`` still
+            # floored-covers a retiring value, ``retiring_values`` floorless-
+            # covers it too, so no emit can straddle the transitions and mask a
+            # short retiring value with the floored pass alone. See
+            # :meth:`complete_secret_rotation`.
+            retiring = self.retiring_values
+            secret_values = self.secret_values
+            captured = _capture(record, secret_values, retiring)
         except Exception:
             self.handleError(record)
             return

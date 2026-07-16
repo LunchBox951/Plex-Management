@@ -223,6 +223,87 @@ async def test_complete_secret_rotation_serializes_a_concurrent_thread_emit(
     assert handler.secret_values == frozenset({current})
 
 
+async def test_active_rotation_masks_a_short_retiring_value_at_capture_time() -> None:
+    """Facet 5 (issue #389): while a rotation is in flight, a record built for a
+    retiring value SHORTER than the read floor is masked AS IT IS CAPTURED --
+    before it ever reaches the ring or the queue -- so a worker-thread log that
+    lands after the completion sweep can never carry the bare old value. The
+    standard floored ``secret_values`` pass would skip a short value; the
+    floorless retired pass, keyed off the published ``retiring_values``, does
+    not."""
+    short_old = "tok5!"  # 5 chars -- below redact_known_secrets' 8-char floor
+    new = "fake-new-long-secret-value"
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    handler.secret_values = frozenset({short_old})
+
+    def _emit_short_old() -> None:
+        # A BARE occurrence (no ``key=value`` shape prefix), so only the value-
+        # based pass can catch it -- isolating the floor behaviour from the shape
+        # grammar, which would mask ``token=...`` regardless.
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="bare %s occurrence",
+            args=(short_old,),
+            exc_info=None,
+        )
+        record.request_id = short_old
+        handler.emit(record)
+
+    # CONTROL: with no rotation active, the floored value pass skips the short
+    # value, so it survives into the ring verbatim -- the exact gap facet 5 closes.
+    _emit_short_old()
+    await asyncio.sleep(0)
+    assert short_old in handler.snapshot_tail(1)[0].message
+    handler.queue.get_nowait()  # drain the control record so the queue below is the rotation's
+
+    # Enter the boundary: publish the retiring value and widen, exactly as
+    # ``secret_rotation`` does on ``begin_secret_rotation``.
+    previous = handler.begin_secret_rotation(
+        frozenset({short_old, new}), retiring_values=frozenset({short_old})
+    )
+    assert previous == frozenset({short_old})
+    assert handler.retiring_values == frozenset({short_old})
+
+    # A worker logs the short old value DURING the rotation window.
+    _emit_short_old()
+    await asyncio.sleep(0)  # let the call_soon_threadsafe enqueue run
+
+    tail = handler.snapshot_tail(1)[0]
+    assert short_old not in tail.message
+    assert short_old not in str(tail.context)
+    queued = handler.queue.get_nowait()
+    assert short_old not in queued.message
+    assert short_old not in str(queued.context)
+
+    # Completion clears the retiring state and resumes the floored contract.
+    handler.complete_secret_rotation(
+        previous, frozenset({new}), retired_values=frozenset({short_old})
+    )
+    assert handler.retiring_values == frozenset()
+    assert handler.secret_values == frozenset({new})
+
+
+async def test_abort_secret_rotation_clears_the_published_retiring_values() -> None:
+    """A failed rotation withdraws the capture-time floorless pass, so a later
+    record for the same short value is no longer over-masked once the rotation
+    is abandoned (the value is still live and covered by its ordinary pass)."""
+    short_old = "ab7!"
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    handler.secret_values = frozenset({short_old})
+
+    previous = handler.begin_secret_rotation(
+        frozenset({short_old}), retiring_values=frozenset({short_old})
+    )
+    assert handler.retiring_values == frozenset({short_old})
+    handler.abort_secret_rotation(previous)
+
+    assert handler.retiring_values == frozenset()
+    assert handler.secret_values == frozenset({short_old})
+
+
 async def test_ring_buffer_captures_every_level(
     test_logger: logging.Logger, handler: LogCaptureHandler
 ) -> None:
