@@ -53,6 +53,7 @@ from plex_manager.ports.metadata import (
 from plex_manager.web.deps import (
     get_library,
     get_library_optional,
+    get_library_optional_short_session,
     get_media_probe,
     get_prowlarr,
     get_qbittorrent,
@@ -692,11 +693,11 @@ def override_adapters(
 ) -> None:
     """Point the adapter dependencies at the supplied fakes.
 
-    ``library`` overrides BOTH the required (``get_library``) and optional
-    (``get_library_optional``) Plex dependencies, so the request-dedupe and import
-    endpoints see the same fake. ``qbt`` likewise overrides BOTH the required
-    (``get_qbittorrent``) and optional (``get_qbittorrent_optional``, the mark-failed
-    endpoint's DB-only-friendly variant) qBittorrent dependencies.
+    ``library`` overrides all three required, optional, and artwork-short Plex
+    dependencies, so the request-dedupe and import endpoints see the same fake.
+    ``qbt`` likewise overrides BOTH the required (``get_qbittorrent``) and optional
+    (``get_qbittorrent_optional``, the mark-failed endpoint's DB-only-friendly
+    variant) qBittorrent dependencies.
     """
     if tmdb is not None:
         app.dependency_overrides[get_tmdb] = lambda: tmdb
@@ -708,5 +709,6 @@ def override_adapters(
     if library is not None:
         app.dependency_overrides[get_library] = lambda: library
         app.dependency_overrides[get_library_optional] = lambda: library
+        app.dependency_overrides[get_library_optional_short_session] = lambda: library
     probe = media_probe or FakeMediaProbe()
     app.dependency_overrides[get_media_probe] = lambda: probe
