@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PurgeOutcome",
     "PurgeResult",
+    "active_purge_paths",
     "begin_placement",
     "end_placement",
     "end_purge",
@@ -159,6 +160,18 @@ def end_placement(library_path: str) -> None:
 def end_purge(library_path: str) -> None:
     """Release a held purge registration (refcounted)."""
     _unregister(library_path, _ACTIVE_PURGE_PATHS)
+
+
+def active_purge_paths() -> tuple[str, ...]:
+    """Snapshot of library paths with an in-flight purge delete (issue #401).
+
+    Read-only view of :data:`_ACTIVE_PURGE_PATHS`'s keys. Used by
+    ``web.app.lifespan``'s bounded shutdown wait to name which path(s) are
+    still being deleted if that wait times out (honesty over silence) -- never
+    used for the purge-vs-import serialization itself, which reads/writes the
+    registry directly.
+    """
+    return tuple(_ACTIVE_PURGE_PATHS)
 
 
 class PurgeOutcome(StrEnum):
