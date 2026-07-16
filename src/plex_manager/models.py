@@ -924,6 +924,30 @@ class UpdateCoordinatorState(Base):
     available_build: Mapped[str | None] = mapped_column(String(400))
     available_digest: Mapped[str | None] = mapped_column(String(400))
     updater_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The sidecar's OWN running image identity, as reported on its liveness
+    # heartbeat (ADR-0025 stage 0, issue #299) -- DISTINCT from
+    # ``current_build``/``current_digest`` above, which are the APP/target image
+    # the sidecar observes for update purposes. NULL until a sidecar new enough
+    # to report it connects (the current sidecar does not emit these yet), and
+    # NULL is deliberately read as "unknown / refresh recommended", never as a
+    # clean build match. Same expand-only, no-CHECK discipline as every other
+    # string column here: a future field addition must stay ignorable by N-1.
+    # Same ``String(400)`` width as the other build/digest columns (a long
+    # private-registry ``@sha256`` digest fits without truncation).
+    updater_observed_build: Mapped[str | None] = mapped_column(String(400))
+    updater_observed_digest: Mapped[str | None] = mapped_column(String(400))
+    # The last self-refresh outcome for the sidecar container itself (ADR-0025
+    # stage 0). A surviving predecessor after a FAILED self-refresh keeps
+    # heartbeating and looks healthy, so this durable record -- never cleared by
+    # an ordinary heartbeat/identity write, only by a later refresh outcome -- is
+    # what keeps the failure honestly visible (north star #3). All NULL until a
+    # refresh is ever recorded (stage 1 emits them; stage 0 only persists and
+    # surfaces).
+    last_refresh_result: Mapped[str | None] = mapped_column(String(32))
+    last_refresh_detail_code: Mapped[str | None] = mapped_column(String(128))
+    last_refresh_from_build: Mapped[str | None] = mapped_column(String(400))
+    last_refresh_to_build: Mapped[str | None] = mapped_column(String(400))
+    last_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
