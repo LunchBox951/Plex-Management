@@ -31,8 +31,9 @@ existing integer ones -- do not revert to the bare ``->`` accessor.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from sqlalchemy import ColumnElement, CursorResult, String, delete, func, insert, or_, select
 from sqlalchemy import cast as sql_cast
@@ -46,11 +47,17 @@ from plex_manager.ports.repositories import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlLogEventRepository"]
+
+# Keyset batch size for ``rewrite_redactable_fields``: large enough that a
+# 100k-row store takes ~100 round trips, small enough that each batch's ORM
+# materialization + Python redaction pass stays well under an event-loop tick
+# budget before the inter-batch yield.
+_REWRITE_BATCH_SIZE: Final = 1000
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -182,6 +189,56 @@ class SqlLogEventRepository:
         stmt = stmt.limit(limit).offset(offset)
         rows = (await self._session.execute(stmt)).scalars().all()
         return LogEventPage(total=total, results=tuple(_to_record(row) for row in rows))
+
+    async def rewrite_redactable_fields(
+        self,
+        message_rewriter: Callable[[str], str],
+        context_rewriter: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> int:
+        # Cost model, stated honestly: this is a FULL-TABLE scan and rewrite
+        # (``log_max_rows`` allows up to 2M rows) that runs while the caller
+        # holds ``secret_rotation_lock`` -- that serialization is ADR-0026's
+        # guarantee, so the lock deliberately stays held for the whole rewrite
+        # and everything commits in the caller's single enclosing transaction.
+        # Rotation is a rare, operator-initiated action, so the cost is paid in
+        # keyset batches (ordered by the integer PK) with an explicit yield to
+        # the event loop between batches: one unbatched ``.all()`` would
+        # materialize the entire table as ORM instances and starve the loop
+        # (SSE heartbeats, /health) for the duration. No value-based SQL
+        # prefilter is possible -- the redaction grammar also matches encoded/
+        # derived variants of a secret that a raw-value LIKE would miss.
+        changed = 0
+        last_id = 0
+        while True:
+            rows = (
+                (
+                    await self._session.execute(
+                        select(LogEvent)
+                        .where(LogEvent.id > last_id)
+                        .order_by(LogEvent.id)
+                        .limit(_REWRITE_BATCH_SIZE)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                return changed
+            batch_changed = 0
+            for row in rows:
+                message = message_rewriter(row.message)
+                context = context_rewriter(row.context_json)
+                if message != row.message or context != row.context_json:
+                    row.message = message
+                    row.context_json = context
+                    batch_changed += 1
+            last_id = rows[-1].id
+            if batch_changed:
+                # Per-batch flush keeps the identity map / dirty set bounded;
+                # rows stay uncommitted until the caller's single commit.
+                await self._session.flush()
+                changed += batch_changed
+            await asyncio.sleep(0)
 
     async def prune_older_than(
         self,

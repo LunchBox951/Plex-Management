@@ -99,6 +99,7 @@ from plex_manager.web.deps import (
     resolve_prowlarr,
     resolve_qbittorrent,
     resolve_tmdb,
+    secret_rotation_lock,
 )
 from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
@@ -1017,14 +1018,9 @@ async def _log_drain_loop(app: FastAPI) -> None:
     last_pruned_at = time.monotonic()
     while True:
         try:
-            async with sessionmaker() as session:
-                # Refresh the capture handler's value-based redaction set
-                # (issue #268) EVERY tick, before draining -- ``emit`` (running
-                # synchronously off any thread, no DB access of its own -- see
-                # ``LogCaptureHandler.secret_values``) reads whatever this loop
-                # last assigned here, so a settings change (a rotated api key,
-                # a newly-configured qBittorrent password) is picked up within
-                # one drain interval rather than requiring a restart.
+            async with sessionmaker() as session, secret_rotation_lock:
+                # Refresh the capture handler's value-based redaction set every tick,
+                # then drain and commit while the shared boundary is held.
                 handler.secret_values = await SettingsStore(session).secret_values()
                 repo = SqlLogEventRepository(session)
                 drained = await log_capture_service.drain_once(handler.queue, repo, handler=handler)

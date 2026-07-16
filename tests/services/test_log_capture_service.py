@@ -27,6 +27,10 @@ from plex_manager.services.log_capture_service import (
     configure_logging,
     drain_once,
     prune_once,
+    redact_log_context,
+    redact_log_message,
+    redact_retired_log_context,
+    redact_retired_log_message,
     resolve_log_level,
     stop_logging,
 )
@@ -48,9 +52,175 @@ async def handler() -> LogCaptureHandler:
     return LogCaptureHandler(loop=asyncio.get_running_loop())
 
 
-# --------------------------------------------------------------------------- #
-# LogCaptureHandler: ring buffer (all levels) + queue (INFO+ only)
-# --------------------------------------------------------------------------- #
+def test_redact_log_context_recurses_keys_values_and_resolves_collisions() -> None:
+    secret = "fake-context-secret-value"  # noqa: S105 -- fixture credential
+    context = {
+        secret: {"nested": [secret, 7, True, None]},
+        "<redacted>": "last value wins",
+    }
+
+    redacted = redact_log_context(context, frozenset({secret}))
+
+    assert redacted == {"<redacted>": "last value wins"}
+
+
+def test_redact_log_context_handles_url_and_base64_representations() -> None:
+    secret = "fake-context-secret"  # noqa: S105 -- fixture credential
+    encoded = "ZmFrZS1jb250ZXh0LXNlY3JldA=="
+    context = {
+        f"https://example.invalid/?token={secret}": [
+            f"https://{secret}@example.invalid/",
+            encoded,
+            4,
+            False,
+            None,
+        ]
+    }
+
+    redacted = redact_log_context(context, frozenset({secret}))
+
+    assert redacted is not None
+    rendered = str(redacted)
+    assert secret not in rendered
+    assert encoded not in rendered
+    assert next(iter(redacted.values()))[-3:] == [4, False, None]
+
+
+def test_redact_log_message_uses_value_first_for_basic_auth_at_sign() -> None:
+    secret = "fake@basic-auth-secret"  # noqa: S105 -- fixture credential
+    message = f"https://user:{secret}@example.invalid/path"
+
+    redacted = redact_log_message(message, frozenset({secret}))
+
+    assert secret not in redacted
+    assert "<redacted>" in redacted
+
+
+def test_redact_retired_helpers_mask_short_values_the_read_floor_skips() -> None:
+    """A retiring value below the 8-char read floor is masked exactly by the
+    rotation-rewrite helpers, in messages and in every context key/leaf, while
+    the CURRENT-value read path keeps its floor (over-redaction guard)."""
+    short_retired = "abc12"
+    message = f"bare {short_retired} occurrence"
+
+    # The read path's floor intentionally skips the short value...
+    assert redact_log_message(message, frozenset({short_retired})) == message
+    # ...but the rotation rewrite must not.
+    rewritten = redact_retired_log_message(message, frozenset({short_retired}))
+    assert short_retired not in rewritten
+    assert "<redacted>" in rewritten
+
+    context = {short_retired: [f"nested {short_retired}", 7, None]}
+    redacted = redact_retired_log_context(context, frozenset({short_retired}))
+    assert redacted is not None
+    rendered = str(redacted)
+    assert short_retired not in rendered
+    assert next(iter(redacted.values()))[-2:] == [7, None]
+
+
+def test_redact_retired_message_still_applies_current_values_and_shape() -> None:
+    """The retired pass composes with the standard current-value + shape pass."""
+    retired = "xy9"
+    current = "fake-current-long-secret"
+    message = f"retired {retired} current {current} password=hunter2"
+
+    redacted = redact_retired_log_message(message, frozenset({retired}), frozenset({current}))
+
+    assert retired not in redacted
+    assert current not in redacted
+    assert "hunter2" not in redacted
+
+
+async def test_handler_secret_rotation_success_and_abort_preserve_contract() -> None:
+    old = "fake-old-handler-secret"
+    current = "fake-current-handler-secret"
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    handler.secret_values = frozenset({old})
+    record = CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=old,
+        context={old: [old]},
+    )
+    handler.queue.put_nowait(record)
+    handler.ring_buffer.append(record)
+
+    previous = handler.begin_secret_rotation(frozenset({current}))
+    assert previous == frozenset({old})
+    handler.abort_secret_rotation(previous)
+    assert handler.queue.get_nowait() == record
+    handler.queue.put_nowait(record)
+    assert handler.snapshot_tail(1)[0] == record
+
+    handler.complete_secret_rotation(previous, frozenset({current}))
+    queued = handler.queue.get_nowait()
+    ring = handler.snapshot_tail(1)[0]
+    assert old not in queued.message
+    assert old not in str(queued.context)
+    assert old not in ring.message
+    assert old not in str(ring.context)
+    assert handler.secret_values == frozenset({current})
+
+
+async def test_complete_secret_rotation_serializes_a_concurrent_thread_emit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = "fake-concurrent-handler-value"
+    current = "fake-current-handler-value"
+    handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+    handler.secret_values = frozenset({old})
+    handler.ring_buffer.append(
+        CapturedLogRecord(
+            created_at=datetime.now(UTC),
+            level="DEBUG",
+            logger="test",
+            message=old,
+            context={"request_id": old},
+        )
+    )
+    previous = handler.begin_secret_rotation(frozenset({current}))
+    rewrite_started = threading.Event()
+    emit_captured = threading.Event()
+    real_redact = redact_log_message
+
+    def coordinated_redact(message: str, values: object) -> str:
+        if threading.current_thread() is threading.main_thread() and not rewrite_started.is_set():
+            rewrite_started.set()
+            assert emit_captured.wait(timeout=1)
+        redacted = real_redact(message, values)  # type: ignore[arg-type]
+        if threading.current_thread() is not threading.main_thread():
+            emit_captured.set()
+        return redacted
+
+    monkeypatch.setattr(
+        "plex_manager.services.log_capture_service.redact_log_message",
+        coordinated_redact,
+    )
+
+    def emit_during_completion() -> None:
+        assert rewrite_started.wait(timeout=1)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.DEBUG,
+            pathname=__file__,
+            lineno=1,
+            msg=old,
+            args=(),
+            exc_info=None,
+        )
+        record.request_id = old
+        handler.emit(record)
+
+    thread = threading.Thread(target=emit_during_completion)
+    thread.start()
+    handler.complete_secret_rotation(previous, frozenset({current}))
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    rendered = str(handler.snapshot_tail(10))
+    assert old not in rendered
+    assert handler.secret_values == frozenset({current})
 
 
 async def test_ring_buffer_captures_every_level(
@@ -679,6 +849,13 @@ class _FailingRepo:
         offset: int = 0,
         oldest_first: bool = False,
     ) -> LogEventPage:
+        raise NotImplementedError
+
+    async def rewrite_redactable_fields(
+        self,
+        message_rewriter: Any,
+        context_rewriter: Any,
+    ) -> int:
         raise NotImplementedError
 
     async def prune_older_than(

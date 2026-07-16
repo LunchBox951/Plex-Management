@@ -31,6 +31,7 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0023](0023-database-rollback-and-pre-migration-backup.md) | Database rollback policy and automatic pre-migration backup | Accepted |
 | [0024](0024-first-party-container-auto-updater.md) | First-party container updater with app-owned policy | Accepted |
 | [0025](0025-updater-sidecar-self-recreation-lifecycle.md) | Automatic recreation of the updater sidecar (successor-spawn self-refresh) | Proposed |
+| [0026](0026-redact-at-rotation-historical-log-secrets.md) | Redact rotated secrets at rotation time; retain no historical secret material | Accepted |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the

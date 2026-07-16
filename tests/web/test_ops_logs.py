@@ -5,6 +5,7 @@ tail, and the LLM-diagnosis export bundle.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from collections.abc import Awaitable, Callable
@@ -16,10 +17,12 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.models import LogEvent
+from plex_manager.models import LogEvent, SystemSettings
 from plex_manager.services import log_capture_service
 from plex_manager.web.deps import SettingsStore
 from plex_manager.web.routers import ops as ops_router
+from plex_manager.web.routers import settings as settings_router
+from plex_manager.web.update_coordinator import ensure_update_coordinator
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -108,6 +111,74 @@ async def test_logs_pagination_limit_offset(
     assert page["events"][0]["message"] == "m1"  # newest-first: m2, m1, m0
 
 
+@pytest.mark.parametrize(
+    ("path", "params"),
+    [
+        ("/api/v1/ops/logs", {}),
+        ("/api/v1/ops/logs/export", {"format": "text"}),
+        ("/api/v1/ops/logs/export", {"format": "json"}),
+    ],
+)
+async def test_durable_log_reads_hold_rotation_lock_through_rendering(
+    path: str,
+    params: dict[str, str],
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable response cannot span a rotation's before/after secret sets."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await ensure_update_coordinator(app)
+    old_secret = _API_KEY
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("tmdb_api_key", "current-read-boundary-fixture")
+        await session.commit()
+    await _insert_event(
+        sessionmaker_,
+        level="INFO",
+        message=f"durable {old_secret}",
+        context={"nested": old_secret},
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_list_events = ops_router.SqlLogEventRepository.list_events
+
+    async def paused_list_events(self: object, *args: object, **kwargs: object) -> object:
+        page = await real_list_events(self, *args, **kwargs)  # type: ignore[arg-type]
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=1)
+        return page
+
+    monkeypatch.setattr(ops_router.SqlLogEventRepository, "list_events", paused_list_events)
+    rotation_started = asyncio.Event()
+    real_refresh = AsyncSession.refresh
+
+    async def observed_rotation_start(self: AsyncSession, instance: object) -> None:
+        if isinstance(instance, SystemSettings):
+            rotation_started.set()
+        await real_refresh(self, instance)
+
+    monkeypatch.setattr(AsyncSession, "refresh", observed_rotation_start)
+    read_rotation_lock = asyncio.Lock()
+    monkeypatch.setattr(ops_router, "secret_rotation_lock", read_rotation_lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", read_rotation_lock)
+    response_task = asyncio.create_task(client.get(path, params=params, headers=_HEADERS))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    rotation_task = asyncio.create_task(
+        client.post("/api/v1/settings/app-key/rotate", headers=_HEADERS)
+    )
+    await asyncio.wait_for(rotation_started.wait(), timeout=1)
+    assert not rotation_task.done()
+    release.set()
+    response = await asyncio.wait_for(response_task, timeout=1)
+    rotation = await asyncio.wait_for(rotation_task, timeout=1)
+    assert rotation.status_code == 200, rotation.text
+    assert response.status_code == 200
+    assert old_secret not in response.text
+
+
 # --------------------------------------------------------------------------- #
 # GET /logs/tail — the live, all-levels ring buffer
 # --------------------------------------------------------------------------- #
@@ -121,6 +192,62 @@ async def test_tail_requires_a_configured_log_handler(
     response = await client.get("/api/v1/ops/logs/tail", headers=_HEADERS)
     assert response.status_code == 503
     assert response.json()["detail"] == "log_handler_unavailable"
+
+
+async def test_tail_holds_rotation_lock_through_rendering(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ring response cannot combine a pre-rotation record with a new secret set."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await ensure_update_coordinator(app)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.ring_buffer.append(
+        log_capture_service.CapturedLogRecord(
+            created_at=_NOW,
+            level="INFO",
+            logger="test",
+            message=f"live {_API_KEY}",
+            context={"key": _API_KEY},
+        )
+    )
+    app.state.log_handler = handler
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    rotation_started = asyncio.Event()
+    real_secret_values = SettingsStore.secret_values
+    real_refresh = AsyncSession.refresh
+
+    async def paused_secret_values(self: SettingsStore) -> frozenset[str]:
+        values = await real_secret_values(self)
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=1)
+        return values
+
+    async def observed_rotation_start(self: AsyncSession, instance: object) -> None:
+        if isinstance(instance, SystemSettings):
+            rotation_started.set()
+        await real_refresh(self, instance)
+
+    monkeypatch.setattr(SettingsStore, "secret_values", paused_secret_values)
+    monkeypatch.setattr(AsyncSession, "refresh", observed_rotation_start)
+    read_rotation_lock = asyncio.Lock()
+    monkeypatch.setattr(ops_router, "secret_rotation_lock", read_rotation_lock)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", read_rotation_lock)
+    response_task = asyncio.create_task(client.get("/api/v1/ops/logs/tail", headers=_HEADERS))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    rotation_task = asyncio.create_task(
+        client.post("/api/v1/settings/app-key/rotate", headers=_HEADERS)
+    )
+    await asyncio.wait_for(rotation_started.wait(), timeout=1)
+    assert not rotation_task.done()
+    release.set()
+    response = await asyncio.wait_for(response_task, timeout=1)
+    rotation = await asyncio.wait_for(rotation_task, timeout=1)
+    assert rotation.status_code == 200, rotation.text
+    assert _API_KEY not in response.text
 
 
 async def test_tail_reads_the_live_ring_buffer_newest_first(
