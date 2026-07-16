@@ -3307,3 +3307,109 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
     await waitFor(() => expect(importMutation.mutateAsync).toHaveBeenCalledWith(11))
   })
 })
+
+describe('TitleDetailModal — request actions suppressed while /requests/by-title is still loading (issue #397 Codex P2)', () => {
+  // Issue #397: `requestsQuery` (GET /requests/by-title) starts cold under its
+  // own per-title cache key even when the modal was opened from a caller that
+  // already knows a request exists -- a clicked Requests row (`boundRequestId`)
+  // or a badged Discover/Search tile (whose badge comes from the SEPARATELY
+  // cached `useTileLiveStates` compact poll). Until that query's first fetch
+  // settles, `liveRequest` reads exactly like a genuinely title-with-no-request
+  // case; before the fix that flashed a live, clickable '+ Request' (TV
+  // defaulting to the whole series) for a title that may already have one.
+  function boundRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
+    return {
+      id: 81,
+      tmdb_id: 42,
+      media_type: 'movie',
+      title: 'Test Movie',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(useCreateRequest).mockReturnValue(idle() as never)
+    vi.mocked(useSearchPreview).mockReturnValue(idle() as never)
+    vi.mocked(useGrab).mockReturnValue(idle() as never)
+    vi.mocked(useMarkFailed).mockReturnValue(idle() as never)
+    vi.mocked(useImportDownload).mockReturnValue(idle() as never)
+    vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
+    vi.mocked(useReportIssue).mockReturnValue(idle() as never)
+    vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
+    vi.mocked(useQueue).mockReturnValue({ data: { queue: [] } } as never)
+  })
+
+  it('opened on a known Requests row: hides + Request while the query is loading, then shows the resolved state', async () => {
+    // The operator just clicked a CONCRETE existing request row, but the
+    // title-scoped fetch is still in flight -- `data` is undefined, matching
+    // react-query's own pre-first-fetch shape (`isLoading` true).
+    vi.mocked(useTitleRequests).mockReturnValue({ data: undefined, isLoading: true } as never)
+
+    const view = render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    // Never a live '+ Request' in this window: the clicked row may well already
+    // be an active request, and firing this would risk a duplicate.
+    expect(screen.queryByRole('button', { name: /\+ request/i })).not.toBeInTheDocument()
+    const checking = screen.getByRole('button', { name: /checking/i })
+    expect(checking).toBeDisabled()
+    expect(screen.getByText('Checking for an existing request…')).toBeInTheDocument()
+
+    // The query resolves: the bound row turns out to be genuinely downloading.
+    vi.mocked(useTitleRequests).mockReturnValue({
+      data: { requests: [boundRow()] },
+      isLoading: false,
+    } as never)
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={81} />,
+    )
+
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /checking/i })).not.toBeInTheDocument(),
+    )
+    expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /\+ request/i })).not.toBeInTheDocument()
+  })
+
+  it('opened on a known TV request row: never defaults + Request to a whole-series create while loading', async () => {
+    // The sharpest instance of the finding: for tv, a live '+ Request' shown
+    // here (before the query confirms a request already exists) defaults
+    // straight to a WHOLE-SERIES create -- the worst-case duplicate.
+    const TV: DiscoverResult = {
+      media_type: 'tv',
+      tmdb_id: 100,
+      title: 'Test Show',
+      year: 2022,
+      library_state: 'none',
+    }
+    vi.mocked(useTitleRequests).mockReturnValue({ data: undefined, isLoading: true } as never)
+
+    render(<TitleDetailModal title={TV} open onOpenChange={() => {}} boundRequestId={81} />)
+
+    expect(screen.queryByRole('button', { name: /\+ request/i })).not.toBeInTheDocument()
+    // The pre-request "Whole series" checkbox (state.kind === 'none' only) must
+    // not render either -- it belongs to the confirmed-no-request flow.
+    expect(screen.queryByLabelText('Whole series')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /checking/i })).toBeDisabled()
+  })
+
+  it('a title genuinely without a request still resolves to + Request once the (non-loading) query settles', async () => {
+    vi.mocked(useTitleRequests).mockReturnValue({
+      data: { requests: [] },
+      isLoading: false,
+    } as never)
+
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    expect(await screen.findByRole('button', { name: /^\+ request$/i })).toBeInTheDocument()
+  })
+})

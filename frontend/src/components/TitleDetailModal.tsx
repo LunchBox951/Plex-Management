@@ -100,6 +100,16 @@ function asApiError(error: unknown): ApiError {
  */
 type DerivedState =
   | { kind: 'none' }
+  // Issue #397 Codex P2: the title-scoped `requestsQuery` (GET /requests/by-title)
+  // starts cold under its own per-title cache key even when the modal was opened
+  // from a caller that already knows a request exists — a clicked Requests row
+  // (`boundRequestId`) or a badged Discover/Search tile (whose badge comes from
+  // the SEPARATELY-cached `useTileLiveStates` compact poll). Until that query's
+  // first fetch settles, `liveRequest` reads exactly like a genuinely
+  // title-with-no-request case; folding that into `none` would flash a live,
+  // clickable '+ Request' (TV defaulting to the whole series) for a title that
+  // may already have one, risking a duplicate. See the `state` derivation below.
+  | { kind: 'checking' }
   | { kind: 'pending' }
   | { kind: 'searching' }
   | { kind: 'downloading' }
@@ -374,11 +384,14 @@ function isSeasonGrabbable(request: RequestResponse, season: number | null): boo
 const FINALIZING: StatusPresentation = { label: 'Finalizing', intent: 'downloading' }
 const IMPORT_BLOCKED: StatusPresentation = { label: 'Import blocked', intent: 'error' }
 const NOT_REQUESTED: StatusPresentation = { label: 'Not requested', intent: 'neutral' }
+const CHECKING: StatusPresentation = { label: 'Checking…', intent: 'neutral' }
 
 function statePresentation(state: DerivedState): StatusPresentation {
   switch (state.kind) {
     case 'none':
       return NOT_REQUESTED
+    case 'checking':
+      return CHECKING
     case 'import_blocked':
       return IMPORT_BLOCKED
     case 'completed':
@@ -399,6 +412,11 @@ function stateSentence(
   queueItem: QueueItem | null,
 ): string {
   switch (state.kind) {
+    case 'checking':
+      // Issue #397: the title-scoped request query hasn't resolved its FIRST
+      // fetch yet — deliberately noncommittal, never "Not in the library and
+      // not requested" (that's `none`'s honest claim once the query settles).
+      return 'Checking for an existing request…'
     case 'none':
       // Presence without a tracked request (issue #131): the discovery
       // projection says Plex owns this title even though no request row exists
@@ -765,10 +783,23 @@ export function TitleDetailModal({
     return matches.length > 0 ? matches[matches.length - 1]! : null
   }, [queueQuery.data, title, effectiveRequestId, currentSeason, isAdmin])
 
-  const state = deriveState(
-    liveRequest ? seasonStatusFor(liveRequest, currentSeason) : null,
-    requestId !== null,
-  )
+  // Issue #397 Codex P2: only fold into `deriveState`'s 'none' once the
+  // title-scoped query has had a chance to answer. `isLoading` (react-query:
+  // pending AND in flight) is true only for that FIRST-fetch window — it
+  // flips false as soon as the query settles, success or error, so a failed
+  // fetch still falls through to the ordinary derivation rather than wedging
+  // the action zone shut forever (honesty over silence, north star #3).
+  // `requestId !== null` / `liveRequest !== null` both mean this modal
+  // instance already has a concrete answer (a just-created row, or a poll
+  // that already landed) and skip the gate even mid-fetch.
+  const titleRequestsUnresolved =
+    requestId === null && liveRequest === null && requestsQuery.isLoading
+  const state: DerivedState = titleRequestsUnresolved
+    ? { kind: 'checking' }
+    : deriveState(
+        liveRequest ? seasonStatusFor(liveRequest, currentSeason) : null,
+        requestId !== null,
+      )
   const reportTarget = reportFor
     ? ((queueQuery.data?.queue ?? []).find((item) => item.id === reportFor.downloadId) ?? null)
     : null
@@ -1325,6 +1356,18 @@ export function TitleDetailModal({
 
   let actionZone: ReactNode
   switch (state.kind) {
+    case 'checking':
+      // Issue #397 Codex P2: render a neutral, disabled loading affordance —
+      // never '+ Request' — while the title-scoped query's first fetch is
+      // still in flight. A caller-known row/tile can resolve to an ACTIVE
+      // request here; offering a live '+ Request' in that window risks a
+      // duplicate (TV defaults to the whole series).
+      actionZone = (
+        <Button loading disabled>
+          Checking…
+        </Button>
+      )
+      break
     case 'none':
       actionZone = (
         <>
