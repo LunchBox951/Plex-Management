@@ -2103,10 +2103,13 @@ async def test_heartbeat_empty_string_identity_field_is_an_honest_422(
 
 
 async def test_status_null_observed_identity_reads_stale(
-    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R2: absent observed identity is unknown (None), never a clean match."""
     await seed(initialized=True, app_api_key=_API_KEY)
+    # The runtime id is real and stamped -- the None below is driven purely by
+    # the sidecar never having reported its identity.
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-runtime-build")
     await _fresh_coordinator(app)
     body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
     assert body["updater_build_matches_app"] is None
@@ -2114,20 +2117,13 @@ async def test_status_null_observed_identity_reads_stale(
 
 
 async def test_status_sidecar_ahead_reads_mismatch_not_older(
-    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R3: a differing observed digest is a direction-free mismatch (False)."""
+    """R3: a differing observed build is a direction-free mismatch (False)."""
     await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-runtime-n")
     coordinator = await _fresh_coordinator(app)
-    # App observed its OWN image (target) at digest N-1 after a rollback.
-    generation = await coordinator.request_action(UpdateAction.check)
-    assert await coordinator.acknowledge_action(
-        expected_generation=generation,
-        result=UpdateResult.no_update,
-        current_build="app-build-n1",
-        current_digest="sha256:" + "1" * 64,
-    )
-    # The sidecar reports it is running N+1 (ahead) -- still a mismatch.
+    # The sidecar reports it is running N+1 (ahead) -- still just a mismatch.
     await coordinator.record_updater_identity(
         observed_build="sidecar-build-n1plus",
         observed_digest="sha256:" + "2" * 64,
@@ -2136,24 +2132,199 @@ async def test_status_sidecar_ahead_reads_mismatch_not_older(
     assert body["updater_build_matches_app"] is False
 
 
-async def test_status_same_digest_reads_match(
-    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+async def test_status_matches_running_app_not_stale_target_observation(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Codex round 1: the comparison anchor is the RUNNING app, not the row.
+
+    The rollback shape: the coordinator row's ``current_build`` is the last
+    TARGET observation (N+1, from before the operator rolled the app back to
+    N), and the sidecar also still runs N+1. Comparing against the row would
+    read as a clean match while the running app is actually on N -- the match
+    must anchor on the process's own build id and report the mismatch.
+    """
     await seed(initialized=True, app_api_key=_API_KEY)
+    # The RUNNING process is N...
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "build-n")
     coordinator = await _fresh_coordinator(app)
+    # ...but the row's last target observation (pre-rollback) says N+1.
     generation = await coordinator.request_action(UpdateAction.check)
     assert await coordinator.acknowledge_action(
         expected_generation=generation,
         result=UpdateResult.no_update,
-        current_build="app-build",
-        current_digest="sha256:" + "f" * 64,
+        current_build="build-n-plus-1",
+        current_digest="sha256:" + "9" * 64,
     )
+    # The sidecar (still on the pre-rollback image) matches the ROW, not the app.
+    await coordinator.record_updater_identity(
+        observed_build="build-n-plus-1",
+        observed_digest="sha256:" + "9" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is False
+
+
+async def test_status_same_runtime_build_reads_match(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
     await coordinator.record_updater_identity(
         observed_build="app-build",
         observed_digest="sha256:" + "f" * 64,
     )
     body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
     assert body["updater_build_matches_app"] is True
+
+
+async def test_status_unstamped_runtime_build_reads_unknown_not_a_lie(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstamped runtime id (dev "0.0.0") cannot distinguish builds -> None."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "0.0.0")
+    coordinator = await _fresh_coordinator(app)
+    await coordinator.record_updater_identity(
+        observed_build="0.0.0",
+        observed_digest="sha256:" + "a" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    # Even an equal-looking "0.0.0" pair is honestly unknown, never a match.
+    assert body["updater_build_matches_app"] is None
+
+
+@pytest.mark.parametrize("beat", [{}, {"phase": "checking", "action_generation": None}])
+async def test_identityless_heartbeat_clears_stored_identity(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    beat: dict[str, object],
+) -> None:
+    """Codex round 1: identity is per-heartbeat self-description, never inherited.
+
+    A sidecar replaced/downgraded to an image that doesn't report identity
+    (every pre-stage-1 sidecar) must not keep wearing its predecessor's stored
+    identity: its first identity-less beat clears the observation and the match
+    state reverts to unknown (None -> no banner).
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    monkeypatch.setenv("PLEX_MANAGER_BUILD_ID", "app-build")
+    coordinator = await _fresh_coordinator(app)
+
+    # A newer sidecar reported identity...
+    identified = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"updater_build": "stage1-build", "updater_digest": "sha256:" + "b" * 64},
+    )
+    assert identified.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "stage1-build"
+    assert body["updater_build_matches_app"] is False
+
+    # ...then the container was replaced by one that doesn't (e.g. a checking
+    # beat from an old sidecar). Its beat clears the stale identity.
+    payload = {key: value for key, value in beat.items() if value is not None}
+    if payload.get("phase") == "checking":
+        generation = await coordinator.request_action(UpdateAction.check)
+        payload["action_generation"] = generation
+    cleared = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json=payload,
+    )
+    assert cleared.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] is None
+    assert body["updater_observed_digest"] is None
+    assert body["updater_build_matches_app"] is None
+
+
+async def test_refresh_outcome_route_accepts_and_surfaces(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """Codex round 1: the accept-side refresh-outcome contract ships with the expand."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json={
+            "result": "failed",
+            "detail_code": "successor_never_pinged",
+            "from_build": "old-build",
+            "to_build": "new-build",
+        },
+    )
+    assert response.status_code == 200
+    # The route's own response and a later status read both surface the record.
+    assert response.json()["last_refresh"]["result"] == "failed"
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "failed"
+    assert body["last_refresh"]["detail_code"] == "successor_never_pinged"
+    assert body["last_refresh"]["from_build"] == "old-build"
+    assert body["last_refresh"]["to_build"] == "new-build"
+    assert body["last_refresh"]["at"] is not None
+
+    # A later successful refresh is the only thing that overwrites it.
+    succeeded = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json={"result": "succeeded", "from_build": "old-build", "to_build": "new-build"},
+    )
+    assert succeeded.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "succeeded"
+    assert body["last_refresh"]["detail_code"] is None
+
+
+async def test_refresh_outcome_route_requires_sidecar_secret(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, updater_headers: dict[str, str]
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+    # The public admin credential must NOT reach the internal updater surface.
+    refused = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=_ADMIN,
+        json={"result": "failed"},
+    )
+    assert refused.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"result": "Not A Code"},  # pattern violation
+        {"result": "9leading_digit"},  # must start [a-z] (matches _bounded_code)
+        {"result": "failed", "detail_code": ""},  # empty string is not "absent"
+        {"result": "failed", "from_build": ""},  # ditto
+        {"result": "failed", "from_build": "has\ncontrol"},  # control chars
+        {"result": "failed", "bogus": 1},  # extra="forbid"
+    ],
+)
+async def test_refresh_outcome_route_rejects_malformed_bodies_with_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    payload: dict[str, object],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+    response = await client.post(
+        "/api/v1/internal/updates/refresh-outcome",
+        headers=updater_headers,
+        json=payload,
+    )
+    assert response.status_code == 422
 
 
 async def test_status_surfaces_failed_refresh_record(

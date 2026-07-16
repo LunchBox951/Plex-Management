@@ -98,6 +98,7 @@ __all__ = [
     "UpdateLeaseResponse",
     "UpdateOutcomeRequest",
     "UpdateRefreshItem",
+    "UpdateRefreshOutcomeRequest",
     "UpdateResultItem",
     "UpdateStatusResponse",
     "WatchlistStatusItem",
@@ -1030,11 +1031,14 @@ class UpdateStatusResponse(BaseModel):
     last_checked_at: datetime | None = None
     last_result: UpdateResultItem | None = None
     # ADR-0025 stage 0 sidecar observability (issue #299). ``True`` = the sidecar
-    # confirmed the SAME image as the app; ``False`` = a confirmed version
-    # mismatch (direction-free -- C7 permits the sidecar being AHEAD of an
-    # app that rolled back, so this never claims "older"/"newer"); ``None`` =
-    # the running sidecar has not reported its identity (the expected state
-    # until the stage-1 emitting sidecar ships), never read as a clean match.
+    # reported the SAME build id the RUNNING app process carries; ``False`` = a
+    # confirmed version mismatch (direction-free -- C7 permits the sidecar being
+    # AHEAD of an app that rolled back, so this never claims "older"/"newer");
+    # ``None`` = honestly unknown: the sidecar has not reported its identity
+    # (the expected state until the stage-1 emitting sidecar ships) OR the
+    # running app's own build id is unstamped (a dev/source run) -- never read
+    # as a clean match. See ``_updater_build_matches`` in the updates router for
+    # why the anchor is the running process, not the coordinator row.
     updater_build_matches_app: bool | None = None
     updater_observed_build: str | None = None
     updater_observed_digest: str | None = None
@@ -1137,6 +1141,34 @@ class UpdateHeartbeatRequest(BaseModel):
         if self.phase == "checking" and self.action_generation is None:
             raise ValueError("a checking heartbeat requires action_generation")
         return self
+
+
+class UpdateRefreshOutcomeRequest(BaseModel):
+    """A sidecar self-refresh outcome report (ADR-0025 stage 0, issue #299).
+
+    The accept-side contract for the stage-1 self-refresh ladder, shipped WITH
+    the expand release so a newer sidecar's outcome report never 404s against an
+    app that already accepts its heartbeats (Codex round 1 on PR #384) -- a
+    surviving predecessor after a failed refresh keeps heartbeating and looks
+    healthy, so this durable report is the only honest signal of the failure.
+    Nothing emits it in stage 0.
+
+    ``result`` is an OPEN pattern-bounded code (not a Literal) so a future
+    outcome vocabulary stays expand-only. Every pattern here is a strict subset
+    of the service layer's ``_bounded_code``/``_bounded_text`` predicates, so a
+    body that validates at this edge can never blow up as a bare ``ValueError``
+    (an HTTP 500) in the service -- the same honest-422 lesson as the M1
+    empty-string fix.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    result: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    detail_code: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    # Non-empty, bounded, control-character-free -- mirrors ``_bounded_text``
+    # exactly, and the 400 cap matches the ``String(400)`` storage columns.
+    from_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
+    to_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
 
 
 class UpdateClaimRequest(BaseModel):

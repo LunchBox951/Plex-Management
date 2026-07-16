@@ -4018,6 +4018,58 @@
         "title": "UpdateRefreshItem",
         "type": "object"
       },
+      "UpdateRefreshOutcomeRequest": {
+        "additionalProperties": false,
+        "description": "A sidecar self-refresh outcome report (ADR-0025 stage 0, issue #299).\n\nThe accept-side contract for the stage-1 self-refresh ladder, shipped WITH\nthe expand release so a newer sidecar's outcome report never 404s against an\napp that already accepts its heartbeats (Codex round 1 on PR #384) -- a\nsurviving predecessor after a failed refresh keeps heartbeating and looks\nhealthy, so this durable report is the only honest signal of the failure.\nNothing emits it in stage 0.\n\n``result`` is an OPEN pattern-bounded code (not a Literal) so a future\noutcome vocabulary stays expand-only. Every pattern here is a strict subset\nof the service layer's ``_bounded_code``/``_bounded_text`` predicates, so a\nbody that validates at this edge can never blow up as a bare ``ValueError``\n(an HTTP 500) in the service -- the same honest-422 lesson as the M1\nempty-string fix.",
+        "properties": {
+          "detail_code": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "from_build": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Build"
+          },
+          "result": {
+            "pattern": "^[a-z][a-z0-9_]{0,31}$",
+            "title": "Result",
+            "type": "string"
+          },
+          "to_build": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Build"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "UpdateRefreshOutcomeRequest",
+        "type": "object"
+      },
       "UpdateRenewRequest": {
         "additionalProperties": false,
         "description": "Lease renewal plus a bounded, token-owned active phase.",
@@ -5317,6 +5369,53 @@
           }
         ],
         "summary": "Outcome Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/refresh-outcome": {
+      "post": {
+        "description": "Record the sidecar's self-refresh outcome (ADR-0025 stage 0, issue #299).\n\nThe accept side of the stage-1 self-refresh ladder, shipped WITH the C7\nexpand release (Codex round 1 on PR #384): without this route, the first\nemitting sidecar's failure report would 404 against an app that already\naccepts its heartbeats, and -- because a surviving predecessor keeps\nheartbeating and looks healthy -- the failed refresh would be masked\nentirely (north star #3). Same sidecar-secret auth as every other internal\nupdater endpoint; nothing emits it in stage 0. The record is durable: only\na later refresh outcome overwrites it (ordinary heartbeats never do -- see\n``record_refresh_outcome``), and the status endpoint surfaces it as\n``last_refresh``.",
+        "operationId": "refresh_outcome_endpoint_api_v1_internal_updates_refresh_outcome_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRefreshOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Refresh Outcome Endpoint",
         "tags": [
           "internal-updates"
         ]

@@ -396,6 +396,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/internal/updates/refresh-outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh Outcome Endpoint
+         * @description Record the sidecar's self-refresh outcome (ADR-0025 stage 0, issue #299).
+         *
+         *     The accept side of the stage-1 self-refresh ladder, shipped WITH the C7
+         *     expand release (Codex round 1 on PR #384): without this route, the first
+         *     emitting sidecar's failure report would 404 against an app that already
+         *     accepts its heartbeats, and -- because a surviving predecessor keeps
+         *     heartbeating and looks healthy -- the failed refresh would be masked
+         *     entirely (north star #3). Same sidecar-secret auth as every other internal
+         *     updater endpoint; nothing emits it in stage 0. The record is durable: only
+         *     a later refresh outcome overwrites it (ordinary heartbeats never do -- see
+         *     ``record_refresh_outcome``), and the status endpoint surfaces it as
+         *     ``last_refresh``.
+         */
+        post: operations["refresh_outcome_endpoint_api_v1_internal_updates_refresh_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/internal/updates/release": {
         parameters: {
             query?: never;
@@ -3210,6 +3241,34 @@ export interface components {
             to_build?: string | null;
         };
         /**
+         * UpdateRefreshOutcomeRequest
+         * @description A sidecar self-refresh outcome report (ADR-0025 stage 0, issue #299).
+         *
+         *     The accept-side contract for the stage-1 self-refresh ladder, shipped WITH
+         *     the expand release so a newer sidecar's outcome report never 404s against an
+         *     app that already accepts its heartbeats (Codex round 1 on PR #384) -- a
+         *     surviving predecessor after a failed refresh keeps heartbeating and looks
+         *     healthy, so this durable report is the only honest signal of the failure.
+         *     Nothing emits it in stage 0.
+         *
+         *     ``result`` is an OPEN pattern-bounded code (not a Literal) so a future
+         *     outcome vocabulary stays expand-only. Every pattern here is a strict subset
+         *     of the service layer's ``_bounded_code``/``_bounded_text`` predicates, so a
+         *     body that validates at this edge can never blow up as a bare ``ValueError``
+         *     (an HTTP 500) in the service -- the same honest-422 lesson as the M1
+         *     empty-string fix.
+         */
+        UpdateRefreshOutcomeRequest: {
+            /** Detail Code */
+            detail_code?: string | null;
+            /** From Build */
+            from_build?: string | null;
+            /** Result */
+            result: string;
+            /** To Build */
+            to_build?: string | null;
+        };
+        /**
          * UpdateRenewRequest
          * @description Lease renewal plus a bounded, token-owned active phase.
          */
@@ -3853,6 +3912,39 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["UpdateOutcomeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStatusResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    refresh_outcome_endpoint_api_v1_internal_updates_refresh_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRefreshOutcomeRequest"];
             };
         };
         responses: {

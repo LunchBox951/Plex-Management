@@ -309,15 +309,22 @@ class SqlUpdateCoordinationRepository:
         build cannot interpret. Writes only the two identity columns -- it never
         touches ``phase``/``requested_action`` (no coordination decision is
         implied by liveness) and never clears ``last_refresh_*`` (an ordinary
-        heartbeat must not mask a recorded refresh failure). ``observed_build``
-        and ``observed_digest`` are a MATCHED PAIR reported together by the
-        sidecar; both are written as given -- including ``None``, so a beat
-        carrying only one of the two OVERWRITES the other with NULL. Stage 1
-        author note (PR #384 review): the emitting sidecar must always send
-        build and digest together; if a future protocol ever legitimately sends
-        them independently, this write needs a write-only-what's-present guard
-        first, or the absent half of a previously-reported identity is silently
-        erased.
+        heartbeat must not mask a recorded refresh failure).
+
+        CONTRACT (Codex round 1 on PR #384): identity is PER-HEARTBEAT
+        self-description, never durable state a later container inherits. The
+        heartbeat endpoint calls this on EVERY authenticated beat with exactly
+        what the beat carried -- ``None``/``None`` for an identity-less beat,
+        which CLEARS a previously stored identity. A sidecar replaced or
+        downgraded to an image that doesn't report identity therefore reverts
+        the match state to unknown (``None`` -> no banner) on its next beat,
+        instead of wearing its predecessor's identity as a stale lie. Stage 1
+        author note: ``observed_build``/``observed_digest`` are a MATCHED PAIR
+        -- the emitting sidecar must always send both together, because both
+        columns are overwritten as given (a one-sided beat NULLs the other
+        half by design, per the clearing contract above); a future protocol
+        that legitimately sends them independently needs a
+        write-only-what's-present guard here first.
         """
         state = await self._lock()
         if state.phase not in _KNOWN_COORDINATOR_PHASES:

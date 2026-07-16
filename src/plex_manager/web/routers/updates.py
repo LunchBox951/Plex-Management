@@ -45,6 +45,7 @@ from plex_manager.web.schemas import (
     UpdateLeaseResponse,
     UpdateOutcomeRequest,
     UpdateRefreshItem,
+    UpdateRefreshOutcomeRequest,
     UpdateRenewRequest,
     UpdateResultItem,
     UpdateStatusResponse,
@@ -157,35 +158,50 @@ def _refresh_item(snapshot: CoordinatorSnapshot) -> UpdateRefreshItem | None:
     )
 
 
-def _updater_build_matches(
-    snapshot: CoordinatorSnapshot,
-    *,
-    app_build: str,
-) -> bool | None:
-    """Whether the sidecar runs the SAME image as the app (ADR-0025 stage 0).
+# Runtime build ids that cannot distinguish one build from another: the empty
+# string, and the unstamped package-version fallback a dev/source run reports
+# (the promote gate stamps a real version at release; ``current_build_id``'s
+# env var is CI-injected into every published image). Comparing against these
+# could fabricate a match OR a mismatch, so both read as unknown instead.
+_UNSTAMPED_RUNTIME_BUILDS = frozenset({"", "0.0.0"})
+
+
+def _updater_build_matches(snapshot: CoordinatorSnapshot) -> bool | None:
+    """Whether the sidecar runs the same build as the RUNNING app (ADR-0025 stage 0).
+
+    The comparison anchor is deliberately the running process's OWN build
+    identifier (``current_build_id()``: the CI-baked ``PLEX_MANAGER_BUILD_ID``,
+    falling back to the release-stamped package version) and NOT the
+    coordinator row's ``current_build``/``current_digest`` (Codex round 1 on
+    PR #384): those columns record the last TARGET observation a check/install
+    reported, which an operator rollback leaves pointing at an image the
+    process is no longer running -- a sidecar on N+1 would then read as a
+    clean match while the app actually runs N.
+
+    Honest limitation, documented rather than papered over: the app holds no
+    Docker authority (ADR-0025 C2), so its own RUNNING image digest is
+    unknowable from inside the container -- the comparison is build-id-only,
+    and a same-build-id rebuild with different bytes reads as a match. The
+    observed digest is still persisted and surfaced verbatim for the operator
+    and for stage 1 (which compares digests sidecar-side, where the socket
+    lives -- Q3).
 
     R2: an ABSENT observed identity (the sidecar has not reported it -- the
     expected state until the stage-1 emitting sidecar ships) is ``None``
-    ("unknown / refresh recommended"), NEVER a clean ``True`` match. R3: a
-    present-but-different identity is ``False`` ("version mismatch") with NO
-    direction -- C7 lets the sidecar run a build AHEAD of an app that rolled
-    back, so this never asserts older/newer. Q3: compare the image DIGEST first
-    (a same-SHA rebuild shares the build id but differs in bytes), falling back
-    to the human-readable build id only when a digest is unavailable on either
-    side.
+    ("unknown / refresh recommended"), NEVER a clean ``True``. The same
+    ``None`` covers an UNSTAMPED runtime id (a dev/source run's ``0.0.0``
+    fallback): it cannot distinguish builds, so no match or mismatch is
+    fabricated from it. R3: a present-but-different build id is ``False``
+    ("version mismatch") with NO direction -- C7 lets the sidecar run a build
+    AHEAD of an app that rolled back, so this never asserts older/newer.
     """
     observed_build = snapshot.updater_observed_build
-    observed_digest = snapshot.updater_observed_digest
-    if observed_build is None and observed_digest is None:
+    if observed_build is None:
         return None
-    app_digest = snapshot.current_digest
-    if observed_digest is not None and app_digest is not None:
-        return observed_digest == app_digest
-    if observed_build is not None:
-        return observed_build == app_build
-    # Only a digest was observed but the app has no digest to compare it to --
-    # honestly unknown rather than a fabricated match.
-    return None
+    runtime_build = current_build_id()
+    if runtime_build in _UNSTAMPED_RUNTIME_BUILDS:
+        return None
+    return observed_build == runtime_build
 
 
 def _state_and_blocker(
@@ -268,11 +284,10 @@ async def _status(
     available = coordinator.updater_available(snapshot, max_age=_UPDATER_HEARTBEAT_MAX_AGE)
     state, blocker = _state_and_blocker(snapshot, policy, updater_available=available, now=now)
     window = policy.schedule.next_window(now)
-    app_build = snapshot.current_build or current_build_id()
     return UpdateStatusResponse(
         state=state,  # type: ignore[arg-type]
         updater_available=available,
-        current_build=app_build,
+        current_build=snapshot.current_build or current_build_id(),
         current_digest=snapshot.current_digest,
         available_build=snapshot.available_build,
         available_digest=snapshot.available_digest,
@@ -282,7 +297,7 @@ async def _status(
         blocker=blocker,
         last_checked_at=snapshot.last_checked_at,
         last_result=_last_result(snapshot),
-        updater_build_matches_app=_updater_build_matches(snapshot, app_build=app_build),
+        updater_build_matches_app=_updater_build_matches(snapshot),
         updater_observed_build=snapshot.updater_observed_build,
         updater_observed_digest=snapshot.updater_observed_digest,
         last_refresh=_refresh_item(snapshot),
@@ -580,16 +595,25 @@ async def heartbeat_endpoint(body: UpdateHeartbeatRequest, request: Request) -> 
             code="coordinator_state_unknown",
             message="The update coordinator is in an unrecognized state.",
         )
-    # ADR-0025 stage 0 (issue #299): accept and persist a newer sidecar's own
-    # reported image identity, independently of whether this beat also carries a
-    # ``checking`` phase. Never required -- the current sidecar sends neither.
-    if body.updater_build is not None or body.updater_digest is not None:
-        await _guard_unknown_phase(
-            coordinator.record_updater_identity(
-                observed_build=body.updater_build,
-                observed_digest=body.updater_digest,
-            )
+    # ADR-0025 stage 0 (issue #299): identity is PER-HEARTBEAT self-description.
+    # Persist exactly what this authenticated beat carried -- and when it
+    # carried no identity, CLEAR any previously stored one (Codex round 1): a
+    # replaced/downgraded sidecar that doesn't report identity (every
+    # pre-stage-1 sidecar) must never inherit its predecessor's stored
+    # build/digest, or the match state would keep asserting the DEAD
+    # container's identity. Absence honestly reverts to unknown
+    # (``updater_build_matches_app=None`` -> no banner). Runs BEFORE the
+    # CAS-guarded phase touch below: the identity claim is orthogonal to the
+    # check-generation CAS, so a stale-generation ``checking`` beat still
+    # updates/clears identity even though its phase touch is refused.
+    # Eligibility polls deliberately do NOT touch identity -- only this
+    # endpoint carries the self-description contract.
+    await _guard_unknown_phase(
+        coordinator.record_updater_identity(
+            observed_build=body.updater_build,
+            observed_digest=body.updater_digest,
         )
+    )
     if body.phase is None:
         # The phase-less liveness heartbeat (the C7 expand direction): refresh
         # ``updater_last_seen_at`` only -- deliberately NEVER rewrite the
@@ -849,6 +873,48 @@ async def outcome_endpoint(body: UpdateOutcomeRequest, request: Request) -> Upda
                 message="The update outcome did not match an active maintenance lease.",
             )
     publish_realtime(request.app, ("updates",), reason=f"update_{body.outcome}")
+    settings = get_settings()
+    maker = request.app.state.sessionmaker
+    async with maker() as session:
+        return await _status(request, session, settings)
+
+
+@internal_router.post("/refresh-outcome")
+async def refresh_outcome_endpoint(
+    body: UpdateRefreshOutcomeRequest, request: Request
+) -> UpdateStatusResponse:
+    """Record the sidecar's self-refresh outcome (ADR-0025 stage 0, issue #299).
+
+    The accept side of the stage-1 self-refresh ladder, shipped WITH the C7
+    expand release (Codex round 1 on PR #384): without this route, the first
+    emitting sidecar's failure report would 404 against an app that already
+    accepts its heartbeats, and -- because a surviving predecessor keeps
+    heartbeating and looks healthy -- the failed refresh would be masked
+    entirely (north star #3). Same sidecar-secret auth as every other internal
+    updater endpoint; nothing emits it in stage 0. The record is durable: only
+    a later refresh outcome overwrites it (ordinary heartbeats never do -- see
+    ``record_refresh_outcome``), and the status endpoint surfaces it as
+    ``last_refresh``.
+    """
+    coordinator = await _coordinator(request)
+    snapshot = await coordinator.snapshot()
+    if snapshot.phase not in _KNOWN_PHASES:
+        raise AppError(
+            status_code=409,
+            code="coordinator_state_unknown",
+            message="The update coordinator is in an unrecognized state.",
+        )
+    await _guard_unknown_phase(
+        coordinator.record_refresh_outcome(
+            result=body.result,
+            detail_code=body.detail_code,
+            from_build=body.from_build,
+            to_build=body.to_build,
+        )
+    )
+    # ``body.result`` is pattern-bounded lowercase, so the reason stays a
+    # bounded code (never free text) exactly like the other publish reasons.
+    publish_realtime(request.app, ("updates",), reason=f"updater_refresh_{body.result}")
     settings = get_settings()
     maker = request.app.state.sessionmaker
     async with maker() as session:

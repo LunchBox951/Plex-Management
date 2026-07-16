@@ -179,6 +179,61 @@ function UpdatePanel({
         <p className="mt-4 text-xs text-faint">No completed updater operation has been reported.</p>
       )}
 
+      {/* The sidecar's own self-refresh record (ADR-0025 stage 0, issue #299) —
+          distinct from "Last completed operation" above (the app/target
+          update). Rendered whenever a record exists, INDEPENDENT of the
+          build-match banner below: a surviving predecessor after a failed
+          refresh keeps heartbeating and looks healthy, so this durable record
+          is the only honest signal of the failure (north star #3) — hiding it
+          because the build currently matches or is unknown would mask it. */}
+      {status.last_refresh ? (
+        <div
+          className={cn(
+            'mt-4 rounded-lg border px-3 py-2 text-xs text-muted',
+            status.last_refresh.result === 'failed'
+              ? 'border-error/40 bg-error/5'
+              : 'border-hairline bg-bg',
+          )}
+        >
+          <p
+            className={cn(
+              'font-semibold',
+              status.last_refresh.result === 'failed' ? 'text-error' : 'text-ink',
+            )}
+          >
+            {status.last_refresh.result === 'failed'
+              ? 'Updater self-refresh failed'
+              : 'Updater self-refresh'}
+          </p>
+          <p className="mt-1 font-mono [overflow-wrap:anywhere]">
+            {readableCode(status.last_refresh.result)} ·{' '}
+            {formatTimestamp(status.last_refresh.at)}
+          </p>
+          {status.last_refresh.from_build || status.last_refresh.to_build ? (
+            <p className="mt-1 font-mono [overflow-wrap:anywhere]">
+              {status.last_refresh.from_build ?? 'unknown'} →{' '}
+              {status.last_refresh.to_build ?? 'unknown'}
+            </p>
+          ) : null}
+          {status.last_refresh.detail_code ? (
+            <p className="mt-1 font-mono text-searching [overflow-wrap:anywhere]">
+              {readableCode(status.last_refresh.detail_code)}
+            </p>
+          ) : null}
+          {status.last_refresh.result === 'failed' ? (
+            <>
+              {/* North star #1: the failure always carries its correction path. */}
+              <p className="mt-2">
+                The updater kept running its previous build. Refresh it on the install host with:
+              </p>
+              <pre className="mt-1 overflow-x-auto rounded bg-bg px-2 py-1.5 font-mono text-[11px] text-ink">
+                docker compose --profile auto-update up -d updater
+              </pre>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="mt-4 flex flex-wrap gap-2">
         <Button
           variant="secondary"
