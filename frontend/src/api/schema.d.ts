@@ -1524,30 +1524,32 @@ export interface paths {
          *     after re-reading the row so a state that healed on its own is never blindly
          *     clobbered (north stars #1/#2: a button, never a terminal).
          *
-         *     The locked decision matrix:
+         *     The locked decision matrix (see ``decide_recovery``):
          *
-         *     * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
-         *       no-op, nothing wedged to recover. Also the honest, idempotent answer to
-         *       a double-click: the second call finds the recovered state already known.
-         *     * Leased busy phase (``draining``/``installing``/``rollback``), any
-         *       action: 409 ``coordinator_phase_known`` -- an operation is in flight and
-         *       its own acknowledgement or lease expiry legitimately resolves the
-         *       action; never reset a live update. Both exits converge on a recoverable
-         *       state if the action remains unrecognized.
-         *     * ``checking`` + unrecognized action: refused only while the updater
-         *       heartbeat is fresh (the 45s liveness contract) -- a live sidecar could
-         *       be mid-check. ``checking`` holds no lease, so once the heartbeat is
-         *       stale nothing can ever expire it; the action-only reset then proceeds
-         *       (the phase itself stays ``checking`` and heals through the next
-         *       completed check's normal acknowledgement).
+         *     * Known non-busy phase + known action: 409 ``coordinator_phase_known`` --
+         *       a true no-op, nothing wedged to recover. Also the honest, idempotent
+         *       answer to a double-click: the second call finds the recovered state
+         *       already known.
+         *     * ANY shape under an UNEXPIRED drain lease: 409
+         *       ``coordinator_drain_active`` -- an updater generation may be
+         *       legitimately mid-install; the lease TTL bounds the wait, and an expired
+         *       lease is swept (durably, even on a refused attempt) so a retry then
+         *       proceeds.
          *     * Known non-busy phase + unrecognized action: clears the action to
-         *       ``none`` (the action-only reset), leaving the phase untouched.
-         *     * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
-         *       -- a NEWER updater generation may be legitimately mid-install in a phase
-         *       this build simply doesn't know; the lease TTL bounds the wait, and an
-         *       expired lease is swept so a retry then proceeds.
-         *     * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
-         *       queued action is preserved for retry, an unrecognized one is cleared.
+         *       ``none`` under a bumped generation (the action-only reset), leaving the
+         *       phase untouched.
+         *     * BUSY phase whose start anchor is younger than the recovery bound: 409
+         *       ``coordinator_recovery_not_ready`` -- the operation could genuinely be
+         *       in flight. The anchor is the ONLY clock: heartbeat freshness is
+         *       deliberately not evidence, because eligibility polls refresh it even
+         *       when no work is handed out, so a merely-polling sidecar can never
+         *       extend this gate (issue #368). Legacy busy rows with no anchor get one
+         *       durably backfilled on first observation -- including by this refusal
+         *       itself -- so the clock always starts and the bound always arrives.
+         *     * BUSY phase past the bound, or an unknown phase: re-anchors to ``idle``.
+         *       A KNOWN queued action is preserved (with its generation) for retry; an
+         *       unrecognized or absent one has its generation bumped, fencing any late
+         *       worker still holding the old generation.
          */
         post: operations["force_reset_endpoint_api_v1_updates_force_reset_post"];
         delete?: never;

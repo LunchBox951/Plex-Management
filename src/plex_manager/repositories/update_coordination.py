@@ -99,19 +99,12 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC) if value is not None else None
 
 
-def _updater_heartbeat_fresh(last_seen: datetime | None, now: datetime, max_age: timedelta) -> bool:
-    """Whether the sidecar's last heartbeat is recent enough to call it live.
-
-    Mirrors ``UpdateCoordinationService.updater_available`` exactly (including
-    treating a future timestamp -- clock skew -- as NOT live), so the
-    force-reset checking predicate and the status endpoint's
-    ``updater_available`` can never disagree about the same row.
-    """
-    seen = _as_utc(last_seen)
-    if seen is None:
-        return False
-    age = now - seen
-    return timedelta(0) <= age <= max_age
+# NOTE: heartbeat freshness deliberately plays no part in recovery decisions.
+# Every eligibility poll refreshes ``updater_last_seen_at`` even when no work
+# is handed out, so freshness is not evidence of work in flight -- see
+# ``plex_manager.domain.update_recovery.decide_recovery`` for the two signals
+# that gate busy-phase recovery instead (live drain lease, bounded start-anchor
+# age).
 
 
 @dataclass(frozen=True)
@@ -568,10 +561,16 @@ class SqlUpdateCoordinationRepository:
         self,
         now: datetime,
         *,
-        updater_heartbeat_max_age: timedelta,
         recovery_max_age: timedelta,
     ) -> ForceResetResult | None:
-        """Apply the evidence-based recovery matrix under the coordinator lock."""
+        """Apply the evidence-based recovery matrix under the coordinator lock.
+
+        Refusal paths (WAIT / live drain) raise BEFORE any recovery mutation,
+        so the only writes pending at raise time are observation side-effects
+        (expired-lease cleanup, the legacy busy-row anchor backfill) that the
+        service layer commits even on refusal -- the recovery clock must start
+        on the very first observation from ANY endpoint.
+        """
         state = await self._lock()
         await self._cleanup_expired(now)
         await self._session.refresh(state)
@@ -584,9 +583,6 @@ class SqlUpdateCoordinationRepository:
         decision = decide_recovery(
             phase=state.phase,
             requested_action=state.requested_action,
-            updater_heartbeat_fresh=_updater_heartbeat_fresh(
-                state.updater_last_seen_at, now, updater_heartbeat_max_age
-            ),
             live_drain=drain is not None,
             phase_started_at=phase_started_at,
             now=now,

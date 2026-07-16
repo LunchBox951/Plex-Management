@@ -244,7 +244,7 @@ function UpdatePanel({
       ) : null}
       {waitingForRecovery ? (
         <p className="mt-4 rounded-lg border border-searching/40 bg-searching/5 px-3 py-3 text-xs text-muted">
-          Recovery is waiting for a stale heartbeat and bounded age evidence. The updater is still potentially active; try again after the evidence window has elapsed.
+          Recovery is waiting for bounded age evidence that the operation was abandoned. It may still be in flight; try again after the evidence window has elapsed.
         </p>
       ) : null}
       {liveDrain ? (

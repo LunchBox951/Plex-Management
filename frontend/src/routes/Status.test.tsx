@@ -436,7 +436,7 @@ describe('Status', () => {
 
 
   it.each([
-    ['coordinator_recovery_not_ready', /waiting for a stale heartbeat/i],
+    ['coordinator_recovery_not_ready', /waiting for bounded age evidence/i],
     ['coordinator_drain_active', /maintenance lease is active/i],
   ])('shows non-actionable recovery blocker %s', (blocker, copy) => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })

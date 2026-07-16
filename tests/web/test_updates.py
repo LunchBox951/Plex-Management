@@ -1285,20 +1285,21 @@ async def test_force_reset_refuses_when_phase_is_already_known(
         assert (await session.execute(select(AuditLog))).scalars().all() == []
 
 
-async def test_force_reset_refuses_live_actionless_checking_even_when_request_is_old(
+async def test_force_reset_refuses_young_actionless_checking_end_to_end(
     app: FastAPI,
     client: httpx.AsyncClient,
     seed: SeedFn,
 ) -> None:
-    """A fresh heartbeat owns the long-running automatic check, so the web
-    recovery endpoint returns its ordinary live-coordinator refusal."""
+    """A recently started automatic check is protected by its young start
+    anchor (not by the heartbeat), so the web recovery endpoint returns its
+    ordinary not-ready refusal and changes nothing."""
     await seed(initialized=True, app_api_key=_API_KEY)
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
     before = await coordinator.request_action(UpdateAction.check)
     now = datetime.now(UTC)
-    requested_at = now - timedelta(minutes=31)
+    requested_at = now - timedelta(minutes=2)
     async with app.state.sessionmaker() as session:
         await session.execute(
             update(UpdateCoordinatorState)
@@ -1307,6 +1308,7 @@ async def test_force_reset_refuses_live_actionless_checking_even_when_request_is
                 phase="checking",
                 requested_action="none",
                 requested_at=requested_at,
+                last_started_at=requested_at,
                 updater_last_seen_at=now,
             )
         )
@@ -1414,6 +1416,48 @@ async def test_legacy_busy_status_and_reset_fail_closed_then_agree_after_bound(
     recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
     assert recovered.status_code == 200
     assert (await coordinator.snapshot()).phase == "idle"
+
+
+async def test_consecutive_direct_force_resets_converge_without_status_calls(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator who only ever clicks the recovery button must converge: the
+    first refused reset durably backfills the legacy row's `now` anchor (a 409
+    must not roll it back), so the second attempt past the bound succeeds with
+    no status/snapshot observation in between."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=None,
+                updater_last_seen_at=None,
+            )
+        )
+        await session.commit()
+
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
+
+    moment[0] += timedelta(minutes=10)
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.action_generation == 1
 
 
 async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(
@@ -1618,22 +1662,23 @@ async def test_eligibility_fails_closed_on_unrecognized_requested_action(
     assert snapshot.phase == "idle"
 
 
-async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
+async def test_checking_action_wedge_recovery_is_bounded_despite_live_polling(
     app: FastAPI,
     client: httpx.AsyncClient,
     seed: SeedFn,
 ) -> None:
-    """Codex round 3 P2 on #357: checking + unrecognized action. With a FRESH
-    heartbeat a check could be in flight -- no wedge flag (status reads
-    'checking'), force-reset refuses. Once the heartbeat crosses the 45s
-    liveness contract, the banner appears and the action-only reset clears
-    the action, leaving phase checking for the normal ack path to heal."""
+    """checking + unrecognized action while an OLD sidecar keeps repolling
+    (heartbeat fresh throughout, refreshed by every eligibility poll). A young
+    start anchor still refuses -- a check could genuinely be in flight. Once
+    the anchor crosses the recovery bound, the stale banner appears and the
+    reset proceeds EVEN THOUGH the heartbeat never went stale: polling proves
+    connectivity, not work, and must never extend the gate (issue #368)."""
     await seed(initialized=True, app_api_key=_API_KEY)
     coordinator = UpdateCoordinationService(app.state.sessionmaker)
     await coordinator.initialize()
     app.state.update_coordinator = coordinator
 
-    async def plant(last_seen: datetime) -> None:
+    async def plant(started_at: datetime) -> None:
         async with app.state.sessionmaker() as session:
             await session.execute(
                 update(UpdateCoordinatorState)
@@ -1641,14 +1686,14 @@ async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
                 .values(
                     phase="checking",
                     requested_action="future_action",
-                    updater_last_seen_at=last_seen,
-                    last_started_at=datetime.now(UTC) - timedelta(minutes=10),
+                    updater_last_seen_at=datetime.now(UTC),
+                    last_started_at=started_at,
                 )
             )
             await session.commit()
 
-    # Fresh heartbeat: a live sidecar could be mid-check.
-    await plant(datetime.now(UTC))
+    # Young anchor: a live sidecar could genuinely be mid-check.
+    await plant(datetime.now(UTC) - timedelta(minutes=2))
     status = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert status.json()["state"] == "unavailable"
     assert status.json()["blocker"] == "coordinator_recovery_not_ready"
@@ -1657,9 +1702,9 @@ async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
     assert refused.json()["detail"] == "coordinator_recovery_not_ready"
     assert (await coordinator.snapshot()).requested_action == "future_action"
 
-    # Stale heartbeat: no check can be in flight; the wedge is flagged and the
-    # action-only reset proceeds.
-    await plant(datetime.now(UTC) - timedelta(minutes=2))
+    # Anchor past the bound, heartbeat STILL fresh: the wedge is flagged and
+    # the reset proceeds anyway, fencing the unrecognized action's generation.
+    await plant(datetime.now(UTC) - timedelta(minutes=10))
     status = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert status.json()["state"] == "unavailable"
     assert status.json()["blocker"] == "coordinator_state_stale"

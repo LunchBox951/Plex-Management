@@ -56,12 +56,29 @@ def decide_recovery(
     *,
     phase: str,
     requested_action: str,
-    updater_heartbeat_fresh: bool,
     live_drain: bool,
     phase_started_at: datetime | None,
     now: datetime,
     max_age: timedelta,
 ) -> RecoveryDecision:
+    """Decide the recovery action for one observed coordinator shape.
+
+    Work-in-flight evidence for a BUSY phase is deliberately limited to two
+    signals that a merely-polling sidecar cannot refresh:
+
+    * a live drain lease (its TTL bounds the wait), and
+    * the bounded age of the phase's start anchor, which only moves on a real
+      phase *transition* -- never on a same-phase heartbeat or eligibility
+      poll.
+
+    Heartbeat freshness is deliberately NOT evidence here: every eligibility
+    poll refreshes ``updater_last_seen_at`` even when the app hands out no
+    work (the fail-closed ``action="none"`` answer), so an idle sidecar that
+    repolls forever would keep a wedged busy row permanently unrecoverable --
+    an unbounded gate, which is exactly what issue #368 forbids. A genuinely
+    in-flight operation is still protected: its start anchor is young for the
+    full recovery window, and an install always holds a drain lease.
+    """
     known_action = requested_action in KNOWN_REQUESTED_ACTIONS
     unknown_action = not known_action
     if phase not in KNOWN_COORDINATOR_PHASES:
@@ -80,10 +97,6 @@ def decide_recovery(
         if unknown_action:
             return RecoveryDecision(RecoveryAction.ACTION_ONLY, "unrecognized action", True, False)
         return RecoveryDecision(RecoveryAction.NOOP, "recognized state", False, True)
-    if updater_heartbeat_fresh:
-        return RecoveryDecision(
-            RecoveryAction.WAIT, "updater heartbeat is fresh", False, known_action
-        )
     if not _old_enough(phase_started_at, now, max_age):
         return RecoveryDecision(
             RecoveryAction.WAIT, "busy phase lacks bounded stale evidence", False, known_action

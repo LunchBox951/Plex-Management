@@ -57,10 +57,11 @@ __all__ = [
 _CODE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 _DEFAULT_CRITICAL_TTL = timedelta(minutes=5)
 # The sidecar-liveness contract: a heartbeat older than this means no updater
-# is connected. Single source of truth shared by the updates router (status's
-# ``updater_available`` and the 503 gate on manual actions) and by
-# ``force_reset_coordinator_phase``'s checking-phase predicate, so "is a check
-# plausibly in flight" can never drift from "is the sidecar connected".
+# is connected. Used by the updates router (status's ``updater_available`` and
+# the 503 gate on manual actions). Deliberately NOT used by recovery decisions:
+# an eligibility poll refreshes the heartbeat even when no work is handed out,
+# so freshness proves connectivity, never work in flight -- recovery is gated
+# on the bounded start anchor and live drain leases instead (issue #368).
 UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
 COORDINATOR_RECOVERY_MAX_AGE = timedelta(minutes=10)
 _logger = logging.getLogger(__name__)
@@ -352,7 +353,6 @@ class UpdateCoordinationService:
         self,
         *,
         actor_user_id: int | None,
-        updater_heartbeat_max_age: timedelta = UPDATER_HEARTBEAT_MAX_AGE,
         recovery_max_age: timedelta = COORDINATOR_RECOVERY_MAX_AGE,
     ) -> ForceResetResult | None:
         """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
@@ -383,12 +383,23 @@ class UpdateCoordinationService:
         """
         async with self._sessionmaker() as session:
             repo = SqlUpdateCoordinationRepository(session)
-            result = await repo.force_reset_phase(
-                self._now(),
-                updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age),
-                recovery_max_age=_positive_ttl(recovery_max_age),
-            )
+            # Observation side-effects (the legacy busy-row anchor backfill and
+            # expired-lease cleanup) must be durable even when the decision is a
+            # refusal: an operator who only ever hits force-reset must still
+            # start -- and keep -- the recovery clock on the FIRST attempt, or
+            # a repeatedly rolled-back `now` anchor makes
+            # ``coordinator_recovery_not_ready`` permanent. Refusals raise (or
+            # return None) before any recovery mutation, so committing here
+            # persists exactly those legitimate observations and nothing else.
+            try:
+                result = await repo.force_reset_phase(
+                    self._now(), recovery_max_age=_positive_ttl(recovery_max_age)
+                )
+            except (CoordinatorRecoveryNotReadyError, DrainLeaseActiveError):
+                await session.commit()
+                raise
             if result is None:
+                await session.commit()
                 return None
             old_value: dict[str, object] = {}
             new_value: dict[str, object] = {}
