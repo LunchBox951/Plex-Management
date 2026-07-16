@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.metadata import MetadataPort
-    from plex_manager.ports.repositories import RequestRecord
+    from plex_manager.ports.repositories import CompactRequestState, RequestRecord
 
 __all__ = [
     "SETTLED_REQUEST_STATUS_VALUES",
@@ -37,6 +37,7 @@ __all__ = [
     "MediaNotFoundError",
     "MediaTypeDeferredError",
     "NoAiredSeasonsError",
+    "compact_request_states",
     "count_subscribers",
     "create_request",
     "create_request_result",
@@ -44,9 +45,9 @@ __all__ = [
     "get_request",
     "is_request_visible_to_user",
     "list_requests",
+    "list_requests_for_title",
     "list_requests_for_user",
     "list_requests_page",
-    "list_subscribed_request_ids",
     "list_subscribers",
     "mark_available",
     "mark_completed",
@@ -1521,6 +1522,36 @@ async def list_requests_page(
     return page, next_cursor
 
 
+async def compact_request_states(
+    session: AsyncSession, keys: Sequence[tuple[int, str]], *, for_user_id: int | None
+) -> dict[tuple[int, str], CompactRequestState]:
+    """Batch the folded live-state view for a set of tile keys (issue #370).
+
+    Backs ``POST /requests/live-state``: the client tile overlay's freshness
+    poll, keyed by exactly the ``(tmdb_id, media_type)`` pairs currently
+    visible (Discover/Search tiles), never the whole request table. See
+    :meth:`RequestRepository.compact_states_by_tmdb_ids` for the fold rule and
+    the fold-across-page-boundaries safety argument.
+    """
+    return await SqlRequestRepository(session).compact_states_by_tmdb_ids(
+        keys, for_user_id=for_user_id
+    )
+
+
+async def list_requests_for_title(
+    session: AsyncSession, tmdb_id: int, media_type: str, *, for_user_id: int | None
+) -> list[RequestRecord]:
+    """Every visible RAW request row for one title, id-ascending (issue #370).
+
+    Backs ``GET /requests/by-title``: the title-detail modal's full match list.
+    Bounded by one title's lifetime history; deliberately not display-folded --
+    see :meth:`RequestRepository.list_for_title`.
+    """
+    return await SqlRequestRepository(session).list_for_title(
+        tmdb_id, media_type, for_user_id=for_user_id
+    )
+
+
 async def is_request_visible_to_user(session: AsyncSession, request_id: int, user_id: int) -> bool:
     """Return whether a shared user subscribes to a request."""
     return await SqlRequestRepository(session).is_subscriber(request_id, user_id)
@@ -1532,7 +1563,7 @@ async def list_subscribers(session: AsyncSession, request_id: int) -> list[int]:
     Drives the ``can_withdraw``/``has_other_participants``/``is_owner`` DTO
     flags (``web/routers/requests.py:_to_response``) for a single-record
     response; the list endpoint uses the batched :func:`count_subscribers` and
-    :func:`list_subscribed_request_ids` instead to avoid an N+1.
+    :func:`subscribed_request_ids_among` instead to avoid an N+1.
     """
     return await SqlRequestRepository(session).list_subscribers(request_id)
 
@@ -1542,28 +1573,21 @@ async def count_subscribers(session: AsyncSession, request_ids: Sequence[int]) -
     return await SqlRequestRepository(session).count_subscribers(request_ids)
 
 
-async def list_subscribed_request_ids(session: AsyncSession, user_id: int) -> set[int]:
-    """Return the set of request ids ``user_id`` subscribes to (issue #314).
-
-    Used to compute ``can_withdraw``/``has_other_participants`` on the requests
-    list endpoint without a per-row query: a non-admin's list is already
-    subscriber-filtered (every returned row is in this set by construction),
-    while an admin's unfiltered view needs the real membership check (an admin
-    is not necessarily a subscriber of every row they can see).
-    """
-    return await SqlRequestRepository(session).list_subscribed_request_ids(user_id)
-
-
 async def subscribed_request_ids_among(
     session: AsyncSession, user_id: int, request_ids: Sequence[int]
 ) -> set[int]:
     """The subset of ``request_ids`` that ``user_id`` subscribes to (issue #218).
 
-    The page-scoped sibling of :func:`list_subscribed_request_ids` for the
-    paginated history endpoint: membership for exactly the page's rows -- one
-    bounded ``request_id IN (...) AND user_id = :u`` read (served by the
-    ``(user_id, request_id)`` composite index), never the O(all-subscriptions)
-    whole-set scan per page.
+    Used to compute ``can_withdraw``/``has_other_participants`` on the requests
+    list endpoint (page or legacy) without a per-row query: a non-admin's list
+    is already subscriber-filtered (every returned row is in this set by
+    construction, no query needed), while an admin's unfiltered view needs the
+    real membership check -- one bounded ``request_id IN (...) AND user_id =
+    :u`` read scoped to exactly the visible rows (served by the ``(user_id,
+    request_id)`` composite index). Issue #370 Stage A/B retired the old
+    whole-set ``list_subscribed_request_ids`` (O(all the caller's
+    subscriptions) per call) once this page-scoped read subsumed its one
+    caller; empty input is a no-op returning the empty set.
     """
     return await SqlRequestRepository(session).subscribed_request_ids_among(user_id, request_ids)
 

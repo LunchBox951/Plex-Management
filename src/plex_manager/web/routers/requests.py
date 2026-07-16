@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +56,9 @@ from plex_manager.web.deps import (
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
+    CompactStateField,
+    CompactStateRequest,
+    CompactStateResponse,
     CreateRequestBody,
     ErrorDetail,
     ErrorEnvelope,
@@ -587,27 +590,24 @@ async def list_requests_endpoint(
     subscribed_ids: set[int]
     if auth.user_id is None:
         subscribed_ids = set()
-    elif limit is not None:
-        # PAGE-SCOPED membership (#218 Codex round 1): a page must never pay the
-        # O(all-the-caller's-subscriptions) whole-set read the legacy mode uses.
-        # A shared user's page rows are subscriber-filtered IN the page SQL, so
-        # membership IS the page (zero extra queries); an admin's unfiltered page
-        # gets one membership read scoped to exactly the page ids (served by the
-        # ``(user_id, request_id)`` composite index).
-        subscribed_ids = (
-            {r.id for r in records}
-            if not auth.is_admin
-            else await request_service.subscribed_request_ids_among(
-                session, auth.user_id, [r.id for r in records]
-            )
-        )
+    elif not auth.is_admin:
+        # A shared user's visible rows (page OR legacy list) are already
+        # subscriber-filtered in SQL, so membership IS the record set --
+        # zero extra queries.
+        subscribed_ids = {r.id for r in records}
     else:
-        # LEGACY mode keeps its whole-set read untouched (byte-compat promise):
-        # a non-admin's list is already subscriber-filtered above, so every row
-        # is in the caller's own membership set by construction; an admin's
-        # UNFILTERED view is not, so the real membership check still matters
-        # (see ``list_subscribed_request_ids``).
-        subscribed_ids = await request_service.list_subscribed_request_ids(session, auth.user_id)
+        # Admin/unfiltered view (page OR legacy list): one membership read
+        # scoped to exactly the visible ids, served by the ``(user_id,
+        # request_id)`` composite index. Issue #370 Stage A retires the old
+        # O(all-the-caller's-subscriptions) whole-set read for BOTH modes here
+        # -- ``records`` is already visibility-filtered and (in legacy mode)
+        # display-folded by this point, so intersecting the caller's
+        # subscriptions with exactly these ids is byte-identical to the old
+        # whole-set-then-filter result, just bounded instead of O(all the
+        # caller's subscriptions).
+        subscribed_ids = await request_service.subscribed_request_ids_among(
+            session, auth.user_id, [r.id for r in records]
+        )
     return RequestListResponse(
         requests=[
             await _to_response(
@@ -626,6 +626,110 @@ async def list_requests_endpoint(
             for r in records
         ],
         next_cursor=next_cursor,
+    )
+
+
+@router.post("/live-state")
+async def live_state_endpoint(
+    body: CompactStateRequest,
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> CompactStateResponse:
+    """Folded live-state per tile key -- the client tile overlay's freshness poll (#370).
+
+    Phase 2 of issue #218: the client's Discover/Search tiles need the SAME
+    active-else-newest fold ``GET /requests``'s legacy mode computes, but keyed
+    by exactly the currently-visible tile keys, and WITHOUT re-fetching the
+    whole request history or Discover page every poll tick. ``POST`` (not
+    ``GET``) because a page can carry well over a hundred tile keys, which
+    risks URL-length limits as repeated query params.
+
+    A key present in ``states`` has at least one visible request row for that
+    title; a key with none is simply ABSENT (never a fabricated state). Same
+    visibility scope as ``GET /requests``: admin / API-key sees every row,
+    a shared user sees only their own subscribed rows, and the unreachable
+    non-admin-without-a-user-identity case fails closed to an empty map.
+    """
+    for_user_id = None if auth.is_admin or auth.user_id is None else auth.user_id
+    keys = [(key.tmdb_id, key.media_type) for key in body.keys]
+    compact = await request_service.compact_request_states(session, keys, for_user_id=for_user_id)
+    return CompactStateResponse(
+        states={
+            f"{media_type}:{tmdb_id}": CompactStateField(
+                status=cast(RequestStatus, state.status),
+                request_id=state.request_id,
+                has_history=True,
+                has_coexisting_available=state.has_coexisting_available,
+            )
+            for (tmdb_id, media_type), state in compact.items()
+        }
+    )
+
+
+@router.get("/by-title")
+async def requests_by_title_endpoint(
+    auth: Annotated[AuthContext, Depends(require_api_key)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    tmdb_id: Annotated[int, Query()],
+    media_type: Annotated[Literal["movie", "tv"], Query()],
+) -> RequestListResponse:
+    """Every visible RAW request row for one title, id-ascending (issue #370).
+
+    Backs the title-detail modal, which needs the WHOLE match list for a title
+    (bound-request/re-request resolution, per-season status, download
+    progress, subscriber flags) -- never a folded representative. Bounded by
+    one title's lifetime history (tiny), so this is a plain GET with no
+    pagination; ``next_cursor`` is always ``null`` (the shape matches
+    ``GET /requests`` for the client's shared response handling, but a title's
+    history never needs a second page in practice). Same visibility scope as
+    ``GET /requests``. Unknown/never-requested titles return an empty list,
+    never a 404 (there is nothing owned to hide the existence of).
+    """
+    for_user_id = None if auth.is_admin or auth.user_id is None else auth.user_id
+    records = await request_service.list_requests_for_title(
+        session, tmdb_id, media_type, for_user_id=for_user_id
+    )
+    active_downloads_by_request = await SqlDownloadRepository(session).list_active_for_requests(
+        [r.id for r in records]
+    )
+    # ``by-title`` is homogeneous (one ``media_type`` per call, unlike the mixed
+    # movie+tv list endpoint), so no movie/tv id split is needed here: a movie
+    # request id simply has no season rows and this returns {} for it.
+    seasons_by_request = await SqlSeasonRequestRepository(session).list_for_requests(
+        [r.id for r in records]
+    )
+    all_season_ids = [s.id for seasons in seasons_by_request.values() for s in seasons]
+    episode_counts_by_season_id = await SqlSeasonEpisodeStateRepository(session).counts_for_seasons(
+        all_season_ids
+    )
+    subscriber_counts = await request_service.count_subscribers(session, [r.id for r in records])
+    subscribed_ids: set[int]
+    if auth.user_id is None:
+        subscribed_ids = set()
+    elif not auth.is_admin:
+        subscribed_ids = {r.id for r in records}
+    else:
+        subscribed_ids = await request_service.subscribed_request_ids_among(
+            session, auth.user_id, [r.id for r in records]
+        )
+    return RequestListResponse(
+        requests=[
+            await _to_response(
+                session,
+                r,
+                seasons_by_request,
+                episode_counts_by_season_id,
+                active_downloads_by_request,
+                can_mutate=_can_mutate_request(auth, r),
+                is_owner=_is_owner(auth, r),
+                can_withdraw=r.id in subscribed_ids,
+                has_other_participants=(
+                    subscriber_counts.get(r.id, 0) - (1 if r.id in subscribed_ids else 0) > 0
+                ),
+            )
+            for r in records
+        ],
+        next_cursor=None,
     )
 
 

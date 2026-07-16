@@ -40,6 +40,9 @@ __all__ = [
     "AuthUser",
     "BlocklistEntry",
     "BlocklistResponse",
+    "CompactStateField",
+    "CompactStateRequest",
+    "CompactStateResponse",
     "CreateRequestBody",
     "DiscoverHomeResponse",
     "DiscoverHomeRow",
@@ -89,6 +92,7 @@ __all__ = [
     "SetupCompleteRequest",
     "SetupStatusResponse",
     "SubsystemHealthItem",
+    "TileKey",
     "TmdbValidateRequest",
     "UpdateActionRequest",
     "UpdateClaimRequest",
@@ -1351,6 +1355,63 @@ class RequestListResponse(BaseModel):
 
     requests: list[RequestResponse]
     next_cursor: int | None = None
+
+
+class TileKey(BaseModel):
+    """One Discover/Search tile identity: ``(media_type, tmdb_id)`` (issue #370)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    media_type: MediaTypeField
+    tmdb_id: int
+
+
+class CompactStateRequest(BaseModel):
+    """``POST /requests/live-state`` body -- the visible tile key set to poll (issue #370).
+
+    POST, not GET: a Discover/Search page can carry well over a hundred tile
+    keys, which risks URL-length limits as repeated query params; ``react-query``
+    keys its cache on the request body just as well as the URL, so a POST read
+    polls fine. ``keys`` is capped so one batch stays bounded.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    keys: list[TileKey] = Field(max_length=500)
+
+
+class CompactStateField(BaseModel):
+    """One tile's folded live-state (issue #370) -- see ``CompactRequestState``.
+
+    ``status``/``request_id`` are the representative row's (active-else-newest);
+    ``has_history`` is always ``True`` for every key present in the response
+    map (a title with no visible request rows is simply absent) -- included
+    explicitly rather than relying on callers to infer it from key presence,
+    since the tv quick-request gate reads it directly.
+    ``has_coexisting_available`` is the movie presence-contradiction bit: a
+    NON-representative row is a settled ``available`` alongside the chosen
+    representative. Always ``False`` for tv.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: RequestStatus  # see the wire-boundary-validation note on SeasonStatus above
+    request_id: int
+    has_history: bool
+    has_coexisting_available: bool
+
+
+class CompactStateResponse(BaseModel):
+    """``POST /requests/live-state`` response body (issue #370).
+
+    ``states`` is keyed by ``"{media_type}:{tmdb_id}"`` (matching the client's
+    tile-key convention); a key absent from the map has no visible request
+    history for the caller.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    states: dict[str, CompactStateField]
 
 
 class WithdrawSubscriptionResponse(BaseModel):
