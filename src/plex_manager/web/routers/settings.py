@@ -19,7 +19,7 @@ import asyncio
 import json
 import re
 import secrets
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
@@ -237,6 +237,33 @@ async def _rewrite_before_secret_replacement(
     )
 
 
+async def _commit_and_complete(
+    session: AsyncSession,
+    handler: LogCaptureHandler,
+    previous_values: frozenset[str],
+    *,
+    retiring_values: frozenset[str],
+) -> None:
+    """Read the post-write secret set, commit, then run the completion sweep.
+
+    The one indivisible unit :func:`secret_rotation` shields against
+    cancellation (issue #389 facet 1): the ``secret_values()`` read sees this
+    request's flushed-but-uncommitted new values, the commit makes them durable,
+    and only then does :meth:`~plex_manager.services.log_capture_service.
+    LogCaptureHandler.complete_secret_rotation` rewrite the queue/ring and narrow
+    the capture snapshot. There is no ``await`` between the commit landing and
+    the sweep, so a cancellation can never wedge itself between "commit durable"
+    and "retired value swept from the live surfaces". A commit FAILURE propagates
+    to the caller, which rolls back and restores the snapshot exactly like a
+    pre-commit failure -- nothing durable landed, so the sweep must NOT run.
+    """
+    current_values = await SettingsStore(session).secret_values()
+    await session.commit()
+    handler.complete_secret_rotation(
+        previous_values, current_values, retired_values=retiring_values
+    )
+
+
 @asynccontextmanager
 async def secret_rotation(
     session: AsyncSession,
@@ -244,6 +271,7 @@ async def secret_rotation(
     *,
     retiring_values: frozenset[str],
     incoming_values: frozenset[str] = frozenset(),
+    reread_retiring: Callable[[AsyncSession], Awaitable[frozenset[str]]] | None = None,
 ) -> AsyncGenerator[None]:
     """The single transactional boundary for every in-scope secret mutation (ADR-0026).
 
@@ -256,35 +284,60 @@ async def secret_rotation(
     ``incoming_values`` are new values the body is about to write (so in-flight
     emits mask them before they are committed).
 
-    NOTE the in-lock ``session.rollback()`` below: any row writes the caller
-    staged BEFORE entering are discarded -- the ``yield`` body must (re)apply
-    every write it wants committed, in the boundary's fresh transaction.
+    Three properties this boundary guarantees BY CONSTRUCTION (issue #389),
+    so the "stale pre-lock state / pending inserts / cancel mid-commit" finding
+    family cannot recur facet-by-facet:
+
+    a. **Entered clean.** The caller's pre-lock transaction is rolled back
+       BEFORE contending for the lock, so no request ever holds an open DB write
+       transaction while awaiting ``secret_rotation_lock``. On SQLite a held
+       writer would otherwise deadlock-until-busy-timeout against a drain tick
+       that already holds this lock and needs to write (facet 3). Any row writes
+       the caller staged before entering are therefore discarded -- the
+       ``yield`` body must (re)apply every write it wants committed.
+
+    b. **Re-read under the lock.** All rotation-relevant state is read AFTER the
+       lock is held, in a fresh transaction that observes whatever committed
+       while we waited. ``reread_retiring``, when given, re-derives the CURRENT
+       retiring value under the lock (facet 2) rather than trusting the caller's
+       possibly-stale pre-lock read; the ``yield`` body is where a caller
+       re-reads settings and re-evaluates any access decision (facet 4).
+
+    c. **Shielded commit + cleanup.** The post-write ``secret_values()`` read,
+       the commit, and the completion sweep run as one non-cancellable unit
+       (:func:`_commit_and_complete`, shielded below), so a cancellation that
+       arrives once the commit is durable can never skip the sweep and strand a
+       retired value in the queue/ring after it has left ``secret_values()``
+       (facet 1).
     """
     handler = _log_handler(request)
+    # (a) Release any pre-lock write transaction BEFORE we start waiting on the
+    # lock -- see property (a) above.
+    await session.rollback()
     async with secret_rotation_lock:
-        # End the request's pre-lock transaction (the same idiom the /logs read
-        # endpoints use): the drain loop may have held the lock first and
-        # committed rows carrying the retiring value AFTER this session already
-        # began reading -- a retained pre-lock snapshot would let the rewrite
-        # below miss those rows, and the final secret_values() read would
-        # regress the handler snapshot to stale values. The rewrite, the
-        # caller's writes, and the final read then share ONE fresh transaction,
-        # committed once -- the write/rewrite atomicity is unchanged.
+        # (b) Fresh transaction under the lock. The pre-lock rollback already
+        # ended the caller's transaction; this belt-and-suspenders rollback keeps
+        # the "every read below is post-lock and fresh" contract explicit and
+        # robust to a future caller that touches the session between (a) and here.
         await session.rollback()
+        if reread_retiring is not None:
+            retiring_values = await reread_retiring(session)
         transition_values = (
             (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
         )
-        previous_values = handler.begin_secret_rotation(transition_values)
+        previous_values = handler.begin_secret_rotation(
+            transition_values, retiring_values=retiring_values
+        )
         try:
             await _rewrite_before_secret_replacement(session, retiring_values)
             yield
-            current_values = await SettingsStore(session).secret_values()
-            await session.commit()
         except asyncio.CancelledError:
-            # Restore the in-memory snapshot first (synchronous, always runs),
-            # then SHIELD the rollback so its DB op completes instead of being
-            # cancelled mid-flight -- a half-cancelled aiosqlite rollback closes
-            # the connection and poisons the shared boundary for the drain loop.
+            # Cancelled BEFORE the commit unit began (during the rewrite or the
+            # caller's body): nothing durable landed. Restore the in-memory
+            # snapshot first (synchronous, always runs), then SHIELD the rollback
+            # so its DB op completes instead of being cancelled mid-flight -- a
+            # half-cancelled aiosqlite rollback closes the connection and poisons
+            # the shared boundary for the drain loop.
             handler.abort_secret_rotation(previous_values)
             await asyncio.shield(session.rollback())
             raise
@@ -292,9 +345,29 @@ async def secret_rotation(
             await session.rollback()
             handler.abort_secret_rotation(previous_values)
             raise
-        handler.complete_secret_rotation(
-            previous_values, current_values, retired_values=retiring_values
+        # (c) Commit + completion sweep as one shielded, non-cancellable unit. A
+        # cancellation delivered while this runs is REMEMBERED and re-raised only
+        # AFTER the unit finishes, so the commit and its sweep are never torn
+        # apart. ``ensure_future`` gives a single stable task to re-shield across
+        # repeated cancellations; the loop exits only when it is ``done()``.
+        commit_task = asyncio.ensure_future(
+            _commit_and_complete(session, handler, previous_values, retiring_values=retiring_values)
         )
+        pending_cancel: asyncio.CancelledError | None = None
+        while not commit_task.done():
+            try:
+                await asyncio.shield(commit_task)
+            except asyncio.CancelledError as exc:
+                pending_cancel = exc
+            except Exception:
+                # Commit (or the pre-commit read) failed: no rotation landed, so
+                # roll back and restore the snapshot exactly like a pre-commit
+                # failure. The sweep inside the unit never ran.
+                await session.rollback()
+                handler.abort_secret_rotation(previous_values)
+                raise
+        if pending_cancel is not None:
+            raise pending_cancel
 
 
 def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:

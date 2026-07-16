@@ -33,7 +33,11 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, LogEvent, Setting, SystemSettings, User
 from plex_manager.services import log_capture_service
-from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
+from plex_manager.web.deps import (
+    PLEX_MACHINE_ID_SETTING,
+    SETUP_TOKEN_HEADER_NAME,
+    SettingsStore,
+)
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers import auth as auth_module
@@ -2085,3 +2089,272 @@ async def test_sign_in_rotation_waits_for_drain_and_retired_row_is_rewritten(
         row = (await db.execute(select(LogEvent))).scalars().one()
     assert _OLD_PLEX_TOKEN not in row.message
     assert _OLD_PLEX_TOKEN not in json.dumps(row.context_json)
+
+
+# --------------------------------------------------------------------------- #
+# Boundary-race family (issue #389): the rotation boundary is entered clean,
+# re-reads its state under the lock, and shields commit + cleanup as one unit.
+# --------------------------------------------------------------------------- #
+async def test_cancel_during_commit_still_runs_the_completion_sweep(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facet 1: a cancellation delivered once the rotation commit is durable must
+    NOT skip the post-commit sweep. The commit + completion run as one shielded
+    unit, so the retired token is erased from the durable rows, the queue, and
+    the ring, and ``secret_values`` narrows -- even though the request ends
+    cancelled and never sets a cookie."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    await _insert_log_event(sessionmaker_, _OLD_PLEX_TOKEN)
+    handler = _live_handler_with(_OLD_PLEX_TOKEN)
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
+    rewrite_finished = False
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        if rewrite_finished:
+            # The boundary's commit is now DURABLE. Pause so the test can cancel
+            # the request while the shielded unit is mid-flight; the sweep still
+            # runs once ``release`` fires.
+            committed.set()
+            await _wait_for_event(release)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    )
+    await _wait_for_event(committed)
+    task.cancel()
+    # Deliver the cancellation to the request's shielded await while the commit
+    # unit is still paused, so the request genuinely ends cancelled.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    await assert_task_raises(task, asyncio.CancelledError)
+
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        row = (await db.execute(select(LogEvent))).scalars().one()
+    assert user.encrypted_plex_token == _NEW_PLEX_TOKEN  # commit landed durably
+    assert _OLD_PLEX_TOKEN not in row.message  # durable rewrite ran
+    assert _OLD_PLEX_TOKEN not in json.dumps(row.context_json)
+    for record in (*_drain_queue(handler), *handler.snapshot_tail(10)):
+        assert _OLD_PLEX_TOKEN not in record.message  # queue/ring swept
+        assert _OLD_PLEX_TOKEN not in json.dumps(record.context)
+    assert _OLD_PLEX_TOKEN not in handler.secret_values  # snapshot narrowed
+    assert _NEW_PLEX_TOKEN in handler.secret_values
+
+
+async def test_concurrent_same_account_rotations_retire_the_current_stored_token(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facet 2: two concurrent sign-ins for the SAME account with different
+    replacement tokens both read the same pre-lock ``old_token``. The loser must
+    retire whatever token is ACTUALLY stored under the lock (the winner's freshly
+    committed value) -- re-read there, not the stale pre-lock read -- or the
+    winner's token is left uncovered by the historical rewrite."""
+    old = "same-account-old-token"
+    a_new = "same-account-token-a-longenough"
+    b_new = "same-account-token-b-longenough"
+    await _seed_rotation_fixture(seed, sessionmaker_, old_token=old)
+    await _insert_log_event(sessionmaker_, old)
+    handler = _live_handler_with(old)
+    handler.secret_values = frozenset({old})
+    app.state.log_handler = handler
+    await _use_transport(
+        app,
+        _token_routed_transport(
+            {
+                a_new: (_OWNER_USER, [_owned_server()]),
+                b_new: (_OWNER_USER, [_owned_server()]),
+            }
+        ),
+    )
+    lock = _ObservableLock()
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    gates: list[tuple[asyncio.Event, asyncio.Event]] = [
+        (asyncio.Event(), asyncio.Event()),
+        (asyncio.Event(), asyncio.Event()),
+    ]
+    rewrite_values: list[frozenset[str]] = []
+
+    async def gated_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        entered, release = gates[len(rewrite_values)]
+        rewrite_values.append(values)
+        entered.set()
+        await _wait_for_event(release)
+        return await real_rewrite(session, values)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", gated_rewrite)
+
+    sign_in_a = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": a_new}))
+    await _wait_for_event(gates[0][0])
+    # B reaches _upsert_user and reads old_token=old (A has not committed) before
+    # it queues behind A on the shared boundary.
+    sign_in_b = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": b_new}))
+    await _wait_for_event(lock.second_acquire_started)
+    assert not sign_in_b.done()
+    gates[0][1].set()
+    response_a = await asyncio.wait_for(sign_in_a, timeout=5.0)
+    assert response_a.status_code == 200
+    # A committed old -> a_new. Seed the live surfaces with an a_new-bearing
+    # record (in-memory only; the single-connection test DB precludes a durable
+    # concurrent write). If B retired the stale ``old``, this survives.
+    a_record = log_capture_service.CapturedLogRecord(
+        created_at=datetime.now(UTC),
+        level="INFO",
+        logger="test",
+        message=f"live {a_new}",
+        context={a_new: [a_new]},
+    )
+    handler.queue.put_nowait(a_record)
+    handler.ring_buffer.append(a_record)
+    await _wait_for_event(gates[1][0])
+    gates[1][1].set()
+    response_b = await asyncio.wait_for(sign_in_b, timeout=5.0)
+    assert response_b.status_code == 200
+
+    # A retired ``old``; B re-read and retired the CURRENT stored value a_new.
+    assert rewrite_values == [frozenset({old}), frozenset({a_new})]
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        row = (await db.execute(select(LogEvent))).scalars().one()
+    assert user.encrypted_plex_token == b_new  # last writer wins
+    assert old not in row.message  # A's rewrite erased the original value
+    for record in (*_drain_queue(handler), *handler.snapshot_tail(10)):
+        assert old not in record.message and a_new not in record.message
+        assert old not in json.dumps(record.context)
+        assert a_new not in json.dumps(record.context)
+    assert b_new in handler.secret_values
+    assert old not in handler.secret_values
+    assert a_new not in handler.secret_values
+
+
+async def test_rotation_boundary_releases_write_txn_before_awaiting_lock(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facet 3: the sign-in mints + flushes a client-identifier row before the
+    boundary; that open write transaction must be rolled back BEFORE the boundary
+    contends for ``secret_rotation_lock``, so a request never holds a SQLite
+    writer while waiting on the lock (which would deadlock against a drain that
+    holds the lock and needs to write)."""
+    await _seed_rotation_fixture(seed, sessionmaker_)  # no client-id stored -> minted here
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    real_rollback = AsyncSession.rollback
+    observed_session: list[AsyncSession] = []
+    in_txn_before: list[bool] = []
+
+    async def recording_rollback(self: AsyncSession) -> None:
+        if not observed_session:
+            observed_session.append(self)
+            in_txn_before.append(self.in_transaction())
+        await real_rollback(self)
+
+    class ProbedLock(asyncio.Lock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_txn_at_acquire: bool | None = None
+
+        async def acquire(self) -> Literal[True]:
+            if observed_session and self.in_txn_at_acquire is None:
+                self.in_txn_at_acquire = observed_session[0].in_transaction()
+            return await super().acquire()
+
+    lock = ProbedLock()
+    monkeypatch.setattr(AsyncSession, "rollback", recording_rollback)
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+
+    assert response.status_code == 200
+    # There WAS an open write transaction (the flushed client-id insert + user
+    # update) when the boundary took its pre-lock rollback...
+    assert in_txn_before == [True]
+    # ...and by the time the boundary acquired the lock, that transaction was
+    # already released -- no writer is held while waiting.
+    assert lock.in_txn_at_acquire is False
+
+
+async def test_rotation_boundary_revalidates_access_against_repointed_server(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facet 4 (security): a token-rotation sign-in recomputes its access
+    decision INSIDE the boundary. If a concurrent Plex repoint changes
+    ``plex_machine_identifier`` while the sign-in waits on the lock, an account
+    with access only to the OLD server is refused against the NEW one instead of
+    minting a session against a server it cannot reach. Simulated (the
+    single-connection test DB precludes a real concurrent write) by returning the
+    OLD machine id for the pre-lock access read and the NEW id for the read the
+    boundary recomputes -- exactly what a committed repoint would present."""
+    new_machine = "repointed-machine-id"
+    await _seed_rotation_fixture(seed, sessionmaker_)  # machine_id=_MACHINE_ID, user 42 old token
+    await _insert_log_event(sessionmaker_, _OLD_PLEX_TOKEN)
+    handler = _live_handler_with(_OLD_PLEX_TOKEN)
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    # The account owns ONLY the original server; it has no resource for the repoint.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    real_get = SettingsStore.get
+    machine_reads = 0
+
+    async def racing_get(self: SettingsStore, key: str) -> str | None:
+        nonlocal machine_reads
+        if key == PLEX_MACHINE_ID_SETTING:
+            machine_reads += 1
+            # 1st read = pre-lock decision (original server); 2nd = the boundary's
+            # recompute (repointed server).
+            return _MACHINE_ID if machine_reads == 1 else new_machine
+        return await real_get(self, key)
+
+    monkeypatch.setattr(SettingsStore, "get", racing_get)
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "server_access_denied"
+    assert machine_reads == 2  # the access check ran a SECOND time, under the lock
+    # Fails CLOSED: token not rotated, no session minted, history + snapshot intact.
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+        sessions = (await db.execute(select(AuthSession))).scalars().all()
+        row = (await db.execute(select(LogEvent))).scalars().one()
+    assert user.encrypted_plex_token == _OLD_PLEX_TOKEN
+    assert sessions == []
+    assert _OLD_PLEX_TOKEN in row.message  # rewrite rolled back -> unchanged
+    assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})
