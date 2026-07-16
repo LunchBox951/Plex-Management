@@ -2,12 +2,8 @@ import { act, fireEvent, render, screen } from '@testing-library/react'
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import {
-  useDiscoverHome,
-  useRequests,
-  useRequestsInvalidated,
-} from '../api/hooks'
-import type { DiscoverResult, RequestResponse } from '../api/types'
+import { useDiscoverHome, useTileLiveStates } from '../api/hooks'
+import type { CompactStateField, DiscoverResult } from '../api/types'
 import { resetSettleObservations } from '../lib/tileState'
 import { Discover } from './Discover'
 
@@ -15,12 +11,12 @@ import { Discover } from './Discover'
 // calls its full hook surface before its own guard, and each unbadged tile mounts a
 // QuickRequestButton (useCreateRequest + useToast). Stub the whole hooks module —
 // same pattern as Requests.test.tsx — so nothing touches the network; the hooks
-// this suite actually drives (useDiscoverHome / useRequests /
-// useRequestsInvalidated) are overridden per test.
+// this suite actually drives (useDiscoverHome / useTileLiveStates, issue #370
+// phase 2 — the compact live-state poll replaced useRequests/
+// useRequestsInvalidated for tile decoration) are overridden per test.
 vi.mock('../api/hooks', () => ({
   useDiscoverHome: vi.fn(),
-  useRequests: vi.fn(),
-  useRequestsInvalidated: vi.fn(() => false),
+  useTileLiveStates: vi.fn(),
   // Admin context for the shared modal's RBAC gating (same default as
   // Requests.test.tsx): this suite tests quick-request gating, not roles.
   useAuthMe: vi.fn(() => ({
@@ -37,6 +33,9 @@ vi.mock('../api/hooks', () => ({
   useReportIssue: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useCancelRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
   useWithdrawSubscription: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+  // The modal's title-scoped read (issue #370 phase 2) — this suite never opens
+  // it with pre-existing request state, so an idle empty read is enough.
+  useTitleRequests: vi.fn(() => ({ data: { requests: [] }, isSuccess: true })),
 }))
 
 vi.mock('../components/ui/toast', () => ({ useToast: () => ({ toast: vi.fn() }) }))
@@ -100,19 +99,13 @@ const HERO: DiscoverResult = {
 const REQUEST_MOVIE = 'Request Fresh Movie'
 const REQUEST_SHOW = 'Request Fresh Show'
 
-function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
+/** One tile's folded live-state (issue #370 phase 2) — see `CompactStateField`. */
+function liveState(overrides: Partial<CompactStateField> = {}): CompactStateField {
   return {
-    id: 1,
-    tmdb_id: 2,
-    media_type: 'tv',
-    title: 'Fresh Show',
     status: 'failed',
-    is_anime: false,
-    keep_forever: false,
-    can_mutate: false,
-    is_owner: false,
-    can_withdraw: false,
-    has_other_participants: false,
+    request_id: 1,
+    has_history: true,
+    has_coexisting_available: false,
     ...overrides,
   }
 }
@@ -126,10 +119,15 @@ function mockHome(items: DiscoverResult[] = [MOVIE], spotlights: DiscoverResult[
   })
 }
 
-function mockRequests(rows: RequestResponse[]) {
-  ;(useRequests as unknown as Mock).mockReturnValue({
-    data: { requests: rows },
+/** `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map. */
+function mockLiveStates(
+  states: Record<string, CompactStateField>,
+  options?: { invalidated?: boolean },
+) {
+  ;(useTileLiveStates as unknown as Mock).mockReturnValue({
+    data: { states },
     isSuccess: true,
+    invalidated: options?.invalidated ?? false,
     dataUpdatedAt: Date.now(),
   })
 }
@@ -140,8 +138,7 @@ beforeEach(() => {
   // module-level state — reset between tests like tileState.test.ts does.
   resetSettleObservations()
   mockHome()
-  mockRequests([])
-  ;(useRequestsInvalidated as unknown as Mock).mockReturnValue(false)
+  mockLiveStates({})
 })
 
 afterEach(() => {
@@ -256,48 +253,49 @@ describe('Discover — hero-first home (issue #188)', () => {
 })
 
 describe('Discover — quick-request freshness gate (Codex P2)', () => {
-  it('hides the quick-request action while the requests query is invalidated, even though derived state is null', () => {
-    // The bug window: useCreateRequest has invalidated /requests after a
-    // season-scoped tv request, but the refetch has not landed. The invalidated
+  it('hides the quick-request action while the live-state query is invalidated, even though derived state is null', () => {
+    // The bug window: useCreateRequest has invalidated the live-state query after
+    // a season-scoped tv request, but the refetch has not landed. The invalidated
     // flag is set, so the still-null tile must NOT expose a Request button (a click
     // would POST a seasons-less, whole-series body).
-    mockRequests([])
-    ;(useRequestsInvalidated as unknown as Mock).mockReturnValue(true)
+    mockLiveStates({}, { invalidated: true })
     render(<Discover />)
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
-  it('hides the quick-request action before the first requests fetch completes', () => {
-    // No /requests fetch has succeeded yet: state derives null only for lack of
+  it('hides the quick-request action before the first live-state fetch completes', () => {
+    // No live-state fetch has succeeded yet: state derives null only for lack of
     // data, which is not proof the title is unrequested. Suppress until we know.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTileLiveStates as unknown as Mock).mockReturnValue({
       data: undefined,
       isSuccess: false,
+      invalidated: false,
       dataUpdatedAt: 0,
     })
     render(<Discover />)
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
-  it('hides the quick-request action when the requests query is in ERROR state', () => {
+  it('hides the quick-request action when the live-state query is in ERROR state', () => {
     // isFetched would be true here (the fetch COMPLETED — with an error) while
     // data is still undefined, so every tile derives null with zero request
     // knowledge. The gate must demand a SUCCESSFUL fetch, not just a finished one.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTileLiveStates as unknown as Mock).mockReturnValue({
       data: undefined,
       isSuccess: false,
       isError: true,
       isFetched: true,
+      invalidated: false,
       dataUpdatedAt: 0,
     })
     render(<Discover />)
     expect(screen.queryByRole('button', { name: REQUEST_MOVIE })).not.toBeInTheDocument()
   })
 
-  it('shows the quick-request action once the requests query has settled and the title is still unrequested', () => {
+  it('shows the quick-request action once the live-state query has settled and the title is still unrequested', () => {
     // Fetched successfully and not invalidated: the null state is now trustworthy,
     // so the one-click Request is safe to offer.
-    mockRequests([])
+    mockLiveStates({})
     render(<Discover />)
     // getByRole (singular) doubles as a honesty check: the looping row exposes the
     // quick-request action exactly once, not one-per-clone.
@@ -314,9 +312,7 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
       // whole aired series — where the modal's "Request again" deliberately narrows
       // to the selected season. The tile must offer nothing; retry goes via modal.
       mockHome([SHOW])
-      mockRequests([
-        requestRow({ status, seasons: [{ season_number: 5, status }] }),
-      ])
+      mockLiveStates({ 'tv:2': liveState({ status, has_history: true }) })
       render(<Discover />)
       expect(screen.queryByRole('button', { name: REQUEST_SHOW })).not.toBeInTheDocument()
       // The tile itself still opens the detail modal — the correction path. The
@@ -328,12 +324,11 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
 
   it('shows the quick-request action for a tv title with no request rows at all', () => {
     // True first-time request: whole-series tracking is exactly what the user asks
-    // for. A same-tmdb_id MOVIE row must not suppress it (exact media_type
-    // correlation, mirroring deriveTileState).
+    // for. A same-tmdb_id MOVIE key must not suppress it — the compact endpoint's
+    // "media_type:tmdb_id" map keys movie and tv independently, so `states['tv:2']`
+    // is simply absent here.
     mockHome([SHOW])
-    mockRequests([
-      requestRow({ tmdb_id: SHOW.tmdb_id, media_type: 'movie', title: 'Same-id Movie', status: 'failed' }),
-    ])
+    mockLiveStates({ 'movie:2': liveState({ status: 'failed', has_history: true }) })
     render(<Discover />)
     expect(screen.getByRole('button', { name: REQUEST_SHOW })).toBeInTheDocument()
   })
@@ -342,9 +337,7 @@ describe('Discover — tv quick-request is first-time only (Codex P2)', () => {
     // Movies keep the scope-free behavior: a re-request after cancelled/evicted has
     // no season scope to corrupt, and the backend dedups an actually-active one.
     mockHome([MOVIE])
-    mockRequests([
-      requestRow({ tmdb_id: MOVIE.tmdb_id, media_type: 'movie', title: 'Fresh Movie', status: 'cancelled' }),
-    ])
+    mockLiveStates({ 'movie:1': liveState({ status: 'cancelled', has_history: true }) })
     render(<Discover />)
     expect(screen.getByRole('button', { name: REQUEST_MOVIE })).toBeInTheDocument()
   })

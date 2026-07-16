@@ -1,22 +1,20 @@
 import * as RadixDialog from '@radix-ui/react-dialog'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import {
-  useDiscoverHome,
-  useDiscoverSearch,
-  useRequests,
-  useRequestsInvalidated,
-} from '../api/hooks'
-import type { DiscoverResult, RequestResponse } from '../api/types'
+import { useDiscoverHome, useDiscoverSearch, useTileLiveStates } from '../api/hooks'
+import type { CompactStateField, DiscoverResult } from '../api/types'
 import { resetSettleObservations } from '../lib/tileState'
 import { SearchOverlay } from './SearchOverlay'
 import { TitleDetailModal } from './TitleDetailModal'
 
+// Issue #370 phase 2: `useTileLiveStates` (the compact live-state poll) replaced
+// `useRequests`/`useRequestsInvalidated` as this overlay's tile-decoration data
+// source. The stubbed `TitleDetailModal` below never calls the real component's
+// hook surface (`useTitleRequests` included), so no mock is needed for it here.
 vi.mock('../api/hooks', () => ({
   useDiscoverHome: vi.fn(),
   useDiscoverSearch: vi.fn(),
-  useRequests: vi.fn(),
-  useRequestsInvalidated: vi.fn(() => false),
+  useTileLiveStates: vi.fn(),
   useCreateRequest: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }))
 
@@ -128,20 +126,13 @@ const DETAIL_MOVIE: DiscoverResult = {
   library_state: 'none',
 }
 
-function requestRow(overrides: Partial<RequestResponse> = {}): RequestResponse {
+/** One tile's folded live-state (issue #370 phase 2) — see `CompactStateField`. */
+function liveState(overrides: Partial<CompactStateField> = {}): CompactStateField {
   return {
-    id: 11,
-    tmdb_id: RETRY_SHOW.tmdb_id,
-    media_type: 'tv',
-    title: RETRY_SHOW.title,
     status: 'failed',
-    is_anime: false,
-    keep_forever: false,
-    can_mutate: true,
-    is_owner: false,
-    can_withdraw: false,
-    has_other_participants: false,
-    seasons: [{ season_number: 2, status: 'failed' }],
+    request_id: 11,
+    has_history: true,
+    has_coexisting_available: false,
     ...overrides,
   }
 }
@@ -181,10 +172,15 @@ function setSearch(overrides: Record<string, unknown> = {}) {
   })
 }
 
-function setRequests(rows: RequestResponse[] = [], overrides: Record<string, unknown> = {}) {
-  ;(useRequests as unknown as Mock).mockReturnValue({
-    data: { requests: rows },
+/** `states` is keyed `"media_type:tmdb_id"`, matching the backend's wire map. */
+function setLiveStates(
+  states: Record<string, CompactStateField> = {},
+  overrides: Record<string, unknown> = {},
+) {
+  ;(useTileLiveStates as unknown as Mock).mockReturnValue({
+    data: { states },
     isSuccess: true,
+    invalidated: false,
     dataUpdatedAt: 300,
     ...overrides,
   })
@@ -217,8 +213,7 @@ beforeEach(() => {
   resetSettleObservations()
   setHome()
   setSearch()
-  setRequests()
-  ;(useRequestsInvalidated as unknown as Mock).mockReturnValue(false)
+  setLiveStates()
 })
 
 afterEach(() => {
@@ -323,14 +318,23 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
     expect(useDiscoverHome).toHaveBeenLastCalledWith({ enabled: true })
   })
 
-  it('adds no /requests observer while closed — Layout already polls that query', () => {
+  it('adds no live-state observer while closed — Layout already polls /requests for other surfaces', () => {
     render(<SearchOverlay />)
 
-    expect(useRequests).toHaveBeenLastCalledWith({ poll: false, enabled: false })
-    expect(useRequests).not.toHaveBeenCalledWith({ poll: true, enabled: true })
+    expect(useTileLiveStates).toHaveBeenLastCalledWith(expect.anything(), {
+      poll: false,
+      enabled: false,
+    })
+    expect(useTileLiveStates).not.toHaveBeenCalledWith(expect.anything(), {
+      poll: true,
+      enabled: true,
+    })
 
     openOverlay()
-    expect(useRequests).toHaveBeenLastCalledWith({ poll: true, enabled: true })
+    expect(useTileLiveStates).toHaveBeenLastCalledWith(expect.anything(), {
+      poll: true,
+      enabled: true,
+    })
   })
 
   it('mounts the details modal only after a title is selected', async () => {
@@ -415,7 +419,9 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
 
   it('renders result glyphs and keeps the one-click request gate scope-safe', async () => {
     setSearch({ data: { results: [OWNED_MOVIE, FRESH_MOVIE, RETRY_SHOW] } })
-    setRequests([requestRow()])
+    setLiveStates({
+      [`tv:${RETRY_SHOW.tmdb_id}`]: liveState({ status: 'failed', has_history: true }),
+    })
     render(<SearchOverlay />)
     openOverlay()
 
@@ -445,7 +451,7 @@ describe('SearchOverlay — popular suggestions and debounced search', () => {
         ],
       },
     })
-    setRequests([])
+    setLiveStates({})
     render(<SearchOverlay />)
     openOverlay()
 

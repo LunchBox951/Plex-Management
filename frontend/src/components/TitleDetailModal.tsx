@@ -8,8 +8,8 @@ import {
   useMarkFailed,
   useQueue,
   useReportIssue,
-  useRequests,
   useSetKeepForever,
+  useTitleRequests,
   useWithdrawSubscription,
   type ReportReason,
 } from '../api/hooks'
@@ -482,7 +482,16 @@ export function TitleDetailModal({
   // Live correlation sources — poll while a title is open so the action zone
   // tracks the backend through search -> download -> import without a refresh.
   // GET /queue is admin-only: keep it entirely idle for shared sessions.
-  const requestsQuery = useRequests({ poll: open })
+  //
+  // Issue #370 phase 2: title-scoped via GET /requests/by-title instead of the
+  // whole raw /requests history — this modal only ever needs ONE title's rows.
+  // Dummy fallback values (`'movie'`/`0`) are never actually queried: `enabled`
+  // requires a non-null `title`, and every caller only renders this modal with
+  // one (see `TitleDetailModalProps.title`'s docstring).
+  const requestsQuery = useTitleRequests(title?.media_type ?? 'movie', title?.tmdb_id ?? 0, {
+    poll: open,
+    enabled: open && title !== null,
+  })
   const queueQuery = useQueue({ poll: open, enabled: isAdmin })
 
   const [requestId, setRequestId] = useState<number | null>(null)
@@ -619,14 +628,17 @@ export function TitleDetailModal({
     setPosterFailed(false)
   }, [titleKey])
 
-  // The live request for this exact title (media_type + tmdb_id), if any. /requests
-  // comes back in ascending id order and the backend intentionally allows
-  // re-requesting an available/failed/evicted title, so a stale terminal row must
-  // not shadow a newer active re-request: prefer a non-settled match, else the
-  // newest. `evicted` (ADR-0012) is excluded for the SAME reason as
-  // available/failed — it must never shadow a fresh re-request created after the
-  // disk-pressure sweep reclaimed the old one (mirrors the backend's own
-  // `_SETTLED_REQUEST_STATUSES`).
+  // The live request for this exact title (media_type + tmdb_id), if any.
+  // GET /requests/by-title (issue #370 phase 2) already scopes to exactly this
+  // title's rows, ascending id order, so the filter below is now a defensive
+  // no-op (kept rather than dropped: cheap, and it still protects against a
+  // stale response landing after `title` has since changed underneath it).
+  // The backend intentionally allows re-requesting an available/failed/evicted
+  // title, so a stale terminal row must not shadow a newer active re-request:
+  // prefer a non-settled match, else the newest. `evicted` (ADR-0012) is
+  // excluded for the SAME reason as available/failed — it must never shadow a
+  // fresh re-request created after the disk-pressure sweep reclaimed the old
+  // one (mirrors the backend's own `_SETTLED_REQUEST_STATUSES`).
   const liveRequest = useMemo<RequestResponse | null>(() => {
     if (!title) return null
     const matches = (requestsQuery.data?.requests ?? []).filter(

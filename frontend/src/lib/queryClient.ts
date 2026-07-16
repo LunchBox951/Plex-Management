@@ -52,6 +52,16 @@ export const queryKeys = {
   activeSessions: ['auth', 'sessions'] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
+  // Issue #370 phase 2 — nested UNDER the ['requests'] prefix on purpose: every
+  // existing request-mutation `invalidateQueries({ queryKey: queryKeys.requests })`
+  // call (default `exact: false`, prefix match) ALREADY invalidates these too,
+  // with no mutation call site needing to know these queries exist. This is a
+  // structural guarantee, not a per-call-site convention to remember — the same
+  // pattern `request(id)` above already relies on.
+  requestsLiveState: (sortedKeys: readonly string[]) =>
+    ['requests', 'live-state', ...sortedKeys] as const,
+  requestsByTitle: (mediaType: string, tmdbId: number) =>
+    ['requests', 'by-title', mediaType, tmdbId] as const,
   queue: ['queue'] as const,
   blocklist: (tmdbId?: number) => ['blocklist', tmdbId ?? 'all'] as const,
   qualityProfile: ['quality-profile'] as const,

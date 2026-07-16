@@ -3,7 +3,7 @@
  * presentational and consistent. Built on the generated client, so a contract
  * change surfaces as a type error in these hooks.
  */
-import { useSyncExternalStore } from 'react'
+import { useMemo, useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
@@ -13,6 +13,7 @@ import type {
   AppApiKeyStatusResponse,
   AuthMeResponse,
   BlocklistResponse,
+  CompactStateResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
   DiscoverSearchResponse,
@@ -22,6 +23,7 @@ import type {
   HealthResponse,
   LogsResponse,
   LogsTailResponse,
+  MediaType,
   PlexLibraryOption,
   PlexServersResponse,
   PlexSignInRequest,
@@ -37,6 +39,7 @@ import type {
   SettingsUpdate,
   SetupCompleteRequest,
   SetupStatusResponse,
+  TileKey,
   UpdateStatusResponse,
   WithdrawSubscriptionResponse,
 } from './types'
@@ -484,6 +487,102 @@ export function useRequestsInvalidated(): boolean {
     (onStoreChange) => qc.getQueryCache().subscribe(onStoreChange),
     () => qc.getQueryState(queryKeys.requests)?.isInvalidated ?? false,
   )
+}
+
+/** `"media_type:tmdb_id"` — the same composite key the backend response map uses. */
+function tileKeyToken(mediaType: string, tmdbId: number): string {
+  return `${mediaType}:${tmdbId}`
+}
+
+/**
+ * Folded live-state per visible tile (issue #370 phase 2) — the tile-overlay
+ * freshness poll that replaced fetching the WHOLE raw `/requests` history for
+ * Discover/Search tile decoration. `items` drives both the POST body and the
+ * query's cache identity: a deduped, order-independent key set (a fresh
+ * Discover page, a new search) is a different query, but re-rendering with
+ * the SAME visible tiles in a different array order is not.
+ *
+ * `POST /requests/live-state` returns each key's ALREADY-FOLDED
+ * (active-else-newest) representative — see `deriveTileState`, which now
+ * takes this per-tile state directly instead of the raw array it used to
+ * filter.
+ */
+export function useTileLiveStates(
+  items: readonly { media_type: MediaType; tmdb_id: number }[],
+  options?: { poll?: boolean; enabled?: boolean },
+) {
+  const realtimeConnected = useRealtimeConnected()
+  const keys = useMemo<TileKey[]>(() => {
+    const byToken = new Map<string, TileKey>()
+    for (const item of items) {
+      byToken.set(tileKeyToken(item.media_type, item.tmdb_id), {
+        media_type: item.media_type,
+        tmdb_id: item.tmdb_id,
+      })
+    }
+    return Array.from(byToken.keys())
+      .sort()
+      .map((token) => byToken.get(token)!)
+  }, [items])
+  const sortedTokens = useMemo(
+    () => keys.map((key) => tileKeyToken(key.media_type, key.tmdb_id)),
+    [keys],
+  )
+  const queryKey = queryKeys.requestsLiveState(sortedTokens)
+
+  const query = useQuery({
+    queryKey,
+    // No visible tiles -> nothing to poll; an empty POST would just be a
+    // wasted round trip for an empty response the caller can produce locally.
+    enabled: (options?.enabled ?? true) && keys.length > 0,
+    queryFn: async (): Promise<CompactStateResponse> =>
+      unwrap(await client.POST('/api/v1/requests/live-state', { body: { keys } })),
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
+  })
+
+  // Same invalidated-while-refetching gate as `useRequestsInvalidated`, keyed
+  // on THIS call's own key set so a just-created request's quick-request
+  // suppression tracks the exact query the caller is reading.
+  const qc = useQueryClient()
+  const invalidated = useSyncExternalStore(
+    (onStoreChange) => qc.getQueryCache().subscribe(onStoreChange),
+    () => qc.getQueryState(queryKey)?.isInvalidated ?? false,
+  )
+
+  return { ...query, invalidated }
+}
+
+/**
+ * Every visible RAW row for one title (issue #370 phase 2) — the title-detail
+ * modal's replacement for `useRequests({ poll: open })`: a title-scoped read
+ * via `GET /requests/by-title` instead of correlating out of the whole
+ * request history.
+ */
+export function useTitleRequests(
+  mediaType: MediaType,
+  tmdbId: number,
+  options?: { poll?: boolean; enabled?: boolean },
+) {
+  const realtimeConnected = useRealtimeConnected()
+  return useQuery({
+    queryKey: queryKeys.requestsByTitle(mediaType, tmdbId),
+    enabled: options?.enabled ?? true,
+    queryFn: async (): Promise<RequestListResponse> =>
+      unwrap(
+        await client.GET('/api/v1/requests/by-title', {
+          params: { query: { media_type: mediaType, tmdb_id: tmdbId } },
+        }),
+      ),
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
+  })
 }
 
 export function useRequest(id: number, enabled = true) {

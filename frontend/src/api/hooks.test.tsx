@@ -5,6 +5,7 @@ import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
   useCheckForUpdate,
+  useCreateRequest,
   useEvict,
   useDiscoverHome,
   useExchangeApiKey,
@@ -15,6 +16,7 @@ import {
   useRequestsInvalidated,
   useRevokeAppKey,
   useRotateAppKey,
+  useTileLiveStates,
   useUpdateSettings,
   useUpdateStatus,
   useUpdateWhenReady,
@@ -367,6 +369,86 @@ describe('useWithdrawSubscription', () => {
       code: 'has_other_participants',
     })
     expect(invalidate).not.toHaveBeenCalled()
+  })
+})
+
+describe('issue #370 phase 2 — compact live-state / by-title invalidation', () => {
+  it('a request mutation invalidates the nested live-state and by-title queries by construction', async () => {
+    // The highest-risk omission flagged in the design: every request-mutation
+    // onSuccess must also invalidate the two new query keys, or a created/
+    // cancelled/withdrawn request leaves a stale tile/modal. Rather than add a
+    // second invalidateQueries call at every one of the ~9 call sites (easy to
+    // forget on the NEXT mutation too), queryKeys.requestsLiveState/
+    // requestsByTitle are nested UNDER the ['requests'] prefix every existing
+    // mutation already invalidates — so this is a structural guarantee, not a
+    // per-call-site convention. Proven here against a REAL QueryClient (default
+    // exact:false prefix matching), not a mock.
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    qc.setQueryData(queryKeys.requestsLiveState(['movie:603']), { states: {} })
+    qc.setQueryData(queryKeys.requestsByTitle('movie', 603), { requests: [], next_cursor: null })
+
+    ;(client.POST as unknown as Mock).mockResolvedValue({
+      data: { id: 1, tmdb_id: 603, media_type: 'movie', title: 'Fight Club', status: 'pending' },
+      response: { status: 201 },
+    })
+    const { result } = renderHook(() => useCreateRequest(), { wrapper: createWrapper(qc) })
+    await result.current.mutateAsync({ tmdb_id: 603, media_type: 'movie' })
+
+    await waitFor(() =>
+      expect(qc.getQueryState(queryKeys.requestsLiveState(['movie:603']))?.isInvalidated).toBe(
+        true,
+      ),
+    )
+    expect(qc.getQueryState(queryKeys.requestsByTitle('movie', 603))?.isInvalidated).toBe(true)
+  })
+
+  it('queryKeys.requestsLiveState/requestsByTitle nest under the requests prefix', () => {
+    // Pins the key SHAPE the structural guarantee above depends on: any future
+    // rename that moves these off the ['requests', ...] prefix would silently
+    // break every mutation's invalidation without failing loudly elsewhere.
+    expect(queryKeys.requestsLiveState(['movie:1', 'tv:2'])).toEqual([
+      'requests',
+      'live-state',
+      'movie:1',
+      'tv:2',
+    ])
+    expect(queryKeys.requestsByTitle('tv', 5)).toEqual(['requests', 'by-title', 'tv', 5])
+  })
+})
+
+describe('useTileLiveStates', () => {
+  it('POSTs the deduped, sorted key set and never fetches for an empty item list', async () => {
+    ;(client.POST as unknown as Mock).mockResolvedValue({
+      data: { states: { 'movie:1': { status: 'pending', request_id: 9, has_history: true, has_coexisting_available: false } } },
+      response: { status: 200 },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const { result, rerender } = renderHook<
+      ReturnType<typeof useTileLiveStates>,
+      { media_type: 'movie' | 'tv'; tmdb_id: number }[]
+    >((items) => useTileLiveStates(items), { wrapper: createWrapper(qc), initialProps: [] })
+    // No items: disabled, no POST at all.
+    expect(client.POST).not.toHaveBeenCalled()
+    expect(result.current.data).toBeUndefined()
+
+    rerender([
+      { media_type: 'tv', tmdb_id: 2 },
+      { media_type: 'movie', tmdb_id: 1 },
+      { media_type: 'movie', tmdb_id: 1 }, // duplicate — deduped
+    ])
+    await waitFor(() => expect(client.POST).toHaveBeenCalledTimes(1))
+    expect(client.POST).toHaveBeenCalledWith('/api/v1/requests/live-state', {
+      body: {
+        keys: [
+          { media_type: 'movie', tmdb_id: 1 },
+          { media_type: 'tv', tmdb_id: 2 },
+        ],
+      },
+    })
+    await waitFor(() =>
+      expect(result.current.data?.states['movie:1']?.request_id).toBe(9),
+    )
   })
 })
 

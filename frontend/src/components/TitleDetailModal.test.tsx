@@ -14,7 +14,7 @@ import {
   useMarkFailed,
   useQueue,
   useReportIssue,
-  useRequests,
+  useTitleRequests,
   useSearchPreview,
   useSetKeepForever,
   useWithdrawSubscription,
@@ -52,7 +52,7 @@ vi.mock('../api/hooks', () => ({
   useGrab: vi.fn(),
   useMarkFailed: vi.fn(),
   useImportDownload: vi.fn(),
-  useRequests: vi.fn(),
+  useTitleRequests: vi.fn(),
   useQueue: vi.fn(),
   useSetKeepForever: vi.fn(),
   // ADR-0014 correction hooks: default to an idle mutation so every render path
@@ -184,7 +184,7 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     // liveRequest stays null: the /requests poll has NOT yet reflected the new row,
     // which is exactly the window where the bug enabled Grab.
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     return { createMutation, previewMutation }
@@ -223,7 +223,7 @@ describe('TitleDetailModal TV request actions', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
   })
 
@@ -274,7 +274,7 @@ describe('TitleDetailModal report-a-problem gating (G6)', () => {
 
   // Request always 'downloading' (the lagging status); only the download status moves.
   function setDownloadStatus(downloadStatus: DownloadStateValue): void {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [request({ status: 'downloading' })] },
     })
     ;(useQueue as unknown as Mock).mockReturnValue({
@@ -376,7 +376,7 @@ describe('TitleDetailModal — movie path is unchanged by the tv season selector
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -442,7 +442,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -514,7 +514,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -577,7 +577,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useGrab as unknown as Mock).mockReturnValue(mutation(undefined))
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -616,7 +616,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -682,7 +682,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -747,7 +747,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -784,7 +784,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -843,7 +843,7 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     ;(useReportIssue as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [request] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [sharedPack] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
@@ -882,14 +882,14 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
   })
 
   it('shows no keep-forever control before any request exists', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
     expect(screen.queryByText(/keep forever/i)).not.toBeInTheDocument()
   })
 
   it("reflects the live request's unpinned state and pins it on click", async () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ keep_forever: false })] },
     })
     const setKeepForeverMock = mutation(undefined)
@@ -909,7 +909,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
   })
 
   it('shows the checkbox pre-checked when the request is already pinned', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ keep_forever: true })] },
     })
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
@@ -918,7 +918,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
   })
 
   it('renders the evicted status honestly with a "Request again" affordance, never Grab', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'evicted' })] },
     })
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
@@ -938,7 +938,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
     // right after "Request again" would have pinned the OLD, now-off-disk
     // request -- leaving the freshly re-grabbed copy unpinned (auto-evictable)
     // despite the success toast.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ id: 7, status: 'evicted', keep_forever: true })] },
     })
     const created = movieRequest({ id: 9, status: 'pending', keep_forever: false })
@@ -960,7 +960,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
 
     // Once polling confirms the fresh request is available, the checkbox must
     // target id 9 rather than the stale evicted id 7 that preceded it.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ id: 7, status: 'evicted', keep_forever: true }),
@@ -989,7 +989,7 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
     // Both an old evicted request AND a fresh one exist for this tmdb_id — the
     // fresh (non-settled) one must win, never the older evicted row (mirrors the
     // backend's own `_SETTLED_REQUEST_STATUSES` dedup exclusion).
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ id: 7, status: 'evicted' }),
@@ -1038,7 +1038,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
   })
 
   it('reports an available title via the report-issue endpoint with the chosen reason', async () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'available' })] },
     })
     const reportMock = mutation(movieRequest({ status: 'searching' }))
@@ -1059,7 +1059,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
   })
 
   it('offers Cancel for a searching request and calls the cancel endpoint', async () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'searching' })] },
     })
     const cancelMock = mutation(movieRequest({ status: 'cancelled' }))
@@ -1096,7 +1096,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       has_other_participants: false,
       seasons: [{ season_number: 3, status: 'waiting_for_air_date' }],
     }
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [waiting] } })
     const cancelMock = mutation({ ...waiting, status: 'cancelled' })
     ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
     render(<TitleDetailModal title={tvTitle} open onOpenChange={() => {}} />)
@@ -1114,7 +1114,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
   })
 
   it('does not offer Cancel for an already-imported (available) request', () => {
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'available' })] },
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1125,7 +1125,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     // ADR-0014: after cancelling then re-requesting the same title, the older
     // `cancelled` row must not shadow the newer active one — the modal must target the
     // fresh id, not the settled cancelled one. (liveRequest treats cancelled as settled.)
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ id: 7, status: 'cancelled' }),
@@ -1157,7 +1157,7 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
       year: 2022,
       library_state: 'none',
     }
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           {
@@ -1232,7 +1232,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows "Cancel request" (never Withdraw) to an admin, even with other participants', () => {
     // authState.current already defaults to admin (see beforeEach above).
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1250,7 +1250,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows "Cancel request" to a non-admin sole owner (no other participants)', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: false }),
@@ -1264,7 +1264,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows "Withdraw" (never Cancel) to a non-admin owner WITH other participants', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: true }),
@@ -1278,7 +1278,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows "Withdraw" to a plain (non-owner) subscriber', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ is_owner: false, can_withdraw: true, has_other_participants: true }),
@@ -1292,7 +1292,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows the plain-subscriber withdraw confirm copy and calls withdraw with the live request id', async () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ id: 9, is_owner: false, can_withdraw: true, has_other_participants: true }),
@@ -1313,7 +1313,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
 
   it('shows the owner-with-others withdraw confirm copy (hand-off wording)', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({ is_owner: true, can_withdraw: true, has_other_participants: true }),
@@ -1335,7 +1335,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // "continues for others" copy here even though withdrawing actually cancels
     // the request and removes the download.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           // Ownerless request (`can_mutate: false`, matching the real API's
@@ -1371,7 +1371,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // MERE subscription removal (`withdraw_participant` reuses `cancel_request`
     // ONLY on a cancellable status), so the destructive copy would lie.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1413,7 +1413,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
       year: 2022,
       library_state: 'none',
     }
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           {
@@ -1464,7 +1464,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
       // button entirely, stranding a participant of a settled/blocked row with no
       // self-removal affordance.
       asSharedUser()
-      ;(useRequests as unknown as Mock).mockReturnValue({
+      ;(useTitleRequests as unknown as Mock).mockReturnValue({
         data: {
           requests: [
             movieRequest({
@@ -1487,7 +1487,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // last-participant withdrawal from import_blocked / partially_available 409s
     // `withdrawal_blocked_active_request`, which `runWithdraw` surfaces as a toast.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1510,7 +1510,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // copy (which over-promises a removal that will be refused) nor the
     // destructive teardown copy -- it uses the honest refusal variant.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1549,7 +1549,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // must not block that: "Withdraw anyway" round-trips and the authoritative
     // outcome produces the honest success toast.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1582,7 +1582,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // Confirming a withdrawal the backend then 409s must produce the "Withdraw
     // failed" ERROR toast -- and no success toast of either wording.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1628,7 +1628,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // tore it down -- returning `settled: true`. The success toast must reflect the
     // REAL teardown, not the now-stale benign snapshot (the #351 lie).
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1669,7 +1669,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // (`settled: false`). The toast must not falsely claim a cancel + download
     // removal that did not happen.
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1705,7 +1705,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // settled row instead of being forced to hard-cancel it for everyone. The
     // admin auth default from beforeEach stands; `can_withdraw: true` marks them
     // a participant of this row.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1725,7 +1725,7 @@ describe('TitleDetailModal — subscriber control: Withdraw vs Cancel (issue #31
     // Finding C boundary: an admin who does NOT subscribe to the row
     // (`can_withdraw: false`) still sees no Withdraw -- withdrawal is a
     // participant capability, and the API drives that with `can_withdraw`.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           movieRequest({
@@ -1784,7 +1784,7 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   const UNKNOWN_STATUS = 'a_future_backend_status' as RequestStatusValue
 
   it('renders a neutral badge for an unrecognized request status, never throwing', () => {
-    vi.mocked(useRequests).mockReturnValue({
+    vi.mocked(useTitleRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
     } as never)
     expect(() =>
@@ -1794,7 +1794,7 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   })
 
   it('offers no Grab and no Re-search for an unrecognized status (so the release browser, only reachable via Re-search/Preview, can never be opened)', () => {
-    vi.mocked(useRequests).mockReturnValue({
+    vi.mocked(useTitleRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: UNKNOWN_STATUS })] },
     } as never)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1804,7 +1804,7 @@ describe('TitleDetailModal — unknown status fails closed, not open (issue #205
   })
 
   it('still offers Re-search for a KNOWN non-terminal status (no_acceptable_release)', () => {
-    vi.mocked(useRequests).mockReturnValue({
+    vi.mocked(useTitleRequests).mockReturnValue({
       data: { requests: [movieRequest({ status: 'no_acceptable_release' })] },
     } as never)
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1837,7 +1837,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
   }
 
@@ -1882,7 +1882,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
 
   it('ignores admin-only queue data cached before a shared-user role transition', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'import_blocked' })] },
     })
     ;(useQueue as unknown as Mock).mockReturnValue({
@@ -1913,7 +1913,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
   it('shows creator mutations to a shared user while keeping operator actions hidden', () => {
     asSharedUser()
     // The API capability, not the account's global role, grants creator actions.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'available', can_mutate: true })] },
     })
     const { unmount } = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1925,7 +1925,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     unmount()
 
     // Cancel is creator-capable, while re-search remains an admin-only release action.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'searching', can_mutate: true })] },
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1938,7 +1938,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
 
   it('keeps a shared subscriber read-only when the request denies mutation capability', () => {
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [movieRequest({ status: 'available', can_mutate: false })],
       },
@@ -1951,7 +1951,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     expect(screen.queryByRole('button', { name: /report a problem/i })).not.toBeInTheDocument()
     unmount()
 
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [movieRequest({ status: 'searching', can_mutate: false })],
       },
@@ -1968,7 +1968,7 @@ describe('TitleDetailModal — shared (non-admin) users get a request-only modal
     // POST /requests is NOT admin-only: re-requesting an evicted/failed title is
     // exactly the shared-user flow (the auto-grab worker does the rest).
     asSharedUser()
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [movieRequest({ status: 'evicted' })] },
     })
     render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
@@ -1991,7 +1991,7 @@ describe('TitleDetailModal — one-shot release-preview action', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
     return previewMutation
   }
@@ -2225,7 +2225,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [otherUsersRow, clickedRow] },
     })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
@@ -2284,7 +2284,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     const view = render(
@@ -2299,7 +2299,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     // present right alongside the fresh one. `boundRequestId` (the prop) is
     // still literally 81 — before the fix this would keep resolving to the dead
     // evicted row forever, masking the fresh, genuinely active request.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [settledRow, freshRow] },
     })
     view.rerender(
@@ -2368,7 +2368,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     const view = render(
@@ -2379,7 +2379,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     expect(screen.getByText('Evicted')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /request again/i }))
     await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [settledRow, freshRow, otherUsersRow] },
     })
     view.rerender(
@@ -2483,7 +2483,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     ;(useMarkFailed as unknown as Mock).mockReturnValue(markFailedMock)
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [settledRow] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     const view = render(
@@ -2494,7 +2494,7 @@ describe('TitleDetailModal — bound request row (duplicate same-title rows)', (
     expect(screen.getByText('Evicted')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /request again/i }))
     await waitFor(() => expect(createRequestMock.mutateAsync).toHaveBeenCalled())
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [settledRow, freshRow, otherUsersRow] },
     })
     ;(useQueue as unknown as Mock).mockReturnValue({
@@ -2562,7 +2562,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
     ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
     ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
     ;(useSetKeepForever as unknown as Mock).mockReturnValue(idle())
-    ;(useRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ data: { requests: [] } })
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
   }
 
@@ -2614,7 +2614,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
     // Re-acquire never re-arms it: the force-create makes a FRESH pending row.
     const createMutation = mutation(created())
     ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: { requests: [created({ id: 7, status: 'available' })] },
     })
 
@@ -2643,7 +2643,7 @@ describe('TitleDetailModal — Re-acquire an owned title (issue #131)', () => {
   it('never offers Re-acquire for a TV title (movie-only; report-issue covers tv)', () => {
     // An available tv season: report-issue is the per-season re-acquisition verb,
     // so the movie-only Re-acquire button must NOT appear.
-    ;(useRequests as unknown as Mock).mockReturnValue({
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
       data: {
         requests: [
           {
@@ -2750,7 +2750,7 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
     vi.mocked(useSetKeepForever).mockReturnValue(idle() as never)
     vi.mocked(useReportIssue).mockReturnValue(idle() as never)
     vi.mocked(useCancelRequest).mockReturnValue(idle() as never)
-    vi.mocked(useRequests).mockReturnValue({ data: { requests } } as never)
+    vi.mocked(useTitleRequests).mockReturnValue({ data: { requests } } as never)
     vi.mocked(useQueue).mockReturnValue({ data: { queue } } as never)
   }
 
