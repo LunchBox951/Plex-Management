@@ -97,6 +97,8 @@ __all__ = [
     "UpdateLeaseRequest",
     "UpdateLeaseResponse",
     "UpdateOutcomeRequest",
+    "UpdateRefreshItem",
+    "UpdateRefreshOutcomeRequest",
     "UpdateResultItem",
     "UpdateStatusResponse",
     "WatchlistStatusItem",
@@ -978,6 +980,26 @@ class UpdateResultItem(BaseModel):
     detail_code: str | None = None
 
 
+class UpdateRefreshItem(BaseModel):
+    """The last recorded self-refresh outcome for the updater sidecar itself.
+
+    ADR-0025 stage 0 (issue #299): a durable record of the sidecar's own
+    container replacement, distinct from :class:`UpdateResultItem` (which is the
+    APP/target update). All fields are best-effort -- a stage-1 sidecar reports
+    what it can. ``result`` is an OPEN string (e.g. ``failed`` / ``succeeded``)
+    so a future outcome value stays renderable by the neutral frontend without a
+    contract change.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    result: str
+    detail_code: str | None = None
+    from_build: str | None = None
+    to_build: str | None = None
+    at: datetime | None = None
+
+
 class UpdateStatusResponse(BaseModel):
     """Honest public status for the admin update controls."""
 
@@ -1008,6 +1030,19 @@ class UpdateStatusResponse(BaseModel):
     blocker: str | None = None
     last_checked_at: datetime | None = None
     last_result: UpdateResultItem | None = None
+    # ADR-0025 stage 0 sidecar observability (issue #299). ``True`` = the sidecar
+    # reported the SAME build id the RUNNING app process carries; ``False`` = a
+    # confirmed version mismatch (direction-free -- C7 permits the sidecar being
+    # AHEAD of an app that rolled back, so this never claims "older"/"newer");
+    # ``None`` = honestly unknown: the sidecar has not reported its identity
+    # (the expected state until the stage-1 emitting sidecar ships) OR the
+    # running app's own build id is unstamped (a dev/source run) -- never read
+    # as a clean match. See ``_updater_build_matches`` in the updates router for
+    # why the anchor is the running process, not the coordinator row.
+    updater_build_matches_app: bool | None = None
+    updater_observed_build: str | None = None
+    updater_observed_digest: str | None = None
+    last_refresh: UpdateRefreshItem | None = None
 
 
 class UpdateActionRequest(BaseModel):
@@ -1055,12 +1090,90 @@ class UpdateRenewRequest(UpdateLeaseRequest):
 
 
 class UpdateHeartbeatRequest(BaseModel):
-    """Unleased liveness for digest checks before a drain is claimed."""
+    """Unleased liveness for digest checks before a drain is claimed.
+
+    ADR-0025 stage 0 (issue #299) is the C7 forward-compatibility "expand": the
+    app must ACCEPT a newer sidecar's phase-less liveness heartbeat and its own
+    reported image identity WITHOUT requiring them. The current sidecar keeps
+    sending exactly ``{"phase": "checking", "action_generation": N}`` (nothing
+    in this release emits the new fields), which still validates unchanged; a
+    future sidecar may instead omit ``phase`` and attach its own build/digest.
+    ``extra="forbid"`` is deliberately KEPT -- the new fields are now known, so
+    an unknown field is still rejected -- but ``phase``/``action_generation``
+    become optional and the ``checking`` invariant is re-imposed by validator so
+    the old contract is preserved exactly (a ``checking`` heartbeat still
+    requires its ``action_generation``).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    phase: Literal["checking"]
-    action_generation: int = Field(ge=0)
+    phase: Literal["checking"] | None = None
+    action_generation: int | None = Field(default=None, ge=0)
+    # The sidecar's OWN running image identity (stage 0 accepts; stage 1 emits).
+    # Bounded exactly like the ``UpdateOutcomeRequest`` image fields and the
+    # ``String(400)`` storage columns so a long ``@sha256`` digest round-trips.
+    # The pattern (mirrors ``UpdateRefreshOutcomeRequest.from_build``/
+    # ``to_build``, and is a strict subset of the service's ``_bounded_text``
+    # predicate) makes both an empty string AND a control character an honest
+    # 422 at the edge (north star #3): "absent" is spelled ``None``/omitted,
+    # never ``""``, and a stray control character (e.g. a newline pasted into
+    # a build id) never reaches ``record_updater_identity()`` -- without it,
+    # either shape sails past the endpoint's ``is not None`` gate into the
+    # service's ``_bounded_text``, whose bare ``ValueError`` would surface as a
+    # 500 instead of a 422. The container-id/nonce fields below get the same
+    # non-emptiness from their ``+`` patterns (one-or-more), which reject
+    # ``""`` outright.
+    updater_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
+    updater_digest: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
+    # A self-inspected container id (hex) and a self-refresh nonce, carried by a
+    # stage-1 successor's authenticated liveness ping. Accepted and bounded here
+    # so the app never 422s a newer sidecar; unused by stage 0 beyond validation.
+    updater_container_id: str | None = Field(
+        default=None, max_length=128, pattern=r"^[0-9a-fA-F]+$"
+    )
+    refresh_nonce: str | None = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @model_validator(mode="after")
+    def _checking_requires_generation(self) -> UpdateHeartbeatRequest:
+        """Preserve the pre-expand contract: a ``checking`` beat carries its CAS.
+
+        The old sidecar always paired ``phase="checking"`` with an
+        ``action_generation`` the app CAS-matches against the pending check.
+        Making both optional for the new liveness shape must not silently accept
+        a ``checking`` beat with no generation (which the heartbeat endpoint
+        would then try to CAS against ``None``), so re-impose the pairing.
+        """
+        if self.phase == "checking" and self.action_generation is None:
+            raise ValueError("a checking heartbeat requires action_generation")
+        return self
+
+
+class UpdateRefreshOutcomeRequest(BaseModel):
+    """A sidecar self-refresh outcome report (ADR-0025 stage 0, issue #299).
+
+    The accept-side contract for the stage-1 self-refresh ladder, shipped WITH
+    the expand release so a newer sidecar's outcome report never 404s against an
+    app that already accepts its heartbeats (Codex round 1 on PR #384) -- a
+    surviving predecessor after a failed refresh keeps heartbeating and looks
+    healthy, so this durable report is the only honest signal of the failure.
+    Nothing emits it in stage 0.
+
+    ``result`` is an OPEN pattern-bounded code (not a Literal) so a future
+    outcome vocabulary stays expand-only. Every pattern here is a strict subset
+    of the service layer's ``_bounded_code``/``_bounded_text`` predicates, so a
+    body that validates at this edge can never blow up as a bare ``ValueError``
+    (an HTTP 500) in the service -- the same honest-422 lesson as the M1
+    empty-string fix.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    result: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    detail_code: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    # Non-empty, bounded, control-character-free -- mirrors ``_bounded_text``
+    # exactly, and the 400 cap matches the ``String(400)`` storage columns.
+    from_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
+    to_build: str | None = Field(default=None, pattern=r"^[^\x00-\x1f\x7f]{1,400}$")
 
 
 class UpdateClaimRequest(BaseModel):

@@ -207,6 +207,48 @@ class UpdateCoordinationService:
             await session.commit()
             return stamped
 
+    async def record_updater_identity(
+        self,
+        *,
+        observed_build: str | None = None,
+        observed_digest: str | None = None,
+    ) -> None:
+        """Persist the sidecar's own reported image identity (ADR-0025 stage 0)."""
+        observed_build = _bounded_text(observed_build, "observed_build")
+        observed_digest = _bounded_text(observed_digest, "observed_digest")
+        async with self._sessionmaker() as session:
+            await SqlUpdateCoordinationRepository(session).record_updater_identity(
+                now=self._now(),
+                observed_build=observed_build,
+                observed_digest=observed_digest,
+            )
+            await session.commit()
+
+    async def record_refresh_outcome(
+        self,
+        *,
+        result: str,
+        detail_code: str | None = None,
+        from_build: str | None = None,
+        to_build: str | None = None,
+    ) -> None:
+        """Persist the sidecar's last self-refresh outcome (ADR-0025 stage 0)."""
+        bounded_result = _bounded_code(result, "result")
+        if bounded_result is None:
+            raise ValueError("refresh result must be a bounded lowercase code")
+        detail_code = _bounded_code(detail_code, "detail_code")
+        from_build = _bounded_text(from_build, "from_build")
+        to_build = _bounded_text(to_build, "to_build")
+        async with self._sessionmaker() as session:
+            await SqlUpdateCoordinationRepository(session).record_refresh_outcome(
+                now=self._now(),
+                result=bounded_result,
+                detail_code=detail_code,
+                from_build=from_build,
+                to_build=to_build,
+            )
+            await session.commit()
+
     async def request_action(self, action: UpdateAction) -> int:
         """Persist operator intent, or refuse while an update operation is active."""
         async with self._sessionmaker() as session:
