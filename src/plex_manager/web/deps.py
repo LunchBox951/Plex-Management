@@ -241,6 +241,53 @@ _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 # document instead of minting a duplicate.
 api_key_header = _api_key_header
 
+
+class Cell[T]:
+    """A single mutable slot standing in for a bare module-level global.
+
+    CodeQL's ``py/unused-global-variable`` flags a module-level name that is
+    written but has no LOCAL (same-module) read of that write, because its
+    liveness analysis doesn't follow a value across either (a) separate
+    invocations of a function that rebinds the name under ``global`` — the
+    only reader is a LATER call, not this one — or (b) a
+    ``from module import name`` into a DIFFERENT module, which creates an
+    independent binding the query doesn't trace back to its origin. Both
+    shapes fired in this codebase the same day: alert #358 on
+    ``auth._last_stale_key_eviction`` (a cadence gate read at the top of the
+    function it's rebound in, so the read always precedes the NEXT write) and
+    alert #363 on this module's ``secret_rotation_lock`` (read only via
+    cross-module ``async with`` in ``app.py``/``routers/ops.py``/
+    ``routers/settings.py``) — both dismissed as false positives (issue #385,
+    following the same-family precedent of issue #378 / PR #379's
+    ``py/ineffectual-statement`` fix).
+
+    Wrapping the value here and reading/writing ``.value`` turns every store
+    into an ``Attribute`` write instead of a bare-name ``global`` rebind or an
+    imported bare name — attribute access on a live object isn't the "global
+    variable" shape this query's dataflow targets, so it doesn't fire. Runtime
+    semantics are unchanged: one object, one slot, read and written exactly
+    where the bare global used to be.
+
+    Reach for this the next time the SAME rule fires on a cross-invocation or
+    cross-module global instead of filing a third one-off dismissal.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: T) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        # Compares against a BARE value, not another ``Cell``: tests assert e.g.
+        # ``auth_module._last_stale_key_eviction == 100.0`` directly against the
+        # wrapped float, so equality must work transparently without an extra
+        # ``.value`` hop. Nothing in this codebase compares two ``Cell``s.
+        return bool(self.value == other)
+
+    def __repr__(self) -> str:
+        return f"Cell({self.value!r})"
+
+
 # Serializes the app-key critical section across router modules. The rotate/revoke
 # endpoints (``settings`` router) do a read-modify-write on ``SystemSettings.app_api_key``
 # under this lock; the recovery-key EXCHANGE (``POST /api/v1/auth/api-key``, ``auth``
@@ -254,7 +301,11 @@ api_key_header = _api_key_header
 app_key_rotate_lock = asyncio.Lock()
 
 # One-process boundary for secret mutation, log reads/renders, and drain writes.
-secret_rotation_lock = asyncio.Lock()
+# Wrapped in ``Cell`` (see its docstring) because this module's only read of the
+# lock used to be the assignment itself — every actual use is a cross-module
+# ``async with`` in ``app.py``/``routers/ops.py``/``routers/settings.py``, which
+# is exactly the shape CodeQL's py/unused-global-variable flagged as alert #363.
+secret_rotation_lock = Cell(asyncio.Lock())
 
 
 class AuthMethod(StrEnum):

@@ -162,8 +162,8 @@ async def test_durable_log_reads_hold_rotation_lock_through_rendering(
 
     monkeypatch.setattr(AsyncSession, "refresh", observed_rotation_start)
     read_rotation_lock = asyncio.Lock()
-    monkeypatch.setattr(ops_router, "secret_rotation_lock", read_rotation_lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", read_rotation_lock)
+    monkeypatch.setattr(ops_router.secret_rotation_lock, "value", read_rotation_lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", read_rotation_lock)
     response_task = asyncio.create_task(client.get(path, params=params, headers=_HEADERS))
     await asyncio.wait_for(entered.wait(), timeout=1)
     rotation_task = asyncio.create_task(
@@ -234,8 +234,8 @@ async def test_tail_holds_rotation_lock_through_rendering(
     monkeypatch.setattr(SettingsStore, "secret_values", paused_secret_values)
     monkeypatch.setattr(AsyncSession, "refresh", observed_rotation_start)
     read_rotation_lock = asyncio.Lock()
-    monkeypatch.setattr(ops_router, "secret_rotation_lock", read_rotation_lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", read_rotation_lock)
+    monkeypatch.setattr(ops_router.secret_rotation_lock, "value", read_rotation_lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", read_rotation_lock)
     response_task = asyncio.create_task(client.get("/api/v1/ops/logs/tail", headers=_HEADERS))
     await asyncio.wait_for(entered.wait(), timeout=1)
     rotation_task = asyncio.create_task(

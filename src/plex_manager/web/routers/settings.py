@@ -261,7 +261,7 @@ async def secret_rotation(
     every write it wants committed, in the boundary's fresh transaction.
     """
     handler = _log_handler(request)
-    async with secret_rotation_lock:
+    async with secret_rotation_lock.value:
         # End the request's pre-lock transaction (the same idiom the /logs read
         # endpoints use): the drain loop may have held the lock first and
         # committed rows carrying the retiring value AFTER this session already

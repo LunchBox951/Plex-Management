@@ -1018,7 +1018,7 @@ async def _log_drain_loop(app: FastAPI) -> None:
     last_pruned_at = time.monotonic()
     while True:
         try:
-            async with sessionmaker() as session, secret_rotation_lock:
+            async with sessionmaker() as session, secret_rotation_lock.value:
                 # Refresh the capture handler's value-based redaction set every tick,
                 # then drain and commit while the shared boundary is held.
                 handler.secret_values = await SettingsStore(session).secret_values()

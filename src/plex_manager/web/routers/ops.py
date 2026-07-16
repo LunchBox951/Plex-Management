@@ -270,7 +270,7 @@ async def list_logs_endpoint(
     """Paginated, filtered read of the durable ``log_events`` store, newest
     first. ``correlation_id`` matches a ``request_id``/``download_id``/
     ``tmdb_id`` carried in a record's context."""
-    async with secret_rotation_lock:
+    async with secret_rotation_lock.value:
         await session.rollback()
         page = await SqlLogEventRepository(session).list_events(
             level=level,
@@ -307,7 +307,7 @@ async def tail_logs_endpoint(
     restart, never persisted (only INFO+ reaches durable ``log_events``, see
     ``GET /logs`` above). ``dropped_count`` is the capture handler's own honest
     signal for how many INFO+ records missed durable storage since startup."""
-    async with secret_rotation_lock:
+    async with secret_rotation_lock.value:
         await session.rollback()
         records = handler.snapshot_tail(limit)
         records.reverse()
@@ -386,7 +386,7 @@ async def export_logs_endpoint(
     containing ``@``, concretely) before the value-based exact-match search
     ever sees it whole.
     """
-    async with secret_rotation_lock:
+    async with secret_rotation_lock.value:
         await session.rollback()
         repo = SqlLogEventRepository(session)
         if correlation_id is not None:

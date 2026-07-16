@@ -4970,8 +4970,8 @@ async def test_capture_before_rotation_and_drain_after_commit_redacts_retired_re
         real_release()
 
     monkeypatch.setattr(lock, "release", release_after_live_cleanup)
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
 
     response = await _mutation_request(
         client,
@@ -5018,8 +5018,8 @@ async def test_capture_during_rotation_cannot_commit_retired_secret(
     handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
     rotation_ready = asyncio.Event()
     release_rotation = asyncio.Event()
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5096,8 +5096,8 @@ async def test_drain_holds_rotation_lock_before_mutation_and_retired_row_is_rewr
     )
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
     entered_drain = asyncio.Event()
     release_drain = asyncio.Event()
     drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
@@ -5137,8 +5137,8 @@ async def test_mutation_holds_rotation_lock_before_drain_and_drain_reads_final_s
     handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
     mutation_entered = asyncio.Event()
     release_mutation = asyncio.Event()
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5189,8 +5189,8 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
     app.state.log_handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler.secret_values = frozenset({old_secret})
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
 
     if failure == "rewrite":
         real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5300,8 +5300,8 @@ async def test_mutation_reopens_transaction_under_lock_before_rewrite(
             return result
 
     lock = _RecordingLock()
-    monkeypatch.setattr(app_module, "secret_rotation_lock", lock)
-    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
 
     real_rollback = AsyncSession.rollback
 
