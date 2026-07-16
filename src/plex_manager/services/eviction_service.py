@@ -193,7 +193,13 @@ _STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = frozenset({RequestStatu
 # had to defend against (double-claim, resume-vs-mid-purge) exists ONLY when
 # sweeps overlap. Serializing them deletes that permutation class outright; the
 # claim CAS in :func:`_evict_one` remains the database-enforced backstop for
-# anything outside this process. A plain module bool, not an ``asyncio.Lock``:
+# anything outside this process. "Still running" covers CANCELLATION unwinding
+# too, not only a normal in-progress tick (issue #128): a cancelled sweep does
+# not release this latch until any in-flight purge delete has genuinely
+# settled (``purge_service._delete_to_settlement`` shields exactly that wait),
+# so ``_resume_interrupted_evictions`` on a LATER sweep can never observe a
+# path mid-delete and restore its row to 'available' out from under a
+# still-running ``rmtree``. A plain module bool, not an ``asyncio.Lock``:
 # the check-and-set below has no ``await`` between them, so it is atomic on the
 # single event loop; a plain mutable holder has no loop binding (asyncio
 # primitives cache their first loop, which breaks under per-test event loops);
@@ -1934,6 +1940,11 @@ async def run_eviction_sweep(
     class (double-claim, recovery racing a mid-purge claim) exists ONLY when
     they overlap. The skipped invocation's work is not lost — the in-flight
     sweep is already doing it, and the periodic tick retries every interval.
+    "In flight" includes a CANCELLED sweep still unwinding: the ``finally``
+    below does not clear the latch until any purge delete this sweep started
+    has genuinely settled on disk (issue #128), so a second invocation landing
+    right after cancellation still correctly no-ops instead of racing
+    crash-recovery against a delete that is still physically running.
     """
     if _sweep_latch["busy"]:
         _logger.info(

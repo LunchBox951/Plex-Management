@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+import threading
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -22,6 +24,7 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
     FailureDetail,
 )
+from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.web.fakes import FakeLibrary, FakeQbittorrent
@@ -39,6 +42,150 @@ async def test_purge_deletes_an_in_root_file_and_reports_freed_bytes(tmp_path: P
     assert result.outcome is PurgeOutcome.deleted
     assert result.freed_bytes == 2048
     assert not target.exists()
+
+
+class _BlockedDeleteFileSystem(LocalFileSystem):
+    """A real, root-guarded :class:`LocalFileSystem` whose ``delete`` blocks (in
+    its worker thread) until the test releases it -- lets a test cancel the
+    AWAITING coroutine while the underlying delete thread is still running, the
+    exact window issue #128 needs exercised."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__([str(root)])
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.deleted: list[str] = []
+
+    def delete(self, path: str) -> None:
+        self.started.set()
+        self.release.wait(timeout=5)
+        super().delete(path)
+        self.deleted.append(path)
+
+
+class _FailingBlockedDeleteFileSystem(_BlockedDeleteFileSystem):
+    """Like :class:`_BlockedDeleteFileSystem`, but the delete worker fails
+    (``OSError``) once released instead of succeeding."""
+
+    def delete(self, path: str) -> None:
+        self.started.set()
+        self.release.wait(timeout=5)
+        raise OSError("blocked delete failed")
+
+
+async def test_cancelled_purge_keeps_path_registered_until_delete_worker_settles(
+    tmp_path: Path,
+) -> None:
+    """Issue #128: cancelling ``purge_library_path`` mid-delete must NOT release
+    its ``_ACTIVE_PURGE_PATHS`` registration (observed here via
+    ``begin_placement``) until the background delete thread genuinely finishes
+    -- otherwise a concurrent import placement (or, in ``eviction_service``, a
+    later sweep's crash-recovery) can act on the path while a delete is still
+    physically running against it."""
+    target = tmp_path / "movies" / "Blocked Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+    )
+    cancelled = False
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        purge_task.cancel()
+        # Give the cancellation a chance to be delivered; the purge must NOT
+        # have completed (nor released its registration) yet -- the worker
+        # thread is still blocked on ``fs.release``.
+        await asyncio.sleep(0)
+        assert not purge_task.done()
+        assert purge_service.begin_placement(str(target)) is False
+        assert target.exists()
+    finally:
+        fs.release.set()
+        try:
+            await purge_task
+        except asyncio.CancelledError:
+            cancelled = True
+
+    assert cancelled is True
+    assert fs.deleted == [str(target)]
+    assert not target.exists()
+    # Only NOW -- after the worker thread actually finished -- is the
+    # registration released.
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+async def test_cancelled_purge_with_a_failing_worker_raises_cancelled_not_the_worker_error(
+    tmp_path: Path,
+) -> None:
+    """A cancellation racing an ALSO-failing delete must surface as the
+    cancellation (the caller is already unwinding on it and will never read a
+    classified ``PurgeResult``), never leak the worker's ``OSError`` as an
+    unhandled exception on the event loop."""
+    target = tmp_path / "movies" / "Failing Blocked Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _FailingBlockedDeleteFileSystem(target.parent)
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        purge_task = asyncio.create_task(purge_service.purge_library_path(fs, str(target)))
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        purge_task.cancel()
+        await asyncio.sleep(0)
+        assert not purge_task.done()
+        fs.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await purge_task
+        # Let any deferred "exception never retrieved" callback run.
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert loop_errors == []
+    assert target.exists()  # the (swallowed) delete never actually succeeded
+
+
+async def test_uncancelled_delete_worker_error_propagates_as_an_error_outcome(
+    tmp_path: Path,
+) -> None:
+    """Without any cancellation racing it, a genuine delete failure is still
+    classified and returned as ``PurgeOutcome.error`` exactly as before -- the
+    settlement shield changes nothing about the ordinary failure path."""
+    target = tmp_path / "movies" / "Failing Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _FailingBlockedDeleteFileSystem(target.parent)
+    fs.release.set()
+
+    result = await purge_service.purge_library_path(fs, str(target))
+
+    assert result.outcome is PurgeOutcome.error
+    assert target.exists()
+
+
+async def test_delete_to_settlement_propagates_a_worker_oserror_when_not_cancelled(
+    tmp_path: Path,
+) -> None:
+    """Direct unit coverage of the settlement helper: an uncancelled worker
+    failure is raised as itself, not swallowed."""
+    target = tmp_path / "movies" / "Failing Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _FailingBlockedDeleteFileSystem(target.parent)
+    fs.release.set()
+    delete_to_settlement = cast(
+        Callable[[FileSystemPort, str], Awaitable[None]],
+        purge_service.__dict__["_delete_to_settlement"],
+    )
+
+    with pytest.raises(OSError, match="blocked delete failed"):
+        await delete_to_settlement(fs, str(target))
+
+    assert target.exists()
 
 
 async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path) -> None:
