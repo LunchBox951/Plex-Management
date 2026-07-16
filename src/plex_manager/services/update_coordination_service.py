@@ -372,25 +372,51 @@ class UpdateCoordinationService:
         actor_user_id: int | None,
         recovery_max_age: timedelta = COORDINATOR_RECOVERY_MAX_AGE,
     ) -> ForceResetResult | None:
-        """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
+        """Admin break-glass: recover a wedged coordinator phase (issues #354, #368).
 
-        The service face of the recovery path for the fail-closed unknown-phase
-        wedge (issue #354; see
+        The service face of the recovery path for two distinct wedges: the
+        fail-closed unknown-phase guard (issue #354), and an orphaned known
+        BUSY phase (``checking``/``draining``/``installing``/``rollback``)
+        whose sidecar died without ever releasing it (issue #368). See
+        :func:`~plex_manager.domain.update_recovery.decide_recovery` for the
+        evidence matrix itself -- a live drain lease or a bounded start-anchor
+        age are the only two signals gated on; heartbeat freshness is
+        deliberately not evidence -- and
         :meth:`~plex_manager.repositories.update_coordination.SqlUpdateCoordinationRepository.force_reset_phase`
-        for the lock + re-check protocol and the full (phase x requested_action)
-        decision matrix, including the ACTION-ONLY variant -- a KNOWN, non-busy
-        phase paired with an unrecognized queued action -- and why an UNEXPIRED
-        drain lease under an unknown phase raises :class:`DrainLeaseActiveError`
-        instead of being torn).
+        for the lock + re-check protocol that applies it. In outline:
+
+        * a live drain lease (known busy or unrecognized phase alike) raises
+          :class:`DrainLeaseActiveError` -- an updater generation may
+          genuinely be mid-install, so the reset refuses rather than tearing
+          a live lease;
+        * a known busy phase whose start anchor has not yet aged past
+          ``recovery_max_age`` raises :class:`CoordinatorRecoveryNotReadyError`
+          -- the operation could still be in flight, so the caller retries
+          once the bound elapses;
+        * a known non-busy phase with a known action is a true no-op (``None``
+          is returned, nothing wedged to recover);
+        * a known non-busy phase with an unrecognized action clears the
+          action alone (the ACTION-ONLY reset), fencing its generation;
+        * everything else -- a drain-less busy phase past the bound, or an
+          unrecognized phase -- re-anchors the phase to ``idle``. A genuinely
+          queued known action (``check``/``install``) is preserved, keeping
+          its generation so the reconnecting sidecar can still complete it;
+          an unrecognized or absent (``"none"``) action instead has the
+          generation bumped, fencing any late/abandoned worker's outcome
+          behind a CAS it can no longer satisfy.
 
         The reset and its :class:`~plex_manager.models.AuditLog` row commit in ONE
         transaction: a state change that silently reassigned the coordinator out
-        of an unknown state with no durable record of WHO did it, or when, would
+        of a wedged state with no durable record of WHO did it, or when, would
         violate "honesty over silence" (north star #3). The audit row is written
-        only when a reset actually happened -- a no-op refusal (nothing this
-        operation may recover) or a drain-active refusal changes nothing and
-        records nothing -- and it names exactly what changed: the re-anchored
-        phase, the cleared unrecognized ``requested_action``, or both.
+        only when a reset actually happened -- the not-ready-yet, drain-active,
+        and true-no-op refusals perform no recovery mutation and write no audit
+        row, though observation side-effects (a legacy busy row's backfilled
+        start anchor, an expired-lease sweep) still commit durably so the
+        recovery clock starts on first contact -- and it
+        names exactly what changed: the re-anchored phase, the cleared
+        unrecognized ``requested_action``, the fenced ``action_generation``, or
+        any combination of the three.
         ``actor_user_id`` is ``None`` for an API-key / recovery-key admin, which
         has no Plex identity; that honest null actor matches every other admin
         action taken via the break-glass credential.
