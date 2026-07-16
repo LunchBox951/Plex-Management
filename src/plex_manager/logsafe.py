@@ -684,33 +684,33 @@ _AUTHORITY_SCAN_WINDOW: Final = 512
 #: starts its applicable shape search. A shape-pass match whose KEY contains the
 #: occurrence starts at most the key prefix cap (64) before it, plus slack.
 _SHAPE_KEY_SCAN_WINDOW: Final = 96
-#: Maximum text span after the candidate key included in each exact grammar
-#: search. All five grammars accept a truncated value, so this is enough to prove
-#: the later whole-line shape pass starts at this key without scanning its full
-#: (possibly very long) value.
+#: Maximum text span AFTER the separator probe's end (i.e. past the value's
+#: start) included in each exact grammar search. All five grammars accept a
+#: truncated value, so this is enough to prove the later whole-line shape pass
+#: starts at this key without scanning its full (possibly very long) value.
 _SHAPE_VALUE_SCAN_WINDOW: Final = 512
-#: Maximum suffix span inspected by the cheap anchored prose-reject test before
-#: attempting the heavier exact shape grammars. It rejects ordinary prose
-#: occurrences such as ``password password ...`` without searching any grammar.
-#: DELIBERATELY EQUAL to :data:`_SHAPE_VALUE_SCAN_WINDOW`: the prefilter must
-#: never reject a case the self-verification scan below would SPARE, or the
-#: keyword (a configured secret whose value equals a key word) is masked, its
-#: paired value loses the key ``redact_secrets`` anchors on, and that value
-#: LEAKS. A ``key<sep>`` pair separated only by ``\s*`` (the sole thing that can
-#: sit between the key word and its ``:``/``=`` in ``_SECRET_KV_RE``'s grammar)
-#: is thus accepted for exactly as far as self-verification can confirm it --
-#: no realistic rendering ever puts hundreds of blanks there (only ``['\"]?\s*``
-#: is legal in that gap, and no serializer emits hundreds of blanks), and any
-#: gap beyond this shared bound fails BOTH tests identically, never a
-#: prefilter-only inconsistency. Beyond the bound the behavior is fail-closed
-#: for the KEY occurrence (the configured key-word secret is masked) but does
-#: FORFEIT the shape pass's coverage of the PAIRED value: masking the key strips
-#: the anchor ``redact_secrets`` would have keyed that value off of, so a
-#: non-configured value past 512 blanks goes unmasked where the unbounded parent
-#: masked it. That trade is deliberate -- the linearity bound has to stop
-#: somewhere, and the forfeited region is unreachable for any real rendering.
-_KEY_SHAPE_SUFFIX_WINDOW: Final = _SHAPE_VALUE_SCAN_WINDOW
-_KEY_SHAPE_SUFFIX_RE: Final = re.compile(r"(?:['\"]?\s*[:=]|['\"]\s*,)")
+#: The cheap ANCHORED separator probe run before the heavier exact shape
+#: grammars: from the occurrence's end, an optional quote, whitespace, a
+#: ``:``/``=`` (or the tuple form's quote-comma), and the whitespace after it --
+#: exactly the region every self-verification grammar's own separator admits
+#: (``_KV_SEP_PATTERN``'s ``['\"]?\s*[:=]\s*`` / ``_SECRET_TUPLE_RE``'s
+#: ``(?P=kq)\s*,\s*``). It rejects ordinary prose occurrences such as
+#: ``password password ...`` in O(1) without searching any grammar, and on a hit
+#: its match END locates the value's start so the grammar scan below can be
+#: given a tight end bound.
+#:
+#: DELIBERATELY UNBOUNDED (``.match``-anchored, no end bound), so the probe can
+#: never reject a separator gap the grammars themselves would accept -- a
+#: renderer- or attacker-inserted run of hundreds of blanks between the key and
+#: its ``=`` must not strip the key anchor ``redact_secrets`` masks the paired
+#: value off of (Codex PR #376 round 2). This is still linear in message size,
+#: BY CONSTRUCTION rather than by window: a key-word occurrence is a run of word
+#: characters, so no occurrence can begin inside another occurrence's
+#: pure-whitespace probe region -- the probed regions are pairwise disjoint and
+#: their total is bounded by the message length. The probe itself backtracks
+#: O(1) per whitespace position (``\s*`` then a one-char class), so the whole
+#: miss path stays amortized O(n).
+_KEY_SHAPE_SUFFIX_RE: Final = re.compile(r"(?:['\"]?\s*[:=]\s*|['\"]\s*,\s*)")
 
 
 #: Maximum length for a newly generated depth-2 candidate. Baseline raw and
@@ -909,17 +909,21 @@ def _mask_known_value(match: re.Match[str]) -> str:
     authority_from = max(0, ident_start - _AUTHORITY_SCAN_WINDOW)
     if _AUTHORITY_PREFIX_RE.search(text, authority_from, ident_start) is not None:
         return _REDACTED  # userinfo/authority position, not a key -- fail closed
-    # Reject ordinary prose occurrences before invoking a shape grammar. The
-    # anchored suffix check and every authoritative grammar search have explicit
-    # local end bounds, so repeated keyword misses remain linear in message size.
-    suffix_end = min(len(text), match.end() + _KEY_SHAPE_SUFFIX_WINDOW)
-    if _KEY_SHAPE_SUFFIX_RE.match(text, match.end(), suffix_end) is None:
+    # Reject ordinary prose occurrences before invoking a shape grammar: the
+    # anchored separator probe fails in O(1) on prose and, on a hit, locates the
+    # value's start (its match end) -- including across an arbitrarily long
+    # whitespace gap, which the probe must tolerate exactly as far as the
+    # grammars themselves do (see _KEY_SHAPE_SUFFIX_RE: disjoint probe regions
+    # keep repeated keyword misses linear in message size WITHOUT a window that
+    # could undercut the grammars and strip the shape pass's key anchor).
+    separator = _KEY_SHAPE_SUFFIX_RE.match(text, match.end())
+    if separator is None:
         return _REDACTED
     # Self-verify against the same non-cookie shape objects that redact_secrets()
     # will run later. The grammars accept truncated values, so the bounded slice
     # proves the key/value start while the later whole-line pass masks the value.
     scan_from = max(0, match.start() - _SHAPE_KEY_SCAN_WINDOW)
-    scan_to = min(len(text), match.end() + _SHAPE_VALUE_SCAN_WINDOW)
+    scan_to = min(len(text), separator.end() + _SHAPE_VALUE_SCAN_WINDOW)
     for shape_re in _SELF_VERIFY_SHAPE_RES:
         for shape in shape_re.finditer(text, scan_from, scan_to):
             if shape.start() > match.start():

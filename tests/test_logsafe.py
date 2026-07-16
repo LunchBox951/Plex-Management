@@ -1255,10 +1255,14 @@ def test_key_guard_bounds_every_shape_grammar_search(monkeypatch: pytest.MonkeyP
     assert max(recorder.end_positions) <= 1_000
 
 
-def test_key_guard_requires_a_bounded_local_shape_suffix() -> None:
-    gap = " " * 1_000
-    text = f"password{gap}=paired-sample-000"
-    assert redact_known_secrets(text, ["password"]) == f"<redacted>{gap}=paired-sample-000"
+def test_key_guard_requires_an_anchored_separator_probe() -> None:
+    """The prose-reject probe is anchored at the occurrence's end: a key word
+    followed by anything other than the grammars' own separator region
+    (optional quote + whitespace + ``:``/``=``, or quote + comma) is masked
+    without any grammar search -- but text between the occurrence and a REAL
+    separator never disqualifies it, however long (see the over-window test)."""
+    assert redact_known_secrets("password stored ok", ["password"]) == "<redacted> stored ok"
+    assert redact_known_secrets("password; then prose", ["password"]) == "<redacted>; then prose"
 
 
 def test_key_guard_handles_thousands_of_unshaped_keyword_occurrences() -> None:
@@ -1270,22 +1274,33 @@ def test_key_guard_handles_thousands_of_unshaped_keyword_occurrences() -> None:
     assert result == "<redacted> " * 2_000
 
 
-def test_key_guard_prefilter_never_undercuts_the_self_verification_scan() -> None:
-    """Codex PR #376 regression: the cheap prose-reject prefilter must accept a
-    ``key<sep>value`` pair for as far as the self-verification scan can spare it.
-    A tighter prefilter window would MASK the ``password`` key here (a configured
-    secret whose value equals a key word), destroying the anchor
-    ``redact_secrets`` keys the value off of and LEAKING that value. With the
-    prefilter window pinned equal to ``_SHAPE_VALUE_SCAN_WINDOW`` the pair is
-    spared and the composed pass masks the value, never the reverse.
+def test_key_guard_spares_a_paired_key_across_any_separator_gap() -> None:
+    """Codex PR #376 rounds 1+2: the linearity bound must never reject a
+    ``key<sep>value`` pair the shape grammars themselves accept. Masking the
+    ``password`` key here (a configured secret whose value equals a key word)
+    would destroy the anchor ``redact_secrets`` keys the paired value off of
+    and LEAK that value -- for ANY whitespace run a renderer or attacker can
+    insert around the separator, not just gaps inside some fixed window. The
+    anchored separator probe tolerates the gap end-to-end (it is what the
+    grammars' own ``\\s*`` admits), so the pair is spared and the composed pass
+    masks the value, never the reverse.
     """
-    # Gaps well within the shared prefilter/self-verify window (512).
-    for gap_len in (10, 200, 500):
+    for gap_len in (0, 10, 200, 500, 513, 1_000, 5_000):
         gap = " " * gap_len
-        text = f"password{gap}=hunter2longvalue"
-        composed = redact_secrets(redact_known_secrets(text, ["password"]))
-        assert "hunter2longvalue" not in composed, gap_len
-        assert composed == f"password{gap}=<redacted>", gap_len
+        for text, masked in (
+            # gap BEFORE the separator (round-2 report's exact shape)
+            (f"password{gap}=hunter2longvalue", f"password{gap}=<redacted>"),
+            # gap AFTER the separator (same mechanism, other side)
+            (f"password ={gap}hunter2longvalue", f"password ={gap}<redacted>"),
+        ):
+            composed = redact_secrets(redact_known_secrets(text, ["password"]))
+            assert "hunter2longvalue" not in composed, (gap_len, text[:24])
+            assert composed == masked, (gap_len, text[:24])
+    # Tuple rendering with an over-window gap around the comma separator.
+    tuple_text = "('password'" + " " * 1_000 + ", 'hunter2longvalue')"
+    composed = redact_secrets(redact_known_secrets(tuple_text, ["password"]))
+    assert "hunter2longvalue" not in composed
+    assert composed == "('password'" + " " * 1_000 + ", '<redacted>')"
 
 
 def test_key_guard_masks_a_key_word_secret_behind_an_overlong_identifier() -> None:
