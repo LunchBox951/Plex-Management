@@ -25,6 +25,7 @@ from enum import StrEnum
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.repositories.update_coordination import (
+    CoordinatorRecoveryNotReadyError,
     CoordinatorSnapshot,
     DrainLeaseActiveError,
     ForceResetResult,
@@ -35,7 +36,9 @@ from plex_manager.repositories.update_coordination import (
 from plex_manager.services import audit_service
 
 __all__ = [
+    "COORDINATOR_RECOVERY_MAX_AGE",
     "UPDATER_HEARTBEAT_MAX_AGE",
+    "CoordinatorRecoveryNotReadyError",
     "CoordinatorSnapshot",
     "DrainClaim",
     "DrainLeaseActiveError",
@@ -54,11 +57,13 @@ __all__ = [
 _CODE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
 _DEFAULT_CRITICAL_TTL = timedelta(minutes=5)
 # The sidecar-liveness contract: a heartbeat older than this means no updater
-# is connected. Single source of truth shared by the updates router (status's
-# ``updater_available`` and the 503 gate on manual actions) and by
-# ``force_reset_coordinator_phase``'s checking-phase predicate, so "is a check
-# plausibly in flight" can never drift from "is the sidecar connected".
+# is connected. Used by the updates router (status's ``updater_available`` and
+# the 503 gate on manual actions). Deliberately NOT used by recovery decisions:
+# an eligibility poll refreshes the heartbeat even when no work is handed out,
+# so freshness proves connectivity, never work in flight -- recovery is gated
+# on the bounded start anchor and live drain leases instead (issue #368).
 UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
+COORDINATOR_RECOVERY_MAX_AGE = timedelta(minutes=10)
 _logger = logging.getLogger(__name__)
 
 
@@ -184,6 +189,23 @@ class UpdateCoordinationService:
             )
             await session.commit()
         return await self.snapshot() if touched else None
+
+    async def mark_busy_work_dispatched(self) -> bool:
+        """Durably restart the busy-phase recovery clock on a real work handout.
+
+        Called when eligibility actually assigns a ``check``/``install`` to the
+        sidecar while the coordinator row is already in a busy phase -- a
+        genuine work-start even though the phase string repeats (a MANUAL
+        queued action; automatic dispatch is gated on a non-busy phase). Never
+        called for no-work polls or same-phase heartbeats (see the repo
+        method).
+        """
+        async with self._sessionmaker() as session:
+            stamped = await SqlUpdateCoordinationRepository(session).mark_busy_work_dispatched(
+                self._now()
+            )
+            await session.commit()
+            return stamped
 
     async def request_action(self, action: UpdateAction) -> int:
         """Persist operator intent, or refuse while an update operation is active."""
@@ -348,7 +370,7 @@ class UpdateCoordinationService:
         self,
         *,
         actor_user_id: int | None,
-        updater_heartbeat_max_age: timedelta = UPDATER_HEARTBEAT_MAX_AGE,
+        recovery_max_age: timedelta = COORDINATOR_RECOVERY_MAX_AGE,
     ) -> ForceResetResult | None:
         """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
 
@@ -378,21 +400,40 @@ class UpdateCoordinationService:
         """
         async with self._sessionmaker() as session:
             repo = SqlUpdateCoordinationRepository(session)
-            result = await repo.force_reset_phase(
-                self._now(), updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age)
-            )
+            # Observation side-effects (the legacy busy-row anchor backfill and
+            # expired-lease cleanup) must be durable even when the decision is a
+            # refusal: an operator who only ever hits force-reset must still
+            # start -- and keep -- the recovery clock on the FIRST attempt, or
+            # a repeatedly rolled-back `now` anchor makes
+            # ``coordinator_recovery_not_ready`` permanent. Refusals raise (or
+            # return None) before any recovery mutation, so committing here
+            # persists exactly those legitimate observations and nothing else.
+            try:
+                result = await repo.force_reset_phase(
+                    self._now(), recovery_max_age=_positive_ttl(recovery_max_age)
+                )
+            except (CoordinatorRecoveryNotReadyError, DrainLeaseActiveError):
+                await session.commit()
+                raise
             if result is None:
+                await session.commit()
                 return None
-            old_value: dict[str, str] = {}
-            new_value: dict[str, str] = {}
+            old_value: dict[str, object] = {}
+            new_value: dict[str, object] = {}
             if result.old_phase is not None:
                 old_value["phase"] = result.old_phase
                 new_value["phase"] = UpdatePhase.idle.value
             if result.cleared_requested_action is not None:
                 old_value["requested_action"] = result.cleared_requested_action
                 new_value["requested_action"] = "none"
+            if (
+                result.old_action_generation is not None
+                and result.new_action_generation is not None
+            ):
+                old_value["action_generation"] = result.old_action_generation
+                new_value["action_generation"] = result.new_action_generation
             description = (
-                "Force-reset an unrecognized update coordinator phase to idle."
+                "Force-reset the update coordinator phase to idle."
                 if result.old_phase is not None
                 else "Cleared an unrecognized queued updater action."
             )

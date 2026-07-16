@@ -11,9 +11,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
+from plex_manager.domain.update_recovery import (
+    BUSY_COORDINATOR_PHASES,
+    KNOWN_REQUESTED_ACTIONS,
+    RecoveryAction,
+    decide_recovery,
+    dispatch_starts_work,
+)
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    COORDINATOR_RECOVERY_MAX_AGE,
     UPDATER_HEARTBEAT_MAX_AGE,
+    CoordinatorRecoveryNotReadyError,
     DrainLeaseActiveError,
     UnknownCoordinatorPhaseError,
     UpdateAction,
@@ -44,24 +53,17 @@ from plex_manager.web.updater_auth import require_updater
 
 __all__ = ["internal_router", "router"]
 
-# The liveness contract now lives in the coordination service (round 3 of
-# #354/#357 made force-reset's checking predicate depend on it too); this alias
-# keeps the router's existing call sites while guaranteeing the two cannot drift.
+# The liveness contract lives in the coordination service; this alias keeps
+# the router's ``updater_available`` call sites while guaranteeing the two
+# cannot drift. It gates AVAILABILITY only -- recovery decisions deliberately
+# ignore heartbeat freshness (see ``decide_recovery``), because eligibility
+# polls refresh it even when no work is handed out.
 _UPDATER_HEARTBEAT_MAX_AGE = UPDATER_HEARTBEAT_MAX_AGE
 _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
+_COORDINATOR_RECOVERY_MAX_AGE = COORDINATOR_RECOVERY_MAX_AGE
 _KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
-# ``"none"`` plus every operator intent this build understands. Mirrors the
-# repo layer's ``_KNOWN_REQUESTED_ACTIONS`` (which duplicates it for hexagonal
-# layering); derived from the enum here, so it cannot drift.
-_KNOWN_REQUESTED_ACTIONS = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
-# The phases whose in-flight operation legitimately rewrites ``requested_action``
-# on completion. The LEASED ones (draining/installing/rollback) always suppress
-# the action-only wedge -- lease expiry converges. ``checking`` is leaseless, so
-# it suppresses the wedge only while the sidecar heartbeat says a check could
-# actually be in flight (see ``_state_and_blocker``).
-_BUSY_PHASES = frozenset({"checking", "draining", "installing", "rollback"})
 
 router = APIRouter(
     prefix="/api/v1/updates",
@@ -148,24 +150,34 @@ def _state_and_blocker(
     updater_available: bool,
     now: datetime,
 ) -> tuple[str, str | None]:
-    if snapshot.phase not in _KNOWN_PHASES:
-        return "unavailable", "coordinator_state_unknown"
-    # The action-only wedge (issue #354, Codex rounds 2-3): a rollback can
-    # leave a perfectly recognizable phase paired with a requested_action this
-    # build does not know, which makes request_action refuse ALL new intent
-    # while eligibility now fails closed on it (never hands the sidecar work
-    # over it). Flag it like the unknown-phase wedge -- and, like that check,
-    # BEFORE the updater-availability gate, because the recovery endpoint works
-    # without a live sidecar and the operator must be shown the button either
-    # way. Exemptions mirror force_reset_phase's matrix exactly: the LEASED
-    # busy phases always suppress it (their lease expiry converges), and the
-    # leaseless ``checking`` suppresses it only while the heartbeat is fresh
-    # enough that a check could genuinely be in flight.
-    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS and (
-        snapshot.phase not in _BUSY_PHASES
-        or (snapshot.phase == "checking" and not updater_available)
+    phase_started_at = (
+        snapshot.last_started_at or snapshot.requested_at
+        if snapshot.phase in BUSY_COORDINATOR_PHASES
+        else None
+    )
+    decision = decide_recovery(
+        phase=snapshot.phase,
+        requested_action=snapshot.requested_action,
+        live_drain=snapshot.drain_owner is not None,
+        phase_started_at=phase_started_at,
+        now=now,
+        max_age=_COORDINATOR_RECOVERY_MAX_AGE,
+    )
+    if decision.action is RecoveryAction.LIVE_DRAIN and (
+        snapshot.phase not in _KNOWN_PHASES
+        or snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS
     ):
+        return "unavailable", "coordinator_drain_active"
+    if decision.action is RecoveryAction.WAIT and (
+        snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS or not updater_available
+    ):
+        return "unavailable", "coordinator_recovery_not_ready"
+    if decision.action is RecoveryAction.REANCHOR and snapshot.phase not in _KNOWN_PHASES:
+        return "unavailable", "coordinator_state_unknown"
+    if decision.action is RecoveryAction.ACTION_ONLY:
         return "unavailable", "requested_action_unknown"
+    if decision.action is RecoveryAction.REANCHOR:
+        return "unavailable", "coordinator_state_stale"
     if not updater_available:
         return "unavailable", "updater_unavailable"
     if snapshot.phase == "draining":
@@ -311,37 +323,45 @@ async def force_reset_endpoint(
     after re-reading the row so a state that healed on its own is never blindly
     clobbered (north stars #1/#2: a button, never a terminal).
 
-    The locked decision matrix:
+    The locked decision matrix (see ``decide_recovery``):
 
-    * Known phase + known action: 409 ``coordinator_phase_known`` -- a true
-      no-op, nothing wedged to recover. Also the honest, idempotent answer to
-      a double-click: the second call finds the recovered state already known.
-    * Leased busy phase (``draining``/``installing``/``rollback``), any
-      action: 409 ``coordinator_phase_known`` -- an operation is in flight and
-      its own acknowledgement or lease expiry legitimately resolves the
-      action; never reset a live update. Both exits converge on a recoverable
-      state if the action remains unrecognized.
-    * ``checking`` + unrecognized action: refused only while the updater
-      heartbeat is fresh (the 45s liveness contract) -- a live sidecar could
-      be mid-check. ``checking`` holds no lease, so once the heartbeat is
-      stale nothing can ever expire it; the action-only reset then proceeds
-      (the phase itself stays ``checking`` and heals through the next
-      completed check's normal acknowledgement).
+    * Known non-busy phase + known action: 409 ``coordinator_phase_known`` --
+      a true no-op, nothing wedged to recover. Also the honest, idempotent
+      answer to a double-click: the second call finds the recovered state
+      already known.
+    * ANY shape under an UNEXPIRED drain lease: 409
+      ``coordinator_drain_active`` -- an updater generation may be
+      legitimately mid-install; the lease TTL bounds the wait, and an expired
+      lease is swept (durably, even on a refused attempt) so a retry then
+      proceeds.
     * Known non-busy phase + unrecognized action: clears the action to
-      ``none`` (the action-only reset), leaving the phase untouched.
-    * Unknown phase + UNEXPIRED drain lease: 409 ``coordinator_drain_active``
-      -- a NEWER updater generation may be legitimately mid-install in a phase
-      this build simply doesn't know; the lease TTL bounds the wait, and an
-      expired lease is swept so a retry then proceeds.
-    * Unknown phase otherwise: re-anchors the phase to ``idle``; a KNOWN
-      queued action is preserved for retry, an unrecognized one is cleared.
+      ``none`` under a bumped generation (the action-only reset), leaving the
+      phase untouched.
+    * BUSY phase whose start anchor is younger than the recovery bound: 409
+      ``coordinator_recovery_not_ready`` -- the operation could genuinely be
+      in flight. The anchor is the ONLY clock: heartbeat freshness is
+      deliberately not evidence, because eligibility polls refresh it even
+      when no work is handed out, so a merely-polling sidecar can never
+      extend this gate (issue #368). Legacy busy rows with no anchor get one
+      durably backfilled on first observation -- including by this refusal
+      itself -- so the clock always starts and the bound always arrives.
+    * BUSY phase past the bound, or an unknown phase: re-anchors to ``idle``.
+      A KNOWN queued action is preserved (with its generation) for retry; an
+      unrecognized or absent one has its generation bumped, fencing any late
+      worker still holding the old generation.
     """
     coordinator = await _coordinator(request)
     try:
         result = await coordinator.force_reset_coordinator_phase(
             actor_user_id=auth.user_id,
-            updater_heartbeat_max_age=_UPDATER_HEARTBEAT_MAX_AGE,
+            recovery_max_age=_COORDINATOR_RECOVERY_MAX_AGE,
         )
+    except CoordinatorRecoveryNotReadyError as exc:
+        raise AppError(
+            status_code=409,
+            code="coordinator_recovery_not_ready",
+            message="Recovery is waiting for bounded stale evidence; try again shortly.",
+        ) from exc
     except DrainLeaseActiveError as exc:
         raise AppError(
             status_code=409,
@@ -405,7 +425,7 @@ async def _eligibility(
     # work (action="none" is the sidecar's ordinary sleep-and-repoll answer,
     # per the #346 fail-closed contract) until the operator runs the audited
     # action-only reset.
-    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS:
+    if snapshot.requested_action not in KNOWN_REQUESTED_ACTIONS:
         policy = await load_update_policy(session)
         now = datetime.now(UTC)
         return (
@@ -432,7 +452,22 @@ async def _eligibility(
         if action == "check":
             blocker = "checking_for_update"
     elif policy.schedule.enabled:
-        if snapshot.available_digest is not None:
+        # AUTOMATIC dispatch only ever starts from a recognized NON-BUSY
+        # phase. A busy phase means either an operation is genuinely in
+        # flight (the single sidecar never polls eligibility mid-operation --
+        # its loop is sequential and mid-check liveness goes through the
+        # generation-bound /heartbeat) or the row is stale and must age out
+        # into recovery (automatic sweep or the operator button) first.
+        # Without this gate, a crash-looping sidecar (poll -> handed an
+        # automatic check -> dies -> repolls) would restamp the recovery
+        # anchor every window and keep a stuck busy row perpetually
+        # unrecoverable -- exactly the unbounded wedge issue #368 forbids.
+        # MANUAL queued intent (the requested_action branches above) is
+        # deliberately NOT gated: a queued action is preserved across
+        # recovery anyway, and its handout legitimately restarts the clock.
+        if snapshot.phase in BUSY_COORDINATOR_PHASES:
+            blocker = "coordinator_phase_busy"
+        elif snapshot.available_digest is not None:
             if window_open:
                 action = "install"
             else:
@@ -444,6 +479,23 @@ async def _eligibility(
             action = "check"
     if action == "install" and policy.idle_only and snapshot.active_critical_operations:
         blocker = "active_critical_work"
+    if (
+        touch
+        and dispatch_starts_work(action, blocker)
+        and snapshot.phase in BUSY_COORDINATOR_PHASES
+    ):
+        # Handing real work to the sidecar over a row already in a busy phase
+        # (necessarily a MANUAL queued action -- automatic dispatch is gated
+        # on a non-busy phase above) is a genuine work-START even though the
+        # sidecar's subsequent same-phase heartbeat cannot move the age
+        # anchor. Restart the recovery clock here, in the handout, so an
+        # operator button press cannot fence the work that was just
+        # dispatched. ``dispatch_starts_work`` is the SAME predicate the
+        # runner's early-return guard derives from, so the stamp fires
+        # exactly when the runner will act: no-work polls and advisory
+        # blocked-install answers (idle_only + active critical work) never
+        # move the anchor.
+        await coordinator.mark_busy_work_dispatched()
     return (
         UpdateEligibilityResponse(
             action=action,
