@@ -1285,6 +1285,111 @@ async def test_force_reset_refuses_when_phase_is_already_known(
         assert (await session.execute(select(AuditLog))).scalars().all() == []
 
 
+async def test_force_reset_refuses_live_actionless_checking_even_when_request_is_old(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """A fresh heartbeat owns the long-running automatic check, so the web
+    recovery endpoint returns its ordinary live-coordinator refusal."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    before = await coordinator.request_action(UpdateAction.check)
+    now = datetime.now(UTC)
+    requested_at = now - timedelta(minutes=31)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=requested_at,
+                updater_last_seen_at=now,
+            )
+        )
+        await session.commit()
+
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "checking"
+    assert snapshot.requested_action == "none"
+    assert snapshot.action_generation == before
+    assert snapshot.requested_at == requested_at
+    async with app.state.sessionmaker() as session:
+        assert (await session.execute(select(AuditLog))).scalars().all() == []
+
+
+async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """A fresh-install automatic check has no requested_at; once its heartbeat
+    is stale the web recovery path still fences and re-anchors it."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=datetime.now(UTC) - timedelta(minutes=10),
+                updater_last_seen_at=datetime.now(UTC) - timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.action_generation == 0
+    assert snapshot.requested_at is None
+
+
+async def test_force_reset_reanchors_drainless_busy_phase_preserving_queued_action_end_to_end(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+) -> None:
+    """The web recovery re-anchors an orphaned busy phase while retaining its
+    queued install under the fenced generation for the sidecar to pick up."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    generation = await coordinator.request_action(UpdateAction.install)
+    requested_at = (await coordinator.snapshot()).requested_at
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(phase="installing", last_started_at=datetime.now(UTC) - timedelta(minutes=10))
+        )
+        await session.commit()
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.requested_action == "install"
+    assert snapshot.action_generation == generation
+    assert snapshot.requested_at == requested_at
+
+
 async def test_force_reset_requires_admin(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -1369,7 +1474,8 @@ async def test_force_reset_recovers_the_action_only_wedge_end_to_end(
     async with app.state.sessionmaker() as session:
         audit = (await session.execute(select(AuditLog))).scalars().all()
     assert len(audit) == 1
-    assert audit[0].old_value == {"requested_action": "future_action"}
+    assert audit[0].old_value == {"requested_action": "future_action", "action_generation": 0}
+    assert audit[0].new_value == {"requested_action": "none", "action_generation": 1}
 
     after = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert after.json()["blocker"] != "requested_action_unknown"
@@ -1445,6 +1551,7 @@ async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
                     phase="checking",
                     requested_action="future_action",
                     updater_last_seen_at=last_seen,
+                    last_started_at=datetime.now(UTC) - timedelta(minutes=10),
                 )
             )
             await session.commit()
@@ -1452,11 +1559,11 @@ async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
     # Fresh heartbeat: a live sidecar could be mid-check.
     await plant(datetime.now(UTC))
     status = await client.get("/api/v1/updates/status", headers=_ADMIN)
-    assert status.json()["state"] == "checking"
-    assert status.json()["blocker"] != "requested_action_unknown"
+    assert status.json()["state"] == "unavailable"
+    assert status.json()["blocker"] == "coordinator_recovery_not_ready"
     refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
     assert refused.status_code == 409
-    assert refused.json()["detail"] == "coordinator_phase_known"
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
     assert (await coordinator.snapshot()).requested_action == "future_action"
 
     # Stale heartbeat: no check can be in flight; the wedge is flagged and the
@@ -1464,13 +1571,22 @@ async def test_checking_action_wedge_recovery_is_gated_on_sidecar_silence(
     await plant(datetime.now(UTC) - timedelta(minutes=2))
     status = await client.get("/api/v1/updates/status", headers=_ADMIN)
     assert status.json()["state"] == "unavailable"
-    assert status.json()["blocker"] == "requested_action_unknown"
+    assert status.json()["blocker"] == "coordinator_state_stale"
     recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
     assert recovered.status_code == 200
     snapshot = await coordinator.snapshot()
-    assert snapshot.phase == "checking"
+    assert snapshot.phase == "idle"
     assert snapshot.requested_action == "none"
     async with app.state.sessionmaker() as session:
         audit = (await session.execute(select(AuditLog))).scalars().all()
     assert len(audit) == 1
-    assert audit[0].old_value == {"requested_action": "future_action"}
+    assert audit[0].old_value == {
+        "phase": "checking",
+        "requested_action": "future_action",
+        "action_generation": 0,
+    }
+    assert audit[0].new_value == {
+        "phase": "idle",
+        "requested_action": "none",
+        "action_generation": 1,
+    }

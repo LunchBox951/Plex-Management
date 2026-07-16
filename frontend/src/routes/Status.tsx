@@ -83,7 +83,11 @@ function UpdatePanel({
   // the banner appears exactly when a guard is the thing blocking the controls.
   const phaseWedged = status.blocker === 'coordinator_state_unknown'
   const actionWedged = status.blocker === 'requested_action_unknown'
-  const wedged = phaseWedged || actionWedged
+  const staleWedged = status.blocker === 'coordinator_state_stale'
+  const waitingForRecovery = status.blocker === 'coordinator_recovery_not_ready'
+  const liveDrain = status.blocker === 'coordinator_drain_active'
+  const wedged = phaseWedged || actionWedged || staleWedged
+  const recoveryBlocked = wedged || waitingForRecovery || liveDrain
   // waiting_for_window describes the AUTOMATIC policy. Keep the explicit
   // manual action available there because it intentionally bypasses that
   // window. waiting_for_idle means an install is already queued.
@@ -181,7 +185,7 @@ function UpdatePanel({
           size="sm"
           loading={checkPending}
           disabled={
-            wedged ||
+            recoveryBlocked ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -197,7 +201,7 @@ function UpdatePanel({
           size="sm"
           loading={updatePending}
           disabled={
-            wedged ||
+            recoveryBlocked ||
             !status.updater_available ||
             operationActive ||
             updateQueued ||
@@ -214,12 +218,16 @@ function UpdatePanel({
           <p className="font-semibold text-error">
             {phaseWedged
               ? 'Coordinator in an unrecognized state'
-              : 'Queued action not recognized by this version'}
+              : actionWedged
+                ? 'Queued action not recognized by this version'
+                : 'Coordinator state is stale'}
           </p>
           <p className="mt-1 text-muted">
             {phaseWedged
-              ? 'Check and install are disabled — they can only fail until this is cleared. It’s usually the aftermath of a version rollback. Recovering re-anchors the coordinator to idle so the controls work again; a queued update is preserved for retry. If an update is still mid-flight, recovery is refused until its maintenance lease expires (a few minutes) — try again shortly.'
-              : 'A queued updater action isn’t recognized by this version — usually the aftermath of a version rollback — so every new check or install is refused as “already in progress”. Recovering clears the unrecognized action so the controls work again; nothing else is changed.'}
+              ? 'Check and install are disabled — they can only fail until this is cleared. Recovering re-anchors the coordinator to idle so the controls work again; a queued update is preserved for retry.'
+              : actionWedged
+                ? 'A queued updater action isn’t recognized by this version, so every new check or install is refused. Recovering clears it and invalidates late work; nothing else is changed.'
+                : 'The updater is stale. Recovery re-anchors it only after bounded evidence, preserves known actions, clears unknown actions while invalidating late work, and never removes a live lease.'}
           </p>
           <div className="mt-3">
             <Button
@@ -234,7 +242,17 @@ function UpdatePanel({
           </div>
         </div>
       ) : null}
-      {!status.updater_available && !wedged ? (
+      {waitingForRecovery ? (
+        <p className="mt-4 rounded-lg border border-searching/40 bg-searching/5 px-3 py-3 text-xs text-muted">
+          Recovery is waiting for a stale heartbeat and bounded age evidence. The updater is still potentially active; try again after the evidence window has elapsed.
+        </p>
+      ) : null}
+      {liveDrain ? (
+        <p className="mt-4 rounded-lg border border-searching/40 bg-searching/5 px-3 py-3 text-xs text-muted">
+          Recovery is refused while the maintenance lease is active. The lease is never removed by recovery; try again after it expires.
+        </p>
+      ) : null}
+      {!status.updater_available && !recoveryBlocked ? (
         <p className="mt-3 text-xs text-faint">
           Enable the automatic-update Compose profile to connect the scoped updater sidecar.
         </p>

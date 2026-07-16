@@ -11,9 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_session
+from plex_manager.domain.update_recovery import (
+    BUSY_COORDINATOR_PHASES,
+    RecoveryAction,
+    decide_recovery,
+)
 from plex_manager.repositories.update_coordination import CoordinatorSnapshot
 from plex_manager.services.update_coordination_service import (
+    COORDINATOR_RECOVERY_MAX_AGE,
     UPDATER_HEARTBEAT_MAX_AGE,
+    CoordinatorRecoveryNotReadyError,
     DrainLeaseActiveError,
     UnknownCoordinatorPhaseError,
     UpdateAction,
@@ -51,6 +58,7 @@ _UPDATER_HEARTBEAT_MAX_AGE = UPDATER_HEARTBEAT_MAX_AGE
 _SIDE_CAR_POLL_SECONDS = 15
 _AUTOMATIC_CHECK_INTERVAL = timedelta(minutes=15)
 _DRAIN_TTL = timedelta(minutes=10)
+_COORDINATOR_RECOVERY_MAX_AGE = COORDINATOR_RECOVERY_MAX_AGE
 _KNOWN_PHASES = frozenset(phase.value for phase in UpdatePhase)
 # ``"none"`` plus every operator intent this build understands. Mirrors the
 # repo layer's ``_KNOWN_REQUESTED_ACTIONS`` (which duplicates it for hexagonal
@@ -148,24 +156,35 @@ def _state_and_blocker(
     updater_available: bool,
     now: datetime,
 ) -> tuple[str, str | None]:
-    if snapshot.phase not in _KNOWN_PHASES:
-        return "unavailable", "coordinator_state_unknown"
-    # The action-only wedge (issue #354, Codex rounds 2-3): a rollback can
-    # leave a perfectly recognizable phase paired with a requested_action this
-    # build does not know, which makes request_action refuse ALL new intent
-    # while eligibility now fails closed on it (never hands the sidecar work
-    # over it). Flag it like the unknown-phase wedge -- and, like that check,
-    # BEFORE the updater-availability gate, because the recovery endpoint works
-    # without a live sidecar and the operator must be shown the button either
-    # way. Exemptions mirror force_reset_phase's matrix exactly: the LEASED
-    # busy phases always suppress it (their lease expiry converges), and the
-    # leaseless ``checking`` suppresses it only while the heartbeat is fresh
-    # enough that a check could genuinely be in flight.
-    if snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS and (
-        snapshot.phase not in _BUSY_PHASES
-        or (snapshot.phase == "checking" and not updater_available)
+    phase_started_at = (
+        snapshot.last_started_at or snapshot.requested_at
+        if snapshot.phase in BUSY_COORDINATOR_PHASES
+        else None
+    )
+    decision = decide_recovery(
+        phase=snapshot.phase,
+        requested_action=snapshot.requested_action,
+        updater_heartbeat_fresh=updater_available,
+        live_drain=snapshot.drain_owner is not None,
+        phase_started_at=phase_started_at,
+        now=now,
+        max_age=_COORDINATOR_RECOVERY_MAX_AGE,
+    )
+    if decision.action is RecoveryAction.LIVE_DRAIN and (
+        snapshot.phase not in _KNOWN_PHASES
+        or snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS
     ):
+        return "unavailable", "coordinator_drain_active"
+    if decision.action is RecoveryAction.WAIT and (
+        snapshot.requested_action not in _KNOWN_REQUESTED_ACTIONS or not updater_available
+    ):
+        return "unavailable", "coordinator_recovery_not_ready"
+    if decision.action is RecoveryAction.REANCHOR and snapshot.phase not in _KNOWN_PHASES:
+        return "unavailable", "coordinator_state_unknown"
+    if decision.action is RecoveryAction.ACTION_ONLY:
         return "unavailable", "requested_action_unknown"
+    if decision.action is RecoveryAction.REANCHOR:
+        return "unavailable", "coordinator_state_stale"
     if not updater_available:
         return "unavailable", "updater_unavailable"
     if snapshot.phase == "draining":
@@ -341,7 +360,14 @@ async def force_reset_endpoint(
         result = await coordinator.force_reset_coordinator_phase(
             actor_user_id=auth.user_id,
             updater_heartbeat_max_age=_UPDATER_HEARTBEAT_MAX_AGE,
+            recovery_max_age=_COORDINATOR_RECOVERY_MAX_AGE,
         )
+    except CoordinatorRecoveryNotReadyError as exc:
+        raise AppError(
+            status_code=409,
+            code="coordinator_recovery_not_ready",
+            message="Recovery is waiting for bounded stale evidence; try again shortly.",
+        ) from exc
     except DrainLeaseActiveError as exc:
         raise AppError(
             status_code=409,

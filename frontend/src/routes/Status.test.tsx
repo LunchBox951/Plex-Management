@@ -434,6 +434,44 @@ describe('Status', () => {
     await waitFor(() => expect(forceResetMutateAsync).toHaveBeenCalledTimes(1))
   })
 
+
+  it.each([
+    ['coordinator_recovery_not_ready', /waiting for a stale heartbeat/i],
+    ['coordinator_drain_active', /maintenance lease is active/i],
+  ])('shows non-actionable recovery blocker %s', (blocker, copy) => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state: 'unavailable', updater_available: true, blocker }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText(copy)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update when ready' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Recover coordinator' })).not.toBeInTheDocument()
+  })
+
+  it('offers stale-state recovery and explains preservation', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ state: 'unavailable', updater_available: false, blocker: 'coordinator_state_stale' }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText('Coordinator state is stale')).toBeInTheDocument()
+    expect(screen.getByText(/preserves known actions/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Recover coordinator' })).toBeInTheDocument()
+  })
   it('hides the coordinator recovery affordance for a healthy coordinator', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })

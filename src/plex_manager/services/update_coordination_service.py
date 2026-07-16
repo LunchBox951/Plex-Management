@@ -25,6 +25,7 @@ from enum import StrEnum
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.repositories.update_coordination import (
+    CoordinatorRecoveryNotReadyError,
     CoordinatorSnapshot,
     DrainLeaseActiveError,
     ForceResetResult,
@@ -35,7 +36,9 @@ from plex_manager.repositories.update_coordination import (
 from plex_manager.services import audit_service
 
 __all__ = [
+    "COORDINATOR_RECOVERY_MAX_AGE",
     "UPDATER_HEARTBEAT_MAX_AGE",
+    "CoordinatorRecoveryNotReadyError",
     "CoordinatorSnapshot",
     "DrainClaim",
     "DrainLeaseActiveError",
@@ -59,6 +62,7 @@ _DEFAULT_CRITICAL_TTL = timedelta(minutes=5)
 # ``force_reset_coordinator_phase``'s checking-phase predicate, so "is a check
 # plausibly in flight" can never drift from "is the sidecar connected".
 UPDATER_HEARTBEAT_MAX_AGE = timedelta(seconds=45)
+COORDINATOR_RECOVERY_MAX_AGE = timedelta(minutes=10)
 _logger = logging.getLogger(__name__)
 
 
@@ -349,6 +353,7 @@ class UpdateCoordinationService:
         *,
         actor_user_id: int | None,
         updater_heartbeat_max_age: timedelta = UPDATER_HEARTBEAT_MAX_AGE,
+        recovery_max_age: timedelta = COORDINATOR_RECOVERY_MAX_AGE,
     ) -> ForceResetResult | None:
         """Admin break-glass: re-anchor an unrecognized coordinator phase to idle.
 
@@ -379,20 +384,28 @@ class UpdateCoordinationService:
         async with self._sessionmaker() as session:
             repo = SqlUpdateCoordinationRepository(session)
             result = await repo.force_reset_phase(
-                self._now(), updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age)
+                self._now(),
+                updater_heartbeat_max_age=_positive_ttl(updater_heartbeat_max_age),
+                recovery_max_age=_positive_ttl(recovery_max_age),
             )
             if result is None:
                 return None
-            old_value: dict[str, str] = {}
-            new_value: dict[str, str] = {}
+            old_value: dict[str, object] = {}
+            new_value: dict[str, object] = {}
             if result.old_phase is not None:
                 old_value["phase"] = result.old_phase
                 new_value["phase"] = UpdatePhase.idle.value
             if result.cleared_requested_action is not None:
                 old_value["requested_action"] = result.cleared_requested_action
                 new_value["requested_action"] = "none"
+            if (
+                result.old_action_generation is not None
+                and result.new_action_generation is not None
+            ):
+                old_value["action_generation"] = result.old_action_generation
+                new_value["action_generation"] = result.new_action_generation
             description = (
-                "Force-reset an unrecognized update coordinator phase to idle."
+                "Force-reset the update coordinator phase to idle."
                 if result.old_phase is not None
                 else "Cleared an unrecognized queued updater action."
             )
