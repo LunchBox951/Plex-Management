@@ -251,6 +251,43 @@ describe('Status', () => {
     expect(screen.getByRole('button', { name: 'Update queued' })).toBeDisabled()
   })
 
+  it('shows a direction-free build-mismatch banner with the refresh command', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ updater_build_matches_app: false }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.getByText('Updater is running a different build')).toBeInTheDocument()
+    expect(
+      screen.getByText('docker compose --profile auto-update up -d updater'),
+    ).toBeInTheDocument()
+    // Direction-free (R3): never claims the sidecar is older or newer.
+    expect(screen.queryByText(/older|newer/i)).not.toBeInTheDocument()
+  })
+
+  it('shows no build-mismatch banner when identity is unknown or matching', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+    // `null` is the expected pre-stage-1 state (sidecar hasn't reported its
+    // identity) — it must NOT raise a permanent banner on a healthy install.
+    ;(useUpdateStatus as unknown as Mock).mockReturnValue({
+      data: updateStatus({ updater_build_matches_app: null }),
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: updatesRefetch,
+    })
+    render(<Status />, { wrapper: Wrapper })
+    expect(screen.queryByText('Updater is running a different build')).not.toBeInTheDocument()
+  })
+
   it.each([
     ['installing', 'Installing update'],
     ['rollback', 'Rolling back'],

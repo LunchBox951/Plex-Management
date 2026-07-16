@@ -1961,3 +1961,188 @@ async def test_checking_action_wedge_recovery_is_bounded_despite_live_polling(
         "requested_action": "none",
         "action_generation": 1,
     }
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0025 stage 0: sidecar identity + self-refresh observability (issue #299)
+# --------------------------------------------------------------------------- #
+async def _fresh_coordinator(app: FastAPI) -> UpdateCoordinationService:
+    coordinator = UpdateCoordinationService(app.state.sessionmaker)
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    return coordinator
+
+
+async def test_old_sidecar_checking_heartbeat_still_validates(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """C7 backward-compat: the pre-expand ``{phase, action_generation}`` beat works."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    generation = await coordinator.request_action(UpdateAction.check)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking", "action_generation": generation},
+    )
+    assert response.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "checking"
+    assert snapshot.updater_last_seen_at is not None
+
+
+async def test_phaseless_liveness_heartbeat_writes_no_phase(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    """The C7 expand direction: a phase-less beat refreshes liveness only."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    generation = await coordinator.request_action(UpdateAction.check)
+    before = await coordinator.snapshot()
+    assert before.phase == "idle"
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={},
+    )
+    assert response.status_code == 200
+    after = await coordinator.snapshot()
+    # Liveness refreshed, but phase / action / generation are untouched.
+    assert after.updater_last_seen_at is not None
+    assert after.phase == "idle"
+    assert after.requested_action == "check"
+    assert after.action_generation == generation
+
+
+async def test_heartbeat_persists_and_surfaces_sidecar_identity(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={
+            "updater_build": "sidecar-build",
+            "updater_digest": "sha256:" + "a" * 64,
+            "updater_container_id": "deadBEEF01",
+            "refresh_nonce": "nonce-1_A",
+        },
+    )
+    assert response.status_code == 200
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_observed_build"] == "sidecar-build"
+    assert body["updater_observed_digest"] == "sha256:" + "a" * 64
+
+
+async def test_heartbeat_rejects_unknown_field_and_bare_checking(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    # extra="forbid" stays in force for genuinely unknown fields.
+    extra = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking", "action_generation": 0, "bogus": 1},
+    )
+    assert extra.status_code == 422
+    # The pre-expand contract is preserved: a checking beat needs its generation.
+    bare = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={"phase": "checking"},
+    )
+    assert bare.status_code == 422
+
+
+async def test_status_null_observed_identity_reads_stale(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """R2: absent observed identity is unknown (None), never a clean match."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is None
+    assert body["updater_observed_build"] is None
+
+
+async def test_status_sidecar_ahead_reads_mismatch_not_older(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """R3: a differing observed digest is a direction-free mismatch (False)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    # App observed its OWN image (target) at digest N-1 after a rollback.
+    generation = await coordinator.request_action(UpdateAction.check)
+    assert await coordinator.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.no_update,
+        current_build="app-build-n1",
+        current_digest="sha256:" + "1" * 64,
+    )
+    # The sidecar reports it is running N+1 (ahead) -- still a mismatch.
+    await coordinator.record_updater_identity(
+        observed_build="sidecar-build-n1plus",
+        observed_digest="sha256:" + "2" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is False
+
+
+async def test_status_same_digest_reads_match(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    generation = await coordinator.request_action(UpdateAction.check)
+    assert await coordinator.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.no_update,
+        current_build="app-build",
+        current_digest="sha256:" + "f" * 64,
+    )
+    await coordinator.record_updater_identity(
+        observed_build="app-build",
+        observed_digest="sha256:" + "f" * 64,
+    )
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["updater_build_matches_app"] is True
+
+
+async def test_status_surfaces_failed_refresh_record(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
+) -> None:
+    """north star #3: a durable failed self-refresh is shown, not masked."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    coordinator = await _fresh_coordinator(app)
+    await coordinator.record_refresh_outcome(
+        result="failed",
+        detail_code="successor_never_pinged",
+        from_build="old",
+        to_build="new",
+    )
+    # A later ordinary identity heartbeat must not clear the record.
+    await coordinator.record_updater_identity(observed_build="old", observed_digest="sha256:old")
+
+    body = (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()
+    assert body["last_refresh"]["result"] == "failed"
+    assert body["last_refresh"]["detail_code"] == "successor_never_pinged"
+    assert body["last_refresh"]["from_build"] == "old"
+    assert body["last_refresh"]["to_build"] == "new"

@@ -44,6 +44,7 @@ from plex_manager.web.schemas import (
     UpdateLeaseRequest,
     UpdateLeaseResponse,
     UpdateOutcomeRequest,
+    UpdateRefreshItem,
     UpdateRenewRequest,
     UpdateResultItem,
     UpdateStatusResponse,
@@ -143,6 +144,50 @@ def _last_result(snapshot: CoordinatorSnapshot) -> UpdateResultItem | None:
     )
 
 
+def _refresh_item(snapshot: CoordinatorSnapshot) -> UpdateRefreshItem | None:
+    """The durable self-refresh record, or ``None`` when none was ever recorded."""
+    if snapshot.last_refresh_result is None:
+        return None
+    return UpdateRefreshItem(
+        result=snapshot.last_refresh_result,
+        detail_code=snapshot.last_refresh_detail_code,
+        from_build=snapshot.last_refresh_from_build,
+        to_build=snapshot.last_refresh_to_build,
+        at=snapshot.last_refresh_at,
+    )
+
+
+def _updater_build_matches(
+    snapshot: CoordinatorSnapshot,
+    *,
+    app_build: str,
+) -> bool | None:
+    """Whether the sidecar runs the SAME image as the app (ADR-0025 stage 0).
+
+    R2: an ABSENT observed identity (the sidecar has not reported it -- the
+    expected state until the stage-1 emitting sidecar ships) is ``None``
+    ("unknown / refresh recommended"), NEVER a clean ``True`` match. R3: a
+    present-but-different identity is ``False`` ("version mismatch") with NO
+    direction -- C7 lets the sidecar run a build AHEAD of an app that rolled
+    back, so this never asserts older/newer. Q3: compare the image DIGEST first
+    (a same-SHA rebuild shares the build id but differs in bytes), falling back
+    to the human-readable build id only when a digest is unavailable on either
+    side.
+    """
+    observed_build = snapshot.updater_observed_build
+    observed_digest = snapshot.updater_observed_digest
+    if observed_build is None and observed_digest is None:
+        return None
+    app_digest = snapshot.current_digest
+    if observed_digest is not None and app_digest is not None:
+        return observed_digest == app_digest
+    if observed_build is not None:
+        return observed_build == app_build
+    # Only a digest was observed but the app has no digest to compare it to --
+    # honestly unknown rather than a fabricated match.
+    return None
+
+
 def _state_and_blocker(
     snapshot: CoordinatorSnapshot,
     policy: AutomaticUpdatePolicy,
@@ -223,10 +268,11 @@ async def _status(
     available = coordinator.updater_available(snapshot, max_age=_UPDATER_HEARTBEAT_MAX_AGE)
     state, blocker = _state_and_blocker(snapshot, policy, updater_available=available, now=now)
     window = policy.schedule.next_window(now)
+    app_build = snapshot.current_build or current_build_id()
     return UpdateStatusResponse(
         state=state,  # type: ignore[arg-type]
         updater_available=available,
-        current_build=snapshot.current_build or current_build_id(),
+        current_build=app_build,
         current_digest=snapshot.current_digest,
         available_build=snapshot.available_build,
         available_digest=snapshot.available_digest,
@@ -236,6 +282,10 @@ async def _status(
         blocker=blocker,
         last_checked_at=snapshot.last_checked_at,
         last_result=_last_result(snapshot),
+        updater_build_matches_app=_updater_build_matches(snapshot, app_build=app_build),
+        updater_observed_build=snapshot.updater_observed_build,
+        updater_observed_digest=snapshot.updater_observed_digest,
+        last_refresh=_refresh_item(snapshot),
     )
 
 
@@ -530,6 +580,29 @@ async def heartbeat_endpoint(body: UpdateHeartbeatRequest, request: Request) -> 
             code="coordinator_state_unknown",
             message="The update coordinator is in an unrecognized state.",
         )
+    # ADR-0025 stage 0 (issue #299): accept and persist a newer sidecar's own
+    # reported image identity, independently of whether this beat also carries a
+    # ``checking`` phase. Never required -- the current sidecar sends neither.
+    if body.updater_build is not None or body.updater_digest is not None:
+        await _guard_unknown_phase(
+            coordinator.record_updater_identity(
+                observed_build=body.updater_build,
+                observed_digest=body.updater_digest,
+            )
+        )
+    if body.phase is None:
+        # The phase-less liveness heartbeat (the C7 expand direction): refresh
+        # ``updater_last_seen_at`` only -- deliberately NEVER rewrite the
+        # coordinator phase (the no-phase-writes invariant). ``touch_updater``
+        # with no phase/generation is an unconditional liveness write.
+        await _guard_unknown_phase(coordinator.touch_updater())
+        return UpdateLeaseResponse(
+            ready=False,
+            lease_seconds=int(_DRAIN_TTL.total_seconds()),
+            blocker=None,
+        )
+    # The pre-expand ``checking`` heartbeat: unchanged CAS-guarded phase touch.
+    # The schema validator guarantees ``action_generation`` is present here.
     after = await _guard_unknown_phase(
         coordinator.touch_updater(
             phase=UpdatePhase(body.phase),

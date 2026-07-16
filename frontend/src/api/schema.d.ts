@@ -3111,15 +3111,32 @@ export interface components {
         /**
          * UpdateHeartbeatRequest
          * @description Unleased liveness for digest checks before a drain is claimed.
+         *
+         *     ADR-0025 stage 0 (issue #299) is the C7 forward-compatibility "expand": the
+         *     app must ACCEPT a newer sidecar's phase-less liveness heartbeat and its own
+         *     reported image identity WITHOUT requiring them. The current sidecar keeps
+         *     sending exactly ``{"phase": "checking", "action_generation": N}`` (nothing
+         *     in this release emits the new fields), which still validates unchanged; a
+         *     future sidecar may instead omit ``phase`` and attach its own build/digest.
+         *     ``extra="forbid"`` is deliberately KEPT -- the new fields are now known, so
+         *     an unknown field is still rejected -- but ``phase``/``action_generation``
+         *     become optional and the ``checking`` invariant is re-imposed by validator so
+         *     the old contract is preserved exactly (a ``checking`` heartbeat still
+         *     requires its ``action_generation``).
          */
         UpdateHeartbeatRequest: {
             /** Action Generation */
-            action_generation: number;
-            /**
-             * Phase
-             * @constant
-             */
-            phase: "checking";
+            action_generation?: number | null;
+            /** Phase */
+            phase?: "checking" | null;
+            /** Refresh Nonce */
+            refresh_nonce?: string | null;
+            /** Updater Build */
+            updater_build?: string | null;
+            /** Updater Container Id */
+            updater_container_id?: string | null;
+            /** Updater Digest */
+            updater_digest?: string | null;
         };
         /** UpdateLeaseRequest */
         UpdateLeaseRequest: {
@@ -3166,6 +3183,29 @@ export interface components {
              * @enum {string}
              */
             outcome: "no_update" | "update_available" | "succeeded" | "failed" | "rolled_back";
+            /** To Build */
+            to_build?: string | null;
+        };
+        /**
+         * UpdateRefreshItem
+         * @description The last recorded self-refresh outcome for the updater sidecar itself.
+         *
+         *     ADR-0025 stage 0 (issue #299): a durable record of the sidecar's own
+         *     container replacement, distinct from :class:`UpdateResultItem` (which is the
+         *     APP/target update). All fields are best-effort -- a stage-1 sidecar reports
+         *     what it can. ``result`` is an OPEN string (e.g. ``failed`` / ``succeeded``)
+         *     so a future outcome value stays renderable by the neutral frontend without a
+         *     contract change.
+         */
+        UpdateRefreshItem: {
+            /** At */
+            at?: string | null;
+            /** Detail Code */
+            detail_code?: string | null;
+            /** From Build */
+            from_build?: string | null;
+            /** Result */
+            result: string;
             /** To Build */
             to_build?: string | null;
         };
@@ -3225,6 +3265,7 @@ export interface components {
             current_digest?: string | null;
             /** Last Checked At */
             last_checked_at?: string | null;
+            last_refresh?: components["schemas"]["UpdateRefreshItem"] | null;
             last_result?: components["schemas"]["UpdateResultItem"] | null;
             /** Next Window End */
             next_window_end?: string | null;
@@ -3237,6 +3278,12 @@ export interface components {
             state: "disabled" | "unavailable" | "idle" | "checking" | "update_available" | "waiting_for_window" | "waiting_for_idle" | "draining" | "installing" | "rollback" | "succeeded" | "failed";
             /** Updater Available */
             updater_available: boolean;
+            /** Updater Build Matches App */
+            updater_build_matches_app?: boolean | null;
+            /** Updater Observed Build */
+            updater_observed_build?: string | null;
+            /** Updater Observed Digest */
+            updater_observed_digest?: string | null;
         };
         /** ValidationError */
         ValidationError: {

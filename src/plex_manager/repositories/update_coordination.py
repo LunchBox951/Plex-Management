@@ -132,6 +132,16 @@ class CoordinatorSnapshot:
     active_critical_operations: int
     drain_owner: str | None
     drain_expires_at: datetime | None
+    # ADR-0025 stage 0 (issue #299): the sidecar's OWN reported image identity
+    # and the last durable self-refresh outcome. All ``None`` until a sidecar
+    # new enough to report them connects / a refresh is recorded.
+    updater_observed_build: str | None = None
+    updater_observed_digest: str | None = None
+    last_refresh_result: str | None = None
+    last_refresh_detail_code: str | None = None
+    last_refresh_from_build: str | None = None
+    last_refresh_to_build: str | None = None
+    last_refresh_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +286,80 @@ class SqlUpdateCoordinationRepository:
             active_critical_operations=critical_count,
             drain_owner=drain.owner if drain is not None else None,
             drain_expires_at=_as_utc(drain.expires_at) if drain is not None else None,
+            updater_observed_build=state.updater_observed_build,
+            updater_observed_digest=state.updater_observed_digest,
+            last_refresh_result=state.last_refresh_result,
+            last_refresh_detail_code=state.last_refresh_detail_code,
+            last_refresh_from_build=state.last_refresh_from_build,
+            last_refresh_to_build=state.last_refresh_to_build,
+            last_refresh_at=_as_utc(state.last_refresh_at),
+        )
+
+    async def record_updater_identity(
+        self,
+        *,
+        now: datetime,
+        observed_build: str | None,
+        observed_digest: str | None,
+    ) -> None:
+        """Persist the sidecar's OWN reported image identity (ADR-0025 stage 0).
+
+        A locked write like every other coordination write: fail closed on an
+        unrecognized phase (issue #322) rather than stamping over state this
+        build cannot interpret. Writes only the two identity columns -- it never
+        touches ``phase``/``requested_action`` (no coordination decision is
+        implied by liveness) and never clears ``last_refresh_*`` (an ordinary
+        heartbeat must not mask a recorded refresh failure). ``observed_build``
+        and ``observed_digest`` are a matched pair reported together by the
+        sidecar; both are written as given.
+        """
+        state = await self._lock()
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                updater_observed_build=observed_build,
+                updater_observed_digest=observed_digest,
+                updated_at=now,
+            )
+        )
+
+    async def record_refresh_outcome(
+        self,
+        *,
+        now: datetime,
+        result: str,
+        detail_code: str | None,
+        from_build: str | None,
+        to_build: str | None,
+    ) -> None:
+        """Persist the sidecar's last self-refresh outcome (ADR-0025 stage 0).
+
+        The ONLY writer of the durable ``last_refresh_*`` record. A surviving
+        predecessor after a FAILED self-refresh keeps heartbeating and looks
+        healthy, so this record -- untouched by ordinary heartbeats/identity
+        writes -- is what keeps the failure honestly visible (north star #3).
+        Locked and fail-closed on an unrecognized phase like the rest of the
+        module. Stage 0 ships no HTTP caller (nothing emits refreshes yet); the
+        method exists so the read/surface path is real and stage 1 only wires an
+        endpoint to it.
+        """
+        state = await self._lock()
+        if state.phase not in _KNOWN_COORDINATOR_PHASES:
+            raise UnknownCoordinatorPhaseError(state.phase)
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                last_refresh_result=result,
+                last_refresh_detail_code=detail_code,
+                last_refresh_from_build=from_build,
+                last_refresh_to_build=to_build,
+                last_refresh_at=now,
+                updated_at=now,
+            )
         )
 
     async def _backfill_legacy_busy_anchor(

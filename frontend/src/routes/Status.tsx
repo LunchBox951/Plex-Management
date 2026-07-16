@@ -252,6 +252,27 @@ function UpdatePanel({
           Recovery is refused while the maintenance lease is active. The lease is never removed by recovery; try again after it expires.
         </p>
       ) : null}
+      {status.updater_build_matches_app === false ? (
+        <div className="mt-4 rounded-lg border border-searching/40 bg-searching/5 px-3 py-3 text-xs">
+          {/* ADR-0025 stage 0 (issue #299): a confirmed build skew between the
+              sidecar and the app. Non-alarming (not an error tone) — it's a
+              maintenance nudge, not a failure. Deliberately direction-free: the
+              sidecar can legitimately be running a build AHEAD of an app that
+              rolled back, so this never says "older"/"newer" (R3). Shown only
+              for an explicit `false`; `null` (the sidecar hasn't reported its
+              identity — the norm until the emitting sidecar ships) raises no
+              banner, so a healthy install stays quiet. */}
+          <p className="font-semibold text-searching">Updater is running a different build</p>
+          <p className="mt-1 text-muted">
+            The updater sidecar is on a different build than the app (a version mismatch). It keeps
+            running the image it started from until it&apos;s refreshed. Refresh it on the install
+            host with (no re-download needed):
+          </p>
+          <pre className="mt-2 overflow-x-auto rounded bg-bg px-2 py-1.5 font-mono text-[11px] text-ink">
+            docker compose --profile auto-update up -d updater
+          </pre>
+        </div>
+      ) : null}
       {!status.updater_available && !recoveryBlocked ? (
         <p className="mt-3 text-xs text-faint">
           Enable the automatic-update Compose profile to connect the scoped updater sidecar.
