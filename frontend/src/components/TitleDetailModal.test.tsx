@@ -3439,6 +3439,82 @@ describe('TitleDetailModal — request actions suppressed while /requests/by-tit
     expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
   })
 
+  it('a bound row MISSING from a stale non-empty cache stays checking, never acting on the wrong row (round 3)', async () => {
+    // The operator clicked a CONCRETE Requests row (id 99: an admin duplicate,
+    // or a row created after this title was last cached), but the stale
+    // non-empty by-title cache only knows an OLDER row for the same title.
+    // Falling through would resolve `liveRequest` to that wrong cached row via
+    // the active-else-newest fallback and point cancel/grab/pin/request-again
+    // at it. The gate must hold 'checking' until the epoch refetch answers.
+    const staleOtherRow = boundRow({ id: 81, status: 'no_acceptable_release' })
+    vi.mocked(useTitleRequests).mockReturnValue({
+      authoritative: false,
+      data: { requests: [staleOtherRow] },
+    } as never)
+
+    const view = render(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={99} />,
+    )
+
+    expect(screen.getByRole('button', { name: /checking/i })).toBeDisabled()
+    expect(screen.getByText('Checking for an existing request…')).toBeInTheDocument()
+    // None of the wrong row's controls: no Re-search (row 81's no-release
+    // verb), no Cancel, no Request again, no + Request.
+    expect(screen.queryByRole('button', { name: /re-search/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cancel request/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /request again/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /\+ request/i })).not.toBeInTheDocument()
+
+    // The epoch refetch lands with BOTH rows: the modal presents the CLICKED
+    // row's state (downloading), not the older duplicate's no-release.
+    vi.mocked(useTitleRequests).mockReturnValue({
+      authoritative: true,
+      data: { requests: [staleOtherRow, boundRow({ id: 99 })] },
+    } as never)
+    view.rerender(
+      <TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={99} />,
+    )
+
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /checking/i })).not.toBeInTheDocument(),
+    )
+    expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
+  })
+
+  it('a bound row PRESENT in the cache renders ITS controls even mid-refetch (round 3)', () => {
+    // The clicked row IS in the (possibly refetching) cache: the `liveRequest`
+    // memo gives it absolute priority, so its state is the honest thing to
+    // present -- no reason to hold 'checking' for an answer we already have.
+    vi.mocked(useTitleRequests).mockReturnValue({
+      authoritative: false,
+      data: { requests: [boundRow({ id: 81 }), boundRow({ id: 99, status: 'pending' })] },
+    } as never)
+
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={99} />)
+
+    expect(screen.queryByRole('button', { name: /checking/i })).not.toBeInTheDocument()
+    // The BOUND row's pending state, not the sibling's downloading.
+    expect(
+      screen.getByText('Your request is queued and will be searched automatically.'),
+    ).toBeInTheDocument()
+  })
+
+  it('an AUTHORITATIVE answer genuinely missing the bound row falls through to normal title resolution (round 3)', () => {
+    // The epoch fetch settled and the clicked row is truly gone (deleted/
+    // pruned server-side). Wedging on 'checking' for a row that no longer
+    // exists would lie; `liveRequest`'s documented fallback (active-else-
+    // newest for the title) presents the title's real remaining state.
+    vi.mocked(useTitleRequests).mockReturnValue({
+      authoritative: true,
+      data: { requests: [boundRow({ id: 81 })] },
+    } as never)
+
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} boundRequestId={99} />)
+
+    expect(screen.queryByRole('button', { name: /checking/i })).not.toBeInTheDocument()
+    expect(screen.getByText('A release was grabbed and is transferring.')).toBeInTheDocument()
+  })
+
   it('opened on a known TV request row: never defaults + Request to a whole-series create while non-authoritative', async () => {
     // The sharpest instance of the finding: for tv, a live '+ Request' shown
     // here (before the query confirms a request already exists) defaults

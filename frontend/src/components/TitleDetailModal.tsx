@@ -804,8 +804,29 @@ export function TitleDetailModal({
   // instance already has a concrete answer (a just-created row, or cached
   // rows — even slightly stale ones are REAL requests, never a spurious
   // '+ Request') and skip the gate even mid-fetch.
+  //
+  // Round 3: a caller-PINNED row (`boundRequestId`) must additionally be
+  // PRESENT before a stale cache is trusted — same authoritative predicate,
+  // one more consumer condition, no new mechanism. A non-empty cached answer
+  // that predates the clicked row (an admin's duplicate same-title row, or a
+  // row created after the older cache) otherwise falls through with
+  // `liveRequest` resolved to the WRONG row via the active-else-newest
+  // fallback, mis-targeting cancel/grab/pin/request-again at a row the
+  // operator never clicked while the epoch refetch is still in flight. The
+  // memo gives a present bound row absolute priority, so `liveRequest.id !==
+  // boundRequestId` is exactly "the clicked row is not in this answer".
+  // Once the query IS authoritative and the bound row is genuinely absent
+  // (the row was deleted/pruned server-side), fall through to the normal
+  // title resolution — `liveRequest`'s own documented fallback: presenting
+  // the title's real remaining state is honest, wedging on 'checking' for a
+  // row that no longer exists would not be. (`reboundRequestId` needs no
+  // clause here: a rebind is always set alongside `requestId`, which already
+  // short-circuits the gate.)
+  const boundRowUnresolved = boundRequestId != null && liveRequest?.id !== boundRequestId
   const titleRequestsUnresolved =
-    requestId === null && liveRequest === null && !requestsQuery.authoritative
+    requestId === null &&
+    !requestsQuery.authoritative &&
+    (liveRequest === null || boundRowUnresolved)
   const state: DerivedState = titleRequestsUnresolved
     ? { kind: 'checking' }
     : deriveState(
