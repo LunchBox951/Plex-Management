@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.logsafe import safe_text
 from plex_manager.services import path_visibility
 
 if TYPE_CHECKING:
@@ -242,7 +243,7 @@ async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
             _logger.warning(
                 "purge delete of %r failed (%s) while the caller was being "
                 "cancelled; the delete did not complete",
-                library_path,
+                safe_text(library_path),
                 type(worker_error).__name__,
             )
         raise asyncio.CancelledError
