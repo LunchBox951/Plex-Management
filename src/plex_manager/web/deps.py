@@ -253,6 +253,9 @@ api_key_header = _api_key_header
 # version/CAS or advisory lock spanning the same critical section.
 app_key_rotate_lock = asyncio.Lock()
 
+# One-process boundary for secret mutation, log reads/renders, and drain writes.
+secret_rotation_lock = asyncio.Lock()
+
 
 class AuthMethod(StrEnum):
     """How the current request authenticated."""
