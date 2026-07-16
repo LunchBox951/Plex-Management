@@ -3397,6 +3397,67 @@ async def test_rotate_app_key_rewrites_durable_and_live_logs(
     assert _API_KEY not in handler.snapshot_tail(1)[0].message
 
 
+async def test_rotate_app_key_cancelled_before_commit_launch_fails_safe(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #399 round 3: ``POST /app-key/rotate`` returns the NEW key exactly
+    once -- committing a rotation for a caller that already disconnected would
+    revoke the old recovery credential with the replacement undeliverable,
+    locking a recovery-only operator out. A cancellation already pending when
+    the boundary reaches its point of no return (the pre-commit checkpoint)
+    must land BEFORE the commit unit launches and fail SAFE: no key change, no
+    historical rewrite committed, snapshot restored, the OLD key still the
+    live credential. (The mirror ordering -- cancellation arriving once the
+    commit unit has genuinely started -- is pinned by the facet-1 test
+    ``test_cancel_during_commit_still_runs_the_completion_sweep``: the unit
+    stays atomic and the sweep still runs; both orderings must coexist.)"""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        session.add(LogEvent(level="INFO", logger="test", message=f"durable {_API_KEY}"))
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    app.state.log_handler = handler
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_checkpoint = settings_router._cancellation_checkpoint  # pyright: ignore[reportPrivateUsage]
+
+    async def paused_checkpoint() -> None:
+        entered.set()
+        await _wait_for_event(release)
+        await real_checkpoint()
+
+    monkeypatch.setattr(settings_router, "_cancellation_checkpoint", paused_checkpoint)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    )
+    await _wait_for_event(entered)
+    task.cancel()
+    await assert_task_raises(task, asyncio.CancelledError)
+
+    # Fail SAFE: nothing durable landed, the snapshot is restored...
+    assert handler.secret_values == frozenset({_API_KEY})
+    assert handler.retiring_values == frozenset()
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+        row = (await session.execute(select(LogEvent))).scalar_one()
+    assert system is not None and system.app_api_key == _API_KEY
+    assert row.message == f"durable {_API_KEY}"  # historical rewrite rolled back
+    # ...and the OLD key is still the live credential for a later attempt.
+    status_response = await client.get(
+        "/api/v1/settings/app-key/status", headers={"X-Api-Key": _API_KEY}
+    )
+    assert status_response.status_code == 200
+
+
 async def test_revoke_app_key_rewrites_durable_and_live_logs(
     client: httpx.AsyncClient,
     app: FastAPI,

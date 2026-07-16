@@ -240,6 +240,22 @@ async def _rewrite_before_secret_replacement(
     )
 
 
+async def _cancellation_checkpoint() -> None:
+    """Give any already-pending cancellation of this task a place to land NOW.
+
+    A zero-delay checkpoint (``await asyncio.sleep(0)`` raises the pending
+    ``CancelledError``, if any, and otherwise merely yields one scheduler
+    tick). :func:`secret_rotation` awaits this immediately before launching
+    the non-cancellable commit unit -- the boundary's deliberate point of no
+    return (codex #399 round 3): a caller that has already disconnected fails
+    safe *here*, before anything durable can land, instead of having a
+    credential rotation committed whose response can no longer be delivered.
+    A named helper (not an inline ``sleep(0)``) so tests can pin the exact
+    interleaving deterministically.
+    """
+    await asyncio.sleep(0)
+
+
 async def _commit_and_complete(
     session: AsyncSession,
     handler: LogCaptureHandler,
@@ -313,17 +329,40 @@ async def secret_rotation(
        cancellation that arrives once the commit is durable can never skip the
        sweep and strand a retired value in the queue/ring after it has left
        ``secret_values()`` (facet 1).
+
+    **Point of no return / known residual.** Immediately before the commit
+    unit launches, :func:`_cancellation_checkpoint` gives any already-pending
+    cancellation one final place to land -- a caller that has already
+    disconnected fails SAFE (rollback, snapshot restored, old credential still
+    valid) rather than having a rotation committed whose response can no
+    longer be delivered (``POST /app-key/rotate`` returns the new key exactly
+    once). Once the unit has genuinely started it is deliberately unstoppable:
+    a cancellation arriving mid-commit still lands the rotation atomically --
+    the inherent residual of atomic credential rotation, since tearing the
+    unit apart is the strictly worse failure. For the app-key rotate shape the
+    operational recovery is the admin-session reveal path (``GET /app-key``
+    with a Plex-session admin); a two-phase old-key-grace design could remove
+    the residual entirely but is future hardening, not this boundary's scope.
     """
     handler = _log_handler(request)
     # (a) Release any pre-lock write transaction BEFORE we start waiting on the
-    # lock -- see property (a) above.
-    await session.rollback()
+    # lock -- see property (a) above. SHIELDED (codex #399 round 3): a
+    # cancellation delivered during THIS await would otherwise interrupt the
+    # rollback's DB op mid-flight -- before any of the shielded handlers below
+    # are installed -- and a half-cancelled aiosqlite rollback closes the
+    # connection and poisons the shared boundary, the exact hazard those
+    # handlers exist to prevent. The escaping CancelledError still cancels the
+    # request (nothing is staged or widened yet); the rollback simply runs to
+    # completion regardless.
+    await asyncio.shield(session.rollback())
     async with secret_rotation_lock:
         # (b) Fresh transaction under the lock. The pre-lock rollback already
         # ended the caller's transaction; this belt-and-suspenders rollback keeps
         # the "every read below is post-lock and fresh" contract explicit and
         # robust to a future caller that touches the session between (a) and here.
-        await session.rollback()
+        # Shielded for the same reason as every other rollback in this boundary:
+        # a cancellation here must not tear the DB op and poison the connection.
+        await asyncio.shield(session.rollback())
         if reread_retiring is not None:
             retiring_values = await reread_retiring(session)
         transition_values = (
@@ -335,13 +374,24 @@ async def secret_rotation(
         try:
             await _rewrite_before_secret_replacement(session, retiring_values)
             yield
+            # POINT OF NO RETURN (codex #399 round 3). A cancellation already
+            # pending against this request must land HERE, before the commit
+            # unit launches: several rotations return the new credential in
+            # the response exactly once (``POST /app-key/rotate`` -- a
+            # recovery-only caller holds no other credential), so committing a
+            # rotation for a caller that has already disconnected would revoke
+            # the old credential with the replacement undeliverable. Landing
+            # the cancellation here takes the existing fail-safe handler below:
+            # rollback, snapshot restored, old credential still valid.
+            await _cancellation_checkpoint()
         except asyncio.CancelledError:
-            # Cancelled BEFORE the commit unit began (during the rewrite or the
-            # caller's body): nothing durable landed. Restore the in-memory
-            # snapshot first (synchronous, always runs), then SHIELD the rollback
-            # so its DB op completes instead of being cancelled mid-flight -- a
-            # half-cancelled aiosqlite rollback closes the connection and poisons
-            # the shared boundary for the drain loop.
+            # Cancelled BEFORE the commit unit began (during the rewrite, the
+            # caller's body, or the final pre-commit checkpoint): nothing
+            # durable landed. Restore the in-memory snapshot first
+            # (synchronous, always runs), then SHIELD the rollback so its DB op
+            # completes instead of being cancelled mid-flight -- a
+            # half-cancelled aiosqlite rollback closes the connection and
+            # poisons the shared boundary for the drain loop.
             handler.abort_secret_rotation(previous_values)
             await asyncio.shield(session.rollback())
             raise

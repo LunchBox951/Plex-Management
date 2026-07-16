@@ -1797,6 +1797,74 @@ async def test_cancelled_sign_in_rotation_releases_lock_and_restores_snapshot(
     assert _NEW_PLEX_TOKEN in handler.secret_values
 
 
+async def test_cancel_during_pre_lock_rollback_completes_and_leaves_boundary_usable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #399 round 3: the boundary's PRE-LOCK rollback (the property-(a)
+    cleanup that releases the flushed writes before contending for the lock) is
+    SHIELDED. A cancellation delivered while it is awaiting must not interrupt
+    the DB op mid-flight -- a half-cancelled aiosqlite rollback closes the
+    connection and poisons the shared boundary. The request still ends
+    cancelled immediately (shield semantics: the rollback keeps running past
+    the request's end), nothing was staged or widened, the lock was never
+    contended, and the connection stays healthy: a retry succeeds end-to-end."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    lock = _ObservableLock()
+    monkeypatch.setattr(settings_router, "secret_rotation_lock", lock)
+
+    real_rollback = AsyncSession.rollback
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    rollback_completed = asyncio.Event()
+    calls = {"n": 0}
+
+    async def paused_first_rollback(self: AsyncSession) -> None:
+        # The FIRST rollback this request performs IS the boundary's pre-lock
+        # cleanup (nothing on the rotation path rolls back before it).
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            await _wait_for_event(release)
+            await real_rollback(self)
+            rollback_completed.set()
+            return
+        await real_rollback(self)
+
+    monkeypatch.setattr(AsyncSession, "rollback", paused_first_rollback)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    )
+    await _wait_for_event(entered)
+    task.cancel()
+    # The request ends cancelled WITHOUT waiting for the rollback (shield
+    # semantics) -- and without tearing it: the op is still pending, not dead.
+    await assert_task_raises(task, asyncio.CancelledError)
+    assert not rollback_completed.is_set()
+    release.set()
+    await _wait_for_event(rollback_completed)  # ...and it RAN TO COMPLETION
+
+    assert lock.acquire_count == 0  # cancelled before the lock was ever contended
+    assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})  # never widened
+    assert handler.retiring_values == frozenset()
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.plex_id == 42))).scalars().one()
+    assert user.encrypted_plex_token == _OLD_PLEX_TOKEN
+    # The connection was not poisoned: a full retry rotation succeeds.
+    monkeypatch.setattr(AsyncSession, "rollback", real_rollback)
+    retry = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    assert retry.status_code == 200
+    assert _NEW_PLEX_TOKEN in handler.secret_values
+
+
 def _token_routed_transport(
     accounts: dict[str, tuple[dict[str, object], list[dict[str, object]]]],
 ) -> httpx.MockTransport:
