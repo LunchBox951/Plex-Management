@@ -410,7 +410,10 @@ class UpdateCoordinationService:
         of a wedged state with no durable record of WHO did it, or when, would
         violate "honesty over silence" (north star #3). The audit row is written
         only when a reset actually happened -- the not-ready-yet, drain-active,
-        and true-no-op refusals all change nothing and record nothing -- and it
+        and true-no-op refusals perform no recovery mutation and write no audit
+        row, though observation side-effects (a legacy busy row's backfilled
+        start anchor, an expired-lease sweep) still commit durably so the
+        recovery clock starts on first contact -- and it
         names exactly what changed: the re-anchored phase, the cleared
         unrecognized ``requested_action``, the fenced ``action_generation``, or
         any combination of the three.
