@@ -241,6 +241,69 @@ _api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 # document instead of minting a duplicate.
 api_key_header = _api_key_header
 
+
+class Cell[T]:
+    """A single mutable slot standing in for a bare module-level global.
+
+    CodeQL's ``py/unused-global-variable`` flags a module-level name that is
+    written but has no LOCAL (same-module) read of that write, because its
+    liveness analysis doesn't follow a value across either (a) separate
+    invocations of a function that rebinds the name under ``global`` — the
+    only reader is a LATER call, not this one — or (b) a
+    ``from module import name`` into a DIFFERENT module, which creates an
+    independent binding the query doesn't trace back to its origin. Both
+    shapes fired in this codebase the same day: alert #358 on
+    ``auth._last_stale_key_eviction`` (a cadence gate read at the top of the
+    function it's rebound in, so the read always precedes the NEXT write) and
+    alert #363 on this module's ``secret_rotation_lock`` (read only via
+    cross-module ``async with`` in ``app.py``/``routers/ops.py``/
+    ``routers/settings.py``) — both dismissed as false positives (issue #385,
+    following the same-family precedent of issue #378 / PR #379's
+    ``py/ineffectual-statement`` fix).
+
+    The two mechanisms need two paired halves, and BOTH must be applied:
+
+    * **Dead-store (a), fixed by this class alone**: reading/writing ``.value``
+      turns every store into an ``Attribute`` write instead of a bare-name
+      ``global`` rebind, which isn't the "global variable" shape the query's
+      dataflow targets — so a cadence gate whose only reader is its own next
+      invocation stops firing (``auth._last_stale_key_eviction``).
+    * **From-import invisibility (b), NOT fixed by the wrapper alone**: if
+      readers still ``from module import name`` the Cell, the defining module
+      remains assigned-but-never-read from CodeQL's viewpoint and the alert
+      re-fires on the wrapped assignment (alert #368 on PR #405 proved this).
+      The readers must import the MODULE and read the global as a module
+      attribute (``from plex_manager.web import deps`` then
+      ``deps.secret_rotation_lock.value``) — a genuine cross-module read of
+      the defining module's global that the query does see.
+
+    Runtime semantics are unchanged either way: one object, one slot, read and
+    written exactly where the bare global used to be. A side benefit of the
+    module-attribute half: there is exactly ONE binding, so test doubles patch
+    ``deps.secret_rotation_lock.value`` once instead of chasing a re-bound copy
+    per importing module.
+
+    Reach for this pairing — Cell for cross-invocation stores, module-attribute
+    reads for cross-module consumers — the next time the SAME rule fires,
+    instead of filing another one-off dismissal.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: T) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        # Compares against a BARE value, not another ``Cell``: tests assert e.g.
+        # ``auth_module._last_stale_key_eviction == 100.0`` directly against the
+        # wrapped float, so equality must work transparently without an extra
+        # ``.value`` hop. Nothing in this codebase compares two ``Cell``s.
+        return bool(self.value == other)
+
+    def __repr__(self) -> str:
+        return f"Cell({self.value!r})"
+
+
 # Serializes the app-key critical section across router modules. The rotate/revoke
 # endpoints (``settings`` router) do a read-modify-write on ``SystemSettings.app_api_key``
 # under this lock; the recovery-key EXCHANGE (``POST /api/v1/auth/api-key``, ``auth``
@@ -254,7 +317,14 @@ api_key_header = _api_key_header
 app_key_rotate_lock = asyncio.Lock()
 
 # One-process boundary for secret mutation, log reads/renders, and drain writes.
-secret_rotation_lock = asyncio.Lock()
+# Wrapped in ``Cell`` AND read by every consumer as ``deps.secret_rotation_lock``
+# module-attribute access, never via ``from``-import of the bare name (see the
+# ``Cell`` docstring for why both halves are required): this module's only read
+# of the lock used to be the assignment itself — every actual use is a
+# cross-module ``async with`` in ``app.py``/``routers/ops.py``/
+# ``routers/settings.py``, which is exactly the shape CodeQL's
+# py/unused-global-variable flagged as alerts #363/#368.
+secret_rotation_lock = Cell(asyncio.Lock())
 
 
 class AuthMethod(StrEnum):
