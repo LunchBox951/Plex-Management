@@ -25,10 +25,12 @@ from typing import Literal
 import httpx
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.config import get_settings
+from plex_manager.db import get_session
 from plex_manager.models import AuthSession, LogEvent, Setting, SystemSettings, User
 from plex_manager.services import log_capture_service
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
@@ -1283,7 +1285,18 @@ async def test_api_key_exchange_does_not_accept_plex_session(
 ) -> None:
     """A non-owner Plex session must NOT be able to mint an ADMIN recovery session
     by calling the exchange with no key: the endpoint validates the recovery key
-    specifically, never falling back to whatever cookie is already in the jar."""
+    specifically, never falling back to whatever cookie is already in the jar.
+
+    This is the RUNTIME half of a two-test pair (issue #380 finding 1, PR #398
+    review): it pins observed behavior end-to-end, including any auth performed
+    INSIDE the endpoint body (a hand-rolled ``authenticate_request(...)`` call or
+    a direct ``request.cookies`` read would slip past the dependency-graph shape
+    test below, whose view ends at the declared dependency surface). Its known
+    limitation is the converse: on today's implementation the cookie is inert by
+    construction, so this test's outcome is indistinguishable from
+    ``test_api_key_exchange_missing_key_rejected`` -- it only gains teeth the
+    moment someone wires cookie auth in. The shape test covers that gap from the
+    structural side; together they close both regression paths."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
     # A shared (non-owner) account signs in: it holds a limited (non-admin) session.
@@ -1296,6 +1309,59 @@ async def test_api_key_exchange_does_not_accept_plex_session(
     response = await client.post("/api/v1/auth/api-key")
     assert response.status_code == 401
     assert response.json()["detail"] == "recovery_key_rejected"
+
+
+async def test_api_key_exchange_dependency_shape_forbids_cookie_auth() -> None:
+    """A signed-in caller's Plex session cookie must NEVER be able to mint an ADMIN
+    recovery session by calling the exchange with no key (issue #380 finding 1).
+
+    The STRUCTURAL half of the pair with
+    ``test_api_key_exchange_does_not_accept_plex_session`` above. On today's
+    implementation the exchange's ``provided`` parameter is sourced exclusively
+    via ``Depends(api_key_header)`` -- an ``APIKeyHeader`` security scheme
+    FastAPI resolves ONLY from ``request.headers``, never ``request.cookies`` --
+    so a cookie in the jar is inert BY CONSTRUCTION and the behavioral test
+    alone cannot distinguish "cookie refused" from "cookie never consulted".
+
+    This pins that construction directly: nothing that can resolve an
+    ``AuthContext`` from a session cookie (``authenticate_request`` /
+    ``require_api_key`` / ``require_admin``) is reachable anywhere in this
+    route's FastAPI dependant graph. It catches the regression the endpoint's
+    docstring warns against -- wiring in ``require_api_key`` (as every
+    cookie-or-key protected route does) so a signed-in NON-admin could mint an
+    ADMIN recovery session -- even in variants that keep a cookie-less request's
+    401/``recovery_key_rejected`` response unchanged. Its own blind spot -- auth
+    performed inside the endpoint BODY, invisible to the dependant graph -- is
+    exactly what the runtime test above exists to catch.
+    """
+    (route,) = [
+        r
+        for r in auth_module.router.routes
+        if isinstance(r, APIRoute)
+        and r.path == "/api/v1/auth/api-key"
+        and r.methods is not None
+        and "POST" in r.methods
+    ]
+
+    def collect_calls(dependant: object, seen: set[object]) -> set[object]:
+        # `Dependant` from fastapi.dependencies.models; typed loosely here since the
+        # attribute isn't part of FastAPI's public type surface. Walks the
+        # SUB-dependency list only -- ``dependant`` itself is the endpoint function,
+        # not one of its dependencies.
+        for sub in getattr(dependant, "dependencies", []):
+            call = getattr(sub, "call", None)
+            if call is not None:
+                seen.add(call)
+            collect_calls(sub, seen)
+        return seen
+
+    calls = collect_calls(route.dependant, set())
+    # The ONLY two things this route depends on: the DB session and the
+    # header-sourced api-key scheme. No cookie-reading function is anywhere in it.
+    assert calls == {get_session, auth_module.api_key_header}
+    assert auth_module.authenticate_request not in calls
+    assert auth_module.require_api_key not in calls
+    assert auth_module.require_admin not in calls
 
 
 async def test_api_key_exchange_throttled_after_limit(
