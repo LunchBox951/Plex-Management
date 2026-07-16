@@ -17,13 +17,15 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
+from plex_manager.domain.update_recovery import KNOWN_REQUESTED_ACTIONS
 from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorState
 from plex_manager.repositories.update_coordination import (
     _BUSY_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
-    _KNOWN_REQUESTED_ACTIONS,  # pyright: ignore[reportPrivateUsage]
+    _as_utc,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.services.update_coordination_service import (
+    CoordinatorRecoveryNotReadyError,
     DrainLeaseActiveError,
     MaintenanceDrainingError,
     MaintenanceLeaseLostError,
@@ -544,6 +546,88 @@ async def test_drain_progress_is_token_bound_and_refreshes_active_phase(
     assert (await service.snapshot()).phase == "idle"
 
 
+async def test_phase_timestamp_uses_exact_persisted_transitions(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+
+    checking = await service.touch_updater(phase=UpdatePhase.checking)
+    assert checking is not None
+    assert checking.last_started_at == clock.now
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                last_started_at=None,
+                requested_at=clock.now - timedelta(minutes=5),
+            )
+        )
+        await session.commit()
+    clock.advance(timedelta(minutes=1))
+    same_checking = await service.touch_updater(phase=UpdatePhase.checking)
+    assert same_checking is not None
+    assert same_checking.last_started_at is None
+
+    await service.touch_updater(phase=UpdatePhase.idle)
+    clock.advance(timedelta(minutes=1))
+    idle_to_checking = await service.touch_updater(phase=UpdatePhase.checking)
+    assert idle_to_checking is not None
+    assert idle_to_checking.last_started_at == clock.now
+    clock.advance(timedelta(minutes=1))
+    checking_to_idle = await service.touch_updater(phase=UpdatePhase.idle)
+    assert checking_to_idle is not None
+    assert checking_to_idle.last_started_at is None
+
+
+async def test_drain_progress_anchors_each_exact_busy_transition(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=10))
+    assert claim is not None
+    assert (await service.snapshot()).last_started_at == clock.now
+
+    clock.advance(timedelta(minutes=1))
+    assert await service.renew_drain_progress(
+        claim.lease.token, ttl=timedelta(minutes=10), phase=UpdatePhase.installing
+    )
+    assert (await service.snapshot()).last_started_at == clock.now
+    clock.advance(timedelta(minutes=1))
+    assert await service.renew_drain_progress(
+        claim.lease.token, ttl=timedelta(minutes=10), phase=UpdatePhase.rollback
+    )
+    assert (await service.snapshot()).last_started_at == clock.now
+
+
+async def test_drain_progress_not_ready_fallback_anchors_persisted_draining(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    critical = await service.acquire_critical("import", ttl=timedelta(minutes=10))
+    assert critical is not None
+    claim = await service.claim_drain(ttl=timedelta(minutes=10))
+    assert claim is not None and not claim.ready
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="installing", last_started_at=clock.now - timedelta(minutes=5)
+            )
+        )
+        await session.commit()
+    clock.advance(timedelta(minutes=1))
+    assert not await service.renew_drain_progress(
+        claim.lease.token, ttl=timedelta(minutes=10), phase=UpdatePhase.rollback
+    )
+    snapshot = await service.snapshot()
+    assert snapshot.phase == "draining"
+    assert snapshot.last_started_at == clock.now
+
+
 async def test_plaintext_lease_token_is_never_persisted(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -862,6 +946,255 @@ async def _audit_rows(sessionmaker_: SessionMaker) -> list[AuditLog]:
         return list(result.scalars().all())
 
 
+@pytest.mark.parametrize(
+    ("heartbeat_offset", "expected_anchor_offset"),
+    [
+        (-timedelta(minutes=12), -timedelta(minutes=12)),
+        (None, timedelta(0)),
+        (timedelta(minutes=1), timedelta(0)),
+    ],
+)
+async def test_legacy_busy_snapshot_backfills_one_durable_age_anchor(
+    sessionmaker_: SessionMaker,
+    heartbeat_offset: timedelta | None,
+    expected_anchor_offset: timedelta,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    heartbeat = None if heartbeat_offset is None else clock.now + heartbeat_offset
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                last_started_at=None,
+                requested_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    snapshot = await service.snapshot()
+    assert snapshot.last_started_at == clock.now + expected_anchor_offset
+    clock.advance(timedelta(minutes=1))
+    assert (await service.snapshot()).last_started_at == snapshot.last_started_at
+
+
+async def test_direct_force_reset_alone_durably_starts_legacy_recovery_clock(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """An operator who ONLY ever hits force-reset (no status/snapshot between
+    attempts) must still converge: the first refused attempt commits the
+    backfilled `now` anchor despite raising, so the second attempt past the
+    bound recovers instead of re-creating a fresh anchor forever."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                last_started_at=None,
+                requested_at=None,
+                updater_last_seen_at=None,
+            )
+        )
+        await session.commit()
+
+    first_observed = clock.now
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+    # The refusal itself durably anchored the recovery clock.
+    assert _as_utc((await _row(sessionmaker_)).last_started_at) == first_observed
+
+    clock.advance(timedelta(minutes=10))
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_phase == "checking"
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.action_generation == 1
+
+
+async def test_refused_and_noop_force_resets_durably_commit_expired_drain_cleanup(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The same observation-durability rule for the other refusal shape: a
+    force-reset that finds an expired drain sweeps it and re-anchors the phase
+    to idle, and that cleanup must survive the no-op refusal that follows."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    assert (await _row(sessionmaker_)).phase == "draining"
+
+    clock.advance(timedelta(minutes=6))
+    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    async with sessionmaker_() as session:
+        assert (await session.execute(select(MaintenanceLease))).scalars().all() == []
+
+
+async def test_actionless_busy_reanchor_fences_late_worker_and_audits_generation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                action_generation=7,
+                last_started_at=clock.now - timedelta(minutes=10),
+                updater_last_seen_at=clock.now - timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_action_generation == 7
+    assert result.new_action_generation == 8
+    assert not await service.acknowledge_action(
+        expected_generation=7, result=UpdateResult.update_available
+    )
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.action_generation == 8
+    audit = await _audit_rows(sessionmaker_)
+    assert audit[0].old_value == {"phase": "checking", "action_generation": 7}
+    assert audit[0].new_value == {"phase": "idle", "action_generation": 8}
+
+
+@pytest.mark.parametrize("action", ["check", "install"])
+async def test_busy_reanchor_preserves_real_queued_action_generation(
+    sessionmaker_: SessionMaker, action: str
+) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action=action,
+                action_generation=7,
+                last_started_at=clock.now - timedelta(minutes=10),
+                updater_last_seen_at=clock.now - timedelta(minutes=2),
+            )
+        )
+        await session.commit()
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.old_action_generation is None
+    assert result.new_action_generation is None
+    row = await _row(sessionmaker_)
+    assert row.requested_action == action
+    assert row.action_generation == 7
+
+
+@pytest.mark.parametrize("phase", [*sorted(_BUSY_COORDINATOR_PHASES), "future_phase"])
+@pytest.mark.parametrize("action", ["none", "check", "install", "future_action"])
+async def test_reanchor_generation_fence_matrix(
+    sessionmaker_: SessionMaker, phase: str, action: str
+) -> None:
+    """The executable half of the recovery truth table: for EVERY
+    reanchor-eligible shape (each drainless busy phase past the bound, and the
+    unknown phase), force-reset bumps the generation exactly when no real
+    queued action is preserved, and a late worker outcome carrying the
+    pre-recovery generation is accepted exactly when its queued action
+    survived the reset. This pins the round-3 rule -- the absent-action fence
+    applies to unknown-phase reanchors too -- cell by cell."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase=phase,
+                requested_action=action,
+                action_generation=5,
+                last_started_at=clock.now - timedelta(minutes=10),
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == phase
+    fences = action in {"none", "future_action"}
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    if fences:
+        assert result.old_action_generation == 5
+        assert result.new_action_generation == 6
+        assert row.action_generation == 6
+        assert row.requested_action == "none"
+    else:
+        assert result.old_action_generation is None
+        assert result.new_action_generation is None
+        assert row.action_generation == 5
+        assert row.requested_action == action
+    late_outcome_accepted = await service.acknowledge_action(
+        expected_generation=5, result=UpdateResult.update_available
+    )
+    assert late_outcome_accepted is (not fences)
+
+
+async def test_work_dispatch_restarts_the_recovery_clock_for_a_stale_busy_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Handing real work to the sidecar over a stale busy row is a genuine
+    work-start even though the phase string repeats: the dispatch stamp must
+    move the anchor so an operator button press cannot fence the freshly
+    dispatched work, and recovery becomes available again only after the NEW
+    work has itself aged past the bound."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                action_generation=3,
+                last_started_at=clock.now - timedelta(minutes=30),
+            )
+        )
+        await session.commit()
+
+    assert await service.mark_busy_work_dispatched() is True
+    assert _as_utc((await _row(sessionmaker_)).last_started_at) == clock.now
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    clock.advance(timedelta(minutes=10))
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.new_action_generation == 4
+
+
+async def test_work_dispatch_stamp_refuses_non_busy_phases(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The dispatch stamp is a busy-phase work-restart marker only: outside a
+    busy phase there is no recovery clock to restart, and the anchor invariant
+    (non-busy phases never carry one) must hold."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+
+    assert await service.mark_busy_work_dispatched() is False
+    assert (await _row(sessionmaker_)).last_started_at is None
+
+
 async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -903,13 +1236,16 @@ async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
     assert audit[0].new_value == {"phase": "idle"}
 
 
-@pytest.mark.parametrize("known_phase", sorted(_KNOWN_COORDINATOR_PHASES))
-async def test_force_reset_refuses_every_known_phase_without_touching_state(
+@pytest.mark.parametrize(
+    "known_phase",
+    sorted(_KNOWN_COORDINATOR_PHASES - _BUSY_COORDINATOR_PHASES),
+)
+async def test_force_reset_refuses_every_non_busy_known_phase_without_touching_state(
     sessionmaker_: SessionMaker, known_phase: str
 ) -> None:
-    """The footgun guard: force-reset acts ONLY on an unrecognized phase. A
-    known phase -- including a live draining/installing/rollback -- is a no-op
-    refusal, never a reset of an in-flight update, and is never audited."""
+    """The footgun guard: every recognized non-busy phase is a no-op refusal,
+    never a reset and never audited. Busy-phase recovery is separately governed
+    by heartbeat freshness or drain ownership below."""
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
     await _plant_phase(sessionmaker_, known_phase)
@@ -979,7 +1315,7 @@ def test_known_requested_actions_track_update_action_exactly() -> None:
     known-requested-action literals can never silently diverge from ``"none"``
     plus the authoritative ``UpdateAction`` enum."""
     expected = frozenset({"none"}) | frozenset(action.value for action in UpdateAction)
-    assert expected == _KNOWN_REQUESTED_ACTIONS
+    assert expected == KNOWN_REQUESTED_ACTIONS
 
 
 async def test_force_reset_clears_an_unrecognized_requested_action(
@@ -1017,8 +1353,13 @@ async def test_force_reset_clears_an_unrecognized_requested_action(
     assert audit[0].old_value == {
         "phase": "future_installing",
         "requested_action": "future_action",
+        "action_generation": 0,
     }
-    assert audit[0].new_value == {"phase": "idle", "requested_action": "none"}
+    assert audit[0].new_value == {
+        "phase": "idle",
+        "requested_action": "none",
+        "action_generation": 1,
+    }
 
 
 async def test_force_reset_double_click_is_idempotent(
@@ -1084,8 +1425,14 @@ async def test_force_reset_clears_unknown_action_under_every_known_non_busy_phas
 
     audit = await _audit_rows(sessionmaker_)
     assert len(audit) == 1
-    assert audit[0].old_value == {"requested_action": "future_action"}
-    assert audit[0].new_value == {"requested_action": "none"}
+    assert audit[0].old_value == {
+        "requested_action": "future_action",
+        "action_generation": 0,
+    }
+    assert audit[0].new_value == {
+        "requested_action": "none",
+        "action_generation": 1,
+    }
 
     # The wedge is gone: fresh operator intent is accepted again.
     assert await service.request_action(UpdateAction.check) == row.action_generation + 1
@@ -1100,13 +1447,16 @@ async def test_force_reset_refuses_unknown_action_while_a_leased_operation_is_in
     writer of requested_action, so recovery must not race it -- refuse, change
     nothing, audit nothing, regardless of sidecar liveness. Both of those
     exits converge on a cell where the action-only reset becomes available.
-    ``checking`` is leaseless and is governed by the heartbeat predicate
+    ``checking`` is leaseless and is governed by the bounded start anchor
     instead (tests below)."""
     service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
     await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
     await _plant_action(sessionmaker_, busy_phase, "future_action")
 
-    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+    with pytest.raises(DrainLeaseActiveError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
 
     row = await _row(sessionmaker_)
     assert row.phase == busy_phase
@@ -1114,7 +1464,12 @@ async def test_force_reset_refuses_unknown_action_while_a_leased_operation_is_in
     assert await _audit_rows(sessionmaker_) == []
 
 
-async def _plant_checking_wedge(sessionmaker_: SessionMaker, last_seen: datetime | None) -> None:
+async def _plant_checking_wedge(
+    sessionmaker_: SessionMaker,
+    last_seen: datetime | None,
+    *,
+    started_at: datetime = datetime(2026, 7, 14, 11, 50, tzinfo=UTC),
+) -> None:
     async with sessionmaker_() as session:
         await session.execute(
             update(UpdateCoordinatorState)
@@ -1123,22 +1478,21 @@ async def _plant_checking_wedge(sessionmaker_: SessionMaker, last_seen: datetime
                 phase="checking",
                 requested_action="future_action",
                 updater_last_seen_at=last_seen,
+                last_started_at=started_at,
             )
         )
         await session.commit()
 
 
 @pytest.mark.parametrize("staleness", ["never_seen", "stale"])
-async def test_force_reset_clears_checking_action_wedge_once_heartbeat_is_stale(
+async def test_force_reset_clears_aged_checking_action_wedge(
     sessionmaker_: SessionMaker, staleness: str
 ) -> None:
-    """Codex round 3 on #357: ``checking`` is busy but LEASELESS -- nothing
-    ever expires it, so a blanket busy refusal left checking + unrecognized
-    action permanently unrecoverable with the sidecar gone. Once the heartbeat
-    is stale (or was never seen) beyond the 45s liveness contract, no check
-    can be in flight: the action-only reset proceeds, clearing the action but
-    deliberately leaving the phase ``checking`` -- the next completed check's
-    normal generation-CAS acknowledgement is the legitimate phase writer."""
+    """``checking`` is busy but LEASELESS -- nothing ever expires it, so a
+    blanket busy refusal left checking + unrecognized action permanently
+    unrecoverable. Once the start anchor is older than the recovery bound the
+    reset proceeds: the phase re-anchors to idle and the unrecognized action
+    is cleared under a bumped generation, fencing any late worker."""
     clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
     service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
     await service.initialize()
@@ -1147,43 +1501,66 @@ async def test_force_reset_clears_checking_action_wedge_once_heartbeat_is_stale(
 
     result = await service.force_reset_coordinator_phase(actor_user_id=None)
     assert result is not None
-    assert result.old_phase is None
+    assert result.old_phase == "checking"
     assert result.cleared_requested_action == "future_action"
 
     row = await _row(sessionmaker_)
-    assert row.phase == "checking"
+    assert row.phase == "idle"
     assert row.requested_action == "none"
     audit = await _audit_rows(sessionmaker_)
     assert len(audit) == 1
-    assert audit[0].old_value == {"requested_action": "future_action"}
+    assert audit[0].old_value == {
+        "phase": "checking",
+        "requested_action": "future_action",
+        "action_generation": 0,
+    }
+    assert audit[0].new_value == {
+        "phase": "idle",
+        "requested_action": "none",
+        "action_generation": 1,
+    }
 
 
-async def test_force_reset_refuses_checking_action_wedge_with_fresh_heartbeat(
+async def test_checking_action_wedge_recovery_is_bounded_despite_fresh_polling(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """While the sidecar heartbeat is FRESH, a check could genuinely be in
-    flight (or its outcome about to land), so the checking-phase action wedge
-    is still refused -- nothing changed, nothing audited. The predicate is the
-    same 45s contract updater_available uses, so 'refused' here always
-    coincides with the UI reporting a connected sidecar."""
+    """An OLD sidecar that merely repolls eligibility every 15s keeps the
+    heartbeat fresh forever without any work in flight; heartbeat freshness
+    must therefore never extend the recovery gate. A YOUNG start anchor still
+    refuses (a check could genuinely be in flight); once the anchor crosses
+    the recovery bound, the wedge recovers even while the heartbeat stays
+    fresh the whole time."""
     clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
     service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
     await service.initialize()
-    await _plant_checking_wedge(sessionmaker_, clock.now - timedelta(seconds=10))
+    await _plant_checking_wedge(
+        sessionmaker_,
+        clock.now - timedelta(seconds=10),
+        started_at=clock.now - timedelta(minutes=2),
+    )
 
-    assert await service.force_reset_coordinator_phase(actor_user_id=None) is None
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
 
     row = await _row(sessionmaker_)
     assert row.phase == "checking"
     assert row.requested_action == "future_action"
     assert await _audit_rows(sessionmaker_) == []
 
-    # The same wedge becomes recoverable as soon as the heartbeat crosses the
-    # liveness contract -- the bounded wait the refusal imposes.
-    clock.advance(timedelta(minutes=2))
+    # Eight more minutes of 15s repolls: the anchor crosses the bound while
+    # the heartbeat never goes stale. Recovery must proceed anyway.
+    clock.advance(timedelta(minutes=8))
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(updater_last_seen_at=clock.now - timedelta(seconds=10))
+        )
+        await session.commit()
     recovered = await service.force_reset_coordinator_phase(actor_user_id=None)
     assert recovered is not None
     assert recovered.cleared_requested_action == "future_action"
+    assert recovered.new_action_generation == 1
     assert (await _row(sessionmaker_)).requested_action == "none"
 
 
@@ -1276,6 +1653,363 @@ async def test_concurrent_force_resets_have_exactly_one_winner(tmp_path: Path) -
         async with maker() as session:
             audit = (await session.execute(select(AuditLog))).scalars().all()
         assert len(audit) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_force_reset_recovers_aged_actionless_checking_despite_fresh_polling(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A check stuck past the recovery bound recovers even while a live
+    sidecar keeps the heartbeat fresh by repolling: fresh polls prove
+    connectivity, never a check in flight, so they cannot extend the gate.
+    The abandoned checker's generation is fenced on the way out."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.check)
+    requested_at = clock.now - timedelta(minutes=31)
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=requested_at,
+                last_started_at=requested_at,
+                updater_last_seen_at=clock.now - timedelta(seconds=10),
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == "checking"
+    assert result.old_action_generation == generation
+    assert result.new_action_generation == generation + 1
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.action_generation == generation + 1
+    assert _as_utc(row.requested_at) == requested_at
+    assert not await service.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.update_available,
+    )
+
+
+async def test_force_reset_refuses_recent_checking_regardless_of_heartbeat(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A healthy in-flight automatic check (young start anchor) stays
+    protected no matter what the heartbeat says: the anchor is the evidence,
+    and it is younger than the recovery bound."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=clock.now - timedelta(minutes=2),
+                updater_last_seen_at=clock.now - timedelta(seconds=10),
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "checking"
+    assert row.action_generation == 0
+    assert row.requested_at is None
+    assert await _audit_rows(sessionmaker_) == []
+
+
+@pytest.mark.parametrize("last_seen", [None, datetime(2026, 7, 14, 11, 58, tzinfo=UTC)])
+async def test_force_reset_recovers_null_requested_at_abandoned_actionless_checking(
+    sessionmaker_: SessionMaker,
+    last_seen: datetime | None,
+) -> None:
+    """A stale or absent heartbeat must recover first-install automatic checks
+    despite their legitimately absent requested_at, fencing late generation 0."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=None,
+                last_started_at=clock.now - timedelta(minutes=10),
+                updater_last_seen_at=last_seen,
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == "checking"
+    assert result.old_action_generation == 0
+    assert result.new_action_generation == 1
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.action_generation == 1
+    assert row.requested_at is None
+    assert not await service.acknowledge_action(
+        expected_generation=0,
+        result=UpdateResult.update_available,
+    )
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].old_value == {"phase": "checking", "action_generation": 0}
+    assert audit[0].new_value == {"phase": "idle", "action_generation": 1}
+
+
+async def test_force_reset_refuses_recent_actionless_checking_with_stale_heartbeat(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A check must age past the existing heartbeat window before a missing
+    heartbeat can establish abandonment."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.check)
+    requested_at = clock.now - timedelta(seconds=10)
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=requested_at,
+                last_started_at=requested_at,
+                updater_last_seen_at=None,
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "checking"
+    assert row.action_generation == generation
+    assert _as_utc(row.requested_at) == requested_at
+    assert await _audit_rows(sessionmaker_) == []
+
+
+@pytest.mark.parametrize("last_seen", [None, datetime(2026, 7, 14, 11, 58, tzinfo=UTC)])
+async def test_force_reset_reanchors_abandoned_actionless_checking_and_fences_old_generation(
+    sessionmaker_: SessionMaker,
+    last_seen: datetime | None,
+) -> None:
+    """An aged start anchor is the abandonment evidence (with or without a
+    heartbeat). Recovery fences its old worker, preserves requested_at, and
+    audits the generation transition."""
+    clock = MutableClock(datetime(2026, 7, 14, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.check)
+    requested_at = clock.now - timedelta(minutes=10)
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                requested_at=requested_at,
+                last_started_at=requested_at,
+                updater_last_seen_at=last_seen,
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == "checking"
+    assert result.cleared_requested_action is None
+    assert result.old_action_generation == generation
+    assert result.new_action_generation == generation + 1
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "none"
+    assert row.action_generation == generation + 1
+    assert _as_utc(row.requested_at) == requested_at
+    assert not await service.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.update_available,
+    )
+    audit = await _audit_rows(sessionmaker_)
+    assert len(audit) == 1
+    assert audit[0].old_value == {
+        "phase": "checking",
+        "action_generation": generation,
+    }
+    assert audit[0].new_value == {
+        "phase": "idle",
+        "action_generation": generation + 1,
+    }
+
+
+async def test_force_reset_refuses_every_recovery_shape_while_drain_is_live(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A live drain is universal evidence of an in-flight updater generation,
+    even if rollback/skew left a superficially safe coordinator phase."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    claim = await service.claim_drain(ttl=timedelta(minutes=5))
+    assert claim is not None
+    await _plant_action(sessionmaker_, "idle", "future_action")
+
+    with pytest.raises(DrainLeaseActiveError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "future_action"
+    assert await _audit_rows(sessionmaker_) == []
+
+
+@pytest.mark.parametrize("phase", ["draining", "installing", "rollback"])
+@pytest.mark.parametrize("action", [UpdateAction.check, UpdateAction.install])
+async def test_force_reset_reanchors_drainless_busy_phase_preserving_queued_action(
+    sessionmaker_: SessionMaker,
+    phase: str,
+    action: UpdateAction,
+) -> None:
+    """A lost drain owner cannot strand a busy phase, but its legitimate queued
+    action remains retryable under the newly fenced generation."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(action)
+    requested_at = (await _row(sessionmaker_)).requested_at
+    await _plant_phase(sessionmaker_, phase)
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                last_started_at=datetime.now(UTC) - timedelta(minutes=11)
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == phase
+    assert result.cleared_requested_action is None
+    assert result.old_action_generation is None
+    assert result.new_action_generation is None
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == action.value
+    assert row.action_generation == generation
+    assert row.requested_at == requested_at
+    audit = await _audit_rows(sessionmaker_)
+    assert audit[0].old_value == {"phase": phase}
+    assert audit[0].new_value == {"phase": "idle"}
+
+
+@pytest.mark.parametrize("phase", ["draining", "installing", "rollback"])
+async def test_force_reset_reanchors_busy_phase_without_its_drain_lease(
+    sessionmaker_: SessionMaker, phase: str
+) -> None:
+    """Leased busy phases are only protected while their drain actually exists;
+    otherwise no later expiry can reach this orphaned phase."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    await _plant_action(sessionmaker_, phase, "future_action")
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                last_started_at=datetime.now(UTC) - timedelta(minutes=11)
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == phase
+    assert result.cleared_requested_action == "future_action"
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    assert row.requested_action == "none"
+
+
+async def test_action_only_reset_fences_late_outcome_and_audits_generation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Clearing skewed action invalidates the old generation, so a delayed
+    outcome cannot overwrite recovery; the audit records the fence."""
+    service = UpdateCoordinationService(sessionmaker_, token_factory=_tokens())
+    await service.initialize()
+    generation = await service.request_action(UpdateAction.check)
+    requested_at = (await _row(sessionmaker_)).requested_at
+    await _plant_action(sessionmaker_, "idle", "future_action")
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    row = await _row(sessionmaker_)
+    assert row.action_generation == generation + 1
+    assert row.requested_at == requested_at
+    assert not await service.acknowledge_action(
+        expected_generation=generation,
+        result=UpdateResult.update_available,
+    )
+    audit = await _audit_rows(sessionmaker_)
+    assert audit[0].old_value == {
+        "requested_action": "future_action",
+        "action_generation": generation,
+    }
+    assert audit[0].new_value == {
+        "requested_action": "none",
+        "action_generation": generation + 1,
+    }
+
+
+async def test_concurrent_drainless_busy_resets_have_exactly_one_winner(tmp_path: Path) -> None:
+    """Recovery re-reads under the lock: only one concurrent operator can
+    re-anchor an orphaned busy phase and write its audit trail."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'busy-reset.db'}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    first = UpdateCoordinationService(maker, token_factory=_tokens("first"))
+    second = UpdateCoordinationService(maker, token_factory=_tokens("second"))
+    await first.initialize()
+    try:
+        await _plant_action(maker, "installing", "future_action")
+        async with maker() as session:
+            await session.execute(
+                update(UpdateCoordinatorState).values(
+                    last_started_at=datetime.now(UTC) - timedelta(minutes=11)
+                )
+            )
+            await session.commit()
+        results = await asyncio.gather(
+            first.force_reset_coordinator_phase(actor_user_id=None),
+            second.force_reset_coordinator_phase(actor_user_id=None),
+        )
+        assert sorted(result is None for result in results) == [False, True]
+        assert (await _row(maker)).phase == "idle"
+        assert len(await _audit_rows(maker)) == 1
     finally:
         await engine.dispose()
 

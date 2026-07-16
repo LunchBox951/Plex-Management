@@ -11,9 +11,20 @@ from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.domain.update_recovery import (
+    BUSY_COORDINATOR_PHASES as _DOMAIN_BUSY_COORDINATOR_PHASES,
+)
+from plex_manager.domain.update_recovery import (
+    KNOWN_COORDINATOR_PHASES as _DOMAIN_KNOWN_COORDINATOR_PHASES,
+)
+from plex_manager.domain.update_recovery import (
+    RecoveryAction,
+    decide_recovery,
+)
 from plex_manager.models import MaintenanceLease, UpdateCoordinatorState
 
 __all__ = [
+    "CoordinatorRecoveryNotReadyError",
     "CoordinatorSnapshot",
     "DrainLeaseActiveError",
     "ForceResetResult",
@@ -30,19 +41,12 @@ LeaseKind = Literal["critical", "drain"]
 # test (tests/services/test_update_coordination_service.py) asserts this set
 # stays equal to ``frozenset(phase.value for phase in UpdatePhase)`` so the two
 # copies cannot silently diverge.
-_KNOWN_COORDINATOR_PHASES = frozenset(
-    {
-        "idle",
-        "checking",
-        "available",
-        "draining",
-        "installing",
-        "rollback",
-        "succeeded",
-        "failed",
-        "rolled_back",
-    }
-)
+_KNOWN_COORDINATOR_PHASES = _DOMAIN_KNOWN_COORDINATOR_PHASES
+_BUSY_COORDINATOR_PHASES = _DOMAIN_BUSY_COORDINATOR_PHASES
+
+
+class CoordinatorRecoveryNotReadyError(RuntimeError):
+    """Raised when recovery evidence is not yet sufficient."""
 
 
 class UnknownCoordinatorPhaseError(RuntimeError):
@@ -55,22 +59,6 @@ class UnknownCoordinatorPhaseError(RuntimeError):
     coordination write re-checks the phase itself, inside its own lock, and
     fails closed instead of guessing what an unrecognized phase means.
     """
-
-
-# The requested_action companion to ``_KNOWN_COORDINATOR_PHASES``, duplicated
-# here for the same hexagonal-layering reason (``UpdateAction`` lives in the
-# service layer). ``"none"`` plus every operator intent the sidecar consumes.
-# A drift-guard test asserts this stays equal to
-# ``{"none"} | {action.value for action in UpdateAction}``.
-_KNOWN_REQUESTED_ACTIONS = frozenset({"none", "check", "install"})
-
-# The phases in which the sidecar (or a check) is actively mid-operation and
-# owns the current ``action_generation``. Shared by :meth:`request_action`'s
-# refuse-to-clobber guard and :meth:`force_reset_phase`'s action-only branch:
-# while one of these is in flight, its own acknowledgement (generation CAS) or
-# lease expiry is the legitimate writer of ``requested_action``, so recovery
-# must not race it.
-_BUSY_COORDINATOR_PHASES = frozenset({"checking", "draining", "installing", "rollback"})
 
 
 class DrainLeaseActiveError(RuntimeError):
@@ -91,16 +79,18 @@ class DrainLeaseActiveError(RuntimeError):
 class ForceResetResult:
     """What a successful force-reset changed (for the caller's audit trail).
 
-    ``old_phase`` is the pre-reset phase iff it was itself unrecognized and
-    re-anchored to ``idle``; ``None`` for the ACTION-ONLY reset variant, where
-    the phase was known and untouched. ``cleared_requested_action`` is the
-    pre-reset ``requested_action`` iff it was unrecognized and normalized to
-    ``"none"``; ``None`` when the stored action was known and preserved
-    untouched. At least one field is always set on a successful reset.
+    ``old_phase`` is the pre-reset phase iff it was re-anchored to ``idle``;
+    ``None`` for the ACTION-ONLY reset variant, where the phase was known and
+    untouched. ``cleared_requested_action`` is the pre-reset
+    ``requested_action`` iff it was unrecognized and normalized to ``"none"``;
+    ``None`` when the stored action was known and preserved untouched. At least
+    one field is always set on a successful reset.
     """
 
     old_phase: str | None
     cleared_requested_action: str | None
+    old_action_generation: int | None
+    new_action_generation: int | None
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -109,19 +99,12 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC) if value is not None else None
 
 
-def _updater_heartbeat_fresh(last_seen: datetime | None, now: datetime, max_age: timedelta) -> bool:
-    """Whether the sidecar's last heartbeat is recent enough to call it live.
-
-    Mirrors ``UpdateCoordinationService.updater_available`` exactly (including
-    treating a future timestamp -- clock skew -- as NOT live), so the
-    force-reset checking predicate and the status endpoint's
-    ``updater_available`` can never disagree about the same row.
-    """
-    seen = _as_utc(last_seen)
-    if seen is None:
-        return False
-    age = now - seen
-    return timedelta(0) <= age <= max_age
+# NOTE: heartbeat freshness deliberately plays no part in recovery decisions.
+# Every eligibility poll refreshes ``updater_last_seen_at`` even when no work
+# is handed out, so freshness is not evidence of work in flight -- see
+# ``plex_manager.domain.update_recovery.decide_recovery`` for the two signals
+# that gate busy-phase recovery instead (live drain lease, bounded start-anchor
+# age).
 
 
 @dataclass(frozen=True)
@@ -259,13 +242,16 @@ class SqlUpdateCoordinationRepository:
                     UpdateCoordinatorState.id == 1,
                     UpdateCoordinatorState.phase.in_(("draining", "installing", "rollback")),
                 )
-                .values(phase="idle", updated_at=now)
+                .values(phase="idle", last_started_at=None, updated_at=now)
             )
         return result.rowcount
 
     async def snapshot(self, now: datetime) -> CoordinatorSnapshot:
         state = await self._lock()
         await self._cleanup_expired(now)
+        await self._session.refresh(state)
+        await self._backfill_legacy_busy_anchor(state, now)
+        await self._session.refresh(state)
         critical_count = await self._critical_count()
         drain = await self._active_drain()
         return CoordinatorSnapshot(
@@ -292,6 +278,68 @@ class SqlUpdateCoordinationRepository:
             drain_expires_at=_as_utc(drain.expires_at) if drain is not None else None,
         )
 
+    async def _backfill_legacy_busy_anchor(
+        self, state: UpdateCoordinatorState, now: datetime
+    ) -> None:
+        """Give pre-anchor busy rows one durable, fail-closed recovery clock."""
+        if (
+            state.phase not in _BUSY_COORDINATOR_PHASES
+            or state.last_started_at is not None
+            or state.requested_at is not None
+        ):
+            return
+        heartbeat = _as_utc(state.updater_last_seen_at)
+        anchor = heartbeat if heartbeat is not None and heartbeat <= now else now
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(
+                UpdateCoordinatorState.id == 1,
+                UpdateCoordinatorState.phase == state.phase,
+                UpdateCoordinatorState.last_started_at.is_(None),
+                UpdateCoordinatorState.requested_at.is_(None),
+            )
+            .values(last_started_at=anchor, updated_at=now)
+        )
+
+    @staticmethod
+    def _phase_timestamp_values(
+        prior_phase: str, resulting_phase: str, now: datetime
+    ) -> dict[str, object]:
+        """Return the age-anchor mutation for one exact persisted transition."""
+        if resulting_phase not in _BUSY_COORDINATOR_PHASES:
+            return {"last_started_at": None}
+        if prior_phase != resulting_phase:
+            return {"last_started_at": now}
+        return {}
+
+    async def mark_busy_work_dispatched(self, now: datetime) -> bool:
+        """Restart the recovery clock: real work was just handed to the sidecar.
+
+        Handing out a ``check``/``install`` over a row already in a busy phase
+        is a genuine work-START event even though the phase string will repeat
+        (necessarily a MANUAL queued action -- eligibility gates AUTOMATIC
+        dispatch on a non-busy phase, so a crash-looping sidecar can never
+        keep restamping a stuck row). Without this stamp the new work inherits
+        the ABANDONED
+        operation's aged anchor and is instantly recovery-eligible -- an
+        operator button press could then fence live work. Passive signals
+        (eligibility polls that hand out nothing, same-phase heartbeats) never
+        reach this method, preserving the bounded-exit invariant: only genuine
+        work-lifecycle events move the anchor.
+        """
+        state = await self._lock()
+        if state.phase not in _BUSY_COORDINATOR_PHASES:
+            return False
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(
+                UpdateCoordinatorState.id == 1,
+                UpdateCoordinatorState.phase == state.phase,
+            )
+            .values(last_started_at=now, updated_at=now)
+        )
+        return True
+
     async def touch_updater(
         self,
         *,
@@ -303,7 +351,9 @@ class SqlUpdateCoordinationRepository:
         state = await self._lock()
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
+        resulting_phase = phase if phase is not None else state.phase
         values: dict[str, object] = {"updater_last_seen_at": now, "updated_at": now}
+        values.update(self._phase_timestamp_values(state.phase, resulting_phase, now))
         if phase is not None:
             values["phase"] = phase
         stmt = update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1)
@@ -400,6 +450,7 @@ class SqlUpdateCoordinationRepository:
     ) -> tuple[LeaseRecord, bool] | None:
         state = await self._lock()
         await self._cleanup_expired(now)
+        await self._session.refresh(state)
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
         if await self._active_drain() is not None:
@@ -439,10 +490,10 @@ class SqlUpdateCoordinationRepository:
         )
         self._session.add(row)
         await self._session.flush()
+        values: dict[str, object] = {"phase": "draining", "updated_at": now}
+        values.update(self._phase_timestamp_values(state.phase, "draining", now))
         await self._session.execute(
-            update(UpdateCoordinatorState)
-            .where(UpdateCoordinatorState.id == 1)
-            .values(phase="draining", last_started_at=now, updated_at=now)
+            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
         )
         return _lease_record(row), (await self._critical_count()) == 0
 
@@ -479,6 +530,7 @@ class SqlUpdateCoordinationRepository:
         """Renew one exact drain and atomically refresh its bounded active phase."""
         state = await self._lock()
         await self._cleanup_expired(now)
+        await self._session.refresh(state)
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
         drain = await self._lease_for_token(token_hash, "drain")
@@ -487,14 +539,18 @@ class SqlUpdateCoordinationRepository:
         ready = (await self._critical_count()) == 0
         drain.renewed_at = now
         drain.expires_at = now + ttl
+        if phase is not None:
+            resulting_phase = phase if ready else "draining"
+        elif state.phase in {"draining", "installing", "rollback"}:
+            resulting_phase = state.phase
+        else:
+            resulting_phase = "draining"
         values: dict[str, object] = {
+            "phase": resulting_phase,
             "updater_last_seen_at": now,
             "updated_at": now,
         }
-        if phase is not None:
-            values["phase"] = phase if ready else "draining"
-        elif state.phase not in {"draining", "installing", "rollback"}:
-            values["phase"] = "draining"
+        values.update(self._phase_timestamp_values(state.phase, resulting_phase, now))
         await self._session.execute(
             update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
         )
@@ -503,6 +559,7 @@ class SqlUpdateCoordinationRepository:
     async def release(self, token_hash: str, now: datetime) -> bool:
         state = await self._lock()
         await self._cleanup_expired(now)
+        await self._session.refresh(state)
         lease = await self._lease_for_token(token_hash)
         if lease is None:
             return False
@@ -524,7 +581,7 @@ class SqlUpdateCoordinationRepository:
         await self._session.execute(
             update(UpdateCoordinatorState)
             .where(UpdateCoordinatorState.id == 1)
-            .values(phase="idle", updated_at=now)
+            .values(phase="idle", last_started_at=None, updated_at=now)
         )
         return True
 
@@ -532,118 +589,67 @@ class SqlUpdateCoordinationRepository:
         self,
         now: datetime,
         *,
-        updater_heartbeat_max_age: timedelta,
+        recovery_max_age: timedelta,
     ) -> ForceResetResult | None:
-        """Re-anchor an UNRECOGNIZED coordinator phase to ``idle`` (issue #354).
+        """Apply the evidence-based recovery matrix under the coordinator lock.
 
-        The recovery counterpart to the fail-closed unknown-phase guard every
-        other phase-rewriting locked write enforces (issue #322 / PR #346). Once
-        a concurrent, newer, or rolled-back generation leaves the singleton row
-        in a phase this app version does not know, all seven locked writes 409
-        permanently and NEITHER writer of ``phase='idle'`` (drain release,
-        expiry cleanup) is reachable -- a wedge whose only prior exit was direct
-        DB surgery, in direct tension with north stars #1 and #2. This is the
-        in-app button that ends it.
-
-        Concurrency contract (the reason this lives in the repo, inside the
-        lock): it runs INSIDE :meth:`_lock` and RE-READS the row after acquiring
-        the lock, exactly like the guards it complements. The wedge may have
-        healed or moved between the caller's snapshot and this transaction; a
-        blind reset would then clobber whatever a concurrent writer legitimately
-        landed. The full (phase x requested_action) matrix, decided under the
-        lock:
-
-        * KNOWN phase, KNOWN action: ``None`` -- a true no-op refusal, nothing
-          wedged to recover (also the idempotent second-click answer once a
-          first reset has landed ``idle``/``none``).
-        * KNOWN LEASED-BUSY phase (``draining``/``installing``/``rollback``),
-          any action: ``None`` -- an operation is in flight and its own
-          acknowledgement (generation CAS) or drain-lease expiry is the
-          legitimate writer of ``requested_action``; even an unrecognized
-          action must not be raced here. Both exits converge on a recoverable
-          cell: an ack rewrites the action itself, and lease expiry re-anchors
-          the phase to ``idle`` while preserving the action -- the action-only
-          cell below.
-        * ``checking`` phase, UNRECOGNIZED action (Codex round 3 on #357):
-          ``checking`` is busy but LEASELESS -- nothing ever expires it, so the
-          round-2 "its exits converge" rationale does not hold. The honest
-          in-flight signal in the coordination data is the sidecar heartbeat:
-          only a live sidecar can be mid-check or about to deliver a check
-          outcome. While the heartbeat is FRESH (within
-          ``updater_heartbeat_max_age``, the same 45s contract as
-          ``updater_available``), refuse. Once it is STALE or absent, no check
-          can be in flight: allow the ACTION-ONLY reset. The phase itself is
-          deliberately left ``checking`` (never force-rewritten): with the
-          action cleared, the next completed check -- automatic, or a queued
-          ``check`` the sidecar picks up on reconnect -- acknowledges through
-          the normal generation-CAS path and rewrites the phase legitimately.
-        * KNOWN NON-BUSY phase, UNRECOGNIZED action: the ACTION-ONLY reset
-          (issue #354, Codex round 2). A rollback can leave a perfectly safe
-          phase (e.g. ``idle``) paired with an action this build does not know;
-          that action makes :meth:`request_action` refuse ALL new intent (any
-          non-``none`` action reads as in-progress) while meaning nothing to
-          eligibility -- a quieter wedge with, previously, no exit. Clear the
-          unrecognized action to ``"none"``, touch nothing else, and return a
-          result with ``old_phase=None``.
-        * UNKNOWN phase, UNEXPIRED drain lease: raises
-          :class:`DrainLeaseActiveError`. That pairing is the version-skew
-          shape where a NEWER updater generation is legitimately mid-operation
-          in a phase this build simply doesn't know; deleting its live lease
-          and stamping ``idle`` would admit new critical work and drain claims
-          underneath a possibly-live container replacement. The lease TTL
-          bounds the wait: :meth:`_cleanup_expired` (run first on this path)
-          clears an EXPIRED drain, so a retry after expiry proceeds. Only a
-          dead lease is ever swept out of the way, never a live one.
-        * UNKNOWN phase otherwise: the full reset -- stamp ``phase='idle'``
-          and normalize ``requested_action`` by the same rule: a KNOWN action
-          (a queued ``install``/``check``) is PRESERVED for retry, exactly as
-          :meth:`_cleanup_expired`'s crash-recovery path preserves it; an
-          UNRECOGNIZED one is cleared to ``"none"``.
-
-        Image and generation fields are always preserved; ``critical`` leases
-        (independent app-side work) are never touched.
-
-        Returns a :class:`ForceResetResult` describing what changed on reset,
-        or ``None`` when there was nothing this operation may recover.
+        Refusal paths (WAIT / live drain) raise BEFORE any recovery mutation,
+        so the only writes pending at raise time are observation side-effects
+        (expired-lease cleanup, the legacy busy-row anchor backfill) that the
+        service layer commits even on refusal -- the recovery clock must start
+        on the very first observation from ANY endpoint.
         """
         state = await self._lock()
-        if state.phase in _KNOWN_COORDINATOR_PHASES:
-            if state.requested_action in _KNOWN_REQUESTED_ACTIONS:
-                return None
-            # An unrecognized action is recoverable in every non-busy phase; in
-            # the leaseless ``checking`` phase only once the sidecar heartbeat
-            # says no check can be in flight (see the matrix above). The leased
-            # busy phases always refuse -- their lease expiry converges.
-            action_recoverable = state.phase not in _BUSY_COORDINATOR_PHASES or (
-                state.phase == "checking"
-                and not _updater_heartbeat_fresh(
-                    state.updater_last_seen_at, now, updater_heartbeat_max_age
-                )
-            )
-            if not action_recoverable:
-                return None
-            cleared = state.requested_action
-            await self._session.execute(
-                update(UpdateCoordinatorState)
-                .where(UpdateCoordinatorState.id == 1)
-                .values(requested_action="none", updated_at=now)
-            )
-            return ForceResetResult(old_phase=None, cleared_requested_action=cleared)
         await self._cleanup_expired(now)
-        if await self._active_drain() is not None:
+        await self._session.refresh(state)
+        await self._backfill_legacy_busy_anchor(state, now)
+        await self._session.refresh(state)
+        drain = await self._active_drain()
+        phase_started_at = None
+        if state.phase in _BUSY_COORDINATOR_PHASES:
+            phase_started_at = _as_utc(state.last_started_at) or _as_utc(state.requested_at)
+        decision = decide_recovery(
+            phase=state.phase,
+            requested_action=state.requested_action,
+            live_drain=drain is not None,
+            phase_started_at=phase_started_at,
+            now=now,
+            max_age=recovery_max_age,
+        )
+        if decision.action is RecoveryAction.LIVE_DRAIN:
             raise DrainLeaseActiveError(state.phase)
-        old_phase = state.phase
-        values: dict[str, object] = {"phase": "idle", "updated_at": now}
-        cleared_requested_action: str | None = None
-        if state.requested_action not in _KNOWN_REQUESTED_ACTIONS:
-            cleared_requested_action = state.requested_action
-            values["requested_action"] = "none"
+        if decision.action is RecoveryAction.WAIT:
+            raise CoordinatorRecoveryNotReadyError(decision.reason)
+        if decision.action is RecoveryAction.NOOP:
+            return None
+        old_generation: int | None = None
+        new_generation: int | None = None
+        values: dict[str, object] = {"updated_at": now}
+        old_phase: str | None = None
+        cleared_action: str | None = None
+        if decision.action is RecoveryAction.REANCHOR:
+            old_phase = state.phase
+            values.update(phase="idle", last_started_at=None)
+        if decision.fence_generation:
+            if decision.clear_unknown_action:
+                cleared_action = state.requested_action
+                values["requested_action"] = "none"
+            old_generation = state.action_generation
+            new_generation = old_generation + 1
+            values.update(action_generation=new_generation)
         await self._session.execute(
-            update(UpdateCoordinatorState).where(UpdateCoordinatorState.id == 1).values(**values)
+            update(UpdateCoordinatorState)
+            .where(
+                UpdateCoordinatorState.id == 1,
+                UpdateCoordinatorState.action_generation == state.action_generation,
+            )
+            .values(**values)
         )
         return ForceResetResult(
             old_phase=old_phase,
-            cleared_requested_action=cleared_requested_action,
+            cleared_requested_action=cleared_action,
+            old_action_generation=old_generation,
+            new_action_generation=new_generation,
         )
 
     async def acknowledge_action(
@@ -676,6 +682,7 @@ class SqlUpdateCoordinationRepository:
             "updater_last_seen_at": now,
             "updated_at": now,
         }
+        values.update(self._phase_timestamp_values(state.phase, phase, now))
         if not preserve_action:
             values["requested_action"] = "none"
             values["acknowledged_generation"] = expected_generation
@@ -710,6 +717,7 @@ class SqlUpdateCoordinationRepository:
     ) -> bool:
         state = await self._lock()
         await self._cleanup_expired(now)
+        await self._session.refresh(state)
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
         drain = await self._lease_for_token(token_hash, "drain")
@@ -748,6 +756,7 @@ class SqlUpdateCoordinationRepository:
             "updater_last_seen_at": now,
             "updated_at": now,
         }
+        values.update(self._phase_timestamp_values(state.phase, phase, now))
         if current_build is not None:
             values["current_build"] = current_build
         if current_digest is not None:
