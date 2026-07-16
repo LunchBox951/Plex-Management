@@ -463,6 +463,15 @@ async def _eligibility(
             action = "check"
     if action == "install" and policy.idle_only and snapshot.active_critical_operations:
         blocker = "active_critical_work"
+    if touch and action != "none" and snapshot.phase in BUSY_COORDINATOR_PHASES:
+        # Handing real work to the sidecar over a row already in a busy phase
+        # (e.g. a fresh automatic check dispatched over a stale ``checking``
+        # row) is a genuine work-START even though the sidecar's subsequent
+        # same-phase heartbeat cannot move the age anchor. Restart the
+        # recovery clock here, in the handout, so an operator button press
+        # cannot fence the work that was just dispatched. No-work polls skip
+        # this entirely -- passive signals never move the anchor.
+        await coordinator.mark_busy_work_dispatched()
     return (
         UpdateEligibilityResponse(
             action=action,

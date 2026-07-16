@@ -1249,13 +1249,19 @@ async def test_force_reset_recovers_a_wedged_coordinator_via_admin_button(
 
     recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
     assert recovered.status_code == 200
-    assert (await coordinator.snapshot()).phase == "idle"
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    # The actionless unknown-phase reanchor fences its abandoned worker: a late
+    # outcome carrying the pre-recovery generation must not be able to
+    # overwrite the recovered state.
+    assert snapshot.action_generation == 1
 
     async with app.state.sessionmaker() as session:
         audit = (await session.execute(select(AuditLog))).scalars().all()
     assert len(audit) == 1
     assert audit[0].action_type == "update.coordinator_phase_force_reset"
-    assert audit[0].old_value == {"phase": "future_installing"}
+    assert audit[0].old_value == {"phase": "future_installing", "action_generation": 0}
+    assert audit[0].new_value == {"phase": "idle", "action_generation": 1}
 
     # The guard no longer fires: the control is reachable again.
     assert (await client.get("/api/v1/updates/status", headers=_ADMIN)).json()["blocker"] != (
@@ -1458,6 +1464,105 @@ async def test_consecutive_direct_force_resets_converge_without_status_calls(
     snapshot = await coordinator.snapshot()
     assert snapshot.phase == "idle"
     assert snapshot.action_generation == 1
+
+
+async def test_eligibility_work_handout_restarts_the_recovery_clock(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatching real work over a stale busy row restarts the recovery
+    clock in the same handout: the freshly assigned check must not inherit
+    the abandoned operation's aged anchor, or an operator button press could
+    fence the work that was just handed out."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="check",
+                action_generation=1,
+                last_started_at=moment[0] - timedelta(minutes=30),
+            )
+        )
+        await session.commit()
+
+    # Stale before the handout: recovery is on offer.
+    status = await client.get("/api/v1/updates/status", headers=_ADMIN)
+    assert status.json()["blocker"] == "coordinator_state_stale"
+
+    handed = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert handed.status_code == 200
+    assert handed.json()["action"] == "check"
+    assert (await coordinator.snapshot()).last_started_at == moment[0]
+
+    # The dispatched work owns a fresh recovery window; the button now waits.
+    refused = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "coordinator_recovery_not_ready"
+
+    # The dispatched work completes and is accepted -- nothing fenced it.
+    checked = await client.post(
+        "/api/v1/internal/updates/outcome",
+        headers=updater_headers,
+        json={"operation": "check", "outcome": "no_update", "action_generation": 1},
+    )
+    assert checked.status_code == 200
+    assert (await coordinator.snapshot()).phase == "idle"
+
+
+async def test_no_work_eligibility_poll_never_moves_the_recovery_clock(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The round-2 invariant, guarded end-to-end: an eligibility poll that
+    hands out NOTHING (here the fail-closed answer over an unrecognized
+    queued action) is a passive signal and must leave the aged anchor -- and
+    therefore the recovery offer -- untouched."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    anchor = moment[0] - timedelta(minutes=30)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="future_action",
+                action_generation=1,
+                last_started_at=anchor,
+            )
+        )
+        await session.commit()
+
+    polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert polled.status_code == 200
+    assert polled.json()["action"] == "none"
+    assert polled.json()["blocker"] == "requested_action_unknown"
+    assert (await coordinator.snapshot()).last_started_at == anchor
+
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.requested_action == "none"
+    assert snapshot.action_generation == 2
 
 
 async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(

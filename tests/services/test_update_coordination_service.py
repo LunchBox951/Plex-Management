@@ -1099,6 +1099,102 @@ async def test_busy_reanchor_preserves_real_queued_action_generation(
     assert row.action_generation == 7
 
 
+@pytest.mark.parametrize("phase", [*sorted(_BUSY_COORDINATOR_PHASES), "future_phase"])
+@pytest.mark.parametrize("action", ["none", "check", "install", "future_action"])
+async def test_reanchor_generation_fence_matrix(
+    sessionmaker_: SessionMaker, phase: str, action: str
+) -> None:
+    """The executable half of the recovery truth table: for EVERY
+    reanchor-eligible shape (each drainless busy phase past the bound, and the
+    unknown phase), force-reset bumps the generation exactly when no real
+    queued action is preserved, and a late worker outcome carrying the
+    pre-recovery generation is accepted exactly when its queued action
+    survived the reset. This pins the round-3 rule -- the absent-action fence
+    applies to unknown-phase reanchors too -- cell by cell."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase=phase,
+                requested_action=action,
+                action_generation=5,
+                last_started_at=clock.now - timedelta(minutes=10),
+            )
+        )
+        await session.commit()
+
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    assert result is not None
+    assert result.old_phase == phase
+    fences = action in {"none", "future_action"}
+    row = await _row(sessionmaker_)
+    assert row.phase == "idle"
+    if fences:
+        assert result.old_action_generation == 5
+        assert result.new_action_generation == 6
+        assert row.action_generation == 6
+        assert row.requested_action == "none"
+    else:
+        assert result.old_action_generation is None
+        assert result.new_action_generation is None
+        assert row.action_generation == 5
+        assert row.requested_action == action
+    late_outcome_accepted = await service.acknowledge_action(
+        expected_generation=5, result=UpdateResult.update_available
+    )
+    assert late_outcome_accepted is (not fences)
+
+
+async def test_work_dispatch_restarts_the_recovery_clock_for_a_stale_busy_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Handing real work to the sidecar over a stale busy row is a genuine
+    work-start even though the phase string repeats: the dispatch stamp must
+    move the anchor so an operator button press cannot fence the freshly
+    dispatched work, and recovery becomes available again only after the NEW
+    work has itself aged past the bound."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                action_generation=3,
+                last_started_at=clock.now - timedelta(minutes=30),
+            )
+        )
+        await session.commit()
+
+    assert await service.mark_busy_work_dispatched() is True
+    assert _as_utc((await _row(sessionmaker_)).last_started_at) == clock.now
+    with pytest.raises(CoordinatorRecoveryNotReadyError):
+        await service.force_reset_coordinator_phase(actor_user_id=None)
+
+    clock.advance(timedelta(minutes=10))
+    result = await service.force_reset_coordinator_phase(actor_user_id=None)
+    assert result is not None
+    assert result.new_action_generation == 4
+
+
+async def test_work_dispatch_stamp_refuses_non_busy_phases(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The dispatch stamp is a busy-phase work-restart marker only: outside a
+    busy phase there is no recovery clock to restart, and the anchor invariant
+    (non-busy phases never carry one) must hold."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+
+    assert await service.mark_busy_work_dispatched() is False
+    assert (await _row(sessionmaker_)).last_started_at is None
+
+
 async def test_force_reset_recovers_unknown_phase_to_idle_with_audit(
     sessionmaker_: SessionMaker,
 ) -> None:

@@ -312,6 +312,32 @@ class SqlUpdateCoordinationRepository:
             return {"last_started_at": now}
         return {}
 
+    async def mark_busy_work_dispatched(self, now: datetime) -> bool:
+        """Restart the recovery clock: real work was just handed to the sidecar.
+
+        Handing out a ``check``/``install`` over a row already in a busy phase
+        is a genuine work-START event even though the phase string will repeat
+        (e.g. a fresh automatic check dispatched over a stale ``checking``
+        row). Without this stamp the new work inherits the ABANDONED
+        operation's aged anchor and is instantly recovery-eligible -- an
+        operator button press could then fence live work. Passive signals
+        (eligibility polls that hand out nothing, same-phase heartbeats) never
+        reach this method, preserving the bounded-exit invariant: only genuine
+        work-lifecycle events move the anchor.
+        """
+        state = await self._lock()
+        if state.phase not in _BUSY_COORDINATOR_PHASES:
+            return False
+        await self._session.execute(
+            update(UpdateCoordinatorState)
+            .where(
+                UpdateCoordinatorState.id == 1,
+                UpdateCoordinatorState.phase == state.phase,
+            )
+            .values(last_started_at=now, updated_at=now)
+        )
+        return True
+
     async def touch_updater(
         self,
         *,
@@ -602,18 +628,13 @@ class SqlUpdateCoordinationRepository:
         if decision.action is RecoveryAction.REANCHOR:
             old_phase = state.phase
             values.update(phase="idle", last_started_at=None)
-        if decision.clear_unknown_action or (
-            decision.action is RecoveryAction.REANCHOR
-            and state.phase in _BUSY_COORDINATOR_PHASES
-            and state.requested_action == "none"
-        ):
+        if decision.fence_generation:
             if decision.clear_unknown_action:
                 cleared_action = state.requested_action
+                values["requested_action"] = "none"
             old_generation = state.action_generation
             new_generation = old_generation + 1
             values.update(action_generation=new_generation)
-            if decision.clear_unknown_action:
-                values["requested_action"] = "none"
         await self._session.execute(
             update(UpdateCoordinatorState)
             .where(

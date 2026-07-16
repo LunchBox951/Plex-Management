@@ -37,6 +37,15 @@ class RecoveryDecision:
     reason: str
     clear_unknown_action: bool
     preserve_known_action: bool
+    # Whether executing this recovery must bump ``action_generation`` to fence
+    # a possibly-live abandoned worker. The rule, applied uniformly to KNOWN
+    # and UNKNOWN phases alike: any recovery that declares a worker abandoned
+    # WITHOUT preserving a real queued action (``check``/``install``) fences.
+    # That is every ACTION_ONLY reset (it clears an unrecognized action) and
+    # every REANCHOR whose requested_action is ``"none"`` or unrecognized; a
+    # REANCHOR carrying a real queued action deliberately keeps the generation
+    # so the reconnecting sidecar can still complete that exact action.
+    fence_generation: bool
 
 
 def _utc(value: datetime) -> datetime:
@@ -81,26 +90,45 @@ def decide_recovery(
     """
     known_action = requested_action in KNOWN_REQUESTED_ACTIONS
     unknown_action = not known_action
+    # A reanchor carries no real queued action to hand back to a sidecar when
+    # the action is unrecognized OR absent ("none"); in both cases the worker
+    # that owned the busy/unknown phase is being declared abandoned, so its
+    # generation must be fenced -- regardless of whether the phase is known.
+    reanchor_fences = unknown_action or requested_action == "none"
     if phase not in KNOWN_COORDINATOR_PHASES:
         if live_drain:
             return RecoveryDecision(
-                RecoveryAction.LIVE_DRAIN, "live drain lease", unknown_action, known_action
+                RecoveryAction.LIVE_DRAIN, "live drain lease", unknown_action, known_action, False
             )
         return RecoveryDecision(
-            RecoveryAction.REANCHOR, "unrecognized phase", unknown_action, known_action
+            RecoveryAction.REANCHOR,
+            "unrecognized phase",
+            unknown_action,
+            known_action,
+            reanchor_fences,
         )
     if live_drain:
         return RecoveryDecision(
-            RecoveryAction.LIVE_DRAIN, "live drain lease", unknown_action, known_action
+            RecoveryAction.LIVE_DRAIN, "live drain lease", unknown_action, known_action, False
         )
     if phase not in BUSY_COORDINATOR_PHASES:
         if unknown_action:
-            return RecoveryDecision(RecoveryAction.ACTION_ONLY, "unrecognized action", True, False)
-        return RecoveryDecision(RecoveryAction.NOOP, "recognized state", False, True)
+            return RecoveryDecision(
+                RecoveryAction.ACTION_ONLY, "unrecognized action", True, False, True
+            )
+        return RecoveryDecision(RecoveryAction.NOOP, "recognized state", False, True, False)
     if not _old_enough(phase_started_at, now, max_age):
         return RecoveryDecision(
-            RecoveryAction.WAIT, "busy phase lacks bounded stale evidence", False, known_action
+            RecoveryAction.WAIT,
+            "busy phase lacks bounded stale evidence",
+            False,
+            known_action,
+            False,
         )
     return RecoveryDecision(
-        RecoveryAction.REANCHOR, "busy phase is stale and old", unknown_action, known_action
+        RecoveryAction.REANCHOR,
+        "busy phase is stale and old",
+        unknown_action,
+        known_action,
+        reanchor_fences,
     )

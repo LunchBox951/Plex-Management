@@ -190,6 +190,21 @@ class UpdateCoordinationService:
             await session.commit()
         return await self.snapshot() if touched else None
 
+    async def mark_busy_work_dispatched(self) -> bool:
+        """Durably restart the busy-phase recovery clock on a real work handout.
+
+        Called when eligibility actually assigns a ``check``/``install`` to the
+        sidecar while the coordinator row is already in a busy phase -- a
+        genuine work-start even though the phase string repeats. Never called
+        for no-work polls or same-phase heartbeats (see the repo method).
+        """
+        async with self._sessionmaker() as session:
+            stamped = await SqlUpdateCoordinationRepository(session).mark_busy_work_dispatched(
+                self._now()
+            )
+            await session.commit()
+            return stamped
+
     async def request_action(self, action: UpdateAction) -> int:
         """Persist operator intent, or refuse while an update operation is active."""
         async with self._sessionmaker() as session:
