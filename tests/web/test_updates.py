@@ -1565,6 +1565,62 @@ async def test_no_work_eligibility_poll_never_moves_the_recovery_clock(
     assert snapshot.action_generation == 2
 
 
+async def test_automatic_dispatch_gates_on_non_busy_phase_keeping_recovery_bounded(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The crash-loop shape stays bounded: a sidecar that repolls an aged busy
+    row with an automatic check due is handed NOTHING (so nothing restamps the
+    anchor), the operator button keeps working, and automatic checks resume
+    from the recognized idle phase the moment recovery lands."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    moment = [datetime(2026, 7, 14, 12, 0, tzinfo=UTC)]
+    _freeze_router_clock(monkeypatch, moment)
+    coordinator = UpdateCoordinationService(app.state.sessionmaker, clock=lambda: moment[0])
+    await coordinator.initialize()
+    app.state.update_coordinator = coordinator
+    await _enable_automatic_updates(client)
+    anchor = moment[0] - timedelta(minutes=30)
+    async with app.state.sessionmaker() as session:
+        await session.execute(
+            update(UpdateCoordinatorState)
+            .where(UpdateCoordinatorState.id == 1)
+            .values(
+                phase="checking",
+                requested_action="none",
+                action_generation=1,
+                last_started_at=anchor,
+                last_checked_at=None,
+            )
+        )
+        await session.commit()
+
+    # Crash-loop polls: an automatic check IS due (never checked), but the
+    # busy phase gates the handout, so no poll can restamp the anchor.
+    for _ in range(3):
+        polled = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+        assert polled.status_code == 200
+        assert polled.json()["action"] == "none"
+        assert polled.json()["blocker"] == "coordinator_phase_busy"
+    assert (await coordinator.snapshot()).last_started_at == anchor
+
+    # The exit stays bounded: the aged anchor keeps the button working.
+    recovered = await client.post("/api/v1/updates/force-reset", headers=_ADMIN)
+    assert recovered.status_code == 200
+    snapshot = await coordinator.snapshot()
+    assert snapshot.phase == "idle"
+    assert snapshot.action_generation == 2
+
+    # Automatic checks resume immediately from the recovered idle phase.
+    handed = await client.post("/api/v1/internal/updates/eligibility", headers=updater_headers)
+    assert handed.status_code == 200
+    assert handed.json()["action"] == "check"
+    assert handed.json()["blocker"] is None
+
+
 async def test_force_reset_recovers_null_requested_at_actionless_checking_end_to_end(
     app: FastAPI,
     client: httpx.AsyncClient,

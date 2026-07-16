@@ -451,7 +451,22 @@ async def _eligibility(
         if action == "check":
             blocker = "checking_for_update"
     elif policy.schedule.enabled:
-        if snapshot.available_digest is not None:
+        # AUTOMATIC dispatch only ever starts from a recognized NON-BUSY
+        # phase. A busy phase means either an operation is genuinely in
+        # flight (the single sidecar never polls eligibility mid-operation --
+        # its loop is sequential and mid-check liveness goes through the
+        # generation-bound /heartbeat) or the row is stale and must age out
+        # into recovery (automatic sweep or the operator button) first.
+        # Without this gate, a crash-looping sidecar (poll -> handed an
+        # automatic check -> dies -> repolls) would restamp the recovery
+        # anchor every window and keep a stuck busy row perpetually
+        # unrecoverable -- exactly the unbounded wedge issue #368 forbids.
+        # MANUAL queued intent (the requested_action branches above) is
+        # deliberately NOT gated: a queued action is preserved across
+        # recovery anyway, and its handout legitimately restarts the clock.
+        if snapshot.phase in BUSY_COORDINATOR_PHASES:
+            blocker = "coordinator_phase_busy"
+        elif snapshot.available_digest is not None:
             if window_open:
                 action = "install"
             else:
@@ -465,12 +480,13 @@ async def _eligibility(
         blocker = "active_critical_work"
     if touch and action != "none" and snapshot.phase in BUSY_COORDINATOR_PHASES:
         # Handing real work to the sidecar over a row already in a busy phase
-        # (e.g. a fresh automatic check dispatched over a stale ``checking``
-        # row) is a genuine work-START even though the sidecar's subsequent
-        # same-phase heartbeat cannot move the age anchor. Restart the
-        # recovery clock here, in the handout, so an operator button press
-        # cannot fence the work that was just dispatched. No-work polls skip
-        # this entirely -- passive signals never move the anchor.
+        # (necessarily a MANUAL queued action -- automatic dispatch is gated
+        # on a non-busy phase above) is a genuine work-START even though the
+        # sidecar's subsequent same-phase heartbeat cannot move the age
+        # anchor. Restart the recovery clock here, in the handout, so an
+        # operator button press cannot fence the work that was just
+        # dispatched. No-work polls skip this entirely -- passive signals
+        # never move the anchor.
         await coordinator.mark_busy_work_dispatched()
     return (
         UpdateEligibilityResponse(

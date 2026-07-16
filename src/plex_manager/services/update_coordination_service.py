@@ -195,8 +195,10 @@ class UpdateCoordinationService:
 
         Called when eligibility actually assigns a ``check``/``install`` to the
         sidecar while the coordinator row is already in a busy phase -- a
-        genuine work-start even though the phase string repeats. Never called
-        for no-work polls or same-phase heartbeats (see the repo method).
+        genuine work-start even though the phase string repeats (a MANUAL
+        queued action; automatic dispatch is gated on a non-busy phase). Never
+        called for no-work polls or same-phase heartbeats (see the repo
+        method).
         """
         async with self._sessionmaker() as session:
             stamped = await SqlUpdateCoordinationRepository(session).mark_busy_work_dispatched(

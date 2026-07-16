@@ -317,8 +317,10 @@ class SqlUpdateCoordinationRepository:
 
         Handing out a ``check``/``install`` over a row already in a busy phase
         is a genuine work-START event even though the phase string will repeat
-        (e.g. a fresh automatic check dispatched over a stale ``checking``
-        row). Without this stamp the new work inherits the ABANDONED
+        (necessarily a MANUAL queued action -- eligibility gates AUTOMATIC
+        dispatch on a non-busy phase, so a crash-looping sidecar can never
+        keep restamping a stuck row). Without this stamp the new work inherits
+        the ABANDONED
         operation's aged anchor and is instantly recovery-eligible -- an
         operator button press could then fence live work. Passive signals
         (eligibility polls that hand out nothing, same-phase heartbeats) never
