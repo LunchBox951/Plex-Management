@@ -37,6 +37,7 @@ from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers import auth as auth_module
 from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.routers import settings as settings_router
+from tests.support import assert_task_raises
 
 SeedFn = Callable[..., Awaitable[None]]
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -1710,8 +1711,7 @@ async def test_cancelled_sign_in_rotation_releases_lock_and_restores_snapshot(
     )
     await _wait_for_event(entered)
     cancelled.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await cancelled
+    await assert_task_raises(cancelled, asyncio.CancelledError)
     await asyncio.wait_for(lock.releases.get(), timeout=5.0)
 
     assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})
@@ -2011,8 +2011,7 @@ async def test_sign_in_rotation_waits_for_drain_and_retired_row_is_rewritten(
     await _wait_for_event(lock.second_acquire_started)
     assert not sign_in_task.done()
     release_drain.set()
-    with pytest.raises(_StopDrainLoop):
-        await drain
+    await assert_task_raises(drain, _StopDrainLoop)
     response = await asyncio.wait_for(sign_in_task, timeout=5.0)
 
     assert response.status_code == 200
