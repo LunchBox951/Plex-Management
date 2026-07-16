@@ -131,6 +131,29 @@ def test_redact_retired_message_still_applies_current_values_and_shape() -> None
     assert "hunter2" not in redacted
 
 
+def test_redact_retired_masks_substring_overlaps_whole_in_both_directions() -> None:
+    """Codex #399 round 4 (finding 4): retiring and current values are masked
+    in ONE longest-first alternation, never sequential passes -- a sequential
+    floorless retired pass first would chew a hole in a current secret that
+    CONTAINS the retiring value (rotating ``abc`` -> ``abcdefghi`` turned a
+    logged ``abcdefghi`` into ``***defghi``, and with the full current value
+    gone nothing downstream could ever mask the suffix). The mirror shrink
+    direction must hold too: a current value contained IN the retiring one
+    must not leave a retired-secret remnant behind."""
+    # Growth rotation: retired value is a substring of the current secret.
+    grown = redact_retired_log_message(
+        "token=abcdefghi", frozenset({"abc"}), frozenset({"abcdefghi"})
+    )
+    assert "abcdefghi" not in grown
+    assert "defghi" not in grown  # no hole-chewed suffix of the CURRENT secret
+    # Shrink rotation: current value is a substring of the retiring secret.
+    shrunk = redact_retired_log_message(
+        "old=abcdefghXY", frozenset({"abcdefghXY"}), frozenset({"abcdefgh"})
+    )
+    assert "abcdefghXY" not in shrunk
+    assert "XY" not in shrunk  # no hole-chewed suffix of the RETIRED secret
+
+
 async def test_handler_secret_rotation_success_and_abort_preserve_contract() -> None:
     old = "fake-old-handler-secret"
     current = "fake-current-handler-secret"

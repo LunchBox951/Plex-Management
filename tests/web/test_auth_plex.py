@@ -1805,14 +1805,18 @@ async def test_cancel_during_pre_lock_rollback_completes_and_leaves_boundary_usa
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex #399 round 3: the boundary's PRE-LOCK rollback (the property-(a)
-    cleanup that releases the flushed writes before contending for the lock) is
-    SHIELDED. A cancellation delivered while it is awaiting must not interrupt
-    the DB op mid-flight -- a half-cancelled aiosqlite rollback closes the
-    connection and poisons the shared boundary. The request still ends
-    cancelled immediately (shield semantics: the rollback keeps running past
-    the request's end), nothing was staged or widened, the lock was never
-    contended, and the connection stays healthy: a retry succeeds end-to-end."""
+    """Codex #399 rounds 3-4: the boundary's PRE-LOCK rollback (the
+    property-(a) cleanup that releases the flushed writes before contending
+    for the lock) runs TO COMPLETION across cancellation. A cancellation
+    delivered while it is awaiting must not interrupt the DB op mid-flight (a
+    half-cancelled aiosqlite rollback closes the connection and poisons the
+    shared boundary) -- and, round 4, must not end the request EARLY either:
+    a request that unwinds while the rollback is still running lets
+    ``get_session``'s dependency scope close the session under the live op (a
+    close/rollback race on the connection). The request ends cancelled only
+    AFTER the rollback settles; nothing was staged or widened, the lock was
+    never contended, and the connection stays healthy: a retry succeeds
+    end-to-end."""
     await _seed_rotation_fixture(seed, sessionmaker_)
     handler = log_capture_service.LogCaptureHandler()
     handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
@@ -1846,12 +1850,17 @@ async def test_cancel_during_pre_lock_rollback_completes_and_leaves_boundary_usa
     )
     await _wait_for_event(entered)
     task.cancel()
-    # The request ends cancelled WITHOUT waiting for the rollback (shield
-    # semantics) -- and without tearing it: the op is still pending, not dead.
-    await assert_task_raises(task, asyncio.CancelledError)
+    # The request must NOT end while the rollback is still running
+    # (codex #399 round 4): ending early is exactly the close/rollback race
+    # ``_rollback_to_completion`` exists to prevent. The op is still pending,
+    # not dead -- the cancellation is remembered, not delivered into it.
+    await asyncio.sleep(0.05)
+    assert not task.done()
     assert not rollback_completed.is_set()
     release.set()
-    await _wait_for_event(rollback_completed)  # ...and it RAN TO COMPLETION
+    await _wait_for_event(rollback_completed)  # it RAN TO COMPLETION...
+    # ...and only THEN did the request end, still honoring the cancellation.
+    await assert_task_raises(task, asyncio.CancelledError)
 
     assert lock.acquire_count == 0  # cancelled before the lock was ever contended
     assert handler.secret_values == frozenset({_OLD_PLEX_TOKEN})  # never widened
@@ -1864,6 +1873,50 @@ async def test_cancel_during_pre_lock_rollback_completes_and_leaves_boundary_usa
     retry = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
     assert retry.status_code == 200
     assert _NEW_PLEX_TOKEN in handler.secret_values
+
+
+async def test_rotation_sign_in_recomputes_access_before_the_rewrite_flush(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #399 round 4 (finding 5): the in-lock access recompute can wait on
+    a live ``/identity`` probe for its full in-boundary timeout when no machine
+    identifier is stored. It therefore runs as the boundary's ``pre_rewrite``
+    hook -- BEFORE ``_rewrite_before_secret_replacement`` stages/flushes any
+    writes -- because probing AFTER the flush would hold SQLite's writer lock
+    for the whole probe, surfacing ``database is locked`` to concurrent writers
+    (``db.py`` configures the same 5s busy timeout) while this sign-in is only
+    trying to fail closed. Pin the order: recompute first, rewrite second."""
+    await _seed_rotation_fixture(seed, sessionmaker_)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_OLD_PLEX_TOKEN})
+    app.state.log_handler = handler
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+
+    order: list[str] = []
+    real_access = auth_module._post_init_access  # pyright: ignore[reportPrivateUsage]
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+
+    async def spy_access(*args: object, **kwargs: object) -> bool:
+        order.append("access")
+        return await real_access(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def spy_rewrite(*args: object, **kwargs: object) -> int:
+        order.append("rewrite")
+        return await real_rewrite(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(auth_module, "_post_init_access", spy_access)
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", spy_rewrite)
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
+    assert response.status_code == 200
+    # First "access" is the ordinary pre-lock decision; the second is the
+    # IN-LOCK recompute (facet 4), which must precede the rewrite so no write
+    # transaction is open while a probe could still be blocking.
+    assert order == ["access", "access", "rewrite"]
 
 
 def _token_routed_transport(

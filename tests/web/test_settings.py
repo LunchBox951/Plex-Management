@@ -3459,6 +3459,90 @@ async def test_rotate_app_key_cancelled_before_commit_launch_fails_safe(
     assert status_response.status_code == 200
 
 
+async def test_rotate_app_key_cancelled_during_commit_still_runs_post_commit_invalidations(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #399 round 4 (finding 1): a cancellation that arrives once the
+    rotation commit is durable must NOT skip the caller's must-run post-commit
+    invalidations. Before the ``on_committed`` hook they lived after
+    ``async with secret_rotation(...)``, and the boundary's remembered-
+    cancellation re-raise happened before control ever returned there -- the
+    key rotation was committed, but every already-open stream authenticated by
+    the OLD key stayed live until its lease caught up. The boundary now runs
+    them itself (synchronously, before honoring the remembered cancellation),
+    so a disconnected caller still tears down old-key streams and publishes
+    the access change."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        session.add(LogEvent(level="INFO", logger="test", message=f"durable {_API_KEY}"))
+        await session.commit()
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    app.state.log_handler = handler
+
+    invalidations: list[str] = []
+    real_close = settings_router.close_realtime_streams
+    real_publish = settings_router.publish_realtime
+
+    def spy_close(*args: object, **kwargs: object) -> None:
+        invalidations.append(f"close:{kwargs.get('reason')}")
+        real_close(*args, **kwargs)  # type: ignore[arg-type]
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        invalidations.append(f"publish:{kwargs.get('reason')}")
+        real_publish(*args, **kwargs)  # type: ignore[arg-type]
+
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
+    rewrite_finished = False
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        if rewrite_finished:
+            # The boundary's commit is now DURABLE. Pause so the test can
+            # cancel the request while the protected unit is mid-flight.
+            committed.set()
+            await _wait_for_event(release)
+
+    monkeypatch.setattr(settings_router, "close_realtime_streams", spy_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    task = asyncio.create_task(
+        client.post("/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY})
+    )
+    await _wait_for_event(committed)
+    task.cancel()
+    # Deliver the cancellation while the commit unit is still paused, so the
+    # request genuinely ends cancelled with the rotation already durable.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    await assert_task_raises(task, asyncio.CancelledError)
+
+    # The rotation landed durably AND the invalidations still ran.
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+    assert system is not None and system.app_api_key not in (None, _API_KEY)
+    assert "close:app_key_rotated" in invalidations
+    assert "publish:app_key_rotated" in invalidations
+
+
 async def test_revoke_app_key_rewrites_durable_and_live_logs(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -5411,7 +5495,7 @@ async def test_short_retired_secret_is_masked_despite_read_floor(
     rows, the live ring, and the queue (codex #382): the rewrite's exact-match
     pass has no floor -- the floor guards live reads against over-redaction,
     which does not apply to a specific retiring value."""
-    old_value = "abc12"  # 5 chars: below _MIN_SECRET_VALUE_LENGTH
+    old_value = "abc12"  # 5 chars: below MIN_SECRET_VALUE_LENGTH
     await seed(initialized=True, app_api_key=_API_KEY)
     async with sessionmaker_() as session:
         await SettingsStore(session).set("qbittorrent_password", old_value)

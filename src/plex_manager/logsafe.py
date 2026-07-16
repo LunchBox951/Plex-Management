@@ -657,7 +657,7 @@ def redact_secrets(text: str) -> str:
 #: unrelated log text. A value shorter than this is silently skipped by this
 #: pass -- ``redact_secrets``'s shape grammar is the backstop for short
 #: secrets sitting in a recognized ``key=value``/header/cookie shape.
-_MIN_SECRET_VALUE_LENGTH: Final = 8
+MIN_SECRET_VALUE_LENGTH: Final = 8
 
 #: A word/identifier character (matches a ``[\w-]`` run's members). Used by the
 #: key-name guard below to expand a value match leftward to the start of the
@@ -975,7 +975,7 @@ def redact_known_secrets(
     text: str,
     secret_values: Iterable[str],
     *,
-    min_length: int = _MIN_SECRET_VALUE_LENGTH,
+    min_length: int = MIN_SECRET_VALUE_LENGTH,
 ) -> str:
     """Mask every VERBATIM occurrence of a value in ``secret_values`` inside
     ``text`` with ``"<redacted>"`` -- the value-based complement to
@@ -987,7 +987,7 @@ def redact_known_secrets(
     qBittorrent password, ...) -- this function has no opinion on WHERE those
     came from and does no I/O of its own; it is a plain string-matching pass,
     exactly as total and side-effect-free as :func:`redact_secrets`. A value
-    shorter than ``min_length`` (default :data:`_MIN_SECRET_VALUE_LENGTH`) is
+    shorter than ``min_length`` (default :data:`MIN_SECRET_VALUE_LENGTH`) is
     skipped entirely -- see that constant's docstring for why a short value is
     a false-positive hazard rather than a real credential to guard.
 
