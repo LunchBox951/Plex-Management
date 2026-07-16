@@ -19,6 +19,12 @@ export type WithdrawSubscriptionResponse = Schemas['WithdrawSubscriptionResponse
 export type CreateRequestBody = Schemas['CreateRequestBody']
 export type SeasonStatus = Schemas['SeasonStatus']
 
+/** Issue #370 phase 2 — the compact (folded) live-state view for tile polling. */
+export type TileKey = Schemas['TileKey']
+export type CompactStateRequest = Schemas['CompactStateRequest']
+export type CompactStateResponse = Schemas['CompactStateResponse']
+export type CompactStateField = Schemas['CompactStateField']
+
 export type SearchPreviewRequest = Schemas['SearchPreviewRequest']
 export type SearchPreviewResponse = Schemas['SearchPreviewResponse']
 export type AcceptedRelease = Schemas['AcceptedRelease']

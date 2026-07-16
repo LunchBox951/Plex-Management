@@ -3,7 +3,7 @@
  * presentational and consistent. Built on the generated client, so a contract
  * change surfaces as a type error in these hooks.
  */
-import { useSyncExternalStore } from 'react'
+import { useMemo, useState, useSyncExternalStore } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { client } from './client'
 import { unwrap, ensureOk } from './http'
@@ -13,6 +13,7 @@ import type {
   AppApiKeyStatusResponse,
   AuthMeResponse,
   BlocklistResponse,
+  CompactStateResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
   DiscoverSearchResponse,
@@ -22,6 +23,7 @@ import type {
   HealthResponse,
   LogsResponse,
   LogsTailResponse,
+  MediaType,
   PlexLibraryOption,
   PlexServersResponse,
   PlexSignInRequest,
@@ -37,6 +39,7 @@ import type {
   SettingsUpdate,
   SetupCompleteRequest,
   SetupStatusResponse,
+  TileKey,
   UpdateStatusResponse,
   WithdrawSubscriptionResponse,
 } from './types'
@@ -479,11 +482,231 @@ export function useRequests(options?: { poll?: boolean; enabled?: boolean }) {
  * just-created single-season request to the whole aired series (Codex P2).
  */
 export function useRequestsInvalidated(): boolean {
+  return useQueryInvalidated(queryKeys.requests)
+}
+
+/**
+ * Reactive bridge to ONE exact query key's cache-level `isInvalidated` flag —
+ * the generalization `useRequestsInvalidated` above describes, reused by the
+ * live-state authority predicate below for the nested per-title / per-tile-set
+ * keys. Subscribed via useSyncExternalStore so a consumer re-renders exactly
+ * when the flag flips; the primitive-boolean snapshot elides the cache's other
+ * notifications.
+ */
+function useQueryInvalidated(queryKey: readonly unknown[]): boolean {
   const qc = useQueryClient()
   return useSyncExternalStore(
     (onStoreChange) => qc.getQueryCache().subscribe(onStoreChange),
-    () => qc.getQueryState(queryKeys.requests)?.isInvalidated ?? false,
+    () => qc.getQueryState(queryKey)?.isInvalidated ?? false,
   )
+}
+
+/**
+ * THE one freshness predicate for request-affordance gating (issue #397, Codex
+ * rounds 1–2): may this live-state query's CURRENT data be trusted to decide
+ * whether a request-creating control (`+ Request`, the tile quick-request) is
+ * offered?
+ *
+ * Why a single shared predicate: three sibling bugs bred from consumers each
+ * assembling their own weaker gate out of React Query's raw flags —
+ * `isLoading` misses the stale-cache-with-background-refetch reopen (cached
+ * data returns with `isLoading === false` while an epoch's refetch is still in
+ * flight), `isSuccess && !invalidated` misses caches that went stale WITHOUT
+ * an invalidation (SSE down; Layout's safety-net poll refetches only its own
+ * `['requests']` document, it never marks the nested live-state keys). Every
+ * present and future consumer routes through this hook via the
+ * `authoritative` field `useTitleRequests`/`useTileLiveStates` return, so the
+ * gate cannot be re-derived wrongly at a call site.
+ *
+ * Authoritative ⇔ ALL of:
+ *  1. the observer is enabled (a disabled surface knows nothing);
+ *  2. the query holds data at all;
+ *  3. the key is not invalidated-with-its-refetch-in-flight (a mutation/
+ *     realtime event told us this data is superseded and the replacement is
+ *     actively being fetched — see the `superseded` note in the body for why
+ *     the bare invalidated flag must not gate on its own);
+ *  4. a fetch has COMPLETED — success or error — during the current
+ *     observation EPOCH (`dataUpdatedAt`/`errorUpdatedAt` moved off the
+ *     baseline captured at epoch start; every settled fetch stamps one of
+ *     them, identical payloads included). An epoch restarts whenever the
+ *     query key changes or the observer flips enabled, i.e. exactly when
+ *     React Query may serve a cached answer from before the surface last
+ *     looked away.
+ *     Data React Query itself still considered FRESH at epoch start
+ *     (`!isStale`: younger than the app staleTime, not invalidated) also
+ *     qualifies, latched for the whole epoch: fresh data is never refetched
+ *     on (re)subscribe, so waiting for an epoch fetch would block on one
+ *     that is never coming — and the staleness timer flipping `isStale` a
+ *     second later must not retract an already-granted authority mid-epoch
+ *     (nothing about the data changed; the poll keeps it converging).
+ *
+ * An epoch fetch that FAILS ends the hold too (condition 4 watches
+ * `errorUpdatedAt`): with the backend unreachable, best-known cached state
+ * plus the poll's retries is more honest than wedging every affordance shut
+ * forever. A first-ever fetch that fails leaves `data` undefined, so
+ * condition 2 still fails CLOSED — no affordance is offered on zero knowledge.
+ */
+function useLiveStateAuthority(
+  query: {
+    data: unknown
+    dataUpdatedAt: number
+    errorUpdatedAt: number
+    isStale: boolean
+    isFetching: boolean
+  },
+  options: { epochKey: string; enabled: boolean; invalidated: boolean },
+): boolean {
+  const { epochKey, enabled, invalidated } = options
+  // The epoch baseline, re-captured render-SYNCHRONOUSLY on epoch change via
+  // the React-documented derive-state-during-render pattern — an effect would
+  // leave one committed frame where a stale cache is still trusted, the exact
+  // bug window this predicate exists to close.
+  const snapshot = {
+    key: epochKey,
+    enabled,
+    dataUpdatedAt: query.dataUpdatedAt,
+    errorUpdatedAt: query.errorUpdatedAt,
+    freshAtStart: !query.isStale,
+  }
+  const [epoch, setEpoch] = useState(snapshot)
+  const epochChanged = epoch.key !== epochKey || epoch.enabled !== enabled
+  if (epochChanged) setEpoch(snapshot)
+  // THIS render must judge against the new baseline already, not wait for the
+  // setState-triggered re-render.
+  const baseline = epochChanged ? snapshot : epoch
+  // Condition 3: superseded-awaiting-replacement. Hold only while the
+  // invalidation's own refetch is actually IN FLIGHT: `invalidateQueries`
+  // sets the flag AND starts the active-query refetch inside ONE
+  // notifyManager batch, so no render observes the flag without its fetch.
+  // Gating on the bare flag would WEDGE the hold shut after one failed poll
+  // tick — React Query v5 also sets `isInvalidated` on any fetch ERROR
+  // ("flag existing data as invalidated if we get a background error",
+  // query-core's reducer) and only a SUCCESSFUL fetch clears it, so with the
+  // backend unreachable every affordance would lock behind 'checking' until
+  // recovery: exactly the wedge condition 4's error release exists to prevent.
+  const superseded = invalidated && query.isFetching
+  if (!enabled || superseded || query.data === undefined) return false
+  return (
+    baseline.freshAtStart ||
+    query.dataUpdatedAt !== baseline.dataUpdatedAt ||
+    query.errorUpdatedAt !== baseline.errorUpdatedAt
+  )
+}
+
+/** `"media_type:tmdb_id"` — the same composite key the backend response map uses. */
+function tileKeyToken(mediaType: string, tmdbId: number): string {
+  return `${mediaType}:${tmdbId}`
+}
+
+/**
+ * Folded live-state per visible tile (issue #370 phase 2) — the tile-overlay
+ * freshness poll that replaced fetching the WHOLE raw `/requests` history for
+ * Discover/Search tile decoration. `items` drives both the POST body and the
+ * query's cache identity: a deduped, order-independent key set (a fresh
+ * Discover page, a new search) is a different query, but re-rendering with
+ * the SAME visible tiles in a different array order is not.
+ *
+ * `POST /requests/live-state` returns each key's ALREADY-FOLDED
+ * (active-else-newest) representative — see `deriveTileState`, which now
+ * takes this per-tile state directly instead of the raw array it used to
+ * filter.
+ */
+export function useTileLiveStates(
+  items: readonly { media_type: MediaType; tmdb_id: number }[],
+  options?: { poll?: boolean; enabled?: boolean },
+) {
+  const realtimeConnected = useRealtimeConnected()
+  const keys = useMemo<TileKey[]>(() => {
+    const byToken = new Map<string, TileKey>()
+    for (const item of items) {
+      byToken.set(tileKeyToken(item.media_type, item.tmdb_id), {
+        media_type: item.media_type,
+        tmdb_id: item.tmdb_id,
+      })
+    }
+    return Array.from(byToken.keys())
+      .sort()
+      .map((token) => byToken.get(token)!)
+  }, [items])
+  const sortedTokens = useMemo(
+    () => keys.map((key) => tileKeyToken(key.media_type, key.tmdb_id)),
+    [keys],
+  )
+  const queryKey = queryKeys.requestsLiveState(sortedTokens)
+  // No visible tiles -> nothing to poll; an empty POST would just be a
+  // wasted round trip for an empty response the caller can produce locally.
+  const enabled = (options?.enabled ?? true) && keys.length > 0
+
+  const query = useQuery({
+    queryKey,
+    enabled,
+    queryFn: async (): Promise<CompactStateResponse> =>
+      unwrap(await client.POST('/api/v1/requests/live-state', { body: { keys } })),
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
+  })
+
+  // Same invalidated-while-refetching gate as `useRequestsInvalidated`, keyed
+  // on THIS call's own key set so a just-created request's quick-request
+  // suppression tracks the exact query the caller is reading. Folded into
+  // `authoritative` below — the ONE trust signal consumers read (issue #397);
+  // the weaker raw flag is deliberately not returned, so no consumer can gate
+  // on invalidation alone and miss the stale-epoch cases.
+  const invalidated = useQueryInvalidated(queryKey)
+  const authoritative = useLiveStateAuthority(query, {
+    epochKey: JSON.stringify(queryKey),
+    enabled,
+    invalidated,
+  })
+
+  return { ...query, authoritative }
+}
+
+/**
+ * Every visible RAW row for one title (issue #370 phase 2) — the title-detail
+ * modal's replacement for `useRequests({ poll: open })`: a title-scoped read
+ * via `GET /requests/by-title` instead of correlating out of the whole
+ * request history.
+ *
+ * Returns `authoritative` alongside the query (issue #397): whether the
+ * current data may be trusted for request-affordance gating — see
+ * `useLiveStateAuthority`. Computed HERE, not by the consumer, so the modal
+ * (and any future title-scoped surface) inherits the same freshness gate the
+ * tile layer uses instead of re-deriving a weaker one from raw query flags.
+ */
+export function useTitleRequests(
+  mediaType: MediaType,
+  tmdbId: number,
+  options?: { poll?: boolean; enabled?: boolean },
+) {
+  const realtimeConnected = useRealtimeConnected()
+  const enabled = options?.enabled ?? true
+  const queryKey = queryKeys.requestsByTitle(mediaType, tmdbId)
+  const query = useQuery({
+    queryKey,
+    enabled,
+    queryFn: async (): Promise<RequestListResponse> =>
+      unwrap(
+        await client.GET('/api/v1/requests/by-title', {
+          params: { query: { media_type: mediaType, tmdb_id: tmdbId } },
+        }),
+      ),
+    refetchInterval: options?.poll
+      ? realtimeConnected
+        ? REQUESTS_REALTIME_FLOOR_MS
+        : REQUESTS_POLL_INTERVAL_MS
+      : false,
+  })
+  const invalidated = useQueryInvalidated(queryKey)
+  const authoritative = useLiveStateAuthority(query, {
+    epochKey: JSON.stringify(queryKey),
+    enabled,
+    invalidated,
+  })
+  return { ...query, authoritative }
 }
 
 export function useRequest(id: number, enabled = true) {

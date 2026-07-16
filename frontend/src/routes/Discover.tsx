@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { useDiscoverHome } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
@@ -31,8 +31,20 @@ function createLoadId(): string {
 export function Discover() {
   const [loadId] = useState(createLoadId)
   const home = useDiscoverHome({ loadId })
-  const { tileState, quickRequestable, requestStateRevision } =
-    useDiscoverTilePresentation(home.dataUpdatedAt)
+  // Every tile currently visible on this page — the compact live-state poll's
+  // key set (issue #370 phase 2). Recomputed only when the underlying data
+  // changes, not on every render, so the poll's query key stays stable.
+  const visibleItems = useMemo<DiscoverResult[]>(
+    () => [
+      ...(home.data?.spotlights ?? []),
+      ...(home.data?.rows ?? []).flatMap((row) => row.items),
+    ],
+    [home.data],
+  )
+  const { tileState, quickRequestable, requestStateRevision } = useDiscoverTilePresentation(
+    visibleItems,
+    home.dataUpdatedAt,
+  )
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const layoutContext = useOutletContext<{ searchOpen?: boolean } | null>()

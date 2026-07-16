@@ -504,6 +504,69 @@
         "title": "BlocklistResponse",
         "type": "object"
       },
+      "CompactStateField": {
+        "description": "One tile's folded live-state (issue #370) -- see ``CompactRequestState``.\n\n``status``/``request_id`` are the representative row's (active-else-newest);\n``has_history`` is always ``True`` for every key present in the response\nmap (a title with no visible request rows is simply absent) -- included\nexplicitly rather than relying on callers to infer it from key presence,\nsince the tv quick-request gate reads it directly.\n``has_coexisting_available`` is the movie presence-contradiction bit: a\nNON-representative row is a settled ``available`` alongside the chosen\nrepresentative. Always ``False`` for tv.",
+        "properties": {
+          "has_coexisting_available": {
+            "title": "Has Coexisting Available",
+            "type": "boolean"
+          },
+          "has_history": {
+            "title": "Has History",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RequestStatus"
+          }
+        },
+        "required": [
+          "status",
+          "request_id",
+          "has_history",
+          "has_coexisting_available"
+        ],
+        "title": "CompactStateField",
+        "type": "object"
+      },
+      "CompactStateRequest": {
+        "description": "``POST /requests/live-state`` body -- the visible tile key set to poll (issue #370).\n\nPOST, not GET: a Discover/Search page can carry well over a hundred tile\nkeys, which risks URL-length limits as repeated query params; ``react-query``\nkeys its cache on the request body just as well as the URL, so a POST read\npolls fine. ``keys`` is capped so one batch stays bounded.",
+        "properties": {
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/TileKey"
+            },
+            "maxItems": 500,
+            "title": "Keys",
+            "type": "array"
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "title": "CompactStateRequest",
+        "type": "object"
+      },
+      "CompactStateResponse": {
+        "description": "``POST /requests/live-state`` response body (issue #370).\n\n``states`` is keyed by ``\"{media_type}:{tmdb_id}\"`` (matching the client's\ntile-key convention); a key absent from the map has no visible request\nhistory for the caller.",
+        "properties": {
+          "states": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CompactStateField"
+            },
+            "title": "States",
+            "type": "object"
+          }
+        },
+        "required": [
+          "states"
+        ],
+        "title": "CompactStateResponse",
+        "type": "object"
+      },
       "CreateRequestBody": {
         "description": "Create a media request by tmdb id + media type.",
         "properties": {
@@ -3542,6 +3605,29 @@
         "title": "SubsystemHealthItem",
         "type": "object"
       },
+      "TileKey": {
+        "description": "One Discover/Search tile identity: ``(media_type, tmdb_id)`` (issue #370).",
+        "properties": {
+          "media_type": {
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "media_type",
+          "tmdb_id"
+        ],
+        "title": "TileKey",
+        "type": "object"
+      },
       "TmdbValidateRequest": {
         "description": "Candidate TMDB api key to test.",
         "properties": {
@@ -6438,6 +6524,121 @@
           }
         ],
         "summary": "Create Request Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/by-title": {
+      "get": {
+        "description": "Every visible RAW request row for one title, id-ascending (issue #370).\n\nBacks the title-detail modal, which needs the WHOLE match list for a title\n(bound-request/re-request resolution, per-season status, download\nprogress, subscriber flags) -- never a folded representative. Bounded by\none title's lifetime history (tiny), so this is a plain GET with no\npagination; ``next_cursor`` is always ``null`` (the shape matches\n``GET /requests`` for the client's shared response handling, but a title's\nhistory never needs a second page in practice). Same visibility scope as\n``GET /requests``. Unknown/never-requested titles return an empty list,\nnever a 404 (there is nothing owned to hide the existence of).",
+        "operationId": "requests_by_title_endpoint_api_v1_requests_by_title_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tmdb_id",
+            "required": true,
+            "schema": {
+              "title": "Tmdb Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "media_type",
+            "required": true,
+            "schema": {
+              "enum": [
+                "movie",
+                "tv"
+              ],
+              "title": "Media Type",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "Requests By Title Endpoint",
+        "tags": [
+          "requests"
+        ]
+      }
+    },
+    "/api/v1/requests/live-state": {
+      "post": {
+        "description": "Folded live-state per tile key -- the client tile overlay's freshness poll (#370).\n\nPhase 2 of issue #218: the client's Discover/Search tiles need the SAME\nactive-else-newest fold ``GET /requests``'s legacy mode computes, but keyed\nby exactly the currently-visible tile keys, and WITHOUT re-fetching the\nwhole request history or Discover page every poll tick. ``POST`` (not\n``GET``) because a page can carry well over a hundred tile keys, which\nrisks URL-length limits as repeated query params.\n\nA key present in ``states`` has at least one visible request row for that\ntitle; a key with none is simply ABSENT (never a fabricated state). Same\nvisibility scope as ``GET /requests``: admin / API-key sees every row,\na shared user sees only their own subscribed rows, and the unreachable\nnon-admin-without-a-user-identity case fails closed to an empty map.",
+        "operationId": "live_state_endpoint_api_v1_requests_live_state_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompactStateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactStateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": [],
+            "CSRFHeader": []
+          }
+        ],
+        "summary": "Live State Endpoint",
         "tags": [
           "requests"
         ]

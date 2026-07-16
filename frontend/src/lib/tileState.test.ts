@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DiscoverResult, RequestResponse } from '../api/types'
+import type { DiscoverResult } from '../api/types'
 import { queryClient } from './queryClient'
-import { deriveTileState, indexRequestsByTitle, resetSettleObservations } from './tileState'
+import { deriveTileState, resetSettleObservations, type TileLiveState } from './tileState'
 
 function result(overrides: Partial<DiscoverResult> = {}): DiscoverResult {
   return {
@@ -17,36 +17,37 @@ function result(overrides: Partial<DiscoverResult> = {}): DiscoverResult {
   }
 }
 
-function request(overrides: Partial<RequestResponse> = {}): RequestResponse {
+/**
+ * The compact `/requests/live-state` representative for one tile (issue #370
+ * phase 2) -- `deriveTileState` no longer selects a representative out of a raw
+ * array; the fold already happened server-side, so tests supply the CHOSEN
+ * state directly (or `undefined` for "no live-state entry").
+ */
+function live(overrides: Partial<TileLiveState> = {}): TileLiveState {
   return {
-    id: 1,
-    tmdb_id: 1,
-    media_type: 'movie',
-    title: 'A Title',
     status: 'pending',
-    is_anime: false,
-    keep_forever: false,
-    can_mutate: false,
-    is_owner: false,
-    can_withdraw: false,
-    has_other_participants: false,
+    request_id: 1,
+    has_history: true,
+    has_coexisting_available: false,
     ...overrides,
   }
 }
 
 /**
- * Simulate this session OBSERVING a settle: one poll shows the row active, the
- * next shows it settled. The second call both records the observation (client
- * clock) and derives — its return value is the tile state right after the settle.
+ * Simulate this session OBSERVING a settle: one poll shows the tile's
+ * representative active, the next shows it settled (same `request_id` unless
+ * overridden — a real transition never changes the representative's id). The
+ * second call both records the observation (client clock) and derives — its
+ * return value is the tile state right after the settle.
  */
 function observeSettle(
   tile: DiscoverResult,
-  activeRows: RequestResponse[],
-  settledRows: RequestResponse[],
+  activeLive: TileLiveState,
+  settledLive: TileLiveState,
   baseFetchedAt?: number,
 ) {
-  deriveTileState(tile, activeRows, baseFetchedAt)
-  return deriveTileState(tile, settledRows, baseFetchedAt)
+  deriveTileState(tile, activeLive, baseFetchedAt)
+  return deriveTileState(tile, settledLive, baseFetchedAt)
 }
 
 const BASE_BEFORE_SETTLE = () => Date.now() - 60_000
@@ -60,7 +61,7 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-describe('deriveTileState — server base only (no requests)', () => {
+describe('deriveTileState — server base only (no live-state entry)', () => {
   it('maps library_state "available" to the In-library badge', () => {
     expect(deriveTileState(result({ library_state: 'available' }), undefined)).toEqual({
       label: 'In library',
@@ -69,25 +70,25 @@ describe('deriveTileState — server base only (no requests)', () => {
   })
 
   it('maps library_state "none" to no badge', () => {
-    expect(deriveTileState(result({ library_state: 'none' }), [])).toBeNull()
+    expect(deriveTileState(result({ library_state: 'none' }), undefined)).toBeNull()
   })
 
   it('maps library_state "partially_available" to the partial badge', () => {
-    expect(deriveTileState(result({ library_state: 'partially_available' }), [])).toEqual({
+    expect(deriveTileState(result({ library_state: 'partially_available' }), undefined)).toEqual({
       label: 'Partially available',
       intent: 'available',
     })
   })
 
   it('maps library_state "requested" to a Requested badge', () => {
-    expect(deriveTileState(result({ library_state: 'requested' }), [])).toEqual({
+    expect(deriveTileState(result({ library_state: 'requested' }), undefined)).toEqual({
       label: 'Requested',
       intent: 'neutral',
     })
   })
 
   it('maps library_state "processing" to an in-progress badge', () => {
-    expect(deriveTileState(result({ library_state: 'processing' }), [])).toEqual({
+    expect(deriveTileState(result({ library_state: 'processing' }), undefined)).toEqual({
       label: 'Requested',
       intent: 'searching',
     })
@@ -97,10 +98,7 @@ describe('deriveTileState — server base only (no requests)', () => {
 describe('deriveTileState — live request overlay', () => {
   it('lets an active request overlay the server base', () => {
     // Server base is "none", but a live downloading request is polling: the overlay wins.
-    const state = deriveTileState(
-      result({ library_state: 'none' }),
-      [request({ status: 'downloading' })],
-    )
+    const state = deriveTileState(result({ library_state: 'none' }), live({ status: 'downloading' }))
     expect(state).toEqual({ label: 'Downloading', intent: 'downloading' })
   })
 
@@ -110,33 +108,27 @@ describe('deriveTileState — live request overlay', () => {
     // fresher than the settle observation.
     const state = deriveTileState(
       result({ library_state: 'available' }),
-      [request({ status: 'failed' })],
+      live({ status: 'failed' }),
       BASE_AFTER_SETTLE(),
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 
   it('does NOT let a settled cancelled row shadow a server base', () => {
-    const state = deriveTileState(
-      result({ library_state: 'none' }),
-      [request({ status: 'cancelled' })],
-    )
+    const state = deriveTileState(result({ library_state: 'none' }), live({ status: 'cancelled' }))
     expect(state).toBeNull()
   })
 
-  it('prefers the active row over an older settled row for the same title', () => {
-    const state = deriveTileState(result({ library_state: 'none' }), [
-      request({ id: 1, status: 'evicted' }),
-      request({ id: 2, status: 'searching' }),
-    ])
+  it('shows whatever active representative the server chose (fold happens server-side)', () => {
+    // The active-else-newest fold (issue #370 phase 2: an older settled sibling
+    // vs. a newer active row) is now server-side (`compact_states_by_tmdb_ids`) --
+    // `deriveTileState` just renders the representative it's handed.
+    const state = deriveTileState(result({ library_state: 'none' }), live({ status: 'searching' }))
     expect(state).toEqual({ label: 'Searching', intent: 'searching' })
   })
 
   it('shows a live available request as In library', () => {
-    const state = deriveTileState(
-      result({ library_state: 'none' }),
-      [request({ status: 'available' })],
-    )
+    const state = deriveTileState(result({ library_state: 'none' }), live({ status: 'available' }))
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 })
@@ -148,8 +140,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
   it('degrades a stale "requested" base to none when the live row is seen failing', () => {
     const state = observeSettle(
       result({ library_state: 'requested' }),
-      [request({ status: 'downloading' })],
-      [request({ status: 'failed' })],
+      live({ status: 'downloading' }),
+      live({ status: 'failed' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -158,8 +150,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
   it('degrades a stale "processing" base to none when the live row is seen cancelling', () => {
     const state = observeSettle(
       result({ library_state: 'processing' }),
-      [request({ status: 'searching' })],
-      [request({ status: 'cancelled' })],
+      live({ status: 'searching' }),
+      live({ status: 'cancelled' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -167,11 +159,11 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
 
   it('keeps presence-derived "available" through an observed failed settle', () => {
     // Library presence is independent of the request lifecycle — failed doesn't
-    // evict, and no older available row contradicts it.
+    // evict, and no coexisting older available row contradicts it.
     const state = observeSettle(
       result({ library_state: 'available' }),
-      [request({ status: 'downloading' })],
-      [request({ status: 'failed' })],
+      live({ status: 'downloading' }),
+      live({ status: 'failed' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
@@ -183,8 +175,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
     // stale just like `requested`/`processing`.
     const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'downloading' })],
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'failed' })],
+      live({ status: 'downloading' }),
+      live({ status: 'failed' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -193,8 +185,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
   it('degrades a stale "partially_available" base to none on an observed cancel', () => {
     const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'searching' })],
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'cancelled' })],
+      live({ status: 'searching' }),
+      live({ status: 'cancelled' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -206,8 +198,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
     // a file that was just deleted. (available -> evicted is the sweep's own CAS.)
     const state = observeSettle(
       result({ library_state: 'available' }),
-      [request({ status: 'available' })],
-      [request({ status: 'evicted' })],
+      live({ status: 'available' }),
+      live({ status: 'evicted' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -216,8 +208,8 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
   it('drops a stale "partially_available" base when the row is seen evicting', () => {
     const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'partially_available' }),
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'available' })],
-      [request({ tmdb_id: 7, media_type: 'tv', status: 'evicted' })],
+      live({ status: 'available' }),
+      live({ status: 'evicted' }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
@@ -226,19 +218,19 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
   it('suppresses when the base fetch time is unknown (conservative default)', () => {
     const state = observeSettle(
       result({ library_state: 'requested' }),
-      [request({ status: 'downloading' })],
-      [request({ status: 'failed' })],
+      live({ status: 'downloading' }),
+      live({ status: 'failed' }),
       undefined,
     )
     expect(state).toBeNull()
   })
 
   it('leaves the no-live-row case unchanged (server base is the only truth)', () => {
-    expect(deriveTileState(result({ library_state: 'requested' }), [])).toEqual({
+    expect(deriveTileState(result({ library_state: 'requested' }), undefined)).toEqual({
       label: 'Requested',
       intent: 'neutral',
     })
-    expect(deriveTileState(result({ library_state: 'available' }), [])).toEqual({
+    expect(deriveTileState(result({ library_state: 'available' }), undefined)).toEqual({
       label: 'In library',
       intent: 'available',
     })
@@ -247,25 +239,19 @@ describe('deriveTileState — an OBSERVED settle degrades a pre-settle base', ()
 
 describe('deriveTileState — the suppression is time-aware, never permanent', () => {
   it('trusts a base refetched AFTER the observed settle (movie re-added to Plex)', () => {
-    // The wave-5 scenario: old available row + newer re-request observed failing;
-    // Discover then REFETCHES and the server returns "available" from fresh presence
-    // (the movie was re-added/re-imported). The suppression must lift — hiding the
-    // badge forever would be permanent wrongness, worse than the transient staleness
-    // it replaced.
+    // The wave-5 scenario: a re-request observed failing; Discover then REFETCHES
+    // and the server returns "available" from fresh presence (the movie was
+    // re-added/re-imported). The suppression must lift — hiding the badge forever
+    // would be permanent wrongness, worse than the transient staleness it replaced.
     const tile = result({ library_state: 'available' })
-    const activeRows = [
-      request({ id: 1, status: 'available' }),
-      request({ id: 2, status: 'downloading' }),
-    ]
-    const settledRows = [
-      request({ id: 1, status: 'available' }),
-      request({ id: 2, status: 'failed' }),
-    ]
+    const activeLive = live({ status: 'downloading', request_id: 2, has_coexisting_available: true })
+    const settledLive = live({ status: 'failed', request_id: 2, has_coexisting_available: true })
     // Settle observed against the pre-settle base: suppressed (wave-4 semantics).
-    expect(observeSettle(tile, activeRows, settledRows, BASE_BEFORE_SETTLE())).toBeNull()
-    // The SAME rows after a discover refetch: the fresh base already folds the
-    // failed status server-side, so "available" is presence truth — badge shows.
-    expect(deriveTileState(tile, settledRows, BASE_AFTER_SETTLE())).toEqual({
+    expect(observeSettle(tile, activeLive, settledLive, BASE_BEFORE_SETTLE())).toBeNull()
+    // The SAME representative after a discover refetch: the fresh base already
+    // folds the failed status server-side, so "available" is presence truth —
+    // badge shows.
+    expect(deriveTileState(tile, settledLive, BASE_AFTER_SETTLE())).toEqual({
       label: 'In library',
       intent: 'available',
     })
@@ -273,7 +259,7 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
 
   it('suppresses a base older than the first poll that already carries the settled row', async () => {
     // The wave-6 race: the discover response was computed while the row was still
-    // requested/processing; the FIRST /requests poll lands AFTER the settle. There
+    // requested/processing; the FIRST live-state poll lands AFTER the settle. There
     // is no transition to watch — the first sighting IS the observation, and a base
     // older than that poll cannot be proven to reflect the settle. Suppress AND
     // queue the one-shot invalidation so the tile self-heals within one refetch.
@@ -283,7 +269,7 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     const pollAt = Date.now()
     const state = deriveTileState(
       result({ library_state: 'requested' }),
-      [request({ status: 'failed' })],
+      live({ status: 'failed' }),
       pollAt - 60_000, // base fetched a minute before the poll
       pollAt,
     )
@@ -295,7 +281,7 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     expect(
       deriveTileState(
         result({ library_state: 'available' }),
-        [request({ status: 'failed' })],
+        live({ status: 'failed' }),
         pollAt + 60_000,
         pollAt,
       ),
@@ -318,7 +304,7 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     const pollAt = Date.now() - 10_000
     const state = deriveTileState(
       result({ library_state: 'available' }),
-      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'failed' })],
+      live({ status: 'failed' }),
       pollAt + 5_000, // base resolved after the poll snapshot
       pollAt,
     )
@@ -341,7 +327,7 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     const pollAt = Date.now()
     const state = deriveTileState(
       result({ library_state: 'requested' }),
-      [request({ status: 'failed' })],
+      live({ status: 'failed' }),
       pollAt + 50, // resolved 50ms after the observation — inside one RTT
       pollAt,
     )
@@ -364,12 +350,12 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
       .spyOn(queryClient, 'invalidateQueries')
       .mockResolvedValue(undefined as never)
     const pollAt = Date.now()
-    const rows = [request({ status: 'failed' })]
+    const failedLive = live({ status: 'failed' })
     // First observation happens while rendering the FRESH query's tile.
-    deriveTileState(result({ library_state: 'none' }), rows, pollAt + 60_000, pollAt)
+    deriveTileState(result({ library_state: 'none' }), failedLive, pollAt + 60_000, pollAt)
     // The stale sibling's tile renders suppressed (its base predates the settle)...
     expect(
-      deriveTileState(result({ library_state: 'requested' }), rows, pollAt - 60_000, pollAt),
+      deriveTileState(result({ library_state: 'requested' }), failedLive, pollAt - 60_000, pollAt),
     ).toBeNull()
     // ...and the invalidation was queued by the first observation so it can heal.
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -383,12 +369,12 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
       .mockResolvedValue(undefined as never)
     const pollAt = Date.now()
     const tile = result({ library_state: 'requested' })
-    const rows = [request({ status: 'failed' })]
+    const failedLive = live({ status: 'failed' })
     // First sighting with an old base: suppressed + invalidation queued.
-    expect(deriveTileState(tile, rows, pollAt - 60_000, pollAt)).toBeNull()
+    expect(deriveTileState(tile, failedLive, pollAt - 60_000, pollAt)).toBeNull()
     // Re-derives (same settled row) never re-fire it, whatever the base age.
-    deriveTileState(tile, rows, pollAt - 60_000, pollAt)
-    deriveTileState(tile, rows, pollAt + 60_000, pollAt)
+    deriveTileState(tile, failedLive, pollAt - 60_000, pollAt)
+    deriveTileState(tile, failedLive, pollAt + 60_000, pollAt)
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(invalidate).toHaveBeenCalledTimes(1)
   })
@@ -398,16 +384,17 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
     // Seeing it active clears the old observation; a later settle is a new event
     // against whatever base is current.
     const tile = result({ library_state: 'requested' })
-    observeSettle(tile, [request({ status: 'downloading' })], [request({ status: 'failed' })])
+    observeSettle(tile, live({ status: 'downloading' }), live({ status: 'failed' }))
     // Re-armed: active again — the overlay simply wins.
-    expect(deriveTileState(tile, [request({ status: 'searching' })])).toEqual({
+    expect(deriveTileState(tile, live({ status: 'searching' }))).toEqual({
       label: 'Searching',
       intent: 'searching',
     })
     // Settles again; a base refetched after THIS settle is still trusted.
-    expect(
-      deriveTileState(tile, [request({ status: 'failed' })], BASE_AFTER_SETTLE()),
-    ).toEqual({ label: 'Requested', intent: 'neutral' })
+    expect(deriveTileState(tile, live({ status: 'failed' }), BASE_AFTER_SETTLE())).toEqual({
+      label: 'Requested',
+      intent: 'neutral',
+    })
   })
 
   it('invalidates the discover queries when a settle is first observed', async () => {
@@ -416,131 +403,68 @@ describe('deriveTileState — the suppression is time-aware, never permanent', (
       .mockResolvedValue(undefined as never)
     observeSettle(
       result({ library_state: 'requested' }),
-      [request({ status: 'downloading' })],
-      [request({ status: 'failed' })],
+      live({ status: 'downloading' }),
+      live({ status: 'failed' }),
     )
     // The invalidation is deferred to a microtask (deriveTileState runs in render).
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['discover'] })
     expect(invalidate).toHaveBeenCalledTimes(1)
-    // Re-deriving with the same settled rows does not re-fire it.
-    deriveTileState(result({ library_state: 'requested' }), [request({ status: 'failed' })])
+    // Re-deriving with the same settled row does not re-fire it.
+    deriveTileState(result({ library_state: 'requested' }), live({ status: 'failed' }))
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(invalidate).toHaveBeenCalledTimes(1)
   })
 })
 
-describe('deriveTileState — movie re-request contradiction (pre-settle base only)', () => {
-  it('drops the "available" base when a movie re-request beside an older available row fails', () => {
-    // The movie create path NEVER creates a second row while Plex still has the
-    // title (its fresh is_available(use_cache=False) check dedups to the in-library
-    // row instead) — so a newer request coexisting with an older `available` row
-    // proves the title read ABSENT at create time. When that re-request is observed
-    // settling, the pre-settle `available` base is stale history: unbadge.
+describe('deriveTileState — movie presence-contradiction (has_coexisting_available)', () => {
+  // The compact endpoint (issue #370 phase 2) computes this bit server-side: a
+  // NON-representative row is a settled `available` alongside the chosen
+  // representative -- movie create never creates a second row while Plex still
+  // has the title, so a coexisting available row proves the title read ABSENT
+  // at create time. The server scopes this to movies only (always `false` for
+  // tv), so `deriveTileState` trusts the flag verbatim with no media-type
+  // re-check of its own -- pinned on the backend by
+  // `test_compact_state_movie_coexisting_available`.
+  it('drops the "available" base when a coexisting-available re-request fails', () => {
     const state = observeSettle(
       result({ library_state: 'available' }),
-      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'downloading' })],
-      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'failed' })],
+      live({ status: 'downloading', has_coexisting_available: false }),
+      live({ status: 'failed', has_coexisting_available: true }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('drops the "available" base when the observed movie re-request is cancelled', () => {
+  it('drops the "available" base when a coexisting-available re-request is cancelled', () => {
     const state = observeSettle(
       result({ library_state: 'available' }),
-      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'pending' })],
-      [request({ id: 1, status: 'available' }), request({ id: 2, status: 'cancelled' })],
+      live({ status: 'pending', has_coexisting_available: false }),
+      live({ status: 'cancelled', has_coexisting_available: true }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toBeNull()
   })
 
-  it('keeps the tv "available" base when a season re-request fails', () => {
-    // TV is deliberately NOT covered by the movie contradiction rule: a season-level
-    // re-request (e.g. a newly aired season) is legitimately created while the show
-    // remains partially/fully present (_present_seasons_or_empty only dedups when
-    // EVERY requested season is present), so its failure says nothing about the
-    // seasons already on disk.
+  it('keeps the "available" base when the settled row has no coexisting available sibling', () => {
+    // `has_coexisting_available: false` is what the server sends for every tv
+    // representative (and for a movie with no such sibling) -- the base survives.
     const state = observeSettle(
       result({ tmdb_id: 7, media_type: 'tv', library_state: 'available' }),
-      [
-        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
-        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'downloading' }),
-      ],
-      [
-        request({ id: 1, tmdb_id: 7, media_type: 'tv', status: 'available' }),
-        request({ id: 2, tmdb_id: 7, media_type: 'tv', status: 'failed' }),
-      ],
+      live({ status: 'downloading', has_coexisting_available: false }),
+      live({ status: 'failed', has_coexisting_available: false }),
       BASE_BEFORE_SETTLE(),
     )
     expect(state).toEqual({ label: 'In library', intent: 'available' })
   })
 })
 
-describe('deriveTileState — movie/tv correlation isolation', () => {
-  it('does not apply a tv request to a movie tile with the same tmdb_id', () => {
-    const state = deriveTileState(
-      result({ tmdb_id: 42, media_type: 'movie', library_state: 'none' }),
-      [request({ tmdb_id: 42, media_type: 'tv', status: 'downloading' })],
-    )
-    // The movie tile ignores the tv request entirely -> falls back to its own base.
-    expect(state).toBeNull()
-  })
-
-  it('maps a partially_available request to the partial badge', () => {
+describe('deriveTileState — status→presentation mapping', () => {
+  it('maps a partially_available live status to the partial badge', () => {
     const state = deriveTileState(
       result({ tmdb_id: 5, media_type: 'tv', library_state: 'none' }),
-      [request({ tmdb_id: 5, media_type: 'tv', status: 'partially_available' })],
+      live({ status: 'partially_available' }),
     )
     expect(state).toEqual({ label: 'Partially available', intent: 'available' })
-  })
-})
-
-describe('indexRequestsByTitle — memoized correlation map (issue #218)', () => {
-  it('builds the index once per requests-array instance (memoized identity)', () => {
-    const rows = [
-      request({ id: 1, tmdb_id: 7, media_type: 'movie' }),
-      request({ id: 2, tmdb_id: 7, media_type: 'movie', status: 'failed' }),
-      request({ id: 3, tmdb_id: 7, media_type: 'tv' }),
-    ]
-    const first = indexRequestsByTitle(rows)
-    const second = indexRequestsByTitle(rows)
-    expect(second).toBe(first) // SAME Map instance: built once, O(U + T) per render
-    // A NEW array instance (a fresh poll snapshot) gets a fresh index.
-    expect(indexRequestsByTitle([...rows])).not.toBe(first)
-  })
-
-  it('groups by the composite media_type:tmdb_id key preserving id order', () => {
-    const rows = [
-      request({ id: 1, tmdb_id: 7, media_type: 'movie' }),
-      request({ id: 2, tmdb_id: 7, media_type: 'tv' }),
-      request({ id: 3, tmdb_id: 7, media_type: 'movie', status: 'failed' }),
-    ]
-    const index = indexRequestsByTitle(rows)
-    expect(index.get('movie:7')?.map((r) => r.id)).toEqual([1, 3]) // id-ascending, tv excluded
-    expect(index.get('tv:7')?.map((r) => r.id)).toEqual([2])
-  })
-
-  it('bounds per-tile correlation to lookups: many tiles never rescan the array', () => {
-    // Comparison-bound proxy: after ONE deriveTileState call builds the index,
-    // the array itself is never re-iterated for further tiles — verified by
-    // freezing iteration via a poisoned filter/find on the array instance.
-    const rows = [
-      request({ id: 1, tmdb_id: 100, media_type: 'movie', status: 'downloading' }),
-      request({ id: 2, tmdb_id: 101, media_type: 'movie', status: 'pending' }),
-    ]
-    deriveTileState(result({ tmdb_id: 100, media_type: 'movie', library_state: 'none' }), rows)
-    rows.filter = () => {
-      throw new Error('per-tile array rescan (O(T x U)) is forbidden after the index is built')
-    }
-    // 50 further tiles resolve purely through the memoized index.
-    for (let i = 0; i < 50; i++) {
-      const state = deriveTileState(
-        result({ tmdb_id: 100 + (i % 2), media_type: 'movie', library_state: 'none' }),
-        rows,
-      )
-      expect(state).not.toBeNull()
-    }
   })
 })

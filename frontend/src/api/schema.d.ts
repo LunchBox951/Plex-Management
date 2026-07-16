@@ -865,6 +865,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/requests/by-title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Requests By Title Endpoint
+         * @description Every visible RAW request row for one title, id-ascending (issue #370).
+         *
+         *     Backs the title-detail modal, which needs the WHOLE match list for a title
+         *     (bound-request/re-request resolution, per-season status, download
+         *     progress, subscriber flags) -- never a folded representative. Bounded by
+         *     one title's lifetime history (tiny), so this is a plain GET with no
+         *     pagination; ``next_cursor`` is always ``null`` (the shape matches
+         *     ``GET /requests`` for the client's shared response handling, but a title's
+         *     history never needs a second page in practice). Same visibility scope as
+         *     ``GET /requests``. Unknown/never-requested titles return an empty list,
+         *     never a 404 (there is nothing owned to hide the existence of).
+         */
+        get: operations["requests_by_title_endpoint_api_v1_requests_by_title_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/requests/live-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Live State Endpoint
+         * @description Folded live-state per tile key -- the client tile overlay's freshness poll (#370).
+         *
+         *     Phase 2 of issue #218: the client's Discover/Search tiles need the SAME
+         *     active-else-newest fold ``GET /requests``'s legacy mode computes, but keyed
+         *     by exactly the currently-visible tile keys, and WITHOUT re-fetching the
+         *     whole request history or Discover page every poll tick. ``POST`` (not
+         *     ``GET``) because a page can carry well over a hundred tile keys, which
+         *     risks URL-length limits as repeated query params.
+         *
+         *     A key present in ``states`` has at least one visible request row for that
+         *     title; a key with none is simply ABSENT (never a fabricated state). Same
+         *     visibility scope as ``GET /requests``: admin / API-key sees every row,
+         *     a shared user sees only their own subscribed rows, and the unreachable
+         *     non-admin-without-a-user-identity case fails closed to an empty map.
+         */
+        post: operations["live_state_endpoint_api_v1_requests_live_state_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/requests/{request_id}": {
         parameters: {
             query?: never;
@@ -1869,6 +1932,55 @@ export interface components {
         BlocklistResponse: {
             /** Entries */
             entries: components["schemas"]["BlocklistEntry"][];
+        };
+        /**
+         * CompactStateField
+         * @description One tile's folded live-state (issue #370) -- see ``CompactRequestState``.
+         *
+         *     ``status``/``request_id`` are the representative row's (active-else-newest);
+         *     ``has_history`` is always ``True`` for every key present in the response
+         *     map (a title with no visible request rows is simply absent) -- included
+         *     explicitly rather than relying on callers to infer it from key presence,
+         *     since the tv quick-request gate reads it directly.
+         *     ``has_coexisting_available`` is the movie presence-contradiction bit: a
+         *     NON-representative row is a settled ``available`` alongside the chosen
+         *     representative. Always ``False`` for tv.
+         */
+        CompactStateField: {
+            /** Has Coexisting Available */
+            has_coexisting_available: boolean;
+            /** Has History */
+            has_history: boolean;
+            /** Request Id */
+            request_id: number;
+            status: components["schemas"]["RequestStatus"];
+        };
+        /**
+         * CompactStateRequest
+         * @description ``POST /requests/live-state`` body -- the visible tile key set to poll (issue #370).
+         *
+         *     POST, not GET: a Discover/Search page can carry well over a hundred tile
+         *     keys, which risks URL-length limits as repeated query params; ``react-query``
+         *     keys its cache on the request body just as well as the URL, so a POST read
+         *     polls fine. ``keys`` is capped so one batch stays bounded.
+         */
+        CompactStateRequest: {
+            /** Keys */
+            keys: components["schemas"]["TileKey"][];
+        };
+        /**
+         * CompactStateResponse
+         * @description ``POST /requests/live-state`` response body (issue #370).
+         *
+         *     ``states`` is keyed by ``"{media_type}:{tmdb_id}"`` (matching the client's
+         *     tile-key convention); a key absent from the map has no visible request
+         *     history for the caller.
+         */
+        CompactStateResponse: {
+            /** States */
+            states: {
+                [key: string]: components["schemas"]["CompactStateField"];
+            };
         };
         /**
          * CreateRequestBody
@@ -3070,6 +3182,19 @@ export interface components {
              * @enum {string}
              */
             status: "ok" | "degraded" | "down" | "not_configured";
+        };
+        /**
+         * TileKey
+         * @description One Discover/Search tile identity: ``(media_type, tmdb_id)`` (issue #370).
+         */
+        TileKey: {
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "tv";
+            /** Tmdb Id */
+            tmdb_id: number;
         };
         /**
          * TmdbValidateRequest
@@ -4508,6 +4633,71 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    requests_by_title_endpoint_api_v1_requests_by_title_get: {
+        parameters: {
+            query: {
+                tmdb_id: number;
+                media_type: "movie" | "tv";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    live_state_endpoint_api_v1_requests_live_state_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CompactStateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompactStateResponse"];
                 };
             };
             /** @description Validation Error */

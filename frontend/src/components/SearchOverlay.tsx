@@ -88,11 +88,17 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
   const suggestions = useMemo(() => popularTitles(home.data), [home.data])
   const results = queryReady ? (search.data?.results ?? []) : []
   const activeDataUpdatedAt = hasQuery ? search.dataUpdatedAt : home.dataUpdatedAt
-  // Same visibility gate: no /requests observer (Layout's badge already polls
-  // that query) until tiles can actually render.
-  const { tileState, quickRequestable } = useDiscoverTilePresentation(activeDataUpdatedAt, {
-    enabled: open,
-  })
+  // The currently-rendered tile set -- suggestions before a query is typed,
+  // search results once one is (mutually exclusive, mirroring `renderCards`
+  // below). Drives the compact live-state poll's key set (issue #370 phase 2).
+  const visibleItems = hasQuery ? results : suggestions
+  // Same visibility gate: no live-state observer (Layout's badge already polls
+  // /requests for other surfaces) until tiles can actually render.
+  const { tileState, quickRequestable } = useDiscoverTilePresentation(
+    visibleItems,
+    activeDataUpdatedAt,
+    { enabled: open },
+  )
 
   useEffect(() => {
     onOpenChange?.(open)
