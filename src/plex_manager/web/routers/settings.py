@@ -48,6 +48,12 @@ from plex_manager.services.update_policy import (
     UPDATE_POLICY_SETTING_KEYS,
     resolve_update_policy,
 )
+
+# The deps MODULE itself is imported (not just names from it) so the shared
+# ``secret_rotation_lock`` is read as ``deps.secret_rotation_lock`` — a genuine
+# cross-module attribute read CodeQL can see, unlike a ``from``-imported bare
+# name (see the ``Cell`` docstring in ``web.deps``; alerts #363/#368, issue #385).
+from plex_manager.web import deps
 from plex_manager.web.deps import (
     API_KEY_HEADER_NAME,
     AUTO_GRAB_ENABLED_DEFAULT,
@@ -95,7 +101,6 @@ from plex_manager.web.deps import (
     resolve_log_max_rows,
     resolve_log_retention_days,
     resolve_watchlist_sync_interval_minutes,
-    secret_rotation_lock,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams, publish_realtime
@@ -261,7 +266,7 @@ async def secret_rotation(
     every write it wants committed, in the boundary's fresh transaction.
     """
     handler = _log_handler(request)
-    async with secret_rotation_lock.value:
+    async with deps.secret_rotation_lock.value:
         # End the request's pre-lock transaction (the same idiom the /logs read
         # endpoints use): the drain loop may have held the lock first and
         # committed rows carrying the retiring value AFTER this session already

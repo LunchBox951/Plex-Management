@@ -23,6 +23,7 @@ from plex_manager.domain.eviction import EvictionCandidate, select_evictions
 from plex_manager.models import AuthSession, LogEvent, Setting, User
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import log_capture_service, path_visibility
+from plex_manager.web import deps
 from plex_manager.web.deps import (
     AUTO_GRAB_ENABLED_DEFAULT,
     AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
@@ -4943,8 +4944,6 @@ async def test_capture_before_rotation_and_drain_after_commit_redacts_retired_re
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A queued capture survives the boundary only in redacted form after commit."""
-    from plex_manager.web import app as app_module
-    from plex_manager.web.routers import settings as settings_router
 
     old_value = f"old-{kind}-capture-boundary-secret"
     new_secret = "new-generic-capture-boundary-secret"  # noqa: S105 -- fixture credential
@@ -4970,8 +4969,7 @@ async def test_capture_before_rotation_and_drain_after_commit_redacts_retired_re
         real_release()
 
     monkeypatch.setattr(lock, "release", release_after_live_cleanup)
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     response = await _mutation_request(
         client,
@@ -5009,7 +5007,6 @@ async def test_capture_during_rotation_cannot_commit_retired_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The widened handler snapshot redacts emits before a paused rewrite can commit."""
-    from plex_manager.web import app as app_module
     from plex_manager.web.routers import settings as settings_router
 
     old_value = f"old-{kind}-capture-during-secret"
@@ -5018,8 +5015,7 @@ async def test_capture_during_rotation_cannot_commit_retired_secret(
     handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     rotation_ready = asyncio.Event()
     release_rotation = asyncio.Event()
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5078,8 +5074,6 @@ async def test_drain_holds_rotation_lock_before_mutation_and_retired_row_is_rewr
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A drain committed before each mutation is still rewritten before it returns."""
-    from plex_manager.web import app as app_module
-    from plex_manager.web.routers import settings as settings_router
 
     old_value = f"old-{kind}-drain-ordering-secret"
     new_secret = "new-generic-drain-ordering-secret"  # noqa: S105 -- fixture credential
@@ -5096,8 +5090,7 @@ async def test_drain_holds_rotation_lock_before_mutation_and_retired_row_is_rewr
     )
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     entered_drain = asyncio.Event()
     release_drain = asyncio.Event()
     drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))
@@ -5128,7 +5121,6 @@ async def test_mutation_holds_rotation_lock_before_drain_and_drain_reads_final_s
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A drain waiting behind a mutation refreshes only after its final commit."""
-    from plex_manager.web import app as app_module
     from plex_manager.web.routers import settings as settings_router
 
     old_value = f"old-{kind}-mutation-ordering-secret"
@@ -5137,8 +5129,7 @@ async def test_mutation_holds_rotation_lock_before_drain_and_drain_reads_final_s
     handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler = handler
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     mutation_entered = asyncio.Event()
     release_mutation = asyncio.Event()
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5180,7 +5171,6 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every exceptional mutation exit leaves the shared boundary usable."""
-    from plex_manager.web import app as app_module
     from plex_manager.web.routers import settings as settings_router
 
     old_secret = "old-lock-release-secret"  # noqa: S105 -- fixture credential
@@ -5189,8 +5179,7 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
     app.state.log_handler = log_capture_service.LogCaptureHandler()
     app.state.log_handler.secret_values = frozenset({old_secret})
     lock = _OrderingLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     if failure == "rewrite":
         real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -5284,7 +5273,6 @@ async def test_mutation_reopens_transaction_under_lock_before_rewrite(
     lock first may have committed rows carrying the retiring secret, and a
     retained pre-lock snapshot would let the rewrite miss them and the final
     ``secret_values()`` read regress the handler snapshot."""
-    from plex_manager.web import app as app_module
     from plex_manager.web.routers import settings as settings_router
 
     old_value = f"old-{kind}-fresh-snapshot-secret"
@@ -5300,8 +5288,7 @@ async def test_mutation_reopens_transaction_under_lock_before_rewrite(
             return result
 
     lock = _RecordingLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     real_rollback = AsyncSession.rollback
 

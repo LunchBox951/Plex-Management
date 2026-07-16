@@ -61,6 +61,12 @@ from plex_manager.services.update_coordination_service import (
     MaintenanceDrainingError,
     UpdateCoordinationService,
 )
+
+# The deps MODULE itself is imported (not just names from it) so the shared
+# ``secret_rotation_lock`` is read as ``deps.secret_rotation_lock`` — a genuine
+# cross-module attribute read CodeQL can see, unlike a ``from``-imported bare
+# name (see the ``Cell`` docstring in ``web.deps``; alerts #363/#368, issue #385).
+from plex_manager.web import deps
 from plex_manager.web.deps import (
     AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
     CSRF_HEADER_NAME,
@@ -99,7 +105,6 @@ from plex_manager.web.deps import (
     resolve_prowlarr,
     resolve_qbittorrent,
     resolve_tmdb,
-    secret_rotation_lock,
 )
 from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
@@ -1018,7 +1023,7 @@ async def _log_drain_loop(app: FastAPI) -> None:
     last_pruned_at = time.monotonic()
     while True:
         try:
-            async with sessionmaker() as session, secret_rotation_lock.value:
+            async with sessionmaker() as session, deps.secret_rotation_lock.value:
                 # Refresh the capture handler's value-based redaction set every tick,
                 # then drain and commit while the shared boundary is held.
                 handler.secret_values = await SettingsStore(session).secret_values()

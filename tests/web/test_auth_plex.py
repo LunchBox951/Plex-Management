@@ -33,6 +33,7 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, LogEvent, Setting, SystemSettings, User
 from plex_manager.services import log_capture_service
+from plex_manager.web import deps
 from plex_manager.web.deps import SETUP_TOKEN_HEADER_NAME, SettingsStore
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import get_event_hub
@@ -1621,7 +1622,7 @@ async def test_sign_in_identical_token_is_not_a_rotation(
 
     monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", must_not_rewrite)
     lock = _ObservableLock()
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
 
@@ -1663,7 +1664,7 @@ async def test_first_ever_sign_in_token_is_initial_configuration_not_rotation(
 
     monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", must_not_rewrite)
     lock = _ObservableLock()
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     response = await client.post("/api/v1/auth/plex", json={"auth_token": _NEW_PLEX_TOKEN})
 
@@ -1761,7 +1762,7 @@ async def test_cancelled_sign_in_rotation_releases_lock_and_restores_snapshot(
     app.state.log_handler = handler
     await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
     lock = _ObservableLock()
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     entered = asyncio.Event()
     release = asyncio.Event()
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
@@ -1843,7 +1844,7 @@ async def test_concurrent_sign_ins_for_two_users_serialize_and_keep_each_other_m
         ),
     )
     lock = _ObservableLock()
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
     gates: list[tuple[asyncio.Event, asyncio.Event]] = [
         (asyncio.Event(), asyncio.Event()),
@@ -2015,8 +2016,7 @@ async def test_sign_in_rotation_waits_for_in_flight_durable_log_read(
 
     monkeypatch.setattr(ops_router.SqlLogEventRepository, "list_events", paused_list_events)
     lock = _ObservableLock()
-    monkeypatch.setattr(ops_router.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
 
     read_task = asyncio.create_task(client.get("/api/v1/ops/logs", headers={"X-Api-Key": _API_KEY}))
     await _wait_for_event(entered)
@@ -2048,7 +2048,6 @@ async def test_sign_in_rotation_waits_for_drain_and_retired_row_is_rewritten(
     the rotation returns: the drain holds the shared lock, the sign-in queues
     behind it, and the freshly-drained row containing the retiring token is
     covered by the durable rewrite."""
-    from plex_manager.web import app as app_module
 
     await _seed_rotation_fixture(seed, sessionmaker_)
     handler = log_capture_service.LogCaptureHandler()
@@ -2064,8 +2063,7 @@ async def test_sign_in_rotation_waits_for_drain_and_retired_row_is_rewritten(
     app.state.log_handler = handler
     await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
     lock = _ObservableLock()
-    monkeypatch.setattr(app_module.secret_rotation_lock, "value", lock)
-    monkeypatch.setattr(settings_router.secret_rotation_lock, "value", lock)
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
     entered_drain = asyncio.Event()
     release_drain = asyncio.Event()
     drain = asyncio.create_task(_run_one_drain(app, monkeypatch, entered_drain, release_drain))

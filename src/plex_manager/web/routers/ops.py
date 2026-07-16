@@ -78,6 +78,12 @@ from plex_manager.services.log_capture_service import (
     redact_log_context,
     redact_log_message,
 )
+
+# The deps MODULE itself is imported (not just names from it) so the shared
+# ``secret_rotation_lock`` is read as ``deps.secret_rotation_lock`` — a genuine
+# cross-module attribute read CodeQL can see, unlike a ``from``-imported bare
+# name (see the ``Cell`` docstring in ``web.deps``; alerts #363/#368, issue #385).
+from plex_manager.web import deps
 from plex_manager.web.deps import (
     SettingsStore,
     get_anime_movie_root_optional,
@@ -98,7 +104,6 @@ from plex_manager.web.deps import (
     get_tv_root_optional,
     get_watchlist_status,
     require_admin,
-    secret_rotation_lock,
 )
 from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
@@ -270,7 +275,7 @@ async def list_logs_endpoint(
     """Paginated, filtered read of the durable ``log_events`` store, newest
     first. ``correlation_id`` matches a ``request_id``/``download_id``/
     ``tmdb_id`` carried in a record's context."""
-    async with secret_rotation_lock.value:
+    async with deps.secret_rotation_lock.value:
         await session.rollback()
         page = await SqlLogEventRepository(session).list_events(
             level=level,
@@ -307,7 +312,7 @@ async def tail_logs_endpoint(
     restart, never persisted (only INFO+ reaches durable ``log_events``, see
     ``GET /logs`` above). ``dropped_count`` is the capture handler's own honest
     signal for how many INFO+ records missed durable storage since startup."""
-    async with secret_rotation_lock.value:
+    async with deps.secret_rotation_lock.value:
         await session.rollback()
         records = handler.snapshot_tail(limit)
         records.reverse()
@@ -386,7 +391,7 @@ async def export_logs_endpoint(
     containing ``@``, concretely) before the value-based exact-match search
     ever sees it whole.
     """
-    async with secret_rotation_lock.value:
+    async with deps.secret_rotation_lock.value:
         await session.rollback()
         repo = SqlLogEventRepository(session)
         if correlation_id is not None:
