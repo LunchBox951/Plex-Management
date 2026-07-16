@@ -31,6 +31,7 @@ from plex_manager.adapters.plex.library import (
     reset_caches,
 )
 from plex_manager.ports.library import ArtworkImage, WatchState, WatchStateQuery
+from tests.support import assert_task_raises
 
 PLEX_URL = "http://plex:32400"
 TOKEN = "super-secret-plex-token"  # noqa: S105
@@ -3134,8 +3135,7 @@ async def test_fetch_artwork_typed_failure_releases_permit() -> None:
     try:
         first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
         assert 0 in first_four
-        with pytest.raises(PlexLibraryError):
-            await tasks[0]
+        await assert_task_raises(tasks[0], PlexLibraryError)
         fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
         assert fifth not in first_four
         release.set()
@@ -3159,8 +3159,7 @@ async def test_fetch_artwork_cancellation_releases_permit() -> None:
         first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
         cancelled = first_four[0]
         tasks[cancelled].cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await tasks[cancelled]
+        await assert_task_raises(tasks[cancelled], asyncio.CancelledError)
         fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
         assert fifth not in first_four
         release.set()
@@ -3247,8 +3246,7 @@ async def test_fetch_artwork_cancellation_closes_stream_and_releases_limiter() -
     try:
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await assert_task_raises(task, asyncio.CancelledError)
         assert stream.closed is True
         follow_up = _adapter(_artwork_handler(), "http://art-after-cancel:32400")
         assert (

@@ -27,6 +27,7 @@ from plex_manager.adapters.plex.library import (
 from plex_manager.ports.library import ArtworkImage, ArtworkKind, LibraryPort
 from plex_manager.web import deps
 from plex_manager.web.deps import SettingsStore
+from tests.support import assert_task_raises
 from tests.web.fakes import FakeLibrary, override_adapters
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -284,8 +285,7 @@ async def test_route_real_limiter_releases_after_request_cancellation(
         cancelled_id = first_four[0]
         cancelled_task = admitted[cancelled_id - 1200]
         cancelled_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await cancelled_task
+        await assert_task_raises(cancelled_task, asyncio.CancelledError)
         assert await asyncio.wait_for(entered.get(), timeout=1.0) == 1300
         release.set()
         remaining = [task for task in admitted if task is not cancelled_task]
