@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from plex_manager.models import LogEvent
 from plex_manager.ports.repositories import LogEventCreate
@@ -15,6 +15,77 @@ from plex_manager.repositories import SqlLogEventRepository
 from plex_manager.repositories import log_events as log_events_module
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def test_rewrite_redactable_fields_updates_message_context_and_is_idempotent(
+    session: AsyncSession,
+) -> None:
+    repo = SqlLogEventRepository(session)
+    await repo.create(
+        level="INFO",
+        logger="test",
+        message="unsafe old-value",
+        context={"old-value": {"nested": "old-value"}},
+    )
+    await repo.create(level="INFO", logger="test", message="safe")
+
+    def rewrite_message(value: str) -> str:
+        return value.replace("old-value", "<redacted>")
+
+    def rewrite_context(value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {key.replace("old-value", "<redacted>"): {"nested": "<redacted>"} for key in value}
+
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 1
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 0
+    page = await repo.list_events(limit=10)
+    assert "old-value" not in str(page.results)
+
+
+async def test_rewrite_redactable_fields_is_correct_across_batch_boundaries(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The keyset-batched scan rewrites every row, including ones past the
+    first batch boundary, and counts changes across all batches."""
+    monkeypatch.setattr(log_events_module, "_REWRITE_BATCH_SIZE", 2)
+    repo = SqlLogEventRepository(session)
+    for index in range(5):
+        await repo.create(
+            level="INFO",
+            logger="test",
+            message=f"row {index} old-value",
+            context={"key": "old-value"} if index % 2 == 0 else None,
+        )
+
+    def rewrite_message(value: str) -> str:
+        return value.replace("old-value", "<redacted>")
+
+    def rewrite_context(value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {key: rewrite_message(str(item)) for key, item in value.items()}
+
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 5
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 0
+    page = await repo.list_events(limit=10)
+    assert len(page.results) == 5
+    assert "old-value" not in str(page.results)
+
+
+async def test_rewrite_redactable_fields_rolls_back_with_caller_transaction(
+    engine: AsyncEngine,
+) -> None:
+    sessionmaker_ = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessionmaker_() as session:
+        repo = SqlLogEventRepository(session)
+        await repo.create(level="INFO", logger="test", message="original")
+        await session.commit()
+        await repo.rewrite_redactable_fields(lambda _value: "changed", lambda value: value)
+        await session.rollback()
+    async with sessionmaker_() as session:
+        page = await SqlLogEventRepository(session).list_events(limit=10)
+        assert page.results[0].message == "original"
 
 
 async def test_create_then_list_returns_persisted_record(session: AsyncSession) -> None:

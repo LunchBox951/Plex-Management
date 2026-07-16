@@ -19,6 +19,8 @@ import asyncio
 import json
 import re
 import secrets
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 
@@ -34,8 +36,14 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.ports.library import LibraryPort
+from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import SubsystemHealth, TtlCache
+from plex_manager.services.log_capture_service import (
+    LogCaptureHandler,
+    redact_retired_log_context,
+    redact_retired_log_message,
+)
 from plex_manager.services.update_policy import (
     UPDATE_POLICY_SETTING_KEYS,
     resolve_update_policy,
@@ -87,6 +95,7 @@ from plex_manager.web.deps import (
     resolve_log_max_rows,
     resolve_log_retention_days,
     resolve_watchlist_sync_interval_minutes,
+    secret_rotation_lock,
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams, publish_realtime
@@ -104,7 +113,7 @@ from plex_manager.web.setup_validation import (
     library_options,
 )
 
-__all__ = ["router"]
+__all__ = ["router", "secret_rotation"]
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -207,6 +216,85 @@ _rotate_lock = app_key_rotate_lock
 # with a database-level version/CAS or advisory lock spanning the same critical
 # section; an in-process lock alone would not coordinate separate workers.
 _settings_update_lock = asyncio.Lock()
+
+
+def _log_handler(request: Request) -> LogCaptureHandler:
+    handler = getattr(request.app.state, "log_handler", None)
+    if not isinstance(handler, LogCaptureHandler):
+        handler = LogCaptureHandler(loop=asyncio.get_running_loop())
+        request.app.state.log_handler = handler
+    return handler
+
+
+async def _rewrite_before_secret_replacement(
+    session: AsyncSession, old_values: frozenset[str]
+) -> int:
+    if not old_values:
+        return 0
+    return await SqlLogEventRepository(session).rewrite_redactable_fields(
+        lambda message: redact_retired_log_message(message, old_values),
+        lambda context: redact_retired_log_context(context, old_values),
+    )
+
+
+@asynccontextmanager
+async def secret_rotation(
+    session: AsyncSession,
+    request: Request,
+    *,
+    retiring_values: frozenset[str],
+    incoming_values: frozenset[str] = frozenset(),
+) -> AsyncGenerator[None]:
+    """The single transactional boundary for every in-scope secret mutation (ADR-0026).
+
+    All FOUR mutation paths (generic ``PUT /settings`` secret replacement,
+    app-key rotation, app-key revocation, and the user Plex-token replacement
+    on ``POST /api/v1/auth/plex`` -- issue #374, which is why this is public)
+    run their historical rewrite and their write (the ``yield`` body) through
+    here, so the lock/rewrite/commit sequence cannot drift between them.
+    ``retiring_values`` are the values leaving ``secret_values()``;
+    ``incoming_values`` are new values the body is about to write (so in-flight
+    emits mask them before they are committed).
+
+    NOTE the in-lock ``session.rollback()`` below: any row writes the caller
+    staged BEFORE entering are discarded -- the ``yield`` body must (re)apply
+    every write it wants committed, in the boundary's fresh transaction.
+    """
+    handler = _log_handler(request)
+    async with secret_rotation_lock:
+        # End the request's pre-lock transaction (the same idiom the /logs read
+        # endpoints use): the drain loop may have held the lock first and
+        # committed rows carrying the retiring value AFTER this session already
+        # began reading -- a retained pre-lock snapshot would let the rewrite
+        # below miss those rows, and the final secret_values() read would
+        # regress the handler snapshot to stale values. The rewrite, the
+        # caller's writes, and the final read then share ONE fresh transaction,
+        # committed once -- the write/rewrite atomicity is unchanged.
+        await session.rollback()
+        transition_values = (
+            (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
+        )
+        previous_values = handler.begin_secret_rotation(transition_values)
+        try:
+            await _rewrite_before_secret_replacement(session, retiring_values)
+            yield
+            current_values = await SettingsStore(session).secret_values()
+            await session.commit()
+        except asyncio.CancelledError:
+            # Restore the in-memory snapshot first (synchronous, always runs),
+            # then SHIELD the rollback so its DB op completes instead of being
+            # cancelled mid-flight -- a half-cancelled aiosqlite rollback closes
+            # the connection and poisons the shared boundary for the drain loop.
+            handler.abort_secret_rotation(previous_values)
+            await asyncio.shield(session.rollback())
+            raise
+        except Exception:
+            await session.rollback()
+            handler.abort_secret_rotation(previous_values)
+            raise
+        handler.complete_secret_rotation(
+            previous_values, current_values, retired_values=retiring_values
+        )
 
 
 def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:
@@ -737,20 +825,30 @@ async def rotate_app_key_endpoint(
                 # clobber the winner.
                 raise HTTPException(status_code=409, detail="app_key_changed")
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
-        system.app_api_key = new_key
-        # Invalidate every recovery-cookie session born from the OLD key (finding 4):
-        # its authority ends with the key it was minted from. EXCEPT the acting admin's
-        # OWN session when THEY rotated from a recovery cookie (issue #293 P1): this
-        # response carries their one-time copy of the new key, so revoking their cookie
-        # in this same commit would 401 the SPA's post-rotate refetch/reconnect before
-        # it renders the key and leave a Plex-less operator with neither key. They
-        # legitimately performed the rotation, so their session survives; all OTHER
-        # recovery sessions are still revoked. Staged in this same transaction so it
-        # commits atomically with the new key.
-        await _revoke_recovery_sessions(
-            session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
-        )
-        await session.commit()
+        old_key = system.app_api_key
+        retired_values = frozenset({old_key}) if old_key is not None else frozenset[str]()
+        # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
+        # that is safe because every app-key writer holds ``_rotate_lock``
+        # (held here), so the DB value cannot move under us.
+        async with secret_rotation(
+            session,
+            request,
+            retiring_values=retired_values,
+            incoming_values=frozenset({new_key}),
+        ):
+            # Re-read the row in the boundary's FRESH transaction: the rollback
+            # expired the pre-lock instance, and on a pathological
+            # never-initialized install it would have discarded an uncommitted
+            # ensure_system_settings insert entirely -- refresh() then raises
+            # loudly (the instance is no longer persistent) instead of letting
+            # the key write silently miss the committed transaction.
+            await session.refresh(system)
+            system.app_api_key = new_key
+            # Invalidate every recovery-cookie session born from the OLD key,
+            # except the acting recovery-cookie admin.
+            await _revoke_recovery_sessions(
+                session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
+            )
     close_realtime_streams(
         request.app,
         reason="app_key_rotated",
@@ -800,12 +898,21 @@ async def revoke_app_key_endpoint(
             await session.refresh(system)
             if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
                 raise HTTPException(status_code=409, detail="app_key_changed")
-        system.app_api_key = None
-        # Invalidate any recovery-cookie session (finding 4): with the key gone,
-        # a break-glass cookie must not keep admin access — the same immediate
-        # lockout a direct ``X-Api-Key`` caller gets. Atomic with the key clear.
-        await _revoke_recovery_sessions(session)
-        await session.commit()
+        old_key = system.app_api_key
+        if old_key is None:
+            system.app_api_key = None
+            await _revoke_recovery_sessions(session)
+            await session.commit()
+        else:
+            # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
+            # safe for the same reason as the rotate path -- every app-key
+            # writer holds ``_rotate_lock`` (held here).
+            async with secret_rotation(session, request, retiring_values=frozenset({old_key})):
+                # Re-read in the boundary's fresh transaction (see the rotate
+                # path's comment).
+                await session.refresh(system)
+                system.app_api_key = None
+                await _revoke_recovery_sessions(session)
     close_realtime_streams(
         request.app,
         reason="app_key_revoked",
@@ -1122,32 +1229,65 @@ async def put_settings_endpoint(
         resolved_roots = await _resolve_root_writes(body)
 
         written_fields: set[str] = set()
-        for field in body.model_fields_set:
-            value = getattr(body, field)
-            if value is None:
-                continue
-            if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
-                continue
-            if field in resolved_roots:
-                value = resolved_roots[field]
-            await store.set(field, _to_stored_string(field, value))
-            written_fields.add(field)
-        if plex_identity_changed:
-            if machine_identifier is None:
-                # Unverifiable (incomplete pair): drop the stale anchor, keep sessions.
-                await store.delete(PLEX_MACHINE_ID_SETTING)
-            else:
-                # Verified repoint, all in this SAME transaction: cache the id just
-                # derived from the NEW server and revoke every ACTIVE session so
-                # nobody's old-server authority outlives the repoint (the caller's
-                # own session included, deliberately — see the docstring).
-                await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
-                await session.execute(
-                    update(AuthSession)
-                    .where(AuthSession.revoked_at.is_(None))
-                    .values(revoked_at=datetime.now(UTC))
-                )
-        await session.commit()
+        submitted_secret_fields = {
+            field
+            for field in body.model_fields_set
+            if field in SECRET_SETTING_KEYS
+            and getattr(body, field) is not None
+            and getattr(body, field) != SECRET_MASK
+        }
+        old_secret_values_list: list[str] = []
+        changing_secret_fields: set[str] = set()
+        for field in submitted_secret_fields:
+            old_value = await store.get(field)
+            if old_value != _to_stored_string(field, getattr(body, field)):
+                changing_secret_fields.add(field)
+                if old_value:
+                    old_secret_values_list.append(old_value)
+        old_secret_values = frozenset(old_secret_values_list)
+        # Deliberately NOT reading store.secret_values() here: a PUT touching
+        # only non-secret fields must never decrypt stored credentials (codex
+        # #382) -- an unrelated corrupt encrypted value would otherwise 500 a
+        # save of, say, log_retention_days. The rotation boundary reads the
+        # full decrypted set itself, fresh, under the lock -- and only when a
+        # secret actually changes.
+        incoming_secret_values = frozenset(
+            _to_stored_string(field, getattr(body, field)) for field in changing_secret_fields
+        )
+
+        async def write_settings() -> None:
+            for field in body.model_fields_set:
+                value = getattr(body, field)
+                if value is None:
+                    continue
+                if field in SECRET_SETTING_KEYS and value == SECRET_MASK:
+                    continue
+                if field in resolved_roots:
+                    value = resolved_roots[field]
+                await store.set(field, _to_stored_string(field, value))
+                written_fields.add(field)
+            if plex_identity_changed:
+                if machine_identifier is None:
+                    await store.delete(PLEX_MACHINE_ID_SETTING)
+                else:
+                    await store.set(PLEX_MACHINE_ID_SETTING, machine_identifier)
+                    await session.execute(
+                        update(AuthSession)
+                        .where(AuthSession.revoked_at.is_(None))
+                        .values(revoked_at=datetime.now(UTC))
+                    )
+
+        if changing_secret_fields:
+            async with secret_rotation(
+                session,
+                request,
+                retiring_values=old_secret_values,
+                incoming_values=incoming_secret_values,
+            ):
+                await write_settings()
+        else:
+            await write_settings()
+            await session.commit()
 
         # A long configured interval must not postpone an enable/shorten change --
         # nor a Plex identity change's snapshot cleanup -- until the old sleep

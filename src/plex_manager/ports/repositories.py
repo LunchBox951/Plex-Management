@@ -14,7 +14,7 @@ and the ``LogEvent`` repository backing the durable, LLM-diagnosable log store.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -1124,6 +1124,14 @@ class LogEventRepository(Protocol):
         export cap keeps the OLDEST matching rows (the root-cause lead-up),
         not the newest (see issue #96).
         """
+        raise NotImplementedError
+
+    async def rewrite_redactable_fields(
+        self,
+        message_rewriter: Callable[[str], str],
+        context_rewriter: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> int:
+        """Rewrite redactable message/context fields in the current transaction."""
         raise NotImplementedError
 
     async def prune_older_than(

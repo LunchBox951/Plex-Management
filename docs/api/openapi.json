@@ -3698,23 +3698,83 @@
       },
       "UpdateHeartbeatRequest": {
         "additionalProperties": false,
-        "description": "Unleased liveness for digest checks before a drain is claimed.",
+        "description": "Unleased liveness for digest checks before a drain is claimed.\n\nADR-0025 stage 0 (issue #299) is the C7 forward-compatibility \"expand\": the\napp must ACCEPT a newer sidecar's phase-less liveness heartbeat and its own\nreported image identity WITHOUT requiring them. The current sidecar keeps\nsending exactly ``{\"phase\": \"checking\", \"action_generation\": N}`` (nothing\nin this release emits the new fields), which still validates unchanged; a\nfuture sidecar may instead omit ``phase`` and attach its own build/digest.\n``extra=\"forbid\"`` is deliberately KEPT -- the new fields are now known, so\nan unknown field is still rejected -- but ``phase``/``action_generation``\nbecome optional and the ``checking`` invariant is re-imposed by validator so\nthe old contract is preserved exactly (a ``checking`` heartbeat still\nrequires its ``action_generation``).",
         "properties": {
           "action_generation": {
-            "minimum": 0.0,
-            "title": "Action Generation",
-            "type": "integer"
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Generation"
           },
           "phase": {
-            "const": "checking",
-            "title": "Phase",
-            "type": "string"
+            "anyOf": [
+              {
+                "const": "checking",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "refresh_nonce": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Nonce"
+          },
+          "updater_build": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Build"
+          },
+          "updater_container_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[0-9a-fA-F]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Container Id"
+          },
+          "updater_digest": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Digest"
           }
         },
-        "required": [
-          "phase",
-          "action_generation"
-        ],
         "title": "UpdateHeartbeatRequest",
         "type": "object"
       },
@@ -3897,6 +3957,117 @@
         "title": "UpdateOutcomeRequest",
         "type": "object"
       },
+      "UpdateRefreshItem": {
+        "description": "The last recorded self-refresh outcome for the updater sidecar itself.\n\nADR-0025 stage 0 (issue #299): a durable record of the sidecar's own\ncontainer replacement, distinct from :class:`UpdateResultItem` (which is the\nAPP/target update). All fields are best-effort -- a stage-1 sidecar reports\nwhat it can. ``result`` is an OPEN string (e.g. ``failed`` / ``succeeded``)\nso a future outcome value stays renderable by the neutral frontend without a\ncontract change.",
+        "properties": {
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "detail_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "from_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Build"
+          },
+          "result": {
+            "title": "Result",
+            "type": "string"
+          },
+          "to_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Build"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "UpdateRefreshItem",
+        "type": "object"
+      },
+      "UpdateRefreshOutcomeRequest": {
+        "additionalProperties": false,
+        "description": "A sidecar self-refresh outcome report (ADR-0025 stage 0, issue #299).\n\nThe accept-side contract for the stage-1 self-refresh ladder, shipped WITH\nthe expand release so a newer sidecar's outcome report never 404s against an\napp that already accepts its heartbeats (Codex round 1 on PR #384) -- a\nsurviving predecessor after a failed refresh keeps heartbeating and looks\nhealthy, so this durable report is the only honest signal of the failure.\nNothing emits it in stage 0.\n\n``result`` is an OPEN pattern-bounded code (not a Literal) so a future\noutcome vocabulary stays expand-only. Every pattern here is a strict subset\nof the service layer's ``_bounded_code``/``_bounded_text`` predicates, so a\nbody that validates at this edge can never blow up as a bare ``ValueError``\n(an HTTP 500) in the service -- the same honest-422 lesson as the M1\nempty-string fix.",
+        "properties": {
+          "detail_code": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "from_build": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Build"
+          },
+          "result": {
+            "pattern": "^[a-z][a-z0-9_]{0,31}$",
+            "title": "Result",
+            "type": "string"
+          },
+          "to_build": {
+            "anyOf": [
+              {
+                "pattern": "^[^\\x00-\\x1f\\x7f]{1,400}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Build"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "UpdateRefreshOutcomeRequest",
+        "type": "object"
+      },
       "UpdateRenewRequest": {
         "additionalProperties": false,
         "description": "Lease renewal plus a bounded, token-owned active phase.",
@@ -4065,6 +4236,16 @@
             ],
             "title": "Last Checked At"
           },
+          "last_refresh": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpdateRefreshItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "last_result": {
             "anyOf": [
               {
@@ -4120,6 +4301,39 @@
           "updater_available": {
             "title": "Updater Available",
             "type": "boolean"
+          },
+          "updater_build_matches_app": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Build Matches App"
+          },
+          "updater_observed_build": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Observed Build"
+          },
+          "updater_observed_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updater Observed Digest"
           }
         },
         "required": [
@@ -5153,6 +5367,53 @@
           }
         ],
         "summary": "Outcome Endpoint",
+        "tags": [
+          "internal-updates"
+        ]
+      }
+    },
+    "/api/v1/internal/updates/refresh-outcome": {
+      "post": {
+        "description": "Record the sidecar's self-refresh outcome (ADR-0025 stage 0, issue #299).\n\nThe accept side of the stage-1 self-refresh ladder, shipped WITH the C7\nexpand release (Codex round 1 on PR #384): without this route, the first\nemitting sidecar's failure report would 404 against an app that already\naccepts its heartbeats, and -- because a surviving predecessor keeps\nheartbeating and looks healthy -- the failed refresh would be masked\nentirely (north star #3). Same sidecar-secret auth as every other internal\nupdater endpoint; nothing emits it in stage 0. The record is durable: only\na later refresh outcome overwrites it (ordinary heartbeats never do -- see\n``record_refresh_outcome``), and the status endpoint surfaces it as\n``last_refresh``.",
+        "operationId": "refresh_outcome_endpoint_api_v1_internal_updates_refresh_outcome_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRefreshOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "UpdaterBearer": []
+          }
+        ],
+        "summary": "Refresh Outcome Endpoint",
         "tags": [
           "internal-updates"
         ]

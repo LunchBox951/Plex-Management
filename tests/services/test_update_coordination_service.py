@@ -981,6 +981,49 @@ async def test_legacy_busy_snapshot_backfills_one_durable_age_anchor(
     assert (await service.snapshot()).last_started_at == snapshot.last_started_at
 
 
+@pytest.mark.parametrize(
+    ("heartbeat_offset", "expected_anchor_offset"),
+    [
+        (-timedelta(minutes=12), -timedelta(minutes=12)),
+        (None, timedelta(0)),
+        (timedelta(minutes=1), timedelta(0)),
+    ],
+)
+async def test_legacy_busy_touch_backfills_the_same_anchor_as_direct_snapshot(
+    sessionmaker_: SessionMaker,
+    heartbeat_offset: timedelta | None,
+    expected_anchor_offset: timedelta,
+) -> None:
+    """Regression test for issue #387: ``touch_updater()`` -- the liveness
+    write ``_eligibility(touch=True)`` calls before its trailing
+    ``snapshot()`` -- must backfill a legacy pre-anchor busy row's recovery
+    clock using the heartbeat AS IT STOOD BEFORE this call's own write, so a
+    row first observed via a touch anchors identically to one first observed
+    via a direct ``snapshot()`` (the parametrization above)."""
+    clock = MutableClock(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+    service = UpdateCoordinationService(sessionmaker_, clock=clock, token_factory=_tokens())
+    await service.initialize()
+    heartbeat = None if heartbeat_offset is None else clock.now + heartbeat_offset
+    async with sessionmaker_() as session:
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                last_started_at=None,
+                requested_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    touched = await service.touch_updater()
+    assert touched is not None
+    assert touched.last_started_at == clock.now + expected_anchor_offset
+    # The touch itself still legitimately refreshed liveness to now, even
+    # though the recovery anchor used the pre-touch value.
+    assert touched.updater_last_seen_at == clock.now
+
+
 async def test_direct_force_reset_alone_durably_starts_legacy_recovery_clock(
     sessionmaker_: SessionMaker,
 ) -> None:

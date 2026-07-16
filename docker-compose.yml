@@ -65,14 +65,17 @@ services:
   # This is the ONLY service granted Docker authority; it has no published port
   # and runs only its small outbound updater process from the promoted app image.
   #
-  # Known limitation (#299): automatic updates replace ONLY the plex-manager
-  # container. The sidecar cannot recreate itself mid-operation — stopping
-  # itself would kill the very state machine driving the update — so after an
-  # update it keeps running the image it was started from, and later releases'
-  # updater-side fixes do not apply to it automatically. The app and sidecar
-  # share one image and the sidecar's own update pull already fetched the new
-  # bytes, so refreshing it after an update is one admin command on the install
-  # host (no re-download):
+  # Known limitation (#299, ADR-0025): automatic updates replace ONLY the
+  # plex-manager container. The sidecar cannot recreate itself mid-operation —
+  # stopping itself would kill the very state machine driving the update — so
+  # after an update it keeps running the image it was started from, and later
+  # releases' updater-side fixes do not apply to it automatically. As of the
+  # ADR-0025 stage 0 expand, a build skew between the sidecar and the app is
+  # SURFACED in-app (Status → Updates) rather than silent; fully automated
+  # self-recreation is tracked for a later release. The app and sidecar share
+  # one image and the sidecar's own update pull already fetched the new bytes,
+  # so refreshing it after an update is one admin command on the install host
+  # (no re-download):
   #   docker compose --profile auto-update up -d updater
   updater:
     profiles: ["auto-update"]

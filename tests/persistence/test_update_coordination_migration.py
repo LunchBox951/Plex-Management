@@ -12,6 +12,21 @@ from alembic.config import Config
 from plex_manager.config import get_settings
 
 _PRE_UPDATE_REVISION = "a9c31e72b4f6"
+# The revision immediately before the ADR-0025 stage 0 sidecar-observability
+# columns, and that revision itself.
+_PRE_SIDECAR_OBSERVABILITY_REVISION = "e91b3f7a5d24"
+_SIDECAR_OBSERVABILITY_REVISION = "ec826d3aa951"
+_SIDECAR_OBSERVABILITY_COLUMNS = frozenset(
+    {
+        "updater_observed_build",
+        "updater_observed_digest",
+        "last_refresh_result",
+        "last_refresh_detail_code",
+        "last_refresh_from_build",
+        "last_refresh_to_build",
+        "last_refresh_at",
+    }
+)
 
 
 def _run(
@@ -38,6 +53,11 @@ def _tables(db_path: Path) -> set[str]:
             str(row[0])
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
+
+
+def _columns(db_path: Path, table: str) -> set[str]:
+    with sqlite3.connect(db_path) as connection:
+        return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
 def test_existing_install_gains_seeded_coordinator_and_lease_indexes(
@@ -69,6 +89,35 @@ def test_existing_install_gains_seeded_coordinator_and_lease_indexes(
         assert "ix_update_coordinator_state_updater_last_seen_at" not in indexes
         assert "ix_maintenance_leases_kind" not in indexes
         assert "ix_maintenance_leases_kind_expires" in indexes
+
+
+def test_sidecar_observability_columns_expand_and_reverse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0025 stage 0: the columns are added expand-only and drop cleanly."""
+    db_path = tmp_path / "sidecar-observability.db"
+    _run(db_path, _PRE_SIDECAR_OBSERVABILITY_REVISION, monkeypatch)
+    before = _columns(db_path, "update_coordinator_state")
+    assert not (_SIDECAR_OBSERVABILITY_COLUMNS & before)
+
+    _run(db_path, _SIDECAR_OBSERVABILITY_REVISION, monkeypatch)
+    after = _columns(db_path, "update_coordinator_state")
+    assert after >= _SIDECAR_OBSERVABILITY_COLUMNS
+    # Expand-only: the pre-existing columns are untouched.
+    assert before <= after
+    # Every new column is NULL on the pre-existing seeded singleton row.
+    with sqlite3.connect(db_path) as connection:
+        selected = ", ".join(sorted(_SIDECAR_OBSERVABILITY_COLUMNS))
+        values = connection.execute(
+            f"SELECT {selected} FROM update_coordinator_state WHERE id = 1"  # noqa: S608
+        ).fetchone()
+    assert values is not None
+    assert all(value is None for value in values)
+
+    _run(db_path, _PRE_SIDECAR_OBSERVABILITY_REVISION, monkeypatch, down=True)
+    reverted = _columns(db_path, "update_coordinator_state")
+    assert not (_SIDECAR_OBSERVABILITY_COLUMNS & reverted)
+    assert reverted == before
 
 
 def test_migration_downgrade_drops_only_new_tables(
