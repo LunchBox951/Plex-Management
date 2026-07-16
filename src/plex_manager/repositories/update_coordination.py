@@ -310,8 +310,14 @@ class SqlUpdateCoordinationRepository:
         touches ``phase``/``requested_action`` (no coordination decision is
         implied by liveness) and never clears ``last_refresh_*`` (an ordinary
         heartbeat must not mask a recorded refresh failure). ``observed_build``
-        and ``observed_digest`` are a matched pair reported together by the
-        sidecar; both are written as given.
+        and ``observed_digest`` are a MATCHED PAIR reported together by the
+        sidecar; both are written as given -- including ``None``, so a beat
+        carrying only one of the two OVERWRITES the other with NULL. Stage 1
+        author note (PR #384 review): the emitting sidecar must always send
+        build and digest together; if a future protocol ever legitimately sends
+        them independently, this write needs a write-only-what's-present guard
+        first, or the absent half of a previously-reported identity is silently
+        erased.
         """
         state = await self._lock()
         if state.phase not in _KNOWN_COORDINATOR_PHASES:

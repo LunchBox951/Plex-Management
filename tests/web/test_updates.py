@@ -2072,6 +2072,36 @@ async def test_heartbeat_rejects_unknown_field_and_bare_checking(
     assert bare.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["updater_build", "updater_digest", "updater_container_id", "refresh_nonce"],
+)
+async def test_heartbeat_empty_string_identity_field_is_an_honest_422(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    updater_headers: dict[str, str],
+    field: str,
+) -> None:
+    """PR #384 review M1: "absent" is ``None``/omitted, never ``""``.
+
+    Without ``min_length=1`` (build/digest) / the one-or-more patterns
+    (container id/nonce), ``""`` passes schema validation, sails past the
+    endpoint's ``is not None`` gate, and blows up in the service's
+    ``_bounded_text`` as a bare ``ValueError`` -- an HTTP 500 where north star
+    #3 demands an honest 4xx at the edge.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _fresh_coordinator(app)
+
+    response = await client.post(
+        "/api/v1/internal/updates/heartbeat",
+        headers=updater_headers,
+        json={field: ""},
+    )
+    assert response.status_code == 422
+
+
 async def test_status_null_observed_identity_reads_stale(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn
 ) -> None:
