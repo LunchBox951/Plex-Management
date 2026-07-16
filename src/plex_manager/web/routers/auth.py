@@ -18,7 +18,7 @@ import secrets
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, NamedTuple, cast
 
 import httpx
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -58,6 +58,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams
+from plex_manager.web.routers.settings import secret_rotation
 from plex_manager.web.schemas import (
     ActiveSessionsResponse,
     ActiveSessionUser,
@@ -129,18 +130,96 @@ async def plex_sign_in_endpoint(
         username=account.username,
         is_admin=is_admin,
     )
+    # The RETIRING credential, read BEFORE the new token is staged (issue #374):
+    # ``EncryptedStr`` decrypts transparently on load, so this is the plaintext
+    # value the redact-at-rotation pass (ADR-0026) must erase from log history.
+    old_token = user.encrypted_plex_token
     user.email = account.email
     user.avatar_url = account.avatar_url
-    user.encrypted_plex_token = body.auth_token
     user.last_login = datetime.now(UTC)
 
-    # ``_issue_browser_session`` commits the staged user-row writes (including any
-    # demotion) alongside the new session. Only AFTER that commit persists the
-    # downgrade do we close the demoted user's realtime streams (issue #183): a
-    # close before the commit would race a reconnect that re-reads the old admin
-    # permissions and resubscribes to admin topics. Post-commit, any reconnect
-    # reads the demoted permissions, so no admin stream can survive the downgrade.
-    await _issue_browser_session(session, response, request=request, user_id=user.id)
+    # The commit (below, either shape) persists the staged user-row writes
+    # (including any demotion) alongside the new session. Only AFTER that commit
+    # persists the downgrade do we close the demoted user's realtime streams
+    # (issue #183): a close before the commit would race a reconnect that re-reads
+    # the old admin permissions and resubscribes to admin topics. Post-commit, any
+    # reconnect reads the demoted permissions, so no admin stream can survive the
+    # downgrade.
+    if old_token is None or old_token == body.auth_token:
+        # NOT a rotation (ADR-0026 / issue #374), two shapes: a re-sign-in
+        # delivering the IDENTICAL token changes nothing (capture-time and
+        # read-time redaction already cover the still-current value), and a
+        # FIRST-EVER token (no previous value) is initial configuration — there
+        # is no retiring value to erase from history, and the drain loop's
+        # per-tick ``secret_values()`` refresh picks the new token up exactly as
+        # it always has. Neither takes the rotation lock, so the ordinary
+        # sign-in path never queues behind a log read/drain/rotation.
+        user.encrypted_plex_token = body.auth_token
+        await _issue_browser_session(session, response, request=request, user_id=user.id)
+    else:
+        # The stored token VALUE is changing (issue #374): replace it inside the
+        # same locked transactional boundary ADR-0026 built for every other
+        # secret mutation. ``retiring_values`` is exactly the single old value
+        # this user is rotating away from — never the whole secret set — and it
+        # gets the boundary's exact, floorless retired-value pass, so even a
+        # degenerately short token is erased from history. ``incoming_values``
+        # carries the new token so in-flight emits mask it before it commits;
+        # the boundary reads the rest of the transition set itself, fresh,
+        # under the lock. Every OTHER user's current token stays masked at
+        # every instant (both the widened transition and the final narrow read
+        # the full ``secret_values()`` set). Sign-in stays honest and fails
+        # CLOSED: any rewrite/commit failure rolls back the token write, the
+        # session mint, and the historical rewrite together (the old token
+        # remains valid, rows unchanged), and the response sets cookies only
+        # after the boundary commits.
+        #
+        # ``old_token`` was read before the boundary's in-lock rollback; that is
+        # safe because only THIS user's sign-in replaces THIS user's token, and
+        # two same-account sign-ins racing on the row serialize at the database
+        # write — the loser fails closed and can simply retry.
+        staged_permissions = user.permissions  # what _upsert_user just staged
+        async with secret_rotation(
+            session,
+            request,
+            retiring_values=frozenset({old_token}),
+            incoming_values=frozenset({body.auth_token}),
+        ):
+            # The boundary's in-lock rollback DISCARDED every row write this
+            # request staged before entering. Re-stage all of them in the
+            # boundary's fresh transaction so they commit atomically with the
+            # historical rewrite and the session mint. Pre-init, that includes
+            # the setup-claim writes (`ensure_system_settings` insert +
+            # ``setup_started_at`` CAS): re-running the claim is deterministic
+            # against unchanged rows, and losing a genuinely concurrent claim
+            # here fails the sign-in closed exactly as it would have outside.
+            if not initialized:
+                await _claim_or_resume_setup(session, account, resources)
+            # Likewise re-stage the plex.tv client identifier in case THIS
+            # request minted it (its uncommitted insert was discarded by the
+            # rollback): re-asserting the SAME value is create-once idempotent
+            # and a no-op whenever the identifier already persists.
+            await SettingsStore(session).set_if_absent(_CLIENT_ID_SETTING, client_identifier)
+            # Re-read the user row fresh (raises loudly if it went transient
+            # rather than silently dropping the writes), then re-apply this
+            # sign-in's full set of user-row updates.
+            await session.refresh(user)
+            user.username = account.username
+            user.permissions = staged_permissions
+            user.email = account.email
+            user.avatar_url = account.avatar_url
+            user.encrypted_plex_token = body.auth_token
+            user.last_login = datetime.now(UTC)
+            staged = _stage_browser_session(session, user_id=user.id)
+            # Deterministically flush the staged token so the boundary's fresh
+            # post-yield ``secret_values()`` read narrows to the NEW value.
+            await session.flush()
+        _set_session_cookies(
+            response,
+            request=request,
+            session_token=staged.raw_token,
+            csrf_token=staged.csrf_token,
+            expires_at=staged.expires_at,
+        )
     if demoted:
         close_realtime_streams(
             request.app,
@@ -725,6 +804,37 @@ def _me_response(context: AuthContext | None) -> AuthMeResponse:
 # --------------------------------------------------------------------------- #
 # Session issuance (shared by Plex sign-in and the recovery-key exchange)
 # --------------------------------------------------------------------------- #
+class _StagedSession(NamedTuple):
+    """A minted-but-uncommitted browser session's cookie material."""
+
+    raw_token: str
+    csrf_token: str
+    expires_at: datetime
+
+
+def _stage_browser_session(session: AsyncSession, *, user_id: int | None) -> _StagedSession:
+    """Stage (no commit) an ``auth_sessions`` row and return its cookie material.
+
+    Split from :func:`_issue_browser_session` so the token-rotation sign-in path
+    (issue #374) can stage the session INSIDE the ADR-0026 rotation boundary's
+    single transaction — the boundary owns the commit there — while every other
+    caller keeps the stage-commit-cookies composition below. Only the SHA-256
+    hash of the random token is stored; the raw token rides the HTTP-only cookie.
+    """
+    raw_token = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(days=_SESSION_DAYS)
+    session.add(
+        AuthSession(
+            user_id=user_id,
+            token_hash=hash_session_token(raw_token),
+            expires_at=expires_at,
+            last_seen_at=datetime.now(UTC),
+        )
+    )
+    return _StagedSession(raw_token, csrf_token, expires_at)
+
+
 async def _issue_browser_session(
     session: AsyncSession,
     response: Response,
@@ -736,29 +846,18 @@ async def _issue_browser_session(
 
     The single session-issuance path both browser-auth flows share: Plex sign-in
     passes the verified owning ``user_id``; the recovery-key exchange passes
-    ``None`` (an admin recovery session with no Plex identity, CodeQL #263). Only
-    the SHA-256 hash of the random token is stored; the raw token rides the
-    HTTP-only cookie. The commit flushes any caller-pending writes too (the Plex
-    path stages user-row updates before calling this).
+    ``None`` (an admin recovery session with no Plex identity, CodeQL #263). The
+    commit flushes any caller-pending writes too (the Plex path stages user-row
+    updates before calling this).
     """
-    raw_session = secrets.token_urlsafe(32)
-    csrf_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(UTC) + timedelta(days=_SESSION_DAYS)
-    session.add(
-        AuthSession(
-            user_id=user_id,
-            token_hash=hash_session_token(raw_session),
-            expires_at=expires_at,
-            last_seen_at=datetime.now(UTC),
-        )
-    )
+    staged = _stage_browser_session(session, user_id=user_id)
     await session.commit()
     _set_session_cookies(
         response,
         request=request,
-        session_token=raw_session,
-        csrf_token=csrf_token,
-        expires_at=expires_at,
+        session_token=staged.raw_token,
+        csrf_token=staged.csrf_token,
+        expires_at=staged.expires_at,
     )
 
 

@@ -113,7 +113,7 @@ from plex_manager.web.setup_validation import (
     library_options,
 )
 
-__all__ = ["router"]
+__all__ = ["router", "secret_rotation"]
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -238,7 +238,7 @@ async def _rewrite_before_secret_replacement(
 
 
 @asynccontextmanager
-async def _secret_rotation(
+async def secret_rotation(
     session: AsyncSession,
     request: Request,
     *,
@@ -247,12 +247,18 @@ async def _secret_rotation(
 ) -> AsyncGenerator[None]:
     """The single transactional boundary for every in-scope secret mutation (ADR-0026).
 
-    All three mutation paths (generic ``PUT /settings`` secret replacement,
-    app-key rotation, app-key revocation) run their historical rewrite and
-    their write (the ``yield`` body) through here, so the lock/rewrite/commit
-    sequence cannot drift between them. ``retiring_values`` are the values
-    leaving ``secret_values()``; ``incoming_values`` are new values the body is
-    about to write (so in-flight emits mask them before they are committed).
+    All FOUR mutation paths (generic ``PUT /settings`` secret replacement,
+    app-key rotation, app-key revocation, and the user Plex-token replacement
+    on ``POST /api/v1/auth/plex`` -- issue #374, which is why this is public)
+    run their historical rewrite and their write (the ``yield`` body) through
+    here, so the lock/rewrite/commit sequence cannot drift between them.
+    ``retiring_values`` are the values leaving ``secret_values()``;
+    ``incoming_values`` are new values the body is about to write (so in-flight
+    emits mask them before they are committed).
+
+    NOTE the in-lock ``session.rollback()`` below: any row writes the caller
+    staged BEFORE entering are discarded -- the ``yield`` body must (re)apply
+    every write it wants committed, in the boundary's fresh transaction.
     """
     handler = _log_handler(request)
     async with secret_rotation_lock:
@@ -824,7 +830,7 @@ async def rotate_app_key_endpoint(
         # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
         # that is safe because every app-key writer holds ``_rotate_lock``
         # (held here), so the DB value cannot move under us.
-        async with _secret_rotation(
+        async with secret_rotation(
             session,
             request,
             retiring_values=retired_values,
@@ -901,7 +907,7 @@ async def revoke_app_key_endpoint(
             # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
             # safe for the same reason as the rotate path -- every app-key
             # writer holds ``_rotate_lock`` (held here).
-            async with _secret_rotation(session, request, retiring_values=frozenset({old_key})):
+            async with secret_rotation(session, request, retiring_values=frozenset({old_key})):
                 # Re-read in the boundary's fresh transaction (see the rotate
                 # path's comment).
                 await session.refresh(system)
@@ -1272,7 +1278,7 @@ async def put_settings_endpoint(
                     )
 
         if changing_secret_fields:
-            async with _secret_rotation(
+            async with secret_rotation(
                 session,
                 request,
                 retiring_values=old_secret_values,
