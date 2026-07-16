@@ -43,6 +43,36 @@ async def test_rewrite_redactable_fields_updates_message_context_and_is_idempote
     assert "old-value" not in str(page.results)
 
 
+async def test_rewrite_redactable_fields_is_correct_across_batch_boundaries(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The keyset-batched scan rewrites every row, including ones past the
+    first batch boundary, and counts changes across all batches."""
+    monkeypatch.setattr(log_events_module, "_REWRITE_BATCH_SIZE", 2)
+    repo = SqlLogEventRepository(session)
+    for index in range(5):
+        await repo.create(
+            level="INFO",
+            logger="test",
+            message=f"row {index} old-value",
+            context={"key": "old-value"} if index % 2 == 0 else None,
+        )
+
+    def rewrite_message(value: str) -> str:
+        return value.replace("old-value", "<redacted>")
+
+    def rewrite_context(value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {key: rewrite_message(str(item)) for key, item in value.items()}
+
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 5
+    assert await repo.rewrite_redactable_fields(rewrite_message, rewrite_context) == 0
+    page = await repo.list_events(limit=10)
+    assert len(page.results) == 5
+    assert "old-value" not in str(page.results)
+
+
 async def test_rewrite_redactable_fields_rolls_back_with_caller_transaction(
     engine: AsyncEngine,
 ) -> None:

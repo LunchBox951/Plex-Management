@@ -4904,7 +4904,14 @@ async def _run_one_drain(
         await _wait_for_event(release_drain)
         return await real_drain_once(*args, **kwargs)  # type: ignore[arg-type]
 
-    async def stop_after_tick(_seconds: float) -> None:
+    async def stop_after_tick(seconds: float) -> None:
+        # ``app_module.asyncio`` IS the global asyncio module, so this patch
+        # replaces ``asyncio.sleep`` everywhere for the test's duration. Let
+        # zero-delay cooperative yield checkpoints (the batched log rewrite
+        # yields between keyset batches) pass through; only the drain loop's
+        # real interval sleep stops the loop.
+        if seconds == 0:
+            return
         raise _StopDrainLoop
 
     monkeypatch.setattr(app_module.log_capture_service, "drain_once", paused_drain)
