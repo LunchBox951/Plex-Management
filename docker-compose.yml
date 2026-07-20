@@ -20,6 +20,8 @@ services:
     image: ${PLEX_MANAGER_IMAGE:-ghcr.io/lunchbox951/plex-manager:stable}
     container_name: plex-manager
     restart: unless-stopped
+    # Covers uvicorn's 5s drain + the default 60s shutdown_task_timeout_seconds.
+    stop_grace_period: 75s
     labels:
       # Both are required by the privileged sidecar. It will reject a name-only
       # or label-only match and never accepts an arbitrary target over HTTP.
