@@ -24,7 +24,6 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
     FailureDetail,
 )
-from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.support import assert_task_raises
@@ -178,12 +177,12 @@ async def test_delete_to_settlement_propagates_a_worker_oserror_when_not_cancell
     fs = _FailingBlockedDeleteFileSystem(target.parent)
     fs.release.set()
     delete_to_settlement = cast(
-        Callable[[FileSystemPort, str], Awaitable[None]],
+        Callable[..., Awaitable[None]],
         purge_service.__dict__["_delete_to_settlement"],
     )
 
     with pytest.raises(OSError, match="blocked delete failed"):
-        await delete_to_settlement(fs, str(target))
+        await delete_to_settlement(fs, str(target), hold_purge_registration=False)
 
     assert target.exists()
 

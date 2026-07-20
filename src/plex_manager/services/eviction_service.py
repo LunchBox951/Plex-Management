@@ -1958,13 +1958,21 @@ async def run_eviction_sweep(
     identical caveat documented on
     :func:`~plex_manager.services.purge_service.purge_library_path` and
     :func:`~plex_manager.services.purge_service._await_worker_settlement`).
-    This is accepted, not yet closed: it is reachable only inside the bounded
-    shutdown wait on the way to process exit, and issue #128's crash-recovery
-    sweep on the *next* startup reconciles whatever partial disk state an
-    abandoned delete left behind, exactly as it would after a hard crash
-    mid-delete. See ``tests/web/test_shutdown_wait.py`` for a regression test
-    demonstrating the analogous ``_ACTIVE_PURGE_PATHS`` window on the purge
-    side.
+    This is accepted, not yet closed, for ``_sweep_latch`` specifically: it is
+    reachable only inside the bounded shutdown wait on the way to process exit,
+    and issue #128's crash-recovery sweep on the *next* startup reconciles
+    whatever partial disk state an abandoned delete left behind, exactly as it
+    would after a hard crash mid-delete. Note that the analogous window on the
+    purge side (``_ACTIVE_PURGE_PATHS`` in
+    :func:`~plex_manager.services.purge_service.purge_library_path`) HAS since
+    been closed: ``_delete_to_settlement`` now hands that registration's
+    release off to a done-callback on the raw delete worker future, tied to
+    the daemon thread's own physical completion rather than to the (possibly
+    abandoned) settlement — see
+    ``test_begin_placement_refuses_while_an_abandoned_delete_still_runs`` in
+    ``tests/web/test_shutdown_wait.py``. ``_sweep_latch`` was not given the
+    same treatment here; it remains a known, narrower gap than the one that
+    test used to characterize.
     """
     if _sweep_latch["busy"]:
         _logger.info(

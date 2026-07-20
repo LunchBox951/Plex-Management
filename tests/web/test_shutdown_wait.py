@@ -184,12 +184,21 @@ async def test_a_hung_shielded_delete_timeout_finishes_the_settlement_task(
         assert task.done()
         assert task.cancelled()
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # Issue #421: the registration outlives the abandoned settlement --
+        # it is released by a done-callback on the raw delete worker future,
+        # which only fires once the daemon thread genuinely finishes, so it
+        # is still held here even though the settlement task is done.
+        assert purge_service.active_purge_paths() != ()
     finally:
-        # The settlement coroutine and registry are already finished; release
-        # only the test's daemon worker so it does not linger across tests.
+        # The settlement coroutine is already finished; releasing the test's
+        # daemon worker lets it genuinely finish, which fires the done-callback
+        # that clears the registration (issue #421).
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    for _ in range(200):
+        if purge_service.active_purge_paths() == ():
+            break
+        await asyncio.sleep(0.01)
     assert purge_service.active_purge_paths() == ()
 
 
@@ -222,12 +231,20 @@ async def test_timeout_unblocks_request_scoped_settlement(
         )
         assert isinstance(outcome, asyncio.CancelledError)
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # Issue #421: the registration outlives the abandoned settlement until
+        # the daemon delete worker genuinely finishes (see the analogous
+        # assertion in test_a_hung_shielded_delete_timeout_finishes_the_settlement_task).
+        assert purge_service.active_purge_paths() != ()
     finally:
         timeout_trigger.cancel()
         await asyncio.gather(timeout_trigger, return_exceptions=True)
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    for _ in range(200):
+        if purge_service.active_purge_paths() == ():
+            break
+        await asyncio.sleep(0.01)
+    assert purge_service.active_purge_paths() == ()
 
 
 async def test_request_settlement_is_abandoned_when_background_tasks_finish_fast(
@@ -339,29 +356,32 @@ async def test_live_pre_delete_probe_error_keeps_existing_classification(tmp_pat
     assert purge_service.active_purge_paths() == ()
 
 
-async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
+async def test_begin_placement_refuses_while_an_abandoned_delete_still_runs(
     tmp_path: Path,
 ) -> None:
-    """Issue #421: characterize the abandonment-to-exit window's confidence gap.
+    """Issue #421: drives a REAL shutdown interleaving and proves it CLOSED.
 
-    Shutdown abandonment (PR #406's ``abandon_active_settlements``) resolves the
-    purge's shielded settlement -- and this task's ``finally`` releases
-    ``_ACTIVE_PURGE_PATHS`` -- WITHOUT waiting for the daemon ``shutil.rmtree``
-    thread to actually finish (``fs.finished`` provably still unset below). This
-    drives exactly that abandonment for a real, still-running delete and then
-    calls ``begin_placement`` on the identical path in the narrow window before
-    process exit, the live-caller race issue #421 asks a targeted test to settle.
+    Shutdown abandonment (PR #406's ``abandon_active_settlements``) force-
+    resolves the purge's shielded settlement -- and therefore the caller's
+    ``purge_library_path`` task -- WITHOUT waiting for the daemon
+    ``shutil.rmtree`` thread to actually finish (``fs.finished`` provably still
+    unset below). This drives exactly that abandonment, through the same
+    bounded ``app_module._await_background_tasks_shutdown`` wait ``lifespan``
+    uses on real shutdown, for a real, still-running delete.
 
-    Result: ``begin_placement`` returns ``True``. ``_conflicts_with`` only ever
-    consults the current (already-emptied) ``_ACTIVE_PURGE_PATHS`` registry, so
-    a placement can be registered for a directory an abandoned ``rmtree`` is
-    concurrently, physically tearing down -- the exact interleaving the
-    ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS`` ordering rule (PR #117
-    round 9) exists to prevent. This is NOT restructured here (out of scope for
-    this change): it is recorded as a known gap, real only in the shutdown-to-
-    exit window, for the coordinator to weigh against issue #128's crash-
-    recovery backstop reconciling any resulting partial disk state on next
-    startup.
+    Before this change, ``purge_library_path``'s own ``finally`` released
+    ``_ACTIVE_PURGE_PATHS`` the instant the (abandoned) settlement resolved --
+    before the daemon thread had physically stopped touching disk -- so a live
+    caller reaching ``begin_placement`` on the identical path in that window
+    would observe no conflict and wrongly claim it. ``_delete_to_settlement``
+    now hands that release off to a done-callback on the RAW delete worker
+    future (``_release_purge_registration_on_worker_settlement``), which only
+    fires once ``fs.delete`` has genuinely returned on its daemon thread --
+    so the registration outlives the abandoned settlement. This test proves
+    both halves of the fix against the real worker, not a manual re-enactment:
+    ``begin_placement`` REFUSES while the daemon thread is still physically
+    running (even though the asyncio task is already done and abandoned), and
+    only SUCCEEDS once that daemon thread genuinely finishes.
     """
     target = tmp_path / "movies" / "Stuck Movie.mkv"
     target.parent.mkdir()
@@ -369,6 +389,7 @@ async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_run
     fs = _BlockedDeleteFileSystem(target.parent)
 
     task = asyncio.create_task(_purge_worker(fs, str(target)))
+    placed = False
     try:
         assert await asyncio.to_thread(fs.started.wait, 2.0)
         task.cancel()
@@ -382,26 +403,42 @@ async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_run
             (task,), timeout_seconds=0.05
         )
 
-        # The registration is already released and the daemon thread is
+        # The asyncio task is done (abandoned) but the daemon thread is
         # PROVABLY still mid-rmtree -- the exact abandonment-to-exit window
         # issue #421 is concerned with.
         assert task.done()
         assert task.cancelled()
-        assert purge_service.active_purge_paths() == ()
         assert not fs.finished.is_set()
 
-        # CHARACTERIZATION: a live caller reaching begin_placement() in this
-        # window observes no conflict and is allowed to claim the path, even
-        # though the abandoned delete is still physically running against it.
-        claimed = purge_service.begin_placement(str(target))
-        assert claimed is True, (
-            "known gap (issue #421): begin_placement currently succeeds for a "
-            "path an abandoned purge delete is still physically tearing down"
-        )
-    finally:
-        purge_service.end_placement(str(target))
+        # FIXED (issue #421): the registration outlives the abandoned
+        # settlement -- tied to the daemon thread's own physical completion,
+        # not to the (already-resolved) asyncio settlement -- so a live
+        # caller reaching begin_placement() in this window is correctly
+        # refused the path instead of wrongly claiming it.
+        assert len(purge_service.active_purge_paths()) == 1
+        assert purge_service.begin_placement(str(target)) is False
+
+        # Let the daemon thread genuinely finish, then give the loop a chance
+        # to run the done-callback its completion schedules via
+        # ``call_soon_threadsafe`` (issue #421's fix point).
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+        for _ in range(200):
+            if purge_service.active_purge_paths() == ():
+                break
+            await asyncio.sleep(0.01)
+        assert purge_service.active_purge_paths() == ()
+
+        # Only now -- after the delete has PHYSICALLY finished -- does a
+        # placement claim for the same path succeed.
+        assert purge_service.begin_placement(str(target)) is True
+        placed = True
+    finally:
+        if placed:
+            purge_service.end_placement(str(target))
+        if not fs.finished.is_set():
+            fs.release.set()
+            assert await asyncio.to_thread(fs.finished.wait, 2.0)
 
 
 async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
