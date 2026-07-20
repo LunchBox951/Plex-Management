@@ -622,15 +622,29 @@ export function TitleDetailModal({
   const [backdropFailed, setBackdropFailed] = useState(false)
   const [posterFailed, setPosterFailed] = useState(false)
 
-  // Reset the per-title flow whenever a different title is opened. Keyed on
-  // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
-  // collide, so tmdb_id alone would carry one title's request state onto another.
   const titleKey = title ? `${title.media_type}:${title.tmdb_id}` : null
   // Always-current title key, read by async handlers after an await to discard
-  // results that belong to a title the modal has since moved on from.
+  // results that belong to a title the modal has since moved on from. Written
+  // from an effect rather than during render itself (react-hooks/refs: ref
+  // writes must happen outside render) -- effects run after every commit, well
+  // before any awaited async handler can resume, so this is the same "always
+  // current by the time an async handler checks it" guarantee as before.
   const latestTitleKey = useRef(titleKey)
-  latestTitleKey.current = titleKey
   useEffect(() => {
+    latestTitleKey.current = titleKey
+  })
+
+  // Reset the per-title flow whenever a different title is opened. Keyed on
+  // media_type AND tmdb_id: TMDB movie/tv ids are independent namespaces and
+  // collide, so tmdb_id alone would carry one title's request state onto
+  // another. Compared and applied directly in render -- React's documented
+  // "adjusting state when a prop changes" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) -- rather than in a
+  // useEffect, so the reset lands in the SAME commit as the new titleKey
+  // instead of committing one stale render first (react-hooks/set-state-in-effect).
+  const [resetForTitleKey, setResetForTitleKey] = useState(titleKey)
+  if (resetForTitleKey !== titleKey) {
+    setResetForTitleKey(titleKey)
     setRequestId(null)
     setReboundRequestId(null)
     setCreatedGrabbable(false)
@@ -647,7 +661,7 @@ export function TitleDetailModal({
     setReacquireOpen(false)
     setBackdropFailed(false)
     setPosterFailed(false)
-  }, [titleKey])
+  }
 
   // The live request for this exact title (media_type + tmdb_id), if any.
   // GET /requests/by-title (issue #370 phase 2) already scopes to exactly this
@@ -845,11 +859,17 @@ export function TitleDetailModal({
   // 409 (or worse, silently no-op on a state the backend never expected).
   const reportActionable = reportTarget !== null && isMarkFailableStatus(reportTarget.status)
 
-  useEffect(() => {
-    if (reportFor && !reportActionable) {
-      setReportFor(null)
-    }
-  }, [reportFor, reportActionable])
+  // Auto-dismiss the confirm dialog if its target stops being actionable (e.g.
+  // the queue item finished importing while the dialog was open). Applied
+  // directly in render -- React's "adjusting state when a prop changes"
+  // pattern (https://react.dev/learn/you-might-not-need-an-effect) -- rather
+  // than in a useEffect, so the invalid state is corrected in the SAME commit
+  // instead of committing one stale (dialog still open) render first
+  // (react-hooks/set-state-in-effect). `reportFor` is falsy on the very next
+  // render, so this cannot loop.
+  if (reportFor && !reportActionable) {
+    setReportFor(null)
+  }
 
   const { preview, isPending: previewPending, clearPreview, runPreview } =
     useTitleReleasePreview(title, currentSeason)
