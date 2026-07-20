@@ -5404,6 +5404,179 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
     assert response.status_code == 200
 
 
+async def test_post_commit_sweep_failure_still_bumps_generation_and_surfaces(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue #423 regression: a completion sweep that raises AFTER the commit
+    landed is a POST-commit failure, not a pre-commit one. The rotation IS
+    durable, so the must-run ``on_committed`` obligations (identity-generation
+    bump FIRST, then invalidations) still run -- otherwise a repoint would land
+    without a bump and silently reopen the sign-in TOCTOU #400/#416 closed -- and
+    the redaction snapshot must NOT be aborted (that would un-redact the durable
+    new secret). The failure is surfaced honestly rather than swallowed."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    with (
+        caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"),
+        pytest.raises(settings_router._PostCommitSweepError),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+
+    # The commit landed durably despite the sweep failing.
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    # on_committed ran: the identity generation was bumped FIRST (the TOCTOU
+    # close) and a later invalidation still fired.
+    assert deps.plex_identity_generation.value == generation_before + 1
+    assert app.state.watchlist_wake_event.is_set()
+    # The durable rotation must NOT have its redaction snapshot aborted.
+    assert aborted == []
+    # Honest surfacing: the failure names what broke, with the cause rendered.
+    assert "post-commit" in caplog.text
+    assert "completion sweep exploded" in caplog.text
+
+
+async def test_pre_commit_failure_does_not_bump_generation_and_aborts(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unchanged contrast to the post-commit case (issue #423): a commit that
+    fails BEFORE landing leaves nothing durable, so the snapshot IS aborted, the
+    rotation is rolled back, and the identity generation is NOT bumped -- the
+    exact pre-commit behavior PRs #389/#399/#400 built, preserved by the split."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    aborted: list[frozenset[str]] = []
+    real_abort = handler.abort_secret_rotation
+
+    def spy_abort(previous_values: frozenset[str]) -> None:
+        aborted.append(previous_values)
+        real_abort(previous_values)
+
+    monkeypatch.setattr(handler, "abort_secret_rotation", spy_abort)
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    real_commit = AsyncSession.commit
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    rewrite_finished = False
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def failing_once(self: AsyncSession) -> None:
+        if rewrite_finished:
+            raise RuntimeError("commit failed")
+        await real_commit(self)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", failing_once)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    monkeypatch.setattr(AsyncSession, "commit", real_commit)
+
+    # Nothing durable landed: the cached anchor and generation are untouched, and
+    # the post-commit obligations never ran.
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"
+    assert deps.plex_identity_generation.value == generation_before
+    assert not app.state.watchlist_wake_event.is_set()
+    # The pre-commit path DID abort the redaction snapshot back to the
+    # pre-rotation secret set (what ``begin_secret_rotation`` returned).
+    assert aborted == [frozenset({_SEED_PLEX_TOKEN})]
+
+
+async def test_post_commit_invalidation_step_failure_does_not_skip_later_steps(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue #423 secondary: ``_post_commit_invalidations`` isolates each step,
+    so one raising mid-list cannot skip the ones after it while the DB change is
+    durable. A verified repoint whose stream-close throws must still publish the
+    settings SSE, and the generation bump (first, unguarded) is untouched."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    # close_realtime_streams runs BEFORE publish_realtime in the step list.
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        put = await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+
+    # The isolated failure did not fail the request nor skip the earlier bump.
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert deps.plex_identity_generation.value == generation_before + 1
+    # The LATER step still ran despite the earlier one raising.
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
+
+
 @pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
 async def test_mutation_reopens_transaction_under_lock_before_rewrite(
     kind: Literal["generic", "rotate", "revoke"],

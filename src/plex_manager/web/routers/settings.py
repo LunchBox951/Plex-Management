@@ -367,6 +367,41 @@ rollback_to_completion = _rollback_to_completion
 commit_to_completion = _commit_to_completion
 
 
+def _log_invalidation_step_failure(step: str) -> None:
+    """Surface a post-commit invalidation step failure honestly (issue #423).
+
+    Called from the ``except`` of each ISOLATED step in
+    ``_post_commit_invalidations``: the DB change is already durable when these
+    run, so one invalidation raising must not skip the must-run steps after it.
+    The failure is logged loudly (state, not silence -- north star #3) and
+    execution continues. The generation bump is deliberately NOT routed through
+    an isolated step: it is the security-critical must-run and stays first and
+    unguarded (a bare counter increment cannot fail anyway).
+    """
+    _logger.error(
+        "post-commit invalidation step %r failed after a durable settings write; "
+        "the remaining invalidations still run",
+        step,
+        exc_info=True,
+    )
+
+
+class _PostCommitSweepError(Exception):
+    """Raised when the completion sweep fails AFTER ``session.commit()`` landed.
+
+    The signal :func:`secret_rotation` uses to tell "commit failed -- nothing
+    durable landed" apart from "commit succeeded, but the post-commit sweep
+    raised" (issue #423). Both surface identically through
+    ``commit_task.exception()``, yet demand OPPOSITE handling: a pre-commit
+    failure must abort the redaction snapshot and roll back; a post-commit sweep
+    failure must NOT (the transaction already committed, so aborting the snapshot
+    would un-redact the now-durable new secrets against a stale pre-rotation
+    snapshot, and the rollback is a no-op) -- instead the must-run post-commit
+    obligations (``on_committed``: generation bump, invalidations) still run and
+    the failure is surfaced loudly. Carries the real sweep error as ``__cause__``.
+    """
+
+
 async def _commit_and_complete(
     session: AsyncSession,
     handler: LogCaptureHandler,
@@ -383,9 +418,19 @@ async def _commit_and_complete(
     LogCaptureHandler.complete_secret_rotation` rewrite the queue/ring and narrow
     the capture snapshot. There is no ``await`` between the commit landing and
     the sweep, so a cancellation can never wedge itself between "commit durable"
-    and "retired value swept from the live surfaces". A commit FAILURE propagates
-    to the caller, which rolls back and restores the snapshot exactly like a
-    pre-commit failure -- nothing durable landed, so the sweep must NOT run.
+    and "retired value swept from the live surfaces".
+
+    Two failure domains, deliberately kept DISTINCT (issue #423). A commit (or
+    the pre-commit ``secret_values()`` read) FAILURE propagates as-is: nothing
+    durable landed, so the caller rolls back and restores the snapshot exactly
+    like any pre-commit failure, and the sweep never ran. But once
+    ``session.commit()`` has returned the boundary is past the point of no
+    return -- a sweep raising THERE is a POST-commit failure, re-raised wrapped
+    in :class:`_PostCommitSweepError` so the caller runs its must-run
+    ``on_committed`` obligations (generation bump first) and surfaces the failure
+    loudly, rather than mistaking it for a rollback-and-abort case. Conflating
+    the two silently reopened the sign-in TOCTOU #400/#416 closed: a repoint
+    whose sweep threw landed durable but never bumped the identity generation.
 
     ``previous_values is None`` marks a NON-redacting boundary entry (empty
     retiring+incoming -- e.g. a URL-only Plex repoint, issue #400 finding P2-1):
@@ -398,9 +443,18 @@ async def _commit_and_complete(
         return
     current_values = await SettingsStore(session).secret_values()
     await session.commit()
-    handler.complete_secret_rotation(
-        previous_values, current_values, retired_values=retiring_values
-    )
+    # PAST THE POINT OF NO RETURN: the rotation is durable. Any failure from the
+    # synchronous sweep below is a POST-commit failure -- re-raise it wrapped so
+    # the boundary runs ``on_committed`` and surfaces it instead of aborting the
+    # (now stale) redaction snapshot and driving a no-op rollback (issue #423).
+    try:
+        handler.complete_secret_rotation(
+            previous_values, current_values, retired_values=retiring_values
+        )
+    except Exception as sweep_error:
+        raise _PostCommitSweepError(
+            "secret rotation completion sweep failed after the commit landed"
+        ) from sweep_error
 
 
 @asynccontextmanager
@@ -614,13 +668,20 @@ async def secret_rotation(
         # cancelled (nothing cancels it; the awaits above absorb the request's
         # cancellation), so ``exception()`` cannot raise ``CancelledError``.
         unit_error = commit_task.exception()
-        if unit_error is not None:
+        if unit_error is not None and not isinstance(unit_error, _PostCommitSweepError):
             # Commit (or the pre-commit read) failed: no rotation landed. The
             # sweep inside the unit never ran. Restore the in-memory snapshot
             # FIRST -- synchronous, so it runs even when a delivered
             # cancellation is being re-raised at every await below (an anyio
             # cancel scope re-cancels each checkpoint until the request task
             # unwinds).
+            #
+            # A ``_PostCommitSweepError`` is deliberately EXCLUDED here (issue
+            # #423): its commit already landed durably, so it is NOT a
+            # rollback-and-abort case -- aborting the snapshot would un-redact
+            # the now-committed new secrets, and the rollback would be a no-op.
+            # It falls through to the committed path below, which runs
+            # ``on_committed`` and re-raises the failure after.
             if previous_values is not None:
                 handler.abort_secret_rotation(previous_values)
             if pending_cancel is None:
@@ -673,18 +734,49 @@ async def secret_rotation(
             # otherwise the explicit re-raise below honors the remembered one.
             await _rollback_to_completion(session)
             raise pending_cancel from unit_error
-        # The rotation COMMITTED. Run the caller's must-run post-commit
-        # invalidations (SSE stream closes, cache invalidations, realtime
-        # publishes) HERE, before any remembered cancellation is honored
-        # (codex #399 round 4): re-raising first would skip the code after
-        # ``async with secret_rotation(...)`` in the caller, leaving
-        # already-open revoked streams live until their lease catches up and
-        # clients holding stale state -- with the DB change already durable.
-        # The callback is deliberately SYNCHRONOUS (``() -> None``): with no
-        # await inside it, a pending cancellation has nowhere to land until it
-        # finishes, so it runs to completion by construction.
+        # The rotation COMMITTED. Reaching here means the commit landed durably:
+        # either the whole unit succeeded, or (``_PostCommitSweepError``, issue
+        # #423) the commit succeeded but the post-commit completion sweep raised.
+        # BOTH are past the point of no return, so the must-run obligations run.
+        if isinstance(unit_error, _PostCommitSweepError):
+            # Honesty over silence: the rotation IS live, but a retired secret
+            # value may linger in the capture queue/ring until the next
+            # rotation. Name the failure loudly in the durable log BEFORE the
+            # must-run invalidations, so it survives even if one of those (now
+            # per-step isolated) somehow still escaped.
+            _logger.error(
+                "secret rotation committed durably but the post-commit "
+                "completion sweep failed; the rotation is live and the "
+                "generation bump + cache invalidations still run, but a retired "
+                "secret value may remain in the capture queue/ring until the "
+                "next rotation",
+                exc_info=unit_error,
+            )
+        # Run the caller's must-run post-commit invalidations (SSE stream
+        # closes, cache invalidations, realtime publishes) HERE, before any
+        # remembered cancellation is honored (codex #399 round 4) AND before the
+        # sweep failure is re-raised (issue #423): re-raising first would skip
+        # the code after ``async with secret_rotation(...)`` in the caller,
+        # leaving already-open revoked streams live until their lease catches up
+        # and clients holding stale state -- with the DB change already durable.
+        # Critically, the identity-generation bump lives here (first statement
+        # of ``on_committed``): letting a sweep failure skip it is exactly the
+        # sign-in TOCTOU #400/#416 closed. The callback is deliberately
+        # SYNCHRONOUS (``() -> None``): with no await inside it, a pending
+        # cancellation has nowhere to land until it finishes, so it runs to
+        # completion by construction.
         if on_committed is not None:
             on_committed()
+        if unit_error is not None:
+            # A committed rotation whose sweep failed: surface it to the caller
+            # (a 500) now that the must-run obligations have run, so the failure
+            # is reported distinctly rather than swallowed. A remembered
+            # cancellation still WINS the re-raise (the server's teardown
+            # expects a cancelled request task to end cancelled), with the sweep
+            # failure chained as its cause for any consumer that renders it.
+            if pending_cancel is not None:
+                raise pending_cancel from unit_error
+            raise unit_error
         if pending_cancel is not None:
             raise pending_cancel
 
@@ -1731,6 +1823,13 @@ async def put_settings_endpoint(
             if plex_identity_changed:
                 deps.plex_identity_generation.value += 1
 
+            # Every step below the bump is ISOLATED (issue #423): once the writes
+            # are durable, one invalidation raising must not skip the ones after
+            # it (a repoint whose stream-close threw would otherwise never
+            # publish the settings SSE, leaving every tab on a stale snapshot).
+            # Each guard logs honestly and continues; the bump above stays first
+            # and OUTSIDE the guards as the security-critical must-run.
+
             # A long configured interval must not postpone an enable/shorten
             # change -- nor a Plex identity change's snapshot cleanup -- until
             # the old sleep expires. BOTH identity-change shapes need the
@@ -1744,51 +1843,67 @@ async def put_settings_endpoint(
             # they keep protecting titles from eviction until the next
             # scheduled tick (hours/days away) despite the operator explicitly
             # walking away from Plex. The worker owns this process-local event.
-            if plex_identity_changed or written_fields.intersection(
-                {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
-            ):
-                wake_event = getattr(request.app.state, "watchlist_wake_event", None)
-                if isinstance(wake_event, asyncio.Event):
-                    wake_event.set()
+            try:
+                if plex_identity_changed or written_fields.intersection(
+                    {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
+                ):
+                    wake_event = getattr(request.app.state, "watchlist_wake_event", None)
+                    if isinstance(wake_event, asyncio.Event):
+                        wake_event.set()
+            except Exception:
+                _log_invalidation_step_failure("watchlist_worker_wake")
 
             # Same immediacy for the auto-grab worker (issue #332): a shortened
             # interval, a changed per-cycle search cap, or a re-enable must be
             # observed on the next tick, not after the OLD (up to 1h) sleep
             # expires. ``_autograb_loop`` re-reads all three fresh when woken;
             # the worker owns this process-local event.
-            if written_fields.intersection(
-                {
-                    "auto_grab_enabled",
-                    "auto_grab_interval_seconds",
-                    "auto_grab_max_searches_per_cycle",
-                }
-            ):
-                autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
-                if isinstance(autograb_wake_event, asyncio.Event):
-                    autograb_wake_event.set()
+            try:
+                if written_fields.intersection(
+                    {
+                        "auto_grab_enabled",
+                        "auto_grab_interval_seconds",
+                        "auto_grab_max_searches_per_cycle",
+                    }
+                ):
+                    autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
+                    if isinstance(autograb_wake_event, asyncio.Event):
+                        autograb_wake_event.set()
+            except Exception:
+                _log_invalidation_step_failure("autograb_worker_wake")
 
             # Clear backend probe caches before publishing: a listening tab can
             # refetch immediately on the SSE event, so publishing first could
             # race it into the stale pre-update health snapshot.
-            for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
-                if written_fields.intersection(fields):
-                    health_cache.invalidate(subsystem)
+            try:
+                for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+                    if written_fields.intersection(fields):
+                        health_cache.invalidate(subsystem)
+            except Exception:
+                _log_invalidation_step_failure("health_cache_invalidate")
 
-            if plex_identity_changed and machine_identifier is not None:
-                close_realtime_streams(
-                    request.app,
-                    reason="plex_server_repointed",
-                    auth_method=AuthMethod.plex_session.value,
-                )
-            if written_fields or plex_identity_changed:
-                topics = ["settings", "ops:health"]
-                if written_fields.intersection(_UPDATE_POLICY_FIELDS):
-                    topics.append("updates")
-                publish_realtime(
-                    request.app,
-                    tuple(topics),
-                    reason="settings_updated",
-                )
+            try:
+                if plex_identity_changed and machine_identifier is not None:
+                    close_realtime_streams(
+                        request.app,
+                        reason="plex_server_repointed",
+                        auth_method=AuthMethod.plex_session.value,
+                    )
+            except Exception:
+                _log_invalidation_step_failure("close_realtime_streams")
+
+            try:
+                if written_fields or plex_identity_changed:
+                    topics = ["settings", "ops:health"]
+                    if written_fields.intersection(_UPDATE_POLICY_FIELDS):
+                        topics.append("updates")
+                    publish_realtime(
+                        request.app,
+                        tuple(topics),
+                        reason="settings_updated",
+                    )
+            except Exception:
+                _log_invalidation_step_failure("publish_realtime")
 
         # A Plex identity change routes through the SAME boundary even when no
         # secret field is changing (issue #400 / the codex residual on PR #399):
