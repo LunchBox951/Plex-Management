@@ -5577,6 +5577,129 @@ async def test_post_commit_invalidation_step_failure_does_not_skip_later_steps(
     assert "stream close exploded" in caplog.text
 
 
+async def test_rotate_app_key_delivers_new_key_even_when_post_commit_sweep_fails(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up (P1): the rotate endpoint hands back the freshly
+    minted key EXACTLY ONCE. When the post-commit completion sweep raises, the
+    rotation is ALREADY durable -- the old key is dead -- so re-raising the 500
+    (the boundary's ``_PostCommitSweepError``) would strand a recovery-only /
+    header-authenticated operator with NEITHER the old nor the new key (north
+    star #1). The durably committed one-shot credential must still be delivered,
+    with the sweep failure surfaced honestly in the log (north star #3)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        rotate = await client.post(
+            "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
+        )
+
+    # The one-shot credential is delivered despite the failed sweep.
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key not in (None, _API_KEY)
+    # It is the DURABLY COMMITTED key: the new one authenticates, the old 401s.
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": new_key})).status_code == 200
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 401
+    # The durable rotation must NOT have its redaction snapshot aborted.
+    assert aborted == []
+    # Honest surfacing: the failure names what broke, with the cause rendered.
+    assert "post-commit" in caplog.text
+    assert "completion sweep exploded" in caplog.text
+
+
+async def test_rotate_app_key_invalidation_step_failure_does_not_skip_publish(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up: the rotate endpoint's ``_post_commit_invalidations``
+    isolates each step too, so ``close_realtime_streams`` raising after the
+    rotation is durable must not skip the ``publish_realtime`` after it -- nor,
+    by escaping ``on_committed``, mask a boundary error. The rotation still 200s
+    and returns its key."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        rotate = await client.post(
+            "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
+        )
+
+    assert rotate.status_code == 200
+    assert rotate.json()["app_api_key"] not in (None, _API_KEY)
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
+
+
+async def test_revoke_app_key_invalidation_step_failure_does_not_skip_publish(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up: the revoke endpoint's ``_post_commit_invalidations``
+    likewise isolates each step, so ``close_realtime_streams`` raising after the
+    revoke is durable still publishes the access change. The revoke still 204s
+    and the key is durably gone."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        revoke = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+
+    assert revoke.status_code == 204
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+    assert system is not None and system.app_api_key is None
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
+
+
 @pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
 async def test_mutation_reopens_transaction_under_lock_before_rewrite(
     kind: Literal["generic", "rotate", "revoke"],

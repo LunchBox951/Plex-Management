@@ -1315,38 +1315,65 @@ async def rotate_app_key_endpoint(
         # Must-run post-commit invalidations, handed to the boundary so a
         # disconnect-during-commit cannot skip them (codex #399 round 4): once
         # the rotation is durable, every OTHER holder of the old key must lose
-        # its already-open streams NOW, not when its lease catches up.
+        # its already-open streams NOW, not when its lease catches up. Each step
+        # is ISOLATED (issue #423): the credential change is already durable when
+        # these run, so a failing ``close_realtime_streams`` must not skip the
+        # ``publish_realtime`` after it -- nor, by escaping ``on_committed``, mask
+        # a pending ``_PostCommitSweepError`` the boundary is about to surface.
         def _post_commit_invalidations() -> None:
-            close_realtime_streams(
-                request.app,
-                reason="app_key_rotated",
-                auth_method=AuthMethod.api_key.value,
-            )
-            publish_realtime(request.app, ("access",), reason="app_key_rotated")
+            try:
+                close_realtime_streams(
+                    request.app,
+                    reason="app_key_rotated",
+                    auth_method=AuthMethod.api_key.value,
+                )
+            except Exception:
+                _log_invalidation_step_failure("close_realtime_streams")
+            try:
+                publish_realtime(request.app, ("access",), reason="app_key_rotated")
+            except Exception:
+                _log_invalidation_step_failure("publish_realtime")
 
         # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
         # that is safe because every app-key writer holds ``_rotate_lock``
         # (held here), so the DB value cannot move under us.
-        async with secret_rotation(
-            session,
-            request,
-            retiring_values=retired_values,
-            incoming_values=frozenset({new_key}),
-            on_committed=_post_commit_invalidations,
-        ):
-            # Re-read the row in the boundary's FRESH transaction: the rollback
-            # expired the pre-lock instance, and on a pathological
-            # never-initialized install it would have discarded an uncommitted
-            # ensure_system_settings insert entirely -- refresh() then raises
-            # loudly (the instance is no longer persistent) instead of letting
-            # the key write silently miss the committed transaction.
-            await session.refresh(system)
-            system.app_api_key = new_key
-            # Invalidate every recovery-cookie session born from the OLD key,
-            # except the acting recovery-cookie admin.
-            await _revoke_recovery_sessions(
-                session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
-            )
+        try:
+            async with secret_rotation(
+                session,
+                request,
+                retiring_values=retired_values,
+                incoming_values=frozenset({new_key}),
+                on_committed=_post_commit_invalidations,
+            ):
+                # Re-read the row in the boundary's FRESH transaction: the rollback
+                # expired the pre-lock instance, and on a pathological
+                # never-initialized install it would have discarded an uncommitted
+                # ensure_system_settings insert entirely -- refresh() then raises
+                # loudly (the instance is no longer persistent) instead of letting
+                # the key write silently miss the committed transaction.
+                await session.refresh(system)
+                system.app_api_key = new_key
+                # Invalidate every recovery-cookie session born from the OLD key,
+                # except the acting recovery-cookie admin.
+                await _revoke_recovery_sessions(
+                    session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
+                )
+        except _PostCommitSweepError:
+            # The rotation COMMITTED durably and every must-run obligation
+            # (stream closes, realtime publish) already ran inside the boundary,
+            # which also logged the sweep failure loudly. Only the capture-queue
+            # completion sweep failed -- a retired value may linger in the
+            # queue/ring until the next rotation (a logged, self-healing residual).
+            # This endpoint hands back the freshly minted key EXACTLY ONCE, and a
+            # recovery-only / header-authenticated operator holds no other
+            # credential: re-raising the 500 here would retire their old key while
+            # swallowing its only replacement, locking them out over a
+            # non-durable log-redaction failure (north star #1). So the durably
+            # committed one-shot credential is still delivered below. A caller
+            # cancellation still wins inside the boundary (it re-raises the
+            # CancelledError, not this error), so a disconnected client never
+            # reaches here -- only a live one that must receive its new key.
+            pass
     # The invalidations already ran inside the boundary (``on_committed``);
     # only response construction remains out here.
     _set_no_store_headers(response)
@@ -1396,14 +1423,24 @@ async def revoke_app_key_endpoint(
         # Must-run post-commit invalidations (codex #399 round 4): on the
         # rotation path the boundary runs these once the revoke is durable,
         # so a disconnect-during-commit cannot leave revoked-key streams open;
-        # the keyless no-op path below calls it directly after its commit.
+        # the keyless no-op path below calls it directly after its commit. Each
+        # step is ISOLATED (issue #423): the revoke is already durable when these
+        # run, so a failing ``close_realtime_streams`` must not skip the
+        # ``publish_realtime`` after it -- nor, by escaping ``on_committed`` on the
+        # boundary path, mask a pending ``_PostCommitSweepError``.
         def _post_commit_invalidations() -> None:
-            close_realtime_streams(
-                request.app,
-                reason="app_key_revoked",
-                auth_method=AuthMethod.api_key.value,
-            )
-            publish_realtime(request.app, ("access",), reason="app_key_revoked")
+            try:
+                close_realtime_streams(
+                    request.app,
+                    reason="app_key_revoked",
+                    auth_method=AuthMethod.api_key.value,
+                )
+            except Exception:
+                _log_invalidation_step_failure("close_realtime_streams")
+            try:
+                publish_realtime(request.app, ("access",), reason="app_key_revoked")
+            except Exception:
+                _log_invalidation_step_failure("publish_realtime")
 
         old_key = system.app_api_key
         if old_key is None:
