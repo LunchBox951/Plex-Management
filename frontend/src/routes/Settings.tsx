@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useState } from 'react'
 import {
   useActiveSessions,
   useAppKeyStatus,
@@ -776,9 +776,16 @@ export function Settings() {
   // Same, for the (optional) anime library folders (ADR-0015).
   const [manualAnimeMoviePath, setManualAnimeMoviePath] = useState(false)
   const [manualAnimeTvPath, setManualAnimeTvPath] = useState(false)
-  useEffect(() => {
-    if (data && form === null) setForm(initialForm(data))
-  }, [data, form])
+  // Seed the controlled form once the settings load. Applied directly in
+  // render -- React's "adjusting state when a prop changes" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) -- rather than in a
+  // useEffect, so the form is populated in the SAME commit `data` arrives in
+  // instead of committing one extra loading-spinner render first
+  // (react-hooks/set-state-in-effect). `form` is non-null on the very next
+  // render, so this cannot loop.
+  if (data && form === null) {
+    setForm(initialForm(data))
+  }
   const plexBaseChanged =
     data !== undefined &&
     form !== null &&

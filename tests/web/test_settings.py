@@ -5534,3 +5534,64 @@ async def test_short_retired_secret_is_masked_despite_read_floor(
     for record in (*tuple(handler.queue._queue), *handler.snapshot_tail(10)):  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         assert old_value not in record.message
         assert old_value not in json.dumps(record.context)
+
+
+async def test_url_only_repoint_skips_secret_decrypt_for_empty_set_boundary(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A url-only repoint enters ``secret_rotation`` with EMPTY retiring/incoming
+    sets (issue #400 fix #1). P2-1: the empty-set entry must SKIP the boundary's
+    ``SettingsStore.secret_values()`` decrypt entirely -- an unrelated
+    undecryptable stored credential (codex #382) must not 500 a repoint that
+    touches no secret -- while still taking the lock, committing through the
+    shielded unit, running ``on_committed``, and leaving the capture handler's
+    redaction state untouched.
+    """
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({"sentinel-redaction-value"})
+    app.state.log_handler = handler
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    # ``secret_values()`` is the ONLY decrypt the boundary performs; make it raise
+    # exactly as an undecryptable stored credential would. With P2-1 the empty-set
+    # boundary never calls it, so the repoint must not 500. (The redacted response
+    # never calls it, so this scopes cleanly to the boundary's behavior.)
+    decrypt_calls = {"count": 0}
+
+    async def exploding_secret_values(self: SettingsStore) -> frozenset[str]:
+        decrypt_calls["count"] += 1
+        raise RuntimeError("a stored credential could not be decrypted")
+
+    monkeypatch.setattr(SettingsStore, "secret_values", exploding_secret_values)
+
+    published: list[str] = []
+    real_publish = settings_router.publish_realtime
+
+    def spy_publish(app_: object, topics: object, *, reason: str) -> None:
+        published.append(reason)
+        return real_publish(app_, topics, reason=reason)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200  # no 500: the empty-set boundary never decrypted
+    assert decrypt_calls["count"] == 0  # secret_values() was skipped entirely
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # committed through the boundary
+    # The boundary never touched the handler (no begin/complete): redaction untouched.
+    assert handler.secret_values == frozenset({"sentinel-redaction-value"})
+    assert handler.retiring_values == frozenset()
+    # ``on_committed`` still ran after the shielded commit (the settings publish).
+    assert "settings_updated" in published

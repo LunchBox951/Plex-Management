@@ -326,6 +326,32 @@ app_key_rotate_lock = asyncio.Lock()
 # py/unused-global-variable flagged as alerts #363/#368.
 secret_rotation_lock = Cell(asyncio.Lock())
 
+# Process-local plex-identity generation counter (issue #400). It closes the
+# ordinary (non-rotation) sign-in's TOCTOU against a concurrent Plex repoint:
+# an ordinary sign-in never takes ``secret_rotation_lock`` (serializing every
+# sign-in behind log drains/rotations would be a large perf/scope expansion),
+# so it cannot serialize with a repoint on the lock the way a token-rotation
+# sign-in does. Instead every repoint that changes ``plex_machine_identifier``
+# and sweeps sessions BUMPS this counter (in memory, synchronously) BEFORE its
+# revoke ``UPDATE`` commits; an ordinary sign-in reads it before computing the
+# access decision and re-checks it immediately before the session-minting
+# commit, recomputing access when it moved (see ``routers/auth.py``). The
+# in-lock token-rotation sign-in re-checks it too, so a repoint that committed
+# while it waited on the boundary lock is observed there as well.
+#
+# Same ``Cell`` + module-attribute-read discipline as ``secret_rotation_lock``
+# (see the ``Cell`` docstring): written/read only as
+# ``deps.plex_identity_generation.value`` from other modules, never
+# ``from``-imported as a bare name (which would re-fire CodeQL's
+# py/unused-global-variable on the wrapped assignment). Deliberately a
+# SINGLE-PROCESS guard on the same footing as the rotation lock — the supported
+# uvicorn deployment runs one worker; a future multi-worker deployment must
+# replace it with a DB-backed generation/version column spanning the same
+# repoint→sign-in window (no migration is added here precisely because this
+# adds no new cross-process deployment assumption the rotation lock did not
+# already make).
+plex_identity_generation = Cell(0)
+
 
 class AuthMethod(StrEnum):
     """How the current request authenticated."""
