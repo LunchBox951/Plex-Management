@@ -5534,3 +5534,66 @@ async def test_short_retired_secret_is_masked_despite_read_floor(
     for record in (*tuple(handler.queue._queue), *handler.snapshot_tail(10)):  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
         assert old_value not in record.message
         assert old_value not in json.dumps(record.context)
+
+
+async def test_url_only_repoint_enters_boundary_without_disturbing_redaction_state(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A url-only repoint enters ``secret_rotation`` with EMPTY retiring/incoming
+    sets (issue #400 fix #1). That empty-set entry must be a clean no-op for the
+    capture handler's redaction state -- the begin/complete cycle widens the
+    snapshot to the CURRENT ``secret_values()`` and narrows it right back to the
+    same set with an empty (floorless-no-op) retiring set -- while STILL running
+    the post-commit completion sweep and the ``on_committed`` invalidations that a
+    disconnect-during-commit would otherwise skip. Anything else would corrupt
+    live redaction or drop a must-run invalidation on the identity-change path.
+    """
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    async with sessionmaker_() as session:
+        current_secrets = await SettingsStore(session).secret_values()
+    handler.secret_values = current_secrets  # the true live redaction set
+    app.state.log_handler = handler
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+
+    completed = {"called": False}
+    real_complete = handler.complete_secret_rotation
+
+    def spy_complete(*args: object, **kwargs: object) -> None:
+        completed["called"] = True
+        return real_complete(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", spy_complete)
+
+    published: list[str] = []
+    real_publish = settings_router.publish_realtime
+
+    def spy_publish(app_: object, topics: object, *, reason: str) -> None:
+        published.append(reason)
+        return real_publish(app_, topics, reason=reason)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the repoint committed
+    # Redaction state untouched: the empty-set begin/complete round-trips to the
+    # SAME live secret set, never dropping or spuriously widening it.
+    assert handler.secret_values == current_secrets
+    assert handler.retiring_values == frozenset()
+    # The boundary still ran the post-commit completion sweep AND the on_committed
+    # invalidations (the settings/health realtime publish) after the commit.
+    assert completed["called"] is True
+    assert "settings_updated" in published

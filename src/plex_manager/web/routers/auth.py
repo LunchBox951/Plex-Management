@@ -38,6 +38,14 @@ from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
 from plex_manager.services import session_lifecycle
+
+# The deps MODULE itself is imported (not just names from it) so the shared
+# process-local ``plex_identity_generation`` counter is read/re-checked as
+# ``deps.plex_identity_generation.value`` -- a genuine cross-module attribute
+# read CodeQL can see, unlike a ``from``-imported bare name (see the ``Cell``
+# docstring in ``web.deps``; alerts #363/#368, issue #385). ``secret_rotation``
+# reads the same-module lock the same way.
+from plex_manager.web import deps
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
     PLEX_MACHINE_ID_SETTING,
@@ -60,7 +68,7 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams
-from plex_manager.web.routers.settings import secret_rotation
+from plex_manager.web.routers.settings import rollback_to_completion, secret_rotation
 from plex_manager.web.schemas import (
     ActiveSessionsResponse,
     ActiveSessionUser,
@@ -91,6 +99,17 @@ _COOKIE_PATH = "/"
 # retryable envelope (``server_identity_recheck_timeout``) and the boundary
 # rolls back -- never an unbounded lock hold, never an unverified admission.
 _IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS: Final = 5.0
+
+# Bound on the sign-in shape-decision retry (issue #400 round-2 finding 1). The
+# ordinary (no-retire) tail confirms its classification against the COMMITTED
+# stored token under the lock; if a concurrent rotation moved the token to a
+# DIFFERENT value the request re-classifies and re-dispatches (the next pass
+# takes the rotation branch, which retires the committed value through the
+# redaction protocol). A DIFFERENT stored value routes straight to rotation, so
+# in practice this converges in one re-classification; the bound only guards a
+# pathological store that keeps changing under every attempt, failing CLOSED
+# rather than spinning.
+_MAX_SIGN_IN_SHAPE_ATTEMPTS: Final = 3
 
 # In-process, per-client-IP sign-in throttle. A best-effort abuse brake for the
 # ONE unauthenticated write endpoint, not a security boundary: it is deliberately
@@ -143,6 +162,19 @@ async def plex_sign_in_endpoint(
     account = await plex_tv.fetch_account(body.auth_token)
     resources = await plex_tv.fetch_resources(body.auth_token)
 
+    # Stamp the process-local plex-identity generation BEFORE the access
+    # decision (issue #400). A repoint bumps this counter AFTER its
+    # revoke+machine-id commit is durable and while it still holds
+    # ``secret_rotation_lock`` (see ``routers/settings.py``). The ordinary
+    # (no-rotation) path re-checks this stamp INSIDE its own brief lock section
+    # just before minting: because both the repoint's bump and the sign-in's
+    # re-check happen under the one lock, a move seen there always reflects
+    # fully-committed repoint state (recompute against it), and a move NOT seen
+    # means the sign-in's mint serialized before the repoint's sweep (which then
+    # revokes the fresh session). The token-rotation path recomputes access
+    # in-lock via the boundary's ``pre_rewrite`` hook (facet 4) and needs no
+    # generation check -- the lock alone serializes it with the repoint.
+    identity_generation = deps.plex_identity_generation.value
     # The pre-lock access decision. For the token-rotation path this is
     # RECOMPUTED inside the boundary (facet 4 below); it is authoritative only
     # for the ordinary, no-rotation path, which never waits on the lock.
@@ -175,10 +207,15 @@ async def plex_sign_in_endpoint(
     # an inline post-``with`` close could be skipped with the demotion already
     # durable -- leaving the demoted user's admin streams open until lease
     # expiry. Reads ``demoted``/``user`` at call time, after the body below has
-    # recomputed them under the lock -- the rotation body REBINDS ``demoted``
-    # (a shared closure cell with this function), so any refactor that moves
-    # that rebinding into a nested function must add ``nonlocal demoted`` or
-    # this closure would silently see the stale pre-lock value.
+    # recomputed them under the lock -- BOTH the post-init ordinary tail and the
+    # rotation body REBIND ``demoted``/``user`` (shared closure cells with this
+    # function), so any refactor that moves that rebinding into a nested function
+    # must add ``nonlocal`` or this closure would silently see the stale pre-lock
+    # value. The ordinary path calls this directly post-commit; the rotation path
+    # runs it via the boundary's ``on_committed`` hook (codex #399 round 4) so a
+    # cancellation remembered during the commit -- which the boundary re-raises
+    # BEFORE control returns to the caller -- cannot skip it with the demotion
+    # already durable.
     def _close_demoted_streams() -> None:
         if demoted:
             close_realtime_streams(
@@ -188,142 +225,216 @@ async def plex_sign_in_endpoint(
                 user_id=user.id,
             )
 
-    if old_token is None or old_token == body.auth_token:
-        # NOT a rotation (ADR-0026 / issue #374), two shapes: a re-sign-in
-        # delivering the IDENTICAL token changes nothing (capture-time and
-        # read-time redaction already cover the still-current value), and a
-        # FIRST-EVER token (no previous value) is initial configuration — there
-        # is no retiring value to erase from history, and the drain loop's
-        # per-tick ``secret_values()`` refresh picks the new token up exactly as
-        # it always has. Neither takes the rotation lock, so the ordinary
-        # sign-in path never queues behind a log read/drain/rotation.
-        _apply_signin_fields(user, account, permissions=staged_permissions, token=body.auth_token)
-        await _issue_browser_session(session, response, request=request, user_id=user.id)
-        _close_demoted_streams()
-    else:
-        # The stored token VALUE is changing (issue #374): replace it inside the
-        # same locked transactional boundary ADR-0026 built for every other
-        # secret mutation. ``incoming_values`` carries the new token so in-flight
-        # emits mask it before it commits; the boundary reads the rest of the
-        # transition set itself, fresh, under the lock. Sign-in stays honest and
-        # fails CLOSED: any rewrite/commit failure rolls back the token write,
-        # the session mint, and the historical rewrite together (the old token
-        # remains valid, rows unchanged), and the response sets cookies only
-        # after the boundary commits.
+    async def _recompute_access_in_lock() -> None:
+        """RECOMPUTE the access decision while holding ``secret_rotation_lock``.
 
-        async def _reread_retiring_token(rotation_session: AsyncSession) -> frozenset[str]:
-            """Re-derive the token being retired, UNDER the boundary lock (facet 2).
+        Shared by both sign-in shapes when a Plex repoint may have moved the
+        configured server out from under the pre-lock decision:
 
-            ``old_token`` was read before the lock. Two concurrent sign-ins for
-            THIS account with different replacement tokens can both observe the
-            same pre-lock ``old_token``; the loser must retire whatever value is
-            ACTUALLY stored now (the winner's freshly committed token), not the
-            stale pre-lock read, or the winner's token is left uncovered by the
-            historical rewrite. Reading it here — after the boundary's in-lock
-            rollback, in its fresh transaction — sees the committed current
-            value. If it already equals the incoming token (a same-token race),
-            there is nothing to retire.
-            """
-            await rotation_session.refresh(user)
-            current = user.encrypted_plex_token
-            if not current or current == body.auth_token:
-                return frozenset()
-            return frozenset({current})
+        * the ordinary path (issue #400) calls it directly, inside its own
+          brief lock section, only when the identity generation moved;
+        * the token-rotation path passes it as the boundary's ``pre_rewrite``
+          hook (facet 4).
 
-        async def _recompute_access_in_lock() -> None:
-            """RECOMPUTE the access decision under the lock (facet 4).
+        A repoint holds this SAME lock across its revoke+commit and bumps the
+        generation under it, so once we hold the lock the configured server can
+        no longer move under us -- re-running ``_post_init_access`` binds this
+        sign-in's admission/admin decision to the server as it stands NOW. An
+        account with access only to the OLD server fails closed
+        (``_post_init_access`` raises, nothing staged/minted) instead of a
+        session against a server it cannot reach.
 
-            Not trusting the pre-lock one: a concurrent secret-changing Plex
-            repoint can change ``plex_machine_identifier`` (and revoke
-            sessions) while this sign-in waits on the boundary lock. The
-            repoint holds this SAME lock across its own commit, so once we
-            hold it the settings can no longer move under us — re-running the
-            access check binds this sign-in's admission/admin decision to the
-            server as it stands NOW. An account with access only to the OLD
-            server fails closed (``_post_init_access`` raises, nothing was
-            staged) instead of minting a session against a server it cannot
-            reach.
+        TIME-BOUNDED because it runs under the process-global lock:
+        ``_post_init_access``'s pre-rework fallback (no stored machine id)
+        probes the Plex server's ``/identity`` live, and an unresponsive server
+        must not hold the lock for the HTTP client's full 30s timeout (stalling
+        every rotation and the log drain). On expiry the sign-in fails CLOSED --
+        nothing staged or minted -- with a distinct, retryable envelope rather
+        than a silent fallback to the stale pre-lock decision.
+        """
+        nonlocal is_admin
+        try:
+            async with asyncio.timeout(_IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS):
+                is_admin = await _post_init_access(session, account, resources, client=plex_tv)
+        except TimeoutError as exc:
+            raise AppError(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                code="server_identity_recheck_timeout",
+                message="Could not re-verify your access to the configured Plex server in time.",
+                hint="Check that the Plex server is reachable, then sign in again.",
+            ) from exc
 
-            Runs as the boundary's ``pre_rewrite`` hook — under the lock, in
-            the fresh post-lock transaction, but BEFORE the historical
-            rewrite stages any writes (codex #399 round 4): the fallback
-            ``/identity`` probe below can wait out its full timeout, and doing
-            that AFTER the rewrite's flush would hold SQLite's writer lock for
-            the whole probe — ``db.py`` configures the same 5000ms busy
-            timeout, so concurrent writers would start surfacing ``database is
-            locked`` while this sign-in is only trying to fail closed.
+    async def _reread_retiring_token(rotation_session: AsyncSession) -> frozenset[str]:
+        """Re-derive the token being retired, UNDER the boundary lock (facet 2).
 
-            The recompute is TIME-BOUNDED because it runs under the shared
-            rotation lock: ``_post_init_access``'s pre-rework fallback (no
-            stored machine id) probes the Plex server's ``/identity`` live,
-            and an unresponsive server must not hold the process-global lock
-            for the HTTP client's full 30s timeout (stalling every rotation
-            and the log drain). On expiry the sign-in fails CLOSED -- nothing
-            was staged or minted -- with a distinct, retryable envelope rather
-            than a silent fallback to the stale pre-lock decision (which is
-            exactly what facet 4 forbids).
-            """
-            nonlocal is_admin
-            try:
-                async with asyncio.timeout(_IN_BOUNDARY_ACCESS_RECHECK_TIMEOUT_SECONDS):
-                    is_admin = await _post_init_access(session, account, resources, client=plex_tv)
-            except TimeoutError as exc:
-                raise AppError(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    code="server_identity_recheck_timeout",
-                    message=(
-                        "Could not re-verify your access to the configured Plex server in time."
-                    ),
-                    hint="Check that the Plex server is reachable, then sign in again.",
-                ) from exc
+        ``old_token`` was read before the lock. Two concurrent sign-ins for THIS
+        account with different replacement tokens can both observe the same
+        pre-lock ``old_token``; the loser must retire whatever value is ACTUALLY
+        stored now (the winner's freshly committed token), not the stale pre-lock
+        read, or the winner's token is left uncovered by the historical rewrite.
+        Reading it here — after the boundary's in-lock rollback, in its fresh
+        transaction — sees the committed current value. If it already equals the
+        incoming token (a same-token race), there is nothing to retire. Reads
+        ``user`` at call time: on a re-classified ordinary→rotation dispatch the
+        loop rebinds ``user`` to the freshly-committed row before this runs.
+        """
+        await rotation_session.refresh(user)
+        current = user.encrypted_plex_token
+        if not current or current == body.auth_token:
+            return frozenset()
+        return frozenset({current})
 
-        async with secret_rotation(
-            session,
-            request,
-            retiring_values=frozenset({old_token}),
-            incoming_values=frozenset({body.auth_token}),
-            reread_retiring=_reread_retiring_token,
-            # The pre-init claim path stays in the body below: it performs only
-            # local DB work (no live probe), so it cannot hold the writer lock
-            # against a slow network peer the way the post-init recompute can.
-            pre_rewrite=_recompute_access_in_lock if initialized else None,
-            on_committed=_close_demoted_streams,
-        ):
-            # The boundary's in-lock rollback DISCARDED every row write this
-            # request staged before entering. Re-stage all of them in the
-            # boundary's fresh transaction so they commit atomically with the
-            # historical rewrite and the session mint. (The access decision was
-            # already recomputed under this lock by ``_recompute_access_in_lock``
-            # above -- facet 4.)
-            if not initialized:
-                is_admin = await _claim_or_resume_setup(session, account, resources)
-            # Re-stage the plex.tv client identifier in case THIS request minted
-            # it (its uncommitted insert was discarded by the rollback):
-            # re-asserting the SAME value is create-once idempotent and a no-op
-            # whenever the identifier already persists.
+    # SHAPE decision (issue #374 rotation vs. ordinary), re-tried because the
+    # classifying ``old_token`` was read BEFORE the lock (issue #400 round-2
+    # finding 1). A plain ordinary tail keyed on that pre-lock value could
+    # overwrite a token a concurrent rotation just committed WITHOUT retiring it
+    # through the redaction protocol -- both the "stored A, re-sign-in A while a
+    # peer rotates A→B" race and two first-ever sign-ins with different tokens
+    # (both see ``old_token is None``, the loser overwrites the winner). The
+    # ordinary tail therefore confirms its no-retire basis against the COMMITTED
+    # token under the lock and re-dispatches as a rotation if it moved.
+    for _ in range(_MAX_SIGN_IN_SHAPE_ATTEMPTS):
+        if old_token is not None and old_token != body.auth_token:
+            # ROTATION: the stored token VALUE is changing (issue #374). Replace
+            # it inside the same locked boundary ADR-0026 built for every secret
+            # mutation. ``reread_retiring`` re-derives the retiring value fresh
+            # under the lock; ``incoming_values`` masks the new token in-flight;
+            # the boundary reads the rest of the transition set itself. Sign-in
+            # fails CLOSED: any rewrite/commit failure rolls back the token
+            # write, the session mint, and the historical rewrite together, and
+            # cookies are set only after the boundary commits.
+            async with secret_rotation(
+                session,
+                request,
+                retiring_values=frozenset({old_token}),
+                incoming_values=frozenset({body.auth_token}),
+                reread_retiring=_reread_retiring_token,
+                # The pre-init claim path stays in the body below: it performs
+                # only local DB work (no live probe), so it cannot hold the
+                # writer lock against a slow network peer the way the post-init
+                # recompute can. ``_recompute_access_in_lock`` (facet 4) is
+                # shared with the ordinary path.
+                pre_rewrite=_recompute_access_in_lock if initialized else None,
+                on_committed=_close_demoted_streams,
+            ):
+                # The boundary's in-lock rollback DISCARDED every pre-entry row
+                # write; re-stage all of them so they commit atomically with the
+                # historical rewrite and the session mint. (Access was already
+                # recomputed under the lock by ``_recompute_access_in_lock``.)
+                if not initialized:
+                    is_admin = await _claim_or_resume_setup(session, account, resources)
+                await SettingsStore(session).set_if_absent(_CLIENT_ID_SETTING, client_identifier)
+                # Re-read the user row fresh (raises loudly if it went transient
+                # rather than silently dropping the writes). ``previous_permissions``
+                # is this user's committed authority BEFORE this sign-in; the
+                # demotion flag is recomputed from the freshly-decided permissions
+                # so a downgrade decided under the lock still closes streams
+                # post-commit.
+                await session.refresh(user)
+                previous_permissions = user.permissions
+                new_permissions = 1 if is_admin else 0
+                demoted = new_permissions < previous_permissions
+                _apply_signin_fields(
+                    user, account, permissions=new_permissions, token=body.auth_token
+                )
+                staged = _stage_browser_session(session, user_id=user.id)
+                # Deterministically flush the staged token so the boundary's
+                # fresh post-yield ``secret_values()`` read narrows to the NEW
+                # value.
+                await session.flush()
+            # The demoted-stream close already ran inside the boundary
+            # (``on_committed``); only response construction remains out here.
+            _set_session_cookies(
+                response,
+                request=request,
+                session_token=staged.raw_token,
+                csrf_token=staged.csrf_token,
+                expires_at=staged.expires_at,
+            )
+            break
+
+        # ORDINARY candidate (``old_token`` is None or already equals the
+        # submitted token): a re-sign-in with the IDENTICAL token or a FIRST-EVER
+        # token. No value is being retired, so this owes no historical rewrite
+        # and never enters the ``secret_rotation`` boundary.
+        if not initialized:
+            # Pre-init: no repoint can race the first-owner claim (repointing is
+            # a post-init admin action), and the claim CAS already serializes
+            # concurrent first sign-ins -- keep the lockless mint.
+            _apply_signin_fields(
+                user, account, permissions=staged_permissions, token=body.auth_token
+            )
+            await _issue_browser_session(session, response, request=request, user_id=user.id)
+            _close_demoted_streams()
+            break
+
+        # Post-init ordinary: mint under the SAME lock a repoint holds across its
+        # revoke+commit+generation-bump (issue #400). The EXPENSIVE access
+        # decision stayed lockless above; only this brief tail runs under the
+        # lock. End the pre-lock transaction FIRST, driven to completion so a
+        # client-disconnect cancellation can neither tear the rollback's DB op
+        # mid-flight nor race ``get_session``'s scope closing the session under
+        # it (issue #400 round-2 finding 2 -- the shared boundary helper), and so
+        # no held writer awaits the lock a drain tick may hold and need to write.
+        await rollback_to_completion(session)
+        # Drop the pre-lock identity map too: the discarded optimistic
+        # ``_upsert_user`` object shares this account's primary key with the row
+        # the fresh in-lock reads below load, and a lingering stale copy would
+        # collide in the identity map (SAWarning, replaced-on-flush). Expunging
+        # after the rollback lets the locked tail read a truly clean slate.
+        session.expunge_all()
+        async with deps.secret_rotation_lock.value:
+            # Holding the lock, any repoint is either fully done (committed +
+            # bumped, lock released) or not yet started -- never mid-flight under
+            # us. Confirm the no-retire classification against the COMMITTED
+            # token (finding 1): a concurrent rotation may have committed a
+            # DIFFERENT value while we computed access lockless, and overwriting
+            # it here would retire it OUTSIDE the redaction protocol. If it
+            # moved, re-classify from the committed basis -- the next pass takes
+            # the rotation branch, which retires that value properly.
+            committed = await find_user_by_plex_id(session, account.plex_id)
+            if committed is not None:
+                committed_token = committed.encrypted_plex_token
+                if committed_token is not None and committed_token != body.auth_token:
+                    old_token = committed_token
+                    user = committed  # a persistent row the rotation branch can refresh
+                    continue
+            # Re-check the identity generation: a move means a repoint committed
+            # a new configured server while we computed access, so recompute
+            # against that fully-committed state (fails closed on lost access;
+            # demotes on lost ownership). No move means our mint serializes
+            # before any later repoint's revoke sweep, which then revokes our
+            # just-minted session like any other.
+            if deps.plex_identity_generation.value != identity_generation:
+                await _recompute_access_in_lock()
+            # Re-stage everything the pre-lock rollback discarded, in the lock's
+            # fresh transaction: the client identifier (create-once idempotent)
+            # and the user row + demotion flag re-derived from the (possibly
+            # recomputed) access decision.
             await SettingsStore(session).set_if_absent(_CLIENT_ID_SETTING, client_identifier)
-            # Re-read the user row fresh (raises loudly if it went transient
-            # rather than silently dropping the writes). ``previous_permissions``
-            # is this user's committed authority BEFORE this sign-in; the
-            # demotion flag is recomputed from the freshly-decided permissions so
-            # a downgrade decided under the lock still closes streams post-commit.
-            await session.refresh(user)
-            previous_permissions = user.permissions
-            new_permissions = 1 if is_admin else 0
-            demoted = new_permissions < previous_permissions
-            _apply_signin_fields(user, account, permissions=new_permissions, token=body.auth_token)
-            staged = _stage_browser_session(session, user_id=user.id)
-            # Deterministically flush the staged token so the boundary's fresh
-            # post-yield ``secret_values()`` read narrows to the NEW value.
-            await session.flush()
-        # The demoted-stream close already ran inside the boundary
-        # (``on_committed``); only response construction remains out here.
-        _set_session_cookies(
-            response,
-            request=request,
-            session_token=staged.raw_token,
-            csrf_token=staged.csrf_token,
-            expires_at=staged.expires_at,
+            user, demoted = await _upsert_user(
+                session,
+                account_id=account.plex_id,
+                username=account.username,
+                is_admin=is_admin,
+            )
+            _apply_signin_fields(user, account, permissions=user.permissions, token=body.auth_token)
+            await _issue_browser_session(session, response, request=request, user_id=user.id)
+        # Post-commit (``expire_on_commit=False`` keeps ``user``/``demoted``
+        # live): close the demoted user's realtime streams AFTER the downgrade is
+        # durable so no reconnect re-reads the old admin permissions.
+        _close_demoted_streams()
+        break
+    else:
+        # The stored token changed under us on every attempt (a pathological,
+        # endlessly-racing store): fail CLOSED rather than spin or risk an
+        # unredacted overwrite. The account's existing session/credential is
+        # untouched; the client can simply retry.
+        raise AppError(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="sign_in_retry_exhausted",
+            message="Sign-in kept racing a credential change. Please try again.",
+            hint="Retry the sign-in in a moment.",
         )
     return _me_response(
         AuthContext(

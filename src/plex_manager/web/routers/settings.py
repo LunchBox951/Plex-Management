@@ -119,7 +119,7 @@ from plex_manager.web.setup_validation import (
     library_options,
 )
 
-__all__ = ["router", "secret_rotation"]
+__all__ = ["rollback_to_completion", "router", "secret_rotation"]
 
 _logger = logging.getLogger(__name__)
 
@@ -300,6 +300,14 @@ async def _rollback_to_completion(session: AsyncSession) -> None:
         raise rollback_error
     if pending_cancel is not None:
         raise pending_cancel
+
+
+# Public alias (same idiom as ``deps.api_key_header``) so the sign-in endpoint
+# can SHARE this cancellation-safe rollback rather than copy its
+# remember-and-re-raise protocol: ``routers/auth.py`` drives its pre-lock
+# transaction to completion this way before acquiring ``secret_rotation_lock``
+# for the ordinary #400 mint tail (issue #400 round-2 finding 2).
+rollback_to_completion = _rollback_to_completion
 
 
 async def _commit_and_complete(
@@ -1617,6 +1625,24 @@ async def put_settings_endpoint(
             ``plex_identity_changed`` at CALL time, after ``write_settings``
             has populated them.
             """
+            # Bump the process-local plex-identity generation AFTER the repoint's
+            # revoke+machine-id write is durably committed, and (on the boundary
+            # path) while ``secret_rotation_lock`` is still held (issue #400). An
+            # ordinary sign-in re-checks this counter inside the SAME lock right
+            # before it mints: bumping only post-commit-under-lock means a sign-in
+            # that observes the move recomputes against fully-committed state,
+            # and a sign-in that does not observe it necessarily committed its
+            # session BEFORE this revoke ran (both hold the lock, mutually
+            # exclusively), so the sweep above catches that session. Bumping
+            # BEFORE the commit would reopen the window where a sign-in reads
+            # pre-commit state under a moved counter, or commits a stale session
+            # after the sweep. Gated to the verified-repoint shape (a new machine
+            # id + the session sweep) -- the only case that always routes through
+            # the boundary and so always runs this under the lock; an unverifiable
+            # clear neither sweeps sessions nor needs the signal.
+            if plex_identity_changed and machine_identifier is not None:
+                deps.plex_identity_generation.value += 1
+
             # A long configured interval must not postpone an enable/shorten
             # change -- nor a Plex identity change's snapshot cleanup -- until
             # the old sleep expires. BOTH identity-change shapes need the
@@ -1676,7 +1702,24 @@ async def put_settings_endpoint(
                     reason="settings_updated",
                 )
 
-        if changing_secret_fields:
+        # A Plex identity change routes through the SAME boundary even when no
+        # secret field is changing (issue #400 / the codex residual on PR #399):
+        # a URL-only repoint bumps the identity generation and sweeps sessions,
+        # so it must serialize on ``secret_rotation_lock`` with the in-lock
+        # access recompute a token-rotation sign-in performs -- otherwise a
+        # URL-only repoint could still interleave with such a sign-in exactly
+        # where a secret-changing repoint no longer can. With
+        # ``changing_secret_fields`` empty the boundary's ``retiring_values`` and
+        # ``incoming_values`` are both empty frozensets: the historical rewrite
+        # is a no-op (``_rewrite_before_secret_replacement`` returns early on an
+        # empty set), and the begin/complete redaction cycle widens the capture
+        # snapshot to the CURRENT ``secret_values()`` and narrows it right back
+        # to the same set with an empty (floorless-no-op) retiring set -- the
+        # handler's redaction state is left exactly as found while the
+        # post-commit completion sweep and ``on_committed`` still run. The lock,
+        # the fresh post-rollback transaction, and the protected commit are what
+        # this entry is for on the identity-only path.
+        if changing_secret_fields or plex_identity_changed:
             async with secret_rotation(
                 session,
                 request,
