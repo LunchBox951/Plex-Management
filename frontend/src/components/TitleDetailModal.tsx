@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   useAuthMe,
   useCancelRequest,
@@ -625,12 +625,15 @@ export function TitleDetailModal({
   const titleKey = title ? `${title.media_type}:${title.tmdb_id}` : null
   // Always-current title key, read by async handlers after an await to discard
   // results that belong to a title the modal has since moved on from. Written
-  // from an effect rather than during render itself (react-hooks/refs: ref
-  // writes must happen outside render) -- effects run after every commit, well
-  // before any awaited async handler can resume, so this is the same "always
-  // current by the time an async handler checks it" guarantee as before.
+  // from a LAYOUT effect rather than during render itself (react-hooks/refs:
+  // ref writes must happen outside render). It must be useLayoutEffect, not
+  // useEffect: layout effects run synchronously inside the commit, so no
+  // microtask (a settling request/re-acquire promise for the PREVIOUS title)
+  // can observe the new commit with the old key still in the ref -- a passive
+  // effect would leave exactly that gap and let title A's settled handler
+  // pass the guard and write A's state onto title B.
   const latestTitleKey = useRef(titleKey)
-  useEffect(() => {
+  useLayoutEffect(() => {
     latestTitleKey.current = titleKey
   })
 
