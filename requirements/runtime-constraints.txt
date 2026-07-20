@@ -11,7 +11,7 @@ certifi==2026.6.17
 cffi==2.1.0
 click==8.4.2
 cryptography==49.0.0
-fastapi==0.139.0
+fastapi==0.139.2
 greenlet==3.5.3
 guessit==4.1.0
 h11==0.16.0
@@ -30,4 +30,4 @@ typing-inspection==0.4.2
 uvicorn==0.51.0
 uvloop==0.22.1
 watchfiles==1.2.0
-websockets==16.1
+websockets==16.1.1
