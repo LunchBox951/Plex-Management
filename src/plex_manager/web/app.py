@@ -1668,6 +1668,20 @@ async def _await_background_tasks_shutdown(
                 timeout_seconds,
             )
 
+        # ``asyncio.wait`` bounded the first wait, but returning with purge
+        # settlement tasks still pending only postpones the hang: ``asyncio.run``
+        # cancels and gathers every remaining task before closing the loop. Wake
+        # ALL active settlements process-wide, not merely those nested under the
+        # six app-owned tasks, so uvicorn request/protocol tasks blocked in
+        # report-issue purges are covered too. Resolving the settlement future
+        # makes each shield loop unwind; this second wait is intentionally short
+        # and bounded because its only remaining work is coroutine cleanup, never
+        # filesystem I/O (the daemon delete workers stay abandonable).
+        settlement_tasks = purge_service.active_settlement_tasks()
+        purge_service.abandon_active_settlements()
+        if settlement_tasks:
+            await asyncio.wait(settlement_tasks, timeout=0.5)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:

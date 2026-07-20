@@ -39,11 +39,15 @@ class _BlockedDeleteFileSystem(LocalFileSystem):
         super().__init__([str(root)])
         self.started = threading.Event()
         self.release = threading.Event()
+        self.finished = threading.Event()
 
     def delete(self, path: str) -> None:
         self.started.set()
         self.release.wait(timeout=5)
-        super().delete(path)
+        try:
+            super().delete(path)
+        finally:
+            self.finished.set()
 
 
 async def _purge_worker(fs: LocalFileSystem, path: str) -> None:
@@ -103,16 +107,15 @@ async def test_delete_runs_on_a_daemon_thread_the_interpreter_cannot_rejoin(
     assert purge_service.active_purge_paths() == ()
 
 
-async def test_a_hung_shielded_delete_times_out_and_names_the_stuck_path(
+async def test_a_hung_shielded_delete_timeout_finishes_the_settlement_task(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The scenario issue #401 exists for: an eviction delete stuck on a dead
     mount at shutdown time must not hang the wait forever. The bound trips,
-    the still-active purge path is named in the warning (honesty over
-    silence), and the coroutine returns so shutdown can proceed -- the stuck
-    worker thread is abandoned, not killed (only the OS reclaims it on
-    process exit; #395's shielding semantics for the task itself are
-    unchanged -- it is still running, uncancelled, when this returns)."""
+    names the still-active purge path, signals the settlement loop to abandon
+    its daemon worker, and does not return until the cancelled task has really
+    finished. The filesystem thread may still be blocked, but no pending task
+    remains for ``asyncio.run`` teardown to gather forever."""
     target = tmp_path / "movies" / "Stuck Movie.mkv"
     target.parent.mkdir()
     target.write_bytes(b"x")
@@ -135,25 +138,79 @@ async def test_a_hung_shielded_delete_times_out_and_names_the_stuck_path(
 
         assert "shutdown timed out" in caplog.text
         assert os.path.abspath(os.path.normpath(str(target))) in caplog.text
-        # The bound is on THIS wait only -- the shielded task itself keeps
-        # running, exactly as #395 requires (never killed out from under a
-        # still-mutating delete).
-        assert not task.done()
-        assert purge_service.active_purge_paths() == (
-            os.path.abspath(os.path.normpath(str(target))),
-        )
+        assert "purge settlement abandoned" in caplog.text
+        assert task.done()
+        assert task.cancelled()
+        assert not fs.finished.is_set()
+        assert purge_service.active_purge_paths() == ()
     finally:
-        # Let the stuck delete genuinely finish so the worker thread and the
-        # module-level purge registry don't leak into a later test. Once it
-        # settles, ``_delete_to_settlement`` honours the earlier cancellation
-        # (PR #395's "cancellation wins once settled" contract) and raises
-        # ``CancelledError`` out of the task -- expected, not a failure; see
-        # ``tests.services.test_purge_service``'s identical cleanup pattern.
+        # The settlement coroutine and registry are already finished; release
+        # only the test's daemon worker so it does not linger across tests.
         fs.release.set()
-        # Once settled, ``_delete_to_settlement`` honours the earlier
-        # cancellation, so the task's outcome IS a CancelledError -- assert
-        # that contract (which also gives this await an effect CodeQL can
-        # see) rather than merely suppressing it.
-        (outcome,) = await asyncio.gather(task, return_exceptions=True)
-        assert isinstance(outcome, asyncio.CancelledError)
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
     assert purge_service.active_purge_paths() == ()
+
+
+async def test_timeout_unblocks_request_scoped_settlement(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P1-b: a protocol/request task is not one of lifespan's six tasks, but
+    it uses the same settlement loop and therefore must observe the process-
+    wide abandon signal raised when the background-task bound expires."""
+    target = tmp_path / "movies" / "Reported Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+
+    request_task = asyncio.create_task(_purge_worker(fs, str(target)))
+    timeout_trigger = asyncio.create_task(asyncio.sleep(1000))
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        request_task.cancel()
+        await asyncio.sleep(0)
+        assert not request_task.done()
+
+        with caplog.at_level(logging.WARNING):
+            await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+                (timeout_trigger,), timeout_seconds=0.05
+            )
+
+        (outcome,) = await asyncio.wait_for(
+            asyncio.gather(request_task, return_exceptions=True), timeout=0.5
+        )
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert not fs.finished.is_set()
+        assert purge_service.active_purge_paths() == ()
+    finally:
+        timeout_trigger.cancel()
+        await asyncio.gather(timeout_trigger, return_exceptions=True)
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
+async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daemon worker may finish after settlement abandonment and loop close.
+    Its narrow late-delivery guard must absorb only that expected closed-loop
+    RuntimeError rather than surfacing an unhandled thread exception."""
+    target = tmp_path / "movies" / "Late Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+    loop = asyncio.get_running_loop()
+    delivered = threading.Event()
+
+    def _closed_loop_delivery(*_args: object) -> None:
+        delivered.set()
+        raise RuntimeError("Event loop is closed")
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", _closed_loop_delivery)
+    monkeypatch.setattr(loop, "is_closed", lambda: True)
+    purge_service._run_delete_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
+        fs, str(target)
+    )
+    assert fs.started.wait(timeout=2.0)
+    fs.release.set()
+    assert fs.finished.wait(timeout=2.0)
+    assert delivered.wait(timeout=2.0)
