@@ -131,9 +131,11 @@ Generate its private app-to-updater credential once and keep the source path in
 `.env` so later Compose recreations use the same secret:
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))" > .plex-manager-updater-token
-chmod 600 .plex-manager-updater-token
+python -c "import secrets; print(secrets.token_urlsafe(32))" | sudo install -o 10001 -g 0 -m 440 /dev/stdin .plex-manager-updater-token
 ```
+
+Compose file secrets preserve the host file's ownership and mode: root-owned `600`
+would leave the app (uid 10001) and cap-dropped root updater unable to read it.
 
 Then uncomment this existing line in `.env`:
 
