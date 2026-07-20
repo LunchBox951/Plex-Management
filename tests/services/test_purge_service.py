@@ -187,6 +187,69 @@ async def test_delete_to_settlement_propagates_a_worker_oserror_when_not_cancell
     assert target.exists()
 
 
+async def test_hold_registration_is_not_leaked_when_cancellation_is_delivered_after_worker_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #421 follow-up: a done-callback attached directly to the raw
+    delete worker future, deciding hold-vs-release from ``calling_task.
+    cancelling()`` at the moment the worker settles, can observe ``0`` and
+    decide to hold the registration -- only for ``Task.cancel()`` to be
+    called a moment later, AFTER that callback already ran but BEFORE the
+    awaiting coroutine has actually resumed. ``asyncio.shield``'s wrapping
+    future is still pending at that instant, so ``Task.cancel()`` succeeds
+    immediately (no ``_must_cancel`` fallback needed) and the coroutine is
+    handed ``CancelledError`` on its very next step -- after a premature
+    callback already decided "hold". This reproduces that exact interleaving
+    against a worker future under full test control (so the ordering is
+    deterministic rather than luck-of-the-scheduler) and asserts the
+    registration is released, not permanently leaked, despite it.
+    """
+    target = tmp_path / "movies" / "Raced Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem(library_roots=[str(target.parent)])
+    loop = asyncio.get_running_loop()
+    worker: asyncio.Future[None] = loop.create_future()
+    reached_delete = asyncio.Event()
+
+    def _fake_run_delete_on_abandonable_thread(
+        _fs: LocalFileSystem, _library_path: str
+    ) -> asyncio.Future[None]:
+        reached_delete.set()
+        return worker
+
+    monkeypatch.setattr(
+        purge_service,
+        "_run_delete_on_abandonable_thread",
+        _fake_run_delete_on_abandonable_thread,
+    )
+
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+    )
+    await asyncio.wait_for(reached_delete.wait(), timeout=2.0)
+    assert not purge_task.done()
+    # Registered from the moment purge_library_path started.
+    assert purge_service.begin_placement(str(target)) is False
+
+    # The exact race: the worker settles -- scheduling its done-callback(s)
+    # for the loop's NEXT iteration -- and only THEN, one turn later (after
+    # those callbacks have already executed, but before the shielded
+    # coroutine has resumed), is the caller cancelled.
+    worker.set_result(None)
+    await asyncio.sleep(0)
+    purge_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await purge_task
+
+    # The registration must be released -- not left dangling forever --
+    # even though the (would-be) premature callback ran while
+    # ``cancelling()`` still read 0.
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
 async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path) -> None:
     # The root-guard rejection: a breadcrumb resolving OUTSIDE the configured roots
     # must be refused, never deleted -- the load-bearing safety guard.
