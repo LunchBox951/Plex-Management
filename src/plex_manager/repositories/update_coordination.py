@@ -449,21 +449,42 @@ class SqlUpdateCoordinationRepository:
         if state.phase not in _KNOWN_COORDINATOR_PHASES:
             raise UnknownCoordinatorPhaseError(state.phase)
         # Backfill the legacy busy-row anchor BEFORE this call's own liveness
-        # write, under the SAME lock -- mirroring the lock -> backfill ->
-        # refresh ordering ``snapshot()``/``force_reset_phase()`` already use
-        # (issue #387). ``_backfill_legacy_busy_anchor``'s heartbeat fallback
-        # reads ``updater_last_seen_at``; every caller of ``touch_updater``
-        # (eligibility's liveness touch, the phase-less heartbeat, a
-        # same-phase CAS heartbeat) chains straight into a ``snapshot()``
-        # afterward, so writing the fresh heartbeat first would make that
-        # later backfill anchor to THIS call's own poll time instead of the
-        # true stale heartbeat -- costing a legacy pre-anchor row one full
-        # ``COORDINATOR_RECOVERY_MAX_AGE`` window before force-reset is
-        # allowed. A genuine phase transition (``resulting_phase`` below)
-        # still unconditionally re-anchors to ``now`` afterward, same as
-        # always -- that IS a real work-start event, not a passive touch.
+        # write, under the SAME lock (issue #387). ``_backfill_legacy_busy_
+        # anchor``'s heartbeat fallback reads ``updater_last_seen_at``; every
+        # caller of ``touch_updater`` (eligibility's liveness touch, the
+        # phase-less heartbeat, a same-phase CAS heartbeat) chains straight
+        # into a ``snapshot()`` afterward, so writing the fresh heartbeat
+        # first would make that later backfill anchor to THIS call's own poll
+        # time instead of the true stale heartbeat -- costing a legacy
+        # pre-anchor row one full ``COORDINATOR_RECOVERY_MAX_AGE`` window
+        # before force-reset is allowed. A genuine phase transition
+        # (``resulting_phase`` below) still unconditionally re-anchors to
+        # ``now`` afterward, same as always -- that IS a real work-start
+        # event, not a passive touch.
+        #
+        # No ``session.refresh(state)`` after the backfill (issue #403 audit,
+        # unlike ``snapshot()``/``force_reset_phase()`` which do refresh):
+        # provably unnecessary here, not just unread. ``_backfill_legacy_
+        # busy_anchor``'s ``.values()`` only ever sets ``last_started_at``/
+        # ``updated_at`` -- it never writes ``phase``, which is the only
+        # ``state`` attribute read below. And because that UPDATE's WHERE
+        # clause (plain ``==``/``IS NULL`` comparisons) is Python-evaluable,
+        # SQLAlchemy's default ``synchronize_session="auto"`` picks the
+        # "evaluate" strategy and applies the ``.values()`` directly to this
+        # already-locked, identity-mapped ``state`` object -- confirmed
+        # empirically by
+        # ``tests/services/test_update_coordination_service.py::
+        # test_touch_updater_backfill_write_is_visible_without_refresh``,
+        # which reads ``last_started_at`` off this same in-session object
+        # with no explicit refresh and cross-checks it against an
+        # independent column-only SELECT, for both the untouched ``phase``
+        # and the backfill-mutated ``last_started_at``. If this WHERE clause
+        # is ever changed to something SQLAlchemy can't evaluate in Python,
+        # "auto" transparently falls back to "fetch", which expires (rather
+        # than refreshes) the matched columns on this object -- the very
+        # next attribute read below then triggers an implicit reload, so the
+        # invariant this comment documents still holds either way.
         await self._backfill_legacy_busy_anchor(state, now)
-        await self._session.refresh(state)
         resulting_phase = phase if phase is not None else state.phase
         values: dict[str, object] = {"updater_last_seen_at": now, "updated_at": now}
         values.update(self._phase_timestamp_values(state.phase, resulting_phase, now))
