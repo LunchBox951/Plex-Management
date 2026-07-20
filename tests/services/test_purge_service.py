@@ -108,8 +108,8 @@ class _BlockedGuardFileSystem(LocalFileSystem):
                     self.finished.set()
             self._after_guard(call_number)
 
-    def _after_guard(self, call_number: int) -> None:
-        del call_number
+    def _after_guard(self, _call_number: int) -> None:
+        pass
 
 
 class _FailingFirstBlockedGuardFileSystem(_BlockedGuardFileSystem):
@@ -211,7 +211,7 @@ async def test_abandonable_thread_worker_exception_releases_its_permit(
 
     fs.release.set()
     with pytest.raises(OSError, match="blocked guard failed"):
-        await first_task
+        _ = await first_task
     second_result = await asyncio.wait_for(second_task, timeout=2.0)
 
     assert second_result.outcome is PurgeOutcome.deleted
