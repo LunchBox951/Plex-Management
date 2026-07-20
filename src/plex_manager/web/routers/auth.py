@@ -68,7 +68,11 @@ from plex_manager.web.deps import (
 )
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import close_realtime_streams
-from plex_manager.web.routers.settings import rollback_to_completion, secret_rotation
+from plex_manager.web.routers.settings import (
+    commit_to_completion,
+    rollback_to_completion,
+    secret_rotation,
+)
 from plex_manager.web.schemas import (
     ActiveSessionsResponse,
     ActiveSessionUser,
@@ -146,6 +150,23 @@ async def plex_sign_in_endpoint(
     """
     _throttle_sign_in(request)
 
+    # Stamp the process-local plex-identity generation as the FIRST thing this
+    # endpoint does -- strictly BEFORE any DB read opens this session's snapshot
+    # (issue #400 finding P1-1). ORDERING CONSTRAINT: the stamp must precede the
+    # snapshot the access decision is computed against. Read it after the
+    # snapshot opened and a repoint committing+bumping in that gap would leave
+    # the stamp reflecting the POST-bump generation while the access decision
+    # still reads the OLD server from the pre-repoint snapshot -- the locked-tail
+    # re-check would then see the generation unchanged, skip the recompute, and
+    # mint a stale session after the repoint's sweep. Stamping first closes that
+    # skew: any bump not reflected in the decision's snapshot is a bump AFTER the
+    # stamp, so the locked-tail re-check observes it and recomputes. (In-memory
+    # read only; ``_throttle_sign_in`` above touches no DB.) The ordinary
+    # (no-rotation) path re-checks this stamp inside its brief lock section just
+    # before minting; the token-rotation path recomputes access in-lock via the
+    # boundary's ``pre_rewrite`` hook (facet 4) and needs no generation check.
+    identity_generation = deps.plex_identity_generation.value
+
     system = await load_system_settings(session)
     initialized = system is not None and system.initialized
     # The OPTIONAL pre-init hardening token (PLEX_MANAGER_SETUP_TOKEN) must gate the
@@ -162,22 +183,11 @@ async def plex_sign_in_endpoint(
     account = await plex_tv.fetch_account(body.auth_token)
     resources = await plex_tv.fetch_resources(body.auth_token)
 
-    # Stamp the process-local plex-identity generation BEFORE the access
-    # decision (issue #400). A repoint bumps this counter AFTER its
-    # revoke+machine-id commit is durable and while it still holds
-    # ``secret_rotation_lock`` (see ``routers/settings.py``). The ordinary
-    # (no-rotation) path re-checks this stamp INSIDE its own brief lock section
-    # just before minting: because both the repoint's bump and the sign-in's
-    # re-check happen under the one lock, a move seen there always reflects
-    # fully-committed repoint state (recompute against it), and a move NOT seen
-    # means the sign-in's mint serialized before the repoint's sweep (which then
-    # revokes the fresh session). The token-rotation path recomputes access
-    # in-lock via the boundary's ``pre_rewrite`` hook (facet 4) and needs no
-    # generation check -- the lock alone serializes it with the repoint.
-    identity_generation = deps.plex_identity_generation.value
-    # The pre-lock access decision. For the token-rotation path this is
-    # RECOMPUTED inside the boundary (facet 4 below); it is authoritative only
-    # for the ordinary, no-rotation path, which never waits on the lock.
+    # The pre-lock access decision, computed against the snapshot opened above.
+    # For the token-rotation path this is RECOMPUTED inside the boundary (facet 4
+    # below); it is authoritative only for the ordinary, no-rotation path, whose
+    # locked tail re-checks ``identity_generation`` (stamped before the snapshot)
+    # and recomputes if a repoint moved it.
     if not initialized:
         is_admin = await _claim_or_resume_setup(session, account, resources)
     else:
@@ -419,11 +429,23 @@ async def plex_sign_in_endpoint(
                 is_admin=is_admin,
             )
             _apply_signin_fields(user, account, permissions=user.permissions, token=body.auth_token)
-            await _issue_browser_session(session, response, request=request, user_id=user.id)
-        # Post-commit (``expire_on_commit=False`` keeps ``user``/``demoted``
-        # live): close the demoted user's realtime streams AFTER the downgrade is
-        # durable so no reconnect re-reads the old admin permissions.
-        _close_demoted_streams()
+            staged = _stage_browser_session(session, user_id=user.id)
+            # Drive the mint commit to completion UNDER the lock (issue #400
+            # finding P1-2), the lockless-tail analogue of the rotation boundary's
+            # shielded commit unit: a disconnect landing mid-commit must let the
+            # insert land durably (so a queued repoint's revoke sweep sees this
+            # session) or fully roll back -- never a post-release landing that
+            # escapes the sweep. ``on_committed`` closes a demoted user's streams
+            # post-commit, before any remembered cancellation is honored, matching
+            # the rotation branch's ordering (issue #183).
+            await commit_to_completion(session, on_committed=_close_demoted_streams)
+            _set_session_cookies(
+                response,
+                request=request,
+                session_token=staged.raw_token,
+                csrf_token=staged.csrf_token,
+                expires_at=staged.expires_at,
+            )
         break
     else:
         # The stored token changed under us on every attempt (a pathological,

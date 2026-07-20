@@ -20,7 +20,7 @@ import json
 import logging
 import re
 import secrets
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
@@ -119,7 +119,7 @@ from plex_manager.web.setup_validation import (
     library_options,
 )
 
-__all__ = ["rollback_to_completion", "router", "secret_rotation"]
+__all__ = ["commit_to_completion", "rollback_to_completion", "router", "secret_rotation"]
 
 _logger = logging.getLogger(__name__)
 
@@ -261,35 +261,47 @@ async def _cancellation_checkpoint() -> None:
     await asyncio.sleep(0)
 
 
+async def _drive_to_completion(
+    operation: Coroutine[Any, Any, None], *, label: str
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Run ``operation`` (a rollback or commit coroutine) to completion even
+    across request cancellation, returning ``(operation_error, pending_cancel)``.
+
+    ``asyncio.shield`` alone keeps the operation RUNNING but re-raises the
+    ``CancelledError`` to this frame immediately (codex #399 round 4): the
+    cancelled request then unwinds out of the endpoint and ``get_session``'s
+    dependency scope closes the very session the still-running op is using -- a
+    close/op race on the underlying aiosqlite connection in exactly the
+    write-lock cancellation path the shielding exists to protect. So the op runs
+    as a task AWAITED TO COMPLETION: a cancellation delivered while waiting is
+    remembered (never propagated into the op) and returned for the caller to
+    honor once the task settles. ``asyncio.wait`` -- not ``shield`` -- observes
+    completion without retrieving the outcome, the single-consumer discipline
+    the commit unit in :func:`secret_rotation` also uses. The caller decides how
+    to order the operation error against the remembered cancellation.
+    """
+    task = asyncio.ensure_future(operation)
+    pending_cancel: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as exc:
+            pending_cancel = exc
+    _ = label  # reserved for caller-side error messages; kept for a uniform call shape
+    return task.exception(), pending_cancel
+
+
 async def _rollback_to_completion(session: AsyncSession) -> None:
     """Run ``session.rollback()`` to completion even across request cancellation.
 
-    ``asyncio.shield`` alone keeps the rollback RUNNING but re-raises the
-    ``CancelledError`` to this frame immediately (codex #399 round 4): the
-    cancelled request then unwinds out of the endpoint and ``get_session``'s
-    dependency scope closes the very session the still-running rollback is
-    using -- a close/rollback race on the underlying aiosqlite connection in
-    exactly the write-lock cancellation path the shielding exists to protect.
-    So every rollback in the boundary instead runs as a task that is AWAITED
-    TO COMPLETION: a cancellation delivered while waiting is remembered and
-    re-raised only after the task settles (the same remember-and-re-raise
-    protocol as the commit unit in :func:`secret_rotation`, including
-    cancellation winning over a rollback failure with the failure logged and
-    chained), so the session never leaves this frame with a DB op still in
-    flight.
+    Delegates the remember-and-re-raise loop to :func:`_drive_to_completion`;
+    a rollback FAILURE with the request also cancelled logs the failure and lets
+    the cancellation win the re-raise (chained), so the session never leaves this
+    frame with a DB op still in flight.
     """
-    rollback_task = asyncio.ensure_future(session.rollback())
-    pending_cancel: asyncio.CancelledError | None = None
-    while not rollback_task.done():
-        try:
-            # ``asyncio.wait`` -- not ``shield`` -- for the same single-consumer
-            # reason as the commit unit: observe completion without retrieving
-            # the outcome, absorb the request's cancellation without ever
-            # cancelling the rollback itself.
-            await asyncio.wait({rollback_task})
-        except asyncio.CancelledError as exc:
-            pending_cancel = exc
-    rollback_error = rollback_task.exception()
+    rollback_error, pending_cancel = await _drive_to_completion(
+        session.rollback(), label="rollback"
+    )
     if rollback_error is not None:
         if pending_cancel is not None:
             _logger.error(
@@ -302,18 +314,63 @@ async def _rollback_to_completion(session: AsyncSession) -> None:
         raise pending_cancel
 
 
-# Public alias (same idiom as ``deps.api_key_header``) so the sign-in endpoint
-# can SHARE this cancellation-safe rollback rather than copy its
+async def _commit_to_completion(
+    session: AsyncSession, *, on_committed: Callable[[], None] | None = None
+) -> None:
+    """Drive ``session.commit()`` to completion under a caller-held lock (issue
+    #400 round-3 finding P1-2): the ordinary sign-in tail commits its mint while
+    holding ``secret_rotation_lock``, and a disconnect landing mid-commit must
+    let the insert land DURABLY (so a queued repoint's revoke sweep sees the
+    session) or fully roll back -- never a post-release landing that escapes the
+    sweep. The lockless-tail analogue of :func:`secret_rotation`'s shielded
+    commit unit: the cancellation is remembered, the commit settles, then (on
+    success) the synchronous ``on_committed`` runs BEFORE the cancellation is
+    honored -- so a committed downgrade still closes its streams. On commit
+    FAILURE the transaction is rolled back to completion first (the same
+    both-happened chaining the boundary uses) so nothing durable is left behind.
+    """
+    commit_error, pending_cancel = await _drive_to_completion(session.commit(), label="commit")
+    if commit_error is not None:
+        # Commit failed: nothing durable landed. Roll back to completion before
+        # surfacing the failure, so a client disconnect during that rollback
+        # cannot leave the transaction in flight or bury the real cause.
+        try:
+            await _rollback_to_completion(session)
+        except asyncio.CancelledError as exc:
+            _logger.error(
+                "session commit failed while the request was being cancelled",
+                exc_info=commit_error,
+            )
+            raise exc from commit_error
+        except Exception as rollback_error:
+            raise commit_error from rollback_error
+        if pending_cancel is not None:
+            _logger.error(
+                "session commit failed while the request was being cancelled",
+                exc_info=commit_error,
+            )
+            raise pending_cancel from commit_error
+        raise commit_error
+    if on_committed is not None:
+        on_committed()
+    if pending_cancel is not None:
+        raise pending_cancel
+
+
+# Public aliases (same idiom as ``deps.api_key_header``) so the sign-in endpoint
+# can SHARE these cancellation-safe helpers rather than copy the
 # remember-and-re-raise protocol: ``routers/auth.py`` drives its pre-lock
-# transaction to completion this way before acquiring ``secret_rotation_lock``
-# for the ordinary #400 mint tail (issue #400 round-2 finding 2).
+# transaction to completion with ``rollback_to_completion`` before acquiring
+# ``secret_rotation_lock`` (issue #400 round-2 finding 2), and shields its
+# in-lock mint commit with ``commit_to_completion`` (round-3 finding P1-2).
 rollback_to_completion = _rollback_to_completion
+commit_to_completion = _commit_to_completion
 
 
 async def _commit_and_complete(
     session: AsyncSession,
     handler: LogCaptureHandler,
-    previous_values: frozenset[str],
+    previous_values: frozenset[str] | None,
     *,
     retiring_values: frozenset[str],
 ) -> None:
@@ -329,7 +386,16 @@ async def _commit_and_complete(
     and "retired value swept from the live surfaces". A commit FAILURE propagates
     to the caller, which rolls back and restores the snapshot exactly like a
     pre-commit failure -- nothing durable landed, so the sweep must NOT run.
+
+    ``previous_values is None`` marks a NON-redacting boundary entry (empty
+    retiring+incoming -- e.g. a URL-only Plex repoint, issue #400 finding P2-1):
+    there is nothing to redact, so this commits WITHOUT the ``secret_values()``
+    decrypt or the completion sweep. Skipping the decrypt is the point -- it must
+    not 500 on an unrelated undecryptable credential the repoint never touches.
     """
+    if previous_values is None:
+        await session.commit()
+        return
     current_values = await SettingsStore(session).secret_values()
     await session.commit()
     handler.complete_secret_rotation(
@@ -447,14 +513,27 @@ async def secret_rotation(
             await pre_rewrite()
         if reread_retiring is not None:
             retiring_values = await reread_retiring(session)
-        transition_values = (
-            (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
-        )
-        previous_values = handler.begin_secret_rotation(
-            transition_values, retiring_values=retiring_values
-        )
+        # (P2-1) With nothing leaving or entering the secret set -- a URL-only
+        # Plex identity change enters this boundary with both sets empty (issue
+        # #400) -- there is nothing to redact, so SKIP the whole redaction cycle:
+        # no ``secret_values()`` decrypt (which would 500 on an unrelated
+        # undecryptable credential the repoint never touches, codex #382), no
+        # capture-snapshot widen, no historical rewrite, and no completion sweep.
+        # The lock, the fresh post-lock transaction, the ``pre_rewrite`` hook and
+        # the shielded commit + ``on_committed`` all still run -- ``previous_values
+        # is None`` signals the non-redacting shape to the commit unit below.
+        redacting = bool(retiring_values or incoming_values)
+        previous_values: frozenset[str] | None = None
+        if redacting:
+            transition_values = (
+                (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
+            )
+            previous_values = handler.begin_secret_rotation(
+                transition_values, retiring_values=retiring_values
+            )
         try:
-            await _rewrite_before_secret_replacement(session, retiring_values)
+            if redacting:
+                await _rewrite_before_secret_replacement(session, retiring_values)
             yield
             # POINT OF NO RETURN (codex #399 round 3). A cancellation already
             # pending against this request must land HERE, before the commit
@@ -475,7 +554,8 @@ async def secret_rotation(
             # aiosqlite rollback closes the connection and poisons the shared
             # boundary for the drain loop) nor left racing the dependency
             # scope's session close after this handler re-raises.
-            handler.abort_secret_rotation(previous_values)
+            if previous_values is not None:
+                handler.abort_secret_rotation(previous_values)
             await _rollback_to_completion(session)
             raise
         except Exception:
@@ -489,7 +569,8 @@ async def secret_rotation(
             # cancellation does arrive during the rollback, the helper
             # re-raises it only after the rollback settles, with this
             # failure chained as its ``__context__``.
-            handler.abort_secret_rotation(previous_values)
+            if previous_values is not None:
+                handler.abort_secret_rotation(previous_values)
             await _rollback_to_completion(session)
             raise
         # (c) Commit + completion sweep as one non-cancellable unit. A
@@ -540,7 +621,8 @@ async def secret_rotation(
             # cancellation is being re-raised at every await below (an anyio
             # cancel scope re-cancels each checkpoint until the request task
             # unwinds).
-            handler.abort_secret_rotation(previous_values)
+            if previous_values is not None:
+                handler.abort_secret_rotation(previous_values)
             if pending_cancel is None:
                 # Drive this rollback to completion too (codex #399 round 5):
                 # a client disconnect landing while a plain rollback awaited
@@ -1626,21 +1708,27 @@ async def put_settings_endpoint(
             has populated them.
             """
             # Bump the process-local plex-identity generation AFTER the repoint's
-            # revoke+machine-id write is durably committed, and (on the boundary
-            # path) while ``secret_rotation_lock`` is still held (issue #400). An
-            # ordinary sign-in re-checks this counter inside the SAME lock right
-            # before it mints: bumping only post-commit-under-lock means a sign-in
-            # that observes the move recomputes against fully-committed state,
-            # and a sign-in that does not observe it necessarily committed its
-            # session BEFORE this revoke ran (both hold the lock, mutually
-            # exclusively), so the sweep above catches that session. Bumping
-            # BEFORE the commit would reopen the window where a sign-in reads
-            # pre-commit state under a moved counter, or commits a stale session
-            # after the sweep. Gated to the verified-repoint shape (a new machine
-            # id + the session sweep) -- the only case that always routes through
-            # the boundary and so always runs this under the lock; an unverifiable
-            # clear neither sweeps sessions nor needs the signal.
-            if plex_identity_changed and machine_identifier is not None:
+            # machine-id write (+ any session sweep) is durably committed, and (on
+            # the boundary path) while ``secret_rotation_lock`` is still held
+            # (issue #400). An ordinary sign-in re-checks this counter inside the
+            # SAME lock right before it mints: bumping only post-commit-under-lock
+            # means a sign-in that observes the move recomputes against
+            # fully-committed state, and one that does not observe it necessarily
+            # committed its session BEFORE this ran (both hold the lock, mutually
+            # exclusively). Bumping BEFORE the commit would reopen the window where
+            # a sign-in reads pre-commit state under a moved counter, or commits a
+            # stale session after the sweep.
+            #
+            # Bump for BOTH identity-change shapes (issue #400 finding P2-2),
+            # including an unverifiable clear (``machine_identifier is None``): a
+            # clear drops the cached anchor and leaves the install unconfigured,
+            # so an in-flight ordinary sign-in must recompute and fail
+            # ``service_not_configured`` rather than mint against the now-cleared
+            # identity. Both shapes route through the boundary (``plex_identity_changed``),
+            # so this always runs under the lock. (A clear sweeps no sessions -- an
+            # incomplete identity mints none anyway -- but the signal is still owed
+            # to any sign-in that already passed its access decision.)
+            if plex_identity_changed:
                 deps.plex_identity_generation.value += 1
 
             # A long configured interval must not postpone an enable/shorten

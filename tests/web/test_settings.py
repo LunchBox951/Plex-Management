@@ -5536,7 +5536,7 @@ async def test_short_retired_secret_is_masked_despite_read_floor(
         assert old_value not in json.dumps(record.context)
 
 
-async def test_url_only_repoint_enters_boundary_without_disturbing_redaction_state(
+async def test_url_only_repoint_skips_secret_decrypt_for_empty_set_boundary(
     client: httpx.AsyncClient,
     app: FastAPI,
     seed: SeedFn,
@@ -5544,33 +5544,33 @@ async def test_url_only_repoint_enters_boundary_without_disturbing_redaction_sta
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A url-only repoint enters ``secret_rotation`` with EMPTY retiring/incoming
-    sets (issue #400 fix #1). That empty-set entry must be a clean no-op for the
-    capture handler's redaction state -- the begin/complete cycle widens the
-    snapshot to the CURRENT ``secret_values()`` and narrows it right back to the
-    same set with an empty (floorless-no-op) retiring set -- while STILL running
-    the post-commit completion sweep and the ``on_committed`` invalidations that a
-    disconnect-during-commit would otherwise skip. Anything else would corrupt
-    live redaction or drop a must-run invalidation on the identity-change path.
+    sets (issue #400 fix #1). P2-1: the empty-set entry must SKIP the boundary's
+    ``SettingsStore.secret_values()`` decrypt entirely -- an unrelated
+    undecryptable stored credential (codex #382) must not 500 a repoint that
+    touches no secret -- while still taking the lock, committing through the
+    shielded unit, running ``on_committed``, and leaving the capture handler's
+    redaction state untouched.
     """
     from plex_manager.web.routers import settings as settings_router
 
     await seed(initialized=True, app_api_key=_API_KEY)
     await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
     handler = log_capture_service.LogCaptureHandler()
-    async with sessionmaker_() as session:
-        current_secrets = await SettingsStore(session).secret_values()
-    handler.secret_values = current_secrets  # the true live redaction set
+    handler.secret_values = frozenset({"sentinel-redaction-value"})
     app.state.log_handler = handler
     await _use_transport(app, _repoint_transport(identity="NEW-MID"))
 
-    completed = {"called": False}
-    real_complete = handler.complete_secret_rotation
+    # ``secret_values()`` is the ONLY decrypt the boundary performs; make it raise
+    # exactly as an undecryptable stored credential would. With P2-1 the empty-set
+    # boundary never calls it, so the repoint must not 500. (The redacted response
+    # never calls it, so this scopes cleanly to the boundary's behavior.)
+    decrypt_calls = {"count": 0}
 
-    def spy_complete(*args: object, **kwargs: object) -> None:
-        completed["called"] = True
-        return real_complete(*args, **kwargs)  # type: ignore[arg-type]
+    async def exploding_secret_values(self: SettingsStore) -> frozenset[str]:
+        decrypt_calls["count"] += 1
+        raise RuntimeError("a stored credential could not be decrypted")
 
-    monkeypatch.setattr(handler, "complete_secret_rotation", spy_complete)
+    monkeypatch.setattr(SettingsStore, "secret_values", exploding_secret_values)
 
     published: list[str] = []
     real_publish = settings_router.publish_realtime
@@ -5587,13 +5587,11 @@ async def test_url_only_repoint_enters_boundary_without_disturbing_redaction_sta
         headers={"X-Api-Key": _API_KEY},
     )
 
-    assert put.status_code == 200
-    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # the repoint committed
-    # Redaction state untouched: the empty-set begin/complete round-trips to the
-    # SAME live secret set, never dropping or spuriously widening it.
-    assert handler.secret_values == current_secrets
+    assert put.status_code == 200  # no 500: the empty-set boundary never decrypted
+    assert decrypt_calls["count"] == 0  # secret_values() was skipped entirely
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"  # committed through the boundary
+    # The boundary never touched the handler (no begin/complete): redaction untouched.
+    assert handler.secret_values == frozenset({"sentinel-redaction-value"})
     assert handler.retiring_values == frozenset()
-    # The boundary still ran the post-commit completion sweep AND the on_committed
-    # invalidations (the settings/health realtime publish) after the commit.
-    assert completed["called"] is True
+    # ``on_committed`` still ran after the shielded commit (the settings publish).
     assert "settings_updated" in published

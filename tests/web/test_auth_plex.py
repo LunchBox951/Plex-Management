@@ -25,7 +25,7 @@ from typing import Literal
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.routing import APIRoute
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -470,10 +470,10 @@ async def test_sign_in_demotion_closes_streams_after_commit(
     subscription = get_event_hub(app).subscribe(auth_method="plex_session", user_id=user_id)
 
     order: list[str] = []
-    real_issue = auth_module._issue_browser_session  # pyright: ignore[reportPrivateUsage]
+    real_commit = AsyncSession.commit
 
-    async def spy_issue(*args: object, **kwargs: object) -> None:
-        await real_issue(*args, **kwargs)  # type: ignore[arg-type]
+    async def spy_commit(self: AsyncSession) -> None:
+        await real_commit(self)
         order.append("commit")
 
     real_close = auth_module.close_realtime_streams
@@ -482,7 +482,10 @@ async def test_sign_in_demotion_closes_streams_after_commit(
         order.append("close")
         real_close(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(auth_module, "_issue_browser_session", spy_issue)
+    # The post-init ordinary mint commits via ``commit_to_completion`` and closes
+    # the demoted user's streams through its ``on_committed`` hook, so the
+    # commit-before-close ordering holds by construction.
+    monkeypatch.setattr(AsyncSession, "commit", spy_commit)
     monkeypatch.setattr(auth_module, "close_realtime_streams", spy_close)
 
     # The SAME account signs in again with only SHARED access: admin -> non-admin.
@@ -2883,14 +2886,15 @@ async def test_repoint_uncommitted_blocks_ordinary_sign_in_until_it_recomputes(
     sessionmaker_: SessionMaker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Real interleaving (issue #400): a url-only repoint holds the boundary
-    UNCOMMITTED while an ordinary sign-in computes its (old-server) access
-    decision and reaches its own lock-acquire. The sign-in BLOCKS on the lock
-    until the repoint fully commits its new machine id + revoke sweep and bumps
-    the generation under the lock; only then does the sign-in acquire the lock,
-    observe the move, and recompute against the committed new server -- demoting
-    an account that lost ownership or failing CLOSED (403) for one that lost
-    access. The old design's fake-bump could never exercise this ordering."""
+    """Real interleaving (issue #400): a repoint holds the boundary while an
+    ordinary sign-in computes its (old-server) access decision and reaches its
+    own lock-acquire. The sign-in BLOCKS on the lock until the repoint fully
+    commits its new machine id + revoke sweep and bumps the generation under the
+    lock; only then does the sign-in acquire the lock, observe the move, and
+    recompute against the committed new server -- demoting an account that lost
+    ownership or failing CLOSED (403) for one that lost access. (The repoint also
+    rotates the service ``plex_token`` so the boundary runs its historical
+    rewrite, the deterministic in-boundary pause point held before any write.)"""
     _M2 = _OTHER_MACHINE_ID
     await _seed_ordinary_signin_and_repoint(seed, sessionmaker_)
     resources = [_owned_server(_MACHINE_ID)]
@@ -2901,14 +2905,17 @@ async def test_repoint_uncommitted_blocks_ordinary_sign_in_until_it_recomputes(
     )
     lock = _ObservableLock()
     monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
+    # Gate the historical rewrite: it runs under the lock in a READ-only
+    # transaction, BEFORE ``write_settings`` opens a writer -- holding the repoint
+    # mid-boundary without a write lock, so the ordinary sign-in's lockless reads
+    # (on the suite's shared single-connection SQLite) proceed and it blocks only
+    # on the boundary lock. Only the repoint enters the boundary here (the
+    # ordinary sign-in never does), so this pauses the repoint alone.
     real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
     repoint_in_boundary = asyncio.Event()
     release_repoint = asyncio.Event()
 
     async def gated_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
-        # Only the repoint enters the boundary here (the ordinary sign-in never
-        # does), so pausing unconditionally holds the repoint mid-boundary,
-        # uncommitted, still holding the lock.
         repoint_in_boundary.set()
         await _wait_for_event(release_repoint)
         return await real_rewrite(session, values)
@@ -2919,7 +2926,10 @@ async def test_repoint_uncommitted_blocks_ordinary_sign_in_until_it_recomputes(
     repoint = asyncio.create_task(
         client.put(
             "/api/v1/settings",
-            json={"plex_url": "http://new:32400", "plex_token": _SVC_TOKEN},
+            json={
+                "plex_url": "http://new:32400",
+                "plex_token": "rotated-service-token",
+            },
             headers={"X-Api-Key": _API_KEY},
         )
     )
@@ -2972,23 +2982,21 @@ async def test_ordinary_sign_in_committed_under_lock_is_swept_by_a_later_repoint
     )
     lock = _ObservableLock()
     monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
-    real_issue = auth_module._issue_browser_session  # pyright: ignore[reportPrivateUsage]
+    # The post-init ordinary mint commits via ``commit_to_completion`` inside the
+    # lock section; gate its entry so the sign-in pauses holding the lock with the
+    # session staged but not yet committed.
+    real_commit_tc = auth_module.commit_to_completion
     sign_in_at_mint = asyncio.Event()
     release_sign_in = asyncio.Event()
 
-    async def gated_issue(
-        session: AsyncSession,
-        response: Response,
-        *,
-        request: Request,
-        user_id: int | None,
+    async def gated_commit_tc(
+        session: AsyncSession, *, on_committed: Callable[[], None] | None = None
     ) -> None:
-        # Reached only inside the ordinary tail's lock section, before the commit.
         sign_in_at_mint.set()
         await _wait_for_event(release_sign_in)
-        await real_issue(session, response, request=request, user_id=user_id)
+        await real_commit_tc(session, on_committed=on_committed)
 
-    monkeypatch.setattr(auth_module, "_issue_browser_session", gated_issue)
+    monkeypatch.setattr(auth_module, "commit_to_completion", gated_commit_tc)
 
     sign_in = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN}))
     await _wait_for_event(sign_in_at_mint)  # sign-in holds the lock, session not yet committed
@@ -3332,3 +3340,172 @@ async def test_cancelled_pre_lock_rollback_in_ordinary_tail_leaves_boundary_usab
     async with sessionmaker_() as db:
         sessions = (await db.execute(select(AuthSession))).scalars().all()
     assert len(sessions) == 1 and sessions[0].revoked_at is None
+
+
+# --------------------------------------------------------------------------- #
+# Issue #400 round-3 — stamp ordering, shielded mint commit, identity-clear bump
+# --------------------------------------------------------------------------- #
+async def test_generation_stamp_precedes_snapshot_open(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 finding P1-1: the identity-generation stamp is taken STRICTLY
+    before the first DB read opens the sign-in's snapshot. A bump landing at the
+    snapshot boundary must be MISSED by the stamp and SEEN by the locked-tail
+    re-check (triggering a recompute), never folded into the stamp (which would
+    skip the recompute and mint against the stale snapshot). Pinned structurally:
+    bumping the generation from inside ``load_system_settings`` (the first read)
+    forces exactly one recompute iff the stamp preceded that read."""
+    await _seed_ordinary_signin_and_repoint(seed, sessionmaker_)
+    await _use_transport(
+        app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server(_MACHINE_ID)])
+    )
+
+    real_load = auth_module.load_system_settings
+    bumped = {"done": False}
+
+    async def bumping_load(db_session: AsyncSession) -> object:
+        result = await real_load(db_session)
+        if not bumped["done"]:
+            bumped["done"] = True
+            deps.plex_identity_generation.value += 1  # a bump AT the snapshot boundary
+        return result
+
+    monkeypatch.setattr(auth_module, "load_system_settings", bumping_load)
+
+    calls = {"n": 0}
+
+    async def counting_access(
+        db_session: AsyncSession, account: object, resources: object, *, client: object
+    ) -> bool:
+        calls["n"] += 1
+        return True  # owner -> admin; the recompute is idempotent here
+
+    monkeypatch.setattr(auth_module, "_post_init_access", counting_access)
+
+    response = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    assert response.status_code == 200
+    assert response.json()["user"]["is_admin"] is True
+    # The stamp preceded the snapshot: the boundary bump was invisible to it, so
+    # the locked-tail re-check saw the move and recomputed exactly once.
+    assert calls["n"] == 2
+
+
+async def test_cancelled_ordinary_mint_commit_lands_under_lock_and_is_swept(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 finding P1-2: a cancellation during the ordinary mint's commit must
+    let the commit land DURABLY under the lock (visible to a later repoint's
+    sweep) or fully roll back -- never a post-release landing that escapes the
+    sweep. Here the commit is paused, the request cancelled, then released: the
+    session commits under the lock, the cancellation is re-raised, and a following
+    repoint's revoke sweep revokes the committed session."""
+    await _seed_ordinary_signin_and_repoint(seed, sessionmaker_)
+    await _use_transport(
+        app,
+        _sign_in_and_repoint_transport(
+            user=_OWNER_USER, resources=[_owned_server(_MACHINE_ID)], new_identity=_OTHER_MACHINE_ID
+        ),
+    )
+    real_commit = AsyncSession.commit
+    armed = {"value": True}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_commit(self: AsyncSession) -> None:
+        # One-shot: the ordinary mint commit is the first commit in the flow.
+        if armed["value"]:
+            armed["value"] = False
+            entered.set()
+            await _wait_for_event(release)
+        await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", gated_commit)
+
+    cancelled = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN}))
+    await _wait_for_event(entered)  # inside the shielded mint commit, holding the lock
+    cancelled.cancel()
+    release.set()
+    await assert_task_raises(cancelled, asyncio.CancelledError)
+
+    # The session committed durably under the lock despite the cancellation.
+    async with sessionmaker_() as db:
+        sessions = (await db.execute(select(AuthSession))).scalars().all()
+    assert len(sessions) == 1 and sessions[0].revoked_at is None
+
+    # A following repoint's sweep sees and revokes it -- it never escaped.
+    repoint = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://new:32400", "plex_token": _SVC_TOKEN},
+        headers={"X-Api-Key": _API_KEY},
+    )
+    assert repoint.status_code == 200
+    async with sessionmaker_() as db:
+        after = (await db.execute(select(AuthSession))).scalars().all()
+    assert after and all(s.revoked_at is not None for s in after)
+
+
+async def test_ordinary_sign_in_racing_an_identity_clear_fails_service_not_configured(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 finding P2-2: an identity CLEAR (machine id dropped, NO session
+    sweep) must ALSO bump the generation, so an in-flight ordinary sign-in
+    recomputes against the now-unconfigured install and fails
+    ``service_not_configured`` rather than minting against the cleared identity.
+    (The clear also blanks the service token so the boundary runs its gate-able
+    rewrite.)"""
+    await _seed_ordinary_signin_and_repoint(seed, sessionmaker_)
+    await _use_transport(
+        app,
+        _sign_in_and_repoint_transport(
+            user=_OWNER_USER, resources=[_owned_server(_MACHINE_ID)], new_identity=_OTHER_MACHINE_ID
+        ),
+    )
+    lock = _ObservableLock()
+    monkeypatch.setattr(deps.secret_rotation_lock, "value", lock)
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    clear_in_boundary = asyncio.Event()
+    release_clear = asyncio.Event()
+
+    async def gated_rewrite(db_session: AsyncSession, values: frozenset[str]) -> int:
+        clear_in_boundary.set()
+        await _wait_for_event(release_clear)
+        return await real_rewrite(db_session, values)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", gated_rewrite)
+
+    clear = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={"plex_url": "", "plex_token": ""},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await _wait_for_event(clear_in_boundary)  # clear holds the lock, pre-write
+    sign_in = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN}))
+    await _wait_for_event(lock.second_acquire_started)
+    assert not sign_in.done()  # blocked on the lock the clear holds
+    release_clear.set()
+
+    assert (await asyncio.wait_for(clear, timeout=5.0)).status_code == 200
+    response = await asyncio.wait_for(sign_in, timeout=5.0)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "service_not_configured"
+    async with sessionmaker_() as db:
+        sessions = (await db.execute(select(AuthSession))).scalars().all()
+        machine = await SettingsStore(db).get(PLEX_MACHINE_ID_SETTING)
+    assert sessions == []  # failed closed against the cleared identity: nothing minted
+    assert machine is None  # the anchor was dropped by the clear
