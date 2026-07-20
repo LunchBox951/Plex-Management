@@ -518,7 +518,18 @@ async def secret_rotation(
     the home for must-run post-commit invalidations (SSE stream closes, cache
     invalidations, realtime publishes) that a disconnect-during-commit would
     otherwise skip, since the re-raise happens before control ever returns to
-    the code after ``async with secret_rotation(...)``.
+    the code after ``async with secret_rotation(...)``. Its invocation is
+    GUARDED (issue #423 round 3): the commit is already durable when it runs,
+    so a callback that raises (e.g. the sign-in path's demoted-stream close,
+    which does app I/O) must NOT be allowed to mask a remembered cancellation
+    or a ``_PostCommitSweepError`` by replacing the winning exception, nor to
+    vanish silently. Its failure is logged honestly and then folded into the
+    precedence re-raise below as a chained cause -- remembered cancellation
+    wins, then the committed-sweep failure, then the callback failure. When the
+    callback is the ONLY failure it still surfaces to the caller (a 500),
+    mirroring the ``_PostCommitSweepError`` shape: a must-run invalidation that
+    silently failed after a durable commit is a state this boundary refuses to
+    swallow (north star #3).
 
     **Point of no return / known residual.** Immediately before the commit
     unit launches, :func:`_cancellation_checkpoint` gives any already-pending
@@ -765,20 +776,56 @@ async def secret_rotation(
         # SYNCHRONOUS (``() -> None``): with no await inside it, a pending
         # cancellation has nowhere to land until it finishes, so it runs to
         # completion by construction.
+        # GUARD the callback (issue #423 round 3): it runs after a durable
+        # commit, so a raise here must not mask a remembered cancellation or a
+        # ``_PostCommitSweepError`` (replacing the winning exception would break
+        # the precedence this boundary guarantees), nor vanish silently. Capture
+        # it, log it loudly (name the callback, render the cause), and fold it
+        # into the precedence re-raise below. The generation bump is the first
+        # statement of ``on_committed`` and cannot itself fail (a bare counter
+        # increment), so a raise here comes from a LATER must-run step.
+        callback_error: Exception | None = None
         if on_committed is not None:
-            on_committed()
+            try:
+                on_committed()
+            except Exception as exc:
+                callback_error = exc
+                _logger.error(
+                    "secret rotation committed durably but the post-commit "
+                    "callback %r failed; the rotation is live and the commit is "
+                    "durable, but a must-run invalidation may not have run to "
+                    "completion",
+                    getattr(on_committed, "__qualname__", repr(on_committed)),
+                    exc_info=exc,
+                )
+        # Precedence for the re-raise (highest wins; lower failures chain onto
+        # the winner as its cause so none is lost -- the same discipline the
+        # commit-failure branches above follow). A remembered cancellation FIRST:
+        # the server's teardown expects a cancelled request task to end
+        # cancelled, and replacing the CancelledError would break that protocol
+        # mid-teardown. Then the committed-sweep ``_PostCommitSweepError``, then
+        # the callback failure.
+        if pending_cancel is not None:
+            # The sweep error stays primary over a callback error when both
+            # happened (it is the issue #423 committed-state signal); the callback
+            # error was already logged above either way.
+            committed_error = unit_error or callback_error
+            if committed_error is not None:
+                raise pending_cancel from committed_error
+            raise pending_cancel
         if unit_error is not None:
             # A committed rotation whose sweep failed: surface it to the caller
             # (a 500) now that the must-run obligations have run, so the failure
-            # is reported distinctly rather than swallowed. A remembered
-            # cancellation still WINS the re-raise (the server's teardown
-            # expects a cancelled request task to end cancelled), with the sweep
-            # failure chained as its cause for any consumer that renders it.
-            if pending_cancel is not None:
-                raise pending_cancel from unit_error
+            # is reported distinctly rather than swallowed. A callback failure, if
+            # any, is chained as its cause for any consumer that renders it.
+            if callback_error is not None:
+                raise unit_error from callback_error
             raise unit_error
-        if pending_cancel is not None:
-            raise pending_cancel
+        if callback_error is not None:
+            # ONLY the post-commit callback failed: the commit is durable, but a
+            # must-run invalidation did not complete. Surface it honestly (a 500)
+            # rather than swallow it -- the same shape a sweep failure takes.
+            raise callback_error
 
 
 def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:
@@ -1912,12 +1959,16 @@ async def put_settings_endpoint(
             # Clear backend probe caches before publishing: a listening tab can
             # refetch immediately on the SSE event, so publishing first could
             # race it into the stale pre-update health snapshot.
-            try:
-                for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
-                    if written_fields.intersection(fields):
+            for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+                if written_fields.intersection(fields):
+                    # Guard each subsystem independently: one subsystem's
+                    # invalidation raising must not leave the remaining
+                    # subsystems' probe caches stale, and the failure log must
+                    # name the specific subsystem that stayed stale.
+                    try:
                         health_cache.invalidate(subsystem)
-            except Exception:
-                _log_invalidation_step_failure("health_cache_invalidate")
+                    except Exception:
+                        _log_invalidation_step_failure(f"health_cache_invalidate:{subsystem}")
 
             try:
                 if plex_identity_changed and machine_identifier is not None:
