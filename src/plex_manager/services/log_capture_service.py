@@ -75,7 +75,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
 
-from plex_manager.logsafe import redact_known_secrets, redact_secrets
+from plex_manager.logsafe import MIN_SECRET_VALUE_LENGTH, redact_known_secrets, redact_secrets
 from plex_manager.ports.repositories import LOG_EVENT_CORRELATION_KEYS, LogEventCreate
 
 if TYPE_CHECKING:
@@ -305,14 +305,39 @@ def redact_retired_log_message(
     retiring value (1-3 characters) this deliberately masks every occurrence
     of that substring in history -- acceptable over-redaction for a retiring
     credential, versus leaving a real (if short) secret readable once the old
-    value can no longer be redacted at read time. ``current_values`` then get
-    the standard floored value pass, and the shape grammar runs last, matching
-    the established value-first ordering everywhere else.
+    value can no longer be redacted at read time.
+
+    The retiring and current values are masked in ONE combined
+    ``redact_known_secrets`` call, NOT sequential passes (codex #399 round 4):
+    the two sets can overlap as substrings in either direction across a
+    rotation (``abc`` -> ``abcdefghi``, or the shrink ``abcdefghi`` -> ``abc``),
+    and whichever set a sequential first pass masked would chew a hole in the
+    other's occurrence -- rotating ``abc`` -> ``abcdefghi`` with the floorless
+    retired pass first turns a logged ``abcdefghi`` into ``***defghi``, and the
+    full current secret no longer exists anywhere for the later floored pass
+    (or the completion sweep) to find, stranding the suffix in the ring/queue.
+    One combined alternation resolves every overlap longest-match-first by
+    construction, so a value contained in a longer value from EITHER set can
+    never partially mask the longer one. The single call is floorless
+    (``min_length=1``) because the retiring values must be; the floor's
+    false-positive guard is preserved for current values by pre-filtering them
+    against :data:`~plex_manager.logsafe.MIN_SECRET_VALUE_LENGTH` -- exactly
+    the values the default floor would have admitted. The standard floored
+    pass + shape grammar still run last (via :func:`redact_log_message`),
+    matching the established value-first ordering everywhere else.
     """
     retired = frozenset(retired_values)
+    current = frozenset(current_values)
+    floor_eligible_current = frozenset(
+        value for value in current if len(value) >= MIN_SECRET_VALUE_LENGTH
+    )
+    # ``redact_log_message``'s own floored value pass finds nothing new after
+    # the combined call above (every value it could match was already masked);
+    # it is kept for the ``redact_secrets`` shape-grammar step it also runs,
+    # preserving the established value-first-then-shape ordering.
     return redact_log_message(
-        redact_known_secrets(message, retired, min_length=1),
-        retired | frozenset(current_values),
+        redact_known_secrets(message, retired | floor_eligible_current, min_length=1),
+        retired | current,
     )
 
 
@@ -347,7 +372,9 @@ def _extract_context(record: logging.LogRecord) -> dict[str, Any] | None:
 
 
 def _capture(
-    record: logging.LogRecord, secret_values: frozenset[str] = frozenset()
+    record: logging.LogRecord,
+    secret_values: frozenset[str] = frozenset(),
+    retiring_values: frozenset[str] = frozenset(),
 ) -> CapturedLogRecord:
     """Render one stdlib ``LogRecord`` into the pipeline's own frozen shape.
 
@@ -379,18 +406,59 @@ def _capture(
     through (both the ring-buffer live tail and the durable-store queue read
     from this same :class:`CapturedLogRecord`), so both redaction passes
     happen exactly once, upstream of both destinations.
+
+    ``retiring_values`` (issue #389 facet 5) is non-empty ONLY while a secret
+    rotation is in flight (published by :meth:`begin_secret_rotation`, cleared
+    at :meth:`complete_secret_rotation`/:meth:`abort_secret_rotation`). When
+    set, this record is masked with the EXACT, FLOORLESS retired-value pass
+    (:func:`redact_retired_log_message`) instead of the standard floored value
+    pass: the standard pass skips any value shorter than
+    :func:`redact_known_secrets`' 8-character floor, so a short retiring secret
+    would otherwise be captured VERBATIM during the rotation window and could
+    land in the ring/queue AFTER the completion sweep has already run -- with the
+    value already gone from ``secret_values()``, nothing would ever rewrite it.
+    Masking floorlessly HERE, as the record is built (before it reaches the ring
+    or the queue), closes that window by construction. ``secret_values`` (the
+    widened transition set during rotation) is still applied as the floored
+    ``current_values`` companion, so the ordering matches every other pass.
     """
     message = record.getMessage()
     if record.exc_info:
         message = f"{message}\n{_EXC_FORMATTER.formatException(record.exc_info)}"
-    message = redact_log_message(message, secret_values)
+    context = _extract_context(record)
+    if retiring_values:
+        message = redact_retired_log_message(message, retiring_values, secret_values)
+        context = redact_retired_log_context(context, retiring_values, secret_values)
+    else:
+        message = redact_log_message(message, secret_values)
+        context = redact_log_context(context, secret_values)
     return CapturedLogRecord(
         created_at=datetime.fromtimestamp(record.created, tz=UTC),
         level=record.levelname,
         logger=record.name,
         message=message,
-        context=redact_log_context(_extract_context(record), secret_values),
+        context=context,
     )
+
+
+@dataclass(frozen=True)
+class _RedactionSnapshot:
+    """The (secret_values, retiring_values) pair as ONE immutable object.
+
+    :class:`LogCaptureHandler` publishes every redaction-state transition by
+    assigning a NEW instance to a single attribute (codex #399 round 4): a
+    plain attribute assignment/read is atomic under the GIL, so
+    :meth:`LogCaptureHandler.emit` -- which runs synchronously from ANY thread
+    -- always observes the two sets as a coherent pair. Two separate
+    attributes, however carefully write- and read-ordered, could still be
+    straddled by a thread that read one attribute, lost the GIL across both
+    writes of a transition, then read the other -- pairing an empty retiring
+    set with an already-widened secret set and capturing a short retiring
+    value verbatim down the ordinary floored path.
+    """
+
+    secret_values: frozenset[str] = frozenset()
+    retiring_values: frozenset[str] = frozenset()
 
 
 class LogCaptureHandler(logging.Handler):
@@ -431,14 +499,18 @@ class LogCaptureHandler(logging.Handler):
     must never ``await`` from ``emit``, which can run off any thread — see
     above), so it cannot fetch these itself; ``web/app.py``'s
     ``_log_drain_loop`` — which already opens a DB session on its own interval
-    — refreshes this attribute each tick. Reassigning it to a NEW ``frozenset``
-    (never mutating one in place) is what makes the no-lock read in ``emit``
-    safe: a plain attribute read/write is atomic under the GIL, so ``emit``
-    always sees either the old set or the new one, never a partially-updated
-    one. Defaults to an empty ``frozenset`` — before the first refresh (a
-    startup race of at most one drain interval) or with no secrets configured
-    yet, this pass is simply a no-op, exactly as :func:`~plex_manager.logsafe.
-    redact_known_secrets` defines for an empty value set.
+    — refreshes this attribute each tick. ``secret_values`` and
+    ``retiring_values`` are properties over ONE immutable
+    :class:`_RedactionSnapshot` published by a single attribute assignment
+    (codex #399 round 4): a plain attribute read/write is atomic under the
+    GIL, so ``emit`` always sees a COHERENT pair — never a stale
+    ``retiring_values`` next to an already-widened ``secret_values``, the
+    straddle that would send a short retiring secret down the ordinary floored
+    path verbatim. Defaults to empty ``frozenset``\\ s — before the first
+    refresh (a startup race of at most one drain interval) or with no secrets
+    configured yet, this pass is simply a no-op, exactly as
+    :func:`~plex_manager.logsafe.redact_known_secrets` defines for an empty
+    value set.
     """
 
     def __init__(
@@ -452,7 +524,15 @@ class LogCaptureHandler(logging.Handler):
         self.ring_buffer: deque[CapturedLogRecord] = deque(maxlen=ring_buffer_maxlen)
         self.queue: asyncio.Queue[CapturedLogRecord] = asyncio.Queue(maxsize=queue_maxsize)
         self.dropped_count = 0
-        self.secret_values: frozenset[str] = frozenset()
+        # The (secret_values, retiring_values) pair, as ONE immutable snapshot.
+        # Every transition (drain-tick refresh, begin/abort/complete rotation)
+        # publishes a NEW snapshot with a single attribute assignment, so the
+        # lock-free read in :meth:`emit` -- which can run from ANY thread --
+        # always observes a coherent pair (codex #399 round 4): two separate
+        # attributes were individually atomic under the GIL, but a thread could
+        # still pair the OLD empty retiring set with the NEW widened secret set
+        # and mask a short retiring value with the floored pass alone.
+        self._redaction = _RedactionSnapshot()
         self._loop = loop if loop is not None else asyncio.get_running_loop()
         # Guards ``ring_buffer`` against the concurrent-iteration hazard above.
         # A ``threading.Lock`` (not ``asyncio.Lock``): ``emit`` can run from a
@@ -462,15 +542,60 @@ class LogCaptureHandler(logging.Handler):
         # acquired from the event-loop thread inside ``snapshot_tail``.
         self._lock = threading.Lock()
 
-    def begin_secret_rotation(self, secret_values: frozenset[str]) -> frozenset[str]:
-        """Widen capture redaction temporarily and return the old snapshot."""
-        previous = self.secret_values
-        self.secret_values = previous | secret_values
+    @property
+    def secret_values(self) -> frozenset[str]:
+        """The current value-based redaction set (see the class docstring)."""
+        return self._redaction.secret_values
+
+    @secret_values.setter
+    def secret_values(self, values: frozenset[str]) -> None:
+        # The drain-tick refresh path. Publishes a whole new snapshot (single
+        # attribute assignment -- see ``_redaction``); the retiring set is
+        # carried over unchanged, though in practice it is always empty here:
+        # the drain tick and every rotation serialize on the rotation lock.
+        self._redaction = replace(self._redaction, secret_values=values)
+
+    @property
+    def retiring_values(self) -> frozenset[str]:
+        """Values a rotation is retiring; non-empty only mid-rotation.
+
+        Read-only by design: the pair only ever changes together, through
+        :meth:`begin_secret_rotation` / :meth:`abort_secret_rotation` /
+        :meth:`complete_secret_rotation`, so no caller can publish a straddling
+        (retiring, secret) combination.
+        """
+        return self._redaction.retiring_values
+
+    def begin_secret_rotation(
+        self, secret_values: frozenset[str], *, retiring_values: frozenset[str] = frozenset()
+    ) -> frozenset[str]:
+        """Widen capture redaction temporarily and return the old snapshot.
+
+        ``retiring_values`` (issue #389 facet 5) are published to the capture
+        path so every record built WHILE the rotation is in flight masks them
+        with the exact, floorless retired-value pass (see :func:`_capture`) --
+        covering a retiring secret too short for the standard floored value
+        pass, and covering it at capture time so a record that lands after the
+        completion sweep is still clean.
+
+        The widened set and the retiring set are published as ONE snapshot in a
+        single attribute assignment (codex #399 round 4) -- an ordered pair of
+        separate writes was still straddle-able by a worker-thread ``emit``
+        that read the old empty retiring set, lost the GIL across BOTH writes,
+        then read the widened secret set: the floored path would capture a
+        short retiring value verbatim. With one snapshot, no emit can observe
+        the widened set without also observing the floorless retiring set. A
+        rotation is serialized by ``secret_rotation_lock``, so the retiring set
+        is always empty on entry (no nesting)."""
+        previous = self._redaction.secret_values
+        self._redaction = _RedactionSnapshot(
+            secret_values=previous | secret_values, retiring_values=retiring_values
+        )
         return previous
 
     def abort_secret_rotation(self, previous_values: frozenset[str]) -> None:
         """Restore the exact capture snapshot after a failed transaction."""
-        self.secret_values = previous_values
+        self._redaction = _RedactionSnapshot(secret_values=previous_values)
 
     def complete_secret_rotation(
         self,
@@ -513,7 +638,11 @@ class LogCaptureHandler(logging.Handler):
                 ),
                 maxlen=self.ring_buffer.maxlen,
             )
-        self.secret_values = current_values
+        # Narrow-and-clear as ONE snapshot publication (codex #399 round 4):
+        # there is no transient window at all -- an emit sees either the full
+        # mid-rotation pair (widened + retiring, floorless coverage) or the
+        # final pair (narrowed + empty), never a mixed one.
+        self._redaction = _RedactionSnapshot(secret_values=current_values)
 
     def emit(self, record: logging.LogRecord) -> None:
         # Never let a capture bug break logging itself (north star: honesty over
@@ -521,7 +650,14 @@ class LogCaptureHandler(logging.Handler):
         # in the first place). ``handleError`` is the stdlib's own "a handler
         # failed" escape hatch (prints to stderr, respects ``logging.raiseExceptions``).
         try:
-            captured = _capture(record, self.secret_values)
+            # ONE atomic attribute read hands this emit a coherent
+            # (secret_values, retiring_values) pair (codex #399 round 4) --
+            # reading two separate attributes, in any order, could straddle a
+            # rotation transition from another thread and mask a short retiring
+            # value with the floored pass alone. See
+            # :meth:`begin_secret_rotation` / :meth:`complete_secret_rotation`.
+            snapshot = self._redaction
+            captured = _capture(record, snapshot.secret_values, snapshot.retiring_values)
         except Exception:
             self.handleError(record)
             return
