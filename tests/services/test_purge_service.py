@@ -251,7 +251,7 @@ def test_abandonable_thread_releases_permit_after_originating_loop_closes(
         worker = await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
             lambda: None, thread_name="purge-test-restarted"
         )
-        await worker
+        _ = await worker
 
     asyncio.run(asyncio.wait_for(_run_after_loop_restart(), timeout=2.0))
 
