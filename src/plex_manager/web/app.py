@@ -39,7 +39,7 @@ from plex_manager.adapters.tmdb import TmdbApiError, TmdbAuthError
 from plex_manager.config import Settings, get_settings
 from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import User
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
@@ -47,6 +47,7 @@ from plex_manager.services import (
     eviction_service,
     import_service,
     log_capture_service,
+    purge_service,
     queue_service,
     retention_telemetry_service,
     session_lifecycle,
@@ -1596,6 +1597,90 @@ def _emit_setup_ready_hint(url: str) -> None:
     _logger.info("Setup: %s", url)
 
 
+async def _await_background_tasks_shutdown(
+    background_tasks: tuple[asyncio.Task[None], ...], *, timeout_seconds: float
+) -> None:
+    """Await every CANCELLED background task's cleanup, bounded (issue #401).
+
+    ``purge_service._delete_to_settlement`` (PR #395 / issue #128) deliberately
+    shields a purge/eviction delete's off-thread ``fs.delete`` from a caller's
+    cancellation until the underlying delete thread genuinely settles -- a
+    Python thread performing a blocking syscall cannot be interrupted from
+    outside. A dead/hung mount (NFS, a wedged Docker volume) in flight inside
+    ``eviction_task`` or a report-issue purge in ``reconcile_task`` at shutdown
+    time can therefore keep that shielded wait from ever returning, and an
+    unbounded ``asyncio.gather`` here would hang graceful shutdown/restart
+    forever -- exactly the "no in-app recovery path, only a terminal" failure
+    mode this project's north stars call out.
+
+    This bounds ONLY this shutdown-side wait. It does NOT change #395's
+    shielding itself: every other caller of ``_delete_to_settlement`` (normal-
+    operation eviction sweeps, report-issue purges) still waits unboundedly, by
+    design -- ``_ACTIVE_PURGE_PATHS``/``_sweep_latch`` must never be released
+    while a delete is still mutating disk. On a shutdown timeout the still-
+    running delete thread is simply abandoned here: the OS reclaims it when the
+    process exits regardless, so no delete durability is lost, only how long
+    shutdown blocks on it. That abandonment is real, not aspirational, because
+    the delete runs on a dedicated DAEMON thread
+    (:func:`purge_service._run_delete_on_abandonable_thread`, codex #406 P1)
+    -- were it on ``asyncio.to_thread``'s default executor, whose non-daemon
+    workers the interpreter re-joins at exit, the process would still block on
+    the hung delete after this wait "proceeded". The still-active purge
+    path(s), if any, are named in the warning (honesty over silence, never a
+    silent stall) via :func:`purge_service.active_purge_paths`.
+
+    Deliberately uses :func:`asyncio.wait` rather than
+    ``asyncio.wait_for(asyncio.gather(...), timeout=...)``: ``wait_for``
+    cancels its wrapped awaitable when the timeout elapses but then *waits for
+    that cancellation to actually be honoured* before raising ``TimeoutError``
+    (documented CPython behaviour -- "the total wait time may exceed the
+    timeout"). For a task that keeps catching and re-looping past
+    ``CancelledError`` -- exactly ``_delete_to_settlement``'s shielding -- that
+    second wait is itself unbounded, silently defeating the entire point of
+    this bound against a genuinely hung mount. ``asyncio.wait`` returns at the
+    deadline regardless of whether the tasks have finished and, critically,
+    never calls ``.cancel()`` on the tasks itself (they were already cancelled
+    by the caller above), so it can't re-trip #395's shielding either.
+    """
+    done, pending = await asyncio.wait(background_tasks, timeout=timeout_seconds)
+    for task in done:
+        if not task.cancelled():
+            # Retrieve (and discard) any exception so it isn't reported later
+            # as "exception was never retrieved" -- mirrors the old
+            # gather(..., return_exceptions=True) behaviour of swallowing it;
+            # a background task raising anything other than CancelledError
+            # here is unexpected but must not block shutdown.
+            task.exception()
+    if pending:
+        active_paths = purge_service.active_purge_paths()
+        if active_paths:
+            _logger.warning(
+                "shutdown timed out after %.0fs waiting on background task(s); "
+                "proceeding with shutdown anyway -- still-active purge delete(s) "
+                "abandoned (reclaimed by the OS on process exit): %s",
+                timeout_seconds,
+                ", ".join(safe_text(path) for path in active_paths),
+            )
+        else:
+            _logger.warning(
+                "shutdown timed out after %.0fs waiting on background task(s); "
+                "proceeding with shutdown anyway",
+                timeout_seconds,
+            )
+
+    # Returning with purge settlement tasks still pending only postpones a
+    # hang: ``asyncio.run`` cancels and gathers every remaining task before
+    # closing the loop. This is intentionally independent of ``pending`` above:
+    # uvicorn request/protocol tasks are not in the six app-owned loops, so all
+    # six can finish quickly while report-issue remains stuck in a filesystem
+    # settlement. Wake every active phase process-wide, then give coroutine-only
+    # cleanup a short bounded grace; daemon filesystem workers stay abandonable.
+    settlement_tasks = purge_service.active_settlement_tasks()
+    if settlement_tasks:
+        purge_service.abandon_active_settlements()
+        await asyncio.wait(settlement_tasks, timeout=0.5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Prepare persistence + encryption, then share an HTTP client for adapters.
@@ -1679,9 +1764,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         get_event_hub(app).close_all(reason="shutdown")
         for task in background_tasks:
             task.cancel()
-        # Await every cancelled task so its cleanup runs; return_exceptions=True
-        # absorbs the expected CancelledError without re-raising on shutdown.
-        await asyncio.gather(*background_tasks, return_exceptions=True)
+        # Await every cancelled task so its cleanup runs, bounded (issue #401):
+        # see ``_await_background_tasks_shutdown`` -- a purge/eviction delete's
+        # cancellation-shielded off-thread ``fs.delete`` (PR #395 / issue #128)
+        # can otherwise stall this wait forever behind a hung mount.
+        await _await_background_tasks_shutdown(
+            background_tasks,
+            timeout_seconds=get_settings().shutdown_task_timeout_seconds,
+        )
         await app.state.http_client.aclose()
         log_capture_service.stop_logging(log_handler)
 

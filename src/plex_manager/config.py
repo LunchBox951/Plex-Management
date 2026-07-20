@@ -204,6 +204,23 @@ class Settings(BaseSettings):
     # lenient validator below.
     web_concurrency: int = Field(default=1, validation_alias="WEB_CONCURRENCY")
 
+    # Bound on how long ``web.app.lifespan``'s shutdown block waits for the six
+    # cancelled background tasks (reconcile/autograb/log-drain/eviction/
+    # watchlist/session-sweep) to settle (issue #401). A purge/eviction delete's
+    # off-thread ``fs.delete`` is cancellation-SHIELDED until it genuinely
+    # settles (PR #395 / issue #128's ``purge_service._delete_to_settlement`` --
+    # that shielding is unchanged by this setting and still applies during
+    # normal operation) -- a hung mount (dead NFS, a wedged Docker volume) can
+    # therefore keep that worker thread blocked indefinitely, and a Python
+    # thread cannot be interrupted from outside. Without a bound, that stalls
+    # graceful shutdown/restart forever, with no in-app recovery path (violating
+    # this project's "correction without a terminal" north star). On timeout the
+    # still-running delete thread is simply abandoned -- the OS reclaims it when
+    # the process exits regardless, so this changes nothing about delete
+    # durability, only how long shutdown can block on it. 60s is generous for a
+    # legitimate large-directory delete while still bounding the worst case.
+    shutdown_task_timeout_seconds: float = 60.0
+
     @field_validator("web_concurrency", mode="before")
     @classmethod
     def _parse_web_concurrency(cls, value: object) -> object:
