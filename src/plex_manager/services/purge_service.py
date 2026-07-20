@@ -77,6 +77,19 @@ _logger = logging.getLogger(__name__)
 _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS: Final = 5.0
 _CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS: Final = 0.25
 
+_ABANDONABLE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous physical workers on the abandonable substrate.
+
+A dead mount can block an OS thread permanently, so every guard/accounting/
+delete worker shares this small process-wide budget. Four preserves modest
+parallelism for unrelated operator corrections while putting a hard ceiling on
+daemon threads. A :class:`concurrent.futures.ThreadPoolExecutor` is deliberately
+forbidden because its non-daemon workers are joined at interpreter exit, which
+would reintroduce the shutdown hang this substrate exists to prevent (issue
+#417 / PR #406).
+"""
+_ABANDONABLE_THREAD_GATE = asyncio.Semaphore(_ABANDONABLE_THREAD_LIMIT)
+
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
 #
@@ -237,20 +250,29 @@ class PurgeResult:
     detail: str | None = None
 
 
-def _run_on_abandonable_thread[T](
+async def _run_on_abandonable_thread[T](
     operation: Callable[[], T], *, thread_name: str
 ) -> asyncio.Future[T]:
-    """Run blocking filesystem work on a daemon thread and future-ify its result.
+    """Run blocking filesystem work on a bounded daemon-thread substrate.
 
     Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
     default executor's non-daemon workers are joined during interpreter
     teardown. Any filesystem operation that can touch a dead mount -- guard,
     accounting, or delete -- must therefore use this abandonable substrate.
+
+    The gate wait stays a plain cancellable await so a queued caller can unwind
+    during shutdown without ever creating a physical worker. Once acquired, its
+    permit belongs to that worker until :func:`_deliver` runs on PHYSICAL
+    completion -- caller cancellation or settlement abandonment must never make
+    room for another thread while the original remains wedged (issue #417).
     """
+    gate = _ABANDONABLE_THREAD_GATE
+    await gate.acquire()
     loop = asyncio.get_running_loop()
     outcome: asyncio.Future[T] = loop.create_future()
 
     def _deliver(result: T | None, error: BaseException | None) -> None:
+        gate.release()
         # Shutdown abandonment can leave the loop alive briefly while this
         # callback is already queued. Nobody remains entitled to consume a late
         # result, so a completed future is expected rather than an error.
@@ -279,15 +301,21 @@ def _run_on_abandonable_thread[T](
             if not loop.is_closed():
                 raise
 
-    threading.Thread(target=_worker, name=thread_name, daemon=True).start()
+    try:
+        threading.Thread(target=_worker, name=thread_name, daemon=True).start()
+    except BaseException:
+        gate.release()
+        raise
     return outcome
 
 
-def _run_delete_on_abandonable_thread(
+async def _run_delete_on_abandonable_thread(
     fs: FileSystemPort, library_path: str
 ) -> asyncio.Future[None]:
     """Run ``fs.delete`` on the shared abandonable daemon-thread substrate."""
-    return _run_on_abandonable_thread(lambda: fs.delete(library_path), thread_name="purge-delete")
+    return await _run_on_abandonable_thread(
+        lambda: fs.delete(library_path), thread_name="purge-delete"
+    )
 
 
 async def _await_worker_settlement[T](
@@ -364,13 +392,13 @@ async def _await_worker_settlement[T](
 async def _run_probe_to_settlement[T](
     operation: Callable[[], T], library_path: str, *, operation_name: str
 ) -> T:
-    worker = _run_on_abandonable_thread(operation, thread_name="purge-probe")
+    worker = await _run_on_abandonable_thread(operation, thread_name="purge-probe")
     return await _await_worker_settlement(worker, library_path, operation=operation_name)
 
 
 async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
     """Run delete to real settlement, except for process-shutdown abandonment."""
-    worker = _run_delete_on_abandonable_thread(fs, library_path)
+    worker = await _run_delete_on_abandonable_thread(fs, library_path)
     await _await_worker_settlement(worker, library_path, operation="delete")
 
 

@@ -74,6 +74,184 @@ class _FailingBlockedDeleteFileSystem(_BlockedDeleteFileSystem):
         raise OSError("blocked delete failed")
 
 
+class _BlockedGuardFileSystem(LocalFileSystem):
+    """Block every delete-guard probe and expose physical worker progress."""
+
+    def __init__(self, root: Path, *, expected_starts: int) -> None:
+        super().__init__([str(root)])
+        self.release = threading.Event()
+        self.expected_started = threading.Event()
+        self.finished = threading.Event()
+        self._expected_starts = expected_starts
+        self._lock = threading.Lock()
+        self._started_count = 0
+        self._finished_count = 0
+
+    @property
+    def started_count(self) -> int:
+        with self._lock:
+            return self._started_count
+
+    def delete_guard_refuses(self, path: str) -> bool:
+        with self._lock:
+            self._started_count += 1
+            call_number = self._started_count
+            if self._started_count == self._expected_starts:
+                self.expected_started.set()
+        self.release.wait(timeout=5)
+        try:
+            return super().delete_guard_refuses(path)
+        finally:
+            with self._lock:
+                self._finished_count += 1
+                if self._finished_count == self._expected_starts:
+                    self.finished.set()
+            self._after_guard(call_number)
+
+    def _after_guard(self, call_number: int) -> None:
+        del call_number
+
+
+class _FailingFirstBlockedGuardFileSystem(_BlockedGuardFileSystem):
+    """Raise from the first physical guard worker after its gate opens."""
+
+    def _after_guard(self, call_number: int) -> None:
+        if call_number == 1:
+            raise OSError("blocked guard failed")
+
+
+async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #417: N physical workers consume the whole substrate; N+1 stays
+    queued without creating another OS thread until one of those workers really
+    finishes and returns its permit."""
+    worker_limit = 2
+    monkeypatch.setattr(
+        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(worker_limit), raising=False
+    )
+    root = tmp_path / "movies"
+    root.mkdir()
+    targets = [root / f"Blocked {index}.mkv" for index in range(worker_limit + 1)]
+    for target in targets:
+        target.write_bytes(b"x")
+    fs = _BlockedGuardFileSystem(root, expected_starts=worker_limit)
+    tasks = [
+        asyncio.create_task(purge_service.purge_library_path(fs, str(target))) for target in targets
+    ]
+    try:
+        assert await asyncio.to_thread(fs.expected_started.wait, 2.0)
+        await asyncio.sleep(0)
+        assert fs.started_count == worker_limit
+    finally:
+        fs.release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert all(result.outcome is PurgeOutcome.deleted for result in results)
+    assert fs.started_count == worker_limit + 1
+
+
+async def test_abandonable_thread_permit_waits_for_physical_completion_not_caller_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling a settlement awaiter must not release its worker's permit while
+    that daemon thread remains physically blocked on the mount."""
+    monkeypatch.setattr(
+        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
+    )
+    root = tmp_path / "movies"
+    root.mkdir()
+    first = root / "First.mkv"
+    second = root / "Second.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    fs = _BlockedGuardFileSystem(root, expected_starts=1)
+    first_task = asyncio.create_task(purge_service.purge_library_path(fs, str(first)))
+    second_task: asyncio.Task[purge_service.PurgeResult] | None = None
+    second_result: purge_service.PurgeResult | None = None
+    try:
+        assert await asyncio.to_thread(fs.expected_started.wait, 2.0)
+        first_task.cancel()
+        await asyncio.sleep(0)
+        assert not first_task.done()
+
+        second_task = asyncio.create_task(purge_service.purge_library_path(fs, str(second)))
+        await asyncio.sleep(0)
+        assert fs.started_count == 1
+    finally:
+        fs.release.set()
+        await assert_task_raises(first_task, asyncio.CancelledError)
+        if second_task is not None:
+            second_result = await second_task
+
+    assert second_result is not None
+    assert second_result.outcome is PurgeOutcome.deleted
+    assert fs.started_count == 2
+
+
+async def test_abandonable_thread_worker_exception_releases_its_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A physically settled exception is still a settlement: its permit must be
+    returned so the next queued worker can start."""
+    monkeypatch.setattr(
+        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
+    )
+    root = tmp_path / "movies"
+    root.mkdir()
+    first = root / "Failing.mkv"
+    second = root / "Following.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    fs = _FailingFirstBlockedGuardFileSystem(root, expected_starts=1)
+    first_task = asyncio.create_task(purge_service.purge_library_path(fs, str(first)))
+    second_task = asyncio.create_task(purge_service.purge_library_path(fs, str(second)))
+    assert await asyncio.to_thread(fs.expected_started.wait, 2.0)
+    assert fs.started_count == 1
+
+    fs.release.set()
+    with pytest.raises(OSError, match="blocked guard failed"):
+        await first_task
+    second_result = await asyncio.wait_for(second_task, timeout=2.0)
+
+    assert second_result.outcome is PurgeOutcome.deleted
+    assert fs.started_count == 2
+
+
+async def test_shutdown_abandonment_cancels_a_waiter_when_thread_gate_is_saturated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saturated substrate leaves later callers on a plain cancellable gate
+    await, while shutdown abandonment still releases the active settlement."""
+    monkeypatch.setattr(
+        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
+    )
+    root = tmp_path / "movies"
+    root.mkdir()
+    first = root / "Active.mkv"
+    second = root / "Queued.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    fs = _BlockedGuardFileSystem(root, expected_starts=1)
+    active = asyncio.create_task(purge_service.purge_library_path(fs, str(first)))
+    queued = asyncio.create_task(purge_service.purge_library_path(fs, str(second)))
+    try:
+        assert await asyncio.to_thread(fs.expected_started.wait, 2.0)
+        active.cancel()
+        queued.cancel()
+        await asyncio.sleep(0)
+        assert not active.done()
+        assert queued.cancelled()
+        assert fs.started_count == 1
+
+        purge_service.abandon_active_settlements()
+        await assert_task_raises(active, asyncio.CancelledError)
+        assert purge_service.active_purge_paths() == ()
+    finally:
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
 async def test_cancelled_purge_keeps_path_registered_until_delete_worker_settles(
     tmp_path: Path,
 ) -> None:
