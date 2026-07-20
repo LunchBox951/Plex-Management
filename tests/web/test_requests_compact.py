@@ -181,6 +181,61 @@ async def test_compact_state_visibility_scoped(sessionmaker_: SessionMaker) -> N
     assert unscoped[(55, "movie")].request_id == mine_id
 
 
+async def test_compact_state_visibility_scoped_coexisting_available(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #402: the movie presence-contradiction bit must be evaluated over
+    the CALLER's own subscribed rows only. A shared user's own settled
+    ``available`` row alongside their own active re-request sets the flag
+    (driven by user 1's own rows); a sibling ``available`` row that belongs to
+    a DIFFERENT user -- invisible to this scope's JOIN -- must never leak into
+    it, proven by user 2 (who has only their own settled row, no active
+    sibling of their own) seeing the flag as ``False``."""
+    async with sessionmaker_() as session:
+        user1 = User(username="scoped-coexist-1", permissions=0)
+        user2 = User(username="scoped-coexist-2", permissions=0)
+        session.add_all([user1, user2])
+        await session.flush()
+        user1_id, user2_id = user1.id, user2.id
+
+        mine_available = MediaRequest(
+            tmdb_id=66, media_type=MediaType.movie, title="Mine", status=RequestStatus.available
+        )
+        mine_pending = MediaRequest(
+            tmdb_id=66, media_type=MediaType.movie, title="Mine", status=RequestStatus.pending
+        )
+        theirs_available = MediaRequest(
+            tmdb_id=66, media_type=MediaType.movie, title="Theirs", status=RequestStatus.available
+        )
+        session.add_all([mine_available, mine_pending, theirs_available])
+        await session.flush()
+        session.add_all(
+            [
+                RequestSubscriber(request_id=mine_available.id, user_id=user1_id),
+                RequestSubscriber(request_id=mine_pending.id, user_id=user1_id),
+                RequestSubscriber(request_id=theirs_available.id, user_id=user2_id),
+            ]
+        )
+        await session.commit()
+        mine_pending_id = mine_pending.id
+
+    async with sessionmaker_() as session:
+        scoped_user1 = await SqlRequestRepository(session).compact_states_by_tmdb_ids(
+            [(66, "movie")], for_user_id=user1_id
+        )
+        scoped_user2 = await SqlRequestRepository(session).compact_states_by_tmdb_ids(
+            [(66, "movie")], for_user_id=user2_id
+        )
+    # User 1: own settled `available` row + own active re-request -> the flag
+    # is set, and the pending re-request wins the fold as the representative.
+    assert scoped_user1[(66, "movie")].request_id == mine_pending_id
+    assert scoped_user1[(66, "movie")].status == "pending"
+    assert scoped_user1[(66, "movie")].has_coexisting_available is True
+    # User 2: only their own settled `available` row is visible in this scope
+    # -- user 1's sibling `available` row must not leak in as a coexisting one.
+    assert scoped_user2[(66, "movie")].has_coexisting_available is False
+
+
 async def test_compact_state_absent_key_no_fabrication(sessionmaker_: SessionMaker) -> None:
     await _add_request(sessionmaker_, tmdb_id=77, status=RequestStatus.pending)
     async with sessionmaker_() as session:

@@ -22,6 +22,7 @@ from plex_manager.models import AuditLog, MaintenanceLease, UpdateCoordinatorSta
 from plex_manager.repositories.update_coordination import (
     _BUSY_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
     _KNOWN_COORDINATOR_PHASES,  # pyright: ignore[reportPrivateUsage]
+    SqlUpdateCoordinationRepository,
     _as_utc,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.services.update_coordination_service import (
@@ -1022,6 +1023,67 @@ async def test_legacy_busy_touch_backfills_the_same_anchor_as_direct_snapshot(
     # The touch itself still legitimately refreshed liveness to now, even
     # though the recovery anchor used the pre-touch value.
     assert touched.updater_last_seen_at == clock.now
+
+
+async def test_touch_updater_backfill_write_is_visible_without_refresh(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Regression test for issue #403: ``touch_updater()`` no longer calls
+    ``session.refresh(state)`` after ``_backfill_legacy_busy_anchor``. This
+    goes straight at the repository (not the service, whose ``touch_updater``
+    wraps a *second*, fresh-session ``snapshot()`` that would mask an
+    in-session staleness bug) to prove the in-session, identity-mapped row
+    already reflects the backfill's write with no explicit refresh anywhere
+    in this test -- because SQLAlchemy's ``synchronize_session="auto"``
+    resolves to the "evaluate" strategy for this UPDATE's plain
+    ``==``/``IS NULL`` WHERE clause and applies its ``.values()`` straight to
+    the already-locked object. Cross-checked against a raw connection read of
+    the same row so a coincidental Python-side value can't produce a false
+    pass."""
+    clock = MutableClock(datetime(2026, 7, 16, 12, 0, tzinfo=UTC))
+    heartbeat = clock.now - timedelta(minutes=5)
+    async with sessionmaker_() as session:
+        # Seed the id=1 singleton row FIRST: the WHERE-less UPDATE below only
+        # patches an existing row, and on a fresh in-memory DB there isn't
+        # one yet -- skipping this made an earlier version of this test seed
+        # nothing, so `touch_updater()`'s own `ensure_state()` silently
+        # created a default-valued row instead of the one being asserted on.
+        await SqlUpdateCoordinationRepository(session).ensure_state()
+        await session.execute(
+            update(UpdateCoordinatorState).values(
+                phase="checking",
+                requested_action="none",
+                last_started_at=None,
+                requested_at=None,
+                updater_last_seen_at=heartbeat,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        repo = SqlUpdateCoordinationRepository(session)
+        touched = await repo.touch_updater(now=clock.now)
+        assert touched is True
+
+        # Deliberately no session.refresh() anywhere in this test: the
+        # identity-mapped row must already carry the anchor
+        # `_backfill_legacy_busy_anchor` wrote moments earlier inside
+        # touch_updater(), purely from SQLAlchemy's automatic
+        # synchronize_session sync.
+        state = await session.get(UpdateCoordinatorState, 1)
+        assert state is not None
+        assert _as_utc(state.last_started_at) == heartbeat
+
+        # A column-only Core SELECT bypasses the ORM identity map entirely
+        # (no entity is materialized/cached), so this independently confirms
+        # the backfill's write actually landed in the database and the
+        # in-session read above isn't a coincidental stale-but-equal value.
+        raw_last_started_at = (
+            await session.execute(
+                select(UpdateCoordinatorState.last_started_at).where(UpdateCoordinatorState.id == 1)
+            )
+        ).scalar_one()
+        assert _as_utc(raw_last_started_at) == heartbeat
 
 
 async def test_direct_force_reset_alone_durably_starts_legacy_recovery_clock(
