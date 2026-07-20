@@ -35,6 +35,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Literal
@@ -236,89 +237,63 @@ class PurgeResult:
     detail: str | None = None
 
 
-def _run_delete_on_abandonable_thread(
-    fs: FileSystemPort, library_path: str
-) -> asyncio.Future[None]:
-    """Run ``fs.delete`` on a dedicated DAEMON thread, future-ifying its outcome.
+def _run_on_abandonable_thread[T](
+    operation: Callable[[], T], *, thread_name: str
+) -> asyncio.Future[T]:
+    """Run blocking filesystem work on a daemon thread and future-ify its result.
 
-    Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401):
-    ``to_thread`` borrows the event loop's default ``ThreadPoolExecutor``,
-    whose workers are non-daemon and are JOINED at interpreter shutdown (by
-    ``asyncio.run``'s ``shutdown_default_executor`` and again by
-    ``concurrent.futures``' atexit hook). A delete wedged on a dead mount
-    would therefore still block process exit forever even after
-    ``web.app``'s bounded shutdown wait has logged and "proceeded" — the
-    issue #401 bound would be honest only until the last line of ``main``. A
-    dedicated daemon thread is abandonable by construction: nothing ever
-    joins it, so a hung delete can outlive the bounded wait without
-    outliving the process. Abandonment at exit is equivalent to crashing
-    mid-delete, which the sweep's crash-recovery pass already handles (issue
-    #128's whole subject). Deletes are infrequent (eviction sweeps,
-    report-issue purges) and serialized per path by ``_ACTIVE_PURGE_PATHS``,
-    so a fresh thread per delete costs nothing worth pooling.
+    Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
+    default executor's non-daemon workers are joined during interpreter
+    teardown. Any filesystem operation that can touch a dead mount -- guard,
+    accounting, or delete -- must therefore use this abandonable substrate.
     """
     loop = asyncio.get_running_loop()
-    settled_outcome: asyncio.Future[None] = loop.create_future()
+    outcome: asyncio.Future[T] = loop.create_future()
 
-    def _deliver(error: BaseException | None) -> None:
-        # Settlement abandonment can leave the loop alive briefly while this
-        # callback is already queued. Nothing remains entitled to consume the
-        # worker outcome, so a completed/cancelled future is an expected late
-        # delivery, not an error to report from the event loop.
-        if settled_outcome.done():
+    def _deliver(result: T | None, error: BaseException | None) -> None:
+        # Shutdown abandonment can leave the loop alive briefly while this
+        # callback is already queued. Nobody remains entitled to consume a late
+        # result, so a completed future is expected rather than an error.
+        if outcome.done():
             return
         if error is None:
-            settled_outcome.set_result(None)
+            outcome.set_result(result)  # pyright: ignore[reportArgumentType]
         else:
-            settled_outcome.set_exception(error)
+            outcome.set_exception(error)
 
     def _worker() -> None:
+        result: T | None = None
         error: BaseException | None = None
         try:
-            fs.delete(library_path)
+            result = operation()
         except BaseException as exc:  # delivered to the awaiter, never swallowed
             error = exc
         # ``RuntimeError: Event loop is closed`` is the one expected late-
         # delivery failure after shutdown abandonment: nobody can consume the
         # outcome and crash recovery owns the disk state. Keep this guard at
-        # the thread-to-loop boundary rather than broadly suppressing worker
-        # failures, which are still delivered and classified while the loop is
-        # live (honesty over silence).
+        # the thread-to-loop boundary rather than suppressing worker failures,
+        # which are delivered unchanged while the loop is live.
         try:
-            loop.call_soon_threadsafe(_deliver, error)
+            loop.call_soon_threadsafe(_deliver, result, error)
         except RuntimeError:
             if not loop.is_closed():
                 raise
 
-    threading.Thread(target=_worker, name="purge-delete", daemon=True).start()
-    return settled_outcome
+    threading.Thread(target=_worker, name=thread_name, daemon=True).start()
+    return outcome
 
 
-async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
-    """Run ``fs.delete`` to completion, holding any caller cancellation until it does.
+def _run_delete_on_abandonable_thread(
+    fs: FileSystemPort, library_path: str
+) -> asyncio.Future[None]:
+    """Run ``fs.delete`` on the shared abandonable daemon-thread substrate."""
+    return _run_on_abandonable_thread(lambda: fs.delete(library_path), thread_name="purge-delete")
 
-    A plain awaited thread hand-off cancels by detaching the awaiting
-    coroutine — the ``rmtree``/unlink already handed to its thread keeps
-    running in the background regardless, since a thread cannot be
-    interrupted from outside. A bare await would let a cancelled
-    :func:`purge_library_path` unwind through its ``finally`` (releasing its
-    ``_ACTIVE_PURGE_PATHS`` registration) — and, transitively, let a
-    cancelled eviction sweep release ``_sweep_latch`` — while that background
-    thread is still mutating the filesystem. That is exactly the window issue
-    #128 exploits: a *later* sweep's crash-recovery pass can then stat the
-    still-present path, restore the row to ``available``, and watch the file
-    vanish out from under it a moment later when the orphaned delete finally
-    finishes.
 
-    The delete instead runs on its own daemon thread
-    (:func:`_run_delete_on_abandonable_thread`) whose outcome future is never
-    cancelled; this coroutine ``asyncio.shield``s a wait on that future's
-    completion, so a cancellation delivered here is caught and RE-DELIVERED
-    only once the worker has truly settled (success or error) — never before.
-    Every caller's registration release / ``finally`` therefore always
-    observes a settled filesystem, never a still-running delete.
-    """
-    worker: asyncio.Future[None] = _run_delete_on_abandonable_thread(fs, library_path)
+async def _await_worker_settlement[T](
+    worker: asyncio.Future[T], library_path: str, *, operation: str
+) -> T:
+    """Shield one abandonable filesystem worker through real or abandoned settlement."""
     settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     current_task = asyncio.current_task()
     if current_task is None:  # pragma: no cover - running coroutine always owns a task
@@ -326,7 +301,7 @@ async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
     _ACTIVE_SETTLEMENTS[settled] = (library_path, current_task)
     worker_error: BaseException | None = None
 
-    def _consume_worker_result(done: asyncio.Future[None]) -> None:
+    def _consume_worker_result(done: asyncio.Future[T]) -> None:
         nonlocal worker_error
         if not done.cancelled():
             worker_error = done.exception()
@@ -350,9 +325,10 @@ async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
             # sweep reconciles partial disk state exactly as after a crash
             # mid-delete (#128).
             _logger.warning(
-                "purge settlement abandoned during process shutdown while delete "
+                "purge settlement abandoned during process shutdown while %s "
                 "of %r was still active; crash recovery will reconcile the path "
                 "on next startup",
+                operation,
                 safe_text(library_path),
             )
             raise asyncio.CancelledError
@@ -371,7 +347,9 @@ async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
             raise asyncio.CancelledError
         if worker_error is not None:
             raise worker_error
+        return worker.result()
     finally:
+        was_abandoned = settled in _ABANDONED_SETTLEMENTS
         _ACTIVE_SETTLEMENTS.pop(settled, None)
         _ABANDONED_SETTLEMENTS.discard(settled)
         if worker.done():
@@ -379,8 +357,21 @@ async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
             # otherwise the normal callback above already consumed it.
             if not worker.cancelled():
                 worker.exception()
-        else:
+        elif not was_abandoned:
             worker.remove_done_callback(_consume_worker_result)
+
+
+async def _run_probe_to_settlement[T](
+    operation: Callable[[], T], library_path: str, *, operation_name: str
+) -> T:
+    worker = _run_on_abandonable_thread(operation, thread_name="purge-probe")
+    return await _await_worker_settlement(worker, library_path, operation=operation_name)
+
+
+async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
+    """Run delete to real settlement, except for process-shutdown abandonment."""
+    worker = _run_delete_on_abandonable_thread(fs, library_path)
+    await _await_worker_settlement(worker, library_path, operation="delete")
 
 
 async def purge_library_path(
@@ -389,11 +380,10 @@ async def purge_library_path(
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
     Both the size accounting and the delete are real, synchronous disk I/O
-    (``os.stat``/``os.walk``/``shutil.rmtree``), so each runs off the event loop:
-    the size accounting via ``asyncio.to_thread`` — mirroring every other
-    blocking FS primitive in the services layer (see ``eviction_service.
-    _size_bytes``/``_evict_one``) — and the delete on a dedicated abandonable
-    daemon thread (issue #401; see :func:`_run_delete_on_abandonable_thread`).
+    (``os.stat``/``os.walk``/``shutil.rmtree``), so all three filesystem phases
+    (guard, accounting, delete) run on dedicated abandonable daemon threads.
+    A dead mount can wedge any probe just as surely as the final delete, and a
+    default-executor worker would be rejoined by ``asyncio.run`` at teardown.
     The delete specifically goes through :func:`_delete_to_settlement`, which shields
     the wait so a caller's cancellation is never observed until the underlying
     delete thread has genuinely finished (issue #128) — the registration this
@@ -430,7 +420,11 @@ async def purge_library_path(
         # ``delete`` applies (the exact refusal decision, as a read-only query), so
         # this changes nothing for an in-root path -- it only short-circuits the
         # exact paths ``delete`` was always going to refuse.
-        if await asyncio.to_thread(fs.delete_guard_refuses, library_path):
+        if await _run_probe_to_settlement(
+            lambda: fs.delete_guard_refuses(library_path),
+            library_path,
+            operation_name="delete-guard probe",
+        ):
             return PurgeResult(
                 PurgeOutcome.refused, 0, "path resolves outside every configured library root"
             )
@@ -440,7 +434,11 @@ async def purge_library_path(
         # ADR-0012 / ADR-0014). A measurement failure is "unknown -> 0", never an
         # abort.
         try:
-            freed_bytes = await asyncio.to_thread(fs.reclaimable_bytes, library_path)
+            freed_bytes = await _run_probe_to_settlement(
+                lambda: fs.reclaimable_bytes(library_path),
+                library_path,
+                operation_name="reclaimable-bytes probe",
+            )
         except OSError:
             freed_bytes = 0
 

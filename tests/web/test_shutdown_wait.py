@@ -27,6 +27,48 @@ from plex_manager.services import purge_service
 from plex_manager.web import app as app_module
 
 
+class _BlockedProbeFileSystem(LocalFileSystem):
+    """Blocks before delete, in the root-guard probe phase."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__([str(root)])
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def delete_guard_refuses(self, path: str) -> bool:
+        self.started.set()
+        self.release.wait(timeout=5)
+        try:
+            return super().delete_guard_refuses(path)
+        finally:
+            self.finished.set()
+
+
+class _BlockedReclaimProbeFileSystem(LocalFileSystem):
+    """Allows the guard, then blocks in reclaimable-byte accounting."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__([str(root)])
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def reclaimable_bytes(self, path: str) -> int:
+        self.started.set()
+        self.release.wait(timeout=5)
+        try:
+            return super().reclaimable_bytes(path)
+        finally:
+            self.finished.set()
+
+
+class _FailingProbeFileSystem(LocalFileSystem):
+    def delete_guard_refuses(self, path: str) -> bool:
+        del path
+        raise OSError("probe failed")
+
+
 class _BlockedDeleteFileSystem(LocalFileSystem):
     """A real, root-guarded ``LocalFileSystem`` whose ``delete`` blocks (in its
     worker thread) until the test releases it -- lets a test cancel the
@@ -186,6 +228,115 @@ async def test_timeout_unblocks_request_scoped_settlement(
         await asyncio.gather(timeout_trigger, return_exceptions=True)
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
+async def test_request_settlement_is_abandoned_when_background_tasks_finish_fast(
+    tmp_path: Path,
+) -> None:
+    """P1-c: request purge abandonment is independent of a background timeout."""
+    target = tmp_path / "movies" / "Reported Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+    request_task = asyncio.create_task(_purge_worker(fs, str(target)))
+
+    async def _quick() -> None:
+        await asyncio.sleep(1000)
+
+    background_task = asyncio.create_task(_quick())
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        request_task.cancel()
+        background_task.cancel()
+        await asyncio.sleep(0)
+        assert not request_task.done()
+
+        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+            (background_task,), timeout_seconds=5.0
+        )
+
+        assert request_task.done()
+        assert request_task.cancelled()
+        assert not fs.finished.is_set()
+    finally:
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
+async def test_hung_pre_delete_probe_is_abandoned_at_shutdown(tmp_path: Path) -> None:
+    """P1-d: guard/size probes use abandonable workers and settlement tracking."""
+    target = tmp_path / "movies" / "Probe Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedProbeFileSystem(target.parent)
+    purge_task = asyncio.create_task(_purge_worker(fs, str(target)))
+
+    async def _quick() -> None:
+        await asyncio.sleep(1000)
+
+    background_task = asyncio.create_task(_quick())
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        purge_task.cancel()
+        background_task.cancel()
+        await asyncio.sleep(0)
+        assert not purge_task.done(), "probe cancellation must wait for shutdown abandonment"
+
+        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+            (background_task,), timeout_seconds=5.0
+        )
+
+        assert purge_task.done()
+        assert purge_task.cancelled()
+        assert not fs.finished.is_set()
+        assert purge_service.active_purge_paths() == ()
+    finally:
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
+async def test_hung_reclaimable_bytes_probe_is_abandoned_at_shutdown(tmp_path: Path) -> None:
+    """The second pre-delete probe uses the same abandonable settlement path."""
+    target = tmp_path / "movies" / "Size Probe Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedReclaimProbeFileSystem(target.parent)
+    purge_task = asyncio.create_task(_purge_worker(fs, str(target)))
+
+    async def _quick() -> None:
+        await asyncio.sleep(1000)
+
+    background_task = asyncio.create_task(_quick())
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        purge_task.cancel()
+        background_task.cancel()
+        await asyncio.sleep(0)
+        assert not purge_task.done()
+
+        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+            (background_task,), timeout_seconds=5.0
+        )
+
+        assert purge_task.done()
+        assert purge_task.cancelled()
+        assert not fs.finished.is_set()
+        assert purge_service.active_purge_paths() == ()
+    finally:
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
+async def test_live_pre_delete_probe_error_keeps_existing_classification(tmp_path: Path) -> None:
+    """P1-d: moving probes to daemon workers must preserve live-loop errors."""
+    target = tmp_path / "movies" / "Probe Error Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _FailingProbeFileSystem([str(target.parent)])
+
+    with pytest.raises(OSError, match="probe failed"):
+        await purge_service.purge_library_path(fs, str(target))
+    assert purge_service.active_purge_paths() == ()
 
 
 async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
