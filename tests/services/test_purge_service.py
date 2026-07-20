@@ -120,6 +120,16 @@ class _FailingFirstBlockedGuardFileSystem(_BlockedGuardFileSystem):
             raise OSError("blocked guard failed")
 
 
+def _install_abandonable_thread_gate(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
+    """Install a test-local physical-worker limit."""
+    monkeypatch.setattr(
+        purge_service,
+        "_ABANDONABLE_THREAD_GATE",
+        purge_service._AbandonableThreadGate(limit),  # pyright: ignore[reportPrivateUsage]
+        raising=False,
+    )
+
+
 async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -127,9 +137,7 @@ async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
     queued without creating another OS thread until one of those workers really
     finishes and returns its permit."""
     worker_limit = 2
-    monkeypatch.setattr(
-        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(worker_limit), raising=False
-    )
+    _install_abandonable_thread_gate(monkeypatch, worker_limit)
     root = tmp_path / "movies"
     root.mkdir()
     targets = [root / f"Blocked {index}.mkv" for index in range(worker_limit + 1)]
@@ -156,9 +164,7 @@ async def test_abandonable_thread_permit_waits_for_physical_completion_not_calle
 ) -> None:
     """Cancelling a settlement awaiter must not release its worker's permit while
     that daemon thread remains physically blocked on the mount."""
-    monkeypatch.setattr(
-        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
-    )
+    _install_abandonable_thread_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "First.mkv"
@@ -194,9 +200,7 @@ async def test_abandonable_thread_worker_exception_releases_its_permit(
 ) -> None:
     """A physically settled exception is still a settlement: its permit must be
     returned so the next queued worker can start."""
-    monkeypatch.setattr(
-        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
-    )
+    _install_abandonable_thread_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "Failing.mkv"
@@ -218,14 +222,46 @@ async def test_abandonable_thread_worker_exception_releases_its_permit(
     assert fs.started_count == 2
 
 
+def test_abandonable_thread_releases_permit_after_originating_loop_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that physically finishes after its originating loop closes must
+    return its process-wide permit for work submitted by a replacement loop."""
+    _install_abandonable_thread_gate(monkeypatch, 1)
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Late.mkv"
+    target.write_bytes(b"x")
+    fs = _BlockedGuardFileSystem(root, expected_starts=1)
+
+    old_loop = asyncio.new_event_loop()
+    late_worker = old_loop.run_until_complete(
+        purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
+            lambda: fs.delete_guard_refuses(str(target)), thread_name="purge-test-late"
+        )
+    )
+    assert fs.expected_started.wait(timeout=2.0)
+    late_worker.cancel()
+    old_loop.close()
+
+    fs.release.set()
+    assert fs.finished.wait(timeout=2.0)
+
+    async def _run_after_loop_restart() -> None:
+        worker = await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
+            lambda: None, thread_name="purge-test-restarted"
+        )
+        await worker
+
+    asyncio.run(asyncio.wait_for(_run_after_loop_restart(), timeout=2.0))
+
+
 async def test_shutdown_abandonment_cancels_a_waiter_when_thread_gate_is_saturated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A saturated substrate leaves later callers on a plain cancellable gate
     await, while shutdown abandonment still releases the active settlement."""
-    monkeypatch.setattr(
-        purge_service, "_ABANDONABLE_THREAD_GATE", asyncio.Semaphore(1), raising=False
-    )
+    _install_abandonable_thread_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "Active.mkv"

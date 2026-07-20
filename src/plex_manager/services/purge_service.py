@@ -88,7 +88,58 @@ forbidden because its non-daemon workers are joined at interpreter exit, which
 would reintroduce the shutdown hang this substrate exists to prevent (issue
 #417 / PR #406).
 """
-_ABANDONABLE_THREAD_GATE = asyncio.Semaphore(_ABANDONABLE_THREAD_LIMIT)
+_ABANDONABLE_THREAD_GATE_POLL_SECONDS: Final = 0.01
+
+
+class _AbandonableThreadGate:
+    """Thread-safe physical-worker permits with a cancellable asyncio wait.
+
+    The permit store must outlive any one event loop: an abandoned daemon worker
+    can finish after its originating loop closes, and its foreign thread cannot
+    safely release an :class:`asyncio.Semaphore`. A bounded threading semaphore
+    makes physical completion safe on that thread. The non-blocking poll keeps
+    queued callers on ordinary cancellable asyncio awaits without consuming an
+    executor thread that cancellation could strand (issue #417).
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._semaphore = threading.BoundedSemaphore(limit)
+
+    async def acquire(self) -> _AbandonableThreadPermit:
+        """Wait cancellably and return one idempotent permit token."""
+        while not self._semaphore.acquire(blocking=False):
+            await asyncio.sleep(_ABANDONABLE_THREAD_GATE_POLL_SECONDS)
+        return _AbandonableThreadPermit(self)
+
+    def release_permit(self) -> None:
+        """Return a permit from either an event-loop or worker thread."""
+        self._semaphore.release()
+
+
+class _AbandonableThreadPermit:
+    """Release one gate permit at most once across competing terminal paths.
+
+    The worker-completion and thread-start-failure paths are mutually exclusive
+    today. The lock is deliberate defense in depth: release can originate from a
+    foreign daemon thread after loop teardown, so future control-flow changes
+    must not turn an accidental second release into substrate-cap corruption.
+    """
+
+    def __init__(self, gate: _AbandonableThreadGate) -> None:
+        self._gate = gate
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        """Return the permit exactly once; later release attempts are no-ops."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._gate.release_permit()
+
+
+_ABANDONABLE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_THREAD_LIMIT)
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -262,17 +313,17 @@ async def _run_on_abandonable_thread[T](
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
-    permit belongs to that worker until :func:`_deliver` runs on PHYSICAL
-    completion -- caller cancellation or settlement abandonment must never make
-    room for another thread while the original remains wedged (issue #417).
+    permit belongs to that worker until its physical completion ``finally``
+    releases the thread-safe token -- caller cancellation or settlement
+    abandonment must never make room for another thread while the original
+    remains wedged (issue #417).
     """
     gate = _ABANDONABLE_THREAD_GATE
-    await gate.acquire()
+    permit = await gate.acquire()
     loop = asyncio.get_running_loop()
     outcome: asyncio.Future[T] = loop.create_future()
 
     def _deliver(result: T | None, error: BaseException | None) -> None:
-        gate.release()
         # Shutdown abandonment can leave the loop alive briefly while this
         # callback is already queued. Nobody remains entitled to consume a late
         # result, so a completed future is expected rather than an error.
@@ -300,11 +351,13 @@ async def _run_on_abandonable_thread[T](
         except RuntimeError:
             if not loop.is_closed():
                 raise
+        finally:
+            permit.release()
 
     try:
         threading.Thread(target=_worker, name=thread_name, daemon=True).start()
     except BaseException:
-        gate.release()
+        permit.release()
         raise
     return outcome
 
