@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useImportDownload, useMarkFailed, useQueue, useRelocateDownload } from '../api/hooks'
 import type { QueueItem } from '../api/types'
 import { cn } from '../lib/cn'
@@ -131,11 +131,17 @@ export function Queue() {
   const pendingItem = pending ? (items.find((item) => item.id === pending.downloadId) ?? null) : null
   const pendingActionable = pendingItem !== null && isMarkFailableStatus(pendingItem.status)
 
-  useEffect(() => {
-    if (pending && !pendingActionable) {
-      setPending(null)
-    }
-  }, [pending, pendingActionable])
+  // Auto-dismiss the confirm dialog if its target stops being actionable
+  // (e.g. the item finished importing while the dialog was open). Applied
+  // directly in render -- React's "adjusting state when a prop changes"
+  // pattern (https://react.dev/learn/you-might-not-need-an-effect) -- rather
+  // than in a useEffect, so the invalid state is corrected in the SAME commit
+  // instead of committing one stale (dialog still open) render first
+  // (react-hooks/set-state-in-effect). `pending` is falsy on the very next
+  // render, so this cannot loop.
+  if (pending && !pendingActionable) {
+    setPending(null)
+  }
 
   async function runConfirm() {
     if (!pending || !pendingItem || !isMarkFailableStatus(pendingItem.status)) {
