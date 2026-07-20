@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
@@ -119,6 +120,8 @@ from plex_manager.web.setup_validation import (
 )
 
 __all__ = ["router", "secret_rotation"]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/v1/settings",
@@ -242,6 +245,90 @@ async def _rewrite_before_secret_replacement(
     )
 
 
+async def _cancellation_checkpoint() -> None:
+    """Give any already-pending cancellation of this task a place to land NOW.
+
+    A zero-delay checkpoint (``await asyncio.sleep(0)`` raises the pending
+    ``CancelledError``, if any, and otherwise merely yields one scheduler
+    tick). :func:`secret_rotation` awaits this immediately before launching
+    the non-cancellable commit unit -- the boundary's deliberate point of no
+    return (codex #399 round 3): a caller that has already disconnected fails
+    safe *here*, before anything durable can land, instead of having a
+    credential rotation committed whose response can no longer be delivered.
+    A named helper (not an inline ``sleep(0)``) so tests can pin the exact
+    interleaving deterministically.
+    """
+    await asyncio.sleep(0)
+
+
+async def _rollback_to_completion(session: AsyncSession) -> None:
+    """Run ``session.rollback()`` to completion even across request cancellation.
+
+    ``asyncio.shield`` alone keeps the rollback RUNNING but re-raises the
+    ``CancelledError`` to this frame immediately (codex #399 round 4): the
+    cancelled request then unwinds out of the endpoint and ``get_session``'s
+    dependency scope closes the very session the still-running rollback is
+    using -- a close/rollback race on the underlying aiosqlite connection in
+    exactly the write-lock cancellation path the shielding exists to protect.
+    So every rollback in the boundary instead runs as a task that is AWAITED
+    TO COMPLETION: a cancellation delivered while waiting is remembered and
+    re-raised only after the task settles (the same remember-and-re-raise
+    protocol as the commit unit in :func:`secret_rotation`, including
+    cancellation winning over a rollback failure with the failure logged and
+    chained), so the session never leaves this frame with a DB op still in
+    flight.
+    """
+    rollback_task = asyncio.ensure_future(session.rollback())
+    pending_cancel: asyncio.CancelledError | None = None
+    while not rollback_task.done():
+        try:
+            # ``asyncio.wait`` -- not ``shield`` -- for the same single-consumer
+            # reason as the commit unit: observe completion without retrieving
+            # the outcome, absorb the request's cancellation without ever
+            # cancelling the rollback itself.
+            await asyncio.wait({rollback_task})
+        except asyncio.CancelledError as exc:
+            pending_cancel = exc
+    rollback_error = rollback_task.exception()
+    if rollback_error is not None:
+        if pending_cancel is not None:
+            _logger.error(
+                "session rollback failed while the request was being cancelled",
+                exc_info=rollback_error,
+            )
+            raise pending_cancel from rollback_error
+        raise rollback_error
+    if pending_cancel is not None:
+        raise pending_cancel
+
+
+async def _commit_and_complete(
+    session: AsyncSession,
+    handler: LogCaptureHandler,
+    previous_values: frozenset[str],
+    *,
+    retiring_values: frozenset[str],
+) -> None:
+    """Read the post-write secret set, commit, then run the completion sweep.
+
+    The one indivisible unit :func:`secret_rotation` protects from cancellation
+    (issue #389 facet 1): the ``secret_values()`` read sees this
+    request's flushed-but-uncommitted new values, the commit makes them durable,
+    and only then does :meth:`~plex_manager.services.log_capture_service.
+    LogCaptureHandler.complete_secret_rotation` rewrite the queue/ring and narrow
+    the capture snapshot. There is no ``await`` between the commit landing and
+    the sweep, so a cancellation can never wedge itself between "commit durable"
+    and "retired value swept from the live surfaces". A commit FAILURE propagates
+    to the caller, which rolls back and restores the snapshot exactly like a
+    pre-commit failure -- nothing durable landed, so the sweep must NOT run.
+    """
+    current_values = await SettingsStore(session).secret_values()
+    await session.commit()
+    handler.complete_secret_rotation(
+        previous_values, current_values, retired_values=retiring_values
+    )
+
+
 @asynccontextmanager
 async def secret_rotation(
     session: AsyncSession,
@@ -249,6 +336,9 @@ async def secret_rotation(
     *,
     retiring_values: frozenset[str],
     incoming_values: frozenset[str] = frozenset(),
+    reread_retiring: Callable[[AsyncSession], Awaitable[frozenset[str]]] | None = None,
+    pre_rewrite: Callable[[], Awaitable[None]] | None = None,
+    on_committed: Callable[[], None] | None = None,
 ) -> AsyncGenerator[None]:
     """The single transactional boundary for every in-scope secret mutation (ADR-0026).
 
@@ -261,45 +351,252 @@ async def secret_rotation(
     ``incoming_values`` are new values the body is about to write (so in-flight
     emits mask them before they are committed).
 
-    NOTE the in-lock ``session.rollback()`` below: any row writes the caller
-    staged BEFORE entering are discarded -- the ``yield`` body must (re)apply
-    every write it wants committed, in the boundary's fresh transaction.
+    Three properties this boundary guarantees BY CONSTRUCTION (issue #389),
+    so the "stale pre-lock state / pending inserts / cancel mid-commit" finding
+    family cannot recur facet-by-facet:
+
+    a. **Entered clean.** The caller's pre-lock transaction is rolled back
+       BEFORE contending for the lock, so no request ever holds an open DB write
+       transaction while awaiting ``secret_rotation_lock``. On SQLite a held
+       writer would otherwise deadlock-until-busy-timeout against a drain tick
+       that already holds this lock and needs to write (facet 3). Any row writes
+       the caller staged before entering are therefore discarded -- the
+       ``yield`` body must (re)apply every write it wants committed.
+
+    b. **Re-read under the lock.** All rotation-relevant state is read AFTER the
+       lock is held, in a fresh transaction that observes whatever committed
+       while we waited. ``reread_retiring``, when given, re-derives the CURRENT
+       retiring value under the lock (facet 2) rather than trusting the caller's
+       possibly-stale pre-lock read; the ``yield`` body is where a caller
+       re-reads settings and re-evaluates any access decision (facet 4).
+
+    c. **Protected commit + cleanup.** The post-write ``secret_values()`` read,
+       the commit, and the completion sweep run as one non-cancellable unit
+       (:func:`_commit_and_complete`, awaited to completion below with any
+       request cancellation remembered and re-raised only afterwards), so a
+       cancellation that arrives once the commit is durable can never skip the
+       sweep and strand a retired value in the queue/ring after it has left
+       ``secret_values()`` (facet 1).
+
+    Two caller hooks extend those properties to work the caller cannot place
+    correctly from outside (codex #399 round 4). ``pre_rewrite`` runs under
+    the lock in the fresh post-lock transaction but BEFORE the historical
+    rewrite stages any writes -- for in-lock work that may block on live I/O
+    (the sign-in access recompute's ``/identity`` probe) and must therefore
+    never run while the transaction holds SQLite's writer lock. It is part of
+    (b), so a caller re-evaluating an access decision does it against
+    post-lock state. ``on_committed`` is a SYNCHRONOUS callback run once the
+    commit unit has succeeded, BEFORE a remembered cancellation is honored --
+    the home for must-run post-commit invalidations (SSE stream closes, cache
+    invalidations, realtime publishes) that a disconnect-during-commit would
+    otherwise skip, since the re-raise happens before control ever returns to
+    the code after ``async with secret_rotation(...)``.
+
+    **Point of no return / known residual.** Immediately before the commit
+    unit launches, :func:`_cancellation_checkpoint` gives any already-pending
+    cancellation one final place to land -- a caller that has already
+    disconnected fails SAFE (rollback, snapshot restored, old credential still
+    valid) rather than having a rotation committed whose response can no
+    longer be delivered (``POST /app-key/rotate`` returns the new key exactly
+    once). Once the unit has genuinely started it is deliberately unstoppable:
+    a cancellation arriving mid-commit still lands the rotation atomically --
+    the inherent residual of atomic credential rotation, since tearing the
+    unit apart is the strictly worse failure. For the app-key rotate shape the
+    operational recovery is the admin-session reveal path (``GET /app-key``
+    with a Plex-session admin); a two-phase old-key-grace design could remove
+    the residual entirely but is future hardening, not this boundary's scope.
     """
     handler = _log_handler(request)
+    # (a) Release any pre-lock write transaction BEFORE we start waiting on the
+    # lock -- see property (a) above. Run TO COMPLETION (codex #399 rounds 3-4):
+    # a cancellation delivered during this await must neither interrupt the
+    # rollback's DB op mid-flight (a half-cancelled aiosqlite rollback closes
+    # the connection and poisons the shared boundary) NOR unwind the request
+    # while the rollback still runs (``get_session`` would close the session
+    # under it -- see :func:`_rollback_to_completion`). The re-raised
+    # CancelledError still cancels the request (nothing is staged or widened
+    # yet); it just waits for the rollback to settle first.
+    await _rollback_to_completion(session)
     async with deps.secret_rotation_lock.value:
-        # End the request's pre-lock transaction (the same idiom the /logs read
-        # endpoints use): the drain loop may have held the lock first and
-        # committed rows carrying the retiring value AFTER this session already
-        # began reading -- a retained pre-lock snapshot would let the rewrite
-        # below miss those rows, and the final secret_values() read would
-        # regress the handler snapshot to stale values. The rewrite, the
-        # caller's writes, and the final read then share ONE fresh transaction,
-        # committed once -- the write/rewrite atomicity is unchanged.
-        await session.rollback()
+        # (b) Fresh transaction under the lock. The pre-lock rollback already
+        # ended the caller's transaction; this belt-and-suspenders rollback keeps
+        # the "every read below is post-lock and fresh" contract explicit and
+        # robust to a future caller that touches the session between (a) and here.
+        # Run to completion for the same reason as every other rollback in this
+        # boundary: a cancellation must neither tear the DB op nor leave it
+        # racing the dependency scope's session close.
+        await _rollback_to_completion(session)
+        if pre_rewrite is not None:
+            # Caller work that must run under the lock, in the fresh post-lock
+            # transaction, but BEFORE the historical rewrite stages any writes
+            # (codex #399 round 4): the sign-in path's in-boundary access
+            # recompute can wait on a live Plex ``/identity`` probe for several
+            # seconds, and running it after the rewrite's flush would hold
+            # SQLite's writer lock for the whole probe -- concurrent writers
+            # would surface ``database is locked`` while this caller is only
+            # trying to fail closed. A failure here propagates before anything
+            # was staged or widened: no rollback, no snapshot restore needed.
+            await pre_rewrite()
+        if reread_retiring is not None:
+            retiring_values = await reread_retiring(session)
         transition_values = (
             (await SettingsStore(session).secret_values()) | retiring_values | incoming_values
         )
-        previous_values = handler.begin_secret_rotation(transition_values)
+        previous_values = handler.begin_secret_rotation(
+            transition_values, retiring_values=retiring_values
+        )
         try:
             await _rewrite_before_secret_replacement(session, retiring_values)
             yield
-            current_values = await SettingsStore(session).secret_values()
-            await session.commit()
+            # POINT OF NO RETURN (codex #399 round 3). A cancellation already
+            # pending against this request must land HERE, before the commit
+            # unit launches: several rotations return the new credential in
+            # the response exactly once (``POST /app-key/rotate`` -- a
+            # recovery-only caller holds no other credential), so committing a
+            # rotation for a caller that has already disconnected would revoke
+            # the old credential with the replacement undeliverable. Landing
+            # the cancellation here takes the existing fail-safe handler below:
+            # rollback, snapshot restored, old credential still valid.
+            await _cancellation_checkpoint()
         except asyncio.CancelledError:
-            # Restore the in-memory snapshot first (synchronous, always runs),
-            # then SHIELD the rollback so its DB op completes instead of being
-            # cancelled mid-flight -- a half-cancelled aiosqlite rollback closes
-            # the connection and poisons the shared boundary for the drain loop.
+            # Cancelled BEFORE the commit unit began (during the rewrite, the
+            # caller's body, or the final pre-commit checkpoint): nothing
+            # durable landed. Restore the in-memory snapshot first
+            # (synchronous, always runs), then run the rollback TO COMPLETION
+            # so its DB op is neither cancelled mid-flight (a half-cancelled
+            # aiosqlite rollback closes the connection and poisons the shared
+            # boundary for the drain loop) nor left racing the dependency
+            # scope's session close after this handler re-raises.
             handler.abort_secret_rotation(previous_values)
-            await asyncio.shield(session.rollback())
+            await _rollback_to_completion(session)
             raise
         except Exception:
-            await session.rollback()
+            # Same discipline as the cancel handler above (codex #399 round
+            # 5): restore the snapshot first (synchronous, always runs), then
+            # drive the rollback to completion. A client disconnect landing
+            # while a plain ``session.rollback()`` awaited would cancel the
+            # rollback mid-flight -- the exact rollback-vs-session-close race
+            # ``_rollback_to_completion`` exists to prevent -- and would bury
+            # the real failure behind the ``CancelledError``. If a
+            # cancellation does arrive during the rollback, the helper
+            # re-raises it only after the rollback settles, with this
+            # failure chained as its ``__context__``.
             handler.abort_secret_rotation(previous_values)
+            await _rollback_to_completion(session)
             raise
-        handler.complete_secret_rotation(
-            previous_values, current_values, retired_values=retiring_values
+        # (c) Commit + completion sweep as one non-cancellable unit. A
+        # cancellation delivered while this runs is REMEMBERED and re-raised only
+        # AFTER the unit finishes, so the commit and its sweep are never torn
+        # apart. ``ensure_future`` gives a single stable task to re-await across
+        # repeated cancellations; the loop exits only when it is ``done()``.
+        #
+        # ``asyncio.wait`` -- deliberately NOT ``asyncio.shield`` -- observes the
+        # unit's completion WITHOUT retrieving its outcome and WITHOUT
+        # propagating cancellation into it (cancelling this await leaves
+        # ``commit_task`` running untouched, the same protection shield gave).
+        # ``shield`` would additionally re-raise the unit's exception out of
+        # whichever await happened to be watching, and -- once a previous await
+        # had been cancelled -- have its internal done-callback report
+        # "exception in shielded future" through the loop's exception handler: a
+        # second, unordered consumption path for the same outcome. With ``wait``
+        # the unit's outcome has exactly ONE consumer, the check below.
+        commit_task = asyncio.ensure_future(
+            _commit_and_complete(session, handler, previous_values, retiring_values=retiring_values)
         )
+        pending_cancel: asyncio.CancelledError | None = None
+        while not commit_task.done():
+            try:
+                await asyncio.wait({commit_task})
+            except asyncio.CancelledError as exc:
+                # The REQUEST was cancelled, never the unit: remember it and
+                # keep waiting for the unit to settle.
+                pending_cancel = exc
+        # Consume the unit's outcome exactly once, HERE, by inspecting the task
+        # itself -- never by trusting what some await happened to re-raise
+        # (codex #399 round 1). The interleaving that made this mandatory: a
+        # cancellation is remembered above while the unit is still in flight,
+        # then the unit FAILS -- the loop exits via its ``done()`` condition
+        # without any await having raised the failure. Falling through to
+        # ``raise pending_cancel`` at that point would skip the rollback +
+        # snapshot restore (leaving the in-memory redaction set widened with
+        # the rotation rolled back) AND bury the real commit failure behind a
+        # silent cancellation (an "exception was never retrieved" warning at
+        # best) -- both honesty violations. ``commit_task`` itself is never
+        # cancelled (nothing cancels it; the awaits above absorb the request's
+        # cancellation), so ``exception()`` cannot raise ``CancelledError``.
+        unit_error = commit_task.exception()
+        if unit_error is not None:
+            # Commit (or the pre-commit read) failed: no rotation landed. The
+            # sweep inside the unit never ran. Restore the in-memory snapshot
+            # FIRST -- synchronous, so it runs even when a delivered
+            # cancellation is being re-raised at every await below (an anyio
+            # cancel scope re-cancels each checkpoint until the request task
+            # unwinds).
+            handler.abort_secret_rotation(previous_values)
+            if pending_cancel is None:
+                # Drive this rollback to completion too (codex #399 round 5):
+                # a client disconnect landing while a plain rollback awaited
+                # here would cancel it mid-flight (the session/close race
+                # again) and hide ``unit_error`` behind the CancelledError.
+                try:
+                    await _rollback_to_completion(session)
+                except asyncio.CancelledError as exc:
+                    # The cancellation arrived DURING the rollback: from here
+                    # the both-happened protocol below applies -- surface the
+                    # commit failure through the durable log first, then let
+                    # the cancellation win the re-raise with the failure
+                    # chained as its cause.
+                    _logger.error(
+                        "secret rotation commit failed while the request was "
+                        "being cancelled; the rotation was rolled back",
+                        exc_info=unit_error,
+                    )
+                    raise exc from unit_error
+                except Exception as rollback_error:
+                    # The rollback ALSO failed on top of the commit failure.
+                    # The commit failure stays the primary error, with the
+                    # rollback failure chained onto it (a plain propagate here
+                    # would replace it and bury the reason the operator
+                    # actually needs).
+                    raise unit_error from rollback_error
+                raise unit_error
+            # BOTH happened: the request was cancelled AND the unit failed.
+            # Cancellation must still win the re-raise -- the server's task
+            # machinery expects a cancelled request task to end cancelled, and
+            # replacing the CancelledError with another exception would break
+            # that protocol mid-teardown. But a bare CancelledError is exactly
+            # the silent path cancelled requests get (nothing renders it), so
+            # the failure is surfaced FIRST through the durable log pipeline
+            # (state, not silence; synchronous, immune to the re-delivery),
+            # and chained as the cancellation's cause for any consumer that
+            # does render the traceback.
+            _logger.error(
+                "secret rotation commit failed while the request was being "
+                "cancelled; the rotation was rolled back",
+                exc_info=unit_error,
+            )
+            # Run the rollback TO COMPLETION even though this very await is
+            # (re-)cancelled under the caller's cancel scope -- the same
+            # pattern as the pre-yield cancel handler above. When the scope
+            # re-cancels here, the CancelledError re-raised after the rollback
+            # settles IS the honored cancellation (cleanup already done);
+            # otherwise the explicit re-raise below honors the remembered one.
+            await _rollback_to_completion(session)
+            raise pending_cancel from unit_error
+        # The rotation COMMITTED. Run the caller's must-run post-commit
+        # invalidations (SSE stream closes, cache invalidations, realtime
+        # publishes) HERE, before any remembered cancellation is honored
+        # (codex #399 round 4): re-raising first would skip the code after
+        # ``async with secret_rotation(...)`` in the caller, leaving
+        # already-open revoked streams live until their lease catches up and
+        # clients holding stale state -- with the DB change already durable.
+        # The callback is deliberately SYNCHRONOUS (``() -> None``): with no
+        # await inside it, a pending cancellation has nowhere to land until it
+        # finishes, so it runs to completion by construction.
+        if on_committed is not None:
+            on_committed()
+        if pending_cancel is not None:
+            raise pending_cancel
 
 
 def _observed_app_key(request: Request, auth: AuthContext, system: SystemSettings) -> str | None:
@@ -832,6 +1129,19 @@ async def rotate_app_key_endpoint(
         new_key = secrets.token_urlsafe(_API_KEY_BYTES)
         old_key = system.app_api_key
         retired_values = frozenset({old_key}) if old_key is not None else frozenset[str]()
+
+        # Must-run post-commit invalidations, handed to the boundary so a
+        # disconnect-during-commit cannot skip them (codex #399 round 4): once
+        # the rotation is durable, every OTHER holder of the old key must lose
+        # its already-open streams NOW, not when its lease catches up.
+        def _post_commit_invalidations() -> None:
+            close_realtime_streams(
+                request.app,
+                reason="app_key_rotated",
+                auth_method=AuthMethod.api_key.value,
+            )
+            publish_realtime(request.app, ("access",), reason="app_key_rotated")
+
         # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
         # that is safe because every app-key writer holds ``_rotate_lock``
         # (held here), so the DB value cannot move under us.
@@ -840,6 +1150,7 @@ async def rotate_app_key_endpoint(
             request,
             retiring_values=retired_values,
             incoming_values=frozenset({new_key}),
+            on_committed=_post_commit_invalidations,
         ):
             # Re-read the row in the boundary's FRESH transaction: the rollback
             # expired the pre-lock instance, and on a pathological
@@ -854,12 +1165,8 @@ async def rotate_app_key_endpoint(
             await _revoke_recovery_sessions(
                 session, exempt_token_hash=_acting_recovery_session_hash(request, auth)
             )
-    close_realtime_streams(
-        request.app,
-        reason="app_key_rotated",
-        auth_method=AuthMethod.api_key.value,
-    )
-    publish_realtime(request.app, ("access",), reason="app_key_rotated")
+    # The invalidations already ran inside the boundary (``on_committed``);
+    # only response construction remains out here.
     _set_no_store_headers(response)
     return AppApiKeyResponse(app_api_key=new_key)
 
@@ -903,27 +1210,40 @@ async def revoke_app_key_endpoint(
             await session.refresh(system)
             if system.app_api_key is not None and not api_key_matches(observed, system.app_api_key):
                 raise HTTPException(status_code=409, detail="app_key_changed")
+
+        # Must-run post-commit invalidations (codex #399 round 4): on the
+        # rotation path the boundary runs these once the revoke is durable,
+        # so a disconnect-during-commit cannot leave revoked-key streams open;
+        # the keyless no-op path below calls it directly after its commit.
+        def _post_commit_invalidations() -> None:
+            close_realtime_streams(
+                request.app,
+                reason="app_key_revoked",
+                auth_method=AuthMethod.api_key.value,
+            )
+            publish_realtime(request.app, ("access",), reason="app_key_revoked")
+
         old_key = system.app_api_key
         if old_key is None:
             system.app_api_key = None
             await _revoke_recovery_sessions(session)
             await session.commit()
+            _post_commit_invalidations()
         else:
             # ``old_key`` was read before ``_secret_rotation``'s in-lock rollback;
             # safe for the same reason as the rotate path -- every app-key
             # writer holds ``_rotate_lock`` (held here).
-            async with secret_rotation(session, request, retiring_values=frozenset({old_key})):
+            async with secret_rotation(
+                session,
+                request,
+                retiring_values=frozenset({old_key}),
+                on_committed=_post_commit_invalidations,
+            ):
                 # Re-read in the boundary's fresh transaction (see the rotate
                 # path's comment).
                 await session.refresh(system)
                 system.app_api_key = None
                 await _revoke_recovery_sessions(session)
-    close_realtime_streams(
-        request.app,
-        reason="app_key_revoked",
-        auth_method=AuthMethod.api_key.value,
-    )
-    publish_realtime(request.app, ("access",), reason="app_key_revoked")
 
 
 async def _verify_plex_repoint(
@@ -1218,8 +1538,11 @@ async def put_settings_endpoint(
         # that waited behind another PUT cannot retain a pre-lock database
         # snapshot while validating its effective destination/credential pair.
         # The dependencies leave only primitive AuthContext data and make no
-        # writes, so rolling their read transaction back is safe.
-        await session.rollback()
+        # writes, so rolling their read transaction back is safe. Driven to
+        # completion like every other rollback in this module: a client
+        # disconnect landing mid-rollback must not tear the DB op and leave it
+        # racing the dependency scope's session close.
+        await _rollback_to_completion(session)
         await _validate_disk_pressure_pair(body, session)
         await _validate_update_window_pair(body, session)
 
@@ -1282,75 +1605,90 @@ async def put_settings_endpoint(
                         .values(revoked_at=datetime.now(UTC))
                     )
 
+        def _post_commit_invalidations() -> None:
+            """Every must-run invalidation once THIS PUT's writes are durable.
+
+            On the secret-rotation path the boundary runs this via
+            ``on_committed`` (codex #399 round 4) so a disconnect-during-commit
+            cannot skip it -- a verified repoint would otherwise leave
+            old-server Plex-session streams open and probe caches stale with
+            the repoint already committed. The plain path calls it directly
+            after its own commit. Reads ``written_fields`` /
+            ``plex_identity_changed`` at CALL time, after ``write_settings``
+            has populated them.
+            """
+            # A long configured interval must not postpone an enable/shorten
+            # change -- nor a Plex identity change's snapshot cleanup -- until
+            # the old sleep expires. BOTH identity-change shapes need the
+            # immediate wake: a verified repoint (new machine identifier)
+            # leaves old-server tokens STALE for the new server and the
+            # watchlist worker is what clears their snapshots (#296); an
+            # UNVERIFIABLE change (an explicit clear / incomplete pair, which
+            # dropped the cached anchor above) leaves the install truly
+            # unconfigured, and the worker's not_configured branch is what
+            # clears the now-orphaned snapshot rows (#327) -- without the wake
+            # they keep protecting titles from eviction until the next
+            # scheduled tick (hours/days away) despite the operator explicitly
+            # walking away from Plex. The worker owns this process-local event.
+            if plex_identity_changed or written_fields.intersection(
+                {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
+            ):
+                wake_event = getattr(request.app.state, "watchlist_wake_event", None)
+                if isinstance(wake_event, asyncio.Event):
+                    wake_event.set()
+
+            # Same immediacy for the auto-grab worker (issue #332): a shortened
+            # interval, a changed per-cycle search cap, or a re-enable must be
+            # observed on the next tick, not after the OLD (up to 1h) sleep
+            # expires. ``_autograb_loop`` re-reads all three fresh when woken;
+            # the worker owns this process-local event.
+            if written_fields.intersection(
+                {
+                    "auto_grab_enabled",
+                    "auto_grab_interval_seconds",
+                    "auto_grab_max_searches_per_cycle",
+                }
+            ):
+                autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
+                if isinstance(autograb_wake_event, asyncio.Event):
+                    autograb_wake_event.set()
+
+            # Clear backend probe caches before publishing: a listening tab can
+            # refetch immediately on the SSE event, so publishing first could
+            # race it into the stale pre-update health snapshot.
+            for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
+                if written_fields.intersection(fields):
+                    health_cache.invalidate(subsystem)
+
+            if plex_identity_changed and machine_identifier is not None:
+                close_realtime_streams(
+                    request.app,
+                    reason="plex_server_repointed",
+                    auth_method=AuthMethod.plex_session.value,
+                )
+            if written_fields or plex_identity_changed:
+                topics = ["settings", "ops:health"]
+                if written_fields.intersection(_UPDATE_POLICY_FIELDS):
+                    topics.append("updates")
+                publish_realtime(
+                    request.app,
+                    tuple(topics),
+                    reason="settings_updated",
+                )
+
         if changing_secret_fields:
             async with secret_rotation(
                 session,
                 request,
                 retiring_values=old_secret_values,
                 incoming_values=incoming_secret_values,
+                on_committed=_post_commit_invalidations,
             ):
                 await write_settings()
         else:
             await write_settings()
             await session.commit()
-
-        # A long configured interval must not postpone an enable/shorten change --
-        # nor a Plex identity change's snapshot cleanup -- until the old sleep
-        # expires. BOTH identity-change shapes need the immediate wake: a verified
-        # repoint (new machine identifier) leaves old-server tokens STALE for the
-        # new server and the watchlist worker is what clears their snapshots
-        # (#296); an UNVERIFIABLE change (an explicit clear / incomplete pair,
-        # which dropped the cached anchor above) leaves the install truly
-        # unconfigured, and the worker's not_configured branch is what clears the
-        # now-orphaned snapshot rows (#327) -- without the wake they keep
-        # protecting titles from eviction until the next scheduled tick
-        # (hours/days away) despite the operator explicitly walking away from
-        # Plex. The worker owns this process-local event.
-        if plex_identity_changed or written_fields.intersection(
-            {"watchlist_sync_enabled", "watchlist_sync_interval_minutes"}
-        ):
-            wake_event = getattr(request.app.state, "watchlist_wake_event", None)
-            if isinstance(wake_event, asyncio.Event):
-                wake_event.set()
-
-        # Same immediacy for the auto-grab worker (issue #332): a shortened
-        # interval, a changed per-cycle search cap, or a re-enable must be
-        # observed on the next tick, not after the OLD (up to 1h) sleep expires.
-        # ``_autograb_loop`` re-reads all three fresh when woken; the worker owns
-        # this process-local event.
-        if written_fields.intersection(
-            {
-                "auto_grab_enabled",
-                "auto_grab_interval_seconds",
-                "auto_grab_max_searches_per_cycle",
-            }
-        ):
-            autograb_wake_event = getattr(request.app.state, "autograb_wake_event", None)
-            if isinstance(autograb_wake_event, asyncio.Event):
-                autograb_wake_event.set()
-
-        # Clear backend probe caches before publishing: a listening tab can refetch
-        # immediately on the SSE event, so publishing first could race it into the
-        # stale pre-update health snapshot.
-        for subsystem, fields in _SUBSYSTEM_CREDENTIAL_FIELDS.items():
-            if written_fields.intersection(fields):
-                health_cache.invalidate(subsystem)
-
-        if plex_identity_changed and machine_identifier is not None:
-            close_realtime_streams(
-                request.app,
-                reason="plex_server_repointed",
-                auth_method=AuthMethod.plex_session.value,
-            )
-        if written_fields or plex_identity_changed:
-            topics = ["settings", "ops:health"]
-            if written_fields.intersection(_UPDATE_POLICY_FIELDS):
-                topics.append("updates")
-            publish_realtime(
-                request.app,
-                tuple(topics),
-                reason="settings_updated",
-            )
+            _post_commit_invalidations()
 
         return await _redacted(store)
 
