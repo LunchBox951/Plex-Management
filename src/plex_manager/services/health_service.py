@@ -652,13 +652,17 @@ def read_disk_usage(path: str) -> DiskUsage:
 
     Synchronous (a plain ``statvfs`` syscall under the hood) — a hung/
     unresponsive NFS/SMB mount can stall this call indefinitely, so every
-    ``async def`` caller MUST run it via ``await asyncio.to_thread(...)``
-    rather than inline, or it would freeze the whole event loop, not just its
-    own request. :func:`collect_disk_gauges` (below) is itself plain/sync for
-    the same reason :func:`_size_bytes` in ``eviction_service`` is: it is the
-    caller's job to offload the whole thing in one hop (mirrors
-    ``import_service``'s ``asyncio.to_thread``-wrapped copy) rather than
-    threading each individual root one at a time.
+    ``async def`` caller MUST offload it rather than call it inline, or it would
+    freeze the whole event loop, not just its own request. Callers on the
+    shutdown-bound eviction/ops paths use
+    :func:`plex_manager.services.purge_service.run_abandonable_probe`, whose
+    daemon worker cannot outlive that bound; ordinary callers may use
+    ``asyncio.to_thread`` when their lifecycle does not require abandonment.
+    :func:`collect_disk_gauges` (below) is itself plain/sync for the same reason
+    :func:`_size_bytes` in ``eviction_service`` is: it is the caller's job to
+    offload the whole thing in one hop (mirrors ``import_service``'s
+    ``asyncio.to_thread``-wrapped copy) rather than threading each individual
+    root one at a time.
     """
     usage = shutil.disk_usage(path)
     return DiskUsage(root=path, total_bytes=usage.total, available_bytes=usage.free)
