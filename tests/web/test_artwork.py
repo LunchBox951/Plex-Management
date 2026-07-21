@@ -217,15 +217,27 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure_plex(sessionmaker_)
     entered: asyncio.Queue[int] = asyncio.Queue()
-    release = asyncio.Event()
+    decide_failure = asyncio.Event()
+    release_non_failing = asyncio.Event()
+    # Which tmdb_id raises is decided *after* we've observed the real
+    # semaphore's admission order (see below) — the per-request auth session
+    # in require_api_key_short_session doesn't complete FIFO under load, so a
+    # request hardcoded to fail (e.g. always tmdb_id 1100) can lose the race
+    # to be one of the first four admitted and the test flakes (issue #436).
+    fail_id: int | None = None
 
     async def keys(
         _self: PlexLibrary, tmdb_id: int, _media_type: Literal["movie", "tv"]
     ) -> _ArtworkKeys:
+        # Report admission unconditionally, then await the shared failure
+        # decision. The selected request raises immediately, but every other
+        # admitted request stays blocked below until the assertion proves the
+        # error path alone released a permit.
         await entered.put(tmdb_id)
-        if tmdb_id == 1100:
+        await decide_failure.wait()
+        if tmdb_id == fail_id:
             raise PlexLibraryError("synthetic typed upstream failure")
-        await release.wait()
+        await release_non_failing.wait()
         return _ArtworkKeys(None, None)
 
     monkeypatch.setattr(PlexLibrary, "_artwork_keys", keys)
@@ -237,14 +249,22 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     ]
     try:
         first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
-        assert 1100 in first_four
+        # Admission order isn't FIFO, so we don't assert *which* ids landed
+        # here — only that the real 4-slot semaphore admitted exactly four.
+        assert len(first_four) == 4
+        # Let only the selected coroutine escape its limiter scope. The other
+        # three remain blocked, so this fifth admission proves that this typed
+        # error path returned its own semaphore permit.
+        fail_id = first_four[0]
+        decide_failure.set()
         fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
         assert fifth not in first_four
-        release.set()
+        release_non_failing.set()
         responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
         assert [response.status_code for response in responses] == [404] * 5
     finally:
-        release.set()
+        decide_failure.set()
+        release_non_failing.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         reset_caches()
 
