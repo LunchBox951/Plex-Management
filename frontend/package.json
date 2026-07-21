@@ -19,11 +19,11 @@
     "gen:check": "openapi-typescript ../docs/api/openapi.json -o /tmp/plexmgr-schema-check.d.ts && diff -u src/api/schema.d.ts /tmp/plexmgr-schema-check.d.ts"
   },
   "dependencies": {
-    "@fontsource/archivo": "^5.2.8",
-    "@fontsource/hanken-grotesk": "^5.2.8",
-    "@fontsource/ibm-plex-mono": "^5.2.7",
-    "@radix-ui/react-dialog": "^1.1.19",
-    "@radix-ui/react-toast": "^1.2.19",
+    "@fontsource/archivo": "^5.3.0",
+    "@fontsource/hanken-grotesk": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@radix-ui/react-dialog": "^1.1.20",
+    "@radix-ui/react-toast": "^1.2.20",
     "@tanstack/react-query": "^5.66.0",
     "openapi-fetch": "^0.17.0",
     "react": "^19.0.0",
@@ -32,7 +32,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@tailwindcss/vite": "^4.0.6",
+    "@tailwindcss/vite": "^4.3.3",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.2.0",
     "@testing-library/user-event": "^14.6.1",
@@ -45,10 +45,10 @@
     "globals": "^17.7.0",
     "jsdom": "^29.1.1",
     "openapi-typescript": "^7.6.1",
-    "tailwindcss": "^4.0.6",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.63.0",
-    "vite": "^8.1.4",
+    "typescript-eslint": "^8.64.0",
+    "vite": "^8.1.5",
     "vitest": "^4.1.10"
   }
 }

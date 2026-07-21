@@ -221,6 +221,40 @@ def test_candidate_three_way_merge_preserves_runtime_contract_and_adopts_new_ima
     assert "EndpointID" not in networks["plex_default"]
 
 
+@pytest.mark.parametrize(
+    ("existing_timeout", "expected_timeout"),
+    [(10, 75), (None, 75), (90, 90)],
+)
+def test_recreation_only_raises_stop_timeout_for_candidate_and_rollback(
+    existing_timeout: int | None, expected_timeout: int
+) -> None:
+    container = _container()
+    config = container["Config"]
+    assert isinstance(config, dict)
+    if existing_timeout is not None:
+        config["StopTimeout"] = existing_timeout
+    networks = capture_networks(container)
+
+    candidate, _ = build_candidate_spec(
+        container,
+        _old_image(),
+        _new_image(),
+        image_ref=IMAGE_REF,
+        operation_id="operation-stop-timeout",
+        networks=networks,
+    )
+    rollback, _ = build_rollback_spec(
+        container,
+        _old_image(),
+        image_ref=IMAGE_REF,
+        operation_id="operation-stop-timeout",
+        networks=networks,
+    )
+
+    assert candidate["StopTimeout"] == expected_timeout
+    assert rollback["StopTimeout"] == expected_timeout
+
+
 def test_docker_assigned_port_is_materialized_for_candidate_and_rollback() -> None:
     container = _container()
     host = container["HostConfig"]
