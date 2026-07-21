@@ -1040,3 +1040,32 @@ async def test_configured_stop_timeout_bounds_wait_without_overriding_docker_gra
 
     stop_calls = [call for call in engine.calls if call[0] == "stop"]
     assert stop_calls[0] == ("stop", "old-container", 100.0)
+
+
+async def test_legacy_stop_timeout_is_floored_before_rollback_stops(tmp_path: Path) -> None:
+    # A legacy install's original container carries a pre-#419 10s StopTimeout.
+    # build_candidate_spec/build_rollback_spec only-raise that to
+    # MINIMUM_STOP_TIMEOUT (75s) on the recreated specs, so the persisted
+    # state.stop_timeout_seconds must be floored the same way (issue #435) —
+    # otherwise the rollback stop's HTTP client timeout (+10s) undercuts the
+    # candidate/rollback container's actual 75s graceful-shutdown window and
+    # forces an early SIGKILL.
+    engine = _Engine(unhealthy_candidate=True)
+    engine.containers["old-container"]["Config"]["StopTimeout"] = 10
+    coordinator = _Coordinator()
+    state = _MemoryState()
+    runner = UpdaterRunner(
+        _config(tmp_path), cast(Any, engine), cast(Any, coordinator), cast(Any, state)
+    )
+
+    await runner.run_once()
+
+    assert coordinator.outcomes[-1]["outcome"] == "rolled_back"
+    stop_calls = [call for call in engine.calls if call[0] == "stop"]
+    # The candidate created for this failed install, and the target stopped
+    # while rolling back to it, must both be stopped with the floored
+    # (75 + 10 = 85.0) timeout, not the legacy 10 + 10 = 20.0 the original
+    # container's own StopTimeout would otherwise have produced.
+    assert len(stop_calls) >= 2
+    for call in stop_calls:
+        assert call[2] == 85.0
