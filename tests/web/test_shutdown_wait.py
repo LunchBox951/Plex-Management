@@ -28,9 +28,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.ports.library import LibraryPort
-from plex_manager.services import eviction_service, purge_service
+from plex_manager.services import eviction_service, purge_service, retention_telemetry_service
+from plex_manager.services.health_service import TtlCache
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import SettingsStore
+from plex_manager.web.routers import ops as ops_router
+from plex_manager.web.schemas import DiskRootItem
 from tests.web.fakes import FakeLibrary
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -547,6 +550,132 @@ async def test_eviction_service_disk_probe_oserror_still_skips_root(
             )
 
     assert result == []
+
+
+async def test_hung_retention_telemetry_disk_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: the pressure-pass branch of the eviction tick falls straight
+    into ``run_retention_telemetry_sweep``'s own disk-usage probe -- it must
+    share the same shutdown-abandonable settlement tracking as the other three
+    call sites, not a bare ``asyncio.to_thread``."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", blocker)
+    library = FakeLibrary()
+    fs = LocalFileSystem([str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        task = asyncio.create_task(
+            retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=30,
+                threshold_pct=95.0,
+                target_pct=90.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_retention_telemetry_disk_probe_oserror_still_skips_root(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the telemetry sweep's probe preserves its existing ``OSError``
+    fallback: an unreadable root skips the whole sweep for that root (logged),
+    never raises."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", _unreadable)
+    async with sessionmaker_() as session:
+        # None of these should raise -- an unreadable root is a silent (but
+        # logged) skip, exactly as before the probe moved substrates.
+        await retention_telemetry_service.run_retention_telemetry_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem([str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            grace_days=30,
+            threshold_pct=95.0,
+            target_pct=90.0,
+        )
+
+
+async def test_hung_ops_disk_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: ``GET /api/v1/ops/disk`` reads usage BEFORE it ever reaches
+    the now-protected ``preview_candidates`` -- that first read must share the
+    same shutdown-abandonable settlement tracking, not a bare
+    ``asyncio.to_thread``."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(ops_router, "read_disk_usage", blocker)
+    cache: TtlCache[DiskRootItem] = TtlCache()
+
+    async with sessionmaker_() as session:
+        task = asyncio.create_task(
+            ops_router._disk_root_item(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                library=FakeLibrary(),
+                label="movies",
+                media_type="movie",
+                root_path=str(tmp_path),
+                all_roots=(str(tmp_path),),
+                grace_days=30,
+                cache=cache,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_ops_disk_probe_oserror_still_reports_root_error(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the ops-dashboard probe preserves its existing ``OSError``
+    fallback: an unreadable root reports a zeroed, ``error``-set item instead
+    of raising or 500ing the whole ``/ops/disk`` response."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(ops_router, "read_disk_usage", _unreadable)
+    cache: TtlCache[DiskRootItem] = TtlCache()
+
+    async with sessionmaker_() as session:
+        result = await ops_router._disk_root_item(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            library=FakeLibrary(),
+            label="movies",
+            media_type="movie",
+            root_path=str(tmp_path),
+            all_roots=(str(tmp_path),),
+            grace_days=30,
+            cache=cache,
+        )
+
+    assert result.error is not None
+    assert result.candidates == []
 
 
 async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
