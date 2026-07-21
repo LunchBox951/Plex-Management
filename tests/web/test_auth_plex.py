@@ -2453,6 +2453,158 @@ async def test_cancel_during_commit_still_closes_demoted_streams(
     assert user.encrypted_plex_token == _NEW_PLEX_TOKEN
 
 
+async def test_commit_callback_failure_surfaces_and_demotion_stays_durable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #433: ``_commit_to_completion``'s ``on_committed`` guard mirrors the
+    secret_rotation boundary's #423 round-3 guard, on its OTHER call site -- the
+    LOCKLESS ordinary-tail mint (``auth.py``:441 calls ``commit_to_completion(
+    session, on_committed=_close_demoted_streams)``, the non-rotation sibling of
+    the rotation boundary's ``on_committed`` hook). A raising
+    ``close_realtime_streams`` on a demotion sign-in with NO cancellation in play
+    must not vanish silently: the demotion is already durable when the callback
+    runs, so the failure is logged naming the callback and surfaces to the
+    caller (there is no exception handler for a bare ``RuntimeError``, so it
+    propagates through the ASGI transport) instead of masquerading as a clean
+    200."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    first = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert first.status_code == 200
+    user_id = first.json()["user"]["id"]
+
+    calls: list[dict[str, object]] = []
+
+    def raising_close(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+        raise RuntimeError("close_realtime_streams exploded")
+
+    monkeypatch.setattr(auth_module, "close_realtime_streams", raising_close)
+
+    # The SAME account signs in again with only SHARED access: admin -> non-admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_shared_server()]))
+    with (
+        caplog.at_level(logging.ERROR, logger=settings_router.__name__),
+        pytest.raises(RuntimeError, match="close_realtime_streams exploded"),
+    ):
+        _ = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+
+    # The close was attempted (issue #183 ordering still holds: post-commit),
+    # scoped to the demoted user.
+    assert len(calls) == 1
+    assert calls[0]["reason"] == "permission_downgraded"
+    assert calls[0]["user_id"] == user_id
+    # The demotion landed durably despite the callback failing -- a raising
+    # post-commit invalidation must not roll back an already-committed write.
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalars().one()
+    assert user.permissions == 0
+    # Surfaced honestly, naming the callback (issue #433, mirroring #423 round 3).
+    assert "post-commit callback" in caplog.text
+    assert "close_realtime_streams exploded" in caplog.text
+
+
+async def test_commit_callback_failure_plus_cancel_cancel_wins_callback_chained(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #433 (double-event): a remembered cancellation AND a raising
+    ``on_committed`` callback on the SAME durable ordinary-tail mint commit.
+    The lockless-tail sibling of ``test_boundary_on_committed_failure_with_
+    cancel_cancel_wins_callback_chained`` (``test_settings.py``): the
+    ``CancelledError`` still WINS the re-raise, with the callback failure
+    chained as its ``__cause__`` -- captured IN-COROUTINE, since anyio
+    re-raises a FRESH ``CancelledError`` across the ASGI boundary and drops
+    ``__cause__`` (the same idiom
+    ``test_cancel_plus_commit_failure_restores_snapshot_and_surfaces_the_failure``
+    and the boundary's direct tests rely on). Clones the paused_commit/
+    committed/release event-pump scaffolding from
+    ``test_cancel_during_commit_still_closes_demoted_streams``."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _store_setting(sessionmaker_, "plex_machine_identifier", _MACHINE_ID)
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_owned_server()]))
+    first = await client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN})
+    assert first.status_code == 200
+    user_id = first.json()["user"]["id"]
+
+    calls: list[dict[str, object]] = []
+
+    def raising_close(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+        raise RuntimeError("close_realtime_streams exploded")
+
+    monkeypatch.setattr(auth_module, "close_realtime_streams", raising_close)
+
+    real_commit = AsyncSession.commit
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        committed.set()
+        await _wait_for_event(release)
+
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    # Capture the exception IN-COROUTINE, at the exact call site ``auth.py``
+    # uses (before it crosses the ASGI boundary and anyio re-raises a fresh
+    # ``CancelledError`` that drops ``__cause__``).
+    real_commit_tc = auth_module.commit_to_completion
+    captured: list[BaseException] = []
+
+    async def capturing_commit_tc(
+        session: AsyncSession, *, on_committed: Callable[[], None] | None = None
+    ) -> None:
+        try:
+            await real_commit_tc(session, on_committed=on_committed)
+        except BaseException as exc:
+            captured.append(exc)
+            raise
+
+    monkeypatch.setattr(auth_module, "commit_to_completion", capturing_commit_tc)
+
+    # The SAME account signs in again with only SHARED access: admin -> non-admin.
+    await _use_transport(app, _plex_tv_transport(user=_OWNER_USER, resources=[_shared_server()]))
+    task = asyncio.create_task(client.post("/api/v1/auth/plex", json={"auth_token": _TOKEN}))
+    await _wait_for_event(committed)
+    task.cancel()
+    # Deliver the cancellation while the commit is still paused, so it is
+    # REMEMBERED by ``_commit_to_completion`` rather than landing elsewhere.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger=settings_router.__name__):
+        release.set()
+        await assert_task_raises(task, asyncio.CancelledError)
+
+    # Cancellation won the re-raise, with the callback failure chained as its
+    # cause -- observed IN-COROUTINE, before anyio drops it crossing the ASGI
+    # boundary.
+    assert len(captured) == 1
+    assert isinstance(captured[0], asyncio.CancelledError)
+    assert isinstance(captured[0].__cause__, RuntimeError)
+    assert "close_realtime_streams exploded" in str(captured[0].__cause__)
+    # The close was attempted despite the cancellation, scoped to the demoted user.
+    assert len(calls) == 1
+    assert calls[0]["reason"] == "permission_downgraded"
+    assert calls[0]["user_id"] == user_id
+    # The demotion still landed durably -- a remembered cancellation plus a
+    # raising callback must not undo the already-committed write.
+    async with sessionmaker_() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalars().one()
+    assert user.permissions == 0
+    assert "post-commit callback" in caplog.text
+
+
 async def test_cancel_plus_commit_failure_restores_snapshot_and_surfaces_the_failure(
     client: httpx.AsyncClient,
     app: FastAPI,
