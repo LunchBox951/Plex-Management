@@ -1170,7 +1170,14 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
             # for this same root.
             try:
                 pressure_would_fire = (
-                    used_percent(await asyncio.to_thread(read_disk_usage, root)) >= threshold_pct
+                    used_percent(
+                        await purge_service.run_abandonable_probe(
+                            lambda root=root: read_disk_usage(root),
+                            root,
+                            operation_name="disk-pressure probe",
+                        )
+                    )
+                    >= threshold_pct
                 )
             except OSError:
                 pressure_would_fire = True
@@ -1622,7 +1629,7 @@ async def _await_background_tasks_shutdown(
     process exits regardless, so no delete durability is lost, only how long
     shutdown blocks on it. That abandonment is real, not aspirational, because
     the delete runs on a dedicated DAEMON thread
-    (:func:`purge_service._run_delete_on_abandonable_thread`, codex #406 P1)
+    (:func:`purge_service._start_on_abandonable_thread`, codex #406 P1)
     -- were it on ``asyncio.to_thread``'s default executor, whose non-daemon
     workers the interpreter re-joins at exit, the process would still block on
     the hung delete after this wait "proceeded". The still-active purge

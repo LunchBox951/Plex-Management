@@ -18,13 +18,26 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
-from plex_manager.services import purge_service
+from plex_manager.domain.disk_usage import DiskUsage
+from plex_manager.ports.library import LibraryPort
+from plex_manager.services import eviction_service, purge_service, retention_telemetry_service
+from plex_manager.services.health_service import TtlCache
 from plex_manager.web import app as app_module
+from plex_manager.web.deps import SettingsStore
+from plex_manager.web.routers import ops as ops_router
+from plex_manager.web.schemas import DiskRootItem
+from tests.web.fakes import FakeLibrary
+
+SessionMaker = async_sessionmaker[AsyncSession]
 
 
 class _BlockedProbeFileSystem(LocalFileSystem):
@@ -69,6 +82,28 @@ class _FailingProbeFileSystem(LocalFileSystem):
         raise OSError("probe failed")
 
 
+class _BlockedDiskUsageProbe:
+    """A synchronous ``read_disk_usage`` replacement that models a dead mount."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.thread_name: str | None = None
+        self.thread_daemon: bool | None = None
+
+    def __call__(self, path: str) -> DiskUsage:
+        worker = threading.current_thread()
+        self.thread_name = worker.name
+        self.thread_daemon = worker.daemon
+        self.started.set()
+        self.release.wait(timeout=5)
+        try:
+            return DiskUsage(root=path, total_bytes=1000, available_bytes=900)
+        finally:
+            self.finished.set()
+
+
 class _BlockedDeleteFileSystem(LocalFileSystem):
     """A real, root-guarded ``LocalFileSystem`` whose ``delete`` blocks (in its
     worker thread) until the test releases it -- lets a test cancel the
@@ -96,6 +131,57 @@ async def _purge_worker(fs: LocalFileSystem, path: str) -> None:
     """A background task shaped like a real ``lifespan`` member (returns
     ``None``): its body calls the shielded purge primitive."""
     await purge_service.purge_library_path(fs, path)
+
+
+async def _wait_for_registry_release(path: str, *, timeout: float = 2.0) -> None:
+    """Yield to the loop until ``path``'s deferred purge registration is released.
+
+    After shutdown abandonment (#431) the ``_ACTIVE_PURGE_PATHS`` release is
+    deferred to the raw delete worker's done-callback, which the loop runs only
+    once the daemon thread physically settles -- so a test must poll rather than
+    read the registry synchronously right after releasing the worker."""
+    normalized = os.path.abspath(os.path.normpath(path))
+    deadline = time.monotonic() + timeout
+    while normalized in purge_service.active_purge_paths():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"purge registration for {normalized!r} was never released")
+        await asyncio.sleep(0.01)
+
+
+async def _configured_eviction_app(sessionmaker_: SessionMaker, root: Path) -> FastAPI:
+    """Build the smallest production-shaped app state for one leased eviction tick."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(root))
+        await store.set("eviction_enabled", "true")
+        await store.set("disk_pressure_threshold_percent", "95")
+        await store.set("disk_pressure_target_percent", "90")
+        await store.set("eviction_grace_days", "30")
+        await store.set("eviction_interval_minutes", "5")
+        await session.commit()
+
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200))
+    )
+    return app
+
+
+async def _abandon_cancelled_task_at_shutdown(task: asyncio.Task[object]) -> None:
+    """Drive the production shutdown escape hatch for one cancelled settlement."""
+
+    async def _quick_background_task() -> None:
+        await asyncio.sleep(1000)
+
+    background_task = asyncio.create_task(_quick_background_task())
+    task.cancel()
+    background_task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "probe cancellation must wait for shutdown abandonment"
+    await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+        (background_task,), timeout_seconds=5.0
+    )
 
 
 async def test_fast_settling_tasks_are_unaffected_by_the_bound(
@@ -180,16 +266,22 @@ async def test_a_hung_shielded_delete_timeout_finishes_the_settlement_task(
 
         assert "shutdown timed out" in caplog.text
         assert os.path.abspath(os.path.normpath(str(target))) in caplog.text
-        assert "purge settlement abandoned" in caplog.text
+        assert "filesystem settlement abandoned" in caplog.text
         assert task.done()
         assert task.cancelled()
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # #431: the abandoned delete is still physically running, so its
+        # ``_ACTIVE_PURGE_PATHS`` registration is HELD -- deferred to the raw
+        # worker's physical completion -- not cleared the instant the settlement
+        # resolved.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
     finally:
-        # The settlement coroutine and registry are already finished; release
-        # only the test's daemon worker so it does not linger across tests.
+        # Release the daemon worker; its physical completion delivers the
+        # deferred registration release on the loop.
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    await _wait_for_registry_release(str(target))
     assert purge_service.active_purge_paths() == ()
 
 
@@ -222,12 +314,17 @@ async def test_timeout_unblocks_request_scoped_settlement(
         )
         assert isinstance(outcome, asyncio.CancelledError)
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # #431: the abandoned request-scoped delete is still physically running,
+        # so its registration is HELD until the daemon thread settles.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
     finally:
         timeout_trigger.cancel()
         await asyncio.gather(timeout_trigger, return_exceptions=True)
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    await _wait_for_registry_release(str(target))
+    assert purge_service.active_purge_paths() == ()
 
 
 async def test_request_settlement_is_abandoned_when_background_tasks_finish_fast(
@@ -339,29 +436,301 @@ async def test_live_pre_delete_probe_error_keeps_existing_classification(tmp_pat
     assert purge_service.active_purge_paths() == ()
 
 
-async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
+async def test_hung_disk_pressure_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #418: the tick's telemetry pressure probe cannot delay process exit."""
+    app = await _configured_eviction_app(sessionmaker_, tmp_path)
+    blocker = _BlockedDiskUsageProbe()
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return FakeLibrary()
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "read_disk_usage", blocker)
+    task = asyncio.create_task(app_module._eviction_tick_leased(app))  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert await asyncio.to_thread(blocker.started.wait, 2.0)
+        await _abandon_cancelled_task_at_shutdown(task)
+        assert task.done()
+        assert task.cancelled()
+        assert not blocker.finished.is_set()
+    finally:
+        blocker.release.set()
+        assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+        await app.state.http_client.aclose()
+
+
+@pytest.mark.parametrize("probe", ["preview", "sweep"])
+async def test_hung_eviction_service_disk_probe_is_abandoned_at_shutdown(
+    probe: str,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #418: both eviction-service disk reads share settlement tracking."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(eviction_service, "read_disk_usage", blocker)
+    library = FakeLibrary()
+    fs = LocalFileSystem([str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        if probe == "preview":
+            task = asyncio.create_task(
+                eviction_service.preview_candidates(
+                    session=session,
+                    library=library,
+                    media_type="movie",
+                    root_path=str(tmp_path),
+                    grace_days=30,
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                eviction_service.run_eviction_sweep(
+                    session=session,
+                    library=library,
+                    fs=fs,
+                    media_type="movie",
+                    root_path=str(tmp_path),
+                    threshold_pct=95.0,
+                    target_pct=90.0,
+                    grace_days=30,
+                )
+            )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_disk_pressure_probe_oserror_still_suppresses_telemetry(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tick still treats an unreadable root as pressure firing."""
+    app = await _configured_eviction_app(sessionmaker_, tmp_path)
+    telemetry_calls = 0
+    sweep_calls = 0
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return FakeLibrary()
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    async def _telemetry(**_kwargs: object) -> None:
+        nonlocal telemetry_calls
+        telemetry_calls += 1
+
+    async def _sweep(**_kwargs: object) -> list[object]:
+        nonlocal sweep_calls
+        sweep_calls += 1
+        return []
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "read_disk_usage", _unreadable)
+    monkeypatch.setattr(
+        app_module.retention_telemetry_service, "run_retention_telemetry_sweep", _telemetry
+    )
+    monkeypatch.setattr(eviction_service, "run_eviction_sweep", _sweep)
+    try:
+        await app_module._eviction_tick_leased(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert telemetry_calls == 0
+    assert sweep_calls == 1
+
+
+@pytest.mark.parametrize("probe", ["preview", "sweep"])
+async def test_eviction_service_disk_probe_oserror_still_skips_root(
+    probe: str,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving either service probe preserves its existing ``OSError`` fallback."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _unreadable)
+    async with sessionmaker_() as session:
+        if probe == "preview":
+            result = await eviction_service.preview_candidates(
+                session=session,
+                library=FakeLibrary(),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=30,
+            )
+        else:
+            result = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=LocalFileSystem([str(tmp_path)]),
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=95.0,
+                target_pct=90.0,
+                grace_days=30,
+            )
+
+    assert result == []
+
+
+async def test_hung_retention_telemetry_disk_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: the pressure-pass branch of the eviction tick falls straight
+    into ``run_retention_telemetry_sweep``'s own disk-usage probe -- it must
+    share the same shutdown-abandonable settlement tracking as the other three
+    call sites, not a bare ``asyncio.to_thread``."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", blocker)
+    library = FakeLibrary()
+    fs = LocalFileSystem([str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        task = asyncio.create_task(
+            retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=30,
+                threshold_pct=95.0,
+                target_pct=90.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            assert blocker.thread_name == "filesystem-probe"
+            assert blocker.thread_daemon is True
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_retention_telemetry_disk_probe_oserror_still_skips_root(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the telemetry sweep's probe preserves its existing ``OSError``
+    fallback: an unreadable root skips the whole sweep for that root (logged),
+    never raises."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", _unreadable)
+    async with sessionmaker_() as session:
+        # None of these should raise -- an unreadable root is a silent (but
+        # logged) skip, exactly as before the probe moved substrates.
+        await retention_telemetry_service.run_retention_telemetry_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem([str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            grace_days=30,
+            threshold_pct=95.0,
+            target_pct=90.0,
+        )
+
+
+async def test_hung_ops_disk_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: ``GET /api/v1/ops/disk`` reads usage BEFORE it ever reaches
+    the now-protected ``preview_candidates`` -- that first read must share the
+    same shutdown-abandonable settlement tracking, not a bare
+    ``asyncio.to_thread``."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(ops_router, "read_disk_usage", blocker)
+    cache: TtlCache[DiskRootItem] = TtlCache()
+
+    async with sessionmaker_() as session:
+        task = asyncio.create_task(
+            ops_router._disk_root_item(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                library=FakeLibrary(),
+                label="movies",
+                media_type="movie",
+                root_path=str(tmp_path),
+                all_roots=(str(tmp_path),),
+                grace_days=30,
+                cache=cache,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            assert blocker.thread_name == "filesystem-probe"
+            assert blocker.thread_daemon is True
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_ops_disk_probe_oserror_still_reports_root_error(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the ops-dashboard probe preserves its existing ``OSError``
+    fallback: an unreadable root reports a zeroed, ``error``-set item instead
+    of raising or 500ing the whole ``/ops/disk`` response."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(ops_router, "read_disk_usage", _unreadable)
+    cache: TtlCache[DiskRootItem] = TtlCache()
+
+    async with sessionmaker_() as session:
+        result = await ops_router._disk_root_item(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            library=FakeLibrary(),
+            label="movies",
+            media_type="movie",
+            root_path=str(tmp_path),
+            all_roots=(str(tmp_path),),
+            grace_days=30,
+            cache=cache,
+        )
+
+    assert result.error is not None
+    assert result.candidates == []
+
+
+async def test_begin_placement_refuses_while_an_abandoned_delete_still_runs(
     tmp_path: Path,
 ) -> None:
-    """Issue #421: characterize the abandonment-to-exit window's confidence gap.
+    """Issue #431: the abandonment-to-exit ``begin_placement`` race is CLOSED.
 
     Shutdown abandonment (PR #406's ``abandon_active_settlements``) resolves the
-    purge's shielded settlement -- and this task's ``finally`` releases
-    ``_ACTIVE_PURGE_PATHS`` -- WITHOUT waiting for the daemon ``shutil.rmtree``
-    thread to actually finish (``fs.finished`` provably still unset below). This
-    drives exactly that abandonment for a real, still-running delete and then
-    calls ``begin_placement`` on the identical path in the narrow window before
-    process exit, the live-caller race issue #421 asks a targeted test to settle.
-
-    Result: ``begin_placement`` returns ``True``. ``_conflicts_with`` only ever
-    consults the current (already-emptied) ``_ACTIVE_PURGE_PATHS`` registry, so
-    a placement can be registered for a directory an abandoned ``rmtree`` is
-    concurrently, physically tearing down -- the exact interleaving the
-    ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS`` ordering rule (PR #117
-    round 9) exists to prevent. This is NOT restructured here (out of scope for
-    this change): it is recorded as a known gap, real only in the shutdown-to-
-    exit window, for the coordinator to weigh against issue #128's crash-
-    recovery backstop reconciling any resulting partial disk state on next
-    startup.
+    purge's shielded settlement and lets the cancelled task finish, but the
+    ``_ACTIVE_PURGE_PATHS`` release is now tied to the delete worker's PHYSICAL
+    completion, not the settlement -- ``purge_library_path`` hands the
+    registration to ``_delete_to_settlement``, which defers the unregister to the
+    raw worker's done-callback when abandonment resolves the wait early. This
+    drives exactly that abandonment for a real, still-running delete and asserts
+    a live caller reaching ``begin_placement`` in the abandonment-to-exit window
+    is REFUSED the path while the abandoned ``rmtree`` is still tearing it down --
+    the interleaving the ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS``
+    ordering rule (PR #117 round 9) exists to prevent -- and only succeeds once
+    the daemon thread genuinely finishes.
     """
     target = tmp_path / "movies" / "Stuck Movie.mkv"
     target.parent.mkdir()
@@ -382,26 +751,26 @@ async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_run
             (task,), timeout_seconds=0.05
         )
 
-        # The registration is already released and the daemon thread is
-        # PROVABLY still mid-rmtree -- the exact abandonment-to-exit window
-        # issue #421 is concerned with.
+        # The task has finished (cancelled) but the daemon thread is PROVABLY
+        # still mid-rmtree -- the exact abandonment-to-exit window.
         assert task.done()
         assert task.cancelled()
-        assert purge_service.active_purge_paths() == ()
         assert not fs.finished.is_set()
 
-        # CHARACTERIZATION: a live caller reaching begin_placement() in this
-        # window observes no conflict and is allowed to claim the path, even
-        # though the abandoned delete is still physically running against it.
-        claimed = purge_service.begin_placement(str(target))
-        assert claimed is True, (
-            "known gap (issue #421): begin_placement currently succeeds for a "
-            "path an abandoned purge delete is still physically tearing down"
-        )
+        # #431: the registration is HELD until physical completion, so a live
+        # caller is REFUSED the path an abandoned delete is still tearing down.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
+        assert purge_service.begin_placement(str(target)) is False
     finally:
-        purge_service.end_placement(str(target))
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+    # Once the daemon thread physically finished, the deferred loop-delivered
+    # callback releases the registration and placement is allowed again.
+    await _wait_for_registry_release(str(target))
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
 
 
 async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
@@ -423,8 +792,8 @@ async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", _closed_loop_delivery)
     monkeypatch.setattr(loop, "is_closed", lambda: True)
-    await purge_service._run_delete_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
-        fs, str(target)
+    await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
+        lambda: fs.delete(str(target)), thread_name="purge-delete"
     )
     assert fs.started.wait(timeout=2.0)
     fs.release.set()

@@ -2,10 +2,14 @@
 blocks the correction verbs (report-issue, cancel) and the disk-pressure eviction
 sweep all compose, so the load-bearing safety logic lives in ONE place.
 
-Three primitives, each best-effort by design (a failure is logged, never silent,
+Four primitives: the first is infrastructure whose exceptions stay caller-owned;
+the remaining three are best-effort by design (a failure is logged, never silent,
 and never raised) — the DB state change a caller commits around them is the
-authoritative record; a client/Plex/FS hiccup here must never undo it:
+authoritative record; a client/Plex/FS hiccup there must never undo it:
 
+* :func:`run_abandonable_probe` — typed blocking filesystem work on the bounded
+  daemon-thread substrate, registered with process-shutdown settlement tracking.
+  Results and exceptions are delivered unchanged to the caller.
 * :func:`purge_library_path` — the root-guarded ``fs.delete`` of a stored
   ``library_path`` breadcrumb, plus the hardlink-aware reclaimable-bytes
   accounting (measured BEFORE the delete, since a file's link count can only be
@@ -61,6 +65,7 @@ __all__ = [
     "end_purge",
     "purge_library_path",
     "remove_torrent",
+    "run_abandonable_probe",
     "trigger_library_scan",
 ]
 
@@ -181,12 +186,12 @@ _ABANDONED_SETTLEMENTS: set[asyncio.Future[None]] = set()
 
 
 def active_settlement_tasks() -> tuple[asyncio.Task[None], ...]:
-    """Snapshot the tasks currently awaiting purge settlement."""
+    """Snapshot tasks awaiting abandonable filesystem-worker settlement."""
     return tuple(task for _path, task in _ACTIVE_SETTLEMENTS.values())
 
 
 def abandon_active_settlements() -> None:
-    """Wake every active purge settlement without waiting for its daemon worker.
+    """Wake active filesystem settlements without waiting for daemon workers.
 
     This process-shutdown escape hatch snapshots only currently active work.
     Resolving each settlement future makes background and request-scoped purge
@@ -301,25 +306,30 @@ class PurgeResult:
     detail: str | None = None
 
 
-async def _run_on_abandonable_thread[T](
-    operation: Callable[[], T], *, thread_name: str
+def _start_on_abandonable_thread[T](
+    operation: Callable[[], T],
+    *,
+    thread_name: str,
+    permit: _AbandonableThreadPermit,
 ) -> asyncio.Future[T]:
-    """Run blocking filesystem work on a bounded daemon-thread substrate.
+    """Synchronously start one abandonable daemon worker under an ALREADY-HELD permit.
 
-    Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
-    default executor's non-daemon workers are joined during interpreter
-    teardown. Any filesystem operation that can touch a dead mount -- guard,
-    accounting, or delete -- must therefore use this abandonable substrate.
+    Split out of :func:`_run_on_abandonable_thread` (issue #431) so a caller that
+    must keep the physical worker inside its OWN cancellation-cleanup coverage --
+    see :func:`_delete_to_settlement` -- can acquire the gate permit and then
+    create and store the worker future with NO ``await`` between the two. A
+    cancellation delivered at that boundary would otherwise leave a live daemon
+    thread with no future the caller can observe, either leaking the registration
+    forever or releasing it while the thread still runs.
 
-    The gate wait stays a plain cancellable await so a queued caller can unwind
-    during shutdown without ever creating a physical worker. Once acquired, its
-    permit belongs to that worker until its physical completion ``finally``
-    releases the thread-safe token -- caller cancellation or settlement
-    abandonment must never make room for another thread while the original
-    remains wedged (issue #417).
+    ``permit`` is owned by the physical worker from here on: it is returned on the
+    worker's physical-completion ``finally`` AND if ``Thread.start()`` itself
+    raises, but NEVER on caller cancellation or settlement abandonment -- a wedged
+    thread must not make room for another while it remains stuck (issue #417). The
+    closed-loop late-delivery guard is preserved unchanged: a worker that finishes
+    after its originating loop has torn down absorbs only the expected
+    ``RuntimeError`` from ``call_soon_threadsafe``.
     """
-    gate = _ABANDONABLE_THREAD_GATE
-    permit = await gate.acquire()
     loop = asyncio.get_running_loop()
     outcome: asyncio.Future[T] = loop.create_future()
 
@@ -362,13 +372,27 @@ async def _run_on_abandonable_thread[T](
     return outcome
 
 
-async def _run_delete_on_abandonable_thread(
-    fs: FileSystemPort, library_path: str
-) -> asyncio.Future[None]:
-    """Run ``fs.delete`` on the shared abandonable daemon-thread substrate."""
-    return await _run_on_abandonable_thread(
-        lambda: fs.delete(library_path), thread_name="purge-delete"
-    )
+async def _run_on_abandonable_thread[T](
+    operation: Callable[[], T], *, thread_name: str
+) -> asyncio.Future[T]:
+    """Run blocking filesystem work on a bounded daemon-thread substrate.
+
+    Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
+    default executor's non-daemon workers are joined during interpreter
+    teardown. Any filesystem operation that can touch a dead mount -- guard,
+    accounting, or delete -- must therefore use this abandonable substrate.
+
+    The gate wait stays a plain cancellable await so a queued caller can unwind
+    during shutdown without ever creating a physical worker. Once acquired, its
+    permit belongs to that worker until its physical completion ``finally``
+    releases the thread-safe token -- caller cancellation or settlement
+    abandonment must never make room for another thread while the original
+    remains wedged (issue #417). Permit acquisition and the synchronous worker
+    start are split (:func:`_start_on_abandonable_thread`) so a caller needing
+    the worker inside its own cleanup coverage can drive the two steps itself.
+    """
+    permit = await _ABANDONABLE_THREAD_GATE.acquire()
+    return _start_on_abandonable_thread(operation, thread_name=thread_name, permit=permit)
 
 
 async def _await_worker_settlement[T](
@@ -378,7 +402,7 @@ async def _await_worker_settlement[T](
     settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     current_task = asyncio.current_task()
     if current_task is None:  # pragma: no cover - running coroutine always owns a task
-        raise RuntimeError("purge settlement requires an asyncio task")
+        raise RuntimeError("filesystem settlement requires an asyncio task")
     _ACTIVE_SETTLEMENTS[settled] = (library_path, current_task)
     worker_error: BaseException | None = None
 
@@ -400,15 +424,21 @@ async def _await_worker_settlement[T](
                 was_cancelled = True
         if settled in _ABANDONED_SETTLEMENTS:
             # The daemon thread remains abandonable, but the asyncio task must
-            # not remain pending for ``asyncio.run``'s final cancel-and-gather.
-            # Releasing the registration before physical settlement is safe
-            # only during process shutdown; the next startup's crash-recovery
-            # sweep reconciles partial disk state exactly as after a crash
-            # mid-delete (#128).
+            # not remain pending for ``asyncio.run``'s final cancel-and-gather,
+            # so this coroutine returns early via CancelledError. That early
+            # return does NOT, by itself, release any ``_ACTIVE_PURGE_PATHS``
+            # registration: for a delete, :func:`_delete_to_settlement` decides
+            # hold-vs-release from its OWN outcome and defers the actual
+            # unregister to the raw delete worker's physical completion (issue
+            # #431), so the path stays claimed until the ``shutil.rmtree`` thread
+            # genuinely finishes even though this settlement was abandoned. Only
+            # a process that exits before the daemon thread finishes at all is
+            # left to the next startup's crash-recovery sweep to reconcile,
+            # exactly as after a crash mid-delete (#128).
             _logger.warning(
-                "purge settlement abandoned during process shutdown while %s "
-                "of %r was still active; crash recovery will reconcile the path "
-                "on next startup",
+                "filesystem settlement abandoned during process shutdown while %s "
+                "of %r was still active; process exit will reclaim the worker and "
+                "crash recovery will reconcile any partial disk mutation on next startup",
                 operation,
                 safe_text(library_path),
             )
@@ -420,8 +450,9 @@ async def _await_worker_settlement[T](
                 # worker error that ALSO happened during that unwind is logged here
                 # (honesty over silence) rather than raised over the cancellation.
                 _logger.warning(
-                    "purge delete of %r failed (%s) while the caller was being "
-                    "cancelled; the delete did not complete",
+                    "filesystem operation %s on %r failed (%s) while the caller "
+                    "was being cancelled; the operation did not complete",
+                    operation,
                     safe_text(library_path),
                     type(worker_error).__name__,
                 )
@@ -442,17 +473,93 @@ async def _await_worker_settlement[T](
             worker.remove_done_callback(_consume_worker_result)
 
 
-async def _run_probe_to_settlement[T](
-    operation: Callable[[], T], library_path: str, *, operation_name: str
+async def run_abandonable_probe[T](
+    operation: Callable[[], T], path: str, *, operation_name: str
 ) -> T:
-    worker = await _run_on_abandonable_thread(operation, thread_name="purge-probe")
-    return await _await_worker_settlement(worker, library_path, operation=operation_name)
+    """Run one blocking filesystem probe with bounded, shutdown-safe settlement.
+
+    This is the public, purge-agnostic entry point to the shared abandonable
+    daemon-thread substrate. Filesystem reads such as ``statvfs`` can wedge on a
+    dead mount just as permanently as a delete; using ``asyncio.to_thread`` for
+    them would strand a non-daemon default-executor worker that CPython rejoins
+    during interpreter teardown, defeating the web lifespan's bounded shutdown
+    wait. The physical worker therefore consumes the same process-wide permit as
+    purge guards, accounting, and deletes, while its event-loop future is
+    registered in :func:`active_settlement_tasks` so
+    :func:`abandon_active_settlements` can release the awaiting coroutine during
+    process shutdown.
+
+    ``operation`` results and exceptions are delivered unchanged during ordinary
+    operation. In particular, callers retain ownership of narrow classifications
+    such as ``OSError``; this substrate adds no retries, fallback values, or broad
+    exception conversion. ``path`` and ``operation_name`` exist only to make a
+    shutdown abandonment honest and diagnosable without logging probe results.
+    """
+    worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe")
+    return await _await_worker_settlement(worker, path, operation=operation_name)
 
 
-async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
-    """Run delete to real settlement, except for process-shutdown abandonment."""
-    worker = await _run_delete_on_abandonable_thread(fs, library_path)
-    await _await_worker_settlement(worker, library_path, operation="delete")
+async def _delete_to_settlement(
+    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool
+) -> None:
+    """Run delete to real settlement (except process-shutdown abandonment) and own
+    the ``_ACTIVE_PURGE_PATHS`` release decision from this coroutine's OWN outcome.
+
+    The physical delete worker is created INSIDE this coroutine's cleanup
+    ``try``/``finally`` (issue #431): the gate permit is acquired first, then the
+    worker future is created and stored with NO intervening ``await``
+    (:func:`_start_on_abandonable_thread`), so every terminal path resolves the
+    registration exactly once, right here -- cancelled while still queued for a
+    permit (no worker yet), a ``Thread.start()`` failure (starter returned the
+    permit, ``worker`` still ``None``), a worker error, ordinary cancellation,
+    shutdown abandonment, or success.
+
+    Hold-vs-release is decided from ``succeeded`` -- this coroutine's own
+    definitive outcome, set ``True`` ONLY after ``_await_worker_settlement``
+    returns without raising -- never from a snapshot taken inside a worker-done
+    callback that races the caller's resumption. That was the #421 first-attempt
+    trap: a callback reading ``Task.cancelling()`` can fire while that counter
+    still reads 0, with the task's own ``CancelledError`` delivered only on its
+    next resume, AFTER the premature decision to hold, permanently leaking the
+    registration. A caller may keep the claim past a successful delete (releasing
+    it itself via :func:`end_purge` after its own DB commit) ONLY when this
+    coroutine actually observed that success; a failed, cancelled, or abandoned
+    delete is always released here, exactly as :func:`purge_library_path`'s own
+    pre-#421 ``finally`` behaved.
+
+    The ``_unregister`` itself must not run before the daemon worker has
+    physically finished touching disk: if the worker is already done at decision
+    time (every non-abandonment path -- ``_await_worker_settlement`` only returns
+    or raises once the worker settled), release happens immediately; otherwise
+    (shutdown abandonment resolved the settlement early while the
+    ``shutil.rmtree`` thread may still be running) release is deferred to a
+    done-callback on the RAW worker future, which the single-threaded loop runs
+    only once the worker genuinely settles -- closing the abandonment-to-exit
+    window where a live :func:`begin_placement` caller could otherwise claim a
+    path an abandoned delete is still tearing down. A worker still running when
+    its originating loop closes is process-exit territory (issue #128 crash
+    recovery), not an in-process lifecycle event.
+    """
+    worker: asyncio.Future[None] | None = None
+    succeeded = False
+    try:
+        permit = await _ABANDONABLE_THREAD_GATE.acquire()
+        # No ``await`` between the permit acquisition above and storing ``worker``
+        # below: the synchronous starter creates the daemon thread and hands back
+        # its future atomically, so cancellation can never strand a live worker.
+        worker = _start_on_abandonable_thread(
+            lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
+        )
+        await _await_worker_settlement(worker, library_path, operation="delete")
+        succeeded = True
+    finally:
+        if not (succeeded and hold_purge_registration):
+            if worker is None or worker.done():
+                _unregister(library_path, _ACTIVE_PURGE_PATHS)
+            else:
+                worker.add_done_callback(
+                    lambda _done: _unregister(library_path, _ACTIVE_PURGE_PATHS)
+                )
 
 
 async def purge_library_path(
@@ -465,31 +572,37 @@ async def purge_library_path(
     (guard, accounting, delete) run on dedicated abandonable daemon threads.
     A dead mount can wedge any probe just as surely as the final delete, and a
     default-executor worker would be rejoined by ``asyncio.run`` at teardown.
-    The delete specifically goes through :func:`_delete_to_settlement`, which shields
-    the wait so a caller's cancellation is never observed until the underlying
-    delete thread has genuinely finished (issue #128) — the registration this
-    function holds in ``_ACTIVE_PURGE_PATHS`` (below) spans that full worker
-    lifetime, including any cancellation settlement, so a concurrent
-    ``begin_placement`` / a later sweep's crash-recovery can never see this
-    path as free while a delete for it is still physically running.
+    The delete specifically goes through :func:`_delete_to_settlement`, which
+    shields the wait so a caller's cancellation is never observed until the
+    underlying delete thread has genuinely finished (issue #128). Once this
+    function hands the registration off to that helper (the one-way
+    ``registration_handed_off`` flag set immediately before the ``await`` below),
+    the helper owns EVERY terminal path of the ``_ACTIVE_PURGE_PATHS`` claim:
+    success (held or released), a guard/OS failure, ordinary cancellation, AND
+    process-shutdown abandonment all resolve it inside the helper's own
+    ``finally``, tied to the delete worker's PHYSICAL completion — so a
+    concurrent ``begin_placement`` / a later sweep's crash-recovery can never see
+    this path as free while a delete for it is still physically running.
 
-    CAVEAT (issue #421): that invariant holds only up to process-shutdown
-    abandonment. :func:`abandon_active_settlements` (PR #406) can force
+    CLOSED (issue #431): that invariant now holds THROUGH process-shutdown
+    abandonment too. :func:`abandon_active_settlements` (PR #406) can force
     :func:`_delete_to_settlement`'s shielded wait to resolve without the daemon
-    ``shutil.rmtree`` thread ever finishing, and this function's ``finally``
-    below does not special-case that path — it unregisters ``library_path``
-    from ``_ACTIVE_PURGE_PATHS`` as soon as the (abandoned) settlement
-    resolves, which can be BEFORE the delete has physically stopped touching
-    disk (see the identical caveat at :func:`_await_worker_settlement`). The
-    regression test ``test_begin_placement_can_claim_a_path_whose_abandoned_
-    delete_still_runs`` in ``tests/web/test_shutdown_wait.py`` demonstrates
-    that a caller reaching :func:`begin_placement` in that narrow abandonment-
-    to-exit window DOES observe the path as free and claims it while the
-    abandoned delete is still running — this is accepted, not yet closed,
-    because it is reachable only inside the bounded shutdown wait on the way
-    to process exit, and issue #128's crash-recovery sweep on the *next*
-    startup reconciles whatever partial disk state an abandoned delete left
-    behind, exactly as it would after a hard crash mid-delete.
+    ``shutil.rmtree`` thread ever finishing, but the helper does NOT release the
+    registration on that early resolution: with the worker not yet physically
+    done, it defers the ``_unregister`` to a done-callback on the raw delete
+    worker future, which the single-threaded loop runs only once the thread
+    genuinely stops touching disk. The regression test
+    ``test_begin_placement_refuses_while_an_abandoned_delete_still_runs`` in
+    ``tests/web/test_shutdown_wait.py`` drives exactly that abandonment for a
+    real, still-running delete and proves :func:`begin_placement` keeps refusing
+    the path until the daemon thread physically completes, then succeeds once it
+    does. Issue #128's crash-recovery sweep on the *next* startup remains the
+    backstop only for the genuinely-abandoned case where the process exits before
+    the daemon thread finishes at all — this fix closes the in-process
+    abandonment-to-exit ``begin_placement`` race, not the OS-level abandonment.
+    (A separate, accepted process-exit-only gap remains: ``eviction_service``'s
+    ``_sweep_latch`` still clears on that same abandoned-cancellation unwind; it
+    was never a physical-completion tracker, and reconciling it is out of scope.)
 
     The delete goes through :meth:`FileSystemPort.delete`, whose implementation
     refuses (raises :class:`LocalFileSystemError`) any path resolving outside a
@@ -508,7 +621,7 @@ async def purge_library_path(
             PurgeOutcome.deferred, 0, "deferred: an import is placing into this path"
         )
     _register(library_path, _ACTIVE_PURGE_PATHS)
-    release_registration = True
+    registration_handed_off = False
     try:
         # Fail an out-of-root breadcrumb CLOSED and FAST, BEFORE the (potentially
         # huge, recursive) reclaimable_bytes walk. A stale/misconfigured breadcrumb
@@ -519,7 +632,7 @@ async def purge_library_path(
         # ``delete`` applies (the exact refusal decision, as a read-only query), so
         # this changes nothing for an in-root path -- it only short-circuits the
         # exact paths ``delete`` was always going to refuse.
-        if await _run_probe_to_settlement(
+        if await run_abandonable_probe(
             lambda: fs.delete_guard_refuses(library_path),
             library_path,
             operation_name="delete-guard probe",
@@ -533,7 +646,7 @@ async def purge_library_path(
         # ADR-0012 / ADR-0014). A measurement failure is "unknown -> 0", never an
         # abort.
         try:
-            freed_bytes = await _run_probe_to_settlement(
+            freed_bytes = await run_abandonable_probe(
                 lambda: fs.reclaimable_bytes(library_path),
                 library_path,
                 operation_name="reclaimable-bytes probe",
@@ -541,17 +654,29 @@ async def purge_library_path(
         except OSError:
             freed_bytes = 0
 
+        # HANDOFF (issue #431): from here :func:`_delete_to_settlement` owns
+        # EVERY terminal path of this ``_ACTIVE_PURGE_PATHS`` registration --
+        # success (held or released), a guard/OS delete failure, ordinary
+        # cancellation, and shutdown abandonment all resolve it inside that
+        # coroutine's own ``finally``, tied to the delete worker's physical
+        # completion. Set the one-way flag BEFORE the ``await`` so this
+        # function's own ``finally`` never double-releases once the callee has
+        # taken ownership. Everything ABOVE this point (the placement-conflict
+        # deferral, the read-only guard/reclaim probes) started no destructive
+        # work, so a return/cancellation there still releases via this
+        # ``finally``; only the delete's registration is handed off.
+        registration_handed_off = True
         try:
-            await _delete_to_settlement(fs, library_path)
+            await _delete_to_settlement(
+                fs, library_path, hold_purge_registration=hold_purge_registration
+            )
         except LocalFileSystemError as exc:
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
         except OSError as exc:
             return PurgeResult(PurgeOutcome.error, 0, type(exc).__name__)
-        if hold_purge_registration:
-            release_registration = False
         return PurgeResult(PurgeOutcome.deleted, freed_bytes)
     finally:
-        if release_registration:
+        if not registration_handed_off:
             _unregister(library_path, _ACTIVE_PURGE_PATHS)
 
 

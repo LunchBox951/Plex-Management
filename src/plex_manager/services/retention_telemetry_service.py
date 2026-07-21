@@ -182,7 +182,7 @@ from plex_manager.domain.eviction import (
     select_evictions,
 )
 from plex_manager.models import MediaRequest, SeasonRequest
-from plex_manager.services import eviction_service
+from plex_manager.services import eviction_service, purge_service
 from plex_manager.services.health_service import read_disk_usage
 from plex_manager.services.log_capture_service import TELEMETRY_LOGGER_NAME
 
@@ -706,10 +706,16 @@ async def run_retention_telemetry_sweep(
     :data:`_QUEUE_SAFETY_MARGIN`.
     """
     try:
-        # Offloaded like every other blocking FS primitive this subsystem calls
-        # from an async function (mirrors preview_candidates/run_eviction_sweep) —
-        # a hung/unresponsive mount must never freeze the whole event loop.
-        disk = await asyncio.to_thread(read_disk_usage, root_path)
+        # ``shutil.disk_usage`` (a ``statvfs`` syscall) can stall on a hung
+        # NFS/SMB mount. Use the shared abandonable substrate (mirrors
+        # preview_candidates/run_eviction_sweep) so a wedged probe cannot strand
+        # CPython's joined default executor past bounded shutdown — the eviction
+        # tick's pressure-pass branch falls straight into this sweep.
+        disk = await purge_service.run_abandonable_probe(
+            lambda: read_disk_usage(root_path),
+            root_path,
+            operation_name="retention telemetry disk-usage probe",
+        )
     except OSError as exc:
         _logger.warning(
             "retention telemetry sweep skipped for %s root %s (%s)",

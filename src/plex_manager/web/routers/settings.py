@@ -351,10 +351,38 @@ async def _commit_to_completion(
             )
             raise pending_cancel from commit_error
         raise commit_error
+    # GUARD the callback (issue #433, mirroring ``secret_rotation``'s #423
+    # round-3 guard on its own ``on_committed()`` call further down in this
+    # file): it runs after a durable commit, so a raise here must not mask a
+    # remembered cancellation, nor vanish silently. Capture it, log it loudly
+    # (name the callback, render the cause), and fold it into the precedence
+    # re-raise below.
+    callback_error: Exception | None = None
     if on_committed is not None:
-        on_committed()
+        try:
+            on_committed()
+        except Exception as exc:
+            callback_error = exc
+            _logger.error(
+                "session commit landed durably but the post-commit callback %r "
+                "failed; the commit is durable, but a must-run invalidation "
+                "(e.g. closing demoted realtime streams) may not have run to "
+                "completion",
+                getattr(on_committed, "__qualname__", repr(on_committed)),
+                exc_info=exc,
+            )
+    # Precedence for the re-raise: a remembered cancellation wins (the server's
+    # teardown expects a cancelled request task to end cancelled, and replacing
+    # the CancelledError would break that protocol mid-teardown); the callback
+    # error, if any, is chained onto it as the cause so it is not lost. With no
+    # cancellation, a callback-only failure is surfaced honestly (north star
+    # #3) rather than swallowed.
     if pending_cancel is not None:
+        if callback_error is not None:
+            raise pending_cancel from callback_error
         raise pending_cancel
+    if callback_error is not None:
+        raise callback_error
 
 
 # Public aliases (same idiom as ``deps.api_key_header``) so the sign-in endpoint

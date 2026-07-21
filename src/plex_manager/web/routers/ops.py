@@ -45,7 +45,6 @@ value-based exact-match search ever sees it whole.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -60,7 +59,7 @@ from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
-from plex_manager.services import eviction_service, watchlist_service
+from plex_manager.services import eviction_service, purge_service, watchlist_service
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
     SUBSYSTEM_CACHE_KEYS,
@@ -523,9 +522,16 @@ async def _disk_root_item(
         return cached
 
     try:
-        # shutil.disk_usage (a statvfs syscall) can stall on a hung NFS/SMB
-        # mount -- offload it so that never freezes the event loop.
-        usage = await asyncio.to_thread(read_disk_usage, root_path)
+        # ``shutil.disk_usage`` (a ``statvfs`` syscall) can stall on a hung
+        # NFS/SMB mount. Use the shared abandonable substrate so a wedged probe
+        # cannot strand CPython's joined default executor past bounded shutdown
+        # -- this read happens before ``preview_candidates`` below, which is
+        # already routed through the same substrate.
+        usage = await purge_service.run_abandonable_probe(
+            lambda: read_disk_usage(root_path),
+            root_path,
+            operation_name="ops disk-usage probe",
+        )
     except OSError as exc:
         result = DiskRootItem(
             root=label,
