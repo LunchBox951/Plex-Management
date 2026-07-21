@@ -29,7 +29,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.ports.library import LibraryPort
-from plex_manager.services import eviction_service, purge_service, retention_telemetry_service
+from plex_manager.services import (
+    eviction_service,
+    health_service,
+    purge_service,
+    retention_telemetry_service,
+)
 from plex_manager.services.health_service import TtlCache
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import SettingsStore
@@ -712,6 +717,46 @@ async def test_ops_disk_probe_oserror_still_reports_root_error(
 
     assert result.error is not None
     assert result.candidates == []
+
+
+async def test_hung_health_disk_gauge_probe_is_abandoned_at_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #446: routine health polling must not strand a joined worker at exit."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(health_service, "read_disk_usage", blocker)
+    task = asyncio.create_task(health_service.collect_disk_gauges({"movies_root": str(tmp_path)}))
+    try:
+        assert await asyncio.to_thread(blocker.started.wait, 2.0)
+        assert blocker.thread_name == "filesystem-probe"
+        assert blocker.thread_daemon is True
+        await _abandon_cancelled_task_at_shutdown(task)
+        assert task.done()
+        assert task.cancelled()
+        assert not blocker.finished.is_set()
+    finally:
+        blocker.release.set()
+        assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_health_disk_gauge_probe_oserror_still_reports_root_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #446: an unreadable health root retains its zeroed gauge shape."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(health_service, "read_disk_usage", _unreadable)
+
+    result = await health_service.collect_disk_gauges({"movies_root": str(tmp_path)})
+
+    assert len(result) == 1
+    assert result[0].root == "movies_root"
+    assert result[0].total_bytes == 0
+    assert result[0].available_bytes == 0
+    assert result[0].used_percent == 0.0
+    assert result[0].error == "dead mount"
 
 
 async def test_begin_placement_refuses_while_an_abandoned_delete_still_runs(
