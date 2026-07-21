@@ -2,10 +2,14 @@
 blocks the correction verbs (report-issue, cancel) and the disk-pressure eviction
 sweep all compose, so the load-bearing safety logic lives in ONE place.
 
-Three primitives, each best-effort by design (a failure is logged, never silent,
+Four primitives: the first is infrastructure whose exceptions stay caller-owned;
+the remaining three are best-effort by design (a failure is logged, never silent,
 and never raised) — the DB state change a caller commits around them is the
-authoritative record; a client/Plex/FS hiccup here must never undo it:
+authoritative record; a client/Plex/FS hiccup there must never undo it:
 
+* :func:`run_abandonable_probe` — typed blocking filesystem work on the bounded
+  daemon-thread substrate, registered with process-shutdown settlement tracking.
+  Results and exceptions are delivered unchanged to the caller.
 * :func:`purge_library_path` — the root-guarded ``fs.delete`` of a stored
   ``library_path`` breadcrumb, plus the hardlink-aware reclaimable-bytes
   accounting (measured BEFORE the delete, since a file's link count can only be
@@ -61,6 +65,7 @@ __all__ = [
     "end_purge",
     "purge_library_path",
     "remove_torrent",
+    "run_abandonable_probe",
     "trigger_library_scan",
 ]
 
@@ -181,12 +186,12 @@ _ABANDONED_SETTLEMENTS: set[asyncio.Future[None]] = set()
 
 
 def active_settlement_tasks() -> tuple[asyncio.Task[None], ...]:
-    """Snapshot the tasks currently awaiting purge settlement."""
+    """Snapshot tasks awaiting abandonable filesystem-worker settlement."""
     return tuple(task for _path, task in _ACTIVE_SETTLEMENTS.values())
 
 
 def abandon_active_settlements() -> None:
-    """Wake every active purge settlement without waiting for its daemon worker.
+    """Wake active filesystem settlements without waiting for daemon workers.
 
     This process-shutdown escape hatch snapshots only currently active work.
     Resolving each settlement future makes background and request-scoped purge
@@ -378,7 +383,7 @@ async def _await_worker_settlement[T](
     settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     current_task = asyncio.current_task()
     if current_task is None:  # pragma: no cover - running coroutine always owns a task
-        raise RuntimeError("purge settlement requires an asyncio task")
+        raise RuntimeError("filesystem settlement requires an asyncio task")
     _ACTIVE_SETTLEMENTS[settled] = (library_path, current_task)
     worker_error: BaseException | None = None
 
@@ -406,9 +411,9 @@ async def _await_worker_settlement[T](
             # sweep reconciles partial disk state exactly as after a crash
             # mid-delete (#128).
             _logger.warning(
-                "purge settlement abandoned during process shutdown while %s "
-                "of %r was still active; crash recovery will reconcile the path "
-                "on next startup",
+                "filesystem settlement abandoned during process shutdown while %s "
+                "of %r was still active; process exit will reclaim the worker and "
+                "crash recovery will reconcile any partial disk mutation on next startup",
                 operation,
                 safe_text(library_path),
             )
@@ -420,8 +425,9 @@ async def _await_worker_settlement[T](
                 # worker error that ALSO happened during that unwind is logged here
                 # (honesty over silence) rather than raised over the cancellation.
                 _logger.warning(
-                    "purge delete of %r failed (%s) while the caller was being "
-                    "cancelled; the delete did not complete",
+                    "filesystem operation %s on %r failed (%s) while the caller "
+                    "was being cancelled; the operation did not complete",
+                    operation,
                     safe_text(library_path),
                     type(worker_error).__name__,
                 )
@@ -442,11 +448,30 @@ async def _await_worker_settlement[T](
             worker.remove_done_callback(_consume_worker_result)
 
 
-async def _run_probe_to_settlement[T](
-    operation: Callable[[], T], library_path: str, *, operation_name: str
+async def run_abandonable_probe[T](
+    operation: Callable[[], T], path: str, *, operation_name: str
 ) -> T:
-    worker = await _run_on_abandonable_thread(operation, thread_name="purge-probe")
-    return await _await_worker_settlement(worker, library_path, operation=operation_name)
+    """Run one blocking filesystem probe with bounded, shutdown-safe settlement.
+
+    This is the public, purge-agnostic entry point to the shared abandonable
+    daemon-thread substrate. Filesystem reads such as ``statvfs`` can wedge on a
+    dead mount just as permanently as a delete; using ``asyncio.to_thread`` for
+    them would strand a non-daemon default-executor worker that CPython rejoins
+    during interpreter teardown, defeating the web lifespan's bounded shutdown
+    wait. The physical worker therefore consumes the same process-wide permit as
+    purge guards, accounting, and deletes, while its event-loop future is
+    registered in :func:`active_settlement_tasks` so
+    :func:`abandon_active_settlements` can release the awaiting coroutine during
+    process shutdown.
+
+    ``operation`` results and exceptions are delivered unchanged during ordinary
+    operation. In particular, callers retain ownership of narrow classifications
+    such as ``OSError``; this substrate adds no retries, fallback values, or broad
+    exception conversion. ``path`` and ``operation_name`` exist only to make a
+    shutdown abandonment honest and diagnosable without logging probe results.
+    """
+    worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe")
+    return await _await_worker_settlement(worker, path, operation=operation_name)
 
 
 async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
@@ -519,7 +544,7 @@ async def purge_library_path(
         # ``delete`` applies (the exact refusal decision, as a read-only query), so
         # this changes nothing for an in-root path -- it only short-circuits the
         # exact paths ``delete`` was always going to refuse.
-        if await _run_probe_to_settlement(
+        if await run_abandonable_probe(
             lambda: fs.delete_guard_refuses(library_path),
             library_path,
             operation_name="delete-guard probe",
@@ -533,7 +558,7 @@ async def purge_library_path(
         # ADR-0012 / ADR-0014). A measurement failure is "unknown -> 0", never an
         # abort.
         try:
-            freed_bytes = await _run_probe_to_settlement(
+            freed_bytes = await run_abandonable_probe(
                 lambda: fs.reclaimable_bytes(library_path),
                 library_path,
                 operation_name="reclaimable-bytes probe",
