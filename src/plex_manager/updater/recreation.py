@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
-from typing import cast
+from typing import Final, cast
 
 from plex_manager.updater.config import (
     IMAGE_REF_LABEL,
@@ -28,6 +28,10 @@ _IMAGE_BACKED_FIELDS = (
 _DROP_CONFIG_FIELDS = frozenset({"ArgsEscaped", "OnBuild"})
 _DROP_HOST_CONFIG_FIELDS = frozenset({"ContainerIDFile"})
 _IMAGE_OWNED_ENV = frozenset({"PLEX_MANAGER_BUILD_ID"})
+# Keep recreated installs aligned with compose's 75s stop_grace_period: the
+# 60s shutdown task bound, Uvicorn drain, and a safety margin. Only raise an
+# existing value so an operator's intentionally longer grace period survives.
+_MINIMUM_STOP_TIMEOUT: Final = 75
 _MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 
 
@@ -283,6 +287,8 @@ def _base_config(container: JsonObject) -> JsonObject:
     identifier = container.get("Id")
     if isinstance(identifier, str) and current.get("Hostname") == identifier[:12]:
         current.pop("Hostname", None)
+    timeout = current.get("StopTimeout")
+    current["StopTimeout"] = max(timeout if isinstance(timeout, int) else 10, _MINIMUM_STOP_TIMEOUT)
     return current
 
 

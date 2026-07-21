@@ -138,8 +138,17 @@ class UpdaterConfig:
         """Read the Compose secret without ever placing it in configuration reprs."""
         try:
             token = self.secret_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as exc:
+            raise UpdaterConfigError("updater Compose secret file is missing") from exc
+        except PermissionError as exc:
+            raise UpdaterConfigError(
+                "updater Compose secret file is unreadable; check its ownership and mode"
+            ) from exc
         except OSError as exc:
-            raise UpdaterConfigError("updater Compose secret is unavailable") from exc
+            raise UpdaterConfigError(
+                "updater Compose secret file cannot be read; "
+                "check the secret mount and host filesystem"
+            ) from exc
         if not 32 <= len(token) <= 512 or any(ch in token for ch in "\r\n\0"):
             raise UpdaterConfigError("updater Compose secret has an invalid shape")
         return token

@@ -77,6 +77,70 @@ _logger = logging.getLogger(__name__)
 _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS: Final = 5.0
 _CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS: Final = 0.25
 
+_ABANDONABLE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous physical workers on the abandonable substrate.
+
+A dead mount can block an OS thread permanently, so every guard/accounting/
+delete worker shares this small process-wide budget. Four preserves modest
+parallelism for unrelated operator corrections while putting a hard ceiling on
+daemon threads. A :class:`concurrent.futures.ThreadPoolExecutor` is deliberately
+forbidden because its non-daemon workers are joined at interpreter exit, which
+would reintroduce the shutdown hang this substrate exists to prevent (issue
+#417 / PR #406).
+"""
+_ABANDONABLE_THREAD_GATE_POLL_SECONDS: Final = 0.01
+
+
+class _AbandonableThreadGate:
+    """Thread-safe physical-worker permits with a cancellable asyncio wait.
+
+    The permit store must outlive any one event loop: an abandoned daemon worker
+    can finish after its originating loop closes, and its foreign thread cannot
+    safely release an :class:`asyncio.Semaphore`. A bounded threading semaphore
+    makes physical completion safe on that thread. The non-blocking poll keeps
+    queued callers on ordinary cancellable asyncio awaits without consuming an
+    executor thread that cancellation could strand (issue #417).
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._semaphore = threading.BoundedSemaphore(limit)
+
+    async def acquire(self) -> _AbandonableThreadPermit:
+        """Wait cancellably and return one idempotent permit token."""
+        while not self._semaphore.acquire(blocking=False):
+            await asyncio.sleep(_ABANDONABLE_THREAD_GATE_POLL_SECONDS)
+        return _AbandonableThreadPermit(self)
+
+    def release_permit(self) -> None:
+        """Return a permit from either an event-loop or worker thread."""
+        self._semaphore.release()
+
+
+class _AbandonableThreadPermit:
+    """Release one gate permit at most once across competing terminal paths.
+
+    The worker-completion and thread-start-failure paths are mutually exclusive
+    today. The lock is deliberate defense in depth: release can originate from a
+    foreign daemon thread after loop teardown, so future control-flow changes
+    must not turn an accidental second release into substrate-cap corruption.
+    """
+
+    def __init__(self, gate: _AbandonableThreadGate) -> None:
+        self._gate = gate
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        """Return the permit exactly once; later release attempts are no-ops."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._gate.release_permit()
+
+
+_ABANDONABLE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_THREAD_LIMIT)
+
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
 #
@@ -237,16 +301,25 @@ class PurgeResult:
     detail: str | None = None
 
 
-def _run_on_abandonable_thread[T](
+async def _run_on_abandonable_thread[T](
     operation: Callable[[], T], *, thread_name: str
 ) -> asyncio.Future[T]:
-    """Run blocking filesystem work on a daemon thread and future-ify its result.
+    """Run blocking filesystem work on a bounded daemon-thread substrate.
 
     Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
     default executor's non-daemon workers are joined during interpreter
     teardown. Any filesystem operation that can touch a dead mount -- guard,
     accounting, or delete -- must therefore use this abandonable substrate.
+
+    The gate wait stays a plain cancellable await so a queued caller can unwind
+    during shutdown without ever creating a physical worker. Once acquired, its
+    permit belongs to that worker until its physical completion ``finally``
+    releases the thread-safe token -- caller cancellation or settlement
+    abandonment must never make room for another thread while the original
+    remains wedged (issue #417).
     """
+    gate = _ABANDONABLE_THREAD_GATE
+    permit = await gate.acquire()
     loop = asyncio.get_running_loop()
     outcome: asyncio.Future[T] = loop.create_future()
 
@@ -278,16 +351,24 @@ def _run_on_abandonable_thread[T](
         except RuntimeError:
             if not loop.is_closed():
                 raise
+        finally:
+            permit.release()
 
-    threading.Thread(target=_worker, name=thread_name, daemon=True).start()
+    try:
+        threading.Thread(target=_worker, name=thread_name, daemon=True).start()
+    except BaseException:
+        permit.release()
+        raise
     return outcome
 
 
-def _run_delete_on_abandonable_thread(
+async def _run_delete_on_abandonable_thread(
     fs: FileSystemPort, library_path: str
 ) -> asyncio.Future[None]:
     """Run ``fs.delete`` on the shared abandonable daemon-thread substrate."""
-    return _run_on_abandonable_thread(lambda: fs.delete(library_path), thread_name="purge-delete")
+    return await _run_on_abandonable_thread(
+        lambda: fs.delete(library_path), thread_name="purge-delete"
+    )
 
 
 async def _await_worker_settlement[T](
@@ -364,13 +445,13 @@ async def _await_worker_settlement[T](
 async def _run_probe_to_settlement[T](
     operation: Callable[[], T], library_path: str, *, operation_name: str
 ) -> T:
-    worker = _run_on_abandonable_thread(operation, thread_name="purge-probe")
+    worker = await _run_on_abandonable_thread(operation, thread_name="purge-probe")
     return await _await_worker_settlement(worker, library_path, operation=operation_name)
 
 
 async def _delete_to_settlement(fs: FileSystemPort, library_path: str) -> None:
     """Run delete to real settlement, except for process-shutdown abandonment."""
-    worker = _run_delete_on_abandonable_thread(fs, library_path)
+    worker = await _run_delete_on_abandonable_thread(fs, library_path)
     await _await_worker_settlement(worker, library_path, operation="delete")
 
 

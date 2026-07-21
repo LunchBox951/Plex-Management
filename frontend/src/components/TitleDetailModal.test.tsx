@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import {
   StrictMode,
   type ButtonHTMLAttributes,
@@ -29,6 +29,24 @@ import type {
   SearchPreviewResponse,
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
+
+const layoutEffectPin = vi.hoisted(() => ({ deferLatestTitleKeyEffect: false }))
+
+vi.mock('react', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react')>()
+  return {
+    ...actual,
+    useEffect: (effect: Parameters<typeof actual.useEffect>[0], deps?: Parameters<typeof actual.useEffect>[1]) => {
+      // Model React's commit-to-passive-effect gap only for the exact ref write
+      // under test. All ordinary passive effects retain React's real behavior.
+      if (layoutEffectPin.deferLatestTitleKeyEffect && effect.toString().includes('latestTitleKey.current')) {
+        actual.useEffect(() => {}, deps)
+        return
+      }
+      actual.useEffect(effect, deps)
+    },
+  }
+})
 
 // The caller's auth context, read by the modal to gate admin-only verbs. A
 // hoisted mutable holder (not mockReturnValue) so the per-role tests can flip it
@@ -211,6 +229,77 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
+  })
+
+  it('discards a pending title A request when title B commits before it settles (#422)', async () => {
+    layoutEffectPin.deferLatestTitleKeyEffect = false
+    const titleB: DiscoverResult = { ...TITLE, tmdb_id: 43, title: 'Test Movie B' }
+    const created = {
+      id: 7,
+      tmdb_id: TITLE.tmdb_id,
+      media_type: 'movie' as const,
+      title: TITLE.title,
+      status: 'pending' as const,
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+      is_owner: false,
+      can_withdraw: false,
+      has_other_participants: false,
+    }
+    let settleCreate: (request: RequestResponse) => void = () => {}
+    const createMutation = {
+      mutateAsync: vi.fn(
+        () => new Promise<RequestResponse>((resolve) => {
+          settleCreate = resolve
+        }),
+      ),
+      isPending: false,
+    }
+    const setKeepForeverMock = mutation(undefined)
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createMutation)
+    ;(useSearchPreview as unknown as Mock).mockReturnValue(idle())
+    ;(useGrab as unknown as Mock).mockReturnValue(idle())
+    ;(useMarkFailed as unknown as Mock).mockReturnValue(idle())
+    ;(useImportDownload as unknown as Mock).mockReturnValue(idle())
+    ;(useSetKeepForever as unknown as Mock).mockReturnValue(setKeepForeverMock)
+    ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
+      authoritative: true,
+      data: { requests: [] },
+    })
+
+    const view = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+    await waitFor(() => expect(createMutation.mutateAsync).toHaveBeenCalledTimes(1))
+
+    layoutEffectPin.deferLatestTitleKeyEffect = true
+    view.rerender(<TitleDetailModal title={titleB} open onOpenChange={() => {}} />)
+
+    await act(async () => {
+      settleCreate(created)
+      await Promise.resolve()
+    })
+    layoutEffectPin.deferLatestTitleKeyEffect = false
+    expect(toastState.toast).not.toHaveBeenCalled()
+    // A's id and grabbable flag together are the sole source of an otherwise
+    // impossible Grab action while B has no request yet.
+    expect(screen.queryByRole('button', { name: /grab/i })).not.toBeInTheDocument()
+
+    // After B's own row arrives, the pin action must target B's id, never A's
+    // stale `requestId` that would otherwise win over the live row.
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
+      authoritative: true,
+      data: { requests: [{ ...created, id: 8, tmdb_id: titleB.tmdb_id, title: titleB.title, status: 'available' }] },
+    })
+    view.rerender(<TitleDetailModal title={titleB} open onOpenChange={() => {}} />)
+    fireEvent.click(await screen.findByRole('checkbox', { name: /keep forever/i }))
+    await waitFor(() =>
+      expect(setKeepForeverMock.mutateAsync).toHaveBeenCalledWith({ requestId: 8, keepForever: true }),
+    )
+    expect(setKeepForeverMock.mutateAsync).not.toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: created.id }),
+    )
   })
 })
 
