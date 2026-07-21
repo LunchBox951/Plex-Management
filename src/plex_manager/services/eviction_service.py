@@ -1964,12 +1964,12 @@ async def run_eviction_sweep(
     cancellation then unwinds through the ``finally`` below the same way it
     would after a real settlement — clearing ``_sweep_latch`` before the
     abandoned delete has physically stopped touching disk. That residual is a
-    separate, accepted process-exit-only gap: it is reachable only inside the
-    bounded shutdown wait on the way to process exit, and issue #128's crash-
-    recovery sweep on the *next* startup reconciles whatever partial disk state
-    an abandoned delete left behind, exactly as after a hard crash mid-delete.
-    Closing the purge-path race did not (and was not meant to) make
-    ``_sweep_latch`` track physical completion. See
+    separate, ACCEPTED, NOT YET CLOSED gap (issue #451): it is reachable only
+    inside the bounded shutdown wait on the way to process exit, and issue
+    #128's crash-recovery sweep on the *next* startup reconciles whatever
+    partial disk state an abandoned delete left behind, exactly as after a
+    hard crash mid-delete. Closing the purge-path race did not (and was not
+    meant to) make ``_sweep_latch`` track physical completion. See
     ``tests/web/test_shutdown_wait.py`` for the purge-side regression proving
     the ``_ACTIVE_PURGE_PATHS`` window is closed.
     """
