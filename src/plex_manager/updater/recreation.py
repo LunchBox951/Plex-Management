@@ -31,7 +31,10 @@ _IMAGE_OWNED_ENV = frozenset({"PLEX_MANAGER_BUILD_ID"})
 # Keep recreated installs aligned with compose's 75s stop_grace_period: the
 # 60s shutdown task bound, Uvicorn drain, and a safety margin. Only raise an
 # existing value so an operator's intentionally longer grace period survives.
-_MINIMUM_STOP_TIMEOUT: Final = 75
+# Public so runner.py can floor its persisted stop_timeout_seconds against the
+# exact same value the candidate/rollback spec was migrated to (issue #435) —
+# no duplicated literal.
+MINIMUM_STOP_TIMEOUT: Final = 75
 _MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 
 
@@ -288,7 +291,7 @@ def _base_config(container: JsonObject) -> JsonObject:
     if isinstance(identifier, str) and current.get("Hostname") == identifier[:12]:
         current.pop("Hostname", None)
     timeout = current.get("StopTimeout")
-    current["StopTimeout"] = max(timeout if isinstance(timeout, int) else 10, _MINIMUM_STOP_TIMEOUT)
+    current["StopTimeout"] = max(timeout if isinstance(timeout, int) else 10, MINIMUM_STOP_TIMEOUT)
     return current
 
 

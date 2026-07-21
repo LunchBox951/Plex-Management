@@ -28,6 +28,7 @@ from plex_manager.updater.engine import (
     image_id,
 )
 from plex_manager.updater.recreation import (
+    MINIMUM_STOP_TIMEOUT,
     build_candidate_spec,
     build_rollback_spec,
     capture_networks,
@@ -252,7 +253,12 @@ class UpdaterRunner:
         try:
             networks = capture_networks(target)
             port_bindings = capture_port_bindings(target)
-            stop_timeout_seconds = _stop_timeout(target)
+            # Persist the same only-raise floor build_candidate_spec/
+            # build_rollback_spec apply to the recreated container's
+            # StopTimeout, so the rollback stop's HTTP client timeout
+            # (state.stop_timeout_seconds + 10.0) never undercuts the
+            # candidate's actual graceful-shutdown window (issue #435).
+            stop_timeout_seconds = max(_stop_timeout(target), MINIMUM_STOP_TIMEOUT)
             multi_network_create = await self._multi_network_create()
             # Validate the complete candidate payload, including legacy-MAC
             # portability, before claiming a lease or stopping the live target.
