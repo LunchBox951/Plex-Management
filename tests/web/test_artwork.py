@@ -217,7 +217,8 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure_plex(sessionmaker_)
     entered: asyncio.Queue[int] = asyncio.Queue()
-    release = asyncio.Event()
+    decide_failure = asyncio.Event()
+    release_non_failing = asyncio.Event()
     # Which tmdb_id raises is decided *after* we've observed the real
     # semaphore's admission order (see below) — the per-request auth session
     # in require_api_key_short_session doesn't complete FIFO under load, so a
@@ -228,14 +229,15 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     async def keys(
         _self: PlexLibrary, tmdb_id: int, _media_type: Literal["movie", "tv"]
     ) -> _ArtworkKeys:
-        # Report admission unconditionally, then block on the same shared
-        # decision every request blocks on — mirrors the sibling
-        # cancellation test below. Only once released do we know whether
-        # this particular request was chosen as the one to fail.
+        # Report admission unconditionally, then await the shared failure
+        # decision. The selected request raises immediately, but every other
+        # admitted request stays blocked below until the assertion proves the
+        # error path alone released a permit.
         await entered.put(tmdb_id)
-        await release.wait()
+        await decide_failure.wait()
         if tmdb_id == fail_id:
             raise PlexLibraryError("synthetic typed upstream failure")
+        await release_non_failing.wait()
         return _ArtworkKeys(None, None)
 
     monkeypatch.setattr(PlexLibrary, "_artwork_keys", keys)
@@ -250,17 +252,19 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
         # Admission order isn't FIFO, so we don't assert *which* ids landed
         # here — only that the real 4-slot semaphore admitted exactly four.
         assert len(first_four) == 4
-        # Now that admission has settled, pick the failing request from
-        # whoever actually got in first and publish it before releasing —
-        # every blocked coroutine reads this same value once it wakes.
+        # Let only the selected coroutine escape its limiter scope. The other
+        # three remain blocked, so this fifth admission proves that this typed
+        # error path returned its own semaphore permit.
         fail_id = first_four[0]
-        release.set()
+        decide_failure.set()
         fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
         assert fifth not in first_four
+        release_non_failing.set()
         responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
         assert [response.status_code for response in responses] == [404] * 5
     finally:
-        release.set()
+        decide_failure.set()
+        release_non_failing.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         reset_caches()
 
