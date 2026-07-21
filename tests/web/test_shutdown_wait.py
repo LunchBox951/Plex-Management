@@ -88,8 +88,13 @@ class _BlockedDiskUsageProbe:
         self.started = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.thread_name: str | None = None
+        self.thread_daemon: bool | None = None
 
     def __call__(self, path: str) -> DiskUsage:
+        worker = threading.current_thread()
+        self.thread_name = worker.name
+        self.thread_daemon = worker.daemon
         self.started.set()
         self.release.wait(timeout=5)
         try:
@@ -579,6 +584,8 @@ async def test_hung_retention_telemetry_disk_probe_is_abandoned_at_shutdown(
         )
         try:
             assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            assert blocker.thread_name == "filesystem-probe"
+            assert blocker.thread_daemon is True
             await _abandon_cancelled_task_at_shutdown(task)
             assert task.done()
             assert task.cancelled()
@@ -640,6 +647,8 @@ async def test_hung_ops_disk_probe_is_abandoned_at_shutdown(
         )
         try:
             assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            assert blocker.thread_name == "filesystem-probe"
+            assert blocker.thread_daemon is True
             await _abandon_cancelled_task_at_shutdown(task)
             assert task.done()
             assert task.cancelled()
