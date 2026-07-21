@@ -140,11 +140,27 @@ def test_read_secret_fails_closed_for_missing_or_malformed_values(
         UpdaterConfig.from_env().read_secret()
 
 
-def test_read_secret_fails_closed_when_file_is_unavailable(
+def test_read_secret_fails_closed_when_secret_file_is_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _clean_updater_env(monkeypatch)
     monkeypatch.setenv("PLEX_MANAGER_UPDATER_SECRET_FILE", str(tmp_path / "missing"))
 
-    with pytest.raises(UpdaterConfigError, match="unavailable"):
+    with pytest.raises(UpdaterConfigError, match="secret file is missing"):
+        UpdaterConfig.from_env().read_secret()
+
+
+def test_read_secret_reports_an_unreadable_secret_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clean_updater_env(monkeypatch)
+    secret = tmp_path / "updater.secret"
+    monkeypatch.setenv("PLEX_MANAGER_UPDATER_SECRET_FILE", str(secret))
+
+    def raise_permission_error(*_args: object, **_kwargs: object) -> str:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "read_text", raise_permission_error)
+
+    with pytest.raises(UpdaterConfigError, match="secret file is unreadable"):
         UpdaterConfig.from_env().read_secret()
