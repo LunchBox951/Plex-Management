@@ -383,6 +383,14 @@ def _start_on_abandonable_thread[T](
             result = operation()
         except BaseException as exc:  # delivered to the awaiter, never swallowed
             error = exc
+        finally:
+            # Release BEFORE delivery: the wedged-mount hazard this permit bounds
+            # ends when ``operation()`` returns. Delivering first would let the
+            # loop resume the awaiter (e.g. a purge's next preflight phase) while
+            # this thread still held its token, transiently doubling one
+            # correction's draw and falsifying the one-permit-at-a-time budget
+            # invariant documented on :data:`_ABANDONABLE_DELETE_THREAD_LIMIT`.
+            permit.release()
         # ``RuntimeError: Event loop is closed`` is the one expected late-
         # delivery failure after shutdown abandonment: nobody can consume the
         # outcome and crash recovery owns the disk state. Keep this guard at
@@ -393,8 +401,6 @@ def _start_on_abandonable_thread[T](
         except RuntimeError:
             if not loop.is_closed():
                 raise
-        finally:
-            permit.release()
 
     try:
         threading.Thread(target=_worker, name=thread_name, daemon=True).start()
@@ -423,10 +429,13 @@ async def _run_on_abandonable_thread[T](
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
-    permit belongs to that worker until its physical completion ``finally``
-    releases the thread-safe token -- caller cancellation (a detached probe, issue
-    #445) or settlement abandonment must never make room for another thread while
-    the original remains wedged (issue #417). Permit acquisition and the
+    permit belongs to that worker until the blocking operation physically
+    completes -- caller cancellation (a detached probe, issue #445) or settlement
+    abandonment must never make room for another thread while the original
+    remains wedged (issue #417). The worker releases the token BEFORE delivering
+    its outcome to the loop, so an awaiter resumed by that delivery (a purge
+    moving to its next phase) can never observe its own finished worker still
+    holding a permit. Permit acquisition and the
     synchronous worker start are split (:func:`_start_on_abandonable_thread`) so a
     caller needing the worker inside its own cleanup coverage can drive the two
     steps itself.

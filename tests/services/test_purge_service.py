@@ -147,23 +147,35 @@ def _install_abandonable_delete_gate(monkeypatch: pytest.MonkeyPatch, limit: int
     )
 
 
-class _CountingThreadGate:
-    """Wrap a real gate and record every ``acquire`` so a test can prove which
-    budget a given path actually draws from (issue #447): probes and deletes must
-    draw from SEPARATE gates, so routing a delete back through the probe gate has
-    to be demonstrably detectable, not merely tolerated by a spare shared permit.
+class _CountingThreadGate(purge_service._AbandonableThreadGate):  # pyright: ignore[reportPrivateUsage]
+    """Subclass a real gate and record every ``acquire``/release so a test can
+    prove which budget a given path actually draws from (issue #447) -- probes and
+    deletes must draw from SEPARATE gates, so routing a delete back through the
+    probe gate has to be demonstrably detectable, not merely tolerated by a spare
+    shared permit -- and how many permits are held SIMULTANEOUSLY (``max_held``):
+    a purge's phases must each release before the next acquires, so one
+    correction never holds two delete permits at once.
     """
 
     def __init__(self, limit: int) -> None:
-        self._inner = purge_service._AbandonableThreadGate(limit)  # pyright: ignore[reportPrivateUsage]
+        super().__init__(limit)
         self.acquired = 0
+        self.held = 0
+        self.max_held = 0
+        self._count_lock = threading.Lock()
 
     async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
         self.acquired += 1
-        return await self._inner.acquire()
+        permit = await super().acquire()
+        with self._count_lock:
+            self.held += 1
+            self.max_held = max(self.max_held, self.held)
+        return permit
 
     def release_permit(self) -> None:
-        self._inner.release_permit()
+        with self._count_lock:
+            self.held -= 1
+        super().release_permit()
 
 
 async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
@@ -297,6 +309,11 @@ async def test_saturated_probe_budget_does_not_block_a_full_purge_correction(
         # DELETE budget; the saturated probe budget was never touched by the purge.
         assert delete_gate.acquired == 3
         assert probe_gate.acquired == 1
+        # Sequential, not overlapping: each phase's worker releases its permit
+        # BEFORE its outcome is delivered, so the purge never held two delete
+        # permits at once (the one-permit invariant documented on
+        # ``_ABANDONABLE_DELETE_THREAD_LIMIT``).
+        assert delete_gate.max_held == 1
     finally:
         release.set()
 
