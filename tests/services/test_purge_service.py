@@ -24,7 +24,6 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
     FailureDetail,
 )
-from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.services import path_visibility, purge_service
 from plex_manager.services.purge_service import PurgeOutcome
 from tests.support import assert_task_raises
@@ -392,14 +391,237 @@ async def test_delete_to_settlement_propagates_a_worker_oserror_when_not_cancell
     fs = _FailingBlockedDeleteFileSystem(target.parent)
     fs.release.set()
     delete_to_settlement = cast(
-        Callable[[FileSystemPort, str], Awaitable[None]],
+        Callable[..., Awaitable[None]],
         purge_service.__dict__["_delete_to_settlement"],
     )
 
     with pytest.raises(OSError, match="blocked delete failed"):
-        await delete_to_settlement(fs, str(target))
+        await delete_to_settlement(fs, str(target), hold_purge_registration=False)
 
     assert target.exists()
+
+
+async def test_hold_registration_released_when_cancel_lands_after_worker_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #431 (the #421 first-attempt trap): a cancellation delivered AFTER
+    the delete worker settles but BEFORE the caller resumes must still release the
+    held registration -- the hold decision comes from the caller's real
+    resumption, never a pre-resumption ``Task.cancelling()`` snapshot.
+
+    Drives the exact interleaving deterministically via a hand-controlled worker
+    future: ``set_result`` schedules the settlement callback FIFO, ``call_soon``
+    queues the caller's ``cancel()`` behind it, and the settlement callback then
+    queues the task wakeup behind that cancel -- so cancellation is applied after
+    any premature hold snapshot would have been taken, but before the task
+    actually resumes. The first #421 attempt held (and permanently leaked) the
+    registration here; this must release it.
+    """
+    target = tmp_path / "movies" / "Raced Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+
+    loop = asyncio.get_running_loop()
+    worker: asyncio.Future[None] = loop.create_future()
+    reached_settlement = asyncio.Event()
+    original_start = purge_service._start_on_abandonable_thread  # pyright: ignore[reportPrivateUsage]
+
+    def _fake_start(
+        operation: Callable[[], object],
+        *,
+        thread_name: str,
+        permit: purge_service._AbandonableThreadPermit,  # pyright: ignore[reportPrivateUsage]
+    ) -> asyncio.Future[object]:
+        # Read-only guard/reclaim probes run on the real substrate; only the
+        # destructive delete is replaced with a future the test drives by hand.
+        if thread_name != "purge-delete":
+            return original_start(operation, thread_name=thread_name, permit=permit)
+        permit.release()  # nothing physical holds this permit in the fake
+        reached_settlement.set()
+        return cast("asyncio.Future[object]", worker)
+
+    monkeypatch.setattr(purge_service, "_start_on_abandonable_thread", _fake_start)
+
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+    )
+    assert await asyncio.wait_for(reached_settlement.wait(), timeout=2.0)
+    await asyncio.sleep(0)
+    # The delete registration blocks placement while the worker is unsettled.
+    assert purge_service.begin_placement(str(target)) is False
+
+    worker.set_result(None)
+    loop.call_soon(purge_task.cancel)
+
+    await assert_task_raises(purge_task, asyncio.CancelledError)
+
+    # Released, not leaked, despite hold_purge_registration=True.
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+class _BlockDeleteAcquireGate:
+    """A real gate that lets the two read-only probes acquire, then parks the
+    delete's ``acquire`` on a never-resolving (but cancellable) await -- so a
+    caller can be cancelled while queued for a permit with NO worker yet."""
+
+    def __init__(self) -> None:
+        self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
+        self._acquisitions = 0
+        self.delete_acquire_reached = asyncio.Event()
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        self._acquisitions += 1
+        if self._acquisitions >= 3:  # guard=1, reclaim=2, delete=3
+            self.delete_acquire_reached.set()
+            await asyncio.get_running_loop().create_future()  # blocks until cancelled
+        return await self._inner.acquire()
+
+    def release_permit(self) -> None:
+        self._inner.release_permit()
+
+
+async def test_cancel_while_queued_for_delete_permit_releases_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #431: cancelling a purge that is still queued for the delete's gate
+    permit (no physical worker created yet) releases the registration promptly."""
+    target = tmp_path / "movies" / "Queued Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+    gate = _BlockDeleteAcquireGate()
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_THREAD_GATE", gate)
+
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+    )
+    assert await asyncio.wait_for(gate.delete_acquire_reached.wait(), timeout=2.0)
+    # No delete worker exists; the task is parked on the saturated gate, and the
+    # registration is held.
+    assert purge_service.begin_placement(str(target)) is False
+
+    purge_task.cancel()
+    await assert_task_raises(purge_task, asyncio.CancelledError)
+
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+    assert target.exists()  # nothing was deleted -- no worker ever ran
+
+
+async def test_delete_thread_start_failure_releases_permit_and_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #431: if ``Thread.start()`` fails for the delete worker, the
+    exception propagates, the gate permit is returned, the registration is
+    released even under ``hold_purge_registration``, and the gate stays usable."""
+    _install_abandonable_thread_gate(monkeypatch, 1)
+    target = tmp_path / "movies" / "Unstartable Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+
+    class _StartFails:
+        def start(self) -> None:
+            raise RuntimeError("delete thread failed to start")
+
+    original_thread = threading.Thread
+
+    def _make_thread(*, target: Callable[[], None], name: str, daemon: bool) -> threading.Thread:
+        if name == "purge-delete":
+            return cast(threading.Thread, _StartFails())
+        return original_thread(target=target, name=name, daemon=daemon)
+
+    monkeypatch.setattr(purge_service.threading, "Thread", _make_thread)
+
+    with pytest.raises(RuntimeError, match="delete thread failed to start"):
+        await purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+    # Gate still usable: the returned permit lets a second (real) purge complete.
+    monkeypatch.setattr(purge_service.threading, "Thread", original_thread)
+    result = await purge_service.purge_library_path(fs, str(target))
+    assert result.outcome is PurgeOutcome.deleted
+    assert not target.exists()
+
+
+async def test_successful_held_purge_retains_registration_until_end_purge(
+    tmp_path: Path,
+) -> None:
+    """A successful held purge keeps the path claimed after it returns; only the
+    caller's ``end_purge`` releases it (the eviction finalize-commit contract)."""
+    target = tmp_path / "movies" / "Held Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+
+    result = await purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+
+    assert result.outcome is PurgeOutcome.deleted
+    assert not target.exists()
+    assert purge_service.active_purge_paths() == (os.path.abspath(os.path.normpath(str(target))),)
+    assert purge_service.begin_placement(str(target)) is False
+    purge_service.end_purge(str(target))
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+async def test_failed_held_purge_does_not_retain_registration(tmp_path: Path) -> None:
+    """A held purge whose delete FAILS is never held: it returns
+    ``PurgeOutcome.error`` and releases the registration without an ``end_purge``,
+    so placement is immediately allowed again."""
+    target = tmp_path / "movies" / "Failing Held Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _FailingBlockedDeleteFileSystem(target.parent)
+    fs.release.set()  # let the delete run (and fail) without blocking
+
+    result = await purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+
+    assert result.outcome is PurgeOutcome.error
+    assert target.exists()
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+async def test_double_cancellation_still_waits_for_physical_settlement(
+    tmp_path: Path,
+) -> None:
+    """Cancelling twice while the delete is blocked still defers the caller's
+    return until the daemon thread physically settles; cancellation wins and the
+    registration is released exactly once (its coroutine ``finally`` runs once)."""
+    target = tmp_path / "movies" / "Twice Cancelled Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(fs, str(target), hold_purge_registration=True)
+    )
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        purge_task.cancel()
+        await asyncio.sleep(0)
+        assert not purge_task.done()
+        purge_task.cancel()  # a second cancel while the worker is still blocked
+        await asyncio.sleep(0)
+        assert not purge_task.done(), "must still wait for physical settlement"
+        assert purge_service.begin_placement(str(target)) is False
+        assert target.exists()
+    finally:
+        fs.release.set()
+        await assert_task_raises(purge_task, asyncio.CancelledError)
+
+    assert fs.deleted == [str(target)]
+    assert not target.exists()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
 
 
 async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path) -> None:

@@ -1629,7 +1629,7 @@ async def _await_background_tasks_shutdown(
     process exits regardless, so no delete durability is lost, only how long
     shutdown blocks on it. That abandonment is real, not aspirational, because
     the delete runs on a dedicated DAEMON thread
-    (:func:`purge_service._run_delete_on_abandonable_thread`, codex #406 P1)
+    (:func:`purge_service._start_on_abandonable_thread`, codex #406 P1)
     -- were it on ``asyncio.to_thread``'s default executor, whose non-daemon
     workers the interpreter re-joins at exit, the process would still block on
     the hung delete after this wait "proceeded". The still-active purge

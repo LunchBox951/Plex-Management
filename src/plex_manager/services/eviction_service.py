@@ -1951,24 +1951,27 @@ async def run_eviction_sweep(
     instead of racing crash-recovery against a delete that is still physically
     running.
 
-    CAVEAT (issue #421): at process shutdown that does not hold. The purge
-    delete's shielded settlement (:func:`~plex_manager.services.purge_service.
-    _delete_to_settlement`) can be force-resolved by
+    CAVEAT (issue #421 / #431): the ``_ACTIVE_PURGE_PATHS`` purge-vs-placement
+    race this latch is often discussed alongside is now CLOSED even at process
+    shutdown — :func:`~plex_manager.services.purge_service.purge_library_path`
+    holds its path registration until the delete worker PHYSICALLY completes,
+    including through abandonment (see its docstring). ``_sweep_latch`` itself,
+    however, is a coarser in-process serialization flag, NOT a physical-
+    completion tracker: at process shutdown
     :func:`~plex_manager.services.purge_service.abandon_active_settlements`
-    (PR #406) without the daemon ``shutil.rmtree`` thread ever finishing, and
-    this sweep's cancellation then unwinds through the ``finally`` below the
-    same way it would after a real settlement — clearing ``_sweep_latch``
-    before the abandoned delete has physically stopped touching disk (the
-    identical caveat documented on
-    :func:`~plex_manager.services.purge_service.purge_library_path` and
-    :func:`~plex_manager.services.purge_service._await_worker_settlement`).
-    This is accepted, not yet closed: it is reachable only inside the bounded
-    shutdown wait on the way to process exit, and issue #128's crash-recovery
-    sweep on the *next* startup reconciles whatever partial disk state an
-    abandoned delete left behind, exactly as it would after a hard crash
-    mid-delete. See ``tests/web/test_shutdown_wait.py`` for a regression test
-    demonstrating the analogous ``_ACTIVE_PURGE_PATHS`` window on the purge
-    side.
+    (PR #406) can force the purge delete's shielded settlement to resolve
+    without the daemon ``shutil.rmtree`` thread ever finishing, and this sweep's
+    cancellation then unwinds through the ``finally`` below the same way it
+    would after a real settlement — clearing ``_sweep_latch`` before the
+    abandoned delete has physically stopped touching disk. That residual is a
+    separate, accepted process-exit-only gap: it is reachable only inside the
+    bounded shutdown wait on the way to process exit, and issue #128's crash-
+    recovery sweep on the *next* startup reconciles whatever partial disk state
+    an abandoned delete left behind, exactly as after a hard crash mid-delete.
+    Closing the purge-path race did not (and was not meant to) make
+    ``_sweep_latch`` track physical completion. See
+    ``tests/web/test_shutdown_wait.py`` for the purge-side regression proving
+    the ``_ACTIVE_PURGE_PATHS`` window is closed.
     """
     if _sweep_latch["busy"]:
         _logger.info(
