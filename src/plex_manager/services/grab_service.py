@@ -449,6 +449,25 @@ def _planned_target_seasons(scored: ScoredRelease, season: int | None) -> tuple[
     return tuple(dict.fromkeys(scored.target_seasons or (season,)))
 
 
+def _active_guard_seasons(
+    scored: ScoredRelease, season: int | None, target_seasons: tuple[int, ...]
+) -> tuple[int | None, ...]:
+    """Seasons whose active downloads a fresh grab must not duplicate.
+
+    For an ordinary release this is exactly the planned targets (or the primary
+    ``season``). For a multi-season pack the PHYSICAL torrent downloads every
+    ``covered_seasons`` entry, not only the ``target_seasons`` it logically claims
+    -- so an already-active download for ANY covered season (e.g. S1-S7 grabbed as
+    individual packs before an S01-S09 pack targeting S8-S9 surfaces) is a real
+    duplicate and must block the add. This is the grab-time TOCTOU backstop for the
+    planner's ``covered_season_in_flight`` rejection (issue #409): coverage guarding
+    is intentionally wider than logical scope ownership, which stays on the targets.
+    """
+    if scored.covered_seasons:
+        return tuple(dict.fromkeys((*target_seasons, *scored.covered_seasons)))
+    return target_seasons or (season,)
+
+
 def _target_episodes(
     *,
     primary_season: int,
@@ -753,7 +772,7 @@ async def grab(
                 episodes = None
 
     target_seasons = _planned_target_seasons(scored, season)
-    active_guard_seasons: tuple[int | None, ...] = target_seasons or (season,)
+    active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.

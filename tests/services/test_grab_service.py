@@ -623,6 +623,50 @@ async def test_grab_rejects_pack_when_target_sibling_has_different_active_releas
     assert rows[0].torrent_hash == "5" * 40
 
 
+async def test_grab_rejects_pack_overlapping_active_season_outside_targets(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #409 grab-time backstop: a multi-season pack physically covers every
+    ``covered_seasons`` entry, not only the ``target_seasons`` it claims. If a
+    COVERED-but-untargeted season already has a different active torrent (a clean
+    S01-S03 plan targeting S1/S3 racing an S2 download started after the preview),
+    the redundant pack must be refused BEFORE qBittorrent is asked to add it."""
+    request_id = await _make_tv_request(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv("5" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+
+    # The pack claims only S1 and S3, but its physical coverage includes the
+    # already-active S2 -- the widened guard must catch that overlap.
+    pack = _scored_tv("6" * 40, "Some.Show.S01-S03.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"covered_seasons": (1, 2, 3), "target_seasons": (1, 3)}
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=pack,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == "5" * 40
+
+
 async def test_grab_attaches_same_hash_active_for_a_different_season(
     sessionmaker_: SessionMaker,
 ) -> None:
