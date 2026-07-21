@@ -528,11 +528,15 @@ async def run_abandonable_probe[T](
     unwinding the await), the daemon worker runs to completion unobserved and
     releases its OWN permit on that completion (the permit is bound to physical
     thread completion in :func:`_start_on_abandonable_thread`, never to this
-    coroutine), and ``asyncio.shield`` consumes the worker's eventual result or
-    exception so a late delivery is never reported as "never retrieved". This is
-    also what keeps process shutdown bounded WITHOUT any settlement registration:
-    the lifespan's cancellation of a probe-bearing task unwinds it at once rather
-    than blocking on a detached daemon worker.
+    coroutine). ``asyncio.shield`` DROPS its observer on the inner worker future
+    when the caller's await is cancelled, so an explicit done-callback
+    (``_retrieve_worker_outcome``) retrieves the detached worker's eventual
+    exception -- otherwise a late probe failure would surface as the loop's
+    "Future exception was never retrieved" (honesty over silence: a delete gets the
+    equivalent in :func:`_await_worker_settlement`). This is also what keeps
+    process shutdown bounded WITHOUT any settlement registration: the lifespan's
+    cancellation of a probe-bearing task unwinds it at once rather than blocking on
+    a detached daemon worker.
 
     ``operation`` results and exceptions are delivered unchanged during ordinary
     operation. In particular, callers retain ownership of narrow classifications
@@ -541,20 +545,36 @@ async def run_abandonable_probe[T](
     wedged-probe detach honest and diagnosable without logging probe results.
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe")
+
+    def _retrieve_worker_outcome(done: asyncio.Future[T]) -> None:
+        # ``asyncio.shield`` removed its own inner-done callback when this caller's
+        # await was cancelled, leaving the detached worker future unobserved. Read
+        # its outcome so an eventual failure is retrieved rather than reported by
+        # the loop as "Future exception was never retrieved". A result is discarded
+        # (a detached probe's return value has no consumer).
+        if not done.cancelled():
+            done.exception()
+
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
-        if not worker.done():
+        if worker.done():
+            # Settled in the same loop iteration as the cancellation, so shield may
+            # not have consumed its outcome; retrieve any exception now.
+            _retrieve_worker_outcome(worker)
+        else:
             # A read-only probe left running on a (likely wedged) mount: the caller
             # unwinds now, the daemon worker keeps going and returns its own permit
             # when it physically finishes. Log so an abandoned probe worker is
-            # visible (honesty over silence) rather than a silent detach.
+            # visible (honesty over silence) rather than a silent detach, and
+            # retrieve its eventual exception when it finally settles.
             _logger.warning(
                 "%s of %r detached on caller cancellation; its daemon worker will "
                 "run to completion unobserved and then release its probe permit",
                 operation_name,
                 safe_text(path),
             )
+            worker.add_done_callback(_retrieve_worker_outcome)
         raise
 
 

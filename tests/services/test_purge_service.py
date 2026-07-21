@@ -7,6 +7,7 @@ guard is genuinely exercised (the same posture as ``test_eviction_service``).
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import threading
@@ -142,6 +143,25 @@ def _install_abandonable_delete_gate(monkeypatch: pytest.MonkeyPatch, limit: int
     )
 
 
+class _CountingThreadGate:
+    """Wrap a real gate and record every ``acquire`` so a test can prove which
+    budget a given path actually draws from (issue #447): probes and deletes must
+    draw from SEPARATE gates, so routing a delete back through the probe gate has
+    to be demonstrably detectable, not merely tolerated by a spare shared permit.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._inner = purge_service._AbandonableThreadGate(limit)  # pyright: ignore[reportPrivateUsage]
+        self.acquired = 0
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        self.acquired += 1
+        return await self._inner.acquire()
+
+    def release_permit(self) -> None:
+        self._inner.release_permit()
+
+
 async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -217,11 +237,19 @@ async def test_wedged_probe_budget_does_not_starve_a_delete_permit(
 ) -> None:
     """Issue #447: probes and deletes draw from SEPARATE permit budgets, so a
     probe worker wedged on a dead mount holding the ENTIRE probe budget cannot
-    block a delete from acquiring a delete permit. Under the old single shared
-    gate (one permit here) the wedged probe would hold it and the delete would
-    deadlock; the partition keeps the destructive delete's budget its own."""
-    _install_abandonable_probe_gate(monkeypatch, 1)
-    _install_abandonable_delete_gate(monkeypatch, 1)
+    block a delete from acquiring a delete permit.
+
+    Both gates are limit-1 spies. The wedged probe saturates the probe gate, then
+    the delete must complete by drawing from its OWN gate. The spies assert the
+    routing, not just the outcome: routing the delete back through the probe gate
+    (un-partitioning) would both TIME OUT the wait below AND leave
+    ``probe_gate.acquired == 2`` -- so this test demonstrably fails without the
+    partition, rather than passing on a spare permit from an unrelated shared gate.
+    """
+    probe_gate = _CountingThreadGate(1)
+    delete_gate = _CountingThreadGate(1)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", delete_gate)
     root = tmp_path / "movies"
     root.mkdir()
     probe_target = root / "Wedged Probe.mkv"
@@ -235,6 +263,7 @@ async def test_wedged_probe_budget_does_not_starve_a_delete_permit(
         probe_task.cancel()
         await assert_task_raises(probe_task, asyncio.CancelledError)
         assert probe_fs.started_count == 1
+        assert probe_gate.acquired == 1  # only the wedged probe drew a probe permit
 
         # A delete must still acquire its own (separate) permit and complete,
         # despite the probe gate being fully saturated by the wedged worker.
@@ -248,9 +277,79 @@ async def test_wedged_probe_budget_does_not_starve_a_delete_permit(
             timeout=2.0,
         )
         assert not delete_target.exists()
+        # The delete drew from its OWN gate and never touched the saturated probe
+        # gate -- the concrete partition guarantee, not merely "a delete finished".
+        assert delete_gate.acquired == 1
+        assert probe_gate.acquired == 1
     finally:
         probe_fs.release.set()
         assert await asyncio.to_thread(probe_fs.finished.wait, 2.0)
+
+
+async def test_detached_probe_worker_failure_is_retrieved_not_reported_unretrieved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #445: a probe that detached on cancellation whose daemon worker LATER
+    fails must have that exception RETRIEVED. ``asyncio.shield`` drops its observer
+    on the inner worker future when the caller's await is cancelled, so without an
+    explicit done-callback the eventual failure surfaces on the loop as
+    "Future exception was never retrieved" -- a swallowed-error violation of the
+    honesty north star.
+
+    Driven deterministically via a hand-controlled worker future: the guard probe
+    detaches on cancel, then the future is failed with no awaiter. Without the fix
+    the loop's exception handler records the unretrieved-exception context; with it
+    the attached callback consumes the exception and the handler stays silent.
+    """
+    root = tmp_path / "movies"
+    root.mkdir()
+    target = root / "Wedged.mkv"
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(root)])
+
+    loop = asyncio.get_running_loop()
+    # Held in a list so the test can drop its ONLY strong reference to the worker
+    # future (``worker_box.clear()``) and let it be collected -- an unretrieved
+    # exception is reported by ``Future.__del__``, so the future must be
+    # collectible for the no-fix case to surface the violation.
+    worker_box: list[asyncio.Future[object]] = [loop.create_future()]
+    reached_probe = asyncio.Event()
+    original_start = purge_service._start_on_abandonable_thread  # pyright: ignore[reportPrivateUsage]
+
+    def _fake_start(
+        operation: Callable[[], object],
+        *,
+        thread_name: str,
+        permit: purge_service._AbandonableThreadPermit,  # pyright: ignore[reportPrivateUsage]
+    ) -> asyncio.Future[object]:
+        # Only the read-only guard probe is replaced with a hand-driven future;
+        # nothing physical holds its permit, so return it to the gate immediately.
+        if thread_name != "filesystem-probe":
+            return original_start(operation, thread_name=thread_name, permit=permit)
+        permit.release()
+        reached_probe.set()
+        return worker_box[0]
+
+    monkeypatch.setattr(purge_service, "_start_on_abandonable_thread", _fake_start)
+
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        purge_task = asyncio.create_task(purge_service.purge_library_path(fs, str(target)))
+        assert await asyncio.wait_for(reached_probe.wait(), timeout=2.0)
+        purge_task.cancel()
+        await assert_task_raises(purge_task, asyncio.CancelledError)
+        # The detached worker now fails; its exception must be consumed by the
+        # callback run_abandonable_probe attached, not left for the loop to report.
+        worker_box[0].set_exception(OSError("wedged probe finally failed"))
+        worker_box.clear()
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert loop_errors == []
 
 
 async def test_abandonable_thread_worker_exception_releases_its_permit(
