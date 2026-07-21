@@ -818,7 +818,9 @@ async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
     monkeypatch.setattr(loop, "call_soon_threadsafe", _closed_loop_delivery)
     monkeypatch.setattr(loop, "is_closed", lambda: True)
     await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
-        lambda: fs.delete(str(target)), thread_name="purge-delete"
+        lambda: fs.delete(str(target)),
+        thread_name="purge-delete",
+        gate=purge_service._ABANDONABLE_DELETE_THREAD_GATE,  # pyright: ignore[reportPrivateUsage]
     )
     assert fs.started.wait(timeout=2.0)
     fs.release.set()

@@ -121,9 +121,11 @@ class _FailingFirstBlockedGuardFileSystem(_BlockedGuardFileSystem):
 
 
 def _install_abandonable_probe_gate(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
-    """Install a test-local PROBE physical-worker limit (issue #447 split the
-    probe budget from the delete budget; the guard/reclaim probes these tests
-    drive run on the probe gate)."""
+    """Install a test-local PROBE physical-worker limit (issue #447 split the probe
+    budget from the delete budget). The shared probe budget serves genuinely-
+    unrelated read-only probes (``run_abandonable_probe`` callers); a purge's OWN
+    guard/reclaim preflight draws the DELETE budget instead, so tests driving a full
+    ``purge_library_path`` size the DELETE gate."""
     monkeypatch.setattr(
         purge_service,
         "_ABANDONABLE_PROBE_THREAD_GATE",
@@ -133,8 +135,10 @@ def _install_abandonable_probe_gate(monkeypatch: pytest.MonkeyPatch, limit: int)
 
 
 def _install_abandonable_delete_gate(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
-    """Install a test-local DELETE physical-worker limit (the separate destructive
-    budget, issue #447)."""
+    """Install a test-local DELETE physical-worker limit: the destructive budget,
+    which ALSO backs a purge's mandatory guard/reclaim preflight probes (issue
+    #447), so a full ``purge_library_path`` -- guard, reclaim, and delete -- draws
+    only from this gate."""
     monkeypatch.setattr(
         purge_service,
         "_ABANDONABLE_DELETE_THREAD_GATE",
@@ -167,9 +171,10 @@ async def test_abandonable_thread_cap_queues_the_next_worker_until_one_finishes(
 ) -> None:
     """Issue #417: N physical workers consume the whole substrate; N+1 stays
     queued without creating another OS thread until one of those workers really
-    finishes and returns its permit."""
+    finishes and returns its permit. Driven via a full purge, whose guard preflight
+    probe draws the DELETE budget (issue #447), so that gate is the one sized here."""
     worker_limit = 2
-    _install_abandonable_probe_gate(monkeypatch, worker_limit)
+    _install_abandonable_delete_gate(monkeypatch, worker_limit)
     root = tmp_path / "movies"
     root.mkdir()
     targets = [root / f"Blocked {index}.mkv" for index in range(worker_limit + 1)]
@@ -197,9 +202,10 @@ async def test_probe_permit_is_held_by_the_detached_worker_after_caller_cancella
     """Issue #445/#447: a cancelled probe awaiter DETACHES promptly (its task
     finishes on ``CancelledError`` at once, unlike a shielded delete), but the
     probe's permit stays bound to its daemon worker's PHYSICAL completion -- so a
-    second probe queued behind it on the limit-1 probe gate cannot start until the
-    wedged worker actually finishes and returns its own permit."""
-    _install_abandonable_probe_gate(monkeypatch, 1)
+    second probe queued behind it on the limit-1 gate cannot start until the wedged
+    worker actually finishes and returns its own permit. Driven via a full purge,
+    whose guard preflight probe draws the DELETE budget (issue #447)."""
+    _install_abandonable_delete_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "First.mkv"
@@ -232,74 +238,84 @@ async def test_probe_permit_is_held_by_the_detached_worker_after_caller_cancella
     assert fs.started_count == 2
 
 
-async def test_wedged_probe_budget_does_not_starve_a_delete_permit(
+async def test_saturated_probe_budget_does_not_block_a_full_purge_correction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #447: probes and deletes draw from SEPARATE permit budgets, so a
-    probe worker wedged on a dead mount holding the ENTIRE probe budget cannot
-    block a delete from acquiring a delete permit.
+    """Issue #447 (production-shaped): a FULL operator-correction ``purge_library_path``
+    -- delete-guard probe, reclaimable-bytes probe, AND the delete -- must run to
+    completion even when unrelated read-only probes have wedged and saturated the
+    ENTIRE shared PROBE budget, because the purge's mandatory preflight probes draw
+    the DELETE budget, not the probe budget.
 
-    Both gates are limit-1 spies. The wedged probe saturates the probe gate, then
-    the delete must complete by drawing from its OWN gate. The spies assert the
-    routing, not just the outcome: routing the delete back through the probe gate
-    (un-partitioning) would both TIME OUT the wait below AND leave
-    ``probe_gate.acquired == 2`` -- so this test demonstrably fails without the
-    partition, rather than passing on a spare permit from an unrelated shared gate.
+    Counting gates prove the routing, not merely the outcome: the whole purge draws
+    exactly three DELETE permits (guard, reclaim, delete) and NEVER a probe permit,
+    so a regression that put preflight back on the saturated probe gate would
+    DEADLOCK the purge at its guard probe (caught by the bounded ``wait_for`` below)
+    rather than pass on a spare shared permit. Bypassing preflight by calling
+    ``_delete_to_settlement`` directly could not establish this guarantee.
     """
     probe_gate = _CountingThreadGate(1)
-    delete_gate = _CountingThreadGate(1)
+    delete_gate = _CountingThreadGate(2)
     monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
     monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", delete_gate)
     root = tmp_path / "movies"
     root.mkdir()
-    probe_target = root / "Wedged Probe.mkv"
-    probe_target.write_bytes(b"x")
-    probe_fs = _BlockedGuardFileSystem(root, expected_starts=1)
-    probe_task = asyncio.create_task(purge_service.purge_library_path(probe_fs, str(probe_target)))
+
+    # An unrelated read-only probe wedges on a (simulated) dead mount and holds the
+    # ONLY probe permit for the whole test -- the probe budget is fully saturated.
+    started = threading.Event()
+    release = threading.Event()
+
+    def _wedged_probe() -> bool:
+        started.set()
+        release.wait(timeout=5)
+        return False
+
+    probe_task = asyncio.create_task(
+        purge_service.run_abandonable_probe(
+            _wedged_probe, str(root), operation_name="unrelated disk probe"
+        )
+    )
     try:
-        assert await asyncio.to_thread(probe_fs.expected_started.wait, 2.0)
-        # Detach the probe: the caller unwinds, the worker stays wedged holding
-        # the ONLY probe permit.
+        assert await asyncio.to_thread(started.wait, 2.0)
+        # Detach the unrelated probe: the caller unwinds, the worker keeps the sole
+        # probe permit until ``release`` is set in the finally below.
         probe_task.cancel()
         await assert_task_raises(probe_task, asyncio.CancelledError)
-        assert probe_fs.started_count == 1
-        assert probe_gate.acquired == 1  # only the wedged probe drew a probe permit
+        assert probe_gate.acquired == 1  # only the wedged unrelated probe
 
-        # A delete must still acquire its own (separate) permit and complete,
-        # despite the probe gate being fully saturated by the wedged worker.
-        delete_target = root / "Deleted.mkv"
-        delete_target.write_bytes(b"x")
-        delete_fs = LocalFileSystem([str(root)])
-        await asyncio.wait_for(
-            purge_service._delete_to_settlement(  # pyright: ignore[reportPrivateUsage]
-                delete_fs, str(delete_target), hold_purge_registration=False
-            ),
-            timeout=2.0,
+        target = root / "Reported (2020).mkv"
+        target.write_bytes(b"x" * 4096)
+        fs = LocalFileSystem([str(root)])
+        result = await asyncio.wait_for(
+            purge_service.purge_library_path(fs, str(target)), timeout=2.0
         )
-        assert not delete_target.exists()
-        # The delete drew from its OWN gate and never touched the saturated probe
-        # gate -- the concrete partition guarantee, not merely "a delete finished".
-        assert delete_gate.acquired == 1
+        assert result.outcome is PurgeOutcome.deleted
+        assert result.freed_bytes == 4096
+        assert not target.exists()
+        # The whole correction -- guard probe, reclaim probe, delete -- drew from the
+        # DELETE budget; the saturated probe budget was never touched by the purge.
+        assert delete_gate.acquired == 3
         assert probe_gate.acquired == 1
     finally:
-        probe_fs.release.set()
-        assert await asyncio.to_thread(probe_fs.finished.wait, 2.0)
+        release.set()
 
 
-async def test_detached_probe_worker_failure_is_retrieved_not_reported_unretrieved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_detached_probe_worker_failure_is_retrieved_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Issue #445: a probe that detached on cancellation whose daemon worker LATER
-    fails must have that exception RETRIEVED. ``asyncio.shield`` drops its observer
-    on the inner worker future when the caller's await is cancelled, so without an
-    explicit done-callback the eventual failure surfaces on the loop as
-    "Future exception was never retrieved" -- a swallowed-error violation of the
-    honesty north star.
+    fails must have that exception RETRIEVED *and* LOGGED. ``asyncio.shield`` drops
+    its observer on the inner worker future when the caller's await is cancelled, so
+    without an explicit done-callback the eventual failure surfaces on the loop as
+    "Future exception was never retrieved"; and merely consuming it silently would
+    still leave no record the operation failed -- both violate the honesty north
+    star. The callback therefore retrieves the exception (so the loop stays silent)
+    AND logs its sanitized type (so the failure is on the record), the read-only
+    equivalent of the delete path's cancelled-worker-failure log.
 
     Driven deterministically via a hand-controlled worker future: the guard probe
-    detaches on cancel, then the future is failed with no awaiter. Without the fix
-    the loop's exception handler records the unretrieved-exception context; with it
-    the attached callback consumes the exception and the handler stays silent.
+    detaches on cancel, then the future is failed with no awaiter.
     """
     root = tmp_path / "movies"
     root.mkdir()
@@ -335,13 +351,14 @@ async def test_detached_probe_worker_failure_is_retrieved_not_reported_unretriev
     loop_errors: list[dict[str, object]] = []
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    caplog.set_level(logging.WARNING, logger="plex_manager.services.purge_service")
     try:
         purge_task = asyncio.create_task(purge_service.purge_library_path(fs, str(target)))
         assert await asyncio.wait_for(reached_probe.wait(), timeout=2.0)
         purge_task.cancel()
         await assert_task_raises(purge_task, asyncio.CancelledError)
-        # The detached worker now fails; its exception must be consumed by the
-        # callback run_abandonable_probe attached, not left for the loop to report.
+        # The detached worker now fails; its exception must be consumed AND logged by
+        # the callback the probe attached, not left for the loop to report.
         worker_box[0].set_exception(OSError("wedged probe finally failed"))
         worker_box.clear()
         gc.collect()
@@ -349,15 +366,30 @@ async def test_detached_probe_worker_failure_is_retrieved_not_reported_unretriev
     finally:
         loop.set_exception_handler(previous_handler)
 
+    # Retrieved: the loop never reported an unretrieved exception.
     assert loop_errors == []
+    # Logged: an intentional, sanitized failure record (the exception TYPE only,
+    # never the raw message) naming the detached guard probe.
+    failure_logs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "failed" in record.getMessage()
+        and "delete-guard probe" in record.getMessage()
+    ]
+    assert len(failure_logs) == 1
+    message = failure_logs[0].getMessage()
+    assert "OSError" in message
+    assert "wedged probe finally failed" not in message
 
 
 async def test_abandonable_thread_worker_exception_releases_its_permit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A physically settled exception is still a settlement: its permit must be
-    returned so the next queued worker can start."""
-    _install_abandonable_probe_gate(monkeypatch, 1)
+    returned so the next queued worker can start. Driven via a full purge, whose
+    guard preflight probe draws the DELETE budget (issue #447)."""
+    _install_abandonable_delete_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "Failing.mkv"
@@ -394,7 +426,9 @@ def test_abandonable_thread_releases_permit_after_originating_loop_closes(
     old_loop = asyncio.new_event_loop()
     late_worker = old_loop.run_until_complete(
         purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
-            lambda: fs.delete_guard_refuses(str(target)), thread_name="purge-test-late"
+            lambda: fs.delete_guard_refuses(str(target)),
+            thread_name="purge-test-late",
+            gate=purge_service._ABANDONABLE_PROBE_THREAD_GATE,  # pyright: ignore[reportPrivateUsage]
         )
     )
     assert fs.expected_started.wait(timeout=2.0)
@@ -406,7 +440,9 @@ def test_abandonable_thread_releases_permit_after_originating_loop_closes(
 
     async def _run_after_loop_restart() -> None:
         worker = await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
-            lambda: None, thread_name="purge-test-restarted"
+            lambda: None,
+            thread_name="purge-test-restarted",
+            gate=purge_service._ABANDONABLE_PROBE_THREAD_GATE,  # pyright: ignore[reportPrivateUsage]
         )
         _ = await worker
 
@@ -416,12 +452,13 @@ def test_abandonable_thread_releases_permit_after_originating_loop_closes(
 async def test_saturated_probe_gate_leaves_active_and_queued_callers_promptly_cancellable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #445/#447: with the probe gate saturated, a later caller waits on a
-    plain cancellable gate await and cancel unwinds it at once (no worker ever
-    created); the active probe likewise DETACHES promptly on cancel instead of
-    shielding until settlement. Neither needs shutdown abandonment, and both
-    release their pre-delete ``_ACTIVE_PURGE_PATHS`` registration on unwind."""
-    _install_abandonable_probe_gate(monkeypatch, 1)
+    """Issue #445/#447: with the gate saturated, a later caller waits on a plain
+    cancellable gate await and cancel unwinds it at once (no worker ever created);
+    the active probe likewise DETACHES promptly on cancel instead of shielding until
+    settlement. Neither needs shutdown abandonment, and both release their pre-delete
+    ``_ACTIVE_PURGE_PATHS`` registration on unwind. Driven via a full purge, whose
+    guard preflight probe draws the DELETE budget (issue #447)."""
+    _install_abandonable_delete_gate(monkeypatch, 1)
     root = tmp_path / "movies"
     root.mkdir()
     first = root / "Active.mkv"
