@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -130,6 +131,21 @@ async def _purge_worker(fs: LocalFileSystem, path: str) -> None:
     """A background task shaped like a real ``lifespan`` member (returns
     ``None``): its body calls the shielded purge primitive."""
     await purge_service.purge_library_path(fs, path)
+
+
+async def _wait_for_registry_release(path: str, *, timeout: float = 2.0) -> None:
+    """Yield to the loop until ``path``'s deferred purge registration is released.
+
+    After shutdown abandonment (#431) the ``_ACTIVE_PURGE_PATHS`` release is
+    deferred to the raw delete worker's done-callback, which the loop runs only
+    once the daemon thread physically settles -- so a test must poll rather than
+    read the registry synchronously right after releasing the worker."""
+    normalized = os.path.abspath(os.path.normpath(path))
+    deadline = time.monotonic() + timeout
+    while normalized in purge_service.active_purge_paths():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"purge registration for {normalized!r} was never released")
+        await asyncio.sleep(0.01)
 
 
 async def _configured_eviction_app(sessionmaker_: SessionMaker, root: Path) -> FastAPI:
@@ -254,12 +270,18 @@ async def test_a_hung_shielded_delete_timeout_finishes_the_settlement_task(
         assert task.done()
         assert task.cancelled()
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # #431: the abandoned delete is still physically running, so its
+        # ``_ACTIVE_PURGE_PATHS`` registration is HELD -- deferred to the raw
+        # worker's physical completion -- not cleared the instant the settlement
+        # resolved.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
     finally:
-        # The settlement coroutine and registry are already finished; release
-        # only the test's daemon worker so it does not linger across tests.
+        # Release the daemon worker; its physical completion delivers the
+        # deferred registration release on the loop.
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    await _wait_for_registry_release(str(target))
     assert purge_service.active_purge_paths() == ()
 
 
@@ -292,12 +314,17 @@ async def test_timeout_unblocks_request_scoped_settlement(
         )
         assert isinstance(outcome, asyncio.CancelledError)
         assert not fs.finished.is_set()
-        assert purge_service.active_purge_paths() == ()
+        # #431: the abandoned request-scoped delete is still physically running,
+        # so its registration is HELD until the daemon thread settles.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
     finally:
         timeout_trigger.cancel()
         await asyncio.gather(timeout_trigger, return_exceptions=True)
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+    await _wait_for_registry_release(str(target))
+    assert purge_service.active_purge_paths() == ()
 
 
 async def test_request_settlement_is_abandoned_when_background_tasks_finish_fast(
@@ -687,29 +714,23 @@ async def test_ops_disk_probe_oserror_still_reports_root_error(
     assert result.candidates == []
 
 
-async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
+async def test_begin_placement_refuses_while_an_abandoned_delete_still_runs(
     tmp_path: Path,
 ) -> None:
-    """Issue #421: characterize the abandonment-to-exit window's confidence gap.
+    """Issue #431: the abandonment-to-exit ``begin_placement`` race is CLOSED.
 
     Shutdown abandonment (PR #406's ``abandon_active_settlements``) resolves the
-    purge's shielded settlement -- and this task's ``finally`` releases
-    ``_ACTIVE_PURGE_PATHS`` -- WITHOUT waiting for the daemon ``shutil.rmtree``
-    thread to actually finish (``fs.finished`` provably still unset below). This
-    drives exactly that abandonment for a real, still-running delete and then
-    calls ``begin_placement`` on the identical path in the narrow window before
-    process exit, the live-caller race issue #421 asks a targeted test to settle.
-
-    Result: ``begin_placement`` returns ``True``. ``_conflicts_with`` only ever
-    consults the current (already-emptied) ``_ACTIVE_PURGE_PATHS`` registry, so
-    a placement can be registered for a directory an abandoned ``rmtree`` is
-    concurrently, physically tearing down -- the exact interleaving the
-    ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS`` ordering rule (PR #117
-    round 9) exists to prevent. This is NOT restructured here (out of scope for
-    this change): it is recorded as a known gap, real only in the shutdown-to-
-    exit window, for the coordinator to weigh against issue #128's crash-
-    recovery backstop reconciling any resulting partial disk state on next
-    startup.
+    purge's shielded settlement and lets the cancelled task finish, but the
+    ``_ACTIVE_PURGE_PATHS`` release is now tied to the delete worker's PHYSICAL
+    completion, not the settlement -- ``purge_library_path`` hands the
+    registration to ``_delete_to_settlement``, which defers the unregister to the
+    raw worker's done-callback when abandonment resolves the wait early. This
+    drives exactly that abandonment for a real, still-running delete and asserts
+    a live caller reaching ``begin_placement`` in the abandonment-to-exit window
+    is REFUSED the path while the abandoned ``rmtree`` is still tearing it down --
+    the interleaving the ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS``
+    ordering rule (PR #117 round 9) exists to prevent -- and only succeeds once
+    the daemon thread genuinely finishes.
     """
     target = tmp_path / "movies" / "Stuck Movie.mkv"
     target.parent.mkdir()
@@ -730,26 +751,26 @@ async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_run
             (task,), timeout_seconds=0.05
         )
 
-        # The registration is already released and the daemon thread is
-        # PROVABLY still mid-rmtree -- the exact abandonment-to-exit window
-        # issue #421 is concerned with.
+        # The task has finished (cancelled) but the daemon thread is PROVABLY
+        # still mid-rmtree -- the exact abandonment-to-exit window.
         assert task.done()
         assert task.cancelled()
-        assert purge_service.active_purge_paths() == ()
         assert not fs.finished.is_set()
 
-        # CHARACTERIZATION: a live caller reaching begin_placement() in this
-        # window observes no conflict and is allowed to claim the path, even
-        # though the abandoned delete is still physically running against it.
-        claimed = purge_service.begin_placement(str(target))
-        assert claimed is True, (
-            "known gap (issue #421): begin_placement currently succeeds for a "
-            "path an abandoned purge delete is still physically tearing down"
-        )
+        # #431: the registration is HELD until physical completion, so a live
+        # caller is REFUSED the path an abandoned delete is still tearing down.
+        normalized = os.path.abspath(os.path.normpath(str(target)))
+        assert purge_service.active_purge_paths() == (normalized,)
+        assert purge_service.begin_placement(str(target)) is False
     finally:
-        purge_service.end_placement(str(target))
         fs.release.set()
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+    # Once the daemon thread physically finished, the deferred loop-delivered
+    # callback releases the registration and placement is allowed again.
+    await _wait_for_registry_release(str(target))
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
 
 
 async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
@@ -771,8 +792,8 @@ async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", _closed_loop_delivery)
     monkeypatch.setattr(loop, "is_closed", lambda: True)
-    await purge_service._run_delete_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
-        fs, str(target)
+    await purge_service._run_on_abandonable_thread(  # pyright: ignore[reportPrivateUsage]
+        lambda: fs.delete(str(target)), thread_name="purge-delete"
     )
     assert fs.started.wait(timeout=2.0)
     fs.release.set()
