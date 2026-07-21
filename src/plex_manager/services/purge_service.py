@@ -7,9 +7,13 @@ the remaining three are best-effort by design (a failure is logged, never silent
 and never raised) — the DB state change a caller commits around them is the
 authoritative record; a client/Plex/FS hiccup there must never undo it:
 
-* :func:`run_abandonable_probe` — typed blocking filesystem work on the bounded
-  daemon-thread substrate, registered with process-shutdown settlement tracking.
-  Results and exceptions are delivered unchanged to the caller.
+* :func:`run_abandonable_probe` — typed blocking, read-only filesystem work on a
+  dedicated bounded daemon-thread substrate (its OWN permit budget, separate from
+  deletes — see :data:`_ABANDONABLE_PROBE_THREAD_LIMIT`). Results and exceptions
+  are delivered unchanged to the caller, and ordinary cancellation propagates
+  PROMPTLY: the probe DETACHES, letting its daemon worker run to completion
+  unobserved (it releases its own permit on that completion), rather than shielding
+  the caller until physical settlement the way a destructive delete does.
 * :func:`purge_library_path` — the root-guarded ``fs.delete`` of a stored
   ``library_path`` breadcrumb, plus the hardlink-aware reclaimable-bytes
   accounting (measured BEFORE the delete, since a file's link count can only be
@@ -82,16 +86,31 @@ _logger = logging.getLogger(__name__)
 _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS: Final = 5.0
 _CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS: Final = 0.25
 
-_ABANDONABLE_THREAD_LIMIT: Final = 4
-"""Maximum simultaneous physical workers on the abandonable substrate.
+_ABANDONABLE_DELETE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous DESTRUCTIVE delete workers on the abandonable substrate.
 
-A dead mount can block an OS thread permanently, so every guard/accounting/
+A dead mount can block an OS thread permanently, so every ``shutil.rmtree``
 delete worker shares this small process-wide budget. Four preserves modest
 parallelism for unrelated operator corrections while putting a hard ceiling on
 daemon threads. A :class:`concurrent.futures.ThreadPoolExecutor` is deliberately
 forbidden because its non-daemon workers are joined at interpreter exit, which
 would reintroduce the shutdown hang this substrate exists to prevent (issue
 #417 / PR #406).
+"""
+_ABANDONABLE_PROBE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous READ-ONLY probe workers on the abandonable substrate.
+
+A SEPARATE budget from :data:`_ABANDONABLE_DELETE_THREAD_LIMIT` (issue #447):
+read-only probes (``statvfs``/disk-usage, the delete-guard containment check,
+the reclaimable-bytes walk) share the same dead-mount hazard as a delete, but
+partitioning their permits means a burst of probes wedged against a hung root
+can never hold every permit and starve a later report-issue / cancel / eviction
+DELETE — the two never compete for the same tokens. Four mirrors the delete
+budget: enough parallelism for the health dashboard's several roots plus the
+ops-disk / eviction-preview / sweep / telemetry reads, with the same hard
+daemon-thread ceiling. Because a cancelled probe DETACHES rather than shields
+(issue #445), a wedged probe still holds its permit until its own worker
+physically finishes, so this cap is what bounds concurrent wedged probes.
 """
 _ABANDONABLE_THREAD_GATE_POLL_SECONDS: Final = 0.01
 
@@ -144,7 +163,8 @@ class _AbandonableThreadPermit:
         self._gate.release_permit()
 
 
-_ABANDONABLE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_THREAD_LIMIT)
+_ABANDONABLE_DELETE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_DELETE_THREAD_LIMIT)
+_ABANDONABLE_PROBE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_PROBE_THREAD_LIMIT)
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -375,30 +395,44 @@ def _start_on_abandonable_thread[T](
 async def _run_on_abandonable_thread[T](
     operation: Callable[[], T], *, thread_name: str
 ) -> asyncio.Future[T]:
-    """Run blocking filesystem work on a bounded daemon-thread substrate.
+    """Run read-only blocking filesystem work on the bounded PROBE substrate.
 
     Deliberately NOT ``asyncio.to_thread`` (codex #406 P1 / issue #401): the
     default executor's non-daemon workers are joined during interpreter
-    teardown. Any filesystem operation that can touch a dead mount -- guard,
-    accounting, or delete -- must therefore use this abandonable substrate.
+    teardown. Any read-only filesystem operation that can touch a dead mount --
+    the delete guard's containment check, reclaimable-bytes accounting, a
+    ``statvfs`` disk-usage read -- must therefore use this abandonable substrate.
+    Destructive deletes drive the SEPARATE delete gate themselves
+    (:func:`_delete_to_settlement`), so they never contend for a probe permit
+    (issue #447).
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
     permit belongs to that worker until its physical completion ``finally``
-    releases the thread-safe token -- caller cancellation or settlement
-    abandonment must never make room for another thread while the original
-    remains wedged (issue #417). Permit acquisition and the synchronous worker
-    start are split (:func:`_start_on_abandonable_thread`) so a caller needing
-    the worker inside its own cleanup coverage can drive the two steps itself.
+    releases the thread-safe token -- caller cancellation (a detached probe, issue
+    #445) or settlement abandonment must never make room for another thread while
+    the original remains wedged (issue #417). Permit acquisition and the
+    synchronous worker start are split (:func:`_start_on_abandonable_thread`) so a
+    caller needing the worker inside its own cleanup coverage can drive the two
+    steps itself.
     """
-    permit = await _ABANDONABLE_THREAD_GATE.acquire()
+    permit = await _ABANDONABLE_PROBE_THREAD_GATE.acquire()
     return _start_on_abandonable_thread(operation, thread_name=thread_name, permit=permit)
 
 
 async def _await_worker_settlement[T](
     worker: asyncio.Future[T], library_path: str, *, operation: str
 ) -> T:
-    """Shield one abandonable filesystem worker through real or abandoned settlement."""
+    """Shield one abandonable DELETE worker through real or abandoned settlement.
+
+    The shielding here is the destructive-delete substrate property (issue #128 /
+    PR #395): a caller's cancellation is not observed until the underlying delete
+    thread has genuinely settled (or process-shutdown abandonment forces an early
+    return via :func:`abandon_active_settlements`). Read-only probes deliberately
+    do NOT use this path -- :func:`run_abandonable_probe` detaches promptly on
+    cancellation (issue #445) because a read has no partial disk mutation to
+    protect.
+    """
     settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     current_task = asyncio.current_task()
     if current_task is None:  # pragma: no cover - running coroutine always owns a task
@@ -476,27 +510,52 @@ async def _await_worker_settlement[T](
 async def run_abandonable_probe[T](
     operation: Callable[[], T], path: str, *, operation_name: str
 ) -> T:
-    """Run one blocking filesystem probe with bounded, shutdown-safe settlement.
+    """Run one blocking read-only filesystem probe that detaches on cancellation.
 
-    This is the public, purge-agnostic entry point to the shared abandonable
-    daemon-thread substrate. Filesystem reads such as ``statvfs`` can wedge on a
-    dead mount just as permanently as a delete; using ``asyncio.to_thread`` for
-    them would strand a non-daemon default-executor worker that CPython rejoins
-    during interpreter teardown, defeating the web lifespan's bounded shutdown
-    wait. The physical worker therefore consumes the same process-wide permit as
-    purge guards, accounting, and deletes, while its event-loop future is
-    registered in :func:`active_settlement_tasks` so
-    :func:`abandon_active_settlements` can release the awaiting coroutine during
-    process shutdown.
+    This is the public, purge-agnostic entry point to the read-only PROBE
+    substrate. Filesystem reads such as ``statvfs`` can wedge on a dead mount just
+    as permanently as a delete; using ``asyncio.to_thread`` for them would strand a
+    non-daemon default-executor worker that CPython rejoins during interpreter
+    teardown, defeating the web lifespan's bounded shutdown wait. The physical
+    worker therefore runs on the abandonable daemon-thread substrate, consuming a
+    permit from the DEDICATED probe budget (:data:`_ABANDONABLE_PROBE_THREAD_LIMIT`,
+    issue #447) so a wedged probe can never starve a destructive delete.
+
+    Unlike a delete, a read has no partial disk mutation to protect, so this does
+    NOT shield the caller through physical settlement (issue #445). On ORDINARY
+    cancellation the probe DETACHES: :class:`asyncio.CancelledError` propagates to
+    the caller promptly (``asyncio.shield`` protects the worker future while
+    unwinding the await), the daemon worker runs to completion unobserved and
+    releases its OWN permit on that completion (the permit is bound to physical
+    thread completion in :func:`_start_on_abandonable_thread`, never to this
+    coroutine), and ``asyncio.shield`` consumes the worker's eventual result or
+    exception so a late delivery is never reported as "never retrieved". This is
+    also what keeps process shutdown bounded WITHOUT any settlement registration:
+    the lifespan's cancellation of a probe-bearing task unwinds it at once rather
+    than blocking on a detached daemon worker.
 
     ``operation`` results and exceptions are delivered unchanged during ordinary
     operation. In particular, callers retain ownership of narrow classifications
     such as ``OSError``; this substrate adds no retries, fallback values, or broad
     exception conversion. ``path`` and ``operation_name`` exist only to make a
-    shutdown abandonment honest and diagnosable without logging probe results.
+    wedged-probe detach honest and diagnosable without logging probe results.
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe")
-    return await _await_worker_settlement(worker, path, operation=operation_name)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if not worker.done():
+            # A read-only probe left running on a (likely wedged) mount: the caller
+            # unwinds now, the daemon worker keeps going and returns its own permit
+            # when it physically finishes. Log so an abandoned probe worker is
+            # visible (honesty over silence) rather than a silent detach.
+            _logger.warning(
+                "%s of %r detached on caller cancellation; its daemon worker will "
+                "run to completion unobserved and then release its probe permit",
+                operation_name,
+                safe_text(path),
+            )
+        raise
 
 
 async def _delete_to_settlement(
@@ -543,7 +602,7 @@ async def _delete_to_settlement(
     worker: asyncio.Future[None] | None = None
     succeeded = False
     try:
-        permit = await _ABANDONABLE_THREAD_GATE.acquire()
+        permit = await _ABANDONABLE_DELETE_THREAD_GATE.acquire()
         # No ``await`` between the permit acquisition above and storing ``worker``
         # below: the synchronous starter creates the daemon thread and hands back
         # its future atomically, so cancellation can never strand a live worker.

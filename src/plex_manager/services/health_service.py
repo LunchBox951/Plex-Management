@@ -656,7 +656,8 @@ def read_disk_usage(path: str) -> DiskUsage:
     freeze the whole event loop, not just its own request. Callers on the
     shutdown-bound eviction/ops paths use
     :func:`plex_manager.services.purge_service.run_abandonable_probe`, whose
-    daemon worker cannot outlive that bound; ordinary callers may use
+    daemon worker cannot block that bound -- a cancelled probe detaches and the
+    worker is reclaimed by the OS at process exit; ordinary callers may use
     ``asyncio.to_thread`` when their lifecycle does not require abandonment.
     :func:`collect_disk_gauges` (below) is itself plain/sync for the same reason
     :func:`_size_bytes` in ``eviction_service`` is: it is the caller's job to

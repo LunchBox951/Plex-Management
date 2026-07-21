@@ -15,6 +15,7 @@ return so shutdown can proceed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -168,8 +169,13 @@ async def _configured_eviction_app(sessionmaker_: SessionMaker, root: Path) -> F
     return app
 
 
-async def _abandon_cancelled_task_at_shutdown(task: asyncio.Task[object]) -> None:
-    """Drive the production shutdown escape hatch for one cancelled settlement."""
+async def _detach_cancelled_probe_at_shutdown(task: asyncio.Task[object]) -> None:
+    """Drive the production shutdown path for one cancelled, DETACHING probe.
+
+    A read-only probe honors ordinary cancellation promptly (issue #445): the
+    task finishes at once instead of waiting for shutdown abandonment, so the
+    bounded background-task wait proceeds normally while the wedged daemon worker
+    is left to finish (and release its own permit) unobserved."""
 
     async def _quick_background_task() -> None:
         await asyncio.sleep(1000)
@@ -177,11 +183,14 @@ async def _abandon_cancelled_task_at_shutdown(task: asyncio.Task[object]) -> Non
     background_task = asyncio.create_task(_quick_background_task())
     task.cancel()
     background_task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done(), "probe cancellation must wait for shutdown abandonment"
     await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
         (background_task,), timeout_seconds=5.0
     )
+    # The detached probe honors cancellation promptly; let its owning task finish
+    # unwinding (a real tick has cleanup past the probe) so callers can assert its
+    # terminal cancelled state.
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_fast_settling_tasks_are_unaffected_by_the_bound(
@@ -360,30 +369,22 @@ async def test_request_settlement_is_abandoned_when_background_tasks_finish_fast
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
 
 
-async def test_hung_pre_delete_probe_is_abandoned_at_shutdown(tmp_path: Path) -> None:
-    """P1-d: guard/size probes use abandonable workers and settlement tracking."""
+async def test_cancelled_pre_delete_guard_probe_detaches_promptly(tmp_path: Path) -> None:
+    """Issue #445: the guard probe honors ordinary cancellation at once. The purge
+    unwinds on ``CancelledError`` immediately -- without waiting for the wedged
+    daemon worker or shutdown abandonment -- and releases its pre-delete
+    ``_ACTIVE_PURGE_PATHS`` registration. The worker keeps running unobserved."""
     target = tmp_path / "movies" / "Probe Movie.mkv"
     target.parent.mkdir()
     target.write_bytes(b"x")
     fs = _BlockedProbeFileSystem(target.parent)
     purge_task = asyncio.create_task(_purge_worker(fs, str(target)))
-
-    async def _quick() -> None:
-        await asyncio.sleep(1000)
-
-    background_task = asyncio.create_task(_quick())
     try:
         assert await asyncio.to_thread(fs.started.wait, 2.0)
         purge_task.cancel()
-        background_task.cancel()
-        await asyncio.sleep(0)
-        assert not purge_task.done(), "probe cancellation must wait for shutdown abandonment"
+        with pytest.raises(asyncio.CancelledError):
+            await purge_task
 
-        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
-            (background_task,), timeout_seconds=5.0
-        )
-
-        assert purge_task.done()
         assert purge_task.cancelled()
         assert not fs.finished.is_set()
         assert purge_service.active_purge_paths() == ()
@@ -392,30 +393,19 @@ async def test_hung_pre_delete_probe_is_abandoned_at_shutdown(tmp_path: Path) ->
         assert await asyncio.to_thread(fs.finished.wait, 2.0)
 
 
-async def test_hung_reclaimable_bytes_probe_is_abandoned_at_shutdown(tmp_path: Path) -> None:
-    """The second pre-delete probe uses the same abandonable settlement path."""
+async def test_cancelled_reclaimable_bytes_probe_detaches_promptly(tmp_path: Path) -> None:
+    """The second pre-delete probe detaches on the same prompt-cancellation path."""
     target = tmp_path / "movies" / "Size Probe Movie.mkv"
     target.parent.mkdir()
     target.write_bytes(b"x")
     fs = _BlockedReclaimProbeFileSystem(target.parent)
     purge_task = asyncio.create_task(_purge_worker(fs, str(target)))
-
-    async def _quick() -> None:
-        await asyncio.sleep(1000)
-
-    background_task = asyncio.create_task(_quick())
     try:
         assert await asyncio.to_thread(fs.started.wait, 2.0)
         purge_task.cancel()
-        background_task.cancel()
-        await asyncio.sleep(0)
-        assert not purge_task.done()
+        with pytest.raises(asyncio.CancelledError):
+            await purge_task
 
-        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
-            (background_task,), timeout_seconds=5.0
-        )
-
-        assert purge_task.done()
         assert purge_task.cancelled()
         assert not fs.finished.is_set()
         assert purge_service.active_purge_paths() == ()
@@ -451,7 +441,7 @@ async def test_hung_disk_pressure_probe_is_abandoned_at_shutdown(
     task = asyncio.create_task(app_module._eviction_tick_leased(app))  # pyright: ignore[reportPrivateUsage]
     try:
         assert await asyncio.to_thread(blocker.started.wait, 2.0)
-        await _abandon_cancelled_task_at_shutdown(task)
+        await _detach_cancelled_probe_at_shutdown(task)
         assert task.done()
         assert task.cancelled()
         assert not blocker.finished.is_set()
@@ -468,7 +458,8 @@ async def test_hung_eviction_service_disk_probe_is_abandoned_at_shutdown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #418: both eviction-service disk reads share settlement tracking."""
+    """Issue #418/#445: both eviction-service disk reads run on the detaching
+    probe substrate, so a wedged read cannot delay process exit."""
     blocker = _BlockedDiskUsageProbe()
     monkeypatch.setattr(eviction_service, "read_disk_usage", blocker)
     library = FakeLibrary()
@@ -500,7 +491,7 @@ async def test_hung_eviction_service_disk_probe_is_abandoned_at_shutdown(
             )
         try:
             assert await asyncio.to_thread(blocker.started.wait, 2.0)
-            await _abandon_cancelled_task_at_shutdown(task)
+            await _detach_cancelled_probe_at_shutdown(task)
             assert task.done()
             assert task.cancelled()
             assert not blocker.finished.is_set()
@@ -588,9 +579,9 @@ async def test_hung_retention_telemetry_disk_probe_is_abandoned_at_shutdown(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Codex P2: the pressure-pass branch of the eviction tick falls straight
-    into ``run_retention_telemetry_sweep``'s own disk-usage probe -- it must
-    share the same shutdown-abandonable settlement tracking as the other three
-    call sites, not a bare ``asyncio.to_thread``."""
+    into ``run_retention_telemetry_sweep``'s own disk-usage probe -- it must run
+    on the same detaching probe substrate as the other three call sites (issue
+    #445), not a bare ``asyncio.to_thread`` whose worker CPython rejoins at exit."""
     blocker = _BlockedDiskUsageProbe()
     monkeypatch.setattr(retention_telemetry_service, "read_disk_usage", blocker)
     library = FakeLibrary()
@@ -613,7 +604,7 @@ async def test_hung_retention_telemetry_disk_probe_is_abandoned_at_shutdown(
             assert await asyncio.to_thread(blocker.started.wait, 2.0)
             assert blocker.thread_name == "filesystem-probe"
             assert blocker.thread_daemon is True
-            await _abandon_cancelled_task_at_shutdown(task)
+            await _detach_cancelled_probe_at_shutdown(task)
             assert task.done()
             assert task.cancelled()
             assert not blocker.finished.is_set()
@@ -652,9 +643,9 @@ async def test_hung_ops_disk_probe_is_abandoned_at_shutdown(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Codex P2: ``GET /api/v1/ops/disk`` reads usage BEFORE it ever reaches
-    the now-protected ``preview_candidates`` -- that first read must share the
-    same shutdown-abandonable settlement tracking, not a bare
-    ``asyncio.to_thread``."""
+    the now-protected ``preview_candidates`` -- that first read must run on the
+    same detaching probe substrate (issue #445), not a bare ``asyncio.to_thread``
+    whose non-daemon worker CPython rejoins at interpreter exit."""
     blocker = _BlockedDiskUsageProbe()
     monkeypatch.setattr(ops_router, "read_disk_usage", blocker)
     cache: TtlCache[DiskRootItem] = TtlCache()
@@ -676,7 +667,7 @@ async def test_hung_ops_disk_probe_is_abandoned_at_shutdown(
             assert await asyncio.to_thread(blocker.started.wait, 2.0)
             assert blocker.thread_name == "filesystem-probe"
             assert blocker.thread_daemon is True
-            await _abandon_cancelled_task_at_shutdown(task)
+            await _detach_cancelled_probe_at_shutdown(task)
             assert task.done()
             assert task.cancelled()
             assert not blocker.finished.is_set()
@@ -712,6 +703,40 @@ async def test_ops_disk_probe_oserror_still_reports_root_error(
 
     assert result.error is not None
     assert result.candidates == []
+
+
+async def test_detached_probe_does_not_trip_the_bounded_shutdown_wait(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #445: a probe-bearing background task wedged on a dead mount at
+    shutdown is cancelled and DETACHES promptly, so the bounded background-task
+    wait returns WELL WITHIN its timeout without ever tripping it -- the daemon
+    worker is left running (reclaimed by the OS at process exit). Against the old
+    shielded probe this same cancellation would not be honoured until settlement
+    abandonment, so the short bound would time out and log its warning first."""
+    blocker = _BlockedDiskUsageProbe()
+
+    async def _probe_worker() -> None:
+        await purge_service.run_abandonable_probe(
+            lambda: blocker(str(tmp_path)), str(tmp_path), operation_name="shutdown probe"
+        )
+
+    task: asyncio.Task[None] = asyncio.create_task(_probe_worker())
+    try:
+        assert await asyncio.to_thread(blocker.started.wait, 2.0)
+        task.cancel()
+        with caplog.at_level(logging.WARNING, logger="plex_manager.web.app"):
+            await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+                (task,), timeout_seconds=0.05
+            )
+
+        assert task.done()
+        assert task.cancelled()
+        assert "shutdown timed out" not in caplog.text
+        assert not blocker.finished.is_set()
+    finally:
+        blocker.release.set()
+        assert await asyncio.to_thread(blocker.finished.wait, 2.0)
 
 
 async def test_begin_placement_refuses_while_an_abandoned_delete_still_runs(
