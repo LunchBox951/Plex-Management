@@ -30,18 +30,56 @@ import type {
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
 
-const layoutEffectPin = vi.hoisted(() => ({ deferLatestTitleKeyEffect: false }))
+const layoutEffectPin = vi.hoisted(() => ({
+  deferLatestTitleKeyEffect: false,
+  // #438a structural pin: which hook kind last registered the
+  // `latestTitleKey.current = titleKey` guard-write effect. Recorded on every
+  // render regardless of `deferLatestTitleKeyEffect`, so the #422 test can
+  // assert directly that it's `useLayoutEffect` -- a literal hook-kind revert
+  // trips this even though jsdom+act() flushes passive effects synchronously
+  // and would otherwise let a revert slip past the timing simulation below.
+  latestTitleKeyEffectHook: null as 'layout' | 'passive' | null,
+  // #438b inertness canary: counts every time the source-text sniff below
+  // actually recognizes the guard-write effect while a deferral is armed
+  // (whether or not it goes on to no-op it). If a refactor renames
+  // `latestTitleKey` (or otherwise reshapes the closure) so the substring
+  // match goes stale, this stays 0 and the canary assertion fails loudly
+  // instead of the suite passing green for the wrong reason.
+  deferredEffectFireCount: 0,
+}))
 
 vi.mock('react', async (importOriginal) => {
   const actual = await importOriginal<typeof import('react')>()
+  const isLatestTitleKeyGuardWrite = (effect: () => void | (() => void)) =>
+    effect.toString().includes('latestTitleKey.current')
   return {
     ...actual,
+    // Structural spy only -- NEVER no-ops. Deferring a real layout effect
+    // would itself introduce the commit-to-effect gap that `useLayoutEffect`
+    // exists to close for this write, breaking the CORRECT implementation
+    // rather than merely observing which hook it used.
+    useLayoutEffect: (
+      effect: Parameters<typeof actual.useLayoutEffect>[0],
+      deps?: Parameters<typeof actual.useLayoutEffect>[1],
+    ) => {
+      if (isLatestTitleKeyGuardWrite(effect)) {
+        layoutEffectPin.latestTitleKeyEffectHook = 'layout'
+        if (layoutEffectPin.deferLatestTitleKeyEffect) {
+          layoutEffectPin.deferredEffectFireCount += 1
+        }
+      }
+      actual.useLayoutEffect(effect, deps)
+    },
     useEffect: (effect: Parameters<typeof actual.useEffect>[0], deps?: Parameters<typeof actual.useEffect>[1]) => {
       // Model React's commit-to-passive-effect gap only for the exact ref write
       // under test. All ordinary passive effects retain React's real behavior.
-      if (layoutEffectPin.deferLatestTitleKeyEffect && effect.toString().includes('latestTitleKey.current')) {
-        actual.useEffect(() => {}, deps)
-        return
+      if (isLatestTitleKeyGuardWrite(effect)) {
+        layoutEffectPin.latestTitleKeyEffectHook = 'passive'
+        if (layoutEffectPin.deferLatestTitleKeyEffect) {
+          layoutEffectPin.deferredEffectFireCount += 1
+          actual.useEffect(() => {}, deps)
+          return
+        }
       }
       actual.useEffect(effect, deps)
     },
@@ -233,6 +271,8 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
 
   it('discards a pending title A request when title B commits before it settles (#422)', async () => {
     layoutEffectPin.deferLatestTitleKeyEffect = false
+    layoutEffectPin.latestTitleKeyEffectHook = null
+    layoutEffectPin.deferredEffectFireCount = 0
     const titleB: DiscoverResult = { ...TITLE, tmdb_id: 43, title: 'Test Movie B' }
     const created = {
       id: 7,
@@ -270,6 +310,10 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
     })
 
     const view = render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+    // #438a structural pin: the guard-write effect must be registered through
+    // useLayoutEffect, not useEffect -- a literal hook-kind revert trips this
+    // directly, with no dependency on the deferral timing-simulation below.
+    expect(layoutEffectPin.latestTitleKeyEffectHook).toBe('layout')
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
     await waitFor(() => expect(createMutation.mutateAsync).toHaveBeenCalledTimes(1))
 
@@ -280,6 +324,12 @@ describe('TitleDetailModal grab gating on the create path (G3)', () => {
       settleCreate(created)
       await Promise.resolve()
     })
+    // #438b inertness canary: the deferral's source-text sniff must actually
+    // have recognized the guard-write effect at least once during the armed
+    // window above. A stale substring match (e.g. after `latestTitleKey` gets
+    // renamed) would otherwise leave the assertions below passing for the
+    // wrong reason -- this fails loudly instead.
+    expect(layoutEffectPin.deferredEffectFireCount).toBeGreaterThanOrEqual(1)
     layoutEffectPin.deferLatestTitleKeyEffect = false
     expect(toastState.toast).not.toHaveBeenCalled()
     // A's id and grabbable flag together are the sole source of an otherwise

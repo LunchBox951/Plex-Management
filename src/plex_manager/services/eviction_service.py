@@ -1856,9 +1856,13 @@ async def preview_candidates(
     """
     try:
         # ``shutil.disk_usage`` (a ``statvfs`` syscall) can stall on a hung
-        # NFS/SMB mount -- offload it, mirroring every other blocking FS
-        # primitive in this module (see ``_evict_one``/``_movie_candidates``).
-        disk = await asyncio.to_thread(read_disk_usage, root_path)
+        # NFS/SMB mount. Use the shared abandonable substrate so a wedged probe
+        # cannot strand CPython's joined default executor past bounded shutdown.
+        disk = await purge_service.run_abandonable_probe(
+            lambda: read_disk_usage(root_path),
+            root_path,
+            operation_name="eviction preview disk-usage probe",
+        )
     except OSError as exc:
         _logger.warning(
             "eviction candidate preview skipped for %s root %s (%s)",
@@ -2008,9 +2012,13 @@ async def _run_sweep(
     """The sweep body, entered only under :func:`run_eviction_sweep`'s
     serialization latch — see the public docstring."""
     try:
-        # Offloaded for the same reason as ``preview_candidates`` above: a
-        # hung/unresponsive mount must never freeze the whole event loop.
-        disk = await asyncio.to_thread(read_disk_usage, root_path)
+        # A hung/unresponsive mount must neither freeze the event loop nor keep
+        # CPython alive through its joined default executor after shutdown's bound.
+        disk = await purge_service.run_abandonable_probe(
+            lambda: read_disk_usage(root_path),
+            root_path,
+            operation_name="eviction sweep disk-usage probe",
+        )
     except OSError as exc:
         _logger.warning(
             "eviction sweep skipped for %s root %s (%s)",
