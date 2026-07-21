@@ -1170,7 +1170,14 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
             # for this same root.
             try:
                 pressure_would_fire = (
-                    used_percent(await asyncio.to_thread(read_disk_usage, root)) >= threshold_pct
+                    used_percent(
+                        await purge_service.run_abandonable_probe(
+                            lambda root=root: read_disk_usage(root),
+                            root,
+                            operation_name="disk-pressure probe",
+                        )
+                    )
+                    >= threshold_pct
                 )
             except OSError:
                 pressure_would_fire = True

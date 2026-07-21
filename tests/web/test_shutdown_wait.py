@@ -20,11 +20,20 @@ import os
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
-from plex_manager.services import purge_service
+from plex_manager.domain.disk_usage import DiskUsage
+from plex_manager.ports.library import LibraryPort
+from plex_manager.services import eviction_service, purge_service
 from plex_manager.web import app as app_module
+from plex_manager.web.deps import SettingsStore
+from tests.web.fakes import FakeLibrary
+
+SessionMaker = async_sessionmaker[AsyncSession]
 
 
 class _BlockedProbeFileSystem(LocalFileSystem):
@@ -69,6 +78,23 @@ class _FailingProbeFileSystem(LocalFileSystem):
         raise OSError("probe failed")
 
 
+class _BlockedDiskUsageProbe:
+    """A synchronous ``read_disk_usage`` replacement that models a dead mount."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def __call__(self, path: str) -> DiskUsage:
+        self.started.set()
+        self.release.wait(timeout=5)
+        try:
+            return DiskUsage(root=path, total_bytes=1000, available_bytes=900)
+        finally:
+            self.finished.set()
+
+
 class _BlockedDeleteFileSystem(LocalFileSystem):
     """A real, root-guarded ``LocalFileSystem`` whose ``delete`` blocks (in its
     worker thread) until the test releases it -- lets a test cancel the
@@ -96,6 +122,42 @@ async def _purge_worker(fs: LocalFileSystem, path: str) -> None:
     """A background task shaped like a real ``lifespan`` member (returns
     ``None``): its body calls the shielded purge primitive."""
     await purge_service.purge_library_path(fs, path)
+
+
+async def _configured_eviction_app(sessionmaker_: SessionMaker, root: Path) -> FastAPI:
+    """Build the smallest production-shaped app state for one leased eviction tick."""
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("movies_root", str(root))
+        await store.set("eviction_enabled", "true")
+        await store.set("disk_pressure_threshold_percent", "95")
+        await store.set("disk_pressure_target_percent", "90")
+        await store.set("eviction_grace_days", "30")
+        await store.set("eviction_interval_minutes", "5")
+        await session.commit()
+
+    app = FastAPI()
+    app.state.sessionmaker = sessionmaker_
+    app.state.http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200))
+    )
+    return app
+
+
+async def _abandon_cancelled_task_at_shutdown(task: asyncio.Task[object]) -> None:
+    """Drive the production shutdown escape hatch for one cancelled settlement."""
+
+    async def _quick_background_task() -> None:
+        await asyncio.sleep(1000)
+
+    background_task = asyncio.create_task(_quick_background_task())
+    task.cancel()
+    background_task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "probe cancellation must wait for shutdown abandonment"
+    await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+        (background_task,), timeout_seconds=5.0
+    )
 
 
 async def test_fast_settling_tasks_are_unaffected_by_the_bound(
@@ -180,7 +242,7 @@ async def test_a_hung_shielded_delete_timeout_finishes_the_settlement_task(
 
         assert "shutdown timed out" in caplog.text
         assert os.path.abspath(os.path.normpath(str(target))) in caplog.text
-        assert "purge settlement abandoned" in caplog.text
+        assert "filesystem settlement abandoned" in caplog.text
         assert task.done()
         assert task.cancelled()
         assert not fs.finished.is_set()
@@ -337,6 +399,154 @@ async def test_live_pre_delete_probe_error_keeps_existing_classification(tmp_pat
     with pytest.raises(OSError, match="probe failed"):
         await purge_service.purge_library_path(fs, str(target))
     assert purge_service.active_purge_paths() == ()
+
+
+async def test_hung_disk_pressure_probe_is_abandoned_at_shutdown(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #418: the tick's telemetry pressure probe cannot delay process exit."""
+    app = await _configured_eviction_app(sessionmaker_, tmp_path)
+    blocker = _BlockedDiskUsageProbe()
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return FakeLibrary()
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "read_disk_usage", blocker)
+    task = asyncio.create_task(app_module._eviction_tick_leased(app))  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert await asyncio.to_thread(blocker.started.wait, 2.0)
+        await _abandon_cancelled_task_at_shutdown(task)
+        assert task.done()
+        assert task.cancelled()
+        assert not blocker.finished.is_set()
+    finally:
+        blocker.release.set()
+        assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+        await app.state.http_client.aclose()
+
+
+@pytest.mark.parametrize("probe", ["preview", "sweep"])
+async def test_hung_eviction_service_disk_probe_is_abandoned_at_shutdown(
+    probe: str,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #418: both eviction-service disk reads share settlement tracking."""
+    blocker = _BlockedDiskUsageProbe()
+    monkeypatch.setattr(eviction_service, "read_disk_usage", blocker)
+    library = FakeLibrary()
+    fs = LocalFileSystem([str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        if probe == "preview":
+            task = asyncio.create_task(
+                eviction_service.preview_candidates(
+                    session=session,
+                    library=library,
+                    media_type="movie",
+                    root_path=str(tmp_path),
+                    grace_days=30,
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                eviction_service.run_eviction_sweep(
+                    session=session,
+                    library=library,
+                    fs=fs,
+                    media_type="movie",
+                    root_path=str(tmp_path),
+                    threshold_pct=95.0,
+                    target_pct=90.0,
+                    grace_days=30,
+                )
+            )
+        try:
+            assert await asyncio.to_thread(blocker.started.wait, 2.0)
+            await _abandon_cancelled_task_at_shutdown(task)
+            assert task.done()
+            assert task.cancelled()
+            assert not blocker.finished.is_set()
+        finally:
+            blocker.release.set()
+            assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_disk_pressure_probe_oserror_still_suppresses_telemetry(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tick still treats an unreadable root as pressure firing."""
+    app = await _configured_eviction_app(sessionmaker_, tmp_path)
+    telemetry_calls = 0
+    sweep_calls = 0
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return FakeLibrary()
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    async def _telemetry(**_kwargs: object) -> None:
+        nonlocal telemetry_calls
+        telemetry_calls += 1
+
+    async def _sweep(**_kwargs: object) -> list[object]:
+        nonlocal sweep_calls
+        sweep_calls += 1
+        return []
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+    monkeypatch.setattr(app_module, "read_disk_usage", _unreadable)
+    monkeypatch.setattr(
+        app_module.retention_telemetry_service, "run_retention_telemetry_sweep", _telemetry
+    )
+    monkeypatch.setattr(eviction_service, "run_eviction_sweep", _sweep)
+    try:
+        await app_module._eviction_tick_leased(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    assert telemetry_calls == 0
+    assert sweep_calls == 1
+
+
+@pytest.mark.parametrize("probe", ["preview", "sweep"])
+async def test_eviction_service_disk_probe_oserror_still_skips_root(
+    probe: str,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving either service probe preserves its existing ``OSError`` fallback."""
+
+    def _unreadable(_path: str) -> DiskUsage:
+        raise OSError("dead mount")
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _unreadable)
+    async with sessionmaker_() as session:
+        if probe == "preview":
+            result = await eviction_service.preview_candidates(
+                session=session,
+                library=FakeLibrary(),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=30,
+            )
+        else:
+            result = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=LocalFileSystem([str(tmp_path)]),
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=95.0,
+                target_pct=90.0,
+                grace_days=30,
+            )
+
+    assert result == []
 
 
 async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
