@@ -50,5 +50,13 @@
     "typescript-eslint": "^8.64.0",
     "vite": "^8.1.5",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "@redocly/openapi-core": {
+      "js-yaml": "^4.3.0",
+      "minimatch": {
+        "brace-expansion": "^2.1.2"
+      }
+    }
   }
 }
