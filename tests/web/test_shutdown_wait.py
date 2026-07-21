@@ -339,6 +339,71 @@ async def test_live_pre_delete_probe_error_keeps_existing_classification(tmp_pat
     assert purge_service.active_purge_paths() == ()
 
 
+async def test_begin_placement_can_claim_a_path_whose_abandoned_delete_still_runs(
+    tmp_path: Path,
+) -> None:
+    """Issue #421: characterize the abandonment-to-exit window's confidence gap.
+
+    Shutdown abandonment (PR #406's ``abandon_active_settlements``) resolves the
+    purge's shielded settlement -- and this task's ``finally`` releases
+    ``_ACTIVE_PURGE_PATHS`` -- WITHOUT waiting for the daemon ``shutil.rmtree``
+    thread to actually finish (``fs.finished`` provably still unset below). This
+    drives exactly that abandonment for a real, still-running delete and then
+    calls ``begin_placement`` on the identical path in the narrow window before
+    process exit, the live-caller race issue #421 asks a targeted test to settle.
+
+    Result: ``begin_placement`` returns ``True``. ``_conflicts_with`` only ever
+    consults the current (already-emptied) ``_ACTIVE_PURGE_PATHS`` registry, so
+    a placement can be registered for a directory an abandoned ``rmtree`` is
+    concurrently, physically tearing down -- the exact interleaving the
+    ``_ACTIVE_PURGE_PATHS``/``_ACTIVE_PLACEMENT_PATHS`` ordering rule (PR #117
+    round 9) exists to prevent. This is NOT restructured here (out of scope for
+    this change): it is recorded as a known gap, real only in the shutdown-to-
+    exit window, for the coordinator to weigh against issue #128's crash-
+    recovery backstop reconciling any resulting partial disk state on next
+    startup.
+    """
+    target = tmp_path / "movies" / "Stuck Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = _BlockedDeleteFileSystem(target.parent)
+
+    task = asyncio.create_task(_purge_worker(fs, str(target)))
+    try:
+        assert await asyncio.to_thread(fs.started.wait, 2.0)
+        task.cancel()
+        # As in test_a_hung_shielded_delete_timeout_finishes_the_settlement_task:
+        # confirm the shielded wait has not let the task finish on its own before
+        # the shutdown bound forces abandonment below.
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        await app_module._await_background_tasks_shutdown(  # pyright: ignore[reportPrivateUsage]
+            (task,), timeout_seconds=0.05
+        )
+
+        # The registration is already released and the daemon thread is
+        # PROVABLY still mid-rmtree -- the exact abandonment-to-exit window
+        # issue #421 is concerned with.
+        assert task.done()
+        assert task.cancelled()
+        assert purge_service.active_purge_paths() == ()
+        assert not fs.finished.is_set()
+
+        # CHARACTERIZATION: a live caller reaching begin_placement() in this
+        # window observes no conflict and is allowed to claim the path, even
+        # though the abandoned delete is still physically running against it.
+        claimed = purge_service.begin_placement(str(target))
+        assert claimed is True, (
+            "known gap (issue #421): begin_placement currently succeeds for a "
+            "path an abandoned purge delete is still physically tearing down"
+        )
+    finally:
+        purge_service.end_placement(str(target))
+        fs.release.set()
+        assert await asyncio.to_thread(fs.finished.wait, 2.0)
+
+
 async def test_late_delete_completion_after_abandon_does_not_touch_closed_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

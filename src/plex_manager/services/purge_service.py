@@ -473,6 +473,24 @@ async def purge_library_path(
     ``begin_placement`` / a later sweep's crash-recovery can never see this
     path as free while a delete for it is still physically running.
 
+    CAVEAT (issue #421): that invariant holds only up to process-shutdown
+    abandonment. :func:`abandon_active_settlements` (PR #406) can force
+    :func:`_delete_to_settlement`'s shielded wait to resolve without the daemon
+    ``shutil.rmtree`` thread ever finishing, and this function's ``finally``
+    below does not special-case that path — it unregisters ``library_path``
+    from ``_ACTIVE_PURGE_PATHS`` as soon as the (abandoned) settlement
+    resolves, which can be BEFORE the delete has physically stopped touching
+    disk (see the identical caveat at :func:`_await_worker_settlement`). The
+    regression test ``test_begin_placement_can_claim_a_path_whose_abandoned_
+    delete_still_runs`` in ``tests/web/test_shutdown_wait.py`` demonstrates
+    that a caller reaching :func:`begin_placement` in that narrow abandonment-
+    to-exit window DOES observe the path as free and claims it while the
+    abandoned delete is still running — this is accepted, not yet closed,
+    because it is reachable only inside the bounded shutdown wait on the way
+    to process exit, and issue #128's crash-recovery sweep on the *next*
+    startup reconciles whatever partial disk state an abandoned delete left
+    behind, exactly as it would after a hard crash mid-delete.
+
     The delete goes through :meth:`FileSystemPort.delete`, whose implementation
     refuses (raises :class:`LocalFileSystemError`) any path resolving outside a
     configured library root and treats an already-gone in-root path as an
