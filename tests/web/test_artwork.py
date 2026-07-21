@@ -218,14 +218,24 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     await _configure_plex(sessionmaker_)
     entered: asyncio.Queue[int] = asyncio.Queue()
     release = asyncio.Event()
+    # Which tmdb_id raises is decided *after* we've observed the real
+    # semaphore's admission order (see below) — the per-request auth session
+    # in require_api_key_short_session doesn't complete FIFO under load, so a
+    # request hardcoded to fail (e.g. always tmdb_id 1100) can lose the race
+    # to be one of the first four admitted and the test flakes (issue #436).
+    fail_id: int | None = None
 
     async def keys(
         _self: PlexLibrary, tmdb_id: int, _media_type: Literal["movie", "tv"]
     ) -> _ArtworkKeys:
+        # Report admission unconditionally, then block on the same shared
+        # decision every request blocks on — mirrors the sibling
+        # cancellation test below. Only once released do we know whether
+        # this particular request was chosen as the one to fail.
         await entered.put(tmdb_id)
-        if tmdb_id == 1100:
-            raise PlexLibraryError("synthetic typed upstream failure")
         await release.wait()
+        if tmdb_id == fail_id:
+            raise PlexLibraryError("synthetic typed upstream failure")
         return _ArtworkKeys(None, None)
 
     monkeypatch.setattr(PlexLibrary, "_artwork_keys", keys)
@@ -237,10 +247,16 @@ async def test_route_real_limiter_releases_after_typed_upstream_error(
     ]
     try:
         first_four = [await asyncio.wait_for(entered.get(), timeout=1.0) for _ in range(4)]
-        assert 1100 in first_four
+        # Admission order isn't FIFO, so we don't assert *which* ids landed
+        # here — only that the real 4-slot semaphore admitted exactly four.
+        assert len(first_four) == 4
+        # Now that admission has settled, pick the failing request from
+        # whoever actually got in first and publish it before releasing —
+        # every blocked coroutine reads this same value once it wakes.
+        fail_id = first_four[0]
+        release.set()
         fifth = await asyncio.wait_for(entered.get(), timeout=1.0)
         assert fifth not in first_four
-        release.set()
         responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
         assert [response.status_code for response in responses] == [404] * 5
     finally:
