@@ -1940,11 +1940,31 @@ async def run_eviction_sweep(
     class (double-claim, recovery racing a mid-purge claim) exists ONLY when
     they overlap. The skipped invocation's work is not lost — the in-flight
     sweep is already doing it, and the periodic tick retries every interval.
-    "In flight" includes a CANCELLED sweep still unwinding: the ``finally``
-    below does not clear the latch until any purge delete this sweep started
-    has genuinely settled on disk (issue #128), so a second invocation landing
-    right after cancellation still correctly no-ops instead of racing
-    crash-recovery against a delete that is still physically running.
+    "In flight" includes a CANCELLED sweep still unwinding: DURING ORDINARY
+    OPERATION the ``finally`` below does not clear the latch until any purge
+    delete this sweep started has genuinely settled on disk (issue #128), so a
+    second invocation landing right after cancellation still correctly no-ops
+    instead of racing crash-recovery against a delete that is still physically
+    running.
+
+    CAVEAT (issue #421): at process shutdown that does not hold. The purge
+    delete's shielded settlement (:func:`~plex_manager.services.purge_service.
+    _delete_to_settlement`) can be force-resolved by
+    :func:`~plex_manager.services.purge_service.abandon_active_settlements`
+    (PR #406) without the daemon ``shutil.rmtree`` thread ever finishing, and
+    this sweep's cancellation then unwinds through the ``finally`` below the
+    same way it would after a real settlement — clearing ``_sweep_latch``
+    before the abandoned delete has physically stopped touching disk (the
+    identical caveat documented on
+    :func:`~plex_manager.services.purge_service.purge_library_path` and
+    :func:`~plex_manager.services.purge_service._await_worker_settlement`).
+    This is accepted, not yet closed: it is reachable only inside the bounded
+    shutdown wait on the way to process exit, and issue #128's crash-recovery
+    sweep on the *next* startup reconciles whatever partial disk state an
+    abandoned delete left behind, exactly as it would after a hard crash
+    mid-delete. See ``tests/web/test_shutdown_wait.py`` for a regression test
+    demonstrating the analogous ``_ACTIVE_PURGE_PATHS`` window on the purge
+    side.
     """
     if _sweep_latch["busy"]:
         _logger.info(
