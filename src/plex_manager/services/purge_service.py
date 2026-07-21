@@ -549,17 +549,22 @@ async def _run_abandonable_probe[T](
     Unlike a delete, a read has no partial disk mutation to protect, so this does
     NOT shield the caller through physical settlement (issue #445). On ORDINARY
     cancellation the probe DETACHES: :class:`asyncio.CancelledError` propagates to
-    the caller promptly (``asyncio.shield`` protects the worker future while
-    unwinding the await), the daemon worker runs to completion unobserved and
+    the caller promptly, the daemon worker runs to completion unobserved and
     releases its OWN permit on that completion (the permit is bound to physical
     thread completion in :func:`_start_on_abandonable_thread`, never to this
-    coroutine). ``asyncio.shield`` DROPS its observer on the inner worker future
-    when the caller's await is cancelled, so an explicit done-callback
-    (``_retrieve_worker_outcome``) retrieves the detached worker's eventual
-    exception AND logs it (honesty over silence, the read-only equivalent of the
-    delete path's cancelled-worker-failure log in :func:`_await_worker_settlement`)
-    -- otherwise a late probe failure would leave only the earlier generic detach
-    warning, with no record the operation failed. This is also what keeps process
+    coroutine). The await runs through :func:`asyncio.wait`, NOT
+    :func:`asyncio.shield`: ``wait`` neither cancels nor observes the worker
+    future when the caller unwinds (it removes its completion callback in its own
+    ``finally``), whereas a cancelled ``shield`` wrapper keeps watching the inner
+    future and -- on Python 3.14+ -- reports its eventual exception to the loop's
+    exception handler as ``"exception in shielded future"``, spurious noise for a
+    failure this path already handles. The detached worker future would otherwise
+    be wholly unobserved, so an explicit done-callback
+    (``_retrieve_worker_outcome``) retrieves its eventual exception AND logs it
+    (honesty over silence, the read-only equivalent of the delete path's
+    cancelled-worker-failure log in :func:`_await_worker_settlement`) -- otherwise
+    a late probe failure would leave only the earlier generic detach warning, with
+    no record the operation failed. This is also what keeps process
     shutdown bounded WITHOUT any settlement registration: the lifespan's
     cancellation of a probe-bearing task unwinds it at once rather than blocking on
     a detached daemon worker.
@@ -573,9 +578,9 @@ async def _run_abandonable_probe[T](
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
 
     def _retrieve_worker_outcome(done: asyncio.Future[T]) -> None:
-        # ``asyncio.shield`` removed its own inner-done callback when this caller's
-        # await was cancelled, leaving the detached worker future unobserved. Read
-        # its outcome so an eventual failure is RETRIEVED (never reported by the loop
+        # ``asyncio.wait`` removed its completion callback when this caller's await
+        # was cancelled, leaving the detached worker future unobserved. Read its
+        # outcome so an eventual failure is RETRIEVED (never reported by the loop
         # as "Future exception was never retrieved") AND -- honesty over silence --
         # LOGGED with its sanitized type. A result is discarded (a detached probe's
         # return value has no consumer).
@@ -593,11 +598,16 @@ async def _run_abandonable_probe[T](
             )
 
     try:
-        return await asyncio.shield(worker)
+        # NOT ``asyncio.shield``: see the docstring -- a cancelled shield wrapper
+        # keeps observing the worker and (Python 3.14+) reports its late failure to
+        # the loop's exception handler on top of the intentional log below.
+        await asyncio.wait((worker,))
+        return worker.result()
     except asyncio.CancelledError:
         if worker.done():
-            # Settled in the same loop iteration as the cancellation, so shield may
-            # not have consumed its outcome; retrieve (and log any failure) now.
+            # Settled in the same loop iteration as the cancellation, so its
+            # outcome may never have been consumed; retrieve (and log any
+            # failure) now.
             _retrieve_worker_outcome(worker)
         else:
             # A read-only probe left running on a (likely wedged) mount: the caller
