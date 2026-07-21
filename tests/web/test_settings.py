@@ -9,11 +9,12 @@ import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from types import SimpleNamespace
+from typing import Literal, cast
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -5402,6 +5403,686 @@ async def test_failed_or_cancelled_rotation_releases_lock_for_following_drain_an
         _mutation_request(client, "generic", next_secret), timeout=5.0
     )
     assert response.status_code == 200
+
+
+async def test_post_commit_sweep_failure_still_bumps_generation_and_surfaces(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue #423 regression: a completion sweep that raises AFTER the commit
+    landed is a POST-commit failure, not a pre-commit one. The rotation IS
+    durable, so the must-run ``on_committed`` obligations (identity-generation
+    bump FIRST, then invalidations) still run -- otherwise a repoint would land
+    without a bump and silently reopen the sign-in TOCTOU #400/#416 closed -- and
+    the redaction snapshot must NOT be aborted (that would un-redact the durable
+    new secret). The failure is surfaced honestly rather than swallowed."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    with (
+        caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"),
+        pytest.raises(settings_router._PostCommitSweepError),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+
+    # The commit landed durably despite the sweep failing.
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    # on_committed ran: the identity generation was bumped FIRST (the TOCTOU
+    # close) and a later invalidation still fired.
+    assert deps.plex_identity_generation.value == generation_before + 1
+    assert app.state.watchlist_wake_event.is_set()
+    # The durable rotation must NOT have its redaction snapshot aborted.
+    assert aborted == []
+    # Honest surfacing: the failure names what broke, with the cause rendered.
+    assert "post-commit" in caplog.text
+    assert "completion sweep exploded" in caplog.text
+
+
+async def test_pre_commit_failure_does_not_bump_generation_and_aborts(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unchanged contrast to the post-commit case (issue #423): a commit that
+    fails BEFORE landing leaves nothing durable, so the snapshot IS aborted, the
+    rotation is rolled back, and the identity generation is NOT bumped -- the
+    exact pre-commit behavior PRs #389/#399/#400 built, preserved by the split."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    aborted: list[frozenset[str]] = []
+    real_abort = handler.abort_secret_rotation
+
+    def spy_abort(previous_values: frozenset[str]) -> None:
+        aborted.append(previous_values)
+        real_abort(previous_values)
+
+    monkeypatch.setattr(handler, "abort_secret_rotation", spy_abort)
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    real_commit = AsyncSession.commit
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    rewrite_finished = False
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def failing_once(self: AsyncSession) -> None:
+        if rewrite_finished:
+            raise RuntimeError("commit failed")
+        await real_commit(self)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", failing_once)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    monkeypatch.setattr(AsyncSession, "commit", real_commit)
+
+    # Nothing durable landed: the cached anchor and generation are untouched, and
+    # the post-commit obligations never ran.
+    assert await _stored_machine_id(sessionmaker_) == "OLD-MID"
+    assert deps.plex_identity_generation.value == generation_before
+    assert not app.state.watchlist_wake_event.is_set()
+    # The pre-commit path DID abort the redaction snapshot back to the
+    # pre-rotation secret set (what ``begin_secret_rotation`` returned).
+    assert aborted == [frozenset({_SEED_PLEX_TOKEN})]
+
+
+async def test_repoint_cancelled_after_commit_with_sweep_failure_runs_obligations(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #423 double-event (realistic side-effects): BOTH a remembered
+    cancellation AND a post-commit completion-sweep failure land on the same
+    durable repoint. The commit stays durable, the must-run ``on_committed``
+    obligations still run (identity-generation bump + invalidations), the
+    redaction snapshot is NOT aborted, the sweep failure is logged, and -- because
+    the server's teardown expects a cancelled request task to end cancelled -- the
+    request ends in ``CancelledError``. (The exact ``raise pending_cancel from
+    unit_error`` chaining is asserted at the boundary by
+    ``test_boundary_cancel_with_sweep_failure_cancel_wins_sweep_chained``: anyio
+    re-raises a fresh ``CancelledError`` across the ASGI boundary, dropping the
+    ``__cause__`` an in-coro observer would see.)
+
+    Clones the durable-commit pause of
+    ``test_rotate_app_key_cancelled_during_commit_still_runs_post_commit_invalidations``
+    and the exploding sweep of
+    ``test_post_commit_sweep_failure_still_bumps_generation_and_surfaces``."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    # Pause AFTER the durable commit so the test can cancel the request while the
+    # non-cancellable commit unit is still in flight -- the cancellation is
+    # remembered, and the sweep then explodes as the unit completes.
+    real_commit = AsyncSession.commit
+    real_rewrite = settings_router._rewrite_before_secret_replacement  # pyright: ignore[reportPrivateUsage]
+    rewrite_finished = False
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def mark_rewrite(session: AsyncSession, values: frozenset[str]) -> int:
+        nonlocal rewrite_finished
+        result = await real_rewrite(session, values)
+        rewrite_finished = True
+        return result
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        if rewrite_finished:
+            committed.set()
+            await _wait_for_event(release)
+
+    monkeypatch.setattr(settings_router, "_rewrite_before_secret_replacement", mark_rewrite)
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    task = asyncio.create_task(
+        client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+    )
+    await _wait_for_event(committed)
+    task.cancel()
+    # Deliver the cancellation while the commit unit is still paused, so it is
+    # REMEMBERED by the boundary rather than landing at the pre-commit checkpoint.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    with (
+        caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        _ = await task
+
+    # The commit landed durably despite both the cancellation and the sweep failure.
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    # ``on_committed`` still ran: generation bumped FIRST (the TOCTOU close), and a
+    # later invalidation (the watchlist wake) still fired.
+    assert deps.plex_identity_generation.value == generation_before + 1
+    assert app.state.watchlist_wake_event.is_set()
+    # The durable rotation must NOT have its redaction snapshot aborted.
+    assert aborted == []
+    # The sweep failure was surfaced honestly in the durable log.
+    assert "post-commit" in caplog.text
+    assert "completion sweep exploded" in caplog.text
+
+
+def _boundary_request(app: FastAPI) -> Request:
+    """A minimal stand-in request for driving :func:`secret_rotation` directly.
+
+    The boundary touches the request only through ``_log_handler`` (i.e.
+    ``request.app.state.log_handler``), so a namespace carrying the app suffices
+    -- letting the callback-guard tests below exercise every precedence
+    combination deterministically, without an endpoint whose ``on_committed``
+    (the settings path's ``_post_commit_invalidations``) is internally
+    per-step-guarded and so cannot itself raise. The failing callback here stands
+    in for the sign-in path's ``_close_demoted_streams``, which does app I/O and
+    is NOT internally guarded."""
+    return cast(Request, SimpleNamespace(app=app))
+
+
+def _bump_then_raise(ran: list[str]) -> Callable[[], None]:
+    """An ``on_committed`` whose first must-run step completes, then a later one
+    raises -- mirroring the real callbacks (generation bump / stream close FIRST,
+    a fallible invalidation AFTER)."""
+
+    def _callback() -> None:
+        ran.append("must-run-step")
+        raise RuntimeError("post-commit callback exploded")
+
+    return _callback
+
+
+async def test_boundary_on_committed_failure_only_is_surfaced(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #423 round 3: when ONLY the post-commit ``on_committed`` callback
+    raises (no sweep failure, no cancellation), the boundary must NOT swallow it:
+    the commit is durable, the callback's earlier must-run work still ran, the
+    failure is logged naming the callback, and it surfaces to the caller (a 500)
+    -- the same honesty shape a ``_PostCommitSweepError`` takes."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+    app.state.log_handler = handler
+    ran: list[str] = []
+
+    async with sessionmaker_() as session:
+        with (
+            caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"),
+            pytest.raises(RuntimeError, match="post-commit callback exploded"),
+        ):
+            async with settings_router.secret_rotation(
+                session,
+                _boundary_request(app),
+                retiring_values=frozenset(),
+                incoming_values=frozenset(),
+                on_committed=_bump_then_raise(ran),
+            ):
+                await SettingsStore(session).set("log_max_rows", "4321")
+
+    # The callback ran (its early must-run step completed before it raised).
+    assert ran == ["must-run-step"]
+    # The write committed durably despite the callback failing.
+    assert await _stored_setting(sessionmaker_, "log_max_rows") == "4321"
+    # A non-redacting boundary never aborts a redaction snapshot.
+    assert aborted == []
+    # Surfaced honestly, naming the callback.
+    assert "post-commit callback" in caplog.text
+    assert "post-commit callback exploded" in caplog.text
+
+
+async def test_boundary_on_committed_failure_with_sweep_failure_sweep_wins_callback_chained(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #423 round 3 (triple-event minus cancel): a durable commit whose
+    completion sweep AND ``on_committed`` callback both raise. The sweep's
+    ``_PostCommitSweepError`` is the committed-state signal, so it WINS the
+    re-raise with the callback failure chained as its ``__cause__``; neither is
+    swallowed and the redaction snapshot is NOT aborted."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+    ran: list[str] = []
+
+    async with sessionmaker_() as session:
+        with (
+            caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"),
+            pytest.raises(settings_router._PostCommitSweepError) as excinfo,  # pyright: ignore[reportPrivateUsage]
+        ):
+            # A non-empty ``incoming_values`` forces the redacting shape, so the
+            # completion sweep runs (and here explodes) after the commit lands.
+            async with settings_router.secret_rotation(
+                session,
+                _boundary_request(app),
+                retiring_values=frozenset(),
+                incoming_values=frozenset({"incoming-secret"}),
+                on_committed=_bump_then_raise(ran),
+            ):
+                await SettingsStore(session).set("log_max_rows", "5678")
+
+    # The sweep error won; the callback failure is chained, not lost or winning.
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "post-commit callback exploded" in str(excinfo.value.__cause__)
+    # The callback still ran its early must-run step, and the write is durable.
+    assert ran == ["must-run-step"]
+    assert await _stored_setting(sessionmaker_, "log_max_rows") == "5678"
+    # A committed rotation is never abort-and-rolled-back.
+    assert aborted == []
+    # Both failures are surfaced honestly in the durable log.
+    assert "completion sweep" in caplog.text
+    assert "post-commit callback" in caplog.text
+
+
+async def test_boundary_on_committed_failure_with_cancel_cancel_wins_callback_chained(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #423 round 3 (double-event): a remembered cancellation AND a raising
+    ``on_committed`` callback on the same durable commit. The ``CancelledError``
+    still WINS the re-raise (the server's teardown expects a cancelled request
+    task to end cancelled), with the callback failure logged and chained as its
+    ``__cause__`` -- never replacing the cancellation, never vanishing."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    app.state.log_handler = handler
+    ran: list[str] = []
+
+    real_commit = AsyncSession.commit
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        committed.set()
+        await _wait_for_event(release)
+
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    captured: list[BaseException] = []
+
+    async def drive() -> None:
+        async with sessionmaker_() as session:
+            try:
+                async with settings_router.secret_rotation(
+                    session,
+                    _boundary_request(app),
+                    retiring_values=frozenset(),
+                    incoming_values=frozenset(),
+                    on_committed=_bump_then_raise(ran),
+                ):
+                    await SettingsStore(session).set("log_max_rows", "9012")
+            except BaseException as exc:
+                captured.append(exc)
+                raise
+
+    task = asyncio.create_task(drive())
+    await _wait_for_event(committed)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await task
+
+    # Cancellation won the re-raise, with the callback failure chained as cause.
+    assert len(captured) == 1
+    assert isinstance(captured[0], asyncio.CancelledError)
+    assert isinstance(captured[0].__cause__, RuntimeError)
+    assert "post-commit callback exploded" in str(captured[0].__cause__)
+    # The callback still ran its early must-run step, and the write is durable.
+    assert ran == ["must-run-step"]
+    assert await _stored_setting(sessionmaker_, "log_max_rows") == "9012"
+    # Surfaced honestly despite the cancellation winning.
+    assert "post-commit callback" in caplog.text
+
+
+async def test_boundary_cancel_with_sweep_failure_cancel_wins_sweep_chained(
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #423 double-event, chaining pinned AT the boundary: a remembered
+    cancellation AND a post-commit ``_PostCommitSweepError`` on the same durable
+    commit. Observed in-coro (before anyio re-raises a fresh ``CancelledError``
+    across the ASGI boundary and drops ``__cause__``), the ``CancelledError`` WINS
+    the re-raise with the ``_PostCommitSweepError`` chained as its ``__cause__``,
+    the benign ``on_committed`` still ran, and the snapshot is NOT aborted."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+    ran: list[str] = []
+
+    def benign_on_committed() -> None:
+        ran.append("on-committed")
+
+    real_commit = AsyncSession.commit
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        committed.set()
+        await _wait_for_event(release)
+
+    monkeypatch.setattr(AsyncSession, "commit", paused_commit)
+
+    captured: list[BaseException] = []
+
+    async def drive() -> None:
+        async with sessionmaker_() as session:
+            try:
+                # A non-empty ``incoming_values`` forces the redacting shape, so
+                # the completion sweep runs (and here explodes) after the commit.
+                async with settings_router.secret_rotation(
+                    session,
+                    _boundary_request(app),
+                    retiring_values=frozenset(),
+                    incoming_values=frozenset({"incoming-secret"}),
+                    on_committed=benign_on_committed,
+                ):
+                    await SettingsStore(session).set("log_max_rows", "3456")
+            except BaseException as exc:
+                captured.append(exc)
+                raise
+
+    task = asyncio.create_task(drive())
+    await _wait_for_event(committed)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await task
+
+    # Cancellation won the re-raise; the sweep failure is chained, not lost.
+    assert len(captured) == 1
+    assert isinstance(captured[0], asyncio.CancelledError)
+    assert isinstance(
+        captured[0].__cause__,
+        settings_router._PostCommitSweepError,  # pyright: ignore[reportPrivateUsage]
+    )
+    # ``on_committed`` still ran, the write is durable, and the snapshot is intact.
+    assert ran == ["on-committed"]
+    assert await _stored_setting(sessionmaker_, "log_max_rows") == "3456"
+    assert aborted == []
+    assert "completion sweep" in caplog.text
+
+
+async def _stored_setting(sessionmaker_: SessionMaker, key: str) -> str | None:
+    async with sessionmaker_() as session:
+        return await SettingsStore(session).get(key)
+
+
+async def test_post_commit_invalidation_step_failure_does_not_skip_later_steps(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue #423 secondary: ``_post_commit_invalidations`` isolates each step,
+    so one raising mid-list cannot skip the ones after it while the DB change is
+    durable. A verified repoint whose stream-close throws must still publish the
+    settings SSE, and the generation bump (first, unguarded) is untouched."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _seed_plex_identity(sessionmaker_, plex_url="http://old:32400", machine_id="OLD-MID")
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_SEED_PLEX_TOKEN})
+    app.state.log_handler = handler
+    app.state.watchlist_wake_event = asyncio.Event()
+    await _use_transport(app, _repoint_transport(identity="NEW-MID"))
+    generation_before = deps.plex_identity_generation.value
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    # close_realtime_streams runs BEFORE publish_realtime in the step list.
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        put = await client.put(
+            "/api/v1/settings",
+            json={"plex_url": "http://new:32400", "plex_token": "new-repoint-token"},
+            headers={"X-Api-Key": _API_KEY},
+        )
+
+    # The isolated failure did not fail the request nor skip the earlier bump.
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
+    assert deps.plex_identity_generation.value == generation_before + 1
+    # The LATER step still ran despite the earlier one raising.
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
+
+
+async def test_rotate_app_key_delivers_new_key_even_when_post_commit_sweep_fails(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up (P1): the rotate endpoint hands back the freshly
+    minted key EXACTLY ONCE. When the post-commit completion sweep raises, the
+    rotation is ALREADY durable -- the old key is dead -- so re-raising the 500
+    (the boundary's ``_PostCommitSweepError``) would strand a recovery-only /
+    header-authenticated operator with NEITHER the old nor the new key (north
+    star #1). The durably committed one-shot credential must still be delivered,
+    with the sweep failure surfaced honestly in the log (north star #3)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    handler = log_capture_service.LogCaptureHandler()
+    handler.secret_values = frozenset({_API_KEY})
+    aborted: list[frozenset[str]] = []
+    monkeypatch.setattr(handler, "abort_secret_rotation", aborted.append)
+
+    def exploding_sweep(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("completion sweep exploded")
+
+    monkeypatch.setattr(handler, "complete_secret_rotation", exploding_sweep)
+    app.state.log_handler = handler
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        rotate = await client.post(
+            "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
+        )
+
+    # The one-shot credential is delivered despite the failed sweep.
+    assert rotate.status_code == 200
+    new_key = rotate.json()["app_api_key"]
+    assert new_key not in (None, _API_KEY)
+    # It is the DURABLY COMMITTED key: the new one authenticates, the old 401s.
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": new_key})).status_code == 200
+    assert (
+        await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
+    ).status_code == 401
+    # The durable rotation must NOT have its redaction snapshot aborted.
+    assert aborted == []
+    # Honest surfacing: the failure names what broke, with the cause rendered.
+    assert "post-commit" in caplog.text
+    assert "completion sweep exploded" in caplog.text
+
+
+async def test_rotate_app_key_invalidation_step_failure_does_not_skip_publish(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up: the rotate endpoint's ``_post_commit_invalidations``
+    isolates each step too, so ``close_realtime_streams`` raising after the
+    rotation is durable must not skip the ``publish_realtime`` after it -- nor,
+    by escaping ``on_committed``, mask a boundary error. The rotation still 200s
+    and returns its key."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        rotate = await client.post(
+            "/api/v1/settings/app-key/rotate", headers={"X-Api-Key": _API_KEY}
+        )
+
+    assert rotate.status_code == 200
+    assert rotate.json()["app_api_key"] not in (None, _API_KEY)
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
+
+
+async def test_revoke_app_key_invalidation_step_failure_does_not_skip_publish(
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #423 follow-up: the revoke endpoint's ``_post_commit_invalidations``
+    likewise isolates each step, so ``close_realtime_streams`` raising after the
+    revoke is durable still publishes the access change. The revoke still 204s
+    and the key is durably gone."""
+    from plex_manager.web.routers import settings as settings_router
+
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    def exploding_close(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stream close exploded")
+
+    published: list[tuple[object, ...]] = []
+
+    def spy_publish(*args: object, **kwargs: object) -> None:
+        published.append((args, kwargs))
+
+    monkeypatch.setattr(settings_router, "close_realtime_streams", exploding_close)
+    monkeypatch.setattr(settings_router, "publish_realtime", spy_publish)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.web.routers.settings"):
+        revoke = await client.delete("/api/v1/settings/app-key", headers={"X-Api-Key": _API_KEY})
+
+    assert revoke.status_code == 204
+    async with sessionmaker_() as session:
+        system = await load_system_settings(session)
+    assert system is not None and system.app_api_key is None
+    assert published, "publish_realtime must run even after close_realtime_streams raised"
+    assert "close_realtime_streams" in caplog.text
+    assert "stream close exploded" in caplog.text
 
 
 @pytest.mark.parametrize("kind", ["generic", "rotate", "revoke"])
