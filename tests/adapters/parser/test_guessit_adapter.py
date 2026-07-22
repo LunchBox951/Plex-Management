@@ -18,6 +18,7 @@ from plex_manager.adapters.parser import GuessitParser
 from plex_manager.domain.quality import QualitySource
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.quality_service import check_quality
+from plex_manager.domain.season_pack import classify_release_scope
 from plex_manager.domain.source_mapping import resolve_quality
 
 # Prototype leak names — every one is a cam/pre-release/screener/regional rip and
@@ -68,6 +69,18 @@ def test_webdl_parses_to_allowed_source_and_resolution() -> None:
     assert parsed.source is QualitySource.WEBDL
     assert parsed.clean_title == "The Movie"
     assert parsed.year == 2023
+
+
+def test_suits_whole_show_pack_parses_as_all_nine_seasons() -> None:
+    # Issue #409 anchor: the reported Suits whole-show pack must parse as the full
+    # season span 1-9 with NO episode token, so it classifies as a multi_season_pack
+    # -- the premise the in-flight-overlap rejection is built on. If a guessit
+    # upgrade narrowed this to a single season, the dedup guard would silently stop
+    # firing, so this test pins the real parser's behaviour.
+    parsed = GuessitParser().parse("Suits.S01-S09.COMPLETE.1080p.WEB-DL.x264-GROUP")
+    assert parsed.season == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert parsed.episode is None
+    assert classify_release_scope(parsed) == "multi_season_pack"
 
 
 def test_parse_never_raises_on_garbage() -> None:
