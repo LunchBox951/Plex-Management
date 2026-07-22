@@ -46,7 +46,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -577,13 +577,15 @@ async def _run_abandonable_probe[T](
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
 
-    def _retrieve_worker_outcome(done: asyncio.Future[T]) -> None:
+    def _retrieve_worker_outcome(done: asyncio.Future[Any]) -> None:
         # ``asyncio.wait`` removed its completion callback when this caller's await
         # was cancelled, leaving the detached worker future unobserved. Read its
         # outcome so an eventual failure is RETRIEVED (never reported by the loop
         # as "Future exception was never retrieved") AND -- honesty over silence --
         # LOGGED with its sanitized type. A result is discarded (a detached probe's
-        # return value has no consumer).
+        # return value has no consumer), so ``Future[Any]`` -- naming the enclosing
+        # function's ``T`` here trips CodeQL's uninitialized-local check, which does
+        # not model PEP 695 type-parameter scopes.
         if done.cancelled():
             return
         error = done.exception()
