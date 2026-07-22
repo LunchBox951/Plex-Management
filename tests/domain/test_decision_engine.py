@@ -468,8 +468,14 @@ def test_multi_season_pack_ignores_waiting_for_air_date_sibling() -> None:
     assert result.accepted[0].ignored_seasons == (2,)
 
 
-def test_multi_season_pack_does_not_target_already_downloading_sibling() -> None:
-    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP")
+def test_multi_season_pack_rejected_when_it_overlaps_an_in_flight_season() -> None:
+    # Issue #409 (Suits "Broken Series Logic"): a physical multi-season pack
+    # downloads EVERY covered season, not only the ones it logically targets. When a
+    # covered season is already in flight under its own torrent (S2 downloading here,
+    # like S1-S7 grabbed as individual packs before an S01-S09 pack surfaces), the
+    # pack would re-download it -- so the whole candidate is now REJECTED, not
+    # accepted-while-silently-ignoring the overlap.
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=500)
     result = decide(
         [multi],
         FakeParser(),
@@ -488,11 +494,38 @@ def test_multi_season_pack_does_not_target_already_downloading_sibling() -> None
         ),
     )
 
-    assert [s.candidate.title for s in result.accepted] == [
-        "Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP"
-    ]
-    assert result.accepted[0].target_seasons == (1, 3)
-    assert result.accepted[0].ignored_seasons == (2,)
+    assert result.accepted == ()
+    assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
+
+
+def test_in_flight_overlap_multipack_dropped_leaving_only_same_season_pack() -> None:
+    # Companion to the above: with a covered season (S1) in flight, an S01-S03 pack
+    # offered ALONGSIDE a same-season S02 pack used to be accepted too (a redundant
+    # second entry auto-grab could fall back onto). After the fix the multipack is
+    # rejected outright, so ``accepted`` holds ONLY the genuinely useful S02 pack and
+    # no park/backoff occurs when such an alternative exists.
+    multi = _candidate("Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GRP", seeders=500)
+    same_season = _candidate("Show.S02.1080p.WEB-DL.x264-GRP", seeders=5)
+    result = decide(
+        [multi, same_season],
+        FakeParser(),
+        default_profile(),
+        _always_media,
+        _never_blocklisted,
+        prefer_season_pack=True,
+        multi_season_intent=MultiSeasonRequestIntent(
+            mode="whole_show",
+            requested_seasons=(1, 2, 3),
+            seasons=(
+                SeasonPackSeasonState(1, "downloading"),
+                SeasonPackSeasonState(2, "pending"),
+                SeasonPackSeasonState(3, "pending"),
+            ),
+        ),
+    )
+
+    assert [s.candidate.title for s in result.accepted] == ["Show.S02.1080p.WEB-DL.x264-GRP"]
+    assert (multi, RejectionReason.MULTI_SEASON_PACK) in result.rejected
 
 
 def test_single_season_pack_still_classified_and_hard_gated_for() -> None:

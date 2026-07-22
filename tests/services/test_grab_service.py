@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
@@ -24,6 +25,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import AddResult
 from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import grab_service, queue_service
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
@@ -621,6 +623,127 @@ async def test_grab_rejects_pack_when_target_sibling_has_different_active_releas
         rows = (await session.execute(select(Download))).scalars().all()
     assert len(rows) == 1
     assert rows[0].torrent_hash == "5" * 40
+
+
+async def test_grab_rejects_pack_overlapping_active_season_outside_targets(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #409 grab-time backstop: a multi-season pack physically covers every
+    ``covered_seasons`` entry, not only the ``target_seasons`` it claims. If a
+    COVERED-but-untargeted season already has a different active torrent (a clean
+    S01-S03 plan targeting S1/S3 racing an S2 download started after the preview),
+    the redundant pack must be refused BEFORE qBittorrent is asked to add it."""
+    request_id = await _make_tv_request(sessionmaker_)
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=_scored_tv("5" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+
+    # The pack claims only S1 and S3, but its physical coverage includes the
+    # already-active S2 -- the widened guard must catch that overlap.
+    pack = _scored_tv("6" * 40, "Some.Show.S01-S03.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"covered_seasons": (1, 2, 3), "target_seasons": (1, 3)}
+    )
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=pack,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+    assert qbt.added == []
+    async with sessionmaker_() as session:
+        rows = (await session.execute(select(Download))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == "5" * 40
+
+
+async def test_pack_first_then_dedicated_target_season_cannot_double_grab(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #409, the pack-first ordering for a season the pack TARGETS -- the
+    exact shape of the reported Suits bug (every season requested, so every
+    covered season is a target). A multi-season pack persists a durable
+    ``download_scopes`` row for each targeted season, and that row participates in
+    the ``uq_download_scopes_active_scope`` partial unique index. So once the pack
+    commits, a later (or concurrent) dedicated grab of a targeted season cannot
+    double-grab: the pre-add read guard refuses it, AND -- proving the claim is
+    atomic, not merely a TOCTOU read -- the DB unique index itself rejects a
+    second active scope for the same ``(request, season)``. This is the durable
+    atomic claim the covered-season guard relies on for targeted seasons; the
+    remaining non-atomic case is a covered-but-UNTARGETED ride-along season, which
+    carries no scope (see ``grab_service._active_guard_seasons``)."""
+    request_id = await _make_tv_request(sessionmaker_)
+    # Whole-show pack: every covered season is also a target (all seasons due).
+    pack = _scored_tv("6" * 40, "Some.Show.S01-S03.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"covered_seasons": (1, 2, 3), "target_seasons": (1, 2, 3)}
+    )
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=pack,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+
+    async with sessionmaker_() as session:
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Every targeted season is claimed by a durable active scope.
+    assert {s.season_number for s in scopes} == {1, 2, 3}
+    assert all(s.status == "active" for s in scopes)
+
+    # A dedicated grab of a targeted season is refused BEFORE qbt.add.
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored_tv("7" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+    assert qbt.added == []
+
+    # DB-level proof the overlap cannot commit twice even if two grabs raced past
+    # the read guard across the ``qbt.add`` await: a SECOND active download that
+    # tries to attach a season-2 scope collides on uq_download_scopes_active_scope.
+    async with sessionmaker_() as session:
+        second = Download(
+            torrent_hash="7" * 40,
+            status=RequestStatus.downloading.value,
+            media_request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+        session.add(second)
+        await session.flush()
+        with pytest.raises(IntegrityError):
+            await SqlDownloadRepository(session).ensure_scope(
+                second.id, media_request_id=request_id, season=2, episodes=None
+            )
 
 
 async def test_grab_attaches_same_hash_active_for_a_different_season(

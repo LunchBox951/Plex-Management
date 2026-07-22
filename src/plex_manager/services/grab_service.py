@@ -449,6 +449,42 @@ def _planned_target_seasons(scored: ScoredRelease, season: int | None) -> tuple[
     return tuple(dict.fromkeys(scored.target_seasons or (season,)))
 
 
+def _active_guard_seasons(
+    scored: ScoredRelease, season: int | None, target_seasons: tuple[int, ...]
+) -> tuple[int | None, ...]:
+    """Seasons whose ALREADY-COMMITTED active downloads a fresh grab must not duplicate.
+
+    For an ordinary release this is exactly the planned targets (or the primary
+    ``season``). For a multi-season pack the PHYSICAL torrent downloads every
+    ``covered_seasons`` entry, not only the ``target_seasons`` it logically claims
+    -- so a *committed* active download for ANY covered season (e.g. S1-S7 grabbed
+    as individual packs before an S01-S09 pack targeting S8-S9 surfaces) is a real
+    duplicate and blocks the add. This widens the pre-add read guard past logical
+    scope ownership (which stays on the targets), catching the ordering where the
+    per-season download committed FIRST -- the common in-flight case a sequential
+    auto-grab cycle produces, and the planner's ``covered_season_in_flight``
+    companion at grab time (issue #409).
+
+    It is a best-effort READ guard, NOT a concurrency-atomic backstop, and does not
+    fully close issue #409. A pack persists a row + scope only for its scalar
+    ``season`` and its ``target_seasons``; a covered-but-UNTARGETED season -- a
+    ride-along ``waste`` season, e.g. an ``available`` season being upgraded -- gets
+    no scalar and no scope, so it keys neither ``uq_downloads_active_request`` nor
+    ``uq_download_scopes_active_scope``. Two consequences remain: the reverse
+    (pack-committed-first) ordering slips through because this read cannot see a
+    pack's coverage of such a season, and a covered-season pack racing a dedicated
+    upgrade across the ``qbt.add`` await can have both pass this check and both
+    commit non-conflicting rows. Closing that window durably needs the pack's
+    physical coverage PERSISTED as an atomic claim distinct from its importable
+    scopes -- a schema addition (deferred; see PR notes). It cannot be reused from
+    ``download_scopes`` without ``import_service`` then importing the ride-along
+    seasons the pack deliberately skips.
+    """
+    if scored.covered_seasons:
+        return tuple(dict.fromkeys((*target_seasons, *scored.covered_seasons)))
+    return target_seasons or (season,)
+
+
 def _target_episodes(
     *,
     primary_season: int,
@@ -753,7 +789,7 @@ async def grab(
                 episodes = None
 
     target_seasons = _planned_target_seasons(scored, season)
-    active_guard_seasons: tuple[int | None, ...] = target_seasons or (season,)
+    active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
