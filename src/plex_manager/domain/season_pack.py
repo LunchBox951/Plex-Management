@@ -41,6 +41,14 @@ MultiSeasonRequestMode = Literal["whole_show", "explicit_seasons"]
 
 _INSTALLED_STATUSES = frozenset({"completed", "available"})
 _SEARCHABLE_STATUSES = frozenset({"pending", "searching", "no_acceptable_release", "failed"})
+# Seasons a *physical* multi-season pack would re-download from scratch: a season
+# whose own torrent is already ``downloading``, or that finished-but-import-blocked
+# (its bytes are on disk / in flight), is DUPLICATED by a pack that also carries it.
+# Unlike an installed season -- ride-along the waste/majority policy tolerates when
+# the useful seasons outnumber it -- an in-flight overlap is never harmless: the pack
+# collides with a live torrent for the same season (issue #409), so ANY such overlap
+# rejects the whole candidate rather than being buried as ignored coverage.
+_IN_FLIGHT_STATUSES = frozenset({"downloading", "import_blocked"})
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,10 @@ class MultiSeasonPackPlan:
     upgrade_seasons: tuple[int, ...]
     waste_seasons: tuple[int, ...]
     ignored_seasons: tuple[int, ...]
+    # Covered seasons already in flight under their OWN torrent (``downloading`` /
+    # ``import_blocked``) that this physical pack would re-download. A non-empty
+    # tuple always pairs with ``accepted=False`` and ``reason="covered_season_in_flight"``.
+    in_flight_seasons: tuple[int, ...]
 
 
 def classify_release_scope(parsed: ParsedRelease) -> ReleaseScope:
@@ -207,6 +219,16 @@ def plan_multi_season_pack(
     This is the pure policy behind issue #24's follow-up behaviour. It does not
     create seasons and does not perform the grab; it only answers which currently
     tracked seasons a physical pack should satisfy.
+
+    A physical multi-season pack claims only its ``target_seasons`` logically, but
+    downloads EVERY ``covered_seasons`` entry. So if any covered season is already
+    in flight under its own torrent (``downloading``/``import_blocked``), grabbing
+    the pack would re-download content already being fetched -- the exact Suits
+    S01-S09-over-individual-packs duplication of issue #409. Such an overlap is a
+    hard rejection (``reason="covered_season_in_flight"``), NOT harmless ignored
+    coverage; the decision engine then falls through to a same-season pack lower in
+    the same result. The installed-season waste/majority policy still applies only
+    to ``completed``/``available`` overlaps, whose bytes are settled on disk.
     """
     covered = tuple(sorted(set(pack_seasons)))
     requested = set(intent.requested_seasons)
@@ -222,6 +244,7 @@ def plan_multi_season_pack(
             upgrade_seasons=(),
             waste_seasons=(),
             ignored_seasons=tuple(sorted(set(covered) - requested)),
+            in_flight_seasons=(),
         )
 
     eligible = (requested or tracked) & tracked
@@ -231,6 +254,7 @@ def plan_multi_season_pack(
     target: list[int] = []
     upgrades: list[int] = []
     waste: list[int] = []
+    in_flight: list[int] = []
 
     for season_number in covered:
         if season_number not in eligible:
@@ -240,6 +264,10 @@ def plan_multi_season_pack(
             continue
         if state.status in _SEARCHABLE_STATUSES:
             target.append(season_number)
+            continue
+        if state.status in _IN_FLIGHT_STATUSES:
+            # A live torrent already covers this season; the pack would duplicate it.
+            in_flight.append(season_number)
             continue
         if state.status not in _INSTALLED_STATUSES:
             ignored_set.add(season_number)
@@ -264,10 +292,16 @@ def plan_multi_season_pack(
 
     target_seasons = tuple(target)
     waste_seasons = tuple(waste)
+    in_flight_seasons = tuple(in_flight)
     ignored = tuple(sorted(ignored_set))
     reason: str | None = None
     accepted = True
-    if not target_seasons:
+    if in_flight_seasons:
+        # Highest precedence: an already-in-flight overlap makes the physical pack
+        # redundant regardless of how many other seasons it would usefully serve.
+        accepted = False
+        reason = "covered_season_in_flight"
+    elif not target_seasons:
         accepted = False
         reason = "no_useful_seasons"
     elif waste_seasons and len(target_seasons) <= len(waste_seasons):
@@ -282,4 +316,5 @@ def plan_multi_season_pack(
         upgrade_seasons=tuple(upgrades),
         waste_seasons=waste_seasons,
         ignored_seasons=ignored,
+        in_flight_seasons=in_flight_seasons,
     )

@@ -1447,3 +1447,111 @@ async def test_grab_success_clears_the_cooldown(sessionmaker_: SessionMaker) -> 
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status == RequestStatus.downloading
+
+
+# --------------------------------------------------------------------------- #
+# Issue #409 — a multi-season pack must not duplicate already-in-flight seasons
+# --------------------------------------------------------------------------- #
+class _PerSeasonProwlarr:
+    """An :class:`IndexerPort` returning candidates keyed by the queried season.
+
+    Reproduces the Suits scenario: for a per-season query it offers the whole-show
+    S01-S09 pack (higher-seeded) plus the single-season pack for exactly that season.
+    """
+
+    def __init__(self, by_season: dict[int, list[CandidateRelease]]) -> None:
+        self.by_season = by_season
+        self.searched: list[IndexerSearchRequest] = []
+
+    async def search(self, request: IndexerSearchRequest) -> list[CandidateRelease]:
+        self.searched.append(request)
+        return list(self.by_season.get(request.season or 0, []))
+
+
+async def _seed_whole_show(
+    sessionmaker_: SessionMaker,
+    *,
+    tmdb_id: int,
+    downloading: range,
+    pending: range,
+) -> int:
+    """Seed a whole-show TV request whose ``downloading`` seasons are already in
+    flight and whose ``pending`` seasons are still due to search."""
+    all_seasons = sorted({*downloading, *pending})
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=tmdb_id,
+            media_type=MediaType.tv,
+            title="Suits",
+            status=RequestStatus.downloading,
+            tv_request_mode="whole_show",
+            requested_seasons_json=list(all_seasons),
+        )
+        session.add(request)
+        await session.flush()
+        for n in downloading:
+            session.add(
+                SeasonRequest(
+                    media_request_id=request.id,
+                    season_number=n,
+                    status=RequestStatus.downloading.value,
+                )
+            )
+        for n in pending:
+            session.add(
+                SeasonRequest(
+                    media_request_id=request.id,
+                    season_number=n,
+                    status=RequestStatus.pending.value,
+                )
+            )
+        await session.commit()
+        return request.id
+
+
+async def test_multi_season_pack_does_not_duplicate_in_flight_seasons(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # Issue #409 ("Broken Series Logic"), the reported Suits sequence: S1-S7 are
+    # already downloading as individual packs; S8-S9 are still pending. When the
+    # only release the S8/S9 searches surface is the whole-show S01-S09 pack, the
+    # OLD planner accepted it (targeting S8-S9, silently ignoring the S1-S7 it
+    # physically re-downloads), so qBittorrent got the redundant pack on top of the
+    # seven individual torrents. The pack must now be REJECTED: no S01-S09 torrent
+    # is ever added, and with nothing else acceptable the due seasons park honestly
+    # on the backoff ladder (they self-heal once a non-overlapping release appears).
+    tmdb_id = 5000
+    request_id = await _seed_whole_show(
+        sessionmaker_, tmdb_id=tmdb_id, downloading=range(1, 8), pending=range(8, 10)
+    )
+    multipack = candidate(
+        "Suits.S01-S09.COMPLETE.1080p.WEB-DL.x264-GROUP", info_hash="e" * 40, seeders=500
+    )
+    prowlarr = _PerSeasonProwlarr({8: [multipack], 9: [multipack]})
+    qbt = FakeQbittorrent()
+
+    result = await _run(sessionmaker_, prowlarr, qbt)
+
+    # The redundant whole-show pack was never handed to the client (the core defect).
+    assert not any("e" * 40 in source for source, _save, _cat in qbt.added)
+    assert result.grabbed == 0
+    assert result.no_acceptable == 2
+
+    async with sessionmaker_() as session:
+        downloads = (await session.execute(select(Download))).scalars().all()
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # No download row was created at all -- in particular none for the S01-S09 pack.
+    assert downloads == []
+    status_by_season = {s.season_number: s.status for s in seasons}
+    # The seven in-flight seasons are untouched; the two due seasons park honestly.
+    assert all(status_by_season[n] == RequestStatus.downloading.value for n in range(1, 8))
+    assert status_by_season[8] == RequestStatus.no_acceptable_release.value
+    assert status_by_season[9] == RequestStatus.no_acceptable_release.value

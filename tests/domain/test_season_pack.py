@@ -295,6 +295,70 @@ def test_plan_unknown_legacy_quality_is_waste_not_upgrade() -> None:
     assert plan.waste_seasons == (1,)
 
 
+def test_plan_rejects_whole_show_pack_overlapping_in_flight_seasons() -> None:
+    # Issue #409 (Suits): the reported S01-S09 pack surfaces after S1-S7 are already
+    # grabbed as individual packs (``downloading``) and S8-S9 are still ``pending``.
+    # The physical pack would re-download S1-S7, so it is REJECTED with the dedicated
+    # in-flight reason -- the overlapping seasons are NOT laundered as ignored.
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [
+                *(_season(n, "downloading") for n in range(1, 8)),
+                _season(8),
+                _season(9),
+            ],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "covered_season_in_flight"
+    assert plan.in_flight_seasons == (1, 2, 3, 4, 5, 6, 7)
+    assert plan.ignored_seasons == ()
+
+
+def test_plan_accepts_whole_show_pack_when_all_seasons_pending() -> None:
+    # The same nine-season pack IS accepted when nothing overlaps in flight: every
+    # season is still ``pending`` (searchable), so all nine become targets.
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [_season(n) for n in range(1, 10)],
+        ),
+    )
+
+    assert plan.accepted is True
+    assert plan.target_seasons == (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert plan.in_flight_seasons == ()
+
+
+def test_plan_rejects_pack_overlapping_import_blocked_season() -> None:
+    # ``import_blocked`` is in flight too (bytes on disk / mid-import): a pack that
+    # also carries that season would collide, so the overlap rejects consistently.
+    plan = plan_multi_season_pack(
+        pack_seasons=[1, 2],
+        candidate_quality_id=WEBDL1080P.id,
+        profile=default_profile(),
+        intent=_intent(
+            "whole_show",
+            [1, 2],
+            [_season(1, "import_blocked"), _season(2)],
+        ),
+    )
+
+    assert plan.accepted is False
+    assert plan.reason == "covered_season_in_flight"
+    assert plan.in_flight_seasons == (1,)
+
+
 def test_plan_null_installed_quality_ignores_stale_profile_index() -> None:
     plan = plan_multi_season_pack(
         pack_seasons=[1, 2],
