@@ -7,4 +7,4 @@
 # to track the v1 beta (CHANGELOG.md intentionally stays on `[Unreleased]` --
 # this is not a release cut, see CONTRIBUTING.md's release checklist steps
 # 1/3-5). The maintainer bumps this again to "1.0.0" at freeze-exit.
-__version__ = "0.5.0"
+__version__ = "1.0.0"
