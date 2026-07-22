@@ -48,6 +48,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from plex_manager.domain.disk_usage import DiskUsage, used_percent
+from plex_manager.services import purge_service
 from plex_manager.services.path_visibility import KNOWN_DOWNLOAD_MOUNTS
 from plex_manager.web.setup_validation import (
     validate_plex,
@@ -659,17 +660,14 @@ def read_disk_usage(path: str) -> DiskUsage:
     daemon worker cannot block that bound -- a cancelled probe detaches and the
     worker is reclaimed by the OS at process exit; ordinary callers may use
     ``asyncio.to_thread`` when their lifecycle does not require abandonment.
-    :func:`collect_disk_gauges` (below) is itself plain/sync for the same reason
-    :func:`_size_bytes` in ``eviction_service`` is: it is the caller's job to
-    offload the whole thing in one hop (mirrors ``import_service``'s
-    ``asyncio.to_thread``-wrapped copy) rather than threading each individual
-    root one at a time.
+    :func:`collect_disk_gauges` (below) uses that substrate per configured root,
+    preserving a responsive event loop and bounded shutdown for health polling.
     """
     usage = shutil.disk_usage(path)
     return DiskUsage(root=path, total_bytes=usage.total, available_bytes=usage.free)
 
 
-def collect_disk_gauges(roots: dict[str, str | None]) -> list[DiskGauge]:
+async def collect_disk_gauges(roots: dict[str, str | None]) -> list[DiskGauge]:
     """Build a :class:`DiskGauge` per CONFIGURED root in ``roots`` (label -> path).
 
     An unset root (``None``/empty path) is skipped honestly — there is nothing to
@@ -677,18 +675,21 @@ def collect_disk_gauges(roots: dict[str, str | None]) -> list[DiskGauge]:
     ``error`` set and zeroed byte counts, so a broken mount is visible on the
     dashboard rather than silently vanishing from it.
 
-    Deliberately plain ``def`` (not ``async``): it may call :func:`read_disk_usage`
-    (blocking) once per configured root. :func:`collect_health_snapshot` is the
-    ONLY caller and runs the whole thing via ``await asyncio.to_thread(...)`` —
-    see that function — so a stalled mount blocks a worker thread, never the
-    event loop.
+    Each blocking read runs through :func:`purge_service.run_abandonable_probe`.
+    A health poll is a routine shutdown-bound request path, so a hung NFS/SMB
+    mount must neither block the event loop nor strand CPython's joined default
+    executor past bounded shutdown.
     """
     gauges: list[DiskGauge] = []
     for label, path in roots.items():
         if not path:
             continue
         try:
-            usage = read_disk_usage(path)
+            usage = await purge_service.run_abandonable_probe(
+                lambda path=path: read_disk_usage(path),
+                path,
+                operation_name="health disk-usage probe",
+            )
         except OSError as exc:
             gauges.append(
                 DiskGauge(
@@ -739,14 +740,14 @@ async def collect_health_snapshot(
     read, or a settings save landing mid-request can have its invalidation
     silently overwritten by a probe still running on the old credentials.
 
-    ``collect_disk_gauges`` is run via ``asyncio.to_thread`` -- it calls the
-    blocking ``shutil.disk_usage`` once per configured root, and a hung/
-    unresponsive NFS/SMB mount must never freeze this (or any other request's)
-    event-loop turn while a health poll waits on it.
+    ``collect_disk_gauges`` awaits an abandonable daemon-worker probe per
+    configured root. This keeps a hung/unresponsive NFS/SMB mount from freezing
+    the event loop or delaying bounded shutdown with a joined default-executor
+    worker.
     """
     subsystems = await check_subsystems(client, creds, cache, generations)
     subsystems.append(await check_database(session))
-    disks = await asyncio.to_thread(collect_disk_gauges, library_roots)
+    disks = await collect_disk_gauges(library_roots)
     return HealthSnapshot(
         subsystems=tuple(subsystems),
         disks=tuple(disks),

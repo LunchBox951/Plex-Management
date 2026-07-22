@@ -534,30 +534,34 @@ def test_read_disk_usage_raises_on_a_missing_path(tmp_path: Path) -> None:
         read_disk_usage(str(tmp_path / "does" / "not" / "exist"))
 
 
-def test_collect_disk_gauges_skips_an_unset_root(tmp_path: Path) -> None:
-    gauges = collect_disk_gauges({"movies_root": str(tmp_path), "tv_root": None})
+async def test_collect_disk_gauges_skips_an_unset_root(tmp_path: Path) -> None:
+    gauges = await collect_disk_gauges({"movies_root": str(tmp_path), "tv_root": None})
     assert [g.root for g in gauges] == ["movies_root"]
     assert gauges[0].error is None
     assert gauges[0].used_percent >= 0.0
 
 
-def test_collect_disk_gauges_reports_an_unreadable_root_honestly(tmp_path: Path) -> None:
+async def test_collect_disk_gauges_reports_an_unreadable_root_honestly(
+    tmp_path: Path,
+) -> None:
     missing = str(tmp_path / "nope")
-    gauges = collect_disk_gauges({"movies_root": missing})
+    gauges = await collect_disk_gauges({"movies_root": missing})
     assert len(gauges) == 1
     assert gauges[0].error is not None
     assert gauges[0].total_bytes == 0
+    assert gauges[0].available_bytes == 0
     assert gauges[0].used_percent == 0.0
 
 
-def test_collect_disk_gauges_empty_when_every_root_unset() -> None:
-    assert collect_disk_gauges({"movies_root": None, "tv_root": None}) == []
+async def test_collect_disk_gauges_empty_when_every_root_unset() -> None:
+    assert await collect_disk_gauges({"movies_root": None, "tv_root": None}) == []
 
 
 # --------------------------------------------------------------------------- #
 # OP2 regression: collect_health_snapshot must never block the event loop on a
 # slow/hung disk read (shutil.disk_usage / statvfs on an unresponsive NFS/SMB
-# mount) -- it is offloaded via asyncio.to_thread, never called inline.
+# mount) -- collect_disk_gauges runs it on the abandonable daemon-worker
+# substrate, never inline.
 # --------------------------------------------------------------------------- #
 
 
@@ -588,7 +592,7 @@ async def test_collect_health_snapshot_offloads_disk_reads_and_never_blocks(
 
     assert [g.root for g in snapshot.disks] == ["movies_root"]
     # The heartbeat kept ticking WHILE the (slow, synchronous) disk read ran --
-    # proof it executed off the event loop (asyncio.to_thread), not inline.
+    # proof it executed on the abandonable daemon-worker substrate, not inline.
     assert ticks >= 10
 
 
