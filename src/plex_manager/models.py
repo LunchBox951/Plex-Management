@@ -44,6 +44,7 @@ __all__ = [
     "Blocklist",
     "BlocklistReason",
     "Download",
+    "DownloadCoverageClaim",
     "DownloadHistory",
     "DownloadHistoryEvent",
     "DownloadScope",
@@ -153,6 +154,36 @@ class DownloadScopeStatus(StrEnum):
     # carrying such a scope — a legitimately persisted state, not corrupt data
     # (Codex review on PR #269). Scope-terminal, like ``imported``/``failed``.
     cancelled = "cancelled"
+
+
+class DownloadCoverageClaimStatus(StrEnum):
+    """Lifecycle of a physical-coverage claim a torrent holds over one season.
+
+    A multi-season pack physically downloads every season in its ``covered_seasons``
+    footprint, but persists an importable :class:`DownloadScope` only for the seasons
+    it logically TARGETS. A covered-but-untargeted "ride-along" season (e.g. an
+    ``available`` season the pack tolerates under the waste/majority policy and
+    deliberately skips importing) therefore keyed neither active unique index, so a
+    concurrent cycle could grab that season between one pack's ``qbt.add`` and its
+    download registration (issue #456, the deferred remainder of #409). A coverage
+    claim closes that window durably: every grab claims coverage of every season its
+    torrent physically fetches, and ``uq_download_coverage_claims_active`` makes "at
+    most one active download covering ``(request, season)``" a DATABASE invariant --
+    the atomic backstop the ``grab_service._active_guard_seasons`` read guard was
+    the sole (TOCTOU) line for. It is kept OUT of ``download_scopes`` on purpose:
+    ``import_service`` imports every non-``imported`` scope, so a ride-along scope
+    would import the very season the pack skips.
+
+    ``active`` while the physical torrent is live; ``released`` once the download
+    reaches a terminal status (``imported``/``failed``/``no_acceptable_release``) --
+    exactly when the download's own ``uq_downloads_active_request`` slot frees, so a
+    claim never outlives the torrent it guards (a leaked claim would permanently
+    block a season, violating north star #1). A plain ``String`` column like
+    ``download_scopes.status`` -- no CHECK constraint, so no column migration.
+    """
+
+    active = "active"
+    released = "released"
 
 
 class BlocklistReason(StrEnum):
@@ -806,6 +837,56 @@ class DownloadScope(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DownloadCoverageClaim(Base):
+    """One season a physical torrent claims to be actively DOWNLOADING (issue #456).
+
+    Distinct from :class:`DownloadScope` (which records the seasons a torrent will
+    IMPORT): a multi-season pack downloads its full physical ``covered_seasons``
+    footprint but imports only its ``target_seasons``, so a ride-along season it
+    covers-but-skips has no scope and keyed neither active unique index. A claim
+    persists that physical coverage as a first-class atomic guard: every grab claims
+    each season its torrent fetches, and the partial unique index below makes "at
+    most one active download covering ``(request, season)``" a database invariant,
+    closing the residual race the ``grab_service._active_guard_seasons`` read guard
+    could only narrow. The claim never enters the import path, so a pack's ride-along
+    season is guarded without ``import_service`` ever importing it.
+    """
+
+    __tablename__ = "download_coverage_claims"
+    __table_args__ = (
+        Index("ix_download_coverage_claims_download", "download_id"),
+        # At most one ACTIVE physical-coverage claim per (request, season). Mirrors
+        # uq_download_scopes_active_scope / uq_downloads_active_request: the
+        # ``released`` status is excluded so a fresh grab after a torrent terminates
+        # is allowed, and the predicate is supplied per-dialect so the partial index
+        # is honoured on Postgres too. Unlike the scope index this keys on
+        # ``season_number`` (never episodes) -- a ride-along is always a whole
+        # season, and the guarantee it backstops is season-granular.
+        Index(
+            "uq_download_coverage_claims_active",
+            "media_request_id",
+            "season_number",
+            unique=True,
+            sqlite_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+            postgresql_where=sa.text("media_request_id IS NOT NULL AND status = 'active'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    download_id: Mapped[int] = mapped_column(
+        ForeignKey("downloads.id", ondelete="CASCADE"), index=True
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL"), index=True
+    )
+    season_number: Mapped[int | None] = mapped_column()
+    status: Mapped[str] = mapped_column(
+        String, default="active", server_default=sa.text("'active'")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DownloadHistory(Base):

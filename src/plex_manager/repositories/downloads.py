@@ -16,6 +16,7 @@ from sqlalchemy import CursorResult, delete, exists, or_, select, update
 
 from plex_manager.models import (
     Download,
+    DownloadCoverageClaim,
     DownloadScope,
     DownloadScopeStatus,
     MediaRequest,
@@ -65,6 +66,12 @@ def _as_utc(value: datetime | None) -> datetime | None:
 _ACTIVE_SCOPE_STATUSES: frozenset[str] = frozenset(
     {DownloadScopeStatus.active.value, DownloadScopeStatus.import_blocked.value}
 )
+
+# A physical-coverage claim (issue #456) is ``active`` while its torrent is live and
+# ``released`` once the torrent terminates. Only ``active`` claims key the partial
+# unique index and count for the guard; the release write matches only these.
+_ACTIVE_CLAIM_STATUS = "active"
+_RELEASED_CLAIM_STATUS = "released"
 
 
 def _normalize_episodes(value: list[int] | None) -> list[int] | None:
@@ -689,6 +696,166 @@ class SqlDownloadRepository:
     async def list_scopes(self, download_id: int) -> list[DownloadScopeRecord]:
         return (await self._scopes_by_download([download_id])).get(download_id, [])
 
+    async def ensure_coverage_claim(
+        self,
+        download_id: int,
+        *,
+        media_request_id: int,
+        season: int,
+    ) -> None:
+        """Claim ``(media_request_id, season)`` as physically covered by ``download_id``
+        (issue #456).
+
+        Idempotent for a claim this same download already holds -- an already-active
+        claim is a no-op, a ``released`` one is re-activated -- so re-grabbing a shared
+        pack per season, or resurrecting a terminal row, never duplicates a claim.
+        Raises :class:`~sqlalchemy.exc.IntegrityError` (via
+        ``uq_download_coverage_claims_active``) when a DIFFERENT active download already
+        covers the season: that is the atomic backstop the caller resolves to
+        ``AlreadyDownloadingError``, closing the ride-along race durably rather than
+        relying on the pre-add read guard alone. Unlike a scope this is season-granular
+        (never episodes): a ride-along is always a whole season.
+        """
+        stmt = select(DownloadCoverageClaim).where(
+            DownloadCoverageClaim.download_id == download_id,
+            DownloadCoverageClaim.media_request_id == media_request_id,
+            DownloadCoverageClaim.season_number == season,
+        )
+        existing = (await self._session.execute(stmt)).scalars().first()
+        if existing is not None:
+            if existing.status != _ACTIVE_CLAIM_STATUS:
+                existing.status = _ACTIVE_CLAIM_STATUS
+                existing.released_at = None
+                await self._session.flush()
+            return
+
+        self._session.add(
+            DownloadCoverageClaim(
+                download_id=download_id,
+                media_request_id=media_request_id,
+                season_number=season,
+                status=_ACTIVE_CLAIM_STATUS,
+            )
+        )
+        await self._session.flush()
+
+    async def release_coverage_claims(self, download_id: int) -> None:
+        """Release (deactivate) every active physical-coverage claim of ``download_id``.
+
+        Called the instant a download reaches a terminal status -- exactly when its own
+        ``uq_downloads_active_request`` slot frees -- so a claim never outlives the
+        torrent it guards. A leaked ``active`` claim would permanently block a season
+        (north star #1: no failure mode without a correction path), so this is issued
+        on the download's terminal-transition choke, not scattered per lifecycle edge.
+        """
+        await self._session.execute(
+            update(DownloadCoverageClaim)
+            .where(
+                DownloadCoverageClaim.download_id == download_id,
+                DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+            )
+            .values(status=_RELEASED_CLAIM_STATUS, released_at=datetime.now(UTC))
+        )
+
+    async def release_resolved_target_coverage_claims(self, download_id: int) -> None:
+        """Release the coverage claim of every TARGET season this download has fully
+        resolved, while a non-terminal sibling keeps the physical row live (#456).
+
+        A TARGET season is one this download persists a :class:`DownloadScope` for; a
+        ride-along season carries no scope. This releases a claim only for a season
+        that (a) has at least one scope on this download and (b) has NO scope still in
+        an active status (``active``/``import_blocked``) -- i.e. the season is settled
+        (``imported``/``failed``/``cancelled``/``no_acceptable_release``). It never
+        touches a ride-along claim (no scope for that season) or a season with an
+        unresolved sibling scope, so those stay guarded until the whole download
+        terminates and :meth:`release_coverage_claims` frees them.
+
+        The motivating case is a partially imported multi-season pack: S1 imports
+        (scope ``imported``) while S2 stays ``import_blocked`` and the physical row
+        stays ``import_blocked`` (non-terminal). ``align_scalar_scope_with_active``
+        already re-points the legacy scalar guard off S1 so an S1 replacement/upgrade
+        can be grabbed; without this, S1's still-``active`` coverage claim would keep
+        rejecting that grab until the unrelated S2 resolves, regressing the documented
+        partial-pack behaviour. Idempotent -- a season already released is not
+        re-matched by the ``active`` predicate.
+        """
+        claimed_seasons = set(
+            (
+                await self._session.execute(
+                    select(DownloadCoverageClaim.season_number).where(
+                        DownloadCoverageClaim.download_id == download_id,
+                        DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+                        DownloadCoverageClaim.season_number.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not claimed_seasons:
+            return
+        scope_rows = (
+            await self._session.execute(
+                select(DownloadScope.season_number, DownloadScope.status).where(
+                    DownloadScope.download_id == download_id,
+                    DownloadScope.season_number.is_not(None),
+                )
+            )
+        ).all()
+        seasons_with_scope: set[int] = set()
+        seasons_with_active_scope: set[int] = set()
+        for season_number, scope_status in scope_rows:
+            if season_number is None:
+                continue
+            seasons_with_scope.add(season_number)
+            if scope_status in _ACTIVE_SCOPE_STATUSES:
+                seasons_with_active_scope.add(season_number)
+        resolved = {
+            season
+            for season in claimed_seasons
+            if season in seasons_with_scope and season not in seasons_with_active_scope
+        }
+        if not resolved:
+            return
+        await self._session.execute(
+            update(DownloadCoverageClaim)
+            .where(
+                DownloadCoverageClaim.download_id == download_id,
+                DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+                DownloadCoverageClaim.season_number.in_(resolved),
+            )
+            .values(status=_RELEASED_CLAIM_STATUS, released_at=datetime.now(UTC))
+        )
+
+    async def find_active_coverage_owner(
+        self, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        """The NON-TERMINAL download holding an active physical-coverage claim over
+        ``(media_request_id, season)``, or ``None`` (issue #456).
+
+        Powers the belt-and-suspenders read side of the ride-along guard: a covered-
+        but-untargeted season has no scope, so :meth:`find_active_for_request` cannot
+        see a pack's coverage of it -- this can. Joined to ``downloads`` and gated on a
+        non-terminal status so a claim that somehow outlived its torrent still cannot
+        report a phantom conflict (the ``released`` write already handles the normal
+        case). ``season is None`` (a movie) never has a claim, so this returns ``None``.
+        """
+        if season is None:
+            return None
+        stmt = (
+            select(Download)
+            .join(DownloadCoverageClaim, DownloadCoverageClaim.download_id == Download.id)
+            .where(
+                DownloadCoverageClaim.media_request_id == media_request_id,
+                DownloadCoverageClaim.season_number == season,
+                DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+            )
+            .order_by(Download.id)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return await self._to_record_with_scopes(row) if row is not None else None
+
     async def align_scalar_scope_with_active(self, download_id: int) -> None:
         """Keep the legacy scalar TV scope on an unresolved logical scope.
 
@@ -802,6 +969,10 @@ class SqlDownloadRepository:
         elif first_seen_at is not None:
             row.first_seen_at = first_seen_at
         await self._session.flush()
+        if status in _TERMINAL_DOWNLOAD_STATUSES:
+            # The torrent is done -- free its physical-coverage claims in the same
+            # transition that frees its ``uq_downloads_active_request`` slot (#456).
+            await self.release_coverage_claims(download_id)
         if replace_grab_metadata:
             await self._replace_scope_set(
                 download_id,
@@ -944,6 +1115,10 @@ class SqlDownloadRepository:
         # ``CursorResult``/``Any`` as unused imports.
         result = cast(CursorResult[Any], await self._session.execute(stmt))
         updated = result.rowcount == 1
+        if updated and status in _TERMINAL_DOWNLOAD_STATUSES:
+            # Won the terminal transition -- free the torrent's physical-coverage
+            # claims in the same CAS-gated step that frees its active slot (#456).
+            await self.release_coverage_claims(download_id)
         if updated and replace_grab_metadata:
             await self._replace_scope_set(
                 download_id,
