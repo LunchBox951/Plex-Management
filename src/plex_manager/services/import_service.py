@@ -1973,6 +1973,13 @@ async def _import_tv_targets_locked(
             await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
         if failures:
             await download_repo.align_scalar_scope_with_active(download_id)
+            # Partial pack: the physical row stays non-terminal (ImportBlocked) for the
+            # unresolved sibling, so its whole-download claim release (#456) will not
+            # fire. Free the claim of every season that DID fully resolve here so an
+            # imported season's replacement/upgrade can be grabbed without waiting on
+            # the blocked sibling -- the coverage-claim analogue of the scalar-guard
+            # re-point above. Ride-along and still-blocked seasons keep their claims.
+            await download_repo.release_resolved_target_coverage_claims(download_id)
         finalized = await download_repo.update_status_if_in(
             download_id,
             DownloadState.ImportBlocked.value if failures else DownloadState.Imported.value,

@@ -465,20 +465,20 @@ def _active_guard_seasons(
     auto-grab cycle produces, and the planner's ``covered_season_in_flight``
     companion at grab time (issue #409).
 
-    It is a best-effort READ guard, NOT a concurrency-atomic backstop, and does not
-    fully close issue #409. A pack persists a row + scope only for its scalar
-    ``season`` and its ``target_seasons``; a covered-but-UNTARGETED season -- a
-    ride-along ``waste`` season, e.g. an ``available`` season being upgraded -- gets
-    no scalar and no scope, so it keys neither ``uq_downloads_active_request`` nor
-    ``uq_download_scopes_active_scope``. Two consequences remain: the reverse
-    (pack-committed-first) ordering slips through because this read cannot see a
-    pack's coverage of such a season, and a covered-season pack racing a dedicated
-    upgrade across the ``qbt.add`` await can have both pass this check and both
-    commit non-conflicting rows. Closing that window durably needs the pack's
-    physical coverage PERSISTED as an atomic claim distinct from its importable
-    scopes -- a schema addition (deferred; see PR notes). It cannot be reused from
-    ``download_scopes`` without ``import_service`` then importing the ride-along
-    seasons the pack deliberately skips.
+    This footprint is now also the set of seasons a grab persists an ATOMIC
+    physical-coverage claim over (``_claim_covered_seasons`` ->
+    ``download_coverage_claims``, issue #456). A covered-but-UNTARGETED ride-along
+    season -- an ``available``/``waste`` season a pack downloads but deliberately
+    skips importing -- carries no scope (so it keyed neither
+    ``uq_downloads_active_request`` nor ``uq_download_scopes_active_scope``), yet its
+    claim keys ``uq_download_coverage_claims_active``. So the residual window PR #454
+    documented -- the pack-committed-first ordering and a pack racing a dedicated
+    upgrade across the ``qbt.add`` await, both of which this READ alone could miss --
+    is now closed at the database: whichever grab commits second collides on the claim
+    index and is refused. This function stays the belt-and-suspenders read side; the
+    claim is the atomic backstop. The claim is kept OUT of ``download_scopes`` because
+    ``import_service`` imports every non-``imported`` scope, so a ride-along scope
+    would import the very season the pack skips.
     """
     if scored.covered_seasons:
         return tuple(dict.fromkeys((*target_seasons, *scored.covered_seasons)))
@@ -507,13 +507,52 @@ async def _active_conflict_for_targets(
     target_seasons: tuple[int | None, ...],
     torrent_hash: str,
 ) -> DownloadRecord | None:
+    """A DIFFERENT active download already holding any of ``target_seasons``, or None.
+
+    Two independent ownership shapes count as a conflict: an active download/scope for
+    the season (``find_active_for_request``), and -- for a covered-but-untargeted
+    ride-along season a pack persists no scope for (#456) -- an active physical
+    ``download_coverage_claims`` entry (``find_active_coverage_owner``). Checking both
+    makes the read guard belt-and-suspenders to the coverage-claim unique index rather
+    than blind to a pack's ride-along coverage. Both exclude ``torrent_hash`` so a
+    caller never conflicts with its own in-progress grab.
+    """
     if request_id is None:
         return None
     for target_season in target_seasons:
         active = await download_repo.find_active_for_request(request_id, season=target_season)
         if active is not None and active.torrent_hash != torrent_hash:
             return active
+        covered = await download_repo.find_active_coverage_owner(request_id, target_season)
+        if covered is not None and covered.torrent_hash != torrent_hash:
+            return covered
     return None
+
+
+async def _claim_covered_seasons(
+    download_repo: SqlDownloadRepository,
+    *,
+    download_id: int,
+    request_id: int,
+    guard_seasons: tuple[int | None, ...],
+) -> None:
+    """Persist an atomic physical-coverage claim for each of ``guard_seasons`` (#456).
+
+    ``guard_seasons`` is ``_active_guard_seasons``' full footprint: the seasons the
+    torrent physically downloads (targets AND ride-alongs). Every grab claims all of
+    them so a ride-along claim shares one ``(request, season)`` namespace with a
+    dedicated grab's own-season claim -- the collision that makes the guard atomic
+    rather than a bare read. Idempotent per season, and raises ``IntegrityError`` when
+    a different active download already covers one; the caller's existing
+    ``IntegrityError`` handling resolves that to ``AlreadyDownloadingError``. ``None``
+    seasons (a movie, which never rides along) are skipped.
+    """
+    for guard_season in guard_seasons:
+        if guard_season is None:
+            continue
+        await download_repo.ensure_coverage_claim(
+            download_id, media_request_id=request_id, season=guard_season
+        )
 
 
 async def _attach_target_scopes_to_existing_download(
@@ -526,19 +565,27 @@ async def _attach_target_scopes_to_existing_download(
     episodes: list[int] | None,
     scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
     target_seasons: tuple[int, ...],
+    guard_seasons: tuple[int | None, ...],
     observed_season_status: str | None,
     qbt: DownloadClientPort | None = None,
     actually_added: bool = False,
 ) -> DownloadRecord:
-    """Attach logical TV scopes to an already-active physical torrent."""
+    """Attach logical TV scopes to an already-active physical torrent.
+
+    ``guard_seasons`` is the torrent's full physical footprint (``_active_guard_seasons``);
+    the conflict checks and the coverage claims persisted below span it so re-grabbing a
+    shared pack per season keeps the ride-along guard (#456) intact, not just the
+    importable ``target_seasons``.
+    """
     if request_id is None or season is None:
         return existing
 
     target_seasons = target_seasons or (season,)
+    guard_seasons = guard_seasons or target_seasons
     conflict = await _active_conflict_for_targets(
         download_repo,
         request_id=request_id,
-        target_seasons=target_seasons,
+        target_seasons=guard_seasons,
         torrent_hash=existing.torrent_hash,
     )
     if conflict is not None:
@@ -584,12 +631,20 @@ async def _attach_target_scopes_to_existing_download(
                         reason="an attached TV scope moved on mid-grab",
                     )
                 raise RequestNotActiveError(request_id)
+        # Re-assert the torrent's physical-coverage claims over its full footprint
+        # (targets AND ride-alongs) on this per-season re-grab too (#456).
+        await _claim_covered_seasons(
+            download_repo,
+            download_id=existing.id,
+            request_id=request_id,
+            guard_seasons=guard_seasons,
+        )
     except IntegrityError:
         await session.rollback()
         conflict = await _active_conflict_for_targets(
             download_repo,
             request_id=request_id,
-            target_seasons=target_seasons,
+            target_seasons=guard_seasons,
             torrent_hash=existing.torrent_hash,
         )
         if conflict is not None:
@@ -599,7 +654,7 @@ async def _attach_target_scopes_to_existing_download(
                     existing.torrent_hash,
                     actually_added=actually_added,
                     request_id=request_id,
-                    reason="losing an active TV scope race",
+                    reason="losing an active TV scope or coverage-claim race",
                 )
             raise AlreadyDownloadingError(request_id) from None
         record = await download_repo.get_by_hash(existing.torrent_hash)
@@ -826,6 +881,7 @@ async def grab(
                     episodes=episodes,
                     scope_episodes_by_season=scope_episodes_by_season,
                     target_seasons=target_seasons,
+                    guard_seasons=active_guard_seasons,
                     observed_season_status=observed_season_status,
                 )
             return pre
@@ -892,6 +948,7 @@ async def grab(
                 episodes=episodes,
                 scope_episodes_by_season=scope_episodes_by_season,
                 target_seasons=target_seasons,
+                guard_seasons=active_guard_seasons,
                 observed_season_status=observed_season_status,
                 qbt=qbt,
                 actually_added=actually_added,
@@ -954,6 +1011,7 @@ async def grab(
                             episodes=episodes,
                             scope_episodes_by_season=scope_episodes_by_season,
                             target_seasons=target_seasons,
+                            guard_seasons=active_guard_seasons,
                             observed_season_status=observed_season_status,
                             qbt=qbt,
                             actually_added=actually_added,
@@ -1046,6 +1104,7 @@ async def grab(
                         episodes=episodes,
                         scope_episodes_by_season=scope_episodes_by_season,
                         target_seasons=target_seasons,
+                        guard_seasons=active_guard_seasons,
                         observed_season_status=observed_season_status,
                         qbt=qbt,
                         actually_added=actually_added,
@@ -1087,6 +1146,7 @@ async def grab(
                             episodes=episodes,
                             scope_episodes_by_season=scope_episodes_by_season,
                             target_seasons=target_seasons,
+                            guard_seasons=active_guard_seasons,
                             observed_season_status=observed_season_status,
                             qbt=qbt,
                             actually_added=actually_added,
@@ -1174,12 +1234,24 @@ async def grab(
                                 reason="a planned TV scope moved on mid-grab",
                             )
                             raise RequestNotActiveError(request_id)
+                    # Persist an atomic physical-coverage claim for EVERY season the
+                    # torrent fetches -- targets AND covered-but-untargeted ride-alongs
+                    # (#456). A ride-along carries no importable scope, so this claim is
+                    # the only thing that makes a concurrent grab of that season collide
+                    # (on ``uq_download_coverage_claims_active``) instead of racing the
+                    # window between this ``qbt.add`` and its download registration.
+                    await _claim_covered_seasons(
+                        download_repo,
+                        download_id=record.id,
+                        request_id=request_id,
+                        guard_seasons=active_guard_seasons,
+                    )
                 except IntegrityError:
                     await session.rollback()
                     active = await _active_conflict_for_targets(
                         download_repo,
                         request_id=request_id,
-                        target_seasons=target_seasons,
+                        target_seasons=active_guard_seasons,
                         torrent_hash=torrent_hash,
                     )
                     if active is not None:
@@ -1188,7 +1260,7 @@ async def grab(
                             torrent_hash,
                             actually_added=actually_added,
                             request_id=request_id,
-                            reason="losing an active TV scope race",
+                            reason="losing an active TV scope or coverage-claim race",
                         )
                         raise AlreadyDownloadingError(request_id) from None
                     raise

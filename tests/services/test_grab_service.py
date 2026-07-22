@@ -16,6 +16,7 @@ from plex_manager.domain.release import ParsedRelease, ScoredRelease
 from plex_manager.models import (
     Blocklist,
     Download,
+    DownloadCoverageClaim,
     DownloadHistory,
     DownloadScope,
     MediaRequest,
@@ -744,6 +745,305 @@ async def test_pack_first_then_dedicated_target_season_cannot_double_grab(
             await SqlDownloadRepository(session).ensure_scope(
                 second.id, media_request_id=request_id, season=2, episodes=None
             )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #456 — a pack's covered-but-untargeted ride-along seasons persist an
+# atomic physical-coverage claim, closing the residual race PR #454 deferred.
+# --------------------------------------------------------------------------- #
+async def _grab_ride_along_pack(sessionmaker_: SessionMaker, request_id: int) -> int:
+    """Grab an S01-S02 pack that TARGETS only S1, so S2 is a covered-but-untargeted
+    ride-along (imported by nothing, scoped by nothing). Returns the download id."""
+    pack = _scored_tv("6" * 40, "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"covered_seasons": (1, 2), "target_seasons": (1,)}
+    )
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=pack,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+        return record.id
+
+
+async def test_pack_ride_along_season_claim_blocks_concurrent_dedicated_grab(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #456 (the deferred remainder of #409): a physical pack downloads season 2
+    as a ride-along it does NOT import, so S2 gets no ``download_scopes`` row and keyed
+    neither active scope/download index -- the exact gap PR #454 left open. The
+    persisted ``download_coverage_claims`` entry must now guard S2 both ways: the
+    pre-add read guard refuses a concurrent dedicated S2 grab, AND -- proving the claim
+    is atomic, not a mere TOCTOU read -- the ``uq_download_coverage_claims_active``
+    unique index rejects a second active claim for the same ``(request, S2)`` even if
+    two grabs raced past the read across the ``qbt.add`` await."""
+    request_id = await _make_tv_request(sessionmaker_)
+    await _grab_ride_along_pack(sessionmaker_, request_id)
+
+    async with sessionmaker_() as session:
+        claims = (
+            (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.media_request_id == request_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Every physically covered season -- target S1 AND ride-along S2 -- is claimed...
+    assert {c.season_number for c in claims} == {1, 2}
+    assert all(c.status == "active" for c in claims)
+    # ...but S2 carries NO importable scope (the pack deliberately skips it), so the
+    # claim -- not a scope -- is the only thing guarding it (the whole point of #456).
+    assert 2 not in {s.season_number for s in scopes}
+
+    # Read guard: a dedicated grab of the ride-along S2 is refused BEFORE qbt.add
+    # (the candidate carries an info-hash, so the pre-add guard fires first).
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored_tv("7" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+    assert qbt.added == []
+
+    # Atomic proof: a SECOND active download attaching an S2 coverage claim collides
+    # on uq_download_coverage_claims_active -- the durable backstop to the read guard.
+    async with sessionmaker_() as session:
+        second = Download(
+            torrent_hash="7" * 40,
+            status=RequestStatus.downloading.value,
+            media_request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+        session.add(second)
+        await session.flush()
+        with pytest.raises(IntegrityError):
+            await SqlDownloadRepository(session).ensure_coverage_claim(
+                second.id, media_request_id=request_id, season=2
+            )
+
+
+async def test_ride_along_claim_released_on_failure_frees_the_season(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A leaked claim would block a season forever (north star #1), so a claim must be
+    released on the SAME edge that releases the download's scopes. Failing the pack via
+    the operator ``mark_failed`` path drives its download terminal; every coverage claim
+    then becomes ``released`` and a fresh grab of the once-ride-along S2 succeeds."""
+    request_id = await _make_tv_request(sessionmaker_)
+    download_id = await _grab_ride_along_pack(sessionmaker_, request_id)
+
+    async with sessionmaker_() as session:
+        await mark_failed(session, FakeQbittorrent(), download_id=download_id, blocklist=False)
+
+    async with sessionmaker_() as session:
+        claims = (
+            (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.media_request_id == request_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert claims and all(c.status == "released" for c in claims)
+        assert all(c.released_at is not None for c in claims)
+        owner = await SqlDownloadRepository(session).find_active_coverage_owner(request_id, 2)
+        assert owner is None
+
+    # The season is grabbable again -- the guard freed with the torrent, no permanent block.
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            qbt,
+            session,
+            scored=_scored_tv("7" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+    assert record.status == "downloading"
+    assert qbt.added != []
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "allowed_from", "failed_reason"),
+    [
+        # completion: exactly import_service's Downloading -> Imported finalize CAS.
+        ("imported", frozenset({"downloading"}), None),
+        # cancellation: exactly correction_service.cancel_request's Downloading ->
+        # Failed CAS (a cancel reuses the terminal Failed state).
+        ("failed", frozenset({"downloading"}), "cancelled by operator"),
+    ],
+)
+async def test_ride_along_claim_released_on_terminal_transition(
+    sessionmaker_: SessionMaker,
+    terminal_status: str,
+    allowed_from: frozenset[str],
+    failed_reason: str | None,
+) -> None:
+    """Completion and cancellation release a ride-along claim too, via the SAME
+    download-status terminal choke (``update_status_if_in``) that releases scopes --
+    each parametrization issues the exact CAS the owning service does. A claim never
+    outlives the torrent it guards, whichever terminal edge the torrent reaches."""
+    request_id = await _make_tv_request(sessionmaker_)
+    download_id = await _grab_ride_along_pack(sessionmaker_, request_id)
+
+    async with sessionmaker_() as session:
+        won = await SqlDownloadRepository(session).update_status_if_in(
+            download_id, terminal_status, allowed_from, failed_reason=failed_reason
+        )
+        assert won
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        claims = (
+            (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.media_request_id == request_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert claims and all(c.status == "released" for c in claims)
+        owner = await SqlDownloadRepository(session).find_active_coverage_owner(request_id, 2)
+        assert owner is None
+
+
+async def test_partial_import_frees_resolved_season_claim_keeps_blocked_and_ride_along(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #456 partial-pack regression: an S01-S02 pack that also rides along on S3
+    imports S1 but leaves S2 ``import_blocked``, so the physical row stays non-terminal
+    and the whole-download claim release never fires. ``align_scalar_scope_with_active``
+    already re-points the legacy scalar guard off the imported S1; the coverage claim
+    must follow -- S1's claim is released so an S1 replacement/upgrade can be grabbed,
+    while the still-blocked S2 target and the untargeted S3 ride-along keep their claims
+    until the torrent terminates. Without this, S1's stale ``active`` claim would reject
+    every S1 grab until the unrelated S2 resolves."""
+    request_id = await _make_tv_request(sessionmaker_)
+    async with sessionmaker_() as session:
+        # Post-partial-import state: S1 imported, S2 blocked, physical row ImportBlocked
+        # (align_scalar_scope_with_active already re-pointed the scalar season to S2).
+        download = Download(
+            torrent_hash="6" * 40,
+            status="import_blocked",
+            media_request_id=request_id,
+            tmdb_id=900,
+            season=2,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        download_id = download.id
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download_id,
+                    media_request_id=request_id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="imported",
+                ),
+                DownloadScope(
+                    download_id=download_id,
+                    media_request_id=request_id,
+                    season_number=2,
+                    scope_key="season:2|episodes:*",
+                    status="import_blocked",
+                ),
+            ]
+        )
+        session.add_all(
+            DownloadCoverageClaim(
+                download_id=download_id,
+                media_request_id=request_id,
+                season_number=season,
+                status="active",
+            )
+            for season in (1, 2, 3)
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await SqlDownloadRepository(session).release_resolved_target_coverage_claims(download_id)
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        repo = SqlDownloadRepository(session)
+        claims = {
+            c.season_number: c.status
+            for c in (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.download_id == download_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+        # Resolved target S1 freed; blocked target S2 and untargeted ride-along S3 kept.
+        assert claims == {1: "released", 2: "active", 3: "active"}
+        assert await repo.find_active_coverage_owner(request_id, 1) is None
+        assert (await repo.find_active_coverage_owner(request_id, 2)) is not None
+        assert (await repo.find_active_coverage_owner(request_id, 3)) is not None
+
+    # The imported S1 can now be grabbed for a replacement/upgrade despite the still
+    # non-terminal pack, exactly as the scalar-guard re-point already permits.
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            qbt,
+            session,
+            scored=_scored_tv("7" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+    assert record.status == "downloading"
+    assert qbt.added != []
+
+    # ...but the still-blocked S2 target and the S3 ride-along remain guarded.
+    async with sessionmaker_() as session:
+        for blocked_season, blocked_hash in ((2, "8" * 40), (3, "9" * 40)):
+            with pytest.raises(AlreadyDownloadingError):
+                await grab_service.grab(
+                    FakeQbittorrent(),
+                    session,
+                    scored=_scored_tv(
+                        blocked_hash, f"Some.Show.S0{blocked_season}.1080p.WEB-DL.x264-GROUP"
+                    ),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=blocked_season,
+                )
 
 
 async def test_grab_attaches_same_hash_active_for_a_different_season(
