@@ -1474,10 +1474,12 @@ class _WedgedProbe:
     """A blocking read-only probe operation: it parks in its worker thread until
     the test releases it, records how many physical workers actually ran it, and
     returns a fixed value -- the shared substrate is generic, so an ``int`` stands
-    in for the real ``DiskUsage`` payload."""
+    in for the real ``DiskUsage`` payload. Pass ``error`` to model a wedged mount
+    whose worker eventually FAILS once released (e.g. a transient NFS ``OSError``)."""
 
-    def __init__(self, value: int) -> None:
+    def __init__(self, value: int, *, error: BaseException | None = None) -> None:
         self._value = value
+        self._error = error
         self.started = threading.Event()
         self.release = threading.Event()
         self._lock = threading.Lock()
@@ -1488,6 +1490,8 @@ class _WedgedProbe:
             self.calls += 1
         self.started.set()
         assert self.release.wait(timeout=5)
+        if self._error is not None:
+            raise self._error
         return self._value
 
 
@@ -1672,3 +1676,68 @@ async def test_registry_entry_survives_every_awaiter_cancelling(
     assert await asyncio.wait_for(asyncio.shield(shared), timeout=2.0) == 5
     await asyncio.sleep(0)
     assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_all_cancelled_shared_probe_failure_is_retrieved_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #466 review: when EVERY awaiter of a coalesced probe has cancelled and
+    the shared daemon worker LATER fails, that failure must still be RETRIEVED *and*
+    LOGGED. Coalescing must not regress ``_run_abandonable_probe``'s single-caller
+    late-failure contract into a silent swallow: with no awaiter left to re-raise it,
+    the exception would otherwise be consumed purely to quiet the loop, leaving a
+    transient wedged-mount failure invisible to every later poll (honesty over
+    silence)."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=0, error=OSError("nfs probe wedged then failed"))
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    caplog.set_level(logging.WARNING, logger="plex_manager.services.purge_service")
+    try:
+        first = asyncio.create_task(
+            purge_service.run_abandonable_probe(wedged, path, operation_name="health poll")
+        )
+        assert await asyncio.to_thread(wedged.started.wait, 2.0)
+        second = asyncio.create_task(
+            purge_service.run_abandonable_probe(wedged, path, operation_name="health poll")
+        )
+        await asyncio.sleep(0)
+        assert probe_gate.acquired == 1
+
+        first.cancel()
+        second.cancel()
+        await assert_task_raises(first, asyncio.CancelledError)
+        await assert_task_raises(second, asyncio.CancelledError)
+        assert key in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+        # Every awaiter is gone; the still-running worker now fails on its wedged mount.
+        wedged.release.set()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if key not in purge_service._ACTIVE_PROBE_TASKS:  # pyright: ignore[reportPrivateUsage]
+                break
+        assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    # Retrieved: the loop never reported an unretrieved task exception.
+    assert loop_errors == []
+    # Logged: exactly one intentional, sanitized failure record (the exception TYPE
+    # only, never the raw message) naming the shared probe.
+    failure_logs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "failed" in record.getMessage()
+        and "health poll" in record.getMessage()
+    ]
+    assert len(failure_logs) == 1
+    message = failure_logs[0].getMessage()
+    assert "OSError" in message
+    assert "nfs probe wedged then failed" not in message

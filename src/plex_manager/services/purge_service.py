@@ -234,6 +234,34 @@ _ABANDONED_SETTLEMENTS: set[asyncio.Future[None]] = set()
 _ACTIVE_PROBE_TASKS: dict[str, asyncio.Task[Any]] = {}
 
 
+@dataclass
+class _SharedProbeState:
+    """Per-probe bookkeeping that keeps a COALESCED probe's late failure honest.
+
+    The shared probe task is caller-independent (``asyncio.ensure_future``), so
+    awaiters cancelling never cancel it: it runs its happy path and settles with the
+    worker's outcome, which :func:`_run_abandonable_probe`'s own cancellation-path
+    late-failure log therefore never sees. This tracks how many awaiters are still
+    attached (``live_awaiters``), whether any awaiter actually RECEIVED the outcome
+    (``delivered``), and whether the fallback failure log has already fired
+    (``late_failure_logged``) so that when every awaiter has detached and no one is
+    left to re-raise it, the shared worker's failure is still recorded exactly once
+    (honesty over silence) instead of being consumed purely to quiet the loop.
+    """
+
+    live_awaiters: int = 0
+    delivered: bool = False
+    late_failure_logged: bool = False
+
+
+# Parallel to ``_ACTIVE_PROBE_TASKS`` and kept in lockstep with it (same key,
+# created and cleared in the same await-free step): the shared bookkeeping a
+# coalescing awaiter reaches via the registry key. Awaiters capture their entry by
+# reference at attach time, so a done-callback clearing the registry never strands
+# an awaiter that still needs to record a late failure.
+_PROBE_STATES: dict[str, _SharedProbeState] = {}
+
+
 def active_settlement_tasks() -> tuple[asyncio.Task[None], ...]:
     """Snapshot tasks awaiting abandonable filesystem-worker settlement."""
     return tuple(task for _path, task in _ACTIVE_SETTLEMENTS.values())
@@ -678,45 +706,113 @@ async def run_abandonable_probe[T](
         # entry is treated as absent so a fresh poll never reuses a stale reading).
         # Create/register with NO ``await`` between the get and the set so the
         # single-threaded loop keeps this election atomic.
+        state = _SharedProbeState()
         task = asyncio.ensure_future(
             _run_abandonable_probe(
                 operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
             )
         )
         _ACTIVE_PROBE_TASKS[key] = task
-        task.add_done_callback(functools.partial(_forget_probe_task, key))
-    return cast("T", await _attach_to_shared_probe(task))
+        _PROBE_STATES[key] = state
+        task.add_done_callback(
+            functools.partial(_forget_probe_task, key, state, path, operation_name)
+        )
+    else:
+        state = _PROBE_STATES[key]
+    return cast(
+        "T",
+        await _attach_to_shared_probe(task, state, path=path, operation_name=operation_name),
+    )
 
 
-async def _attach_to_shared_probe(task: asyncio.Task[Any]) -> Any:
+async def _attach_to_shared_probe(
+    task: asyncio.Task[Any], state: _SharedProbeState, *, path: str, operation_name: str
+) -> Any:
     """Await a coalesced probe task WITHOUT ever cancelling the shared worker.
 
     :func:`asyncio.wait` never cancels the futures it waits on, so this awaiter can
     unwind on its OWN cancellation (a detached poll, or shutdown) while the shared
-    probe task -- and any other awaiter attached to it -- keeps running. The shared
-    task owns the worker's outcome retrieval, honesty logging, and permit lifecycle
-    (see :func:`_run_abandonable_probe`); an individual awaiter detaching is just a
-    caller unwind and needs no logging of its own. Results and exceptions are
-    delivered unchanged: ``task.result()`` re-raises the probe's exception to every
-    attached awaiter.
+    probe task -- and any other awaiter attached to it -- keeps running. Results and
+    exceptions are delivered unchanged: ``task.result()`` re-raises the probe's
+    exception to every attached awaiter, and a caller that RECEIVES a failure owns it
+    (marked ``delivered``), so the substrate stays silent for it.
+
+    Honesty for the SHARED worker's late failure lives here and in
+    :func:`_forget_probe_task`, not in :func:`_run_abandonable_probe`: coalescing
+    made the shared task caller-independent, so its own cancellation-path log can
+    never fire. Whichever of the two observes that the worker has failed with no
+    awaiter left to receive it -- this awaiter as the LAST one to detach, or the
+    done-callback when every awaiter had already gone -- records it once, the
+    coalesced analog of the single-caller cancelled-worker-failure log.
     """
-    await asyncio.wait((task,))
+    state.live_awaiters += 1
+    detached = True
+    try:
+        await asyncio.wait((task,))
+        # ``asyncio.wait`` returned: the task is settled and the synchronous
+        # ``task.result()`` below WILL deliver its outcome to this caller (no
+        # cancellation point in between), so this awaiter is not detaching.
+        detached = False
+    finally:
+        state.live_awaiters -= 1
+        if not detached:
+            state.delivered = True
+        else:
+            _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
     return task.result()
 
 
-def _forget_probe_task(key: str, task: asyncio.Task[Any]) -> None:
-    """Clear a completed probe's registry entry and retrieve its outcome.
+def _log_orphaned_probe_failure(
+    state: _SharedProbeState, task: asyncio.Task[Any], *, path: str, operation_name: str
+) -> None:
+    """Record a shared probe's failure ONCE when no awaiter is left to receive it.
 
-    Runs as the shared task's done-callback. The entry is removed only if it is
-    still THIS task (a fresh probe for the same path may already have replaced a
-    just-finished one). Retrieving the exception here keeps a probe whose every
-    awaiter had cancelled from surfacing as "Task exception was never retrieved";
-    any attached awaiter still receives it unchanged via ``task.result()``.
+    A no-op unless the shared worker has actually failed AND every awaiter has
+    detached without any of them consuming the outcome; the ``late_failure_logged``
+    latch keeps a single record even though both the last-detaching awaiter and the
+    done-callback may reach here. Logs the exception TYPE only -- never a raw
+    message that could carry a secret (honesty without leakage).
+    """
+    if state.live_awaiters != 0 or state.delivered or state.late_failure_logged:
+        return
+    if not task.done() or task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        return
+    state.late_failure_logged = True
+    _logger.warning(
+        "%s of %r failed (%s) after every coalesced awaiter detached; the shared "
+        "daemon worker ran to completion unobserved and its failure is recorded here only",
+        operation_name,
+        safe_text(path),
+        type(error).__name__,
+    )
+
+
+def _forget_probe_task(
+    key: str, state: _SharedProbeState, path: str, operation_name: str, task: asyncio.Task[Any]
+) -> None:
+    """Clear a completed probe's registry entries and surface its outcome honestly.
+
+    Runs as the shared task's done-callback. The entries are removed only if the
+    task is still THIS one (a fresh probe for the same path may already have replaced
+    a just-finished one). Retrieving the exception keeps a probe whose every awaiter
+    had cancelled from surfacing as "Task exception was never retrieved"; any still
+    attached awaiter receives it unchanged via ``task.result()``, and when NONE
+    remains the failure is logged here (honesty over silence) rather than silently
+    swallowed -- see :func:`_attach_to_shared_probe` for why this contract cannot
+    live on the caller-independent shared task itself.
     """
     if _ACTIVE_PROBE_TASKS.get(key) is task:
         del _ACTIVE_PROBE_TASKS[key]
-    if not task.cancelled():
-        task.exception()
+        _PROBE_STATES.pop(key, None)
+    if task.cancelled():
+        return
+    # Always retrieve (quiet the loop even in the settle-then-cancel race where the
+    # sole awaiter unwinds without consuming), then log only when orphaned.
+    task.exception()
+    _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
 
 
 async def _delete_to_settlement(
