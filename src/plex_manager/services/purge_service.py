@@ -39,6 +39,7 @@ the bad release — a correction verb calls :func:`remove_torrent` AND
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import threading
@@ -46,7 +47,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
@@ -215,6 +216,22 @@ _ACTIVE_PLACEMENT_PATHS: dict[str, int] = {}
 # lock; daemon workers only deliver through ``call_soon_threadsafe``.
 _ACTIVE_SETTLEMENTS: dict[asyncio.Future[None], tuple[str, asyncio.Task[None]]] = {}
 _ABANDONED_SETTLEMENTS: set[asyncio.Future[None]] = set()
+
+# Per-path coalescing for shared read-only PROBE workers (issue #466). A wedged
+# NFS/SMB root is polled by ``GET /api/v1/ops/health`` every ~15s while an
+# earlier poll's probe is STILL blocked in flight; without dedup each poll pins
+# another PROBE permit, so after ~4 polls the shared read budget is exhausted and
+# every unrelated probe consumer (ops/disk, eviction, retention) starves for the
+# duration of the outage. This registry gives each normalized path a SINGLE
+# physical worker: concurrent callers attach to the same in-flight probe task and
+# await its one outcome. The task is caller-independent, so cancelling one awaiter
+# detaches ONLY that awaiter -- the shared worker and every other awaiter are
+# untouched, and the entry lives until the physical worker completes even if every
+# awaiter has cancelled (mirroring the DELETE path's ``_ACTIVE_PURGE_PATHS``
+# dedup). The loop is single-threaded, so get/create/pop is atomic without a lock.
+# Only the public PROBE gate coalesces; a purge's OWN preflight probes draw the
+# separate DELETE budget and are deliberately NOT registered here.
+_ACTIVE_PROBE_TASKS: dict[str, asyncio.Task[Any]] = {}
 
 
 def active_settlement_tasks() -> tuple[asyncio.Task[None], ...]:
@@ -645,10 +662,61 @@ async def run_abandonable_probe[T](
 
     Detach-on-cancellation and unchanged result/exception delivery are documented on
     the shared core, :func:`_run_abandonable_probe`.
+
+    Concurrent calls for the SAME normalized path COALESCE onto one physical worker
+    (issue #466): the first caller starts a caller-independent probe task and every
+    caller (including that first one) attaches to it via :func:`_attach_to_shared_probe`,
+    so a wedged root that is re-polled while its probe is still in flight can never pin
+    more than one PROBE permit and starve the shared read budget. Distinct paths keep
+    their own worker, so cross-root concurrency stays independent (still bounded by
+    :data:`_ABANDONABLE_PROBE_THREAD_LIMIT`).
     """
-    return await _run_abandonable_probe(
-        operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
-    )
+    key = _normalize_guard_path(path)
+    task = _ACTIVE_PROBE_TASKS.get(key)
+    if task is None or task.done():
+        # No in-flight probe for this path (a just-completed-but-not-yet-cleared
+        # entry is treated as absent so a fresh poll never reuses a stale reading).
+        # Create/register with NO ``await`` between the get and the set so the
+        # single-threaded loop keeps this election atomic.
+        task = asyncio.ensure_future(
+            _run_abandonable_probe(
+                operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+            )
+        )
+        _ACTIVE_PROBE_TASKS[key] = task
+        task.add_done_callback(functools.partial(_forget_probe_task, key))
+    return cast("T", await _attach_to_shared_probe(task))
+
+
+async def _attach_to_shared_probe(task: asyncio.Task[Any]) -> Any:
+    """Await a coalesced probe task WITHOUT ever cancelling the shared worker.
+
+    :func:`asyncio.wait` never cancels the futures it waits on, so this awaiter can
+    unwind on its OWN cancellation (a detached poll, or shutdown) while the shared
+    probe task -- and any other awaiter attached to it -- keeps running. The shared
+    task owns the worker's outcome retrieval, honesty logging, and permit lifecycle
+    (see :func:`_run_abandonable_probe`); an individual awaiter detaching is just a
+    caller unwind and needs no logging of its own. Results and exceptions are
+    delivered unchanged: ``task.result()`` re-raises the probe's exception to every
+    attached awaiter.
+    """
+    await asyncio.wait((task,))
+    return task.result()
+
+
+def _forget_probe_task(key: str, task: asyncio.Task[Any]) -> None:
+    """Clear a completed probe's registry entry and retrieve its outcome.
+
+    Runs as the shared task's done-callback. The entry is removed only if it is
+    still THIS task (a fresh probe for the same path may already have replaced a
+    just-finished one). Retrieving the exception here keeps a probe whose every
+    awaiter had cancelled from surfacing as "Task exception was never retrieved";
+    any attached awaiter still receives it unchanged via ``task.result()``.
+    """
+    if _ACTIVE_PROBE_TASKS.get(key) is task:
+        del _ACTIVE_PROBE_TASKS[key]
+    if not task.cancelled():
+        task.exception()
 
 
 async def _delete_to_settlement(
