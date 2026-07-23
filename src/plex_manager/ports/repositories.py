@@ -703,6 +703,24 @@ class DownloadRepository(Protocol):
         """
         raise NotImplementedError
 
+    async def find_active_coverage_owners(
+        self, keys: Sequence[tuple[int, int | None]]
+    ) -> frozenset[tuple[int, int | None]]:
+        """Batch active physical-coverage-claim membership over MANY
+        ``(media_request_id, season)`` keys in one round trip (issue #465).
+
+        The coverage-claim twin of :meth:`find_active_for_requests`: a pack's
+        ride-along season carries no ``DownloadScope`` and matches no scalar
+        download, so :meth:`find_active_for_requests` cannot see the pack covering
+        it -- eviction candidate assembly unions THIS membership into the in-flight
+        verdict so a season a live pack is still fetching is never selected. Returns
+        the SUBSET of ``keys`` for which the season currently has an ``active``
+        coverage claim; a NULL-season (movie) key is never matched (movies hold no
+        claim). Membership matches the singular
+        ``SqlDownloadRepository.find_active_coverage_owner`` for each key.
+        """
+        raise NotImplementedError
+
     async def list_active(self) -> list[DownloadRecord]:
         """List downloads in a non-terminal state (for the reconcile loop)."""
         raise NotImplementedError

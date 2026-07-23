@@ -911,6 +911,49 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return await self._to_record_with_scopes(row) if row is not None else None
 
+    async def find_active_coverage_owners(
+        self, keys: Sequence[tuple[int, int | None]]
+    ) -> frozenset[tuple[int, int | None]]:
+        """Batch :meth:`find_active_coverage_owner` membership over MANY
+        ``(media_request_id, season)`` keys in ONE query (issue #465).
+
+        The coverage-claim twin of :meth:`find_active_for_requests`: eviction
+        candidate assembly must union a season's active physical-coverage claim
+        into its in-flight verdict so a pack's scopeless ride-along season is
+        never selected mid-transfer, and must do it once for the whole pool, not
+        once per candidate. Returns the SUBSET of ``keys`` for which
+        ``find_active_coverage_owner(media_request_id, season) is not None`` would
+        hold individually.
+
+        Queries ``download_coverage_claims`` ALONE (never joining ``downloads``):
+        a claim is written ``released`` the instant its torrent terminates
+        (:meth:`release_coverage_claims`), so an ``active`` claim virtually always
+        has a live torrent -- and treating a rare stale ``active`` claim (one that
+        somehow outlived its download) as in-flight only OVER-guards eviction,
+        the safe direction (a season is kept, never wrongly deleted). The
+        authoritative pre-delete re-check still uses the non-terminal-gated
+        singular :meth:`find_active_coverage_owner`. Movies (``season is None``)
+        never hold a claim, so a NULL-season key is simply never matched.
+        """
+        if not keys:
+            return frozenset()
+        key_set = frozenset(keys)
+        request_ids = list({media_request_id for media_request_id, _season in key_set})
+        stmt = select(
+            DownloadCoverageClaim.media_request_id,
+            DownloadCoverageClaim.season_number,
+        ).where(
+            DownloadCoverageClaim.media_request_id.in_(request_ids),
+            DownloadCoverageClaim.season_number.is_not(None),
+            DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return frozenset(
+            key
+            for media_request_id, season_number in rows
+            if (key := (media_request_id, season_number)) in key_set
+        )
+
     async def align_scalar_scope_with_active(self, download_id: int) -> None:
         """Keep the legacy scalar TV scope on an unresolved logical scope.
 

@@ -449,13 +449,22 @@ async def _season_candidates(
     active_keys = await download_repo.find_active_for_requests(
         [(row.media_request_id, row.season_number) for row in rows]
     )
+    # A pack's ride-along season carries no DownloadScope and matches no scalar
+    # download row, so ``find_active_for_requests`` above is blind to it (issue
+    # #465). Its only guard is an active ``download_coverage_claims`` row -- probe
+    # that once for the whole pool and UNION it into the in-flight verdict, so
+    # eviction never selects a season a live pack is still fetching.
+    coverage_keys = await download_repo.find_active_coverage_owners(
+        [(row.media_request_id, row.season_number) for row in rows]
+    )
     size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row, watch in zip(rows, watch_states, strict=True):
         parent = parents.get(row.media_request_id)
         if parent is None:  # pragma: no cover - the FK guarantees the parent exists
             continue
-        in_flight = (row.media_request_id, row.season_number) in active_keys
+        key = (row.media_request_id, row.season_number)
+        in_flight = key in active_keys or key in coverage_keys
         prospective = EvictionCandidate(
             request_id=row.id,
             media_type="tv",
@@ -522,8 +531,10 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
     Movies: the request itself must still be ``available``, unpinned, and have
     no active download. TV: the pin lives on the PARENT (fetched separately),
     and the SEASON row itself must still be ``available`` with no active
-    download for ``(request, season)``. Either side missing entirely (deleted
-    out from under the sweep) is honestly ``False`` — nothing left to evict.
+    download for ``(request, season)`` AND no active ride-along coverage claim
+    over it (issue #465 -- a scopeless pack coverage ``find_active_for_request``
+    cannot see). Either side missing entirely (deleted out from under the sweep)
+    is honestly ``False`` — nothing left to evict.
     """
     download_repo = SqlDownloadRepository(session)
     if isinstance(pending, _SeasonPending):
@@ -536,11 +547,20 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
                 pending.media_request_id, season=pending.season_number
             )
         ) is not None
+        # A ride-along coverage claim (issue #465) can land AFTER assembly (a pack
+        # starting mid-sweep). It has no scope, so ``find_active_for_request``
+        # cannot see it -- the non-terminal-gated coverage owner does.
+        covered = (
+            await download_repo.find_active_coverage_owner(
+                pending.media_request_id, pending.season_number
+            )
+        ) is not None
         return (
             not parent.keep_forever
             and not await watchlist_service.is_watchlisted(session, pending.tmdb_id, "tv")
             and season.status == RequestStatus.available.value
             and not in_flight
+            and not covered
         )
 
     request = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
