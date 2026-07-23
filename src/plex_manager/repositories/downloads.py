@@ -230,6 +230,20 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return await self._to_record_with_scopes(row) if row is not None else None
 
+    async def find_active_for_request_or_coverage(
+        self, media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        """Return the active logical or physical owner for a request scope.
+
+        A ride-along season has an active physical-coverage claim but intentionally
+        no importable scope, so guards that must avoid work or state changes for an
+        in-flight season need both ownership shapes (issue #462).
+        """
+        active = await self.find_active_for_request(media_request_id, season=season)
+        if active is not None:
+            return active
+        return await self.find_active_coverage_owner(media_request_id, season)
+
     async def find_active_for_requests(
         self, keys: Sequence[tuple[int, int | None]]
     ) -> frozenset[tuple[int, int | None]]:

@@ -333,7 +333,7 @@ async def grab_endpoint(
         # active check is season-SCOPED for a TV grab (body.season): another season
         # still downloading must not suppress THIS season's honest dead-end, and a
         # movie (season=None) keeps its whole-request guard unchanged.
-        active = await SqlDownloadRepository(session).find_active_for_request(
+        active = await SqlDownloadRepository(session).find_active_for_request_or_coverage(
             request.id, season=body.season
         )
         if active is None:
