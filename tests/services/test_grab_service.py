@@ -1215,6 +1215,74 @@ async def test_grab_attaches_same_hash_active_for_a_different_season(
     ]
 
 
+async def test_grab_retries_same_hash_attach_after_coverage_claim_collision(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-hash attach collision rolls back staged scope/status writes, so retry
+    until the requested target scope is durable rather than returning silent success."""
+    request_id = await _make_tv_request(sessionmaker_)
+    pack_hash = "c" * 40
+    pack = _scored_tv(pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP").model_copy(
+        update={"covered_seasons": (1, 2, 3), "target_seasons": (1,)}
+    )
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=pack,
+            request_id=request_id,
+            tmdb_id=900,
+            season=1,
+        )
+
+    real_ensure_claim = grab_service.SqlDownloadRepository.ensure_coverage_claim
+    attempts = 0
+
+    async def collide_once(
+        self: grab_service.SqlDownloadRepository,
+        download_id: int,
+        *,
+        media_request_id: int,
+        season: int,
+    ) -> None:
+        nonlocal attempts
+        if season == 2 and attempts == 0:
+            attempts += 1
+            raise IntegrityError("coverage claim collision", {}, RuntimeError("collision"))
+        await real_ensure_claim(
+            self,
+            download_id,
+            media_request_id=media_request_id,
+            season=season,
+        )
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "ensure_coverage_claim", collide_once)
+    attach = pack.model_copy(update={"target_seasons": (2,)})
+    async with sessionmaker_() as session:
+        record = await grab_service.grab(
+            FakeQbittorrent(),
+            session,
+            scored=attach,
+            request_id=request_id,
+            tmdb_id=900,
+            season=2,
+        )
+
+    assert attempts == 1
+    assert {scope.season for scope in record.scopes} == {1, 2}
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+    assert season.status == RequestStatus.downloading
+
+
 async def test_grab_fresh_multi_season_pack_returns_all_attached_scopes(
     sessionmaker_: SessionMaker,
 ) -> None:

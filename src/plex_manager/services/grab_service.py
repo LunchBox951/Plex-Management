@@ -500,6 +500,11 @@ def _target_episodes(
     return list(episodes) if episodes is not None else None
 
 
+def _normalized_episodes(episodes: Sequence[int] | None) -> tuple[int, ...] | None:
+    normalized = tuple(sorted({int(episode) for episode in episodes or ()}))
+    return normalized or None
+
+
 async def _active_conflict_for_targets(
     download_repo: SqlDownloadRepository,
     *,
@@ -553,6 +558,41 @@ async def _claim_covered_seasons(
         await download_repo.ensure_coverage_claim(
             download_id, media_request_id=request_id, season=guard_season
         )
+
+
+async def _attached_target_scopes(
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    *,
+    download_id: int,
+    request_id: int,
+    season: int,
+    episodes: list[int] | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+    target_seasons: tuple[int, ...],
+) -> bool:
+    scopes = await download_repo.list_scopes(download_id)
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+    statuses = {row.season_number: row.status for row in season_rows}
+    for target_season in target_seasons:
+        target_episodes = _target_episodes(
+            primary_season=season,
+            primary_episodes=episodes,
+            target_season=target_season,
+            scope_episodes_by_season=scope_episodes_by_season,
+        )
+        if (
+            not any(
+                scope.media_request_id == request_id
+                and scope.season == target_season
+                and _normalized_episodes(scope.episodes) == _normalized_episodes(target_episodes)
+                and scope.status in {"active", "import_blocked"}
+                for scope in scopes
+            )
+            or statuses.get(target_season) != RequestStatus.downloading.value
+        ):
+            return False
+    return True
 
 
 async def _attach_target_scopes_to_existing_download(
@@ -657,10 +697,32 @@ async def _attach_target_scopes_to_existing_download(
                     reason="losing an active TV scope or coverage-claim race",
                 )
             raise AlreadyDownloadingError(request_id) from None
-        record = await download_repo.get_by_hash(existing.torrent_hash)
-        if record is not None:
+        record = await download_repo.get_by_hash(existing.torrent_hash, populate_existing=True)
+        if record is not None and await _attached_target_scopes(
+            session,
+            download_repo,
+            download_id=record.id,
+            request_id=request_id,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            target_seasons=target_seasons,
+        ):
             return record
-        raise
+        return await _attach_target_scopes_to_existing_download(
+            session,
+            download_repo,
+            record if record is not None else existing,
+            request_id=request_id,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            target_seasons=target_seasons,
+            guard_seasons=guard_seasons,
+            observed_season_status=observed_season_status,
+            qbt=qbt,
+            actually_added=actually_added,
+        )
 
     await session.commit()
     record = await download_repo.get_by_hash(existing.torrent_hash)
