@@ -772,6 +772,7 @@ async def set_status_if_in(
     season_request_id: int,
     status: str,
     allowed_from: frozenset[str],
+    require_no_active_coverage: bool = False,
     require_parent_unpinned: bool = False,
     require_not_watchlisted: bool = False,
     tolerate_active_conflict: bool = False,
@@ -808,6 +809,7 @@ async def set_status_if_in(
         season_request_id,
         status,
         allowed_from,
+        require_no_active_coverage=require_no_active_coverage,
         require_parent_unpinned=require_parent_unpinned,
         require_not_watchlisted=require_not_watchlisted,
     )
@@ -912,6 +914,7 @@ async def mark_completed_if_in(
     media_request_id: int,
     season_number: int,
     allowed_from: frozenset[str],
+    require_no_active_coverage: bool = False,
 ) -> bool:
     """CAS counterpart of :func:`mark_completed`: move the season to
     ``completed`` only if its CURRENT persisted status is still in
@@ -926,13 +929,20 @@ async def mark_completed_if_in(
     shortcut (``auto_grab_service._attempt_episode_fallback``) uses this so a
     concurrent cancel/correction landing between its due-scope snapshot and
     this write can never be resurrected as ``completed`` (issue #229).
+
+    ``require_no_active_coverage`` lets the fallback fold its ride-along ownership
+    check into this same CAS (issue #462), avoiding a completion that races an
+    active coverage claim.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     changed = await season_repo.set_status_if_in(
-        row.id, RequestStatus.completed.value, allowed_from
+        row.id,
+        RequestStatus.completed.value,
+        allowed_from,
+        require_no_active_coverage=require_no_active_coverage,
     )
     if changed:
         await _recompute_parent(session, media_request_id, stamp_completion=True)
@@ -1029,7 +1039,11 @@ async def reset_for_research(
 
 
 async def mark_no_acceptable_release(
-    session: AsyncSession, *, media_request_id: int, season_number: int
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    require_no_active_coverage: bool = False,
 ) -> bool:
     """Persist ``no_acceptable_release`` on one season when a grab finds nothing.
 
@@ -1045,6 +1059,11 @@ async def mark_no_acceptable_release(
     ``allowed_from`` -- see that constant's comment for exactly which statuses
     (every TERMINAL one, plus ``downloading`` / ``import_blocked``) a parking
     transition must never stomp.
+
+    ``require_no_active_coverage`` folds the ride-along physical-coverage guard into
+    the status CAS. The database evaluates the correlated claim predicate at write
+    time, so a claim committed after a caller's read guard cannot false-park its
+    covered season (issue #462).
 
     FLUSH-ONLY (module convention): the caller commits.
 
@@ -1064,4 +1083,5 @@ async def mark_no_acceptable_release(
         season_request_id=row.id,
         status=RequestStatus.no_acceptable_release.value,
         allowed_from=_PARKABLE_SEASON_STATUS_VALUES,
+        require_no_active_coverage=require_no_active_coverage,
     )

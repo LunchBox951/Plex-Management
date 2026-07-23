@@ -631,6 +631,7 @@ async def _attempt_episode_fallback(
                 media_request_id=scope.request_id,
                 season_number=season,
                 allowed_from=DUE_SEARCH_STATUSES,
+                require_no_active_coverage=True,
             )
             await session.commit()
             if completed:
@@ -856,7 +857,10 @@ async def _park(
         if scope.season_request_id is None:  # pragma: no cover - a tv scope always has one
             return False
         parked = await season_request_service.mark_no_acceptable_release(
-            session, media_request_id=scope.request_id, season_number=scope.season
+            session,
+            media_request_id=scope.request_id,
+            season_number=scope.season,
+            require_no_active_coverage=True,
         )
         if not parked:
             await session.rollback()

@@ -19,7 +19,14 @@ from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.tmdb import TmdbApiError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    Download,
+    DownloadCoverageClaim,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.metadata import EpisodeInfo
 from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
@@ -324,6 +331,82 @@ async def test_fallback_does_not_complete_when_coverage_claim_is_active(
     )
 
     result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.no_acceptable == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
+
+
+async def test_fallback_does_not_complete_when_coverage_claim_commits_after_lookup(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim committed after fallback lookup must atomically prevent completion."""
+    _request_id, season_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=2014, status=RequestStatus.searching
+    )
+    await _seed_imported_episode(sessionmaker_, season_id, 1)
+    await _seed_imported_episode(sessionmaker_, season_id, 2)
+    async with sessionmaker_() as session:
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.upsert_target(
+            season_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+        )
+        await session.commit()
+
+    calls = {"n": 0}
+
+    async def _find_active(
+        _self: object, _media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        return None
+
+    async def _find_coverage_owner(
+        _self: object, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            async with sessionmaker_() as competitor:
+                pack = Download(
+                    torrent_hash="ridealong-race-fallback",
+                    status="downloading",
+                    media_request_id=media_request_id,
+                    tmdb_id=2014,
+                    season=2,
+                )
+                competitor.add(pack)
+                await competitor.flush()
+                competitor.add(
+                    DownloadCoverageClaim(
+                        download_id=pack.id,
+                        media_request_id=media_request_id,
+                        season_number=1,
+                        status="active",
+                    )
+                )
+                await competitor.commit()
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository, "find_active_for_request", _find_active
+    )
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_coverage_owner",
+        _find_coverage_owner,
+    )
+    prowlarr = _PerTmdbProwlarr({2014: []})
+    metadata = FakeTmdb(
+        season_episodes={
+            (2014, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+            ]
+        }
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent(), metadata=metadata)
 
     assert result.no_acceptable == 0
     async with sessionmaker_() as session:

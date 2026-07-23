@@ -349,7 +349,10 @@ async def grab_endpoint(
                 # per season, and let the parent MediaRequest.status stay a computed
                 # rollup (never a direct write _recompute_parent would clobber).
                 parked = await season_request_service.mark_no_acceptable_release(
-                    session, media_request_id=request.id, season_number=body.season
+                    session,
+                    media_request_id=request.id,
+                    season_number=body.season,
+                    require_no_active_coverage=True,
                 )
             else:
                 parked = await request_service.mark_no_acceptable_release(session, request.id)

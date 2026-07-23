@@ -1079,11 +1079,84 @@ async def test_grab_no_acceptable_release_keeps_ride_along_coverage_claim_status
     assert season.status == RequestStatus.pending
 
 
+async def test_grab_no_acceptable_release_keeps_coverage_claim_committed_after_lookup(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim committed after manual lookup must atomically prevent parking."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    override_adapters(
+        app,
+        tmdb=FakeTmdb(
+            shows={900: TvMetadata(tmdb_id=900, title="Some Show", year=2020, season_count=2)}
+        ),
+        prowlarr=FakeProwlarr(prerelease_only_candidates()),
+        qbt=FakeQbittorrent(),
+    )
+    created = await client.post(
+        "/api/v1/requests",
+        json={"tmdb_id": 900, "media_type": "tv", "seasons": [2]},
+        headers=_HEADERS,
+    )
+    assert created.status_code == 201
+    request_id = int(created.json()["id"])
+
+    calls = {"n": 0}
+
+    async def _find_coverage_owner(
+        repo: SqlDownloadRepository, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            async with sessionmaker_() as competitor:
+                pack = Download(
+                    torrent_hash="ridealong-race-manual",
+                    status="downloading",
+                    media_request_id=media_request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+                competitor.add(pack)
+                await competitor.flush()
+                competitor.add(
+                    DownloadCoverageClaim(
+                        download_id=pack.id,
+                        media_request_id=media_request_id,
+                        season_number=2,
+                        status="active",
+                    )
+                )
+                await competitor.commit()
+        return None
+
+    monkeypatch.setattr(SqlDownloadRepository, "find_active_coverage_owner", _find_coverage_owner)
+
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id, "season": 2}, headers=_HEADERS
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_acceptable_release"
+    assert calls["n"] == 1
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 2,
+                )
+            )
+        ).scalar_one()
+    assert season.status == RequestStatus.pending
+
+
 async def test_grab_terminal_request_returns_409_and_adds_nothing(
     app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
-    """Grabbing a stale TERMINAL request id is an honest 409 request_not_active and
-    nothing is handed to the client (no untracked torrent left behind)."""
+    """A stale terminal request is rejected without adding a torrent."""
     await seed(initialized=True, app_api_key=_API_KEY)
     request_id = await _create_request(app, client)
 
