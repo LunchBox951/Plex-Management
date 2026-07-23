@@ -26,7 +26,7 @@ from plex_manager.models import (
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord, QueueRecord
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -771,18 +771,32 @@ class SqlDownloadRepository:
             .values(status=_RELEASED_CLAIM_STATUS, released_at=datetime.now(UTC))
         )
 
-    async def release_resolved_target_coverage_claims(self, download_id: int) -> None:
+    async def release_resolved_target_coverage_claims(
+        self, download_id: int, *, target_seasons: Iterable[int]
+    ) -> None:
         """Release the coverage claim of every TARGET season this download has fully
         resolved, while a non-terminal sibling keeps the physical row live (#456).
 
-        A TARGET season is one this download persists a :class:`DownloadScope` for; a
-        ride-along season carries no scope. This releases a claim only for a season
-        that (a) has at least one scope on this download and (b) has NO scope still in
-        an active status (``active``/``import_blocked``) -- i.e. the season is settled
+        ``target_seasons`` is the set of seasons the CURRENT import actually targets
+        (its non-``imported`` scopes for the owning request); a claim is released only
+        for a season in that set. A TARGET season additionally (a) has at least one
+        scope on this download and (b) has NO scope still in an active status
+        (``active``/``import_blocked``) -- i.e. the season is settled
         (``imported``/``failed``/``cancelled``/``no_acceptable_release``). It never
-        touches a ride-along claim (no scope for that season) or a season with an
-        unresolved sibling scope, so those stay guarded until the whole download
-        terminates and :meth:`release_coverage_claims` frees them.
+        touches a ride-along claim or a season with an unresolved sibling scope, so
+        those stay guarded until the whole download terminates and
+        :meth:`release_coverage_claims` frees them.
+
+        Restricting to ``target_seasons`` is load-bearing for issue #461: a terminal
+        row reused for a fresh pack RETAINS its prior life's ``imported`` scopes (a
+        deliberate, tested invariant -- correction verbs resolve the placing torrent
+        through them). If such a stale season is only a RIDE-ALONG of the current pack,
+        it carries a scope with no active status yet was never a target of this grab;
+        keying "is a target" on scope presence alone would falsely mark it resolved and
+        release its still-active coverage claim while the non-terminal torrent still
+        physically covers it -- reopening the exact duplicate-grab window #456 closed.
+        The caller passes only the seasons THIS import targets (the stale scope's
+        ``imported`` status excludes it), so the ride-along is never eligible.
 
         The motivating case is a partially imported multi-season pack: S1 imports
         (scope ``imported``) while S2 stays ``import_blocked`` and the physical row
@@ -793,6 +807,9 @@ class SqlDownloadRepository:
         partial-pack behaviour. Idempotent -- a season already released is not
         re-matched by the ``active`` predicate.
         """
+        target_season_set = set(target_seasons)
+        if not target_season_set:
+            return
         claimed_seasons = set(
             (
                 await self._session.execute(
@@ -827,7 +844,9 @@ class SqlDownloadRepository:
         resolved = {
             season
             for season in claimed_seasons
-            if season in seasons_with_scope and season not in seasons_with_active_scope
+            if season in target_season_set
+            and season in seasons_with_scope
+            and season not in seasons_with_active_scope
         }
         if not resolved:
             return

@@ -1979,7 +1979,13 @@ async def _import_tv_targets_locked(
             # imported season's replacement/upgrade can be grabbed without waiting on
             # the blocked sibling -- the coverage-claim analogue of the scalar-guard
             # re-point above. Ride-along and still-blocked seasons keep their claims.
-            await download_repo.release_resolved_target_coverage_claims(download_id)
+            # Scope the release to THIS import's target seasons (#461): a reused
+            # terminal row retains its prior life's ``imported`` scopes, so a stale
+            # ride-along season must not be mistaken for a resolved target and have its
+            # still-active coverage claim freed while the torrent still covers it.
+            await download_repo.release_resolved_target_coverage_claims(
+                download_id, target_seasons=target_seasons
+            )
         finalized = await download_repo.update_status_if_in(
             download_id,
             DownloadState.ImportBlocked.value if failures else DownloadState.Imported.value,
