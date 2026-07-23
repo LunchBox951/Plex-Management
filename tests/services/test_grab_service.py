@@ -1283,6 +1283,137 @@ async def test_grab_retries_same_hash_attach_after_coverage_claim_collision(
     assert season.status == RequestStatus.downloading
 
 
+async def test_grab_does_not_reactivate_claims_after_terminal_same_hash_collision(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A collision loser must not reactivate scopes or claims when the row
+    terminalizes after its refresh but before its retry writes."""
+    sm, engine = await _file_backed_sessionmaker(
+        tmp_path, "attach_collision_terminal_during_check.db"
+    )
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "d" * 40
+        pack = _scored_tv(
+            pack_hash, "Some.Show.S01-S03.COMPLETE.1080p.WEB-DL.x264-GROUP"
+        ).model_copy(update={"covered_seasons": (1, 2, 3), "target_seasons": (1,)})
+        async with sm() as session:
+            initial = await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=pack,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+        real_ensure_claim = grab_service.SqlDownloadRepository.ensure_coverage_claim
+        collision_attempts = 0
+
+        async def collide_once(
+            self: grab_service.SqlDownloadRepository,
+            download_id: int,
+            *,
+            media_request_id: int,
+            season: int,
+        ) -> None:
+            nonlocal collision_attempts
+            if season == 2 and collision_attempts == 0:
+                collision_attempts += 1
+                raise IntegrityError("coverage claim collision", {}, RuntimeError("collision"))
+            await real_ensure_claim(
+                self,
+                download_id,
+                media_request_id=media_request_id,
+                season=season,
+            )
+
+        real_list_scopes = grab_service.SqlDownloadRepository.list_scopes
+        terminalized = False
+
+        async def terminalize_during_scope_check(
+            self: grab_service.SqlDownloadRepository, download_id: int
+        ) -> list[object]:
+            nonlocal terminalized
+            if not terminalized:
+                terminalized = True
+                async with sm() as other_session:
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        initial.id,
+                        "failed",
+                        frozenset({"downloading"}),
+                    )
+                    assert moved
+                    season_row = (
+                        await other_session.execute(
+                            select(SeasonRequest).where(
+                                SeasonRequest.media_request_id == request_id,
+                                SeasonRequest.season_number == 2,
+                            )
+                        )
+                    ).scalar_one()
+                    season_row.status = RequestStatus.pending
+                    await other_session.commit()
+            return await real_list_scopes(self, download_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "ensure_coverage_claim", collide_once
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "list_scopes", terminalize_during_scope_check
+        )
+        attach = pack.model_copy(update={"target_seasons": (2,)})
+        async with sm() as session:
+            record = await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=attach,
+                request_id=request_id,
+                tmdb_id=900,
+                season=2,
+            )
+
+        assert collision_attempts == 1
+        assert terminalized
+        assert record.status == "downloading"
+        async with sm() as session:
+            row = await session.get(Download, initial.id)
+            assert row is not None
+            scope_seasons = {
+                scope.season_number
+                for scope in (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == initial.id)
+                    )
+                ).scalars()
+            }
+            claims = {
+                claim.season_number
+                for claim in (
+                    await session.execute(
+                        select(DownloadCoverageClaim).where(
+                            DownloadCoverageClaim.download_id == initial.id
+                        )
+                    )
+                ).scalars()
+            }
+            season_row = (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 2,
+                    )
+                )
+            ).scalar_one()
+        assert row.status == "downloading"
+        assert scope_seasons == {2}
+        assert claims == {1, 2, 3}
+        assert season_row.status == RequestStatus.downloading
+    finally:
+        await engine.dispose()
+
+
 async def test_grab_reuses_a_terminal_same_hash_after_attach_collision(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,

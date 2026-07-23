@@ -637,6 +637,10 @@ async def _attach_target_scopes_to_existing_download(
     if conflict is not None:
         raise AlreadyDownloadingError(request_id)
 
+    if not await download_repo.lock_if_active(existing.id):
+        await session.rollback()
+        return None
+
     try:
         for target_season in target_seasons:
             target_episodes = _target_episodes(
