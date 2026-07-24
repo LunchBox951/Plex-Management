@@ -911,29 +911,6 @@ class SqlDownloadRepository:
         row = (await self._session.execute(stmt)).scalars().first()
         return await self._to_record_with_scopes(row) if row is not None else None
 
-    async def find_active_coverage_owners(
-        self, keys: Sequence[tuple[int, int | None]]
-    ) -> frozenset[tuple[int, int | None]]:
-        """Batch active physical-coverage-claim membership over many
-        ``(media_request_id, season)`` keys in one query (issue #465)."""
-        if not keys:
-            return frozenset()
-        key_set = frozenset(keys)
-        request_ids = list({media_request_id for media_request_id, _season in key_set})
-        stmt = select(
-            DownloadCoverageClaim.media_request_id,
-            DownloadCoverageClaim.season_number,
-        ).where(
-            DownloadCoverageClaim.media_request_id.in_(request_ids),
-            DownloadCoverageClaim.season_number.is_not(None),
-            DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
-        )
-        return frozenset(
-            key
-            for media_request_id, season_number in (await self._session.execute(stmt)).all()
-            if (key := (media_request_id, season_number)) in key_set
-        )
-
     async def find_active_coverage_title(
         self, tmdb_id: int, season: int | None
     ) -> DownloadRecord | None:
