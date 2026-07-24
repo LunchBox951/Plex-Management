@@ -333,7 +333,7 @@ async def grab_endpoint(
         # active check is season-SCOPED for a TV grab (body.season): another season
         # still downloading must not suppress THIS season's honest dead-end, and a
         # movie (season=None) keeps its whole-request guard unchanged.
-        active = await SqlDownloadRepository(session).find_active_for_request(
+        active = await SqlDownloadRepository(session).find_active_for_request_or_coverage(
             request.id, season=body.season
         )
         if active is None:
@@ -349,7 +349,10 @@ async def grab_endpoint(
                 # per season, and let the parent MediaRequest.status stay a computed
                 # rollup (never a direct write _recompute_parent would clobber).
                 parked = await season_request_service.mark_no_acceptable_release(
-                    session, media_request_id=request.id, season_number=body.season
+                    session,
+                    media_request_id=request.id,
+                    season_number=body.season,
+                    require_no_active_coverage=True,
                 )
             else:
                 parked = await request_service.mark_no_acceptable_release(session, request.id)

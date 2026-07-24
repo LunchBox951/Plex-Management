@@ -26,6 +26,7 @@ from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest, ScoredRelease
 from plex_manager.models import (
     Download,
+    DownloadCoverageClaim,
     DownloadScope,
     MediaRequest,
     MediaType,
@@ -407,6 +408,42 @@ async def test_active_download_scope_is_skipped_without_searching(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status == RequestStatus.searching  # untouched
+
+
+async def test_ride_along_coverage_claim_is_skipped_without_searching(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=1399, season_number=2)
+    async with sessionmaker_() as session:
+        pack = Download(
+            torrent_hash="ridealong01",
+            status="downloading",
+            media_request_id=request_id,
+            tmdb_id=1399,
+            season=1,
+        )
+        session.add(pack)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=pack.id,
+                media_request_id=request_id,
+                season_number=2,
+                status="active",
+            )
+        )
+        await session.commit()
+    prowlarr = FakeProwlarr(_tv_season_pack())
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert result.skipped_active == 1
+    assert result.searched == 0
+    assert prowlarr.searched == []
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.pending
 
 
 # --------------------------------------------------------------------------- #
@@ -1206,6 +1243,114 @@ async def test_active_download_before_park_skips_the_park(
         assert row.status == RequestStatus.pending
         assert row.search_attempts == 0
         assert row.next_search_at is None
+
+
+async def test_ride_along_coverage_claim_before_park_skips_the_park(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=1399, season_number=2)
+    prowlarr = FakeProwlarr(good_and_cam_candidates())
+
+    calls = {"n": 0}
+
+    async def _find_active(
+        _self: object, _media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        return None
+
+    async def _find_coverage_owner(
+        _self: object, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        if calls["n"] == 2:
+            return DownloadRecord(
+                id=1,
+                torrent_hash="ridealong02",
+                status="downloading",
+                media_request_id=media_request_id,
+            )
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository, "find_active_for_request", _find_active
+    )
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_coverage_owner",
+        _find_coverage_owner,
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert result.searched == 1
+    assert result.no_acceptable == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.pending
+        assert season.search_attempts == 0
+        assert season.next_search_at is None
+
+
+async def test_park_cas_excludes_coverage_claim_committed_after_the_lookup(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A coverage-only claim committed after the read guard must still block parking."""
+    _request_id, season_id = await _seed_tv_season(sessionmaker_, tmdb_id=1400, season_number=2)
+    prowlarr = FakeProwlarr(prerelease_only_candidates())
+
+    calls = {"n": 0}
+
+    async def _find_active(
+        _self: object, _media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        return None
+
+    async def _find_coverage_owner(
+        _self: object, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            async with sessionmaker_() as competitor:
+                pack = Download(
+                    torrent_hash="ridealong-race-auto",
+                    status="downloading",
+                    media_request_id=media_request_id,
+                    tmdb_id=1400,
+                    season=1,
+                )
+                competitor.add(pack)
+                await competitor.flush()
+                competitor.add(
+                    DownloadCoverageClaim(
+                        download_id=pack.id,
+                        media_request_id=media_request_id,
+                        season_number=2,
+                        status="active",
+                    )
+                )
+                await competitor.commit()
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository, "find_active_for_request", _find_active
+    )
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_coverage_owner",
+        _find_coverage_owner,
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent())
+
+    assert calls["n"] == 2
+    assert result.no_acceptable == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.pending
+        assert season.search_attempts == 0
+        assert season.next_search_at is None
 
 
 async def test_park_cas_loses_to_a_concurrent_downloading_write_skips_backoff_too(

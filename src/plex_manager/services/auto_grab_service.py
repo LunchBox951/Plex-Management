@@ -617,7 +617,10 @@ async def _attempt_episode_fallback(
         # fall-through: there is nothing to complete.
         if (
             target
-            and await download_repo.find_active_for_request(scope.request_id, season=season) is None
+            and await download_repo.find_active_for_request_or_coverage(
+                scope.request_id, season=season
+            )
+            is None
         ):
             # CAS-guarded (issue #229): a concurrent cancel/correction landing
             # between ``_collect_due_scopes``' snapshot and this branch must
@@ -628,6 +631,7 @@ async def _attempt_episode_fallback(
                 media_request_id=scope.request_id,
                 season_number=season,
                 allowed_from=DUE_SEARCH_STATUSES,
+                require_no_active_coverage=True,
             )
             await session.commit()
             if completed:
@@ -815,8 +819,8 @@ async def _park(
     honest-but-now-wrong ``no_acceptable_release`` dead-end -- a momentary lie the
     reconciler would have to undo. The manual endpoint guards this exact race the
     same way, so mirror it: re-check ``find_active_for_request`` immediately before
-    the write and, if a download appeared, skip the park entirely (no status write,
-    no backoff bump) and report it un-parked.
+    the write and, if a download or physical-coverage claim appeared, skip the park
+    entirely (no status write, no backoff bump) and report it un-parked.
 
     Issue #72 -- the CAS itself, not just the pre-check above: that re-check only
     closes the gap up to THIS instant -- a concurrent writer can still win the race
@@ -836,7 +840,9 @@ async def _park(
     from a ~10-minute-old base and make it due again on the very next tick instead of
     honouring the first rung.
     """
-    active = await download_repo.find_active_for_request(scope.request_id, season=scope.season)
+    active = await download_repo.find_active_for_request_or_coverage(
+        scope.request_id, season=scope.season
+    )
     if active is not None:
         _logger.info(
             "auto-grab: active download appeared before park; leaving scope as-is",
@@ -851,7 +857,10 @@ async def _park(
         if scope.season_request_id is None:  # pragma: no cover - a tv scope always has one
             return False
         parked = await season_request_service.mark_no_acceptable_release(
-            session, media_request_id=scope.request_id, season_number=scope.season
+            session,
+            media_request_id=scope.request_id,
+            season_number=scope.season,
+            require_no_active_coverage=True,
         )
         if not parked:
             await session.rollback()
@@ -1035,7 +1044,9 @@ async def run_grab_cycle(
             # instead of a scope whose grab keeps failing (round-3 #2).
             continue
 
-        active = await download_repo.find_active_for_request(scope.request_id, season=scope.season)
+        active = await download_repo.find_active_for_request_or_coverage(
+            scope.request_id, season=scope.season
+        )
         if active is not None:
             skipped_active += 1
             # Resolved elsewhere (a manual/other grab is downloading it): drop any

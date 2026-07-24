@@ -10,12 +10,14 @@ itself carries no ``tmdb_id`` column.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from sqlalchemy import ColumnElement, CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import (
+    Download,
+    DownloadCoverageClaim,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -30,6 +32,11 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlSeasonRequestRepository"]
+
+
+_TERMINAL_DOWNLOAD_STATUSES: Final[frozenset[str]] = frozenset(
+    {"imported", "failed", "no_acceptable_release"}
+)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -448,6 +455,7 @@ class SqlSeasonRequestRepository:
         status: str,
         allowed_from: frozenset[str],
         *,
+        require_no_active_coverage: bool = False,
         require_parent_unpinned: bool = False,
         require_not_watchlisted: bool = False,
     ) -> bool:
@@ -480,6 +488,19 @@ class SqlSeasonRequestRepository:
             SeasonRequest.id == season_request_id,
             SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
         ]
+        if require_no_active_coverage:
+            active_coverage_claim = (
+                select(DownloadCoverageClaim.id)
+                .join(Download, Download.id == DownloadCoverageClaim.download_id)
+                .where(
+                    DownloadCoverageClaim.media_request_id == SeasonRequest.media_request_id,
+                    DownloadCoverageClaim.season_number == SeasonRequest.season_number,
+                    DownloadCoverageClaim.status == "active",
+                    Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                )
+                .exists()
+            )
+            predicates.append(~active_coverage_claim)
         if require_parent_unpinned:
             parent_pinned = (
                 select(MediaRequest.id)

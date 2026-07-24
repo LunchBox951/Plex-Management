@@ -12,14 +12,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.tmdb import TmdbApiError
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.release import CandidateRelease, IndexerSearchRequest
-from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import (
+    Download,
+    DownloadCoverageClaim,
+    MediaRequest,
+    MediaType,
+    RequestStatus,
+    SeasonRequest,
+)
 from plex_manager.ports.metadata import EpisodeInfo
+from plex_manager.ports.repositories import DownloadRecord
 from plex_manager.repositories.season_episode_states import SqlSeasonEpisodeStateRepository
 from plex_manager.services import auto_grab_service
 from tests.web.fakes import FakeQbittorrent, FakeTmdb, candidate
@@ -272,6 +281,138 @@ async def test_fallback_completes_season_when_retraction_empties_the_missing_set
         rows = await repo.list_for_season(season_id)
     # The retracted episode's stale pending row was retired by the refresh.
     assert {r.episode_number: r.status for r in rows} == {1: "imported", 2: "imported"}
+
+
+async def test_fallback_does_not_complete_when_coverage_claim_is_active(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ride-along claim must keep a fully imported target from completing early."""
+    request_id, season_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=2013, status=RequestStatus.searching
+    )
+    await _seed_imported_episode(sessionmaker_, season_id, 1)
+    await _seed_imported_episode(sessionmaker_, season_id, 2)
+    async with sessionmaker_() as session:
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.upsert_target(
+            season_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+        )
+        await session.commit()
+
+    coverage_checks = {"n": 0}
+
+    async def _find_coverage_owner(
+        _self: object, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        coverage_checks["n"] += 1
+        if coverage_checks["n"] >= 2 and media_request_id == request_id and season == 1:
+            return DownloadRecord(
+                id=1,
+                torrent_hash="ridealong04",
+                status="downloading",
+                media_request_id=media_request_id,
+            )
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_coverage_owner",
+        _find_coverage_owner,
+    )
+    qbt = FakeQbittorrent()
+    prowlarr = _PerTmdbProwlarr({2013: []})
+    metadata = FakeTmdb(
+        season_episodes={
+            (2013, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+            ]
+        }
+    )
+
+    result = await _run(sessionmaker_, prowlarr, qbt, metadata=metadata)
+
+    assert result.no_acceptable == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
+
+
+async def test_fallback_does_not_complete_when_coverage_claim_commits_after_lookup(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claim committed after fallback lookup must atomically prevent completion."""
+    _request_id, season_id = await _seed_tv_season(
+        sessionmaker_, tmdb_id=2014, status=RequestStatus.searching
+    )
+    await _seed_imported_episode(sessionmaker_, season_id, 1)
+    await _seed_imported_episode(sessionmaker_, season_id, 2)
+    async with sessionmaker_() as session:
+        repo = SqlSeasonEpisodeStateRepository(session)
+        await repo.upsert_target(
+            season_id, {1: date(2026, 1, 1), 2: date(2026, 1, 8), 3: date(2026, 1, 15)}
+        )
+        await session.commit()
+
+    calls = {"n": 0}
+
+    async def _find_active(
+        _self: object, _media_request_id: int, *, season: int | None = None
+    ) -> DownloadRecord | None:
+        return None
+
+    async def _find_coverage_owner(
+        _self: object, media_request_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            async with sessionmaker_() as competitor:
+                pack = Download(
+                    torrent_hash="ridealong-race-fallback",
+                    status="downloading",
+                    media_request_id=media_request_id,
+                    tmdb_id=2014,
+                    season=2,
+                )
+                competitor.add(pack)
+                await competitor.flush()
+                competitor.add(
+                    DownloadCoverageClaim(
+                        download_id=pack.id,
+                        media_request_id=media_request_id,
+                        season_number=1,
+                        status="active",
+                    )
+                )
+                await competitor.commit()
+        return None
+
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository, "find_active_for_request", _find_active
+    )
+    monkeypatch.setattr(
+        auto_grab_service.SqlDownloadRepository,
+        "find_active_coverage_owner",
+        _find_coverage_owner,
+    )
+    prowlarr = _PerTmdbProwlarr({2014: []})
+    metadata = FakeTmdb(
+        season_episodes={
+            (2014, 1): [
+                EpisodeInfo(episode_number=1, air_date=date(2026, 1, 1)),
+                EpisodeInfo(episode_number=2, air_date=date(2026, 1, 8)),
+            ]
+        }
+    )
+
+    result = await _run(sessionmaker_, prowlarr, FakeQbittorrent(), metadata=metadata)
+
+    assert result.no_acceptable == 0
+    async with sessionmaker_() as session:
+        season = await session.get(SeasonRequest, season_id)
+        assert season is not None
+        assert season.status == RequestStatus.searching
 
 
 async def test_pack_first_wins_metadata_never_consulted(sessionmaker_: SessionMaker) -> None:
