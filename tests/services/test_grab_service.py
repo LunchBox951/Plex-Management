@@ -877,7 +877,9 @@ async def test_pack_ride_along_claim_race_cleans_up_the_losing_pack_torrent(
         )
         pack_qbt = _BlockDuringAddQbt()
         dedicated_qbt = _BlockDuringAddQbt()
-        real_active_conflict = grab_service._active_conflict_for_targets
+        real_active_conflict = (
+            grab_service._active_conflict_for_targets  # pyright: ignore[reportPrivateUsage]
+        )
         pack_guard_checks = 0
         pack_post_add_guard_passed = asyncio.Event()
         release_pack_after_guard = asyncio.Event()
@@ -1030,7 +1032,9 @@ async def test_pack_ride_along_same_hash_race_attaches_the_dedicated_scope(
                 season=season,
             )
 
-        real_attached_target_scopes = grab_service._attached_target_scopes
+        real_attached_target_scopes = (
+            grab_service._attached_target_scopes  # pyright: ignore[reportPrivateUsage]
+        )
         attached_target_scope_checks = 0
 
         async def count_attached_target_scopes(*args: Any, **kwargs: Any) -> bool:
