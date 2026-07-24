@@ -992,7 +992,9 @@ async def test_partial_import_frees_resolved_season_claim_keeps_blocked_and_ride
         await session.commit()
 
     async with sessionmaker_() as session:
-        await SqlDownloadRepository(session).release_resolved_target_coverage_claims(download_id)
+        await SqlDownloadRepository(session).release_resolved_target_coverage_claims(
+            download_id, target_seasons=(1, 2)
+        )
         await session.commit()
 
     async with sessionmaker_() as session:
@@ -1044,6 +1046,118 @@ async def test_partial_import_frees_resolved_season_claim_keeps_blocked_and_ride
                     tmdb_id=900,
                     season=blocked_season,
                 )
+
+
+async def test_partial_import_keeps_prior_life_ride_along_claim_active(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Issue #461: a terminal row reused for a new pack retains its prior life's
+    imported ``DownloadScope`` rows (a tested invariant --
+    ``test_terminal_reuse_preserves_imported_scope_history``). If that stale season is
+    only a RIDE-ALONG of the current pack (covered, not targeted), a partial import of
+    a real current target must NOT treat the stale scope as proof the ride-along was a
+    target of THIS grab and release its still-active coverage claim -- doing so would
+    reopen the pre-#456 duplicate-grab window while the non-terminal torrent still
+    physically covers that season.
+
+    Post-reuse partial-import state: the current pack targets S5+S6 (S5 imported, S6
+    ``import_blocked``, physical row non-terminal); S1 is a prior-life imported scope
+    that is only a ride-along now (active coverage claim, no current-grab target). Only
+    S5 -- an actual target of THIS import -- may have its claim released."""
+    request_id = await _make_tv_request(sessionmaker_)
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="e" * 40,
+            status="import_blocked",
+            media_request_id=request_id,
+            tmdb_id=900,
+            season=6,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        download_id = download.id
+        session.add_all(
+            [
+                # Prior-life imported scope retained across terminal-row reuse: S1 is a
+                # ride-along of the CURRENT pack, never one of its import targets.
+                DownloadScope(
+                    download_id=download_id,
+                    media_request_id=request_id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="imported",
+                ),
+                # Current pack targets: S5 imported this pass, S6 still blocked.
+                DownloadScope(
+                    download_id=download_id,
+                    media_request_id=request_id,
+                    season_number=5,
+                    scope_key="season:5|episodes:*",
+                    status="imported",
+                ),
+                DownloadScope(
+                    download_id=download_id,
+                    media_request_id=request_id,
+                    season_number=6,
+                    scope_key="season:6|episodes:*",
+                    status="import_blocked",
+                ),
+            ]
+        )
+        session.add_all(
+            DownloadCoverageClaim(
+                download_id=download_id,
+                media_request_id=request_id,
+                season_number=season,
+                status="active",
+            )
+            for season in (1, 5, 6)
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        # The import only ever targets S5+S6 this pass -- the stale S1 imported scope is
+        # excluded from import targets by its ``imported`` status -- so only those
+        # seasons are eligible for an early claim release.
+        await SqlDownloadRepository(session).release_resolved_target_coverage_claims(
+            download_id, target_seasons=(5, 6)
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        repo = SqlDownloadRepository(session)
+        claims = {
+            c.season_number: c.status
+            for c in (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.download_id == download_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+        # Only the resolved current target S5 is freed; the still-blocked target S6 and
+        # the prior-life ride-along S1 keep their claims until the torrent terminates.
+        assert claims == {1: "active", 5: "released", 6: "active"}
+        assert (await repo.find_active_coverage_owner(request_id, 1)) is not None
+        assert await repo.find_active_coverage_owner(request_id, 5) is None
+        assert (await repo.find_active_coverage_owner(request_id, 6)) is not None
+
+    # The ride-along S1's still-active claim keeps rejecting a dedicated S1 grab while
+    # the non-terminal torrent physically covers it (the window #456 closed).
+    async with sessionmaker_() as session:
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv("f" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
 
 
 async def test_grab_attaches_same_hash_active_for_a_different_season(
