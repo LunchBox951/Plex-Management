@@ -25,7 +25,7 @@ from plex_manager.models import (
     SeasonRequest,
 )
 from plex_manager.ports.download_client import AddResult
-from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import grab_service, queue_service
 from plex_manager.services.grab_service import (
@@ -1334,7 +1334,7 @@ async def test_grab_does_not_reactivate_claims_after_terminal_same_hash_collisio
 
         async def terminalize_during_scope_check(
             self: grab_service.SqlDownloadRepository, download_id: int
-        ) -> list[object]:
+        ) -> list[DownloadScopeRecord]:
             nonlocal terminalized
             if not terminalized:
                 terminalized = True
