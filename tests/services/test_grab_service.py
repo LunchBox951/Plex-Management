@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -842,6 +843,261 @@ async def test_pack_ride_along_season_claim_blocks_concurrent_dedicated_grab(
             await SqlDownloadRepository(session).ensure_coverage_claim(
                 second.id, media_request_id=request_id, season=2
             )
+
+
+class _BlockDuringAddQbt(FakeQbittorrent):
+    """Pause a grab after all pre-add guards but before registration starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered_add = asyncio.Event()
+        self.resume_add = asyncio.Event()
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        self.entered_add.set()
+        await asyncio.wait_for(self.resume_add.wait(), timeout=1)
+        return await super().add(magnet_or_url, save_path, category)
+
+
+async def test_pack_ride_along_claim_race_cleans_up_the_losing_pack_torrent(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #464: two real sessions pass their pre-add guards while both qBT adds
+    pause. The pack also clears its post-add guard before S2 commits; the dedicated
+    grab wins SQLite's one writer, so the resumed pack collides on its S2 coverage
+    claim, raises ``AlreadyDownloadingError``, and removes its created torrent."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_ride_along_race.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "8" * 40
+        dedicated_hash = "9" * 40
+        pack = _scored_tv(pack_hash, "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
+            update={"covered_seasons": (1, 2), "target_seasons": (1,)}
+        )
+        pack_qbt = _BlockDuringAddQbt()
+        dedicated_qbt = _BlockDuringAddQbt()
+        real_active_conflict = grab_service._active_conflict_for_targets
+        pack_guard_checks = 0
+        pack_post_add_guard_passed = asyncio.Event()
+        release_pack_after_guard = asyncio.Event()
+
+        async def block_pack_after_post_add_guard(
+            download_repo: SqlDownloadRepository,
+            *,
+            request_id: int | None,
+            target_seasons: tuple[int | None, ...],
+            torrent_hash: str,
+        ) -> DownloadRecord | None:
+            nonlocal pack_guard_checks
+            conflict = await real_active_conflict(
+                download_repo,
+                request_id=request_id,
+                target_seasons=target_seasons,
+                torrent_hash=torrent_hash,
+            )
+            if torrent_hash == pack_hash:
+                pack_guard_checks += 1
+                if pack_guard_checks == 2:
+                    assert conflict is None
+                    pack_post_add_guard_passed.set()
+                    await asyncio.wait_for(release_pack_after_guard.wait(), timeout=1)
+            return conflict
+
+        monkeypatch.setattr(
+            grab_service, "_active_conflict_for_targets", block_pack_after_post_add_guard
+        )
+
+        async def grab_pack() -> DownloadRecord:
+            async with sm() as session:
+                return await grab_service.grab(
+                    pack_qbt,
+                    session,
+                    scored=pack,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+
+        async def grab_dedicated() -> DownloadRecord:
+            async with sm() as session:
+                return await grab_service.grab(
+                    dedicated_qbt,
+                    session,
+                    scored=_scored_tv(dedicated_hash, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        pack_task = asyncio.create_task(grab_pack())
+        await asyncio.wait_for(pack_qbt.entered_add.wait(), timeout=1)
+        dedicated_task = asyncio.create_task(grab_dedicated())
+        await asyncio.wait_for(dedicated_qbt.entered_add.wait(), timeout=1)
+
+        # Both pre-add read guards already returned. Let the pack pass its post-add
+        # read guard too, then let the dedicated writer commit S2 before the pack
+        # resumes its real coverage-claim INSERT and trips the database backstop.
+        pack_qbt.resume_add.set()
+        await asyncio.wait_for(pack_post_add_guard_passed.wait(), timeout=1)
+        dedicated_qbt.resume_add.set()
+        await asyncio.wait_for(dedicated_task, timeout=1)
+        release_pack_after_guard.set()
+        with pytest.raises(AlreadyDownloadingError):
+            await asyncio.wait_for(pack_task, timeout=1)
+
+        assert pack_qbt.removed == [(pack_hash, True)]
+        async with sm() as session:
+            downloads = (await session.execute(select(Download))).scalars().all()
+            histories = (await session.execute(select(DownloadHistory))).scalars().all()
+            scopes = (await session.execute(select(DownloadScope))).scalars().all()
+            claims = (await session.execute(select(DownloadCoverageClaim))).scalars().all()
+        assert [(row.torrent_hash, row.season) for row in downloads] == [(dedicated_hash, 2)]
+        assert {scope.season_number for scope in scopes} == {2}
+        assert {(claim.download_id, claim.season_number) for claim in claims} == {
+            (downloads[0].id, 2)
+        }
+        assert [history.torrent_hash for history in histories] == [dedicated_hash]
+    finally:
+        await engine.dispose()
+
+
+async def test_pack_ride_along_same_hash_race_attaches_the_dedicated_scope(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #464: both sessions reach the stale same-hash row-create decision.
+
+    The pack and dedicated S2 grab pass their pre-add guards, then both stop before
+    inserting. The pack wins ``UNIQUE(torrent_hash)``; the dedicated session loses,
+    rolls back, and is forced through the attach collision verification/retry path so
+    S2 is durably attached instead of silently returned as an unscoped success.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_ride_along_same_hash_race.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        torrent_hash = "a" * 40
+        pack = _scored_tv(torrent_hash, "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
+            update={"covered_seasons": (1, 2), "target_seasons": (1,)}
+        )
+        pack_qbt = _BlockDuringAddQbt()
+        dedicated_qbt = _BlockDuringAddQbt()
+        real_create = grab_service.SqlDownloadRepository.create
+        pack_create_entered = asyncio.Event()
+        dedicated_create_entered = asyncio.Event()
+        allow_pack_create = asyncio.Event()
+        allow_dedicated_create = asyncio.Event()
+        create_attempts = 0
+        collision_loser_repositories: set[int] = set()
+
+        async def serialize_stale_same_hash_creates(
+            self: grab_service.SqlDownloadRepository, **kwargs: Any
+        ) -> DownloadRecord:
+            nonlocal create_attempts
+            if kwargs["torrent_hash"] == torrent_hash:
+                create_attempts += 1
+                if kwargs["season"] == 1:
+                    pack_create_entered.set()
+                    await asyncio.wait_for(allow_pack_create.wait(), timeout=1)
+                else:
+                    assert kwargs["season"] == 2
+                    dedicated_create_entered.set()
+                    await asyncio.wait_for(allow_dedicated_create.wait(), timeout=1)
+            try:
+                return await real_create(self, **kwargs)
+            except IntegrityError:
+                collision_loser_repositories.add(id(self))
+                raise
+
+        real_ensure_claim = grab_service.SqlDownloadRepository.ensure_coverage_claim
+        injected_attach_collision = False
+
+        async def force_loser_attach_rollback(
+            self: grab_service.SqlDownloadRepository,
+            download_id: int,
+            *,
+            media_request_id: int,
+            season: int,
+        ) -> None:
+            nonlocal injected_attach_collision
+            if id(self) in collision_loser_repositories and not injected_attach_collision:
+                injected_attach_collision = True
+                raise IntegrityError("coverage claim collision", {}, RuntimeError("collision"))
+            await real_ensure_claim(
+                self,
+                download_id,
+                media_request_id=media_request_id,
+                season=season,
+            )
+
+        real_attached_target_scopes = grab_service._attached_target_scopes
+        attached_target_scope_checks = 0
+
+        async def count_attached_target_scopes(*args: Any, **kwargs: Any) -> bool:
+            nonlocal attached_target_scope_checks
+            attached_target_scope_checks += 1
+            return await real_attached_target_scopes(*args, **kwargs)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "create", serialize_stale_same_hash_creates
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "ensure_coverage_claim", force_loser_attach_rollback
+        )
+        monkeypatch.setattr(grab_service, "_attached_target_scopes", count_attached_target_scopes)
+
+        async def grab_pack() -> DownloadRecord:
+            async with sm() as session:
+                return await grab_service.grab(
+                    pack_qbt,
+                    session,
+                    scored=pack,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+
+        async def grab_dedicated() -> DownloadRecord:
+            async with sm() as session:
+                return await grab_service.grab(
+                    dedicated_qbt,
+                    session,
+                    scored=_scored_tv(torrent_hash, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        pack_task = asyncio.create_task(grab_pack())
+        await asyncio.wait_for(pack_qbt.entered_add.wait(), timeout=1)
+        dedicated_task = asyncio.create_task(grab_dedicated())
+        await asyncio.wait_for(dedicated_qbt.entered_add.wait(), timeout=1)
+        pack_qbt.resume_add.set()
+        await asyncio.wait_for(pack_create_entered.wait(), timeout=1)
+        dedicated_qbt.resume_add.set()
+        await asyncio.wait_for(dedicated_create_entered.wait(), timeout=1)
+        allow_pack_create.set()
+        await asyncio.wait_for(pack_task, timeout=1)
+        allow_dedicated_create.set()
+        attached = await asyncio.wait_for(dedicated_task, timeout=1)
+
+        assert create_attempts == 2
+        assert injected_attach_collision
+        assert attached_target_scope_checks == 1
+        assert attached.torrent_hash == torrent_hash
+        assert dedicated_qbt.removed == []
+        async with sm() as session:
+            downloads = (await session.execute(select(Download))).scalars().all()
+            scopes = (await session.execute(select(DownloadScope))).scalars().all()
+            claims = (await session.execute(select(DownloadCoverageClaim))).scalars().all()
+        assert [(row.torrent_hash, row.season) for row in downloads] == [(torrent_hash, 1)]
+        assert {scope.season_number for scope in scopes} == {1, 2}
+        assert {(claim.download_id, claim.season_number) for claim in claims} == {
+            (downloads[0].id, 1),
+            (downloads[0].id, 2),
+        }
+    finally:
+        await engine.dispose()
 
 
 async def test_ride_along_claim_released_on_failure_frees_the_season(
