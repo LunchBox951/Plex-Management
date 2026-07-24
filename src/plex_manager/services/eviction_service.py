@@ -73,6 +73,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
 from plex_manager.ports.library import WatchStateQuery
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -449,13 +450,22 @@ async def _season_candidates(
     active_keys = await download_repo.find_active_for_requests(
         [(row.media_request_id, row.season_number) for row in rows]
     )
+    # A pack's ride-along season carries no DownloadScope and matches no scalar
+    # download row, so ``find_active_for_requests`` above is blind to it (issue
+    # #465). Claims are owned by the grabbing request, but an older settled row
+    # and newer active sibling can coexist for one title; probe title/season keys
+    # once for the whole pool so either sibling's claim protects the available row.
+    coverage_titles = await download_repo.find_active_coverage_titles(
+        [(row.tmdb_id, row.season_number) for row in rows]
+    )
     size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
     for row, watch in zip(rows, watch_states, strict=True):
         parent = parents.get(row.media_request_id)
         if parent is None:  # pragma: no cover - the FK guarantees the parent exists
             continue
-        in_flight = (row.media_request_id, row.season_number) in active_keys
+        key = (row.media_request_id, row.season_number)
+        in_flight = key in active_keys or (row.tmdb_id, row.season_number) in coverage_titles
         prospective = EvictionCandidate(
             request_id=row.id,
             media_type="tv",
@@ -522,8 +532,10 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
     Movies: the request itself must still be ``available``, unpinned, and have
     no active download. TV: the pin lives on the PARENT (fetched separately),
     and the SEASON row itself must still be ``available`` with no active
-    download for ``(request, season)``. Either side missing entirely (deleted
-    out from under the sweep) is honestly ``False`` — nothing left to evict.
+    download for ``(request, season)`` AND no active ride-along coverage claim
+    over it (issue #465 -- a scopeless pack coverage ``find_active_for_request``
+    cannot see). Either side missing entirely (deleted out from under the sweep)
+    is honestly ``False`` — nothing left to evict.
     """
     download_repo = SqlDownloadRepository(session)
     if isinstance(pending, _SeasonPending):
@@ -536,11 +548,18 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
                 pending.media_request_id, season=pending.season_number
             )
         ) is not None
+        # A ride-along coverage claim (issue #465) can land AFTER assembly (a pack
+        # starting mid-sweep). It has no scope, so ``find_active_for_request``
+        # cannot see it -- the non-terminal-gated coverage owner does.
+        covered = (
+            await download_repo.find_active_coverage_title(pending.tmdb_id, pending.season_number)
+        ) is not None
         return (
             not parent.keep_forever
             and not await watchlist_service.is_watchlisted(session, pending.tmdb_id, "tv")
             and season.status == RequestStatus.available.value
             and not in_flight
+            and not covered
         )
 
     request = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
@@ -1442,6 +1461,10 @@ async def _evict_one(
     another live (available/in-flight) row --  breadcrumb kept; NOTHING deleted --
     the shared-breadcrumb twins shape (#155)   invariant #7; the sibling is decided
                                               fresh by its own later sweep pass
+    a pack's active ride-along coverage claim   restored ``available`` (+ TV rollup);
+    over this season lands AFTER the pre-claim   NOTHING deleted (#465) -- re-checked
+    read (during the watch-state re-read) --    post-claim/pre-delete, same shape as
+    the scopeless-ride-along shape (#465)        the twins guard; the pack keeps its file
     rewatch (or watch-state error) lands       skipped BEFORE the claim (invariant
     between candidate assembly and the claim   #8, #209); row stays ``available``,
     (#209)                                     file untouched, re-decided next sweep
@@ -1458,7 +1481,7 @@ async def _evict_one(
         )
         return None
 
-    season_note = f" season {candidate.season}" if candidate.season is not None else ""
+    season_note = f" season {safe_int(candidate.season)}" if candidate.season is not None else ""
 
     # Cheap EARLY filter (see _still_evictable's docstring): closes the obvious
     # TOCTOU cases -- a keep_forever pin, an active download racing in, or an
@@ -1622,6 +1645,48 @@ async def _evict_one(
             season_note,
             library_path,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        )
+        return None
+
+    # Ride-along coverage-claim guard (#465), the AUTHORITATIVE counterpart of the
+    # cheap :func:`_still_evictable` read above -- structurally the same shape as
+    # the twins guard just before it. The claim CAS compares only THIS season
+    # row's own status/pin/watchlist; it can no more see a pack's active
+    # ``download_coverage_claims`` row (a scopeless ride-along, invisible to
+    # ``find_active_for_request``) than it can see a sibling's breadcrumb. A pack
+    # can commit that claim AFTER _still_evictable read clean -- most of all during
+    # the awaited Plex watch-state re-read just above -- so a pre-claim read alone
+    # is a TOCTOU hole. Re-read it here, AFTER the claim committed ``evicted`` and
+    # BEFORE the delete, off the same committed snapshot: a claim now present means
+    # a live pack is re-fetching this season, so release the claim (restore to
+    # 'available', the identical no-op-regrab path a refused delete takes) rather
+    # than delete a file the pack is mid-transfer. Movies never hold a claim, so
+    # this is a season-only check. Not atomically foldable into the status CAS (the
+    # claim lives in a different table on a different key), and even a folded
+    # predicate could not cover a claim landing between the CAS and the unavoidable
+    # post-commit filesystem delete -- so this mirrors the module's established
+    # post-claim/pre-delete recheck-and-restore pattern (twins #155, rewatch #209),
+    # narrowing the window to the same irreducible micro-window those do.
+    if (
+        isinstance(pending, _SeasonPending)
+        and (
+            await SqlDownloadRepository(session).find_active_coverage_title(
+                pending.tmdb_id, pending.season_number
+            )
+        )
+        is not None
+    ):
+        await _restore_after_failed_delete(session, pending)
+        _logger.warning(
+            "skipping eviction of %r%s: a live pack holds an active ride-along "
+            "coverage claim over this season (landed after the pre-claim re-check) "
+            "-- restored to 'available' rather than deleting a file a pack is fetching",
+            safe_text(candidate.title),
+            season_note,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
         )
         return None
 

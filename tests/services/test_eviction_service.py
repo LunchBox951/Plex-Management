@@ -39,6 +39,7 @@ from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.disk_usage import DiskUsage
 from plex_manager.models import (
     Download,
+    DownloadCoverageClaim,
     DownloadHistory,
     DownloadHistoryEvent,
     MediaRequest,
@@ -815,11 +816,385 @@ async def test_assemble_candidates_batches_parent_lookups_for_seasons(
 
     assert len(candidates) == 6  # 3 shows x 2 seasons
     assert sum(1 for c in candidates if c.in_flight) == 1
-    # ONE query resolves every distinct parent show, not one per show (3 shows).
-    assert len(parent_statements) == 1
-    # ONE pair of queries answers the whole in-flight probe, not one pair per
-    # season row (which would be 12 for 6 seasons).
-    assert len(download_statements) == 2
+    # One query resolves every distinct parent show, and one title-keyed coverage
+    # query protects siblings without per-candidate probes.
+    assert len(parent_statements) == 2
+    # The scope/scalar in-flight probe stays one pair for the whole pool, plus the
+    # single coverage query (which joins ``downloads`` to terminal-gate stale
+    # claims) -- never one probe per season row (which would be 12 for 6 seasons).
+    assert len(download_statements) == 3
+
+
+async def test_assemble_candidates_marks_a_coverage_claimed_ride_along_season_in_flight(
+    sessionmaker_: SessionMaker, engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Issue #465: a pack's ride-along season is guarded ONLY by an active
+    ``download_coverage_claims`` row -- it carries no ``DownloadScope`` and its
+    ``(request, season)`` matches no scalar download, so the scope/scalar-based
+    ``find_active_for_requests`` probe cannot see the pack covering it. Candidate
+    assembly must union the batched coverage probe into ``in_flight`` so eviction
+    never selects a season mid-transfer -- one coverage query for the whole pool
+    on top of the two scope/scalar probes, never one per candidate."""
+    s1_path = tmp_path / "tv" / "Pack Show" / "Season 01"
+    s2_path = tmp_path / "tv" / "Pack Show" / "Season 02"
+    for path in (s1_path, s2_path):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "e01.mkv").write_bytes(b"0" * 512)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=970, title="Pack Show", seasons={1: str(s1_path), 2: str(s2_path)}
+    )
+    # A live pack targets season 1 (scalar match) while physically covering
+    # season 2 as a ride-along: an ACTIVE coverage claim, but NO scope for it.
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="pack",
+            status="downloading",
+            media_request_id=show_id,
+            season=1,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=2,
+                status="active",
+            )
+        )
+        await session.commit()
+    library = FakeLibrary()
+
+    statements, stop = await _capture_statements_touching(engine, ("downloads", "download_scopes"))
+    try:
+        async with sessionmaker_() as session:
+            candidates = await eviction_service.assemble_candidates(
+                session=session,
+                library=library,
+                media_type="tv",
+                root_path=str(tmp_path / "tv"),
+                root_total_bytes=0,
+            )
+    finally:
+        stop()
+
+    by_season = {c.season: c for c in candidates}
+    # Season 1 is the pack's own scalar target; season 2 is visible ONLY through
+    # its coverage claim -- both must read in-flight and be excluded from eviction.
+    assert by_season[1].in_flight is True
+    assert by_season[2].in_flight is True
+    # The whole pool is answered by the two scope/scalar probes plus the single
+    # coverage query (which joins ``downloads`` to terminal-gate stale claims).
+    assert len(statements) == 3
+
+
+async def test_assemble_candidates_ignores_a_stale_claim_on_a_terminal_download(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A leftover ``active`` coverage claim whose download already terminalized
+    is a phantom: the batched title probe terminal-gates it (mirroring the
+    singular ``find_active_coverage_title``), so assembly must NOT mark the
+    season in-flight and eviction stays able to reclaim it."""
+    s2_path = tmp_path / "tv" / "Stale Show" / "Season 02"
+    s2_path.mkdir(parents=True, exist_ok=True)
+    (s2_path / "e01.mkv").write_bytes(b"0" * 512)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=971, title="Stale Show", seasons={2: str(s2_path)}
+    )
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="stale-pack",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=2,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=FakeLibrary(),
+            media_type="tv",
+            root_path=str(tmp_path / "tv"),
+            root_total_bytes=0,
+        )
+
+    by_season = {c.season: c for c in candidates}
+    assert by_season[2].in_flight is False
+
+
+async def test_never_evicts_a_ride_along_season_guarded_only_by_a_coverage_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #465, end to end: a watched, past-grace season the sweep would
+    normally evict must survive while a live pack re-fetches it as a ride-along.
+    The season's only guard is its active coverage claim (no scope, no scalar
+    match), so before this fix the sweep would delete it mid-transfer."""
+    s1_path = _movie_file(tmp_path, "Ride Along S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=971, title="Ride Along", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="ridealong-pack",
+            status="downloading",
+            media_request_id=show_id,
+            season=5,  # the pack's own target season, unrelated to season 1
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await session.commit()
+    library = FakeLibrary(
+        watch_states={(971, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+    assert season_row.status is RequestStatus.available
+
+
+async def test_sibling_coverage_claim_keeps_an_older_available_season_out_of_eviction(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex #470 P1: coverage follows a title/season, not just the settled
+    request row that owns an already-available copy. A newer active sibling can
+    hold the pack's ride-along claim while eviction examines the older row."""
+    s1_path = _movie_file(tmp_path, "Sibling Claim S01.mkv")
+    older_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=974, title="Sibling Claim", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        older_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == older_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        newer_show = MediaRequest(
+            tmdb_id=974,
+            media_type=MediaType.tv,
+            title="Sibling Claim",
+            status=RequestStatus.downloading,
+        )
+        session.add(newer_show)
+        await session.flush()
+        download = Download(
+            torrent_hash="sibling-claim-pack",
+            status="downloading",
+            media_request_id=newer_show.id,
+            season=5,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=newer_show.id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await session.commit()
+        older_season_id = older_season.id
+
+    library = FakeLibrary(
+        watch_states={(974, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="tv",
+            root_path=str(tmp_path),
+            root_total_bytes=0,
+        )
+        still_evictable = await eviction_service._still_evictable(  # pyright: ignore[reportPrivateUsage]
+            session,
+            eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+                media_request_id=older_show_id,
+                season_request_id=older_season_id,
+                season_number=1,
+                tmdb_id=974,
+                size_bytes=1024,
+            ),
+        )
+
+    assert len(candidates) == 1
+    assert candidates[0].in_flight is True
+    assert still_evictable is False
+
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+
+
+async def test_evict_one_restores_when_a_sibling_coverage_claim_lands_during_watch_state_reread(
+    tmp_path: Path,
+) -> None:
+    """Codex #470 P1: the post-CAS guard must apply the same title/sibling
+    semantics as candidate assembly and the early re-check."""
+    db_path = tmp_path / "eviction_sibling_coverage_race.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm: SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        s1_path = _movie_file(tmp_path, "Sibling Mid Reread S01.mkv")
+        older_show_id = await _show_with_seasons(
+            sm, tmdb_id=975, title="Sibling Mid Reread", seasons={1: s1_path}
+        )
+        async with sm() as session:
+            older_season_id = (
+                (
+                    await session.execute(
+                        select(SeasonRequest).where(SeasonRequest.media_request_id == older_show_id)
+                    )
+                )
+                .scalars()
+                .one()
+            ).id
+            newer_show = MediaRequest(
+                tmdb_id=975,
+                media_type=MediaType.tv,
+                title="Sibling Mid Reread",
+                status=RequestStatus.downloading,
+            )
+            session.add(newer_show)
+            await session.commit()
+            newer_show_id = newer_show.id
+
+        stale = eviction_service.EvictionCandidate(
+            request_id=older_season_id,
+            media_type="tv",
+            title="Sibling Mid Reread",
+            season=1,
+            status="available",
+            watched=True,
+            last_viewed_at=_STALE,
+            keep_forever=False,
+            in_flight=False,
+            library_path=s1_path,
+            size_percent=1.0,
+        )
+        pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+            media_request_id=older_show_id,
+            season_request_id=older_season_id,
+            season_number=1,
+            tmdb_id=975,
+            size_bytes=1024,
+        )
+
+        class _SiblingClaimsMidReread(FakeLibrary):
+            async def watch_state(
+                self,
+                tmdb_id: int,
+                media_type: Literal["movie", "tv"],
+                *,
+                season: int | None = None,
+                library_path: str | None = None,
+            ) -> WatchState:
+                async with sm() as claim_session:
+                    download = Download(
+                        torrent_hash="sibling-mid-reread-pack",
+                        status="downloading",
+                        media_request_id=newer_show_id,
+                        season=5,
+                        media_type=MediaType.tv,
+                    )
+                    claim_session.add(download)
+                    await claim_session.flush()
+                    claim_session.add(
+                        DownloadCoverageClaim(
+                            download_id=download.id,
+                            media_request_id=newer_show_id,
+                            season_number=1,
+                            status="active",
+                        )
+                    )
+                    await claim_session.commit()
+                return WatchState(watched=True, last_viewed_at=_STALE)
+
+        fs = LocalFileSystem(library_roots=[str(tmp_path)])
+        async with sm() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=_SiblingClaimsMidReread(),
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+
+        assert outcome is None
+        assert Path(s1_path).exists()
+        async with sm() as session:
+            older_season = await session.get(SeasonRequest, older_season_id)
+        assert older_season is not None
+        assert older_season.status is RequestStatus.available
+    finally:
+        await engine.dispose()
 
 
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:
@@ -2067,6 +2442,222 @@ async def test_recheck_honors_a_keep_forever_pin_on_the_parent_for_a_tv_season(
         season_row = await session.get(SeasonRequest, season_request_id)
         assert season_row is not None
         assert season_row.status is RequestStatus.available
+
+
+async def test_recheck_honors_a_coverage_claim_that_lands_after_assembly(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #465, TOCTOU: a ride-along coverage claim over the season landing
+    AFTER the candidate was assembled (a pack starting mid-sweep) must still stop
+    the delete. The pre-delete re-check consults ``find_active_coverage_owner``,
+    which the scope/scalar probe (blind to a scopeless ride-along) cannot cover."""
+    s1_path = _movie_file(tmp_path, "Late Claim S01.mkv")
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=972, title="Late Claim", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_request_id = season_row.id
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Late Claim",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=s1_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=972,
+        size_bytes=1024,
+    )
+
+    # A pack begins covering season 1 as a ride-along AFTER assembly: an active
+    # coverage claim with no scope and a scalar pointing at a DIFFERENT season.
+    async with sessionmaker_() as claim_session:
+        download = Download(
+            torrent_hash="late-pack",
+            status="downloading",
+            media_request_id=show_id,
+            season=5,
+            media_type=MediaType.tv,
+        )
+        claim_session.add(download)
+        await claim_session.flush()
+        claim_session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await claim_session.commit()
+
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(972, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    assert outcome is None
+    assert Path(s1_path).exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        assert season_row.status is RequestStatus.available
+
+
+async def test_evict_one_restores_when_a_coverage_claim_lands_during_the_watch_state_reread(
+    tmp_path: Path,
+) -> None:
+    """Issue #465, the POST-CHECK window the review flagged: ``_still_evictable``
+    reads the coverage claim CLEAN, then ``_evict_one`` awaits the Plex
+    watch-state re-read -- and a pack can commit a ride-along coverage claim over
+    this season DURING that await. The eviction claim CAS compares only season
+    status / pin / watchlist, never the coverage claim, so a read-then-act guard
+    that only checks BEFORE the claim would commit ``evicted`` and delete the
+    file mid-transfer. The authoritative check must run AFTER the claim commits
+    and BEFORE the delete (mirroring the shared-breadcrumb twins guard), so a
+    claim landing in that window still stops the delete and restores the row.
+
+    Drives a REAL file-backed database (not the shared in-memory ``StaticPool``
+    fixture) so a genuinely separate connection can land the claim mid-``_evict_one``.
+    """
+    db_path = tmp_path / "eviction_coverage_race.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    enable_sqlite_fk_enforcement(engine)  # busy_timeout, like production
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm: SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        s1_path = _movie_file(tmp_path, "Mid Reread S01.mkv")
+        show_id = await _show_with_seasons(
+            sm, tmdb_id=973, title="Mid Reread", seasons={1: s1_path}
+        )
+        async with sm() as session:
+            season_request_id = (
+                (
+                    await session.execute(
+                        select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                    )
+                )
+                .scalars()
+                .one()
+            ).id
+
+        stale = eviction_service.EvictionCandidate(
+            request_id=season_request_id,
+            media_type="tv",
+            title="Mid Reread",
+            season=1,
+            status="available",
+            watched=True,
+            last_viewed_at=_STALE,
+            keep_forever=False,
+            in_flight=False,
+            library_path=s1_path,
+            size_percent=1.0,
+        )
+        pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+            media_request_id=show_id,
+            season_request_id=season_request_id,
+            season_number=1,
+            tmdb_id=973,
+            size_bytes=1024,
+        )
+
+        class _ClaimsMidReread(FakeLibrary):
+            """Commit a ride-along coverage claim over season 1 the instant the
+            pre-claim watch-state re-read is awaited -- i.e. AFTER
+            ``_still_evictable``'s own coverage probe already read clean, exactly
+            the window the review flagged."""
+
+            def __init__(self) -> None:
+                super().__init__(
+                    watch_states={(973, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+                )
+                self._injected = False
+
+            async def watch_state(
+                self,
+                tmdb_id: int,
+                media_type: Literal["movie", "tv"],
+                *,
+                season: int | None = None,
+                library_path: str | None = None,
+            ) -> WatchState:
+                if not self._injected:
+                    self._injected = True
+                    async with sm() as claim_session:
+                        download = Download(
+                            torrent_hash="mid-reread-pack",
+                            status="downloading",
+                            media_request_id=show_id,
+                            season=5,  # the pack's own target, unrelated to season 1
+                            media_type=MediaType.tv,
+                        )
+                        claim_session.add(download)
+                        await claim_session.flush()
+                        claim_session.add(
+                            DownloadCoverageClaim(
+                                download_id=download.id,
+                                media_request_id=show_id,
+                                season_number=1,
+                                status="active",
+                            )
+                        )
+                        await claim_session.commit()
+                return await super().watch_state(
+                    tmdb_id, media_type, season=season, library_path=library_path
+                )
+
+        fs = LocalFileSystem(library_roots=[str(tmp_path)])
+        async with sm() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=_ClaimsMidReread(),
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+
+        assert outcome is None
+        assert Path(s1_path).exists(), (
+            "a coverage claim landing after the re-check must stop the delete"
+        )
+        async with sm() as session:
+            season_row = await session.get(SeasonRequest, season_request_id)
+            assert season_row is not None
+            # Restored to 'available' (not stranded 'evicted' over a live file).
+            assert season_row.status is RequestStatus.available
+    finally:
+        await engine.dispose()
 
 
 async def test_recheck_skips_a_row_a_concurrent_sweep_already_evicted(
