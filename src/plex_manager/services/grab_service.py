@@ -500,6 +500,11 @@ def _target_episodes(
     return list(episodes) if episodes is not None else None
 
 
+def _normalized_episodes(episodes: Sequence[int] | None) -> tuple[int, ...] | None:
+    normalized = tuple(sorted({int(episode) for episode in episodes or ()}))
+    return normalized or None
+
+
 async def _active_conflict_for_targets(
     download_repo: SqlDownloadRepository,
     *,
@@ -555,6 +560,41 @@ async def _claim_covered_seasons(
         )
 
 
+async def _attached_target_scopes(
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    *,
+    download_id: int,
+    request_id: int,
+    season: int,
+    episodes: list[int] | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+    target_seasons: tuple[int, ...],
+) -> bool:
+    scopes = await download_repo.list_scopes(download_id)
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+    statuses = {row.season_number: row.status for row in season_rows}
+    for target_season in target_seasons:
+        target_episodes = _target_episodes(
+            primary_season=season,
+            primary_episodes=episodes,
+            target_season=target_season,
+            scope_episodes_by_season=scope_episodes_by_season,
+        )
+        if (
+            not any(
+                scope.media_request_id == request_id
+                and scope.season == target_season
+                and _normalized_episodes(scope.episodes) == _normalized_episodes(target_episodes)
+                and scope.status in {"active", "import_blocked"}
+                for scope in scopes
+            )
+            or statuses.get(target_season) != RequestStatus.downloading.value
+        ):
+            return False
+    return True
+
+
 async def _attach_target_scopes_to_existing_download(
     session: AsyncSession,
     download_repo: SqlDownloadRepository,
@@ -569,8 +609,12 @@ async def _attach_target_scopes_to_existing_download(
     observed_season_status: str | None,
     qbt: DownloadClientPort | None = None,
     actually_added: bool = False,
-) -> DownloadRecord:
+) -> DownloadRecord | None:
     """Attach logical TV scopes to an already-active physical torrent.
+
+    ``None`` means the row became terminal while recovering from a collision; the
+    caller must continue through the terminal-row reuse path rather than reactivate
+    scopes or coverage claims on the finished row.
 
     ``guard_seasons`` is the torrent's full physical footprint (``_active_guard_seasons``);
     the conflict checks and the coverage claims persisted below span it so re-grabbing a
@@ -579,6 +623,8 @@ async def _attach_target_scopes_to_existing_download(
     """
     if request_id is None or season is None:
         return existing
+    if existing.status in _TERMINAL_STATUS_VALUES:
+        return None
 
     target_seasons = target_seasons or (season,)
     guard_seasons = guard_seasons or target_seasons
@@ -590,6 +636,10 @@ async def _attach_target_scopes_to_existing_download(
     )
     if conflict is not None:
         raise AlreadyDownloadingError(request_id)
+
+    if not await download_repo.lock_if_active(existing.id):
+        await session.rollback()
+        return None
 
     try:
         for target_season in target_seasons:
@@ -657,10 +707,37 @@ async def _attach_target_scopes_to_existing_download(
                     reason="losing an active TV scope or coverage-claim race",
                 )
             raise AlreadyDownloadingError(request_id) from None
-        record = await download_repo.get_by_hash(existing.torrent_hash)
-        if record is not None:
+        record = await download_repo.get_by_hash(existing.torrent_hash, populate_existing=True)
+        if record is not None and await _attached_target_scopes(
+            session,
+            download_repo,
+            download_id=record.id,
+            request_id=request_id,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            target_seasons=target_seasons,
+        ):
             return record
-        raise
+        if record is None:  # pragma: no cover - existing row was just read
+            message = f"download for hash {existing.torrent_hash} vanished mid-grab"
+            raise LookupError(message) from None
+        if record.status in _TERMINAL_STATUS_VALUES:
+            return None
+        return await _attach_target_scopes_to_existing_download(
+            session,
+            download_repo,
+            record,
+            request_id=request_id,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            target_seasons=target_seasons,
+            guard_seasons=guard_seasons,
+            observed_season_status=observed_season_status,
+            qbt=qbt,
+            actually_added=actually_added,
+        )
 
     await session.commit()
     record = await download_repo.get_by_hash(existing.torrent_hash)
@@ -872,7 +949,7 @@ async def grab(
             # season) attaches a logical scope instead of pretending the existing
             # scalar claim covers it.
             if request_id is not None and season is not None:
-                return await _attach_target_scopes_to_existing_download(
+                attached = await _attach_target_scopes_to_existing_download(
                     session,
                     download_repo,
                     pre,
@@ -884,7 +961,10 @@ async def grab(
                     guard_seasons=active_guard_seasons,
                     observed_season_status=observed_season_status,
                 )
-            return pre
+                if attached is not None:
+                    return attached
+            else:
+                return pre
 
     # Parallel-grab guard: if this request already has an active (non-terminal)
     # download for a DIFFERENT release, refuse rather than create a second active
@@ -939,7 +1019,7 @@ async def grab(
         # gave no hash so this is the first time we see the real one from qbt.add.
         # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
         if request_id is not None and season is not None:
-            return await _attach_target_scopes_to_existing_download(
+            attached = await _attach_target_scopes_to_existing_download(
                 session,
                 download_repo,
                 existing,
@@ -953,7 +1033,10 @@ async def grab(
                 qbt=qbt,
                 actually_added=actually_added,
             )
-        return existing
+            if attached is not None:
+                return attached
+        else:
+            return existing
 
     if request_id is not None:
         active = await _active_conflict_for_targets(
@@ -1002,7 +1085,7 @@ async def grab(
                     # untracked -- mirror the non-race active paths by attaching the
                     # requested logical scopes to the physical row.
                     if request_id is not None and season is not None:
-                        return await _attach_target_scopes_to_existing_download(
+                        attached = await _attach_target_scopes_to_existing_download(
                             session,
                             download_repo,
                             record,
@@ -1016,7 +1099,10 @@ async def grab(
                             qbt=qbt,
                             actually_added=actually_added,
                         )
-                    return record
+                        if attached is not None:
+                            return attached
+                    else:
+                        return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
         except IntegrityError:
             await session.rollback()
@@ -1095,7 +1181,7 @@ async def grab(
                 # (first-scope) row as a no-op would leave the loser's season/episodes
                 # untracked, so refuse it honestly rather than silently stranding it.
                 if request_id is not None and season is not None:
-                    return await _attach_target_scopes_to_existing_download(
+                    attached = await _attach_target_scopes_to_existing_download(
                         session,
                         download_repo,
                         winner,
@@ -1109,7 +1195,10 @@ async def grab(
                         qbt=qbt,
                         actually_added=actually_added,
                     )
-                return winner
+                    if attached is not None:
+                        return attached
+                else:
+                    return winner
             record, claimed_reuse = await _reuse_terminal_row(
                 session,
                 download_repo,
@@ -1137,7 +1226,7 @@ async def grab(
                     # instead of returning the winner's row as success (the requested
                     # season/episodes would be silently untracked).
                     if request_id is not None and season is not None:
-                        return await _attach_target_scopes_to_existing_download(
+                        attached = await _attach_target_scopes_to_existing_download(
                             session,
                             download_repo,
                             record,
@@ -1151,7 +1240,10 @@ async def grab(
                             qbt=qbt,
                             actually_added=actually_added,
                         )
-                    return record
+                        if attached is not None:
+                            return attached
+                    else:
+                        return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(

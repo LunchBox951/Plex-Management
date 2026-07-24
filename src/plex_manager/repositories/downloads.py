@@ -652,6 +652,28 @@ class SqlDownloadRepository:
             )
         return _to_record(row, scopes)
 
+    async def lock_if_active(self, download_id: int) -> bool:
+        """Lock a live download row through the current transaction.
+
+        The self-assignment is intentionally a conditional ``UPDATE`` rather than
+        a prior read: it locks the database row only while the persisted row remains
+        non-terminal. A terminal transition racing a scope attachment therefore
+        either wins first (and this returns ``False``) or waits until the attachment
+        commits, so scopes and coverage claims cannot be revived beneath a terminal
+        row.
+        """
+        stmt = (
+            update(Download)
+            .where(
+                Download.id == download_id,
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+            )
+            .values(status=Download.status)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
+
     async def ensure_scope(
         self,
         download_id: int,
