@@ -73,6 +73,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
 from plex_manager.ports.library import WatchStateQuery
 from plex_manager.repositories.downloads import SqlDownloadRepository
@@ -451,11 +452,11 @@ async def _season_candidates(
     )
     # A pack's ride-along season carries no DownloadScope and matches no scalar
     # download row, so ``find_active_for_requests`` above is blind to it (issue
-    # #465). Its only guard is an active ``download_coverage_claims`` row -- probe
-    # that once for the whole pool and UNION it into the in-flight verdict, so
-    # eviction never selects a season a live pack is still fetching.
-    coverage_keys = await download_repo.find_active_coverage_owners(
-        [(row.media_request_id, row.season_number) for row in rows]
+    # #465). Claims are owned by the grabbing request, but an older settled row
+    # and newer active sibling can coexist for one title; probe title/season keys
+    # once for the whole pool so either sibling's claim protects the available row.
+    coverage_titles = await download_repo.find_active_coverage_titles(
+        [(row.tmdb_id, row.season_number) for row in rows]
     )
     size_cache: dict[str, int | None] = {}
     pairs: list[tuple[EvictionCandidate, _Pending]] = []
@@ -464,7 +465,7 @@ async def _season_candidates(
         if parent is None:  # pragma: no cover - the FK guarantees the parent exists
             continue
         key = (row.media_request_id, row.season_number)
-        in_flight = key in active_keys or key in coverage_keys
+        in_flight = key in active_keys or (row.tmdb_id, row.season_number) in coverage_titles
         prospective = EvictionCandidate(
             request_id=row.id,
             media_type="tv",
@@ -551,9 +552,7 @@ async def _still_evictable(session: AsyncSession, pending: _Pending) -> bool:
         # starting mid-sweep). It has no scope, so ``find_active_for_request``
         # cannot see it -- the non-terminal-gated coverage owner does.
         covered = (
-            await download_repo.find_active_coverage_owner(
-                pending.media_request_id, pending.season_number
-            )
+            await download_repo.find_active_coverage_title(pending.tmdb_id, pending.season_number)
         ) is not None
         return (
             not parent.keep_forever
@@ -1671,8 +1670,8 @@ async def _evict_one(
     if (
         isinstance(pending, _SeasonPending)
         and (
-            await SqlDownloadRepository(session).find_active_coverage_owner(
-                pending.media_request_id, pending.season_number
+            await SqlDownloadRepository(session).find_active_coverage_title(
+                pending.tmdb_id, pending.season_number
             )
         )
         is not None
@@ -1682,9 +1681,12 @@ async def _evict_one(
             "skipping eviction of %r%s: a live pack holds an active ride-along "
             "coverage claim over this season (landed after the pre-claim re-check) "
             "-- restored to 'available' rather than deleting a file a pack is fetching",
-            candidate.title,
+            safe_text(candidate.title),
             season_note,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
         )
         return None
 

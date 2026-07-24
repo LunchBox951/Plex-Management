@@ -914,27 +914,8 @@ class SqlDownloadRepository:
     async def find_active_coverage_owners(
         self, keys: Sequence[tuple[int, int | None]]
     ) -> frozenset[tuple[int, int | None]]:
-        """Batch :meth:`find_active_coverage_owner` membership over MANY
-        ``(media_request_id, season)`` keys in ONE query (issue #465).
-
-        The coverage-claim twin of :meth:`find_active_for_requests`: eviction
-        candidate assembly must union a season's active physical-coverage claim
-        into its in-flight verdict so a pack's scopeless ride-along season is
-        never selected mid-transfer, and must do it once for the whole pool, not
-        once per candidate. Returns the SUBSET of ``keys`` for which
-        ``find_active_coverage_owner(media_request_id, season) is not None`` would
-        hold individually.
-
-        Queries ``download_coverage_claims`` ALONE (never joining ``downloads``):
-        a claim is written ``released`` the instant its torrent terminates
-        (:meth:`release_coverage_claims`), so an ``active`` claim virtually always
-        has a live torrent -- and treating a rare stale ``active`` claim (one that
-        somehow outlived its download) as in-flight only OVER-guards eviction,
-        the safe direction (a season is kept, never wrongly deleted). The
-        authoritative pre-delete re-check still uses the non-terminal-gated
-        singular :meth:`find_active_coverage_owner`. Movies (``season is None``)
-        never hold a claim, so a NULL-season key is simply never matched.
-        """
+        """Batch active physical-coverage-claim membership over many
+        ``(media_request_id, season)`` keys in one query (issue #465)."""
         if not keys:
             return frozenset()
         key_set = frozenset(keys)
@@ -947,11 +928,70 @@ class SqlDownloadRepository:
             DownloadCoverageClaim.season_number.is_not(None),
             DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
         )
-        rows = (await self._session.execute(stmt)).all()
         return frozenset(
             key
-            for media_request_id, season_number in rows
+            for media_request_id, season_number in (await self._session.execute(stmt)).all()
             if (key := (media_request_id, season_number)) in key_set
+        )
+
+    async def find_active_coverage_title(
+        self, tmdb_id: int, season: int | None
+    ) -> DownloadRecord | None:
+        """The non-terminal download holding an active physical-coverage claim
+        over a TV ``(tmdb_id, season)`` title key, or ``None`` (issue #470).
+
+        ``DownloadCoverageClaim`` is owned by the request row that grabbed the
+        pack, but old settled and new active rows can coexist for the same show.
+        Coverage therefore protects every sibling's matching title/season, not only
+        the claim owner's request id. ``season is None`` (a movie) has no claim.
+        """
+        if season is None:
+            return None
+        stmt = (
+            select(Download)
+            .join(DownloadCoverageClaim, DownloadCoverageClaim.download_id == Download.id)
+            .join(MediaRequest, MediaRequest.id == DownloadCoverageClaim.media_request_id)
+            .where(
+                MediaRequest.tmdb_id == tmdb_id,
+                MediaRequest.media_type == MediaType.tv,
+                DownloadCoverageClaim.season_number == season,
+                DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+            )
+            .order_by(Download.id)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return await self._to_record_with_scopes(row) if row is not None else None
+
+    async def find_active_coverage_titles(
+        self, keys: Sequence[tuple[int, int]]
+    ) -> frozenset[tuple[int, int]]:
+        """Batch :meth:`find_active_coverage_title` membership over many TV
+        ``(tmdb_id, season)`` title keys in one query (issue #470).
+
+        The claim's request owner may be a newer active sibling while candidate
+        assembly reads an older available sibling, so join through
+        ``media_requests`` and return title keys. This preserves the existing
+        one batched coverage lookup rather than introducing per-candidate probes.
+        """
+        if not keys:
+            return frozenset()
+        key_set = frozenset(keys)
+        tmdb_ids = list({tmdb_id for tmdb_id, _season in key_set})
+        stmt = (
+            select(MediaRequest.tmdb_id, DownloadCoverageClaim.season_number)
+            .join(DownloadCoverageClaim, DownloadCoverageClaim.media_request_id == MediaRequest.id)
+            .where(
+                MediaRequest.tmdb_id.in_(tmdb_ids),
+                MediaRequest.media_type == MediaType.tv,
+                DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
+                DownloadCoverageClaim.season_number.is_not(None),
+            )
+        )
+        return frozenset(
+            key
+            for tmdb_id, season_number in (await self._session.execute(stmt)).all()
+            if (key := (tmdb_id, season_number)) in key_set
         )
 
     async def align_scalar_scope_with_active(self, download_id: int) -> None:

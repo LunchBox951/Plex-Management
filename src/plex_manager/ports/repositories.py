@@ -712,12 +712,9 @@ class DownloadRepository(Protocol):
         The coverage-claim twin of :meth:`find_active_for_requests`: a pack's
         ride-along season carries no ``DownloadScope`` and matches no scalar
         download, so :meth:`find_active_for_requests` cannot see the pack covering
-        it -- eviction candidate assembly unions THIS membership into the in-flight
-        verdict so a season a live pack is still fetching is never selected. Returns
-        the SUBSET of ``keys`` for which the season currently has an ``active``
-        coverage claim; a NULL-season (movie) key is never matched (movies hold no
-        claim). Membership matches the singular
-        ``SqlDownloadRepository.find_active_coverage_owner`` for each key.
+        it. Returns the subset of keys whose own request row holds an active claim;
+        a NULL-season (movie) key is never matched. Callers requiring title-sibling
+        semantics use the concrete eviction repository query.
         """
         raise NotImplementedError
 

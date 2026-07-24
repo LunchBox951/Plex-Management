@@ -816,8 +816,9 @@ async def test_assemble_candidates_batches_parent_lookups_for_seasons(
 
     assert len(candidates) == 6  # 3 shows x 2 seasons
     assert sum(1 for c in candidates if c.in_flight) == 1
-    # ONE query resolves every distinct parent show, not one per show (3 shows).
-    assert len(parent_statements) == 1
+    # One query resolves every distinct parent show, and one title-keyed coverage
+    # query protects siblings without per-candidate probes.
+    assert len(parent_statements) == 2
     # ONE pair of queries answers the whole in-flight probe, not one pair per
     # season row (which would be 12 for 6 seasons).
     assert len(download_statements) == 2
@@ -948,6 +949,206 @@ async def test_never_evicts_a_ride_along_season_guarded_only_by_a_coverage_claim
             .one()
         )
     assert season_row.status is RequestStatus.available
+
+
+async def test_sibling_coverage_claim_keeps_an_older_available_season_out_of_eviction(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex #470 P1: coverage follows a title/season, not just the settled
+    request row that owns an already-available copy. A newer active sibling can
+    hold the pack's ride-along claim while eviction examines the older row."""
+    s1_path = _movie_file(tmp_path, "Sibling Claim S01.mkv")
+    older_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=974, title="Sibling Claim", seasons={1: s1_path}
+    )
+    async with sessionmaker_() as session:
+        older_season = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == older_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        newer_show = MediaRequest(
+            tmdb_id=974,
+            media_type=MediaType.tv,
+            title="Sibling Claim",
+            status=RequestStatus.downloading,
+        )
+        session.add(newer_show)
+        await session.flush()
+        download = Download(
+            torrent_hash="sibling-claim-pack",
+            status="downloading",
+            media_request_id=newer_show.id,
+            season=5,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=newer_show.id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await session.commit()
+        older_season_id = older_season.id
+
+    library = FakeLibrary(
+        watch_states={(974, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=library,
+            media_type="tv",
+            root_path=str(tmp_path),
+            root_total_bytes=0,
+        )
+        still_evictable = await eviction_service._still_evictable(  # pyright: ignore[reportPrivateUsage]
+            session,
+            eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+                media_request_id=older_show_id,
+                season_request_id=older_season_id,
+                season_number=1,
+                tmdb_id=974,
+                size_bytes=1024,
+            ),
+        )
+
+    assert len(candidates) == 1
+    assert candidates[0].in_flight is True
+    assert still_evictable is False
+
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(s1_path).exists()
+
+
+async def test_evict_one_restores_when_a_sibling_coverage_claim_lands_during_watch_state_reread(
+    tmp_path: Path,
+) -> None:
+    """Codex #470 P1: the post-CAS guard must apply the same title/sibling
+    semantics as candidate assembly and the early re-check."""
+    db_path = tmp_path / "eviction_sibling_coverage_race.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm: SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        s1_path = _movie_file(tmp_path, "Sibling Mid Reread S01.mkv")
+        older_show_id = await _show_with_seasons(
+            sm, tmdb_id=975, title="Sibling Mid Reread", seasons={1: s1_path}
+        )
+        async with sm() as session:
+            older_season_id = (
+                (
+                    await session.execute(
+                        select(SeasonRequest).where(SeasonRequest.media_request_id == older_show_id)
+                    )
+                )
+                .scalars()
+                .one()
+            ).id
+            newer_show = MediaRequest(
+                tmdb_id=975,
+                media_type=MediaType.tv,
+                title="Sibling Mid Reread",
+                status=RequestStatus.downloading,
+            )
+            session.add(newer_show)
+            await session.commit()
+            newer_show_id = newer_show.id
+
+        stale = eviction_service.EvictionCandidate(
+            request_id=older_season_id,
+            media_type="tv",
+            title="Sibling Mid Reread",
+            season=1,
+            status="available",
+            watched=True,
+            last_viewed_at=_STALE,
+            keep_forever=False,
+            in_flight=False,
+            library_path=s1_path,
+            size_percent=1.0,
+        )
+        pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+            media_request_id=older_show_id,
+            season_request_id=older_season_id,
+            season_number=1,
+            tmdb_id=975,
+            size_bytes=1024,
+        )
+
+        class _SiblingClaimsMidReread(FakeLibrary):
+            async def watch_state(
+                self,
+                tmdb_id: int,
+                media_type: Literal["movie", "tv"],
+                *,
+                season: int | None = None,
+                library_path: str | None = None,
+            ) -> WatchState:
+                async with sm() as claim_session:
+                    download = Download(
+                        torrent_hash="sibling-mid-reread-pack",
+                        status="downloading",
+                        media_request_id=newer_show_id,
+                        season=5,
+                        media_type=MediaType.tv,
+                    )
+                    claim_session.add(download)
+                    await claim_session.flush()
+                    claim_session.add(
+                        DownloadCoverageClaim(
+                            download_id=download.id,
+                            media_request_id=newer_show_id,
+                            season_number=1,
+                            status="active",
+                        )
+                    )
+                    await claim_session.commit()
+                return WatchState(watched=True, last_viewed_at=_STALE)
+
+        fs = LocalFileSystem(library_roots=[str(tmp_path)])
+        async with sm() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=_SiblingClaimsMidReread(),
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+
+        assert outcome is None
+        assert Path(s1_path).exists()
+        async with sm() as session:
+            older_season = await session.get(SeasonRequest, older_season_id)
+        assert older_season is not None
+        assert older_season.status is RequestStatus.available
+    finally:
+        await engine.dispose()
 
 
 async def test_never_evicts_an_unwatched_movie(sessionmaker_: SessionMaker, tmp_path: Path) -> None:
