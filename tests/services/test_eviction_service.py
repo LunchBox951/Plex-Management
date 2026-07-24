@@ -819,9 +819,10 @@ async def test_assemble_candidates_batches_parent_lookups_for_seasons(
     # One query resolves every distinct parent show, and one title-keyed coverage
     # query protects siblings without per-candidate probes.
     assert len(parent_statements) == 2
-    # ONE pair of queries answers the whole in-flight probe, not one pair per
-    # season row (which would be 12 for 6 seasons).
-    assert len(download_statements) == 2
+    # The scope/scalar in-flight probe stays one pair for the whole pool, plus the
+    # single coverage query (which joins ``downloads`` to terminal-gate stale
+    # claims) -- never one probe per season row (which would be 12 for 6 seasons).
+    assert len(download_statements) == 3
 
 
 async def test_assemble_candidates_marks_a_coverage_claimed_ride_along_season_in_flight(
@@ -832,9 +833,8 @@ async def test_assemble_candidates_marks_a_coverage_claimed_ride_along_season_in
     ``(request, season)`` matches no scalar download, so the scope/scalar-based
     ``find_active_for_requests`` probe cannot see the pack covering it. Candidate
     assembly must union the batched coverage probe into ``in_flight`` so eviction
-    never selects a season mid-transfer -- and that probe must query
-    ``download_coverage_claims`` alone (never joining ``downloads``), leaving the
-    scope/scalar in-flight probe at exactly two queries for the whole pool."""
+    never selects a season mid-transfer -- one coverage query for the whole pool
+    on top of the two scope/scalar probes, never one per candidate."""
     s1_path = tmp_path / "tv" / "Pack Show" / "Season 01"
     s2_path = tmp_path / "tv" / "Pack Show" / "Season 02"
     for path in (s1_path, s2_path):
@@ -884,9 +884,55 @@ async def test_assemble_candidates_marks_a_coverage_claimed_ride_along_season_in
     # its coverage claim -- both must read in-flight and be excluded from eviction.
     assert by_season[1].in_flight is True
     assert by_season[2].in_flight is True
-    # The coverage probe hits ``download_coverage_claims`` alone, so the
-    # scope/scalar in-flight probe stays exactly two queries for the whole pool.
-    assert len(statements) == 2
+    # The whole pool is answered by the two scope/scalar probes plus the single
+    # coverage query (which joins ``downloads`` to terminal-gate stale claims).
+    assert len(statements) == 3
+
+
+async def test_assemble_candidates_ignores_a_stale_claim_on_a_terminal_download(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A leftover ``active`` coverage claim whose download already terminalized
+    is a phantom: the batched title probe terminal-gates it (mirroring the
+    singular ``find_active_coverage_title``), so assembly must NOT mark the
+    season in-flight and eviction stays able to reclaim it."""
+    s2_path = tmp_path / "tv" / "Stale Show" / "Season 02"
+    s2_path.mkdir(parents=True, exist_ok=True)
+    (s2_path / "e01.mkv").write_bytes(b"0" * 512)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=971, title="Stale Show", seasons={2: str(s2_path)}
+    )
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="stale-pack",
+            status="imported",
+            media_request_id=show_id,
+            season=1,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=2,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        candidates = await eviction_service.assemble_candidates(
+            session=session,
+            library=FakeLibrary(),
+            media_type="tv",
+            root_path=str(tmp_path / "tv"),
+            root_total_bytes=0,
+        )
+
+    by_season = {c.season: c for c in candidates}
+    assert by_season[2].in_flight is False
 
 
 async def test_never_evicts_a_ride_along_season_guarded_only_by_a_coverage_claim(

@@ -958,11 +958,13 @@ class SqlDownloadRepository:
         stmt = (
             select(MediaRequest.tmdb_id, DownloadCoverageClaim.season_number)
             .join(DownloadCoverageClaim, DownloadCoverageClaim.media_request_id == MediaRequest.id)
+            .join(Download, Download.id == DownloadCoverageClaim.download_id)
             .where(
                 MediaRequest.tmdb_id.in_(tmdb_ids),
                 MediaRequest.media_type == MediaType.tv,
                 DownloadCoverageClaim.status == _ACTIVE_CLAIM_STATUS,
                 DownloadCoverageClaim.season_number.is_not(None),
+                Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
             )
         )
         return frozenset(

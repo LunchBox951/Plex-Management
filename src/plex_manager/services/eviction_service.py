@@ -1481,7 +1481,7 @@ async def _evict_one(
         )
         return None
 
-    season_note = f" season {candidate.season}" if candidate.season is not None else ""
+    season_note = f" season {safe_int(candidate.season)}" if candidate.season is not None else ""
 
     # Cheap EARLY filter (see _still_evictable's docstring): closes the obvious
     # TOCTOU cases -- a keep_forever pin, an active download racing in, or an
