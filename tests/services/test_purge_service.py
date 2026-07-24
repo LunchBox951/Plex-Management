@@ -1468,3 +1468,276 @@ async def test_trigger_library_scan_records_the_scan() -> None:
         library, library_path="/lib/movies/x", media_type="movie", context="report-issue"
     )
     assert library.scan_calls == [("/lib/movies/x", "movie")]
+
+
+class _WedgedProbe:
+    """A blocking read-only probe operation: it parks in its worker thread until
+    the test releases it, records how many physical workers actually ran it, and
+    returns a fixed value -- the shared substrate is generic, so an ``int`` stands
+    in for the real ``DiskUsage`` payload. Pass ``error`` to model a wedged mount
+    whose worker eventually FAILS once released (e.g. a transient NFS ``OSError``)."""
+
+    def __init__(self, value: int, *, error: BaseException | None = None) -> None:
+        self._value = value
+        self._error = error
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def __call__(self) -> int:
+        with self._lock:
+            self.calls += 1
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+async def test_concurrent_same_path_probes_coalesce_onto_one_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #466: two concurrent ``run_abandonable_probe`` calls for the SAME path
+    share ONE physical worker and one permit; the second caller attaches to the
+    in-flight probe instead of drawing another permit, and both receive its outcome."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=42)
+    path = str(tmp_path / "root")
+
+    first = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="disk probe")
+    )
+    assert await asyncio.to_thread(wedged.started.wait, 2.0)
+    assert probe_gate.acquired == 1
+
+    second = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="disk probe")
+    )
+    await asyncio.sleep(0)  # let the second caller reach its await
+    # The second caller coalesced: it neither acquired a permit nor started a worker.
+    assert probe_gate.acquired == 1
+    assert wedged.calls == 1
+
+    wedged.release.set()
+    assert await asyncio.wait_for(first, timeout=2.0) == 42
+    assert await asyncio.wait_for(second, timeout=2.0) == 42
+
+
+async def test_wedged_root_cannot_exhaust_the_shared_probe_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #466 (the reported failure): a wedged root polled every ~15s must never
+    pin more than ONE read permit no matter how many polls stack up, so the shared
+    four-permit budget stays available for every OTHER probe consumer during the
+    outage. Eight overlapping polls of one wedged root draw a single permit, and an
+    unrelated healthy root is still serviced at once. Without coalescing the eight
+    polls would each draw the gate (saturating it after four) and the healthy probe
+    would queue behind them -- caught by the bounded ``wait_for`` below."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=1)
+    wedged_path = str(tmp_path / "wedged")
+
+    pollers = [
+        asyncio.create_task(
+            purge_service.run_abandonable_probe(wedged, wedged_path, operation_name="health poll")
+        )
+        for _ in range(8)
+    ]
+    assert await asyncio.to_thread(wedged.started.wait, 2.0)
+    await asyncio.sleep(0)
+    # Eight stacked polls of the wedged root, ONE physical permit.
+    assert probe_gate.acquired == 1
+    assert wedged.calls == 1
+
+    # A different, healthy root is fully serviceable -- the budget was never starved.
+    healthy = _WedgedProbe(value=2)
+    healthy.release.set()
+    result = await asyncio.wait_for(
+        purge_service.run_abandonable_probe(
+            healthy, str(tmp_path / "healthy"), operation_name="health poll"
+        ),
+        timeout=2.0,
+    )
+    assert result == 2
+
+    wedged.release.set()
+    results = await asyncio.wait_for(asyncio.gather(*pollers), timeout=2.0)
+    assert results == [1] * 8
+    assert probe_gate.acquired == 2  # only the wedged root and the healthy root
+
+
+async def test_distinct_paths_probe_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #466: coalescing keys on the normalized path, so two DIFFERENT roots
+    keep their own worker and permit -- concurrency across roots stays independent."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    left = _WedgedProbe(value=1)
+    right = _WedgedProbe(value=2)
+
+    left_task = asyncio.create_task(
+        purge_service.run_abandonable_probe(left, str(tmp_path / "left"), operation_name="probe")
+    )
+    right_task = asyncio.create_task(
+        purge_service.run_abandonable_probe(right, str(tmp_path / "right"), operation_name="probe")
+    )
+    assert await asyncio.to_thread(left.started.wait, 2.0)
+    assert await asyncio.to_thread(right.started.wait, 2.0)
+    assert probe_gate.acquired == 2
+
+    left.release.set()
+    right.release.set()
+    assert await asyncio.wait_for(left_task, timeout=2.0) == 1
+    assert await asyncio.wait_for(right_task, timeout=2.0) == 2
+
+
+async def test_cancelling_one_awaiter_leaves_the_shared_probe_for_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #466: cancelling ONE awaiter detaches only that awaiter -- the shared
+    worker keeps running (never restarted), the registry entry lives until physical
+    completion, and a second awaiter still receives the outcome."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=7)
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    first = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="probe")
+    )
+    assert await asyncio.to_thread(wedged.started.wait, 2.0)
+    second = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="probe")
+    )
+    await asyncio.sleep(0)
+    assert probe_gate.acquired == 1
+
+    first.cancel()
+    await assert_task_raises(first, asyncio.CancelledError)
+    # The shared worker was neither cancelled nor restarted, and its registry entry
+    # is still live because the physical worker has not finished.
+    assert wedged.calls == 1
+    assert probe_gate.acquired == 1
+    assert key in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+    wedged.release.set()
+    assert await asyncio.wait_for(second, timeout=2.0) == 7
+    await asyncio.sleep(0)  # let the completion callback clear the registry
+    assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_registry_entry_survives_every_awaiter_cancelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #466: even when ALL awaiters cancel, the shared worker keeps its permit
+    and the registry entry until the physical worker finishes -- a new poll that
+    arrives before completion coalesces onto the SAME wedged worker rather than
+    spawning another (which is exactly how the budget was being exhausted)."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=5)
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    first = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="probe")
+    )
+    assert await asyncio.to_thread(wedged.started.wait, 2.0)
+    second = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="probe")
+    )
+    await asyncio.sleep(0)
+    shared = purge_service._ACTIVE_PROBE_TASKS[key]  # pyright: ignore[reportPrivateUsage]
+
+    first.cancel()
+    second.cancel()
+    await assert_task_raises(first, asyncio.CancelledError)
+    await assert_task_raises(second, asyncio.CancelledError)
+    # Registry entry and worker survive with every awaiter gone.
+    assert wedged.calls == 1
+    assert probe_gate.acquired == 1
+    assert key in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+    # A late poll coalesces onto the still-wedged worker rather than starting a new one.
+    late = asyncio.create_task(
+        purge_service.run_abandonable_probe(wedged, path, operation_name="probe")
+    )
+    await asyncio.sleep(0)
+    assert probe_gate.acquired == 1
+    assert wedged.calls == 1
+
+    wedged.release.set()
+    assert await asyncio.wait_for(late, timeout=2.0) == 5
+    assert await asyncio.wait_for(asyncio.shield(shared), timeout=2.0) == 5
+    await asyncio.sleep(0)
+    assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_all_cancelled_shared_probe_failure_is_retrieved_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #466 review: when EVERY awaiter of a coalesced probe has cancelled and
+    the shared daemon worker LATER fails, that failure must still be RETRIEVED *and*
+    LOGGED. Coalescing must not regress ``_run_abandonable_probe``'s single-caller
+    late-failure contract into a silent swallow: with no awaiter left to re-raise it,
+    the exception would otherwise be consumed purely to quiet the loop, leaving a
+    transient wedged-mount failure invisible to every later poll (honesty over
+    silence)."""
+    probe_gate = _CountingThreadGate(4)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    wedged = _WedgedProbe(value=0, error=OSError("nfs probe wedged then failed"))
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    caplog.set_level(logging.WARNING, logger="plex_manager.services.purge_service")
+    try:
+        first = asyncio.create_task(
+            purge_service.run_abandonable_probe(wedged, path, operation_name="health poll")
+        )
+        assert await asyncio.to_thread(wedged.started.wait, 2.0)
+        second = asyncio.create_task(
+            purge_service.run_abandonable_probe(wedged, path, operation_name="health poll")
+        )
+        await asyncio.sleep(0)
+        assert probe_gate.acquired == 1
+
+        first.cancel()
+        second.cancel()
+        await assert_task_raises(first, asyncio.CancelledError)
+        await assert_task_raises(second, asyncio.CancelledError)
+        assert key in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+        # Every awaiter is gone; the still-running worker now fails on its wedged mount.
+        wedged.release.set()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if key not in purge_service._ACTIVE_PROBE_TASKS:  # pyright: ignore[reportPrivateUsage]
+                break
+        assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    # Retrieved: the loop never reported an unretrieved task exception.
+    assert loop_errors == []
+    # Logged: exactly one intentional, sanitized failure record (the exception TYPE
+    # only, never the raw message) naming the shared probe.
+    failure_logs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "failed" in record.getMessage()
+        and "health poll" in record.getMessage()
+    ]
+    assert len(failure_logs) == 1
+    message = failure_logs[0].getMessage()
+    assert "OSError" in message
+    assert "nfs probe wedged then failed" not in message
