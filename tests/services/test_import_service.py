@@ -3700,16 +3700,8 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
 # --------------------------------------------------------------------------- #
 # run_availability_cycle — the stale-promotion race against a Report Issue
 # re-arm (issue #479), driven by two REAL sessions over a file-backed engine
+# (shares _file_backed_sessionmaker with the late-attach harness above)
 # --------------------------------------------------------------------------- #
-
-
-async def _file_backed_sessionmaker(tmp_path: Path, name: str) -> tuple[SessionMaker, AsyncEngine]:
-    """A real file-backed engine (two sessions = two real connections)."""
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
-    enable_sqlite_fk_enforcement(engine)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    return async_sessionmaker(engine, expire_on_commit=False), engine
 
 
 class _BlockingPresenceLibrary(FakeLibrary):
