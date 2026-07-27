@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.domain.disk_usage import DiskUsage
+from plex_manager.ports.download_client import DownloadStatus
 from plex_manager.ports.library import LibraryPort
 from plex_manager.services import (
     eviction_service,
@@ -41,7 +42,7 @@ from plex_manager.web import app as app_module
 from plex_manager.web.deps import SettingsStore
 from plex_manager.web.routers import ops as ops_router
 from plex_manager.web.schemas import DiskRootItem
-from tests.web.fakes import FakeLibrary
+from tests.web.fakes import FakeLibrary, FakeQbittorrent
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -106,6 +107,28 @@ class _BlockedDiskUsageProbe:
         self.release.wait(timeout=5)
         try:
             return DiskUsage(root=path, total_bytes=1000, available_bytes=900)
+        finally:
+            self.finished.set()
+
+
+class _BlockedContentPathProbe:
+    """A torrent-content existence read that models a dead downloads mount."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.thread_name: str | None = None
+        self.thread_daemon: bool | None = None
+
+    def __call__(self, _path: str) -> bool:
+        worker = threading.current_thread()
+        self.thread_name = worker.name
+        self.thread_daemon = worker.daemon
+        self.started.set()
+        self.release.wait(timeout=5)
+        try:
+            return True
         finally:
             self.finished.set()
 
@@ -739,6 +762,43 @@ async def test_detached_probe_does_not_trip_the_bounded_shutdown_wait(
         assert task.cancelled()
         assert "shutdown timed out" not in caplog.text
         assert not blocker.finished.is_set()
+    finally:
+        blocker.release.set()
+        assert await asyncio.to_thread(blocker.finished.wait, 2.0)
+
+
+async def test_hung_torrent_content_probe_detaches_at_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #483: ``remove_torrent``'s pre-removal, mount-sensitive content reads
+    ran on raw ``asyncio.to_thread``, so a wedged downloads mount left a NON-daemon
+    default-executor worker that CPython rejoins at interpreter teardown -- exactly
+    the shutdown hang the abandonable substrate exists to prevent. They now ride
+    that substrate, so a correction cancelled at shutdown DETACHES promptly on a
+    daemon thread the interpreter never rejoins."""
+    blocker = _BlockedContentPathProbe()
+    monkeypatch.setattr(purge_service, "_content_path_exists", blocker)
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="clip.mkv",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path="/srv/downloads/clip.mkv",
+            )
+        ]
+    )
+    task = asyncio.create_task(purge_service.remove_torrent(qbt, "a" * 40, context="a test"))
+    try:
+        assert await asyncio.to_thread(blocker.started.wait, 2.0)
+        assert blocker.thread_name == "filesystem-probe"
+        assert blocker.thread_daemon is True
+        await _detach_cancelled_probe_at_shutdown(task)
+        assert task.done()
+        assert task.cancelled()
+        assert not blocker.finished.is_set()
+        assert qbt.removed == []  # cancelled before the removal, never mid-delete
     finally:
         blocker.release.set()
         assert await asyncio.to_thread(blocker.finished.wait, 2.0)
