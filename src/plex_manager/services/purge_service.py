@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
-from plex_manager.adapters.filesystem.local import LocalFileSystemError
+from plex_manager.adapters.filesystem.local import LocalFileSystemError, PartialDeleteError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.logsafe import safe_text
 from plex_manager.services import path_visibility
@@ -363,9 +363,17 @@ class PurgeOutcome(StrEnum):
     #: A replacement import is actively placing into this path. Nothing deleted;
     #: eviction should leave the claim/breadcrumb for later recovery.
     deferred = "deferred"
-    #: An ``OSError`` (permission denied, I/O error) while deleting. Nothing (or
-    #: only part of a tree) deleted; the caller may retry later.
+    #: An ``OSError`` (permission denied, I/O error) while deleting, with the
+    #: tree PROVABLY untouched: everything the delete inventoried up front is
+    #: still on disk. The media is therefore still exactly as watchable as it
+    #: was; the caller may retry later.
     error = "error"
+    #: The recursive delete removed SOME of the tree and then failed (issue
+    #: #482). The path still exists but is missing files, so -- unlike
+    #: ``error`` -- the media is NOT watchable and a caller must never restore
+    #: it to an "available" state. Retrying is idempotent and converges to
+    #: ``deleted`` once whatever blocked the removal clears.
+    partial = "partial"
 
 
 @dataclass(frozen=True)
@@ -373,8 +381,10 @@ class PurgeResult:
     """The outcome of a :func:`purge_library_path` attempt.
 
     ``freed_bytes`` is the hardlink-aware reclaimable total measured before the
-    delete (``0`` for anything but a successful ``deleted``). ``detail`` carries
-    the guard message (``refused``) or the exception type name (``error``) so the
+    delete (``0`` for anything but a successful ``deleted`` -- including
+    ``partial``, which really did free SOME bytes but cannot say how many, so it
+    under-reports rather than guesses). ``detail`` carries the guard message
+    (``refused``) or the exception type name (``error``/``partial``) so the
     caller can log an honest reason; ``None`` on success.
     """
 
@@ -927,8 +937,13 @@ async def purge_library_path(
     The delete goes through :meth:`FileSystemPort.delete`, whose implementation
     refuses (raises :class:`LocalFileSystemError`) any path resolving outside a
     configured library root and treats an already-gone in-root path as an
-    idempotent no-op success. Classifies the result rather than logging it: the
-    caller (eviction / report-issue) owns the context-specific message + logger.
+    idempotent no-op success. A recursive delete that removed PART of a tree and
+    then failed raises :class:`PartialDeleteError` and is classified
+    ``partial``, never ``error`` (issue #482): the path still exists but is
+    missing files, so a caller must not restore it to an "available" state the
+    way an untouched failure allows. Classifies the result rather than logging
+    it: the caller (eviction / report-issue) owns the context-specific message +
+    logger.
     """
     # PURGE-vs-IMPORT ordering rule (see the registry block above): defer to an
     # import that is mid-placement into this path -- deleting under it would eat
@@ -1000,6 +1015,11 @@ async def purge_library_path(
             )
         except LocalFileSystemError as exc:
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
+        except PartialDeleteError as exc:
+            # BEFORE the ``OSError`` clause (it is a subclass): a delete that
+            # removed part of the tree leaves media that is no longer watchable,
+            # which callers must not treat as the untouched ``error`` case.
+            return PurgeResult(PurgeOutcome.partial, 0, str(exc))
         except OSError as exc:
             return PurgeResult(PurgeOutcome.error, 0, type(exc).__name__)
         return PurgeResult(PurgeOutcome.deleted, freed_bytes)

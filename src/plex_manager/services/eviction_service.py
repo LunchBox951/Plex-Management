@@ -35,12 +35,15 @@ trigger) is expected to call it once per configured root. Per call:
    ``evicted`` + a still-set breadcrumb thereby always means "claimed but not
    finalized", which is what step 0.5's crash recovery keys on. Claiming BEFORE
    deleting is what stops a concurrent pin/keep from ever losing a kept file to a
-   delete that had already run; if the delete then fails, the claim is restored
-   to ``available`` (and any in-window re-grab it spawned is reconciled away) so
-   a failed unlink can never strand an ``evicted`` row over a still-watchable
-   file. A candidate missing its ``library_path`` breadcrumb, or one the
-   filesystem guard refuses, is skipped + logged — NEVER guessed at, never a
-   silent no-op, and never lets one bad candidate abort the rest of the sweep.
+   delete that had already run; if the delete then fails WITHOUT having removed
+   anything, the claim is restored to ``available`` (and any in-window re-grab it
+   spawned is reconciled away) so a failed unlink can never strand an ``evicted``
+   row over a still-watchable file. A delete that removed PART of a tree before
+   failing (issue #482) is the opposite case and keeps its claim: the media is no
+   longer complete, so restoring it would publish an unplayable ``available``.
+   A candidate missing its ``library_path`` breadcrumb, or one the filesystem
+   guard refuses, is skipped + logged — NEVER guessed at, never a silent no-op,
+   and never lets one bad candidate abort the rest of the sweep.
    Between the claim commit and the delete, a shared-breadcrumb TWIN (#155) --
    another live row also carrying this exact ``library_path`` -- is likewise
    released back to ``available`` rather than deleted out from under it (the
@@ -894,6 +897,14 @@ async def _resume_interrupted_evictions(
     restoring, so a later sweep can never delete the shared path out from under
     the row that actually owns it.
 
+    KNOWN GAP (issue #482, tracked separately): "file still on disk" is decided
+    by a bare ``os.stat`` of the breadcrumb, which cannot tell a COMPLETE tree
+    from one a previous delete already ate into -- so a partially-deleted tree
+    reaching this pass is restored to ``available`` as if intact. Nothing here
+    persists tree completeness across a process restart, and the in-process
+    partial-delete case is handled where it is actually known: :func:`_evict_one`
+    keeps its claim rather than restoring. Stated rather than assumed silently.
+
     Runs at the START of every sweep, BEFORE the pressure pre-check (recovery
     must not wait for pressure) and only after the root's disk stat succeeded
     (an unmounted root must never make its files read as "gone"). Sweeps are
@@ -1350,7 +1361,12 @@ async def _evict_one(
        assembly makes the claim match zero rows.
     2. A failed/refused delete NEVER strands a terminal-status row over a live
        file -- ``_restore_after_failed_delete`` compare-and-swaps the row back
-       ``evicted`` -> ``available`` (recomputing the TV parent rollup).
+       ``evicted`` -> ``available`` (recomputing the TV parent rollup). Its
+       precondition is that the file is INTACT, which is why the purge
+       primitive distinguishes an untouched failure from a PARTIAL one (issue
+       #482): a tree the delete already ate into is not a live file, and
+       restoring it would publish media the UI calls watchable and cannot play.
+       A partial delete therefore keeps the claim instead (see the table below).
     3. Concurrent sweep ticks NEVER double-process -- sweeps are serialized
        in-process (:data:`_sweep_latch`: a second invocation no-ops with a
        log), and the claim CAS (only the winning ``rowcount == 1`` proceeds to
@@ -1419,8 +1435,13 @@ async def _evict_one(
     ========================================  =======================================
     purge ok                                  ``evicted``, breadcrumb CLEARED,
                                               history row, Plex refreshed (finalized)
-    purge refused / error                     restored ``available`` (+ TV rollup);
+    purge refused / error (tree UNTOUCHED)    restored ``available`` (+ TV rollup);
                                               breadcrumb kept; retried next sweep
+    purge PARTIAL -- some of the tree was     claim KEPT (``evicted`` + breadcrumb,
+    removed, then the delete failed (#482)    the "still in progress" shape); NOT
+                                              restored (the media is incomplete);
+                                              no re-grab cancelled; a retried purge
+                                              of the remains converges to deleted
     crash, file still present                 resumed next sweep: restored
                                               ``available``, re-decided fresh
     crash, file already purged                resumed next sweep: finalized
@@ -1713,12 +1734,41 @@ async def _evict_one(
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
             return None
+        if purge.outcome is PurgeOutcome.partial:
+            # The recursive delete removed SOME of the tree and then failed
+            # (issue #482). Everything below this branch assumes the media is
+            # untouched and still watchable -- here it demonstrably is not, so
+            # the restore is exactly the wrong move: it would put the row back
+            # to 'available' over a tree missing files and let the UI claim
+            # media it can no longer play, silently and forever. The eviction is
+            # instead still IN PROGRESS, which is the same shape as the
+            # ``deferred`` branch above: the committed 'evicted' claim and its
+            # breadcrumb both STAY, so the remains stay reclaimable and a
+            # retried purge (idempotent -- an already-gone entry is a no-op)
+            # converges to 'deleted' once whatever blocked the removal clears.
+            # For the same reason no re-grab is cancelled: unlike a restore,
+            # this file really did leave, so an in-window re-request re-fetching
+            # it is legitimate and its import re-places the path.
+            _logger.warning(
+                "eviction of %r%s deleted only PART of the tree before failing (%s); "
+                "leaving the eviction claim and its breadcrumb -- the media is no "
+                "longer complete, so it is NOT restored to 'available'",
+                safe_text(candidate.title),
+                season_note,
+                purge.detail,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            return None
         # The delete refused (a stale/misconfigured breadcrumb pointing outside
-        # every currently-configured library root) or errored (permission/I/O).
-        # The file is STILL on disk and still watchable -- so RESTORE the row to
-        # 'available' (#67): a failed unlink must never strand an 'evicted' status
-        # over a live file (a re-request would then re-grab content that never
-        # left). Never silently skipped, never mis-deleted; a later sweep retries.
+        # every currently-configured library root) or errored (permission/I/O)
+        # with the tree provably untouched. The file is STILL on disk and still
+        # watchable -- so RESTORE the row to 'available' (#67): a failed unlink
+        # must never strand an 'evicted' status over a live file (a re-request
+        # would then re-grab content that never left). Never silently skipped,
+        # never mis-deleted; a later sweep retries.
         await _restore_after_failed_delete(session, pending)
         if purge.outcome is PurgeOutcome.refused:
             _logger.warning(

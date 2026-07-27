@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.adapters.filesystem.local import LocalFileSystem, PartialDeleteError
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.prowlarr.adapter import IndexerError, IndexerRateLimitError
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
@@ -111,6 +111,15 @@ class _DeleteFailsFileSystem(LocalFileSystem):
 
     def delete(self, path: str) -> None:
         raise OSError("permission denied")
+
+
+class _DeletePartiallyFailsFileSystem(LocalFileSystem):
+    """A root-scoped :class:`LocalFileSystem` whose ``delete`` reports a PARTIAL
+    removal (issue #482) -- models ``shutil.rmtree`` unlinking part of a tree and
+    then raising, which leaves an orphan that still has to stay reclaimable."""
+
+    def delete(self, path: str) -> None:
+        raise PartialDeleteError("partially deleted before failing (PermissionError)")
 
 
 class _AddFailsQbittorrent(FakeQbittorrent):
@@ -2020,6 +2029,40 @@ async def test_report_issue_preserves_the_breadcrumb_when_the_purge_fails(
     assert request is not None
     # The file could not be deleted, so the breadcrumb is kept (not None) even though
     # the status re-armed for the re-search.
+    assert request.library_path == str(movie_file)
+
+
+async def test_report_issue_preserves_the_breadcrumb_when_the_purge_is_partial(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    # Issue #482: a delete that removed PART of a tree and then failed leaves an
+    # incomplete orphan on disk. Like the untouched-failure case above -- and
+    # unlike a clean delete -- the breadcrumb must be PRESERVED: it is the only
+    # handle a later retry/eviction has on the remains.
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 1024)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            _DeletePartiallyFailsFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
     assert request.library_path == str(movie_file)
 
 

@@ -1028,10 +1028,11 @@ async def report_issue(
     # (d) purge the library file via the shared root-guarded primitive. ``purge_ok``
     # tracks whether the file was ACTUALLY removed: only then is the ``library_path``
     # breadcrumb cleared (the claim at (b) kept it). On ``error`` (a genuine delete
-    # failure -- permissions, transient I/O, a partial rmtree) or ``refused`` (out-of-
-    # root breadcrumb) the file may still be on disk, so the breadcrumb is PRESERVED --
-    # it is the only handle a later retry / eviction has to reclaim the orphan; losing
-    # it would strand the bad file with no way to purge it (honesty over silence).
+    # failure -- permissions, transient I/O), ``partial`` (a tree the rmtree ate into
+    # before failing, #482) or ``refused`` (out-of-root breadcrumb), files may still be
+    # on disk, so the breadcrumb is PRESERVED -- it is the only handle a later retry /
+    # eviction has to reclaim the orphan; losing it would strand the bad file with no
+    # way to purge it (honesty over silence).
     purge_ok = True
     if target.library_path is not None:
         purge = await purge_service.purge_library_path(fs, target.library_path)
@@ -1040,6 +1041,16 @@ async def report_issue(
             _logger.warning(
                 "report-issue purge of %r refused by the filesystem guard (%s); "
                 "re-searching anyway but keeping the breadcrumb (a stale/misconfigured path)",
+                safe_text(request.title),
+                purge.detail,
+                extra=log_extra,
+            )
+        elif purge.outcome is PurgeOutcome.partial:
+            purge_ok = False
+            _logger.warning(
+                "report-issue purge of %r deleted only PART of the tree before failing "
+                "(%s); re-searching anyway and KEEPING the breadcrumb -- it is the only "
+                "handle a retry has on the remains",
                 safe_text(request.title),
                 purge.detail,
                 extra=log_extra,

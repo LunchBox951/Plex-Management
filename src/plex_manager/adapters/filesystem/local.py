@@ -24,7 +24,7 @@ from pathlib import Path
 
 from plex_manager.domain.plex_video import is_plex_disc_structure_path, plex_video_extension
 
-__all__ = ["LocalFileSystem", "LocalFileSystemError"]
+__all__ = ["LocalFileSystem", "LocalFileSystemError", "PartialDeleteError"]
 
 # os.link failures that genuinely warrant a content-copy fallback (cross-device,
 # hardlink-refusing / unsupported filesystem). Any OTHER errno (notably EEXIST —
@@ -53,6 +53,59 @@ class LocalFileSystemError(RuntimeError):
     guard, which is to make it structurally impossible for eviction to delete
     anything outside a configured library root.
     """
+
+
+class PartialDeleteError(OSError):
+    """Raised when :meth:`LocalFileSystem.delete` removed PART of a directory tree
+    and only THEN failed (issue #482).
+
+    ``shutil.rmtree`` is not atomic: it can unlink several children and raise on
+    the next one, leaving a tree that still exists but is missing files. A caller
+    that treats that identically to a delete which removed NOTHING will restore
+    the row to ``available`` and hand the UI media it claims is watchable but
+    which no longer has all of its files -- silently, and forever. Subclasses
+    :class:`OSError` (it IS an OS-level delete failure, and every existing
+    ``except OSError`` caller keeps working); callers that must distinguish the
+    two catch this FIRST. The message names the underlying error TYPE only --
+    never the path or the partially-removed entries -- because the caller
+    already holds the breadcrumb and logs it itself.
+    """
+
+
+def _tree_entries(leaf: str, parent_fd: int) -> frozenset[str]:
+    """Every path in the tree rooted at ``leaf``, relative to ``parent_fd``.
+
+    A classification probe for :meth:`LocalFileSystem.delete` ONLY: taken once
+    BEFORE ``shutil.rmtree`` and once again after it raises, the two sets are
+    what tell a genuinely-untouched failure from a partial removal. It has to be
+    taken up front -- once entries are unlinked, nothing can reconstruct what
+    the tree held.
+
+    Anchored at ``parent_fd`` and walked with ``follow_symlinks=False``, so it
+    descends exactly the entries ``rmtree`` itself would remove and never
+    dereferences a symlinked directory out of the tree. A symlink TO a directory
+    is inventoried as a single entry and not descended, mirroring the removal.
+
+    Walk errors are DELIBERATELY not raised: an unreadable subtree, or a top that
+    has vanished mid-walk, contributes nothing rather than aborting the
+    classification. Both directions of that bias are safe. In the AFTER set,
+    missing entries read as removed -- an unverifiable tree is classified partial,
+    which is the honest direction (never restore availability over a tree that
+    cannot be shown intact). In the BEFORE set, a subtree that cannot even be
+    LISTED is a subtree ``rmtree`` cannot descend into and therefore cannot empty,
+    so leaving it uninventoried cannot hide a removal; its own directory entry is
+    still inventoried by the parent level.
+    """
+    entries: set[str] = set()
+    try:
+        for dirpath, dirnames, filenames, _dirfd in os.fwalk(
+            leaf, dir_fd=parent_fd, follow_symlinks=False
+        ):
+            entries.add(dirpath)
+            entries.update(os.path.join(dirpath, name) for name in (*dirnames, *filenames))
+    except OSError:
+        pass  # see the docstring: an unwalkable top is classified, never raised
+    return frozenset(entries)
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -668,11 +721,27 @@ class LocalFileSystem:
         request still references directly; eviction owns the breadcrumb it was
         given, never transitively whatever that breadcrumb happens to point to.
 
+        A recursive removal that FAILS is classified rather than collapsed
+        (issue #482). ``shutil.rmtree`` is not atomic: it can unlink several
+        children and then raise, leaving a tree that still exists but is missing
+        files -- and a caller cannot tell that from a removal that touched
+        NOTHING, yet must react to them in opposite ways (only the untouched
+        case leaves media that is still fully watchable). So the tree is
+        inventoried up front (:func:`_tree_entries`) and, ONLY on ``OSError``,
+        re-walked: every inventoried path still present means genuinely
+        untouched and the original error propagates unchanged; ANY inventoried
+        path now gone means partial, raised as :class:`PartialDeleteError` (an
+        ``OSError`` subclass, so callers that never cared still behave exactly
+        as before). ``shutil.rmtree`` itself is untouched by this -- it carries
+        the ancestor-symlink-race containment above and is not reimplemented.
+
         A path (or an intermediate ancestor) that no longer exists at all is a
         no-op, not an error, so a retried eviction (a previous partial success,
         or a breadcrumb pointing at something already removed out-of-band) sees
-        a clean, idempotent success. On a platform that cannot guarantee
-        fd-anchored, no-follow removal (no ``O_NOFOLLOW`` / no ``dir_fd``
+        a clean, idempotent success -- which is exactly what makes retrying a
+        PARTIAL delete converge: each attempt removes what it can, and the
+        attempt that empties the tree returns cleanly. On a platform that cannot
+        guarantee fd-anchored, no-follow removal (no ``O_NOFOLLOW`` / no ``dir_fd``
         support / no symlink-attack-resistant ``shutil.rmtree``), every delete
         is refused up front rather than silently falling back to the unsafe
         pathname re-check this method exists to avoid.
@@ -716,7 +785,19 @@ class LocalFileSystem:
                 # and never shutil.rmtree a symlinked directory's contents.
                 os.unlink(leaf, dir_fd=parent_fd)
             elif stat.S_ISDIR(leaf_stat.st_mode):
-                shutil.rmtree(leaf, dir_fd=parent_fd)
+                # Inventory the tree BEFORE the removal so a failure can be
+                # classified afterwards (issue #482): `shutil.rmtree` is left
+                # EXACTLY as it was -- it carries the ancestor-symlink-race
+                # guards above -- and only the diff around it is new.
+                before = _tree_entries(leaf, parent_fd)
+                try:
+                    shutil.rmtree(leaf, dir_fd=parent_fd)
+                except OSError as exc:
+                    if not before <= _tree_entries(leaf, parent_fd):
+                        raise PartialDeleteError(
+                            f"partially deleted before failing ({type(exc).__name__})"
+                        ) from exc
+                    raise
             else:
                 os.unlink(leaf, dir_fd=parent_fd)
         finally:

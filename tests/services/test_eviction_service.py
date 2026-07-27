@@ -54,7 +54,12 @@ from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import eviction_service, request_service, season_request_service
+from plex_manager.services import (
+    eviction_service,
+    purge_service,
+    request_service,
+    season_request_service,
+)
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
 from tests.web.fakes import FakeLibrary, FakeTmdb
 
@@ -3410,6 +3415,180 @@ async def test_deferred_purge_does_not_restore_while_replacement_import_owns_pat
     assert row.status is RequestStatus.evicted
     assert row.library_path == library_path
     assert history == []
+
+
+async def test_partial_purge_never_restores_the_claimed_row_to_available(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482: the purge removed PART of the tree and then failed. Every
+    other failure branch restores the row to 'available' on the premise that
+    nothing left disk -- here that premise is false, and restoring would hand
+    the UI media it calls fully watchable while files are missing, silently and
+    forever. The claim and its breadcrumb must both stay (the eviction is still
+    in progress, the remains stay reclaimable), no eviction history is written
+    for a delete that has not finished, and -- unlike a restore -- the in-window
+    re-grab must SURVIVE: this file really did leave, so re-fetching it is
+    legitimate rather than a duplicate of on-disk content."""
+    library_path = _movie_file(tmp_path, "Half Eaten.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=482, title="Half Eaten", library_path=library_path
+    )
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=482,
+            media_type=MediaType.movie,
+            title="Half Eaten",
+            status=RequestStatus.pending,
+            eviction_regrab=True,
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    async def _partial_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(
+            PurgeOutcome.partial, 0, "partially deleted before failing (PermissionError)"
+        )
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Half Eaten",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=482, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(482, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    assert outcome is None
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, regrab_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 482)))
+            .scalars()
+            .all()
+        )
+    assert row is not None
+    assert row.status is RequestStatus.evicted  # NOT restored over an incomplete tree
+    assert row.library_path == library_path  # the retry's only handle on the remains
+    assert regrab_row is not None and regrab_row.status is RequestStatus.pending
+    assert history == []  # the eviction is not finished, so nothing is recorded yet
+
+
+async def test_partial_season_tree_delete_keeps_the_claim_and_a_retry_converges(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #482 end-to-end against the REAL filesystem and the REAL purge: a
+    season directory whose parent is read-only lets ``shutil.rmtree`` remove
+    every episode and then fail on the season's own ``rmdir``. The claimed row
+    must stay ``evicted`` with its breadcrumb -- the season is unplayable, so
+    restoring it to 'available' is the bug this closes -- and the purge, retried
+    once the permissions are back, must converge to a clean ``deleted`` off the
+    kept breadcrumb."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    show_dir = tmp_path / "tv" / "Half Eaten Show"
+    season_dir = show_dir / "Season 01"
+    season_dir.mkdir(parents=True)
+    for episode_number in (1, 2):
+        (season_dir / f"Half Eaten Show - S01E0{episode_number}.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=483, title="Half Eaten Show", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_request_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        ).id
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Half Eaten Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=483,
+        size_bytes=2048,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
+    # Only the season's final rmdir needs write permission HERE; its contents do
+    # not -- so the removal genuinely eats the episodes and then fails, on every
+    # directory-entry ordering.
+    os.chmod(show_dir, 0o500)
+    try:
+        async with sessionmaker_() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=FakeLibrary(
+                    watch_states={(483, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+                ),
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+    finally:
+        os.chmod(show_dir, 0o700)
+
+    assert outcome is None
+    assert season_dir.is_dir()  # the top survived...
+    assert list(season_dir.iterdir()) == []  # ...but the episodes did not
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 483)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # never restored over a gutted season
+    assert season_row.library_path == str(season_dir)
+    assert history == []
+
+    retry = await purge_service.purge_library_path(fs, str(season_dir))
+
+    assert retry.outcome is PurgeOutcome.deleted
+    assert not season_dir.exists()
 
 
 async def test_tv_purge_registration_stays_held_until_eviction_finalizes(
