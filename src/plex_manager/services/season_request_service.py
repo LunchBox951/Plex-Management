@@ -985,23 +985,31 @@ async def mark_completed_if_in(
 
 
 async def mark_available(
-    session: AsyncSession, *, media_request_id: int, season_number: int
+    session: AsyncSession,
+    *,
+    media_request_id: int,
+    season_number: int,
+    expected_completed_at: datetime | None,
 ) -> bool:
     """Phase 2 of honest per-season availability: Plex has confirmed the season is indexed.
 
-    The promotion is a CAS over ``completed``/``available``
-    (``SqlSeasonRequestRepository.mark_available``, issue #479). Recomputes the
-    parent rollup with ``stamp_completion=True`` ONLY when the swap happened --
-    for the same reason :func:`mark_completed_if_in` does: recomputing off a
-    promotion that did not happen would persist a rollup derived from a row this
-    call never moved, pushing the stale ``available`` one level up onto the show.
+    The promotion is a CAS over ``completed``/``available`` (issue #479) BOUND to
+    ``expected_completed_at`` -- the season's completion generation as the caller
+    snapshotted it alongside the Plex answer it is acting on, so a season
+    re-armed and re-completed inside that round-trip is not promoted on evidence
+    about content it no longer holds (issue #494). See
+    ``SqlSeasonRequestRepository.mark_available``. Recomputes the parent rollup
+    with ``stamp_completion=True`` ONLY when the swap happened -- for the same
+    reason :func:`mark_completed_if_in` does: recomputing off a promotion that
+    did not happen would persist a rollup derived from a row this call never
+    moved, pushing the stale ``available`` one level up onto the show.
     Returns whether the season was actually promoted.
     """
     season_repo = SqlSeasonRequestRepository(session)
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
-    promoted = await season_repo.mark_available(row.id)
+    promoted = await season_repo.mark_available(row.id, expected_completed_at=expected_completed_at)
     if promoted:
         await _recompute_parent(session, media_request_id, stamp_completion=True)
     return promoted

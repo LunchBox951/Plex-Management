@@ -699,7 +699,7 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
     finalizing = await repo.create(
         tmdb_id=30, media_type="movie", title="Finalizing", status="completed"
     )
-    assert await repo.mark_available(finalizing.id) is True
+    assert await repo.mark_available(finalizing.id, expected_completed_at=None) is True
     promoted = await session.get(MediaRequest, finalizing.id)
     assert promoted is not None
     assert promoted.status is RequestStatus.available
@@ -708,7 +708,7 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
 
     # Re-stamping an already-available row is the create-time short-circuit's
     # own call; it must still succeed, and must keep the earlier import instant.
-    assert await repo.mark_available(finalizing.id) is True
+    assert await repo.mark_available(finalizing.id, expected_completed_at=stamped_at) is True
     restamped = await session.get(MediaRequest, finalizing.id)
     assert restamped is not None
     assert restamped.completed_at == stamped_at
@@ -717,11 +717,51 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
         tmdb_id=31, media_type="movie", title="Reported", status="completed"
     )
     await repo.reset_for_research(rearmed.id)  # the report-issue re-arm
-    assert await repo.mark_available(rearmed.id) is False
+    assert await repo.mark_available(rearmed.id, expected_completed_at=None) is False
     untouched = await session.get(MediaRequest, rearmed.id)
     assert untouched is not None
     assert untouched.status is RequestStatus.searching
     assert untouched.library_verified_at is None
+
+
+async def test_mark_available_cas_refuses_a_replacement_completion(
+    session: AsyncSession,
+) -> None:
+    """Issue #494: the CAS is bound to the completion the caller OBSERVED.
+
+    A row that is re-armed and re-imported inside one Plex round-trip is
+    ``completed`` again, so the status-only predicate could not tell the
+    replacement from the snapshotted original and would promote it on evidence
+    about the purged content. The snapshotted ``completed_at`` is the
+    discriminator: the replacement carries a different generation, so the stale
+    write loses -- while the replacement's OWN generation still promotes it."""
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=32, media_type="movie", title="Replaced", status="completed")
+    await repo.mark_completed(row.id)  # the ORIGINAL completion, snapshotted below
+    original = await session.get(MediaRequest, row.id)
+    assert original is not None
+    observed_completed_at = original.completed_at
+    assert observed_completed_at is not None
+
+    # Report Issue purges + re-arms, then a retry-import lands the REPLACEMENT.
+    await repo.reset_for_research(row.id)
+    await repo.mark_completed(row.id)
+    replacement = await session.get(MediaRequest, row.id)
+    assert replacement is not None
+    assert replacement.completed_at != observed_completed_at
+
+    # The now-stale positive must not promote the replacement...
+    assert await repo.mark_available(row.id, expected_completed_at=observed_completed_at) is False
+    refused = await session.get(MediaRequest, row.id)
+    assert refused is not None
+    assert refused.status is RequestStatus.completed  # honest "Finalizing"
+    assert refused.library_verified_at is None
+
+    # ...but the next pass, which snapshots the replacement's own completion, does.
+    assert await repo.mark_available(row.id, expected_completed_at=replacement.completed_at) is True
+    confirmed = await session.get(MediaRequest, row.id)
+    assert confirmed is not None
+    assert confirmed.status is RequestStatus.available
 
 
 async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> None:
@@ -730,8 +770,9 @@ async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> No
     repo = SqlRequestRepository(session)
     row = await repo.create(tmdb_id=20, media_type="movie", title="Heal", status="available")
     # Stamp library_verified_at/completed_at, as the real already-in-library
-    # short-circuit does.
-    assert await repo.mark_available(row.id) is True
+    # short-circuit does (which passes its freshly-created row's own, unset,
+    # completion generation).
+    assert await repo.mark_available(row.id, expected_completed_at=None) is True
 
     changed = await repo.rearm_false_available_to_pending(row.id)
     assert changed is True

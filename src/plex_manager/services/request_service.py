@@ -23,6 +23,7 @@ from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1295,7 +1296,10 @@ async def create_request_result(
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
-            await repo.mark_available(record.id)
+            # The row was just created in THIS transaction, so its own
+            # ``completed_at`` is the completion this stamp describes (issue
+            # #494's binding); nothing else can have re-completed it yet.
+            await repo.mark_available(record.id, expected_completed_at=record.completed_at)
         if media_type == "tv":
             # Always starts 'pending' above (the movie-only in-library short-circuit
             # never applies to tv); ensure_seasons' own per-season availability check
@@ -1697,14 +1701,23 @@ async def mark_completed(session: AsyncSession, request_id: int) -> None:
     await session.commit()
 
 
-async def mark_available(session: AsyncSession, request_id: int) -> bool:
+async def mark_available(
+    session: AsyncSession, request_id: int, *, expected_completed_at: datetime | None
+) -> bool:
     """Phase 2 of honest availability: Plex has confirmed the title is in the library.
 
+    ``expected_completed_at`` is the ``completed_at`` the caller snapshotted
+    alongside the Plex answer it is acting on; the CAS is bound to it so a row
+    that was re-armed AND re-completed inside that round-trip is not promoted on
+    evidence about the content it no longer holds (issue #494).
+
     Returns whether the row was actually promoted; ``False`` is a benign stale
-    result (the CAS lost to a concurrent correction re-arm), and the caller must
-    not count it as a promotion.
+    result (the CAS lost to a concurrent correction re-arm, or to a replacement
+    completion), and the caller must not count it as a promotion.
     """
-    promoted = await SqlRequestRepository(session).mark_available(request_id)
+    promoted = await SqlRequestRepository(session).mark_available(
+        request_id, expected_completed_at=expected_completed_at
+    )
     await session.commit()
     return promoted
 

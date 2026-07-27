@@ -204,13 +204,15 @@ _IN_LIBRARY_STATUSES: Final = frozenset({"available", "completed"})
 # however many rows are ACTUALLY stuck completed right now.
 _unconfirmed_warned_bucket: dict[str, int] = {}
 # First-observed-miss timestamp -- the substitute anchor for "elapsed since
-# completed" for any row with no PERSISTED completion stamp to anchor on. In
-# practice this means every TV season (``SeasonRequest`` carries no per-season
-# mirror of ``MediaRequest.completed_at``, deliberately deferred rather than
-# added here without its own migration -- see ``SqlRequestRepository.
-# heal_completed_at``'s docstring): a movie instead anchors on its real,
-# persisted ``RequestRecord.completed_at`` and only falls through to this dict
-# in the defensive (should-not-happen) case that stamp is somehow unset -- see
+# completed" for any row with no first-completion stamp to anchor on. In
+# practice this means every TV season: ``SeasonRequest.completed_at`` exists
+# (issue #494) but is a completion GENERATION for the promotion CAS, not this
+# warning's anchor -- it is ``NULL`` for every pre-migration row, so switching
+# the anchor onto it would silently change how existing seasons are measured;
+# that is a separate behavior change, deliberately not made with the CAS fix. A
+# movie instead anchors on its real, persisted ``RequestRecord.completed_at``
+# (which never moves) and only falls through to this dict in the defensive
+# (should-not-happen) case that stamp is somehow unset -- see
 # ``_unconfirmed_anchor``.
 _unconfirmed_since_fallback: dict[str, datetime] = {}
 
@@ -3298,7 +3300,13 @@ async def run_availability_cycle(
                 )
             continue
         try:
-            did_promote = await request_repo.mark_available(request.id)
+            # Bound to the completion THIS tick's Plex answer describes: the row
+            # may have been re-armed and re-imported inside the round-trip above
+            # (issue #494), and a replacement completion must not inherit a
+            # positive that was never about it.
+            did_promote = await request_repo.mark_available(
+                request.id, expected_completed_at=request.completed_at
+            )
             await session.commit()
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
@@ -3485,11 +3493,11 @@ async def run_availability_cycle(
                     title = await _title_for(season_request.media_request_id)
                     _check_bounded_finalizing(
                         key,
-                        # SeasonRequest carries no per-season ``completed_at``
-                        # mirror (deliberately deferred -- see the module
-                        # dict's docstring), so the anchor always falls back
-                        # to the in-memory first-observed-miss timestamp for
-                        # TV.
+                        # The anchor stays the in-memory first-observed-miss
+                        # timestamp for TV: ``SeasonRequest.completed_at`` is
+                        # the promotion CAS's completion generation (issue
+                        # #494), NULL on every pre-migration row, not this
+                        # warning's anchor -- see the module dict's docstring.
                         _unconfirmed_anchor(key, None, now=effective_now),
                         f"{title} season {season_request.season_number}",
                         now=effective_now,
@@ -3500,6 +3508,10 @@ async def run_availability_cycle(
                     session,
                     media_request_id=season_request.media_request_id,
                     season_number=season_request.season_number,
+                    # Bound to the completion THIS tick's season_presence answer
+                    # describes (issue #494) -- the movie loop above documents
+                    # the replacement-completion window this closes.
+                    expected_completed_at=season_request.completed_at,
                 )
                 await session.commit()
             except (PlexLibraryError, PlexAuthError, NotImplementedError):

@@ -1156,23 +1156,43 @@ class SqlRequestRepository:
         row.completed_at = datetime.now(UTC)
         await self._session.flush()
 
-    async def mark_available(self, request_id: int) -> bool:
+    async def mark_available(
+        self, request_id: int, *, expected_completed_at: datetime | None
+    ) -> bool:
         """CAS to ``available`` + stamp ``library_verified_at`` (Plex-confirmed).
 
-        A single ``UPDATE ... WHERE id = ? AND status IN ('completed','available')``
-        -- the DATABASE, not the availability cycle's snapshot, decides (mirrors
-        :meth:`set_status_if_in`'s discipline). ``run_availability_cycle`` reads
-        this tick's ``completed`` rows, awaits a Plex round-trip, and only THEN
-        lands here; report-issue commits its re-arm to ``searching`` inside that
-        window (before any irreversible step), so an unconditional write by pk
-        would flip the correction back to ``available`` and abandon the
-        replacement while the purged title reads watchable (issue #479). Every
-        other status -- ``searching``, ``pending``, ``evicted``, ``failed``, ...
-        -- is excluded for exactly that reason. ``available`` stays in the
-        allowed set so the create-time "already in Plex" stamping call
+        A single ``UPDATE ... WHERE id = ? AND status IN ('completed','available')
+        AND completed_at IS NOT DISTINCT FROM ?`` -- the DATABASE, not the
+        availability cycle's snapshot, decides (mirrors :meth:`set_status_if_in`'s
+        discipline). ``run_availability_cycle`` reads this tick's ``completed``
+        rows, awaits a Plex round-trip, and only THEN lands here; report-issue
+        commits its re-arm to ``searching`` inside that window (before any
+        irreversible step), so an unconditional write by pk would flip the
+        correction back to ``available`` and abandon the replacement while the
+        purged title reads watchable (issue #479). Every other status --
+        ``searching``, ``pending``, ``evicted``, ``failed``, ... -- is excluded
+        for exactly that reason. ``available`` stays in the allowed set so the
+        create-time "already in Plex" stamping call
         (``request_service.create_request``, whose row is created ``available``)
         still lands. Returns whether the row was actually promoted; ``False`` is
         a benign stale result, and the caller must not count it as a promotion.
+
+        ``expected_completed_at`` is the completion the caller's Plex answer
+        actually describes -- ``RequestRecord.completed_at`` as read in the same
+        snapshot, passed back so the swap is bound to THAT completion rather
+        than to "some completion" (issue #494). Status alone cannot tell the two
+        apart: a row re-armed AND re-imported inside one Plex round-trip (the
+        retry-import endpoint drains the replacement independently of this pass)
+        is ``completed`` again by the time the CAS runs, and the stale positive
+        would promote the REPLACEMENT on evidence about the purged content.
+        ``reset_for_research`` clears ``completed_at`` and ``mark_completed``
+        re-stamps it, so the column IS the completion generation: a replacement
+        carries a different one and the predicate refuses. ``IS NOT DISTINCT
+        FROM`` (not ``=``) so a snapshotted ``NULL`` -- a row that reached
+        ``completed`` without a stamp, or the create-time ``available`` row --
+        matches its own ``NULL`` instead of silently never matching. The refusal
+        costs at most one tick: the next pass re-snapshots the replacement's own
+        ``completed_at`` and confirms the content that is actually there now.
 
         Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2):
         the marker means "this row is THIS eviction's own still-in-flight regrab",
@@ -1191,6 +1211,7 @@ class SqlRequestRepository:
                 .where(
                     MediaRequest.id == request_id,
                     MediaRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
+                    MediaRequest.completed_at.is_not_distinct_from(expected_completed_at),
                 )
                 .values(
                     status=RequestStatus.available,

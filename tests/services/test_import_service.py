@@ -4150,6 +4150,116 @@ async def test_availability_promotion_never_overwrites_a_season_report_issue_rea
         await engine.dispose()
 
 
+async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_movie(
+    tmp_path: Path,
+) -> None:
+    """Issue #494: the status-only CAS cannot see a REPLACEMENT completion.
+
+    The cycle snapshots a ``completed`` movie and blocks on Plex. Inside that
+    window the row is re-armed (Report Issue purges the file) AND completes
+    again -- the independent retry-import endpoint drains the replacement while
+    the availability pass is still awaiting its answer. Status alone is back to
+    ``completed``, so the #479 predicate would happily promote the REPLACEMENT
+    on an answer that described the now-purged content. Binding the CAS to the
+    snapshotted ``completed_at`` refuses it: the row honestly stays
+    "Finalizing" until a later tick confirms the content actually there now.
+
+    Deterministic by construction, not by timing: the re-arm + replacement
+    completion are committed from a second real session while the fake Plex
+    adapter holds the pass inside ``present_ids``, so the interleaving is
+    injected rather than raced for.
+    """
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_replaced.db")
+    try:
+        _download_id, request_id = await _seed(
+            sessionmaker_,
+            request_status=RequestStatus.completed,
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            # The ORIGINAL completion -- the one this tick's Plex answer describes.
+            await SqlRequestRepository(session).mark_completed(request_id)
+            await session.commit()
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            repo = SqlRequestRepository(session)
+            await repo.reset_for_research(request_id)  # Report Issue: purged + re-armed
+            await repo.mark_completed(request_id)  # retry-import lands the REPLACEMENT
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.completed  # honest "Finalizing", not promoted
+        assert request.library_verified_at is None
+    finally:
+        await engine.dispose()
+
+
+async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_season(
+    tmp_path: Path,
+) -> None:
+    """Issue #494, season twin: same replacement-completion window, per season.
+
+    TV has the shortest route back to ``completed`` of anything here (the
+    episode fallback can re-complete a re-armed season with no search, grab or
+    download at all), so the season CAS needs the same completion binding --
+    and the parent rollup must not be pushed to ``available`` off a promotion
+    that did not happen.
+    """
+    sessionmaker_, engine = await _file_backed_sessionmaker(
+        tmp_path, "availability_replaced_season.db"
+    )
+    try:
+        _download_id, request_id, season_id = await _seed_tv(
+            sessionmaker_,
+            season=1,
+            request_status=RequestStatus.completed,
+            season_status="completed",
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            await season_request_service.mark_completed(
+                session, media_request_id=request_id, season_number=1
+            )
+            await session.commit()
+        library = _BlockingPresenceLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await season_request_service.reset_for_research(
+                session, media_request_id=request_id, season_number=1
+            )
+            await season_request_service.mark_completed(
+                session, media_request_id=request_id, season_number=1
+            )
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            season_row = await session.get(SeasonRequest, season_id)
+            request = await session.get(MediaRequest, request_id)
+        assert season_row is not None and season_row.status is RequestStatus.completed
+        assert request is not None and request.status is RequestStatus.completed
+    finally:
+        await engine.dispose()
+
+
 async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -4224,7 +4334,9 @@ async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
         sanitized.append(value)
         return value + 1_000_000
 
-    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+    async def promotion_fails(
+        _self: SqlRequestRepository, _request_id: int, *, expected_completed_at: datetime | None
+    ) -> bool:
         raise PlexLibraryError("Plex write failed")
 
     monkeypatch.setattr(import_service, "safe_int", test_safe_int)
@@ -4261,7 +4373,11 @@ async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
         return value + 1_000_000
 
     async def promotion_fails(
-        _session: AsyncSession, *, media_request_id: int, season_number: int
+        _session: AsyncSession,
+        *,
+        media_request_id: int,
+        season_number: int,
+        expected_completed_at: datetime | None,
     ) -> bool:
         raise PlexLibraryError("Plex write failed")
 

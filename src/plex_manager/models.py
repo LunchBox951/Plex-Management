@@ -656,6 +656,23 @@ class SeasonRequest(Base):
     installed_quality_id: Mapped[int | None] = mapped_column()
     installed_profile_index: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # When this season LAST entered ``completed`` -- its completion GENERATION,
+    # not the show-level "first completion" ``MediaRequest.completed_at`` records
+    # (issue #494). Written by ``SqlSeasonRequestRepository.set_status`` /
+    # ``.set_status_if_in`` whenever the target status is ``completed``, cleared
+    # when the row leaves ``completed``/``available`` (a re-arm), and left alone
+    # by the promotion to ``available`` -- so it always names the completion the
+    # row currently stands on. Its ONE reader is
+    # ``SqlSeasonRequestRepository.mark_available``'s CAS, which binds the
+    # promotion to the completion the availability pass actually observed: a
+    # season re-armed AND re-completed inside one Plex round-trip is
+    # ``completed`` again, and status alone cannot tell the replacement from the
+    # snapshotted original. ``NULL`` for every pre-migration row (no backfill is
+    # possible -- the generation was never recorded) and for a row created
+    # straight at ``completed``; that is safe in both directions, since a
+    # snapshotted ``NULL`` matches only its own still-``NULL`` row, and any
+    # re-completion stamps a value that no longer matches it.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
     # ONLY for a season row ``season_request_service.ensure_seasons`` created because
     # its newest tracked history was ``evicted`` -- the season-level eviction guard's

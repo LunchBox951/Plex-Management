@@ -75,9 +75,13 @@ class RequestRecord(BaseModel):
     # warning (issue #158, ``import_service.run_availability_cycle``) reads this
     # as the anchor for "elapsed time since completed" -- persisted and exact
     # (survives a restart), unlike the in-memory fallback anchor a TV
-    # ``SeasonRequestRecord`` must use (it carries no per-season mirror of this
-    # column; see ``SqlRequestRepository.heal_completed_at``'s docstring on why
-    # one is deliberately deferred).
+    # ``SeasonRequestRecord`` still uses for that warning. The season record now
+    # carries a ``completed_at`` of its own (issue #494), but it is a completion
+    # GENERATION with different semantics -- re-stamped on every re-completion,
+    # ``NULL`` for every pre-migration row -- read ONLY by the promotion CAS;
+    # re-anchoring the warning on it is a separate behavior change and was NOT
+    # made here. This column keeps its own "never moves" first-completion rule
+    # (see ``SqlRequestRepository.heal_completed_at``).
     completed_at: datetime | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
     # select this title, regardless of watch state or disk pressure.
@@ -244,6 +248,13 @@ class SeasonRequestRecord(BaseModel):
     # per-season, so the backoff ladder is tracked here.
     search_attempts: int = 0
     next_search_at: datetime | None = None
+    # When this season LAST entered ``completed`` -- its completion GENERATION
+    # (issue #494), NOT the show-level first-completion stamp
+    # ``RequestRecord.completed_at`` carries. Snapshotted by the availability
+    # pass and passed back to ``SeasonRequestRepository.mark_available`` so the
+    # promotion is bound to the completion its Plex answer described. ``NULL``
+    # for a pre-migration row; see ``SeasonRequest.completed_at``'s docstring.
+    completed_at: datetime | None = None
     # The season-level mirror of ``RequestRecord.eviction_regrab`` (issue #156):
     # ``True`` only for a season row ``season_request_service.ensure_seasons``
     # created because Plex reported it present yet its newest tracked history was
@@ -607,7 +618,9 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def mark_available(self, request_id: int) -> bool:
+    async def mark_available(
+        self, request_id: int, *, expected_completed_at: datetime | None
+    ) -> bool:
         """CAS a ``completed``/``available`` request to ``available`` + stamp
         ``library_verified_at``. Returns whether the row was actually promoted.
 
@@ -617,6 +630,12 @@ class RequestRepository(Protocol):
         report-issue during that confirmation round-trip must never be
         overwritten by the stale answer (issue #479), so a ``False`` return is a
         benign "someone else moved this row", not a promotion.
+
+        ``expected_completed_at`` binds the swap to the COMPLETION the caller's
+        Plex answer describes (the ``completed_at`` it snapshotted, ``None``
+        included): a row re-armed and re-imported inside one round-trip is
+        ``completed`` again, so status alone would promote the replacement on
+        stale evidence (issue #494).
         """
         raise NotImplementedError
 
@@ -965,14 +984,19 @@ class SeasonRequestRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def mark_available(self, season_request_id: int) -> bool:
+    async def mark_available(
+        self, season_request_id: int, *, expected_completed_at: datetime | None
+    ) -> bool:
         """CAS a ``completed``/``available`` season to ``available``. Returns
         whether the season was actually promoted.
 
         Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
         the season (``leafCount>0``) -- never asserts watchable before Plex
         actually has it. Same stale-promotion guard as
-        :meth:`RequestRepository.mark_available` (issue #479).
+        :meth:`RequestRepository.mark_available` (issue #479), and the same
+        binding to the observed completion generation (issue #494):
+        ``expected_completed_at`` is the ``SeasonRequestRecord.completed_at``
+        snapshotted with that Plex answer.
         """
         raise NotImplementedError
 
