@@ -3290,7 +3290,10 @@ async def run_availability_cycle(
             await session.rollback()
             _logger.warning(
                 "availability promotion failed; will retry next cycle",
-                extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
+                extra={
+                    "tmdb_id": safe_int(request.tmdb_id),
+                    "request_id": safe_int(request.id),
+                },
             )
             continue
         if did_promote:
@@ -3489,10 +3492,10 @@ async def run_availability_cycle(
                 await session.rollback()
                 _logger.warning(
                     "availability promotion failed for season %s; will retry next cycle",
-                    season_request.season_number,
+                    safe_int(season_request.season_number),
                     extra={
-                        "tmdb_id": season_request.tmdb_id,
-                        "request_id": season_request.media_request_id,
+                        "tmdb_id": safe_int(season_request.tmdb_id),
+                        "request_id": safe_int(season_request.media_request_id),
                     },
                 )
                 continue
