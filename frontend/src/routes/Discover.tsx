@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import { useOutletContext } from 'react-router'
 import { useDiscoverHome } from '../api/hooks'
 import type { DiscoverResult } from '../api/types'
 import { Row } from '../components/Row'

@@ -1,7 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { QueryClientProvider } from '@tanstack/react-query'
-import { RouterProvider } from 'react-router-dom'
+import { RouterProvider } from 'react-router'
 import { ToastProvider } from './components/ui/toast'
 import { queryClient } from './lib/queryClient'
 import { purgeLegacyApiKey } from './lib/legacyCleanup'

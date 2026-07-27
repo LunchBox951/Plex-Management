@@ -1,6 +1,6 @@
 import { act, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { queryKeys } from '../lib/queryClient'

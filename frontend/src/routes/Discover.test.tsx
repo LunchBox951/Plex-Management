@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
-import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Outlet, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useDiscoverHome, useTileLiveStates } from '../api/hooks'
 import type { CompactStateField, DiscoverResult } from '../api/types'
