@@ -380,6 +380,7 @@ def _open_or_create_child_dir(
         return os.open(component, flags, dir_fd=parent_fd)
     except OSError as exc:
         _reraise_ancestor_failure(component, display, exc, action)
+        raise  # unreachable: _reraise_ancestor_failure never returns (NoReturn)
 
 
 def _reraise_ancestor_failure(component: str, display: str, exc: OSError, action: str) -> NoReturn:
