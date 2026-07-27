@@ -66,8 +66,10 @@ __all__ = [
     "active_purge_paths",
     "active_settlement_tasks",
     "begin_placement",
+    "begin_purge",
     "end_placement",
     "end_purge",
+    "purge_in_progress",
     "purge_library_path",
     "remove_torrent",
     "run_abandonable_probe",
@@ -332,6 +334,41 @@ def begin_placement(library_path: str) -> bool:
 def end_placement(library_path: str) -> None:
     """Release a :func:`begin_placement` registration (refcounted)."""
     _unregister(library_path, _ACTIVE_PLACEMENT_PATHS)
+
+
+def begin_purge(library_path: str) -> None:
+    """Register a purge claim over ``library_path`` BEFORE the delete itself runs.
+
+    :func:`purge_library_path` registers its own claim for the duration of its
+    delete, which is enough for a single-step purge. A multi-step destructive verb
+    is the case this exists for: report-issue publishes an eager, re-searchable
+    ``searching`` scope, THEN removes the culprit torrent with its data, and only
+    then purges the library tree (``correction_service.report_issue`` steps
+    (b)-(d)). Between the publish and that final step a replacement can be grabbed
+    and — with a same-hash attach making the import near-instant — PLACED into the
+    very path the purge is about to walk, and the purge would then delete the
+    freshly imported replacement (Codex round-3 P1).
+
+    Claiming the path up front closes that window with the registry's existing
+    ordering rule rather than a second mechanism: :func:`begin_placement` refuses
+    an import into a claimed path (the import retries on its next cycle), and
+    :func:`purge_in_progress` lets the auto-grab worker keep the scope out of its
+    due set for the same span. Refcounted, so the nested registration
+    :func:`purge_library_path` takes for its own delete nests cleanly inside this
+    one. The caller MUST pair this with :func:`end_purge` in a ``finally`` — a
+    leaked claim would block placements into the path for the life of the process.
+    """
+    _register(library_path, _ACTIVE_PURGE_PATHS)
+
+
+def purge_in_progress(library_path: str) -> bool:
+    """Whether ``library_path`` is under an active purge claim (equality OR
+    containment, the registry's normal conflict rule).
+
+    The read-only predicate behind :func:`begin_purge`'s auto-grab consumer; the
+    purge-vs-import serialization itself reads the registry directly.
+    """
+    return _conflicts_with(library_path, _ACTIVE_PURGE_PATHS)
 
 
 def end_purge(library_path: str) -> None:

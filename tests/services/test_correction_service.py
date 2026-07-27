@@ -51,9 +51,12 @@ from plex_manager.ports.download_client import AddResult
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
+from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
+    auto_grab_service,
     correction_service,
     grab_service,
+    purge_service,
     queue_service,
     request_service,
     season_request_service,
@@ -4685,3 +4688,132 @@ async def test_cancel_as_owner_rereads_participants_under_lock_after_a_concurren
         )
     assert request_row is not None and request_row.status == RequestStatus.downloading
     assert set(subs) == {owner_id, joiner_id}  # the joiner's shared request survives
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-3 P1: the re-arm at (b) commits an EAGER ``searching`` scope
+# BEFORE the culprit torrent and the library tree are purged. The auto-grab
+# worker must not be able to grab (and, on a same-hash attach, import) a
+# replacement into the tree that stretch is about to delete.
+# --------------------------------------------------------------------------- #
+class _DueSetProbingQbittorrent(FakeQbittorrent):
+    """A client whose ``remove`` -- report-issue step (c), i.e. AFTER the re-arm
+    has COMMITTED and BEFORE the library purge at (d) -- samples both the purge
+    registry and the auto-grab worker's due set from a SEPARATE session.
+
+    That is exactly the window the P1 describes: ``remove_torrent`` is a real
+    network round-trip against a client that can be slow, so it is the widest
+    part of the gap between the eager publish and the delete.
+    """
+
+    def __init__(self, sm: SessionMaker, library_path: str) -> None:
+        super().__init__()
+        self._sm = sm
+        self._library_path = library_path
+        self.claim_held: list[bool] = []
+        self.due_request_ids: list[int] = []
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        await super().remove(info_hash, delete_files=delete_files)
+        self.claim_held.append(purge_service.purge_in_progress(self._library_path))
+        async with self._sm() as probe:
+            scopes = await auto_grab_service._collect_due_scopes(  # pyright: ignore[reportPrivateUsage]
+                SqlRequestRepository(probe),
+                SqlSeasonRequestRepository(probe),
+                datetime.now(UTC),
+                {},
+            )
+        self.due_request_ids.extend(scope.request_id for scope in scopes)
+
+
+async def _due_request_ids(sm: SessionMaker, *, now: datetime) -> list[int]:
+    """The auto-grab worker's due set, as request ids."""
+    async with sm() as session:
+        scopes = await auto_grab_service._collect_due_scopes(  # pyright: ignore[reportPrivateUsage]
+            SqlRequestRepository(session), SqlSeasonRequestRepository(session), now, {}
+        )
+    return [scope.request_id for scope in scopes]
+
+
+async def test_report_issue_keeps_the_re_armed_scope_out_of_auto_grabs_due_set(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex round-3 P1: while the destructive stretch runs, the re-armed scope is
+    held out of the due set by a purge claim over its tree -- so the worker cannot
+    grab a replacement whose import the purge would then delete. The claim is
+    released at the purge boundary, and the scope is due again immediately after."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 1024)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    qbt = _DueSetProbingQbittorrent(sessionmaker_, str(movie_file))
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            qbt,
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    # The window was genuinely sampled, the claim was held across it, and the
+    # eagerly-published scope was invisible to the worker throughout.
+    assert qbt.claim_held == [True]
+    assert request_id not in qbt.due_request_ids
+    # The verb is over: nothing is left claiming the path...
+    assert not purge_service.purge_in_progress(str(movie_file))
+    # ...and the scope is due again (the inline re-search found nothing, so it
+    # parked; a day later its backoff has elapsed and the worker owns the retry).
+    assert request_id in await _due_request_ids(
+        sessionmaker_, now=datetime.now(UTC) + timedelta(days=1)
+    )
+
+
+async def test_a_partially_purged_correction_is_still_due_for_auto_grab(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The partial case's semantics, stated (Codex round-3 P1): the DURABLE
+    incomplete-delete marker stays armed after a partial purge -- that is a disk
+    fact about a tree that was eaten into, and eviction recovery still keys on it
+    -- but the purge claim is released at the same boundary as on the clean path.
+
+    So the marker is deliberately NOT the auto-grab discriminator: the replacement
+    search is exactly what has to keep running over an incomplete tree, and keying
+    the due set on the marker would park it forever."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 1024)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            _DeletePartiallyFailsFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+    assert request is not None
+    assert request.partial_delete_path == str(movie_file)  # still known-incomplete
+    assert not purge_service.purge_in_progress(str(movie_file))  # released all the same
+    assert request_id in await _due_request_ids(
+        sessionmaker_, now=datetime.now(UTC) + timedelta(days=1)
+    )

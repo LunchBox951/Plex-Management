@@ -88,6 +88,7 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     decision_service,
     grab_service,
+    purge_service,
     request_service,
     season_episode_service,
     season_request_service,
@@ -392,6 +393,38 @@ def _scope_key(scope: _PendingScope) -> ScopeKey:
     return (scope.request_id, scope.season)
 
 
+def _under_active_purge(library_path: str | None) -> bool:
+    """Whether this scope's stored breadcrumb is inside a destructive window a
+    purge claim is currently holding (Codex round-3 P1).
+
+    ``report_issue`` publishes its re-armed, EAGER ``searching`` scope in a commit
+    that lands BEFORE the culprit torrent is removed and the library tree purged,
+    and holds a :func:`purge_service.begin_purge` claim over that tree for the
+    whole stretch (see ``correction_service``'s step (b)). Inside that window the
+    scope is due by status but must NOT be grabbed: a same-hash attach can make
+    the replacement's import near-instant, and an import that lands (and releases
+    its placement registration) before the purge starts walking the directory is
+    deleted by the very correction that asked for it.
+
+    A scope with NO breadcrumb has no tree to race over, and the claim is
+    path-scoped, so this suppresses exactly the racing scopes and nothing else.
+    It is also a WINDOW, never a park: the claim is released at the purge boundary
+    -- on the clean AND the partial outcome alike -- so the scope is due again on
+    the next cycle with its own backoff untouched. Nothing is written here, so a
+    scope skipped this cycle is not charged an attempt.
+
+    In-process is the honest scope for this one (like the purge-vs-import registry
+    it reads, and like ``eviction_service``'s sweep latch): both racers are
+    coroutines in this single app process, and a process that dies mid-correction
+    takes the pending purge with it -- leaving nothing for a later cycle to race.
+    That is exactly why it is NOT the durable ``partial_delete_path`` marker: that
+    marker records a DISK fact which outlives the process and stays armed after a
+    partial delete precisely so a replacement can be fetched, so keying the due
+    set on it would park the replacement search forever.
+    """
+    return library_path is not None and purge_service.purge_in_progress(library_path)
+
+
 async def _collect_due_scopes(
     request_repo: SqlRequestRepository,
     season_repo: SqlSeasonRequestRepository,
@@ -412,8 +445,21 @@ async def _collect_due_scopes(
     expires it is retried without leaping ahead of scopes that never failed -- it
     must not re-monopolise the budget the moment it becomes eligible again.
     """
-    movies = await request_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
-    seasons = await season_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
+    due_movies = await request_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
+    due_seasons = await season_repo.list_due_for_search(DUE_SEARCH_STATUSES, now)
+    # Drop the scopes a destructive correction is mid-way through (see
+    # :func:`_under_active_purge`): due by status, but grabbing one now can land
+    # an import in the tree that correction is about to delete.
+    movies = [r for r in due_movies if not _under_active_purge(r.library_path)]
+    seasons = [s for s in due_seasons if not _under_active_purge(s.library_path)]
+    purge_skipped = (len(due_movies) - len(movies)) + (len(due_seasons) - len(seasons))
+    if purge_skipped:
+        _logger.info(
+            "auto-grab: skipped %d due scope(s) whose library tree is under an active "
+            "purge claim; they are retried on the next cycle once the purge boundary "
+            "completes (no backoff charged)",
+            purge_skipped,
+        )
     scopes: list[_PendingScope] = [
         _PendingScope(
             request_id=r.id,
