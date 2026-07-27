@@ -324,7 +324,7 @@ async def test_removed_then_reacquired_yields_a_second_available_row(
     async with sessionmaker_() as session:
         await request_service.mark_completed(session, reacquired.id)
     async with sessionmaker_() as session:
-        await request_service.mark_available(session, reacquired.id)
+        assert await request_service.mark_available(session, reacquired.id) is True
 
     async with sessionmaker_() as session:
         rows = (

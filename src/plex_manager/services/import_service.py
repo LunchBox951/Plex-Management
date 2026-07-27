@@ -1654,9 +1654,11 @@ async def _reread_scopes_for_finalize(
     (and so a new snapshot) that includes its commit, while one that has not started
     yet is held off until this transaction's terminal swap commits and turns it away.
     The swap's ``require_no_unimported_scope_outside`` predicate cannot substitute for
-    this ordering: on PostgreSQL a blocked ``UPDATE`` re-checks its WHERE against the
-    updated target tuple but evaluates the subquery on its ORIGINAL snapshot, so a
-    scope committed while it waited on the row lock stays invisible to it.
+    this ordering: PostgreSQL is expected but unverified to re-check a blocked
+    ``UPDATE``'s WHERE against the updated target tuple while evaluating the subquery
+    on its ORIGINAL snapshot, so a scope committed while it waited on the row lock
+    stays invisible to it. No PostgreSQL-backed test exercises this; SQLite, the sole
+    supported 1.0 backend, is fully covered by the existing tests.
 
     A lock refused (the row already terminal) needs no branch here: the finalize swap
     is gated on ``Importing`` and loses to that row either way.

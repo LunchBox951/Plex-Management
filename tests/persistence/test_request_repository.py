@@ -729,8 +729,9 @@ async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> No
     no-ops (returns False) once the row has already left that exact signature."""
     repo = SqlRequestRepository(session)
     row = await repo.create(tmdb_id=20, media_type="movie", title="Heal", status="available")
-    await repo.mark_available(row.id)  # stamp library_verified_at/completed_at, as the
-    # real already-in-library short-circuit does.
+    # Stamp library_verified_at/completed_at, as the real already-in-library
+    # short-circuit does.
+    assert await repo.mark_available(row.id) is True
 
     changed = await repo.rearm_false_available_to_pending(row.id)
     assert changed is True

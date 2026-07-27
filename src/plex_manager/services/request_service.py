@@ -1697,10 +1697,11 @@ async def mark_completed(session: AsyncSession, request_id: int) -> None:
     await session.commit()
 
 
-async def mark_available(session: AsyncSession, request_id: int) -> None:
+async def mark_available(session: AsyncSession, request_id: int) -> bool:
     """Phase 2 of honest availability: Plex has confirmed the title is in the library."""
-    await SqlRequestRepository(session).mark_available(request_id)
+    promoted = await SqlRequestRepository(session).mark_available(request_id)
     await session.commit()
+    return promoted
 
 
 async def set_keep_forever(
