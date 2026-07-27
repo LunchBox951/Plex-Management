@@ -95,6 +95,25 @@ def test_move_cross_device_copy_refuses_existing_destination(
     assert dst.read_text() == "existing payload"
 
 
+def test_move_onto_the_same_file_is_a_noop_and_preserves_it(tmp_path: Path) -> None:
+    """``move(p, p)`` must not self-destruct. ``src`` and ``dst`` being the SAME entry
+    makes :meth:`hardlink_or_copy` report the idempotent match (returns ``False``,
+    creates nothing); the follow-up ``src.unlink()`` would then delete the file's only
+    name. The move short-circuits to a no-op instead."""
+    root = tmp_path / "library"
+    root.mkdir()
+    path = root / "movie.mkv"
+    path.write_text("payload")
+    before = path.stat()
+
+    LocalFileSystem().move(path, path, root=root)
+
+    assert path.exists()
+    assert path.read_text() == "payload"
+    after = path.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+
 def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src = tmp_path / "src.mkv"
     src.write_text("payload")
@@ -827,6 +846,48 @@ def test_hardlink_or_copy_refuses_fifo_source_on_the_hardlink_path(tmp_path: Pat
     assert not dst.exists()  # no success, no breadcrumb-worthy entry
     assert list(dst.parent.iterdir()) == []
     assert stat.S_ISFIFO(src.lstat().st_mode)  # source untouched, for the operator
+
+
+def test_hardlink_or_copy_refuses_without_unlinking_a_third_party_entry_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unlink-after-hardlink race the mismatch branch must NOT lose: ``os.link``
+    succeeding proves WE created the entry AT LINK TIME, but the identity read happens
+    later. A non-cooperating writer with access to the destination directory unlinks
+    our fresh link and drops ITS OWN file at the same name before that read. The
+    identity no longer matches the proven-regular source, so the publish is REFUSED --
+    but the third party's file must survive: an entry whose ownership can no longer be
+    proven is never unlinked (pre-fix, this branch deleted it)."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    real_link = os.link
+
+    def _link_then_swap_entry(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        # Between our exclusive link and the identity read, a third party replaces the
+        # entry at the same name with an unrelated file (a different inode).
+        os.unlink(_dst, dir_fd=dst_dir_fd)
+        replacement_fd = os.open(
+            _dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644, dir_fd=dst_dir_fd
+        )
+        try:
+            os.write(replacement_fd, b"third-party file")
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(os, "link", _link_then_swap_entry)
+
+    with pytest.raises(LocalFileSystemError, match="changed identity"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The third party's file was NOT unlinked -- it survives with its own bytes.
+    assert dst.read_bytes() == b"third-party file"
 
 
 @pytest.mark.parametrize("maker", ["directory", "symlink"], ids=["directory", "symlink"])

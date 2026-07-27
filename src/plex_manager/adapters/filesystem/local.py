@@ -283,22 +283,40 @@ def _publish_link_no_overwrite(
     So the link is made by name and then PROVEN: the entry just created must carry the
     same ``(st_dev, st_ino)`` as the descriptor :func:`_open_regular_source` already
     proved regular. A source swapped between that proof and this link (the FIFO the
-    scan-to-place race plants) links a different inode, fails the comparison, and is
-    unlinked again -- so a non-regular file can never acquire a name in the library,
+    scan-to-place race plants) links a different inode and fails the comparison, so the
+    publish is REFUSED -- a non-regular file can never acquire a name in the library,
     pass :func:`_verify_lexical_publication` on its identical inode, and have a
-    breadcrumb plus a Plex scan born for it.
+    breadcrumb plus a Plex scan born for it. The mismatched entry is deliberately NOT
+    unlinked: a mismatch cannot be told apart from a third party having replaced
+    ``name`` after our link, and an entry whose ownership can no longer be proven is
+    never deleted (see the refusal below).
     """
     source_info = os.fstat(source_fd)
     with _publish_lock(dir_fd, name, display):
         os.link(os.fspath(src), name, dst_dir_fd=dir_fd)
         if _entry_identity(dir_fd, name) == (source_info.st_dev, source_info.st_ino):
             return
-        with contextlib.suppress(OSError):
-            os.unlink(name, dir_fd=dir_fd)
+    # Identity mismatch: the entry now at ``name`` is NOT the inode proven regular
+    # before the link. ``os.link`` succeeding proved WE created ``name`` AT LINK TIME,
+    # but the ``_entry_identity`` stat above happens later, and a mismatch has two
+    # causes indistinguishable from the identity alone: (a) the SOURCE was swapped
+    # between :func:`_open_regular_source` and ``os.link``, so ``name`` is our own link
+    # to the wrong inode; (b) ``name`` was itself unlinked and replaced after our link,
+    # so it is now an unknown third-party entry. So we REFUSE WITHOUT UNLINKING -- an
+    # entry we cannot prove we still own is never deleted. In case (b) that is the whole
+    # point: unlinking would destroy another process's file. In case (a) this leaves an
+    # in-root orphan hardlink to the wrong inode -- but that is strictly safer than a
+    # wrong delete: the orphan is IN-ROOT (a hardlink cannot cross filesystems and
+    # ``name`` is under the verified ``dir_fd``), its breadcrumb is NEVER persisted
+    # because we raise -> ImportBlocked, and an untracked in-root file is exactly the
+    # reconciler's job. This is NOT the ancestor-escape GHSA-r5vh is about. The
+    # FIFO/non-regular-source guarantee is preserved in full: raising here means a
+    # mismatched inode never gets a persisted breadcrumb or a Plex scan -- only the
+    # unlink, which cannot be performed safely, is dropped.
     raise LocalFileSystemError(
         f"refusing to publish {display!r}: the import source changed identity between "
-        "validation and the hardlink (containment could not be guaranteed); the link was "
-        "removed"
+        "validation and the hardlink (containment could not be guaranteed); the entry "
+        "was left in place rather than unlinked, as its ownership can no longer be proven"
     )
 
 
@@ -830,7 +848,16 @@ class LocalFileSystem:
         An already-identical destination still completes the move (``src`` is
         removed): the bytes are where the caller asked for them, whichever call put
         them there.
+
+        When ``src`` and ``dst`` are the SAME entry (same ``(st_dev, st_ino)``), the
+        move is a no-op: :meth:`hardlink_or_copy` would report the idempotent match and
+        the ``unlink`` below would then delete the file's only name -- a self-destruct.
+        ``os.path.samefile`` compares device+inode and raises if either path is absent,
+        so a missing source or destination falls through to the normal move.
         """
+        with contextlib.suppress(OSError):
+            if os.path.samefile(src, dst):
+                return
         self.hardlink_or_copy(src, dst, root=root)
         src.unlink()
 

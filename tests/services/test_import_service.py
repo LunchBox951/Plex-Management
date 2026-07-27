@@ -72,6 +72,7 @@ from plex_manager.services import (
     season_request_service,
 )
 from plex_manager.services.import_service import (
+    _remove_quietly,  # pyright: ignore[reportPrivateUsage]
     import_download,
     run_availability_cycle,
     run_import_cycle,
@@ -843,6 +844,29 @@ async def test_scan_failure_never_deletes_unproven_identical_destination_file(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
+
+
+def test_remove_quietly_sanitizes_newlines_in_the_rollback_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The rollback-failure warning logs the placed path and the exception, both of
+    which are request-derived: a movie/show title carries embedded newlines through
+    ``clean_title``, and the adapter refusal echoes that path back into its message. An
+    unsanitized CR/LF would forge a second log record, so both args pass through
+    ``safe_text`` and the emitted record must contain no raw newline."""
+    root = tmp_path / "library"
+    root.mkdir()
+    # Outside the root, so the real descriptor-anchored removal refuses with a
+    # LocalFileSystemError that echoes this newline-bearing path back into ``exc``.
+    malicious = tmp_path / "Evil\nFAKE LOG RECORD (2020)" / "movie.mkv"
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.import_service"):
+        _remove_quietly(LocalFileSystem(), malicious, root)
+
+    record = next(r for r in caplog.records if "could not roll back" in r.getMessage())
+    message = record.getMessage()
+    assert "\n" not in message  # the newline in both path and exc is collapsed
+    assert "Evil FAKE LOG RECORD (2020)" in message  # collapsed to a space, still present
 
 
 async def test_import_idempotent_when_placement_race_lost_to_same_size(

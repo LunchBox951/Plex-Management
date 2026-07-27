@@ -61,7 +61,7 @@ from plex_manager.domain.plex_video import plex_video_extension
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -783,7 +783,14 @@ def _remove_quietly(fs: FileSystemPort, path: Path, root: Path) -> None:
     try:
         fs.remove_published(path, root=root)
     except (OSError, LocalFileSystemError) as exc:
-        _logger.warning("could not roll back placed file %s: %s", path, exc)
+        # ``path`` carries a request-derived title (newlines survive clean_title) and
+        # ``exc`` frequently repeats it, so both are sanitized before they reach the
+        # message args -- an unsanitized value could forge a second log record.
+        _logger.warning(
+            "could not roll back placed file %s: %s",
+            safe_text(str(path)),
+            safe_text(str(exc)),
+        )
 
 
 def _remove_quietly_many(fs: FileSystemPort, paths: list[Path], root: Path) -> None:
