@@ -1148,6 +1148,7 @@ class SqlDownloadRepository:
         clear_timeout_at: bool = False,
         retry_count: int | None = None,
         require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
+        require_no_unimported_scope_outside: frozenset[int] | None = None,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
         persisted status is in ``allowed_from``. Returns whether a row was updated.
@@ -1199,6 +1200,23 @@ class SqlDownloadRepository:
         atomic statement — a concurrent restamp changes ``failed_reason`` and this
         statement then matches 0 rows, with no check-then-act window.
 
+        ``require_no_unimported_scope_outside`` (issue #476) additionally constrains the
+        WHERE to rows having NO non-``imported`` scope whose id is outside the given set
+        — the scope ids the caller OBSERVED. The import finalize reads the scopes and
+        then swaps in two separate statements, and a same-hash grab legitimately
+        attaches a new scope (with its own coverage claim) to a still-``importing`` row
+        in between; terminalizing over that scope would have
+        :meth:`release_coverage_claims` free a claim whose season was never imported. A
+        scope outside the observed set matches 0 rows, and the caller's ``False`` branch
+        leaves the row resumable for a pass that reads the scopes afresh.
+
+        This is a BACKSTOP, not the ordering guarantee: the caller closes the gap by
+        taking this row's lock (:meth:`lock_if_active`, the same lock the attach path
+        takes first) before it reads the scopes. It has to, because on PostgreSQL a
+        blocked ``UPDATE`` re-checks its WHERE against the updated target tuple while
+        still evaluating this subquery on its ORIGINAL snapshot — a scope committed
+        while the statement waited on the row lock would not be seen here.
+
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS
         status (and reason / cleared path).
@@ -1248,6 +1266,18 @@ class SqlDownloadRepository:
             # SQLAlchemy renders ``== None`` as ``IS NULL``, so one comparison
             # covers both the exact-marker and the must-be-unset predicates.
             stmt = stmt.where(Download.failed_reason == require_failed_reason)
+        if require_no_unimported_scope_outside is not None:
+            # Keyed on the literal download id rather than a correlated
+            # ``Download.id`` so the subquery reads identically under every backend.
+            stmt = stmt.where(
+                ~select(DownloadScope.id)
+                .where(
+                    DownloadScope.download_id == download_id,
+                    DownloadScope.status != "imported",
+                    DownloadScope.id.notin_(require_no_unimported_scope_outside),
+                )
+                .exists()
+            )
         # A DML statement yields a ``CursorResult`` carrying ``rowcount`` (the base
         # ``Result`` that ``AsyncSession.execute`` is typed to does not expose it). The
         # cast target is referenced at runtime (not a string) so CodeQL does not read
