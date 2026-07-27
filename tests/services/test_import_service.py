@@ -3069,6 +3069,54 @@ async def test_import_tv_releases_every_coverage_claim_when_nothing_attaches_lat
     assert claims == {1: "released"}
 
 
+async def test_import_tv_finalize_reread_locks_the_download_row_first(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finalize re-read must take the parent download row lock BEFORE reading the
+    scopes, in the same order the attach path takes it (#476).
+
+    Without the lock the re-read and the terminal swap only serialize through the swap's
+    own ``NOT EXISTS`` predicate, and that predicate cannot close the window on
+    PostgreSQL: under READ COMMITTED a blocked ``UPDATE`` re-checks its WHERE against the
+    updated target tuple but still evaluates the subquery on the older command snapshot,
+    so a ``download_scopes`` row the attach committed while the swap waited on the row
+    lock stays invisible, the swap matches, and the late scope is terminalized over.
+    SQLite's single-writer behaviour cannot express that anomaly, so this pins the lock
+    ORDER -- which is what makes the read observe the attach's commit -- rather than
+    trying to reproduce the interleaving.
+    """
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id = await _seed_tv_pack_with_s1_scope(sessionmaker_)
+
+    calls: list[tuple[str, int]] = []
+    real_list_scopes = SqlDownloadRepository.list_scopes
+    real_lock_if_active = SqlDownloadRepository.lock_if_active
+
+    async def recording_list_scopes(
+        self: SqlDownloadRepository, download_id: int
+    ) -> list[DownloadScopeRecord]:
+        calls.append(("list_scopes", download_id))
+        return await real_list_scopes(self, download_id)
+
+    async def recording_lock_if_active(self: SqlDownloadRepository, download_id: int) -> bool:
+        calls.append(("lock_if_active", download_id))
+        return await real_lock_if_active(self, download_id)
+
+    monkeypatch.setattr(SqlDownloadRepository, "list_scopes", recording_list_scopes)
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", recording_lock_if_active)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    # The finalize re-read is the LAST scope read of the pass, and the row lock is taken
+    # directly ahead of it -- nothing may read the scopes unlocked and then terminalize.
+    assert calls[-2:] == [("lock_if_active", download_id), ("list_scopes", download_id)]
+
+
 async def test_import_tv_retry_success_clears_stale_failed_reason(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

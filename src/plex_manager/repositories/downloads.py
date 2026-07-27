@@ -1183,12 +1183,17 @@ class SqlDownloadRepository:
         — the scope ids the caller OBSERVED. The import finalize reads the scopes and
         then swaps in two separate statements, and a same-hash grab legitimately
         attaches a new scope (with its own coverage claim) to a still-``importing`` row
-        in between; without this predicate the swap would terminalize over that scope
-        and :meth:`release_coverage_claims` would free a claim whose season was never
-        imported. Riding the observed set IN the compare-and-swap makes the DATABASE
-        settle what committed in the gap: a scope outside it matches 0 rows, and the
-        caller's ``False`` branch leaves the row resumable for a pass that reads the
-        scopes afresh.
+        in between; terminalizing over that scope would have
+        :meth:`release_coverage_claims` free a claim whose season was never imported. A
+        scope outside the observed set matches 0 rows, and the caller's ``False`` branch
+        leaves the row resumable for a pass that reads the scopes afresh.
+
+        This is a BACKSTOP, not the ordering guarantee: the caller closes the gap by
+        taking this row's lock (:meth:`lock_if_active`, the same lock the attach path
+        takes first) before it reads the scopes. It has to, because on PostgreSQL a
+        blocked ``UPDATE`` re-checks its WHERE against the updated target tuple while
+        still evaluating this subquery on its ORIGINAL snapshot — a scope committed
+        while the statement waited on the row lock would not be seen here.
 
         ``synchronize_session="fetch"`` keeps any already-loaded identity-map instance
         consistent with the DB result, so a later read returns the honest post-CAS

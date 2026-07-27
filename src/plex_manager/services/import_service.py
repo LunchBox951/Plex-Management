@@ -1645,6 +1645,20 @@ async def _reread_scopes_for_finalize(
     finished row -- never imported, and no longer guarded against a duplicate
     physical grab.
 
+    The read and the swap are two statements, so the parent download row is locked
+    FIRST -- the same lock, in the same order, the attach path takes before it touches
+    any scope. That is what makes the read observe an attach that is already under way:
+    an in-flight one holds the lock, so this waits and then reads in a NEW statement
+    (and so a new snapshot) that includes its commit, while one that has not started
+    yet is held off until this transaction's terminal swap commits and turns it away.
+    The swap's ``require_no_unimported_scope_outside`` predicate cannot substitute for
+    this ordering: on PostgreSQL a blocked ``UPDATE`` re-checks its WHERE against the
+    updated target tuple but evaluates the subquery on its ORIGINAL snapshot, so a
+    scope committed while it waited on the row lock stays invisible to it.
+
+    A lock refused (the row already terminal) needs no branch here: the finalize swap
+    is gated on ``Importing`` and loses to that row either way.
+
     ``late_seasons`` are the seasons of the importable scopes (the same filter the
     pass planned with) that the plan does not cover. ``observed_scope_ids`` is every
     scope this read saw as non-``imported`` plus the plan's own: the terminal swap
@@ -1653,6 +1667,7 @@ async def _reread_scopes_for_finalize(
     legacy scope, neither of which this import can resolve -- cannot wedge the swap
     into never succeeding.
     """
+    await download_repo.lock_if_active(download_id)
     scopes = await download_repo.list_scopes(download_id)
     unimported = [scope for scope in scopes if scope.status != "imported"]
     late_seasons = tuple(
