@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
+from unittest import mock
 
 import pytest
 from sqlalchemy import select
@@ -593,6 +595,126 @@ async def test_import_movie_refuses_symlinked_title_ancestor_and_blocks_retryabl
     assert record.download_path is None  # no breadcrumb for a file never published
     assert list(outside.iterdir()) == []
     assert library.scanned == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _EscapesTitleDirMidPlacementFs(LocalFileSystem):
+    """Renames the VERIFIED title directory out of the library (same filesystem) at the
+    instant of publication and leaves a symlink to it behind.
+
+    The descriptor the publish walk holds keeps working -- it refers to the directory,
+    not its name -- so the write itself succeeds, into a directory that is no longer in
+    the library. This is the escape a no-follow walk alone cannot see.
+    """
+
+    def __init__(self, outside: Path) -> None:
+        super().__init__()
+        self.escaped_dir: Path | None = None
+        self._outside = outside
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        real_link = os.link
+
+        def _escape_then_link(
+            link_src: str,
+            link_dst: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            title_dir = dst.parent
+            if title_dir.is_dir() and not title_dir.is_symlink():
+                self.escaped_dir = self._outside / f"{title_dir.name}.real"
+                title_dir.rename(self.escaped_dir)
+                title_dir.symlink_to(self.escaped_dir)
+            real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with mock.patch.object(os, "link", _escape_then_link):
+            return super().hardlink_or_copy(src, dst, root=root)
+
+
+async def test_import_movie_refuses_title_dir_renamed_out_of_root_mid_placement(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, the descriptor-can't-fix-this half, end to end: the title directory
+    is renamed OUT of the library mid-publication. The bytes land through the held
+    descriptor -- outside every configured root -- while the lexical destination
+    becomes a symlink.
+
+    Reported as success, this is the worst outcome the fix exists to prevent: the row
+    would carry an in-root ``download_path`` breadcrumb naming a path that holds
+    nothing of ours, so eviction, correction and purge could never reach the escaped
+    media. The post-placement verification must catch it, remove the escaped file, and
+    block retryably with no breadcrumb and no Plex scan."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+    fs = _EscapesTitleDirMidPlacementFs(outside)
+
+    record = await _import_with_fs(
+        sessionmaker_, download_id, movies_root, _qbt(video), library, fs
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value  # visible and retryable
+    assert record.failed_reason is not None
+    assert "no longer names the file that was placed" in record.failed_reason
+    assert record.download_path is None  # no breadcrumb was ever born pointing nowhere
+    assert library.scanned == []
+    # Nothing escaped: the file briefly published into the moved directory is gone.
+    assert fs.escaped_dir is not None
+    assert list(fs.escaped_dir.iterdir()) == []
+    assert video.exists()  # the source survives, so the operator's retry is real
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_import_movie_with_fifo_destination_conflicts_without_hanging(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A FIFO planted at the destination must resolve as the ordinary conflict block,
+    promptly. Checking the existing entry's type only AFTER opening it readable meant a
+    blocking ``O_RDONLY`` on a writer-less FIFO never returned, wedging the import
+    worker (and, on the shared task, everything queued behind it) forever.
+
+    ``asyncio.timeout`` is the assertion: a regression here is a HANG, which without a
+    bound would stall the whole suite rather than fail one test."""
+    movies_root = tmp_path / "library"
+    title_dir = movies_root / "The Matrix (1999)"
+    title_dir.mkdir(parents=True)
+    os.mkfifo(title_dir / "The Matrix (1999).mkv")
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    async with asyncio.timeout(30):
+        record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "already exists with different content" in record.failed_reason
+    assert record.download_path is None
+    assert library.scanned == []
+    # The operator's file is never touched -- they remove it and press retry.
+    assert stat.S_ISFIFO((title_dir / "The Matrix (1999).mkv").lstat().st_mode)
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked

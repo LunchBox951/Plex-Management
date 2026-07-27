@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
+import signal
+import stat
 import time
+from collections.abc import Generator
 from pathlib import Path
+from types import FrameType
 from typing import IO
 
 import pytest
@@ -569,14 +574,18 @@ def test_hardlink_or_copy_refuses_when_platform_cannot_anchor(
     assert not dst.exists()
 
 
-def test_hardlink_or_copy_survives_ancestor_swapped_to_symlink_mid_publish(
+def test_hardlink_or_copy_refuses_ancestor_swapped_to_symlink_mid_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ancestor-swap race a one-time ``realpath()`` check cannot close: the
     season directory is renamed away and replaced with a symlink out of the library
-    at the instant of publication. The descriptor the walk holds still refers to the
-    directory it verified, so the episode lands there -- inside the root -- and never
-    at the symlink's target."""
+    at the instant of publication.
+
+    The descriptor the walk holds still refers to the directory it verified, so the
+    bytes never reach the symlink's target. But the LEXICAL destination no longer
+    names them, so the breadcrumb the caller would persist is already wrong the
+    moment it is written -- the post-placement verification catches that, rolls the
+    entry back through the held descriptor, and refuses."""
     root = tmp_path / "library"
     season = root / "Some Show (2020)" / "Season 01"
     season.mkdir(parents=True)
@@ -598,11 +607,162 @@ def test_hardlink_or_copy_survives_ancestor_swapped_to_symlink_mid_publish(
         real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(os, "link", _swap_then_link)
-    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
 
     assert list(outside.iterdir()) == []  # the swapped-in link never received bytes
-    landed = season.parent / "Season 01.real" / dst.name
-    assert landed.read_text() == "payload"  # still inside the configured root
+    # The entry created through the held descriptor is undone, so no orphan is left
+    # at a path the caller was never told about.
+    assert list((season.parent / "Season 01.real").iterdir()) == []
+
+
+def test_hardlink_or_copy_refuses_when_destination_dir_is_renamed_out_of_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, the half a held descriptor cannot close: the verified season
+    directory is renamed OUT of the library (same filesystem) and a symlink to it is
+    left at the original name. The publish through the descriptor is itself correct --
+    and lands outside every configured root.
+
+    Nothing may be reported as placed here: the caller would store the in-root path as
+    its breadcrumb, and correction/eviction/purge would then address a path that names
+    nothing, while the real bytes sit somewhere they can never be reached."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped_dir = outside / "Season 01.real"
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    real_link = os.link
+
+    def _escape_then_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if season.is_dir() and not season.is_symlink():
+            season.rename(escaped_dir)  # the opened directory leaves the library
+            season.symlink_to(escaped_dir)  # ...and its name becomes a link to it
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "link", _escape_then_link)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The bytes that briefly landed outside the root are gone: no escaped file
+    # survives a call that did not report success.
+    assert list(escaped_dir.iterdir()) == []
+    assert src.read_text() == "payload"  # the source is untouched, so a retry is real
+
+
+def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The containment verification is not a failure-path-only branch: an ordinary
+    import runs it and passes it. Without this, the check could regress to never
+    running and every escape test would still pass for the wrong reason."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    calls: list[bool] = []
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+
+    def _spy(
+        verify_root: Path, verify_dst: Path, parent_fd: int, name: str, *, placed: bool
+    ) -> None:
+        calls.append(placed)
+        real_verify(verify_root, verify_dst, parent_fd, name, placed=placed)
+
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _spy)
+
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is True
+
+    assert calls == [True]  # ran once, for the file this call placed
+    assert dst.read_text() == "payload"
+    # ...and the property it asserted actually holds: the lexical path names the inode.
+    assert dst.stat().st_ino == src.stat().st_ino
+
+
+@contextlib.contextmanager
+def _bounded(seconds: float, what: str) -> Generator[None]:
+    """Turn a HANG in the body into a test FAILURE.
+
+    The FIFO regressions below are hang bugs, so an unbounded test would stop the
+    whole suite instead of reporting one red test. ``SIGALRM`` interrupts the
+    blocking syscall itself -- which is the only thing that can unwedge a blocking
+    ``open`` of a writer-less FIFO, and something no after-the-fact wall-clock
+    assertion could ever reach.
+    """
+
+    def _fire(_signum: int, _frame: FrameType | None) -> None:
+        raise TimeoutError(f"{what} blocked for more than {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_hardlink_or_copy_refuses_fifo_destination_without_blocking(tmp_path: Path) -> None:
+    """A pre-existing FIFO at the destination is an ordinary conflict, resolved by
+    ``fstatat`` -- never opened for reading. A blocking ``O_RDONLY`` open of a FIFO
+    with no writer never returns, which would wedge the import worker forever on a
+    path any local actor can plant with ``mkfifo``."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    os.mkfifo(dst)
+
+    with (
+        _bounded(10.0, "hardlink_or_copy onto a FIFO destination"),
+        pytest.raises(FileExistsError, match="already exists with different content"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert stat.S_ISFIFO(dst.lstat().st_mode)  # untouched, for the operator to remove
+
+
+@pytest.mark.parametrize("maker", ["fifo", "directory"], ids=["fifo", "directory"])
+def test_hardlink_or_copy_refuses_non_regular_destination_on_the_copy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: str
+) -> None:
+    """The same guarantee on the cross-device COPY fallback, whose publish also lands
+    on the existing entry: a non-regular destination is a conflict, decided without a
+    readable open."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    if maker == "fifo":
+        os.mkfifo(dst)
+    else:
+        dst.mkdir()
+
+    def _refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with (
+        _bounded(10.0, f"hardlink_or_copy onto a {maker} destination via the copy path"),
+        pytest.raises(FileExistsError, match="already exists with different content"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(title.iterdir()) == [dst]  # no temp copy left behind
 
 
 def test_hardlink_or_copy_publishes_into_a_nested_library_root(tmp_path: Path) -> None:

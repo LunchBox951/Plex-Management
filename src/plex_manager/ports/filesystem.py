@@ -66,6 +66,19 @@ class FileSystemPort(Protocol):
         breadcrumb, which the containment guard on :meth:`delete` then correctly
         refuses to clean up -- media that can no longer be corrected from the web UI.
 
+        No-follow traversal alone is NOT sufficient, and implementations MUST also
+        verify containment AFTER placing the file: an anchoring directory handle stops
+        a replacement symlink from being followed, but nothing stops the directory it
+        refers to from being RENAMED out of the library mid-publication, which lands
+        the bytes outside every root by way of a perfectly correct write through that
+        handle. Implementations MUST therefore re-resolve ``dst`` no-follow from
+        ``root`` once placement is complete and confirm it names the very file just
+        placed (same device and inode), MUST undo a placement of their own that fails
+        this check, and MUST report success only when it passes. A rename after that
+        verification is an ordinary post-import library mutation for the reconciler,
+        not a containment failure -- but a breadcrumb must never be BORN pointing
+        outside the root.
+
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline
         report a file as placed without writing or linking anything.

@@ -382,22 +382,42 @@ def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
     present, conflicting entry, not an idempotent win). Same-inode is the cheap
     short-circuit for the common case where a previous attempt already hardlinked
     this very file; otherwise size must match before the bytes are digested.
+
+    NOTHING is opened for reading until ``fstatat`` has proven it a regular file. A
+    blocking ``O_RDONLY`` open of a pre-existing FIFO at the destination sleeps until
+    a writer appears -- forever, for a FIFO nobody writes -- which would wedge the
+    import worker on a path an unprivileged local actor can plant with ``mkfifo``.
+    Every non-regular entry (FIFO, socket, device, directory, symlink) is simply not
+    our file, so it resolves as the ordinary ``FileExistsError`` conflict the operator
+    can see and correct. ``O_NONBLOCK`` on the opens that follow is the belt-and-braces
+    for the residual window between the ``fstatat`` and the open (a swap in between):
+    the open returns immediately whatever now sits there, and the ``fstat`` on the
+    resulting descriptor -- the authoritative check, made on the very object being read
+    -- rejects it. ``O_NONBLOCK`` has no effect on a regular file.
     """
     try:
-        entry_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        entry_info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(entry_info.st_mode):
+        return False
+    try:
+        entry_fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd
+        )
     except OSError:
         # ELOOP (a symlink entry), ENOENT (it vanished), EACCES, a directory on a
         # platform that refuses O_RDONLY on one: none of them is our placed file.
         return False
     try:
-        source_fd = os.open(os.fspath(src), os.O_RDONLY | os.O_CLOEXEC)
+        source_fd = os.open(os.fspath(src), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         os.close(entry_fd)
         return False
     try:
         entry_stat = os.fstat(entry_fd)
         source_stat = os.fstat(source_fd)
-        if not stat.S_ISREG(entry_stat.st_mode):
+        if not stat.S_ISREG(entry_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
             return False
         if (entry_stat.st_dev, entry_stat.st_ino) == (source_stat.st_dev, source_stat.st_ino):
             return True
@@ -424,6 +444,82 @@ def _idempotent_or_conflict(src: Path, dir_fd: int, name: str, display: str) -> 
     if _entry_matches_source(src, dir_fd, name):
         return False
     raise FileExistsError(f"destination already exists with different content: {display}")
+
+
+def _entry_identity(dir_fd: int, name: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of ``name`` relative to ``dir_fd``, or ``None`` if it does
+    not exist. ``follow_symlinks=False``: the identity of the ENTRY itself, so a
+    symlink standing where the file should be never borrows its target's identity."""
+    try:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _verify_lexical_publication(
+    root: Path, dst: Path, parent_fd: int, name: str, *, placed: bool
+) -> None:
+    """Prove the LEXICAL ``dst`` names the very inode just published, or fail closed.
+
+    The second half of GHSA-r5vh, and the half the descriptor walk alone cannot
+    supply. Holding a directory descriptor stops the publish from FOLLOWING a
+    replacement symlink, but it does not pin the opened directory's position in the
+    namespace: an unprivileged local actor can ``rename`` the verified title/show/
+    season directory to a writable spot outside the library and drop a symlink at the
+    original name. The publish then proceeds correctly through the held descriptor --
+    into a directory that is no longer in the library. The bytes land outside every
+    configured root while the caller records the in-root path as its breadcrumb, so
+    the correction, eviction and purge paths address something that names nothing (or,
+    later, attacker-controlled content) and the escaped media can never be reached.
+
+    So once the entry is fully placed, the lexical path is re-resolved from a FRESHLY
+    opened root descriptor by the same no-follow component walk (creating nothing --
+    verification must never build the tree it is checking) and the entry found there
+    is compared by ``(st_dev, st_ino)`` against the entry behind the descriptor we
+    actually wrote through. Equal is the only success: the breadcrumb the caller is
+    about to persist provably names this inode, inside the root. Anything else --
+    a different inode, a vanished path, a symlinked or missing ancestor -- means the
+    tree moved mid-publication, so a file THIS call created is unlinked through the
+    held descriptor (the only handle that still reaches it) and the whole publish is
+    refused as the same visible, retryable :class:`LocalFileSystemError` the
+    ancestor-symlink refusal raises. A file this call did NOT create (the idempotent
+    match) is never unlinked -- it is not ours to remove -- but the publish is refused
+    just the same, because the breadcrumb would be equally wrong.
+
+    Residual window, deliberately not closed here: a rename landing AFTER this check
+    but before the caller commits its breadcrumb cannot be distinguished, by any
+    means POSIX offers, from an operator moving that folder a second later. There is
+    no primitive that pins a directory's name for the duration of a database
+    transaction, so re-checking at commit time would only shift the window, not shut
+    it. Past this point a moved library directory is an ordinary post-import mutation
+    and belongs to the reconciler, which re-derives library paths from what is on disk.
+    What this function guarantees is the property the reconciler needs to start from:
+    a breadcrumb is never born already pointing outside the root.
+    """
+    placed_identity = _entry_identity(parent_fd, name)
+    lexical_identity: tuple[int, int] | None = None
+    if placed_identity is not None:
+        try:
+            with _anchored_publication(root, dst, create_missing=False) as (verify_fd, verify_name):
+                lexical_identity = _entry_identity(verify_fd, verify_name)
+        except (OSError, LocalFileSystemError):
+            # A missing/symlinked/non-directory ancestor on the way back down is
+            # itself the escape being detected -- not a separate error to surface.
+            lexical_identity = None
+    if placed_identity is not None and placed_identity == lexical_identity:
+        return
+    rolled_back = False
+    if placed:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=parent_fd)
+            rolled_back = True
+    undone = "; the placed file was removed" if rolled_back else ""
+    raise LocalFileSystemError(
+        f"refusing to publish {os.fspath(dst)!r}: the destination directory was moved "
+        "out from under the publication -- the path no longer names the file that was "
+        f"placed (containment could not be guaranteed){undone}"
+    )
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -663,6 +759,14 @@ class LocalFileSystem:
         redirect such a re-check onto a same-content decoy outside the root, and the
         caller would record an in-root breadcrumb for it.
 
+        Placement is followed by :func:`_verify_lexical_publication`: success is
+        reported only when the lexical ``dst``, re-walked no-follow from a fresh
+        ``root`` descriptor, resolves to the exact inode just placed. A directory
+        descriptor cannot keep the directory it refers to inside the library — the
+        verified season directory can be RENAMED out and a symlink left in its place —
+        so without that check a correct publish through the descriptor could still land
+        outside every root while the caller stored the in-root path.
+
         A cross-device link raises ``OSError`` (``EXDEV``); some filesystems also
         reject hardlinks with ``EPERM``. Either way we fall back to a metadata-
         preserving copy rather than failing the import.
@@ -677,7 +781,7 @@ class LocalFileSystem:
                 # POST /queue/{id}/import retry) that won the placement race. Checked
                 # BEFORE the cross-device branch below — EEXIST must never be masked
                 # as cross-device into an overwriting copy.
-                return _idempotent_or_conflict(src, parent_fd, name, display)
+                placed = _idempotent_or_conflict(src, parent_fd, name, display)
             except OSError as exc:
                 # Only a genuine cross-device / hardlink-unsupported failure warrants a
                 # copy. Any other errno is surfaced.
@@ -689,8 +793,16 @@ class LocalFileSystem:
                 try:
                     self._copy_no_overwrite(src, dst, parent_fd, name)
                 except FileExistsError:
-                    return _idempotent_or_conflict(src, parent_fd, name, display)
-            return True
+                    placed = _idempotent_or_conflict(src, parent_fd, name, display)
+                else:
+                    placed = True
+            else:
+                placed = True
+            # Success is reported ONLY once the lexical destination is proven to name
+            # the inode just placed: the held descriptor cannot stop the directory it
+            # points at from being renamed out of the library underneath it.
+            _verify_lexical_publication(root, dst, parent_fd, name, placed=placed)
+            return placed
 
     def remove_published(self, dst: Path, *, root: Path) -> None:
         """Remove a file this adapter published at ``dst`` beneath ``root``.
