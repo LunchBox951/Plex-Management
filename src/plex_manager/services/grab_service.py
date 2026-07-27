@@ -595,6 +595,138 @@ async def _attached_target_scopes(
     return True
 
 
+async def _resolve_same_hash_owner(
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    torrent_hash: str,
+    *,
+    request_id: int,
+    season: int,
+    episodes: list[int] | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+    target_seasons: tuple[int, ...],
+    qbt: DownloadClientPort | None,
+    actually_added: bool,
+) -> DownloadRecord:
+    """Settle a lost post-add season CAS without deleting a torrent someone owns.
+
+    Losing that CAS is most often another caller ALREADY COMMITTING this hash:
+    advancing the season to ``downloading`` is exactly what makes the swap match zero
+    rows. ``actually_added`` cannot tell that apart from a genuine orphan --
+    ``qbt.add`` reported ``created`` BEFORE any ownership of the hash was durable, so
+    a winner that committed across that await leaves this grab holding a stale
+    creator's claim on a torrent that is now tracked and live (#480). A live owner is
+    reported (it already carries every target scope) or refused, never cleaned up.
+
+    A TERMINAL row is not proof of an orphan either, and a plain read of one is not a
+    claim: terminal rows are explicitly REUSABLE (:func:`_reuse_terminal_row`), so
+    between the read and the delete a fresh grab can re-own the row, commit it back to
+    ``downloading`` and start relying on the very torrent this call then destroys with
+    its files -- #480 recreated one step later. The reservation is therefore the shared
+    removal claim (#206): registered BEFORE the decision and held across the delete, it
+    is the only thing that makes a racing reuse REFUSE instead of race, and it is
+    released as soon as the removal settles so the row stays plainly reusable
+    afterwards. ``lock_if_terminal`` then re-decides terminality as a conditional
+    ``UPDATE`` rather than a snapshot read, which is what serializes a reuse CAS
+    already in flight ahead of this decision instead of leaving it invisible.
+
+    Raises :class:`RequestNotActiveError` whenever no owner can honestly report this
+    grab's targets as tracked.
+    """
+    owner = await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+    if owner is not None and owner.status not in _TERMINAL_STATUS_VALUES:
+        return await _converge_on_same_hash_owner(
+            session,
+            download_repo,
+            owner,
+            request_id=request_id,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+            target_seasons=target_seasons,
+        )
+    if owner is None:  # pragma: no cover - download rows are never hard-deleted
+        # No row at all: there is nothing for a reuse to resurrect, so no claim can be
+        # taken -- and none is needed. The torrent this grab created is orphaned.
+        if qbt is not None:
+            await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="an attached TV scope moved on mid-grab",
+            )
+        raise RequestNotActiveError(request_id)
+
+    # Terminal, so reusable. Nothing above awaits between the read and this claim, so
+    # no reuse can pass its own guard unclaimed: from here every ``_reuse_terminal_row``
+    # (and the pre-add gate) refuses this row until the removal settles.
+    queue_service.register_removal_in_flight(owner.id)
+    try:
+        still_terminal = await download_repo.lock_if_terminal(owner.id)
+        # The claim, not the row lock, is what keeps the row un-reusable for the rest of
+        # this call -- so release the lock rather than hold it across client I/O.
+        await session.rollback()
+        if not still_terminal:
+            reowned = await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            if reowned is not None and reowned.status not in _TERMINAL_STATUS_VALUES:
+                return await _converge_on_same_hash_owner(
+                    session,
+                    download_repo,
+                    reowned,
+                    request_id=request_id,
+                    season=season,
+                    episodes=episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
+                    target_seasons=target_seasons,
+                )
+        if qbt is not None:
+            await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="an attached TV scope moved on mid-grab",
+            )
+    finally:
+        queue_service.release_removal_in_flight(owner.id)
+    raise RequestNotActiveError(request_id)
+
+
+async def _converge_on_same_hash_owner(
+    session: AsyncSession,
+    download_repo: SqlDownloadRepository,
+    owner: DownloadRecord,
+    *,
+    request_id: int,
+    season: int,
+    episodes: list[int] | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+    target_seasons: tuple[int, ...],
+) -> DownloadRecord:
+    """Report a live same-hash owner's row, or refuse honestly.
+
+    Converges like the collision loser in
+    :func:`_attach_target_scopes_to_existing_download`: the owner's row is reported
+    only once it demonstrably carries every target scope. Otherwise it owns the hash
+    but not this grab's full scope -- and a season it already moved can never be
+    re-CASed out of ``downloading`` -- so refuse rather than report untracked targets
+    as success. Either way the owner's torrent is left untouched.
+    """
+    if await _attached_target_scopes(
+        session,
+        download_repo,
+        download_id=owner.id,
+        request_id=request_id,
+        season=season,
+        episodes=episodes,
+        scope_episodes_by_season=scope_episodes_by_season,
+        target_seasons=target_seasons,
+    ):
+        return owner
+    raise RequestNotActiveError(request_id)
+
+
 async def _attach_target_scopes_to_existing_download(
     session: AsyncSession,
     download_repo: SqlDownloadRepository,
@@ -672,46 +804,18 @@ async def _attach_target_scopes_to_existing_download(
             )
             if not moved:
                 await session.rollback()
-                # Losing this CAS is most often another caller ALREADY COMMITTING
-                # this hash: advancing the season to ``downloading`` is exactly what
-                # makes the swap match zero rows. ``actually_added`` cannot tell the
-                # two apart -- ``qbt.add`` reported ``created`` BEFORE any ownership
-                # of the hash was durable, so a winner that committed across that
-                # await leaves this grab holding a stale creator's claim on a torrent
-                # that is now tracked and live (#480). Re-read the committed row and
-                # only treat the torrent as an orphan when nothing non-terminal still
-                # tracks it; a winner's copy is never ours to delete.
-                owner = await download_repo.get_by_hash(
-                    existing.torrent_hash, populate_existing=True
+                return await _resolve_same_hash_owner(
+                    session,
+                    download_repo,
+                    existing.torrent_hash,
+                    request_id=request_id,
+                    season=season,
+                    episodes=episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
+                    target_seasons=target_seasons,
+                    qbt=qbt,
+                    actually_added=actually_added,
                 )
-                if owner is not None and owner.status not in _TERMINAL_STATUS_VALUES:
-                    if await _attached_target_scopes(
-                        session,
-                        download_repo,
-                        download_id=owner.id,
-                        request_id=request_id,
-                        season=season,
-                        episodes=episodes,
-                        scope_episodes_by_season=scope_episodes_by_season,
-                        target_seasons=target_seasons,
-                    ):
-                        # Converge like the collision loser below: the winner already
-                        # carries every target scope, so report its row.
-                        return owner
-                    # It owns the hash but not this grab's full scope, and a season
-                    # it already moved can never be re-CASed out of ``downloading``
-                    # -- refuse honestly rather than report untracked targets as
-                    # success, leaving the winner's torrent untouched.
-                    raise RequestNotActiveError(request_id)
-                if qbt is not None:
-                    await _remove_torrent_if_added(
-                        qbt,
-                        existing.torrent_hash,
-                        actually_added=actually_added,
-                        request_id=request_id,
-                        reason="an attached TV scope moved on mid-grab",
-                    )
-                raise RequestNotActiveError(request_id)
         # Re-assert the torrent's physical-coverage claims over its full footprint
         # (targets AND ride-alongs) on this per-season re-grab too (#456).
         await _claim_covered_seasons(

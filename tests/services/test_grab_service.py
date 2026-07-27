@@ -1940,6 +1940,261 @@ async def test_grab_still_removes_its_orphan_when_no_committed_owner_remains(
         await engine.dispose()
 
 
+class _ReuseSameHashDuringRemoveQbt(_CommitSameHashOwnerDuringAddQbt):
+    """``remove`` lets a THIRD grab re-own the hash's terminal row before the delete
+    lands -- the check-to-delete window. Terminal rows are explicitly reusable, so a
+    point-in-time "nothing tracks it" read is not a claim on the torrent."""
+
+    def __init__(self, sm: SessionMaker, scored: ScoredRelease, request_id: int) -> None:
+        super().__init__(sm, scored, request_id)
+        self.reuse_record: DownloadRecord | None = None
+        self.reuse_refused = False
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        async with self._sm() as session:
+            try:
+                # ``pre_existing``: this grab's own add resolves to the torrent the
+                # loser created, so its cleanups never remove it -- only the loser's
+                # delete below is under test.
+                self.reuse_record = await grab_service.grab(
+                    FakeQbittorrent(pre_existing={info_hash.lower()}),
+                    session,
+                    scored=self._scored,
+                    request_id=self._request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+            except TorrentRemovalInFlightError:
+                self.reuse_refused = True
+        await super().remove(info_hash, delete_files=delete_files)
+
+
+async def test_grab_reserves_the_hash_before_deleting_its_orphan(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ownership re-check is a READ; terminal rows are reusable, so between it and
+    the delete a fresh grab can re-own the row and start relying on the torrent -- and
+    then have its files destroyed, recreating #480 one step later. The cleanup must
+    hold the shared removal claim across that window so reuse refuses (#206's guard)
+    instead of committing a live row over data this call is deleting."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_reuse_during_delete.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "c" * 40
+        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _ReuseSameHashDuringRemoveQbt(sm, scored, request_id)
+
+        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
+        terminalized = False
+
+        async def terminalize_before_ownership_check(
+            self: grab_service.SqlDownloadRepository,
+            torrent_hash: str,
+            *,
+            populate_existing: bool = False,
+        ) -> DownloadRecord | None:
+            nonlocal terminalized
+            if populate_existing and not terminalized:
+                terminalized = True
+                async with sm() as other_session:
+                    winner = qbt.winner
+                    assert winner is not None
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        winner.id,
+                        "failed",
+                        frozenset({"downloading"}),
+                    )
+                    assert moved
+                    await other_session.commit()
+            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
+        )
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+
+        assert terminalized
+        assert qbt.reuse_refused  # the racing grab was told to retry, not handed the row
+        assert qbt.reuse_record is None
+        async with sm() as session:
+            row = (
+                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
+            ).scalar_one()
+        # No row is left claiming a torrent this call deleted with its files.
+        assert row.status == "failed"
+        assert (pack_hash, True) in qbt.removed
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_rechecks_terminality_against_an_in_flight_reuse(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reuse CAS already in flight when the ownership read ran is invisible to that
+    snapshot read, so terminality is re-decided by the conditional UPDATE that
+    serializes behind it. Modelled by committing the reuse exactly at the probe: the
+    torrent now backs a live row and must survive."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_reuse_at_probe.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "b" * 40
+        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
+
+        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
+        real_lock_if_terminal = grab_service.SqlDownloadRepository.lock_if_terminal
+        terminalized = False
+        reused = False
+
+        async def terminalize_before_ownership_check(
+            self: grab_service.SqlDownloadRepository,
+            torrent_hash: str,
+            *,
+            populate_existing: bool = False,
+        ) -> DownloadRecord | None:
+            nonlocal terminalized
+            if populate_existing and not terminalized:
+                terminalized = True
+                async with sm() as other_session:
+                    winner = qbt.winner
+                    assert winner is not None
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        winner.id,
+                        "failed",
+                        frozenset({"downloading"}),
+                    )
+                    assert moved
+                    await other_session.commit()
+            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
+
+        async def reuse_commits_at_the_probe(
+            self: grab_service.SqlDownloadRepository, download_id: int
+        ) -> bool:
+            nonlocal reused
+            if not reused:
+                reused = True
+                async with sm() as other_session:
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        download_id,
+                        "downloading",
+                        frozenset({"failed"}),
+                    )
+                    assert moved
+                    await other_session.commit()
+            return await real_lock_if_terminal(self, download_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "lock_if_terminal", reuse_commits_at_the_probe
+        )
+        async with sm() as session:
+            record = await grab_service.grab(
+                qbt,
+                session,
+                scored=scored,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+        assert terminalized
+        assert reused
+        assert qbt.removed == []  # the re-owned torrent keeps its data
+        assert qbt.winner is not None
+        assert record.id == qbt.winner.id
+        async with sm() as session:
+            row = (
+                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
+            ).scalar_one()
+        assert row.status == "downloading"
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_releases_the_removal_claim_after_its_orphan_cleanup(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claim is a window, not a lease: once the delete settles the row is plainly
+    reusable again, so a later grab must succeed rather than retry forever."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_claim_released.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "d" * 40
+        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
+
+        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
+        terminalized = False
+
+        async def terminalize_before_ownership_check(
+            self: grab_service.SqlDownloadRepository,
+            torrent_hash: str,
+            *,
+            populate_existing: bool = False,
+        ) -> DownloadRecord | None:
+            nonlocal terminalized
+            if populate_existing and not terminalized:
+                terminalized = True
+                async with sm() as other_session:
+                    winner = qbt.winner
+                    assert winner is not None
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        winner.id,
+                        "failed",
+                        frozenset({"downloading"}),
+                    )
+                    assert moved
+                    await other_session.commit()
+            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
+        )
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+        assert terminalized
+        monkeypatch.undo()
+
+        winner = qbt.winner
+        assert winner is not None
+        assert not queue_service.removal_in_flight(winner.id)
+        async with sm() as session:
+            record = await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=scored,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+        assert record.id == winner.id
+        assert record.status == "downloading"
+    finally:
+        await engine.dispose()
+
+
 async def test_grab_fresh_multi_season_pack_returns_all_attached_scopes(
     sessionmaker_: SessionMaker,
 ) -> None:
