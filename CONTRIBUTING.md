@@ -6,10 +6,10 @@ standard. This guide covers the dev workflow.
 ## Prerequisites
 
 - Python **3.12+**
-- Node.js **22.13+ on the 22 line, or Node.js 24+** with npm (Node 24 LTS
-  recommended). The floor is set by the locked frontend toolchain (ESLint
-  10.6, jsdom 29.1, the Vite 8.1 React plugin); `frontend/package.json`'s
-  `engines` field enforces this exact range.
+- Node.js **22.22.2+ on the 22 line, 24.15+ on the 24 line, or Node.js 26+**
+  with npm (Node 26 LTS recommended). The floor is set by the locked frontend
+  toolchain (jsdom 30, ESLint 10.8, the Vite 8.1 React plugin);
+  `frontend/package.json`'s `engines` field enforces this exact range.
 - FFmpeg (`ffprobe` is used to validate completed video files before import)
 - Docker (for building/running the container)
 - `make` (optional, for the shortcuts below)
