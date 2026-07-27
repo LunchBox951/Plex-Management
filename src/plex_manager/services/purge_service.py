@@ -180,6 +180,10 @@ class _AbandonableThreadPermit:
 
 _ABANDONABLE_DELETE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_DELETE_THREAD_LIMIT)
 _ABANDONABLE_PROBE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_PROBE_THREAD_LIMIT)
+# Correction-path content probes are bounded, best-effort reads that must not be
+# starved by public dashboard/telemetry probes (issue #496). They also remain
+# isolated from destructive corrections, which use the DELETE budget above.
+_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_PROBE_THREAD_LIMIT)
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -1252,7 +1256,11 @@ class _ProbeBoundExceeded(Exception):
 async def _probe_within_bound[T](
     operation: Callable[[], T], path: str, *, operation_name: str, bound: float
 ) -> T:
-    """Run one abandonable PROBE-budget read of ``path`` under a ``bound``-second cap.
+    """Run one correction-path probe under a ``bound``-second cap.
+
+    Correction-path probes use their own permit budget so wedged public health,
+    telemetry, and disk probes cannot starve a ``remove_torrent`` correction
+    (issue #496). The deadline behavior otherwise matches the shared substrate.
 
     Raises :class:`_ProbeBoundExceeded` — and ONLY then — when the bound elapses with
     the probe still unanswered. ``operation``'s own result and exceptions are
@@ -1275,7 +1283,10 @@ async def _probe_within_bound[T](
         raise _ProbeBoundExceeded
     probe = asyncio.ensure_future(
         _run_abandonable_probe(
-            operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+            operation,
+            path,
+            operation_name=operation_name,
+            gate=_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE,
         )
     )
     try:
@@ -1304,8 +1315,8 @@ async def _bounded_content_probe[T](
     DISTINCTLY — an unanswered mount and a read that failed fast are different
     operator facts (:class:`_ProbeBoundExceeded`).
 
-    The worker runs on the shared read-only PROBE budget
-    (:data:`_ABANDONABLE_PROBE_THREAD_LIMIT`) rather than via
+    The worker runs on the correction-only read-only probe budget
+    (:data:`_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE`) rather than via
     ``asyncio.to_thread``: these are ordinary best-effort reads, not a destructive
     correction's preflight, and a default-executor worker wedged on a dead mount is
     rejoined at interpreter teardown, defeating the web lifespan's bounded shutdown
@@ -1382,7 +1393,7 @@ async def _visible_content_path(
     rather than checking the wrong path — when there is no live ``save_path``
     anchor, when ``list_files`` itself fails (a client hiccup here must not
     block the removal that's about to happen regardless), or when the remap
-    proves no candidate, fails, or exhausts the shared bound below.
+    proves no candidate, fails, or exhausts the correction-only bound below.
 
     Every filesystem read here is mount-sensitive and runs BEFORE ``qbt.remove``, so
     together they draw ONE ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` budget

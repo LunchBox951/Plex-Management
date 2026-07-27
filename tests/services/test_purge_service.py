@@ -319,6 +319,49 @@ async def test_saturated_probe_budget_does_not_block_a_full_purge_correction(
         release.set()
 
 
+async def test_saturated_shared_probe_budget_does_not_block_a_correction_path_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #496: the bounded probes on ``remove_torrent``'s correction path
+    must draw a correction-only budget, so unrelated wedged public probes cannot
+    prevent the correction from reading its content path and proceeding."""
+    shared_probe_gate = _CountingThreadGate(1)
+    correction_probe_gate = _CountingThreadGate(1)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", shared_probe_gate)
+    monkeypatch.setattr(
+        purge_service,
+        "_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE",
+        correction_probe_gate,
+        raising=False,
+    )
+    wedged = _WedgedProbe(value=0)
+    shared_probe = asyncio.create_task(
+        purge_service.run_abandonable_probe(
+            wedged, str(tmp_path / "wedged"), operation_name="health poll"
+        )
+    )
+    try:
+        assert await asyncio.to_thread(wedged.started.wait, 2.0)
+        shared_probe.cancel()
+        await assert_task_raises(shared_probe, asyncio.CancelledError)
+
+        result = await asyncio.wait_for(
+            purge_service._bounded_content_probe(  # pyright: ignore[reportPrivateUsage]
+                lambda: True,
+                str(tmp_path / "correction-content"),
+                operation_name="content path visibility probe",
+                timeout=0.2,
+            ),
+            timeout=1.0,
+        )
+
+        assert result is True
+        assert shared_probe_gate.acquired == 1
+        assert correction_probe_gate.acquired == 1
+    finally:
+        wedged.release.set()
+
+
 async def test_detached_probe_worker_failure_is_retrieved_and_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
