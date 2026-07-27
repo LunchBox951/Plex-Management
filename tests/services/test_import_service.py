@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -22,11 +22,17 @@ from typing import Literal
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
+from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.quality_profile import default_profile
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
@@ -57,6 +63,7 @@ from plex_manager.services import (
     path_visibility,
     purge_service,
     queue_service,
+    season_request_service,
 )
 from plex_manager.services.import_service import (
     import_download,
@@ -3292,6 +3299,197 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
         request = await session.get(MediaRequest, request_id)
     assert season_row is not None and season_row.status.value == "completed"
     assert request is not None and request.status is RequestStatus.completed  # stays "Finalizing"
+
+
+# --------------------------------------------------------------------------- #
+# run_availability_cycle — the stale-promotion race against a Report Issue
+# re-arm (issue #479), driven by two REAL sessions over a file-backed engine
+# --------------------------------------------------------------------------- #
+
+
+async def _file_backed_sessionmaker(tmp_path: Path, name: str) -> tuple[SessionMaker, AsyncEngine]:
+    """A real file-backed engine (two sessions = two real connections)."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return async_sessionmaker(engine, expire_on_commit=False), engine
+
+
+class _BlockingPresenceLibrary(FakeLibrary):
+    """Hold the availability pass between its completed-row snapshot and its write.
+
+    ``present_ids`` (movies) and ``season_presence`` (TV) are the awaited Plex
+    round-trips that open the stale-promotion window; pausing inside them puts a
+    concurrent report-issue re-arm exactly where issue #479 places it.
+    """
+
+    def __init__(
+        self,
+        *,
+        available: set[int] | None = None,
+        available_tv_seasons: dict[int, frozenset[int]] | None = None,
+    ) -> None:
+        super().__init__(available=available, available_tv_seasons=available_tv_seasons)
+        self.entered_check = asyncio.Event()
+        self.resume_check = asyncio.Event()
+
+    async def _pause(self) -> None:
+        self.entered_check.set()
+        await asyncio.wait_for(self.resume_check.wait(), timeout=5)
+
+    async def present_ids(
+        self,
+        keys: Sequence[tuple[int, Literal["movie", "tv"]]],
+        *,
+        refresh_absent: bool = False,
+    ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
+        await self._pause()
+        return await super().present_ids(keys, refresh_absent=refresh_absent)
+
+    async def season_presence(self, tmdb_ids: Collection[int]) -> Mapping[int, frozenset[int]]:
+        await self._pause()
+        return await super().season_presence(tmdb_ids)
+
+
+async def test_availability_promotion_never_overwrites_a_movie_report_issue_rearm(
+    tmp_path: Path,
+) -> None:
+    """Issue #479: the cycle snapshots a ``completed`` movie, then blocks on Plex.
+    Report Issue commits the re-arm to ``searching`` inside that window. The
+    positive Plex answer must NOT flip the correction back to ``available``: the
+    conditional promotion loses, nothing is counted promoted, and the row keeps
+    the honest re-armed state with no availability anchors."""
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_movie.db")
+    try:
+        _download_id, request_id = await _seed(
+            sessionmaker_,
+            request_status=RequestStatus.completed,
+            download_status=DownloadState.Imported.value,
+        )
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await SqlRequestRepository(session).reset_for_research(
+                request_id, clear_library_path=False
+            )
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.searching
+        assert request.library_verified_at is None
+        assert request.completed_at is None
+    finally:
+        await engine.dispose()
+
+
+async def test_availability_promotion_never_overwrites_a_season_report_issue_rearm(
+    tmp_path: Path,
+) -> None:
+    """Issue #479, season twin: the lost CAS must also skip the parent rollup
+    recompute -- recomputing off a promotion that did not happen would push the
+    stale ``available`` one level up onto the show."""
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_season.db")
+    try:
+        _download_id, request_id, season_id = await _seed_tv(
+            sessionmaker_,
+            season=1,
+            request_status=RequestStatus.completed,
+            season_status="completed",
+            download_status=DownloadState.Imported.value,
+        )
+        library = _BlockingPresenceLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await season_request_service.reset_for_research(
+                session, media_request_id=request_id, season_number=1, clear_library_path=False
+            )
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            season_row = await session.get(SeasonRequest, season_id)
+            request = await session.get(MediaRequest, request_id)
+        assert season_row is not None and season_row.status is RequestStatus.searching
+        assert request is not None and request.status is RequestStatus.searching
+    finally:
+        await engine.dispose()
+
+
+async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #479 follow-up: a row that sat unconfirmed long enough to be WARNED
+    about carries bounded-Finalizing bookkeeping (a duty-cycle bucket). Once the
+    promotion CAS loses to a Report Issue re-arm, that bucket describes content
+    the row no longer holds, and it must not survive to mis-measure the
+    REPLACEMENT -- a retained bucket would silently swallow the fresh row's own
+    first warning.
+
+    The end-of-cycle sweep cannot be relied on to do this: it only forgets a key
+    that is ABSENT from some tick's completed set, and the re-armed row can be
+    stamped back to ``completed`` by the import pass (which runs BEFORE this one
+    in the same reconcile tick, via an unconditional ``mark_completed``) before
+    any tick ever snapshots it absent. So this asserts the drop happens while the
+    key is STILL in this very tick's completed snapshot -- i.e. the lost-CAS
+    branch dropped it, not the sweep, which by construction could not have.
+    """
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_forget.db")
+    try:
+        request_id = await _seed_movie_request(
+            sessionmaker_,
+            tmdb_id=_TMDB_ID,
+            library_path="/media/Movies/Obsession (2026)",
+            completed_at=datetime.now(UTC) - timedelta(minutes=45),
+        )
+        # Tick 1: neither the GUID batch nor the path fallback confirms the row,
+        # so it is warned about and starts carrying a duty-cycle bucket.
+        with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+            async with sessionmaker_() as session:
+                await run_availability_cycle(
+                    library=FakeLibrary(movie_file_paths=[]), session=session
+                )
+        assert any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+        assert import_service.is_movie_unconfirmed_tracked(request_id)
+
+        # Tick 2: Plex finally says yes, but Report Issue commits the re-arm
+        # inside the awaited round-trip, so the promotion CAS loses.
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await SqlRequestRepository(session).reset_for_research(
+                request_id, clear_library_path=False
+            )
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        assert not import_service.is_movie_unconfirmed_tracked(request_id)
+    finally:
+        await engine.dispose()
 
 
 # --------------------------------------------------------------------------- #
