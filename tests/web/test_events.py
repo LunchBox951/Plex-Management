@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 import httpx
@@ -567,16 +567,24 @@ async def test_events_stream_closes_at_idle_deadline(
             return False
         raise AssertionError(f"unexpected waiter call {wait_calls}")
 
+    deadline_now = datetime(2026, 7, 26, tzinfo=UTC)
+
     async def _idle_soon_admin() -> AuthContext:
-        now = datetime.now(UTC)
         return AuthContext(
             method=AuthMethod.plex_session,
             user_id=78,
             is_admin=True,
-            session_expires_at=now + timedelta(days=30),
-            session_idle_deadline=now + timedelta(seconds=5),
+            session_expires_at=deadline_now + timedelta(days=30),
+            session_idle_deadline=deadline_now + timedelta(seconds=5),
         )
 
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is UTC
+            return deadline_now
+
+    monkeypatch.setattr(events_router, "datetime", _FixedDatetime)
     app.dependency_overrides[require_admin_short_session] = _idle_soon_admin
     monkeypatch.setattr(events_router, "_monotonic", _fake_monotonic)
     monkeypatch.setattr(events_router, "_wait_for_getter", _fake_wait_for_getter)
@@ -592,7 +600,7 @@ async def test_events_stream_closes_at_idle_deadline(
         app.dependency_overrides.pop(require_admin_short_session, None)
 
     assert wait_calls == 2
-    assert timeouts[0] == pytest.approx(5.0, abs=0.1)
+    assert timeouts[0] == 5.0
     assert 0.0 < timeouts[0] < events_router._HEARTBEAT_SECONDS  # pyright: ignore[reportPrivateUsage]
     await _wait_subscribers_zero(app)
 
