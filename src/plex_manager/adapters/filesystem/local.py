@@ -274,9 +274,9 @@ def _non_regular_source_message(src: Path, display: str) -> str:
 
 def _publish_link_no_overwrite(
     src: Path, source_fd: int, dir_fd: int, name: str, display: str
-) -> None:
+) -> tuple[int, int]:
     """Publish the file behind ``source_fd`` at ``name`` (relative to ``dir_fd``) via an
-    exclusive hardlink.
+    exclusive hardlink, returning the published inode's ``(st_dev, st_ino)``.
 
     ``os.link`` takes a PATHNAME, and ``linkat(AT_EMPTY_PATH)`` -- the only way to link
     a descriptor directly -- needs ``CAP_DAC_READ_SEARCH`` this process does not have.
@@ -292,10 +292,15 @@ def _publish_link_no_overwrite(
     never deleted (see the refusal below).
     """
     source_info = os.fstat(source_fd)
+    source_identity = (source_info.st_dev, source_info.st_ino)
     with _publish_lock(dir_fd, name, display):
         os.link(os.fspath(src), name, dst_dir_fd=dir_fd)
-        if _entry_identity(dir_fd, name) == (source_info.st_dev, source_info.st_ino):
-            return
+        if _entry_identity(dir_fd, name) == source_identity:
+            # The entry we linked IS the proven-regular source inode -- that identity,
+            # captured here at publication time, is what the lexical verifier must find
+            # the destination path resolving to (never a fresh re-stat, which a later
+            # swap would move in lockstep with the lexical resolution and defeat).
+            return source_identity
     # Identity mismatch: the entry now at ``name`` is NOT the inode proven regular
     # before the link. ``os.link`` succeeding proved WE created ``name`` AT LINK TIME,
     # but the ``_entry_identity`` stat above happens later, and a mismatch has two
@@ -477,14 +482,28 @@ def _fd_digest(fd: int) -> bytes:
     return digest.digest()
 
 
-def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
-    """Whether the entry already at ``name`` (relative to ``dir_fd``) holds exactly
-    ``src``'s bytes -- the idempotent-re-import decision.
+def _entry_matches_source(source_fd: int, dir_fd: int, name: str) -> tuple[int, int] | None:
+    """The identity ``(st_dev, st_ino)`` of the entry already at ``name`` (relative to
+    ``dir_fd``) IFF it holds exactly the bytes behind ``source_fd`` -- else ``None``.
+    The idempotent-re-import decision, returning the matched inode's identity so the
+    caller can thread it into :func:`_verify_lexical_publication` as the identity this
+    publication resolved to.
 
-    Answered while the publish walk's VERIFIED parent descriptor is still held, never
-    by a pathname re-check afterwards: an ancestor swapped in between the refused
-    exclusive create and such a re-check re-resolves the whole chain, so a decoy of
-    the right size and content sitting outside the library would be accepted as "our
+    Compared against the HELD ``source_fd`` -- the descriptor :func:`_open_regular_source`
+    already proved regular and ``hardlink_or_copy`` still owns -- never a fresh pathname
+    ``open(src)``. A re-open by name is a second TOCTOU: an actor who pre-places matching
+    destination bytes and swaps ``src`` to those same bytes in the window between the
+    proof and this compare would make the re-open read the decoy, match the destination,
+    and report a false idempotent success -- finalizing and scanning attacker-chosen
+    content (GHSA-r5vh). Reading the held descriptor instead compares the destination
+    against the very inode validation proved regular, which a source-path swap cannot
+    touch. It also cannot block: the held descriptor is already open, so the FIFO-swap
+    hang the fresh open risked is gone too.
+
+    Answered while the publish walk's VERIFIED parent descriptor is still held, never by
+    a pathname re-check of the destination afterwards: an ancestor swapped in between the
+    refused exclusive create and such a re-check re-resolves the whole chain, so a decoy
+    of the right size and content sitting outside the library would be accepted as "our
     file is already there" and the pipeline would finalize an out-of-root breadcrumb
     (GHSA-r5vh).
 
@@ -500,7 +519,7 @@ def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
     import worker on a path an unprivileged local actor can plant with ``mkfifo``.
     Every non-regular entry (FIFO, socket, device, directory, symlink) is simply not
     our file, so it resolves as the ordinary ``FileExistsError`` conflict the operator
-    can see and correct. ``O_NONBLOCK`` on the opens that follow is the belt-and-braces
+    can see and correct. ``O_NONBLOCK`` on the open that follows is the belt-and-braces
     for the residual window between the ``fstatat`` and the open (a swap in between):
     the open returns immediately whatever now sits there, and the ``fstat`` on the
     resulting descriptor -- the authoritative check, made on the very object being read
@@ -509,9 +528,9 @@ def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
     try:
         entry_info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except OSError:
-        return False
+        return None
     if not stat.S_ISREG(entry_info.st_mode):
-        return False
+        return None
     try:
         entry_fd = os.open(
             name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd
@@ -519,41 +538,48 @@ def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
     except OSError:
         # ELOOP (a symlink entry), ENOENT (it vanished), EACCES, a directory on a
         # platform that refuses O_RDONLY on one: none of them is our placed file.
-        return False
-    try:
-        source_fd = os.open(os.fspath(src), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
-        os.close(entry_fd)
-        return False
+        return None
     try:
         entry_stat = os.fstat(entry_fd)
         source_stat = os.fstat(source_fd)
-        if not stat.S_ISREG(entry_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
-            return False
-        if (entry_stat.st_dev, entry_stat.st_ino) == (source_stat.st_dev, source_stat.st_ino):
-            return True
+        if not stat.S_ISREG(entry_stat.st_mode):
+            return None
+        entry_identity = (entry_stat.st_dev, entry_stat.st_ino)
+        if entry_identity == (source_stat.st_dev, source_stat.st_ino):
+            return entry_identity
         if entry_stat.st_size != source_stat.st_size:
-            return False
-        return _fd_digest(entry_fd) == _fd_digest(source_fd)
+            return None
+        if _fd_digest(entry_fd) == _fd_digest(source_fd):
+            return entry_identity
+        return None
     except OSError:
         # A read error part-way through is not proof of a match -- fall back to the
         # honest conflict rather than reporting an idempotent skip we cannot justify.
-        return False
+        return None
     finally:
         os.close(entry_fd)
-        os.close(source_fd)
 
 
-def _idempotent_or_conflict(src: Path, dir_fd: int, name: str, display: str) -> bool:
-    """Resolve a refused exclusive create into the publish result: ``False`` (the
-    entry already there is byte-identical -- someone else placed our file) or a raised
-    ``FileExistsError`` naming the conflict for the operator to resolve.
+def _idempotent_or_conflict(
+    source_fd: int, dir_fd: int, name: str, display: str
+) -> tuple[int, int]:
+    """Resolve a refused exclusive create into the publish result: the ``(st_dev,
+    st_ino)`` of the byte-identical entry already there (someone else placed our file
+    -- an idempotent win) or a raised ``FileExistsError`` naming the conflict for the
+    operator to resolve.
 
-    Never returns ``True``: this call did not create the entry, so its caller must not
-    treat the file as theirs to roll back.
+    The returned identity is the inode this publication resolved to; the caller threads
+    it into :func:`_verify_lexical_publication` so the lexical path is proven to name
+    THAT inode, exactly as the create paths thread the inode they linked or wrote. The
+    match is decided against the held ``source_fd`` (never a fresh ``open(src)``), so a
+    ``src`` swapped to decoy bytes after validation cannot manufacture a false match.
+
+    The caller must not treat the returned entry as theirs to roll back: this call did
+    not create it. (``hardlink_or_copy`` records ``placed=False`` on this path.)
     """
-    if _entry_matches_source(src, dir_fd, name):
-        return False
+    identity = _entry_matches_source(source_fd, dir_fd, name)
+    if identity is not None:
+        return identity
     raise FileExistsError(f"destination already exists with different content: {display}")
 
 
@@ -569,7 +595,13 @@ def _entry_identity(dir_fd: int, name: str) -> tuple[int, int] | None:
 
 
 def _verify_lexical_publication(
-    root: Path, dst: Path, parent_fd: int, name: str, *, placed: bool
+    root: Path,
+    dst: Path,
+    parent_fd: int,
+    name: str,
+    published_identity: tuple[int, int],
+    *,
+    placed: bool,
 ) -> None:
     """Prove the LEXICAL ``dst`` names the very inode just published, or fail closed.
 
@@ -587,16 +619,35 @@ def _verify_lexical_publication(
     So once the entry is fully placed, the lexical path is re-resolved from a FRESHLY
     opened root descriptor by the same no-follow component walk (creating nothing --
     verification must never build the tree it is checking) and the entry found there
-    is compared by ``(st_dev, st_ino)`` against the entry behind the descriptor we
-    actually wrote through. Equal is the only success: the breadcrumb the caller is
-    about to persist provably names this inode, inside the root. Anything else --
-    a different inode, a vanished path, a symlinked or missing ancestor -- means the
-    tree moved mid-publication, so a file THIS call created is unlinked through the
-    held descriptor (the only handle that still reaches it) and the whole publish is
-    refused as the same visible, retryable :class:`LocalFileSystemError` the
-    ancestor-symlink refusal raises. A file this call did NOT create (the idempotent
-    match) is never unlinked -- it is not ours to remove -- but the publish is refused
-    just the same, because the breadcrumb would be equally wrong.
+    is compared by ``(st_dev, st_ino)`` against ``published_identity`` -- the identity
+    of the inode this call ACTUALLY published, captured by the placement step at
+    publication time (the source inode the hardlink proved, the temp inode the copy
+    wrote, or the byte-identical entry the idempotent match resolved to). It is NOT a
+    fresh re-stat of ``name`` taken here: a writer who replaces the destination between
+    the placement helper returning and this verifier running would have BOTH a fresh
+    re-stat AND the lexical resolution describe the replacement, so they would compare
+    equal and the caller would record and scan the wrong file with ``placed=True``. The
+    captured identity is pinned to the bytes we wrote, so the only way the lexical path
+    equals it is if the path genuinely still names our inode. Equal is the only success:
+    the breadcrumb the caller is about to persist provably names this inode, inside the
+    root. Anything else -- a different inode, a vanished path, a symlinked or missing
+    ancestor -- means the tree moved (or was swapped) mid-publication, and the whole
+    publish is refused as the same visible, retryable :class:`LocalFileSystemError` the
+    ancestor-symlink refusal raises.
+
+    On that refusal a file THIS call created is rolled back through the held descriptor
+    -- but ONLY when the entry still at ``name`` is provably the one we published
+    (``_entry_identity(parent_fd, name) == published_identity``). This mirrors
+    :func:`_publish_link_no_overwrite`'s refuse-without-unlinking exactly: a writer can
+    replace ``name`` after the identity comparison above but before this rollback, and
+    an entry whose ownership can no longer be proven is NEVER deleted -- unlinking it
+    would destroy a third party's file. A file this call did NOT create (the idempotent
+    match) is never unlinked either; both refuse just the same, because the breadcrumb
+    would be equally wrong. The residual when the guard declines to unlink is an
+    in-root orphan (a hardlink cannot cross filesystems and ``name`` is under the
+    verified ``parent_fd``) whose breadcrumb is never persisted -- reconciler territory,
+    exactly as documented in :func:`_publish_link_no_overwrite`; NOT the ancestor-escape
+    GHSA-r5vh concerns, and strictly safer than a wrong delete.
 
     Residual window, deliberately not closed here: a rename landing AFTER this check
     but before the caller commits its breadcrumb cannot be distinguished, by any
@@ -608,20 +659,20 @@ def _verify_lexical_publication(
     What this function guarantees is the property the reconciler needs to start from:
     a breadcrumb is never born already pointing outside the root.
     """
-    placed_identity = _entry_identity(parent_fd, name)
     lexical_identity: tuple[int, int] | None = None
-    if placed_identity is not None:
-        try:
-            with _anchored_publication(root, dst, create_missing=False) as (verify_fd, verify_name):
-                lexical_identity = _entry_identity(verify_fd, verify_name)
-        except (OSError, LocalFileSystemError):
-            # A missing/symlinked/non-directory ancestor on the way back down is
-            # itself the escape being detected -- not a separate error to surface.
-            lexical_identity = None
-    if placed_identity is not None and placed_identity == lexical_identity:
+    try:
+        with _anchored_publication(root, dst, create_missing=False) as (verify_fd, verify_name):
+            lexical_identity = _entry_identity(verify_fd, verify_name)
+    except (OSError, LocalFileSystemError):
+        # A missing/symlinked/non-directory ancestor on the way back down is
+        # itself the escape being detected -- not a separate error to surface.
+        lexical_identity = None
+    if lexical_identity == published_identity:
         return
+    # Refusing. Roll back ONLY a file we created AND can still prove we own: a swap of
+    # ``name`` after the comparison above must not turn this into a third-party delete.
     rolled_back = False
-    if placed:
+    if placed and _entry_identity(parent_fd, name) == published_identity:
         with contextlib.suppress(OSError):
             os.unlink(name, dir_fd=parent_fd)
             rolled_back = True
@@ -900,14 +951,19 @@ class LocalFileSystem:
             source_fd = _open_regular_source(src, display)
             try:
                 try:
-                    _publish_link_no_overwrite(src, source_fd, parent_fd, name, display)
+                    published_identity = _publish_link_no_overwrite(
+                        src, source_fd, parent_fd, name, display
+                    )
                 except FileExistsError:
                     # Something is already at dst: a prior fully-imported copy, or a
                     # concurrent import (the reconcile loop racing the operator's
                     # POST /queue/{id}/import retry) that won the placement race. Checked
                     # BEFORE the cross-device branch below — EEXIST must never be masked
                     # as cross-device into an overwriting copy.
-                    placed = _idempotent_or_conflict(src, parent_fd, name, display)
+                    published_identity = _idempotent_or_conflict(
+                        source_fd, parent_fd, name, display
+                    )
+                    placed = False
                 except OSError as exc:
                     # Only a genuine cross-device / hardlink-unsupported failure warrants
                     # a copy. Any other errno is surfaced.
@@ -917,9 +973,14 @@ class LocalFileSystem:
                     # copy actually consumes space, so preflight that the destination
                     # filesystem can hold the source before writing a partial file.
                     try:
-                        self._copy_no_overwrite(src, dst, source_fd, parent_fd, name)
+                        published_identity = self._copy_no_overwrite(
+                            src, dst, source_fd, parent_fd, name
+                        )
                     except FileExistsError:
-                        placed = _idempotent_or_conflict(src, parent_fd, name, display)
+                        published_identity = _idempotent_or_conflict(
+                            source_fd, parent_fd, name, display
+                        )
+                        placed = False
                     else:
                         placed = True
                 else:
@@ -927,9 +988,13 @@ class LocalFileSystem:
             finally:
                 os.close(source_fd)
             # Success is reported ONLY once the lexical destination is proven to name
-            # the inode just placed: the held descriptor cannot stop the directory it
-            # points at from being renamed out of the library underneath it.
-            _verify_lexical_publication(root, dst, parent_fd, name, placed=placed)
+            # the exact inode this call published — the identity captured AT publication
+            # time, not a fresh re-stat: the held descriptor cannot stop the directory it
+            # points at from being renamed out of the library underneath it, and a fresh
+            # re-stat would move in lockstep with a destination the attacker replaced.
+            _verify_lexical_publication(
+                root, dst, parent_fd, name, published_identity, placed=placed
+            )
             return placed
 
     def remove_published(self, dst: Path, *, root: Path) -> None:
@@ -965,7 +1030,18 @@ class LocalFileSystem:
 
     def _copy_no_overwrite(
         self, src: Path, dst: Path, source_fd: int, parent_fd: int, name: str
-    ) -> None:
+    ) -> tuple[int, int]:
+        """Publish a cross-device copy at ``name``, returning the published inode's
+        ``(st_dev, st_ino)``.
+
+        The identity is captured from the TEMP descriptor while it is still held, before
+        the temp is linked/renamed into ``name`` -- and ``link``/``rename`` preserve the
+        inode, so the temp's identity IS the published entry's identity. Capturing it
+        from the descriptor we wrote through (never a fresh stat of ``name`` afterwards)
+        is what lets :func:`_verify_lexical_publication` fail closed if a writer replaces
+        the destination between publication and verification: a fresh re-stat would move
+        with the replacement, but this captured identity is pinned to the bytes we wrote.
+        """
         # Sized from the proven-regular descriptor, not a fresh pathname stat: the
         # preflight, the bytes copied and the completeness check below must all be
         # about the same inode, or a source swapped mid-import turns a short copy into
@@ -992,6 +1068,10 @@ class LocalFileSystem:
         try:
             with os.fdopen(tmp_fd, "wb") as target:
                 _copy_contents(source_fd, target)
+                # Captured from the descriptor we wrote through, while we still hold it:
+                # link/rename below preserve this inode, so it IS the published entry.
+                temp_info = os.fstat(tmp_fd)
+            published_identity = (temp_info.st_dev, temp_info.st_ino)
             # Verify the copy is complete before exposing it at the final path.
             copied_size = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False).st_size
             if copied_size != src_size:
@@ -1001,6 +1081,7 @@ class LocalFileSystem:
                 )
             _publish_temp_no_overwrite(parent_fd, tmp_name, name, os.fspath(dst))
             published = True
+            return published_identity
         finally:
             # The copy target is a temp entry in the destination directory, never
             # the final name, so a process crash cannot leave a partial library file

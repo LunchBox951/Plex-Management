@@ -688,20 +688,28 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
-    calls: list[bool] = []
+    calls: list[tuple[bool, tuple[int, int]]] = []
     real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
 
     def _spy(
-        verify_root: Path, verify_dst: Path, parent_fd: int, name: str, *, placed: bool
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        placed: bool,
     ) -> None:
-        calls.append(placed)
-        real_verify(verify_root, verify_dst, parent_fd, name, placed=placed)
+        calls.append((placed, published_identity))
+        real_verify(verify_root, verify_dst, parent_fd, name, published_identity, placed=placed)
 
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _spy)
 
     assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is True
 
-    assert calls == [True]  # ran once, for the file this call placed
+    # Ran once, for the file this call placed, and was handed the identity captured at
+    # publication time -- the very inode the source was hardlinked to.
+    assert calls == [(True, (src.stat().st_dev, src.stat().st_ino))]
     assert dst.read_text() == "payload"
     # ...and the property it asserted actually holds: the lexical path names the inode.
     assert dst.stat().st_ino == src.stat().st_ino
@@ -888,6 +896,166 @@ def test_hardlink_or_copy_refuses_without_unlinking_a_third_party_entry_swap(
 
     # The third party's file was NOT unlinked -- it survives with its own bytes.
     assert dst.read_bytes() == b"third-party file"
+
+
+def test_hardlink_or_copy_idempotency_compares_held_source_not_a_reopened_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, the idempotent-retry window (Finding 1): on ``EEXIST`` the existing
+    destination must be compared against the descriptor :func:`_open_regular_source`
+    already proved regular -- NEVER a fresh ``open(src)`` by pathname.
+
+    An actor pre-places arbitrary destination bytes, then swaps ``src`` to a NEW inode
+    holding those same bytes in the window between the proof and the compare. A re-open
+    by name would read the decoy, match the destination, and report a false idempotent
+    success -- finalizing and scanning attacker-chosen content. Reading the held
+    descriptor sees the ORIGINAL inode's bytes, so the decoy never matches and the
+    publish is refused as an honest conflict. Pre-fix this returned ``False`` (a false
+    idempotent win); the fix RAISES."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"original-payload")  # the validated bytes, behind the held fd
+    dst = title / "The Matrix (1999).mkv"
+    # Pre-placed by the actor: same length, DIFFERENT bytes -> the link fails EEXIST and
+    # the idempotency compare runs.
+    dst.write_bytes(b"decoy-aaaaaaaaaa")
+
+    real_open = local_fs._open_regular_source  # pyright: ignore[reportPrivateUsage]
+
+    def _open_then_swap_source(swap_src: Path, display: str) -> int:
+        fd = real_open(swap_src, display)  # holds the ORIGINAL inode (original-payload)
+        # The source PATH is repointed to a new inode whose bytes equal the decoy, in
+        # the window before the idempotency compare. The held fd keeps the old inode.
+        planted = tmp_path / "planted.mkv"
+        planted.write_bytes(b"decoy-aaaaaaaaaa")
+        os.rename(planted, src)
+        return fd
+
+    monkeypatch.setattr(local_fs, "_open_regular_source", _open_then_swap_source)
+
+    # A false idempotent success would RETURN False (no exception); the fix REFUSES.
+    with pytest.raises(FileExistsError, match="already exists with different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The decoy was never adopted as "ours" -- it is left untouched for the operator.
+    assert dst.read_bytes() == b"decoy-aaaaaaaaaa"
+
+
+def test_hardlink_or_copy_idempotent_retry_still_matches_identical_prior_placement(
+    tmp_path: Path,
+) -> None:
+    """The held-descriptor compare must not break the legitimate retry: a prior attempt
+    that already placed exactly these bytes (an independent copy -- a different inode) is
+    still recognized as an idempotent win (``False``), not a spurious conflict."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"identical-bytes!")
+    dst = title / "The Matrix (1999).mkv"
+    dst.write_bytes(b"identical-bytes!")  # a true prior placement, same bytes, diff inode
+
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is False
+    assert dst.read_bytes() == b"identical-bytes!"
+
+
+def test_hardlink_or_copy_verifier_rejects_destination_replaced_before_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, Finding 2: a writer replaces the destination AFTER the placement helper
+    returns but BEFORE the verifier runs.
+
+    A verifier that re-STATS the placed entry here would see the replacement, and so
+    would the lexical resolution -- the two would compare equal and the call would report
+    the wrong file as placed. Comparing the lexical path against the identity captured at
+    PUBLICATION time catches the swap instead. Pre-fix this returned ``True`` (a false
+    success on attacker content); the fix RAISES and reports nothing placed."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    dst = title / "The Matrix (1999).mkv"
+
+    real_publish = local_fs._publish_link_no_overwrite  # pyright: ignore[reportPrivateUsage]
+
+    def _publish_then_replace(
+        publish_src: Path, source_fd: int, dir_fd: int, name: str, display: str
+    ) -> object:
+        # Placement completes normally; THEN a writer replaces our entry with a different
+        # regular file (same directory, no escape) before the verifier runs.
+        result = real_publish(publish_src, source_fd, dir_fd, name, display)
+        os.unlink(name, dir_fd=dir_fd)
+        replacement_fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+        try:
+            os.write(replacement_fd, b"attacker-chosen")
+        finally:
+            os.close(replacement_fd)
+        return result
+
+    monkeypatch.setattr(local_fs, "_publish_link_no_overwrite", _publish_then_replace)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The swapped-in file was neither adopted as placed nor (it is not ours) unlinked.
+    assert dst.read_bytes() == b"attacker-chosen"
+
+
+def test_hardlink_or_copy_verifier_rollback_never_unlinks_a_third_party_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, Finding 3: the verifier's rollback carries the same hazard already
+    fixed in :func:`_publish_link_no_overwrite`.
+
+    The verified season directory escapes the library (forcing the rollback branch), and
+    a third party replaces our placed entry with its own file before the rollback unlink.
+    An unconditional unlink would destroy the third party's file. The fix rolls back ONLY
+    when the entry is still provably the inode we published, and otherwise REFUSES WITHOUT
+    UNLINKING -- an entry whose ownership can no longer be proven is never deleted (the
+    residual is an in-root orphan whose breadcrumb is never persisted -- reconciler
+    territory, not the ancestor-escape GHSA-r5vh concerns). Pre-fix the rollback deleted
+    the third party's file."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped_dir = outside / "Season 01.real"
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    dst = season / "Some Show - S01E01.mkv"
+
+    real_publish = local_fs._publish_link_no_overwrite  # pyright: ignore[reportPrivateUsage]
+
+    def _publish_then_escape_and_swap(
+        publish_src: Path, source_fd: int, dir_fd: int, name: str, display: str
+    ) -> object:
+        result = real_publish(publish_src, source_fd, dir_fd, name, display)
+        # The verified directory leaves the library (its held descriptor still reaches
+        # it), so the lexical re-walk hits a symlink and the verifier enters rollback.
+        season.rename(escaped_dir)
+        season.symlink_to(escaped_dir)
+        # A third party replaces OUR placed file with its own, via the held descriptor --
+        # the window the rollback unlink must not act blindly in.
+        os.unlink(name, dir_fd=dir_fd)
+        replacement_fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+        try:
+            os.write(replacement_fd, b"third-party file")
+        finally:
+            os.close(replacement_fd)
+        return result
+
+    monkeypatch.setattr(local_fs, "_publish_link_no_overwrite", _publish_then_escape_and_swap)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The third party's file SURVIVES -- the rollback refused to unlink an entry it could
+    # no longer prove it owned (pre-fix, the unconditional unlink deleted it).
+    assert (escaped_dir / dst.name).read_bytes() == b"third-party file"
 
 
 @pytest.mark.parametrize("maker", ["directory", "symlink"], ids=["directory", "symlink"])
