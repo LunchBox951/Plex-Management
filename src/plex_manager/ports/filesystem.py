@@ -42,8 +42,19 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        Returns ``True`` iff THIS call created ``dst``, and ``False`` when an entry
+        holding exactly ``src``'s bytes was already there (an idempotent re-import,
+        or a concurrent import that won the placement race). A DIFFERENT file at
+        ``dst`` is raised as ``FileExistsError`` -- never overwritten, and never
+        reported as placed. Callers roll ``dst`` back only on ``True``, so the
+        already/identical answer decides whether a file is theirs to delete; it MUST
+        therefore be computed against the same verified destination directory the
+        publish attempt used, never by a second pathname lookup the caller makes
+        afterwards (an ancestor swapped in between would answer for a file outside
+        the root -- GHSA-r5vh).
 
         ``dst`` MUST lie beneath ``root`` -- the library root the caller selected
         for this title (the ADR-0015 anime root, or the normal one). Implementations
@@ -58,6 +69,24 @@ class FileSystemPort(Protocol):
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline
         report a file as placed without writing or linking anything.
+        """
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
+        """Remove a file :meth:`hardlink_or_copy` published at ``dst`` beneath ``root``.
+
+        The rollback counterpart of :meth:`hardlink_or_copy`, for the import that
+        placed a file and then failed a later step (a Plex scan error). It carries
+        the SAME containment obligation, for the same reason: implementations MUST
+        open every component below ``root`` without following symlinks and MUST
+        REFUSE (raise) a symlinked or non-directory ancestor. A plain pathname
+        unlink re-resolves the whole chain, so a title/season directory renamed and
+        replaced by a symlink after publication would send the rollback outside every
+        configured root and delete an unrelated same-named file there (GHSA-r5vh,
+        CWE-59) while leaving the published file behind.
+
+        A ``dst`` (or an ancestor) that no longer exists is a no-op, not an error --
+        rollback runs on failure paths that may already have been partly applied.
         """
         raise NotImplementedError
 

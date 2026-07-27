@@ -470,21 +470,25 @@ class _LosingRaceFs(LocalFileSystem):
         super().__init__()
         self._winner_size = winner_size
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
         _make_video(dst, self._winner_size)
-        raise FileExistsError(str(dst))
+        # Delegate so the REAL adapter meets the winner's file and makes the
+        # already-there-and-identical call itself: that decision now happens behind
+        # the publish walk's descriptor, and a fake that short-circuits it would
+        # assert nothing about the code the pipeline actually runs.
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 class _WrongSameSizeFs(LocalFileSystem):
     """Loses placement to a same-size but different file."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
         dst.parent.mkdir(parents=True, exist_ok=True)
         size = os.path.getsize(src)
         with dst.open("wb") as handle:
             handle.seek(size - 1)
             handle.write(b"x")
-        raise FileExistsError(str(dst))
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 async def _import_with_fs(
@@ -618,6 +622,63 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
     assert record.status == DownloadState.ImportBlocked.value
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
     assert not dst.exists(), "a file THIS import placed must be rolled back on scan failure"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _SwapsAncestorAfterPlacementFs(LocalFileSystem):
+    """Publishes normally, then renames the movie-title directory away and drops a
+    symlink out of the library in its place -- the post-publication window in which a
+    pathname rollback resolves somewhere the publish never wrote."""
+
+    def __init__(self, outside: Path) -> None:
+        super().__init__()
+        self._outside = outside
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        placed = super().hardlink_or_copy(src, dst, root=root)
+        title_dir = dst.parent
+        title_dir.rename(title_dir.parent / f"{title_dir.name}.real")
+        title_dir.symlink_to(self._outside)
+        return placed
+
+
+async def test_scan_failure_rollback_never_unlinks_through_a_swapped_ancestor(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, CWE-59: the movie-title directory is renamed away and replaced by an
+    out-of-root symlink AFTER the file is published. Rolling the placement back by
+    pathname re-resolves through that link and unlinks an unrelated same-named file
+    outside every configured root, while leaving the published file behind. The
+    anchored rollback refuses instead, and the import still blocks honestly."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "The Matrix (1999).mkv"
+    victim.write_text("someone else's file")
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        _ScanFailsLibrary(),
+        _SwapsAncestorAfterPlacementFs(outside),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert victim.read_text() == "someone else's file"
+    assert (movies_root / "The Matrix (1999).real" / "The Matrix (1999).mkv").exists()
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
@@ -1774,20 +1835,6 @@ def test_place_file_refuses_symlinked_destination_ancestor(tmp_path: Path) -> No
         )
 
     assert list(outside.iterdir()) == []
-
-
-def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
-    """``_same_file_content`` must not raise ``FileNotFoundError`` on a dangling
-    symlink dst -- it is honestly NOT the same content as a real src file."""
-    src = tmp_path / "src.mkv"
-    src.write_text("payload")
-    dst = tmp_path / "dst.mkv"
-    dst.symlink_to(tmp_path / "gone.mkv")
-
-    assert (
-        import_service._same_file_content(str(src), dst)  # pyright: ignore[reportPrivateUsage]
-        is False
-    )
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(
@@ -3645,11 +3692,11 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
-        super().hardlink_or_copy(src, dst, root=root)
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(

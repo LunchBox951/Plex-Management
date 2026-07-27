@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import os
 import threading
@@ -755,77 +754,47 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> bool:
     to resolve, so a re-import never silently overwrites someone else's file.
 
     ``root`` (the selected library root) is handed to the adapter, which creates the
-    destination's directories and publishes the file anchored to no-follow directory
-    descriptors below it. Neither the directory creation nor the "is something
-    already here?" decision may be made by pathname up here: an ancestor that is a
+    destination's directories, publishes the file, and decides "is something already
+    here, and is it ours?" — all anchored to no-follow directory descriptors below
+    that root. NONE of it may be done by pathname up here: an ancestor that is a
     symlink out of the library would make ``os.makedirs`` publish outside every
-    configured root, and would make a pathname existence check report on a file that
-    is not in the library at all (GHSA-r5vh). Both now happen fd-relative inside
-    ``hardlink_or_copy``, which refuses such an ancestor outright; the checks below
-    run only once that walk has proved every ancestor a real directory.
+    configured root, and would make a pathname existence/content check answer for a
+    file that is not in the library at all — including one swapped in AFTER the
+    adapter refused the exclusive create (GHSA-r5vh).
+    """
+    return fs.hardlink_or_copy(Path(src), dst, root=root)
+
+
+def _remove_quietly(fs: FileSystemPort, path: Path, root: Path) -> None:
+    """Best-effort rollback of a file THIS attempt placed, when a later step fails.
+
+    Routed through the adapter's descriptor-anchored removal rather than
+    ``Path.unlink``: a pathname unlink re-resolves every ancestor, so a title/season
+    directory renamed and replaced by a symlink after publication would send the
+    rollback outside ``root`` and delete an unrelated same-named file there
+    (GHSA-r5vh, CWE-59). A refusal there means the tree changed underneath us — the
+    file stays on disk, which a later retry re-adopts, and deleting nothing beats
+    deleting someone else's file.
+
+    Failures are logged and swallowed, never raised: every caller is already blocking
+    the import for the failure that triggered this rollback, and raising here would
+    replace that honest, retryable block with an unhandled error.
     """
     try:
-        fs.hardlink_or_copy(Path(src), dst, root=root)
-    except FileExistsError:
-        # Something is already at ``dst``: a prior fully-imported copy, or a
-        # concurrent import (the reconcile loop racing the operator's
-        # POST /queue/{id}/import retry) that won the placement race. Same content
-        # (same size + digest) is an idempotent win for the other attempt, NOT a
-        # failure to block on. A differently-sized file is a user's manually-managed
-        # library file, or a title Plex availability missed: NEVER blind-delete it
-        # (that is data loss) — surface it as an import conflict the operator
-        # resolves, instead of overwriting their file with the download.
-        #
-        # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
-        # absent (GHSA-8fj8), which would report "nothing there" for an entry the
-        # adapter just refused to publish over.
-        if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
-            return False  # the race winner's file — not ours to roll back
-        raise FileExistsError(f"destination already exists with different content: {dst}") from None
-    return True  # we created dst; a later failure may roll it back
+        fs.remove_published(path, root=root)
+    except (OSError, LocalFileSystemError) as exc:
+        _logger.warning("could not roll back placed file %s: %s", path, exc)
 
 
-def _file_digest(path: str | Path) -> bytes:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.digest()
-
-
-def _same_file_content(src: str, dst: Path) -> bool:
-    # samefile is only the cheap same-inode short-circuit; on any OSError (a side
-    # not stat-able) fall through to the honest size + digest comparison below.
-    with contextlib.suppress(OSError):
-        if os.path.samefile(src, dst):
-            return True
-    try:
-        dst_size = dst.stat().st_size
-    except OSError:
-        # A dangling symlink (or dst vanished between the lexists check and here)
-        # is NOT our identical file -- never raise FileNotFoundError out of a
-        # content check; the caller surfaces this as an honest conflict instead.
-        return False
-    if dst_size != os.path.getsize(src):
-        return False
-    return _file_digest(src) == _file_digest(dst)
-
-
-def _remove_quietly(path: Path) -> None:
-    """Best-effort unlink (rolling back a placed file when a later step fails)."""
-    with contextlib.suppress(OSError):
-        path.unlink()
-
-
-def _remove_quietly_many(paths: list[Path]) -> None:
-    """Best-effort unlink of every path THIS call placed (TV scan-failure rollback).
+def _remove_quietly_many(fs: FileSystemPort, paths: list[Path], root: Path) -> None:
+    """Best-effort rollback of every path THIS call placed (TV scan-failure rollback).
 
     Unlike the movie path's single ``dst``, a season import can place several
     episode files before its one combined scan fails; each is rolled back the
     same best-effort way.
     """
     for path in paths:
-        _remove_quietly(path)
+        _remove_quietly(fs, path, root)
 
 
 # Per-download serialization. The reconcile loop and an operator's
@@ -1555,7 +1524,7 @@ async def _import_download_locked(
             # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
             owns_placement = placed or row.download_path == str(dst)
             if owns_placement:
-                await asyncio.to_thread(_remove_quietly, dst)
+                await asyncio.to_thread(_remove_quietly, fs, dst, Path(effective_movies_root))
             await _block(
                 session,
                 download_repo,
@@ -1908,7 +1877,7 @@ async def _import_tv_targets_locked(
                 try:
                     placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
                 except (FileExistsError, LocalFileSystemError, OSError) as exc:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                     reason = (
                         str(exc)
                         if isinstance(exc, FileExistsError | LocalFileSystemError)
@@ -1929,7 +1898,7 @@ async def _import_tv_targets_locked(
                 try:
                     await library.trigger_scan(str(plan.season_dir), "tv")
                 except (PlexLibraryError, PlexAuthError) as exc:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                     failures.append(
                         _TvImportFailure(plan.target, f"plex scan failed: {type(exc).__name__}")
                     )
@@ -2438,7 +2407,7 @@ async def _import_tv_locked(
             try:
                 placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
             except (FileExistsError, LocalFileSystemError, OSError) as exc:
-                await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                 reason = (
                     str(exc)
                     if isinstance(exc, FileExistsError | LocalFileSystemError)
@@ -2469,7 +2438,7 @@ async def _import_tv_locked(
         try:
             await library.trigger_scan(str(season_dir), "tv")
         except (PlexLibraryError, PlexAuthError) as exc:
-            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
             await _block(
                 session,
                 download_repo,

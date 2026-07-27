@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import os
 import shutil
 import stat
@@ -33,6 +34,11 @@ __all__ = ["LocalFileSystem", "LocalFileSystemError"]
 _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
     {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
 )
+
+#: Read size for the destination-vs-source digest comparison. Media files are large;
+#: this is the same 1 MiB chunk the import pipeline used before the comparison moved
+#: behind the publish walk's descriptor.
+_DIGEST_CHUNK_BYTES = 1024 * 1024
 
 #: Lowercased directory names whose contents are bonus material, not the main
 #: feature — skipped entirely when picking the largest video.
@@ -251,7 +257,9 @@ _PUBLICATION_CONTAINMENT_SUPPORTED: bool = (
 )
 
 
-def _open_or_create_child_dir(parent_fd: int, component: str, display: str) -> int:
+def _open_or_create_child_dir(
+    parent_fd: int, component: str, display: str, *, create_missing: bool, action: str
+) -> int:
     """Open (creating it if absent) ``component`` inside ``parent_fd``, no-follow.
 
     ``O_NOFOLLOW | O_DIRECTORY`` is what makes this a containment primitive: an
@@ -260,36 +268,44 @@ def _open_or_create_child_dir(parent_fd: int, component: str, display: str) -> i
     SURFACED as a refusal. The ``mkdir`` is allowed to lose to a concurrent import
     creating the same season directory (``EEXIST``); the open that follows is what
     decides whether what now sits there is trustworthy.
+
+    ``create_missing=False`` is the REMOVAL walk (:meth:`LocalFileSystem.
+    remove_published`), which must never create the tree it is rolling back out of:
+    a missing component propagates its ``FileNotFoundError`` for the caller to treat
+    as "already gone".
     """
     flags = _PUBLISH_DIR_FLAGS | os.O_NOFOLLOW
     try:
         return os.open(component, flags, dir_fd=parent_fd)
     except FileNotFoundError:
-        pass
+        if not create_missing:
+            raise
     except OSError as exc:
-        _reraise_ancestor_failure(component, display, exc)
+        _reraise_ancestor_failure(component, display, exc, action)
     with contextlib.suppress(FileExistsError):
         os.mkdir(component, dir_fd=parent_fd)
     try:
         return os.open(component, flags, dir_fd=parent_fd)
     except OSError as exc:
-        _reraise_ancestor_failure(component, display, exc)
+        _reraise_ancestor_failure(component, display, exc, action)
 
 
-def _reraise_ancestor_failure(component: str, display: str, exc: OSError) -> NoReturn:
+def _reraise_ancestor_failure(component: str, display: str, exc: OSError, action: str) -> NoReturn:
     """Re-raise a destination ancestor's open failure: a symlink / non-directory is a
     containment breach and becomes a :class:`LocalFileSystemError`; anything else (a
     permission problem, a vanished mount) is surfaced unchanged."""
     if exc.errno in (errno.ELOOP, errno.ENOTDIR):
         raise LocalFileSystemError(
-            f"refusing to publish {display!r}: destination ancestor {component!r} is a "
+            f"refusing to {action} {display!r}: destination ancestor {component!r} is a "
             "symlink or non-directory (containment could not be guaranteed)"
         ) from exc
     raise exc
 
 
 @contextlib.contextmanager
-def _anchored_publication(root: Path, dst: Path) -> Generator[tuple[int, str], None, None]:
+def _anchored_publication(
+    root: Path, dst: Path, *, create_missing: bool = True, action: str = "publish"
+) -> Generator[tuple[int, str], None, None]:
     """Yield ``(parent_fd, leaf_name)`` for publishing ``dst`` beneath ``root``.
 
     The enforcement layer for GHSA-r5vh. ``root`` -- the library root the caller
@@ -312,27 +328,102 @@ def _anchored_publication(root: Path, dst: Path) -> Generator[tuple[int, str], N
 
     ``dst`` must lie beneath ``root``; a lexically escaping destination (``..``)
     is refused before any descriptor is opened.
+
+    ``create_missing=False`` walks without creating anything -- the removal side
+    (:meth:`LocalFileSystem.remove_published`), where a missing component means the
+    tree is already gone and raises ``FileNotFoundError`` rather than rebuilding it.
     """
     display = os.fspath(dst)
     if not _PUBLICATION_CONTAINMENT_SUPPORTED:
         raise LocalFileSystemError(
-            f"refusing to publish {display!r}: this platform cannot guarantee "
+            f"refusing to {action} {display!r}: this platform cannot guarantee "
             "fd-anchored, no-follow publication containment"
         )
     components = os.path.relpath(display, os.fspath(root)).split(os.sep)
     if os.pardir in components or components == [os.curdir]:
         raise LocalFileSystemError(
-            f"refusing to publish {display!r}: outside the library root {os.fspath(root)!r}"
+            f"refusing to {action} {display!r}: outside the library root {os.fspath(root)!r}"
         )
     dir_fd = os.open(os.fspath(root), _PUBLISH_DIR_FLAGS)
     try:
         for component in components[:-1]:
-            next_fd = _open_or_create_child_dir(dir_fd, component, display)
+            next_fd = _open_or_create_child_dir(
+                dir_fd, component, display, create_missing=create_missing, action=action
+            )
             os.close(dir_fd)
             dir_fd = next_fd
         yield dir_fd, components[-1]
     finally:
         os.close(dir_fd)
+
+
+def _fd_digest(fd: int) -> bytes:
+    """SHA-256 of the whole file behind ``fd``, read from its start."""
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, _DIGEST_CHUNK_BYTES):
+        digest.update(chunk)
+    return digest.digest()
+
+
+def _entry_matches_source(src: Path, dir_fd: int, name: str) -> bool:
+    """Whether the entry already at ``name`` (relative to ``dir_fd``) holds exactly
+    ``src``'s bytes -- the idempotent-re-import decision.
+
+    Answered while the publish walk's VERIFIED parent descriptor is still held, never
+    by a pathname re-check afterwards: an ancestor swapped in between the refused
+    exclusive create and such a re-check re-resolves the whole chain, so a decoy of
+    the right size and content sitting outside the library would be accepted as "our
+    file is already there" and the pipeline would finalize an out-of-root breadcrumb
+    (GHSA-r5vh).
+
+    The entry is opened ``O_NOFOLLOW``, so a symlink at the destination -- dangling
+    or not -- is never dereferenced and never counts as a match (GHSA-8fj8: it is a
+    present, conflicting entry, not an idempotent win). Same-inode is the cheap
+    short-circuit for the common case where a previous attempt already hardlinked
+    this very file; otherwise size must match before the bytes are digested.
+    """
+    try:
+        entry_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        # ELOOP (a symlink entry), ENOENT (it vanished), EACCES, a directory on a
+        # platform that refuses O_RDONLY on one: none of them is our placed file.
+        return False
+    try:
+        source_fd = os.open(os.fspath(src), os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        os.close(entry_fd)
+        return False
+    try:
+        entry_stat = os.fstat(entry_fd)
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(entry_stat.st_mode):
+            return False
+        if (entry_stat.st_dev, entry_stat.st_ino) == (source_stat.st_dev, source_stat.st_ino):
+            return True
+        if entry_stat.st_size != source_stat.st_size:
+            return False
+        return _fd_digest(entry_fd) == _fd_digest(source_fd)
+    except OSError:
+        # A read error part-way through is not proof of a match -- fall back to the
+        # honest conflict rather than reporting an idempotent skip we cannot justify.
+        return False
+    finally:
+        os.close(entry_fd)
+        os.close(source_fd)
+
+
+def _idempotent_or_conflict(src: Path, dir_fd: int, name: str, display: str) -> bool:
+    """Resolve a refused exclusive create into the publish result: ``False`` (the
+    entry already there is byte-identical -- someone else placed our file) or a raised
+    ``FileExistsError`` naming the conflict for the operator to resolve.
+
+    Never returns ``True``: this call did not create the entry, so its caller must not
+    treat the file as theirs to roll back.
+    """
+    if _entry_matches_source(src, dir_fd, name):
+        return False
+    raise FileExistsError(f"destination already exists with different content: {display}")
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -545,37 +636,92 @@ class LocalFileSystem:
 
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         """Move ``src`` to ``dst`` (beneath ``root``) without replacing an existing
-        destination file."""
+        destination file.
+
+        An already-identical destination still completes the move (``src`` is
+        removed): the bytes are where the caller asked for them, whichever call put
+        them there.
+        """
         self.hardlink_or_copy(src, dst, root=root)
         src.unlink()
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        Returns ``True`` iff THIS call created ``dst``; ``False`` when an entry
+        holding exactly ``src``'s bytes was already there. A different file at ``dst``
+        raises ``FileExistsError`` and is never overwritten.
 
         ``dst`` must lie beneath the library ``root`` the caller selected for this
         title, and every destination component below that root is created and
         opened no-follow relative to a held directory descriptor
         (:func:`_anchored_publication`) — a symlinked movie-title / show / season
-        ancestor is refused, never followed outside the root (GHSA-r5vh).
+        ancestor is refused, never followed outside the root (GHSA-r5vh). The
+        already-identical decision is made against that same held descriptor rather
+        than handed back to the caller as a bare ``FileExistsError`` to re-check by
+        pathname: an ancestor swapped in after the exclusive create was refused would
+        redirect such a re-check onto a same-content decoy outside the root, and the
+        caller would record an in-root breadcrumb for it.
 
         A cross-device link raises ``OSError`` (``EXDEV``); some filesystems also
         reject hardlinks with ``EPERM``. Either way we fall back to a metadata-
         preserving copy rather than failing the import.
         """
         with _anchored_publication(root, dst) as (parent_fd, name):
+            display = os.fspath(dst)
             try:
-                _publish_link_no_overwrite(src, parent_fd, name, os.fspath(dst))
+                _publish_link_no_overwrite(src, parent_fd, name, display)
+            except FileExistsError:
+                # Something is already at dst: a prior fully-imported copy, or a
+                # concurrent import (the reconcile loop racing the operator's
+                # POST /queue/{id}/import retry) that won the placement race. Checked
+                # BEFORE the cross-device branch below — EEXIST must never be masked
+                # as cross-device into an overwriting copy.
+                return _idempotent_or_conflict(src, parent_fd, name, display)
             except OSError as exc:
                 # Only a genuine cross-device / hardlink-unsupported failure warrants a
-                # copy. EEXIST (the destination already exists — e.g. a concurrent import
-                # won the race) or any other errno is surfaced, never silently masked as
-                # cross-device into an overwriting copy.
+                # copy. Any other errno is surfaced.
                 if exc.errno not in _COPY_FALLBACK_ERRNOS:
                     raise
                 # Cross-device (or hardlink-refusing) filesystem: copy instead. A
                 # copy actually consumes space, so preflight that the destination
                 # filesystem can hold the source before writing a partial file.
-                self._copy_no_overwrite(src, dst, parent_fd, name)
+                try:
+                    self._copy_no_overwrite(src, dst, parent_fd, name)
+                except FileExistsError:
+                    return _idempotent_or_conflict(src, parent_fd, name, display)
+            return True
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
+        """Remove a file this adapter published at ``dst`` beneath ``root``.
+
+        The rollback counterpart of :meth:`hardlink_or_copy`, and anchored exactly the
+        same way: every component below ``root`` is opened ``O_NOFOLLOW``, so a
+        title/season directory renamed away and replaced by a symlink AFTER the file
+        was published makes this refuse with :class:`LocalFileSystemError` instead of
+        unlinking an unrelated same-named file at the link's target. ``Path.unlink``
+        cannot do that — it re-resolves the whole chain and follows the swap
+        (GHSA-r5vh, CWE-59). The leaf is removed with ``unlinkat`` relative to the
+        verified descriptor, which never dereferences the final component, so a
+        symlink that appeared at ``dst`` loses only its own entry (matching
+        :meth:`delete`) and a directory there raises ``OSError`` rather than being
+        recursively deleted.
+
+        A missing ancestor or a missing ``dst`` is a no-op: rollback runs on failure
+        paths that may already be partly applied, and re-running must stay honest
+        rather than manufacture an error.
+        """
+        try:
+            with (
+                _anchored_publication(root, dst, create_missing=False, action="roll back") as (
+                    parent_fd,
+                    name,
+                ),
+                contextlib.suppress(FileNotFoundError),
+            ):
+                os.unlink(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return  # an ancestor is already gone -- nothing we placed remains there
 
     def _copy_no_overwrite(self, src: Path, dst: Path, parent_fd: int, name: str) -> None:
         src_size = src.stat().st_size

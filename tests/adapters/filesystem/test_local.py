@@ -1579,3 +1579,192 @@ def test_reclaimable_bytes_for_a_directory_skips_a_symlinked_file(tmp_path: Path
     # Only E01 (300 bytes, real single-linked file) counts; the symlinked E02
     # must NOT contribute its target's 900 bytes.
     assert LocalFileSystem().reclaimable_bytes(os.fspath(season_dir)) == 300
+
+
+def test_hardlink_or_copy_reports_placement_and_idempotent_skip(tmp_path: Path) -> None:
+    """The publish result the import pipeline's rollback ownership turns on: True the
+    first time, False when the very same bytes are already there."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is True
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is False
+
+
+def test_hardlink_or_copy_conflicts_on_a_same_size_different_file(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    dst.parent.mkdir(parents=True)
+    dst.write_text("PAYLOAD")  # same size, different bytes
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.read_text() == "PAYLOAD"  # never overwritten
+
+
+def test_hardlink_or_copy_never_treats_a_dangling_symlink_as_an_idempotent_skip(
+    tmp_path: Path,
+) -> None:
+    """GHSA-8fj8: a dangling symlink at dst reads as "absent" under ``exists()``. The
+    entry comparison opens ``O_NOFOLLOW``, so it is an honest conflict -- never a
+    "someone already placed our file" skip that would finalize a breadcrumb pointing
+    at nothing."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "dst.mkv"
+    target = root / "gone.mkv"  # never created
+    dst.symlink_to(target)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.is_symlink()
+    assert not target.exists()
+
+
+def test_hardlink_or_copy_idempotent_skip_ignores_a_swapped_in_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ancestor swap landing between the refused exclusive create and the
+    already-there-and-identical decision. That decision is made against the held
+    descriptor, so a same-content decoy planted outside the root can never be
+    mistaken for our destination and reported as an idempotent skip."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    dst.write_text("occupied")  # in-root: a DIFFERENT file -- an honest conflict
+    (outside / dst.name).write_text("payload")  # out-of-root decoy: same content
+    real_link = os.link
+
+    def _swap_after_eexist(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        try:
+            real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        except FileExistsError:
+            if title.is_dir() and not title.is_symlink():
+                title.rename(title.parent / "The Matrix (1999).real")
+                title.symlink_to(outside)
+            raise
+
+    monkeypatch.setattr(os, "link", _swap_after_eexist)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+
+def test_remove_published_unlinks_the_file_it_placed(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    fs.hardlink_or_copy(src, dst, root=root)
+
+    fs.remove_published(dst, root=root)
+
+    assert not dst.exists()
+    assert dst.parent.is_dir()  # only the file goes, never the season directory
+
+
+def test_remove_published_is_a_no_op_when_already_gone(tmp_path: Path) -> None:
+    """Rollback runs on failure paths that may already be partly applied; a missing
+    leaf OR a missing ancestor is an honest no-op, not an error."""
+    root = tmp_path / "library"
+    root.mkdir()
+    fs = LocalFileSystem()
+
+    fs.remove_published(root / "Show" / "Season 01" / "gone.mkv", root=root)
+    (root / "Show").mkdir()
+    fs.remove_published(root / "Show" / "gone.mkv", root=root)
+
+
+def test_remove_published_refuses_an_ancestor_swapped_after_publication(
+    tmp_path: Path,
+) -> None:
+    """GHSA-r5vh, CWE-59: publication legitimately completes into the directory whose
+    descriptor the walk verified, even when that directory is renamed away mid-publish.
+    Rolling that placement back by pathname afterwards would re-resolve through the
+    symlink left in its place and unlink an unrelated same-named file OUTSIDE the root.
+    The anchored removal refuses instead."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+    victim = outside / dst.name
+    victim.write_text("someone else's file")
+
+    # The swap the publish walk's descriptor rode out, now visible by pathname.
+    season.rename(season.parent / "Season 01.real")
+    season.symlink_to(outside)
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().remove_published(dst, root=root)
+
+    assert victim.read_text() == "someone else's file"
+    assert (season.parent / "Season 01.real" / dst.name).exists()
+
+
+def test_remove_published_refuses_a_destination_outside_the_root(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    escaped = tmp_path / "outside" / "escaped.mkv"
+    escaped.parent.mkdir()
+    escaped.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="outside the library root"):
+        LocalFileSystem().remove_published(escaped, root=root)
+
+    assert escaped.exists()
+
+
+def test_remove_published_refuses_when_platform_cannot_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_fs, "_PUBLICATION_CONTAINMENT_SUPPORTED", False)
+    dst = tmp_path / "dst.mkv"
+    dst.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
+        LocalFileSystem().remove_published(dst, root=tmp_path)
+
+    assert dst.exists()
+
+
+def test_hardlink_or_copy_conflicts_when_a_directory_occupies_the_destination(
+    tmp_path: Path,
+) -> None:
+    """A directory sitting where the media file belongs is a conflict for the operator
+    to resolve, never an idempotent skip -- only a REGULAR file can be the file a
+    previous attempt placed."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    dst.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.is_dir()  # left for the operator, never removed

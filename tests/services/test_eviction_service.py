@@ -2152,7 +2152,10 @@ class _SlowDeleteFileSystem:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
@@ -2768,7 +2771,10 @@ class _PinsSecondCandidateOnFirstDeleteFs:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
@@ -2907,7 +2913,10 @@ class _ConcurrentSecondEvictFs:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:

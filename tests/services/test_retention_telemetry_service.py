@@ -77,7 +77,10 @@ class _MappedReclaimFileSystem:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
