@@ -266,10 +266,10 @@ class UpdateCoordinationService:
         expected_generation: int,
         result: UpdateResult,
         error_code: str | None = None,
-        current_build: str | None | _UnsetValue = _UNSET,
-        current_digest: str | None | _UnsetValue = _UNSET,
-        available_build: str | None | _UnsetValue = _UNSET,
-        available_digest: str | None | _UnsetValue = _UNSET,
+        current_build: str | _UnsetValue | None = _UNSET,
+        current_digest: str | _UnsetValue | None = _UNSET,
+        available_build: str | _UnsetValue | None = _UNSET,
+        available_digest: str | _UnsetValue | None = _UNSET,
         preserve_action: bool = False,
     ) -> bool:
         """CAS-acknowledge a non-install action such as an image check."""
