@@ -1301,6 +1301,19 @@ async def _recover_rearmed_season(
     Returns whether this recovery destroyed data the sweep's pressure ledger has
     not accounted for (see :func:`_resume_one`).
     """
+    if purge_service.purge_in_progress(library_path):
+        _logger.info(
+            "deferring recovery of %r season %s: an operator correction holds an "
+            "active purge claim over its path",
+            _safe_title(title),
+            safe_int(pending.season_number),
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True

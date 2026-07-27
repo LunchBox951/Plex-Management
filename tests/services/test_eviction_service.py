@@ -7365,6 +7365,56 @@ async def test_recovery_defers_the_force_purge_while_a_pack_holds_a_coverage_cla
     assert history == []
 
 
+async def test_recovery_defers_rearmed_purge_during_report_issue_active_purge(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #516: report-issue publishes searching + breadcrumb + marker before
+    awaiting torrent removal.  Its active purge claim owns the correction window,
+    so recovery must not purge or record the correction as an eviction."""
+    root = tmp_path / "tv"
+    season_dir = root / "Correction In Progress" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Correction.In.Progress.S01E01.mkv").write_bytes(b"0" * 1024)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4955,
+        title="Correction In Progress",
+        season_dir=season_dir,
+        status=RequestStatus.searching,
+    )
+
+    purge_service.begin_purge(str(season_dir))
+    try:
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=LocalFileSystem(library_roots=[str(root)]),
+                media_type="tv",
+                root_path=str(root),
+                threshold_pct=101.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+    finally:
+        purge_service.end_purge(str(season_dir))
+
+    assert outcomes == []
+    assert season_dir.exists(), "report-issue retains ownership of its active purge"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 4955)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.searching
+    assert season_row.library_path == str(season_dir)
+    assert season_row.partial_delete_path == str(season_dir)
+    assert history == []
+
+
 async def test_a_cancelled_regrabs_remains_are_left_alone_while_a_pack_covers_the_season(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
