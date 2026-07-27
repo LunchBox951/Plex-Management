@@ -113,6 +113,7 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         poster_url=row.poster_url,
         backdrop_url=row.backdrop_url,
         library_path=row.library_path,
+        partial_delete_path=row.partial_delete_path,
         completed_at=_as_utc(row.completed_at),
         keep_forever=bool(row.keep_forever),
         search_attempts=row.search_attempts,
@@ -639,8 +640,13 @@ class SqlRequestRepository:
             CursorResult[Any],
             await self._session.execute(
                 update(MediaRequest)
+                # The incomplete-delete marker (issues #482 / #485) dies with the
+                # breadcrumb it describes: a NULL ``library_path`` names no tree to
+                # reclaim, so an outstanding marker over it could only mislead a
+                # later recovery pass. Cleared in the SAME statement so no window
+                # exists where one is set without the other.
+                .values(library_path=None, partial_delete_path=None)
                 .where(*predicates)
-                .values(library_path=None)
                 .execution_options(synchronize_session="fetch")
             ),
         )
@@ -1258,11 +1264,52 @@ class SqlRequestRepository:
             # the FIRST stamp stands, nothing to do.
 
     async def set_library_path(self, request_id: int, library_path: str) -> None:
-        """Store the final placed path this request's import wrote into (ADR-0012)."""
+        """Store the final placed path this request's import wrote into (ADR-0012).
+
+        Also RETIRES any outstanding incomplete-delete marker (issues #482 / #485):
+        a placement is fresh content written by an import, so whatever an earlier
+        delete did or did not finish removing has just been superseded. Without
+        this, a same-row re-import into the SAME deterministic path would inherit
+        the previous eviction's marker, and a LATER eviction of that fully-restored
+        media could be routed through the force-purge/converge branch instead of
+        being reconsidered -- a marker outliving its subject is a destructive bug,
+        not a conservative one.
+        """
         row = await self._session.get(MediaRequest, request_id)
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.library_path = library_path
+        row.partial_delete_path = None
+        await self._session.flush()
+
+    async def set_partial_delete_path(self, request_id: int, library_path: str) -> None:
+        """ARM the durable incomplete-delete marker over ``library_path`` (#482 / #485).
+
+        Called BEFORE a destructive delete of this row's media, in the same
+        transaction as the eviction claim, so that a crash / cancellation / restart
+        anywhere inside the delete still leaves durable evidence that the tree
+        cannot be assumed intact. See ``MediaRequest.partial_delete_path``'s
+        docstring for the full arm/disarm protocol. A flush, not a commit: the
+        caller owns the transaction boundary (arming must land with the claim).
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.partial_delete_path = library_path
+        await self._session.flush()
+
+    async def clear_partial_delete_path(self, request_id: int) -> None:
+        """DISARM the incomplete-delete marker (#482 / #485) -- idempotent.
+
+        Called only once the delete's outcome PROVES the tree needs no further
+        reclaiming: it was fully removed, it was provably untouched, or it was
+        never started. No-op-safe when nothing was armed; a missing row is an
+        honest ``LookupError`` rather than a silent skip.
+        """
+        row = await self._session.get(MediaRequest, request_id)
+        if row is None:
+            raise LookupError(f"media request {request_id} does not exist")
+        row.partial_delete_path = None
         await self._session.flush()
 
     async def reset_for_research(self, request_id: int, *, clear_library_path: bool = True) -> None:
@@ -1297,6 +1344,10 @@ class SqlRequestRepository:
         row.status = RequestStatus.searching
         if clear_library_path:
             row.library_path = None
+            # The incomplete-delete marker dies with the breadcrumb (#482 / #485):
+            # with no stored path there is nothing left for recovery to reclaim,
+            # so an outstanding marker could only mislead it.
+            row.partial_delete_path = None
         row.completed_at = None
         row.library_verified_at = None
         # A report-issue is the operator saying "look again NOW": the auto-grab
@@ -1514,6 +1565,9 @@ class SqlRequestRepository:
         if row is None:
             raise LookupError(f"media request {request_id} does not exist")
         row.library_path = None
+        # The marker dies with the breadcrumb it describes (issues #482 / #485):
+        # the caller only reaches here once the purge ACTUALLY removed the file.
+        row.partial_delete_path = None
         await self._session.flush()
 
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:

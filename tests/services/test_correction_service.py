@@ -2030,6 +2030,10 @@ async def test_report_issue_preserves_the_breadcrumb_when_the_purge_fails(
     # The file could not be deleted, so the breadcrumb is kept (not None) even though
     # the status re-armed for the re-search.
     assert request.library_path == str(movie_file)
+    # The delete provably removed NOTHING, so the incomplete-delete marker armed
+    # before the purge is retired again (issues #482 / #485): the media is exactly
+    # as complete as it was, and eviction recovery must treat it as it always did.
+    assert request.partial_delete_path is None
 
 
 async def test_report_issue_preserves_the_breadcrumb_when_the_purge_is_partial(
@@ -2064,6 +2068,129 @@ async def test_report_issue_preserves_the_breadcrumb_when_the_purge_is_partial(
         request = await session.get(MediaRequest, request_id)
     assert request is not None
     assert request.library_path == str(movie_file)
+    # ...AND the incomplete delete is recorded DURABLY on the row (issues #482 /
+    # #485). Without it, eviction's crash-recovery pass would later stat the
+    # surviving path, read "still there" as "still complete", and publish the
+    # remains as watchable -- the same dishonesty in a different pass.
+    assert request.partial_delete_path == str(movie_file)
+
+
+async def test_report_issue_tv_partial_purge_records_the_incomplete_delete_on_the_season(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex P1: the TV shape is where this actually bites. A report-issue purge
+    that eats into a season directory leaves a PRE-GRAB row carrying a breadcrumb
+    -- exactly the shape eviction's crash-recovery pass enumerates and folds back
+    to 'available' off a bare ``os.stat``. That fold would call a season missing
+    episodes fully watchable AND cancel the replacement search meant to restore
+    it, so the incomplete delete has to be recorded on the season row itself."""
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Half Purged Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Half.Purged.Show.S01E01.mkv").write_bytes(b"x" * 1024)
+
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=4820,
+            media_type=MediaType.tv,
+            title="Half Purged Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_dir),
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            _DeletePartiallyFailsFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+    assert season.library_path == str(season_dir)  # the retry's only handle on the remains
+    assert season.partial_delete_path == str(season_dir)  # and it is known-incomplete
+
+
+async def test_report_issue_tv_clean_purge_leaves_no_incomplete_delete_marker(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The disarm half: a purge that actually removed the season leaves NOTHING to
+    reclaim, so the marker armed before it must come back off with the breadcrumb.
+    A marker outliving its subject is the destructive direction -- a later eviction
+    of the replacement content would take the force-purge branch (issues #482 /
+    #485)."""
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Cleanly Purged Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Cleanly.Purged.Show.S01E01.mkv").write_bytes(b"x" * 1024)
+
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=4821,
+            media_type=MediaType.tv,
+            title="Cleanly Purged Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_dir),
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert not season_dir.exists()
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+    assert season.library_path is None
+    assert season.partial_delete_path is None
 
 
 async def test_report_issue_researches_the_whole_season_after_an_episode_scoped_import(

@@ -463,6 +463,31 @@ class MediaRequest(Base):
     # breadcrumb (or a tv rollup row, where the breadcrumb lives per-season on
     # ``SeasonRequest`` instead) — eviction skips + logs rather than guessing one.
     library_path: Mapped[str | None] = mapped_column(String)
+    # DURABLE incomplete-delete marker (issues #482 / #485). Holds the exact path a
+    # destructive delete of this row's media was STARTED against and has not been
+    # proven to have left intact — ``NULL`` whenever no such delete is outstanding.
+    # ``shutil.rmtree`` is not atomic: it can unlink several children and then
+    # raise, leaving a directory that still ``os.stat``s fine but is missing files.
+    # A recovery pass that reads "the path still exists" as "the media is still
+    # watchable" would then restore the row to ``available`` over gutted media —
+    # the exact dishonesty #482 closes — and a crash/cancellation mid-``rmtree``
+    # produces the same shape with no in-band result to classify at all (#485).
+    # So the marker is ARMED (set to the breadcrumb) in the SAME commit as the
+    # eviction claim, BEFORE the delete runs, and DISARMED only once the outcome
+    # proves the tree is either fully gone (a completed purge/finalize) or provably
+    # untouched (a refused/errored delete that removed nothing, an import deferral
+    # that never started one). A confirmed ``PurgeOutcome.partial`` leaves it
+    # armed. Anything that ends without proof — a crash, a cancelled sweep, a
+    # process restart — therefore leaves it armed too, which is the honest default:
+    # recovery routes an armed row through retry/converge instead of restore.
+    # A fresh import placement (``set_library_path``) clears it, so a same-row
+    # re-import is never prejudged by the previous eviction's marker; so does every
+    # breadcrumb clear, since a ``NULL`` breadcrumb has nothing left to reclaim.
+    # Consumers require ``partial_delete_path == library_path`` before acting, so a
+    # replacement import that re-stamps a DIFFERENT path invalidates it implicitly
+    # as well. ``NULL`` for every pre-migration row — the safe default (no
+    # outstanding delete), identical to today's behavior.
+    partial_delete_path: Mapped[str | None] = mapped_column(String)
     # Operator pin (ADR-0012): a pinned title is NEVER selected by
     # ``domain/eviction.py``, regardless of watch state or disk pressure. Movie or
     # (whole) show granularity — TV eviction is scoped per season on
@@ -613,6 +638,12 @@ class SeasonRequest(Base):
     # reconstruct" rule, same eviction target. ``None`` for seasons imported
     # before this breadcrumb existed.
     library_path: Mapped[str | None] = mapped_column(String)
+    # The per-season mirror of ``MediaRequest.partial_delete_path`` (issues #482 /
+    # #485) — same arm-before-delete / disarm-only-on-proof protocol, same
+    # ``NULL``-is-safe default. TV is where this matters most: a season directory
+    # is a TREE, so a failed recursive delete is exactly the shape that leaves a
+    # season standing with half its episodes gone. See that column's docstring.
+    partial_delete_path: Mapped[str | None] = mapped_column(String)
     # Auto-grab scheduling (ADR-0013) — the per-season mirror of the identically
     # named columns on ``MediaRequest``. A TV grab is always per-season, so the
     # backoff ladder is tracked here (not on the parent, whose status is a computed

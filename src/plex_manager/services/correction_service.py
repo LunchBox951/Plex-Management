@@ -1033,9 +1033,40 @@ async def report_issue(
     # on disk, so the breadcrumb is PRESERVED -- it is the only handle a later retry /
     # eviction has to reclaim the orphan; losing it would strand the bad file with no
     # way to purge it (honesty over silence).
+    #
+    # ARM the row's durable incomplete-delete marker BEFORE the purge (issues #482 /
+    # #485), exactly as the eviction sweep does. Report-issue keeps its breadcrumb
+    # over a PRE-GRAB row, which is a shape eviction's crash-recovery pass enumerates
+    # and -- absent this marker -- folds back to ``available`` off a bare ``os.stat``
+    # of the surviving directory. If this purge ate into the tree first, that fold
+    # publishes a season missing episodes as fully watchable AND cancels the
+    # replacement search that was going to restore it. The marker is cleared again
+    # below for every outcome that PROVES the tree needs no further reclaiming, so
+    # only a genuinely incomplete delete leaves it standing.
     purge_ok = True
     if target.library_path is not None:
+        if is_tv and target.season is not None:
+            await season_request_service.set_partial_delete_path(
+                session,
+                media_request_id=request_id,
+                season_number=target.season,
+                library_path=target.library_path,
+            )
+        else:
+            await request_repo.set_partial_delete_path(request_id, target.library_path)
         purge = await purge_service.purge_library_path(fs, target.library_path)
+        if purge.outcome is not PurgeOutcome.partial:
+            # Every other outcome establishes the tree's state: it is fully gone
+            # (``deleted``), or nothing left disk at all (``refused`` / ``error``
+            # with the up-front inventory intact / ``deferred``, decided before any
+            # destructive work). Retire the marker so recovery treats the row
+            # exactly as it did before this correction ran.
+            if is_tv and target.season is not None:
+                await season_request_service.clear_partial_delete_path(
+                    session, media_request_id=request_id, season_number=target.season
+                )
+            else:
+                await request_repo.clear_partial_delete_path(request_id)
         if purge.outcome is PurgeOutcome.refused:
             purge_ok = False
             _logger.warning(
@@ -1050,7 +1081,9 @@ async def report_issue(
             _logger.warning(
                 "report-issue purge of %r deleted only PART of the tree before failing "
                 "(%s); re-searching anyway and KEEPING the breadcrumb -- it is the only "
-                "handle a retry has on the remains",
+                "handle a retry has on the remains -- and RECORDING the incomplete "
+                "delete on the row so recovery cannot fold the remains back to "
+                "'available'",
                 safe_text(request.title),
                 purge.detail,
                 extra=log_extra,
