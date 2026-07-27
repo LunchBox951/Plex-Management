@@ -672,6 +672,37 @@ async def _attach_target_scopes_to_existing_download(
             )
             if not moved:
                 await session.rollback()
+                # Losing this CAS is most often another caller ALREADY COMMITTING
+                # this hash: advancing the season to ``downloading`` is exactly what
+                # makes the swap match zero rows. ``actually_added`` cannot tell the
+                # two apart -- ``qbt.add`` reported ``created`` BEFORE any ownership
+                # of the hash was durable, so a winner that committed across that
+                # await leaves this grab holding a stale creator's claim on a torrent
+                # that is now tracked and live (#480). Re-read the committed row and
+                # only treat the torrent as an orphan when nothing non-terminal still
+                # tracks it; a winner's copy is never ours to delete.
+                owner = await download_repo.get_by_hash(
+                    existing.torrent_hash, populate_existing=True
+                )
+                if owner is not None and owner.status not in _TERMINAL_STATUS_VALUES:
+                    if await _attached_target_scopes(
+                        session,
+                        download_repo,
+                        download_id=owner.id,
+                        request_id=request_id,
+                        season=season,
+                        episodes=episodes,
+                        scope_episodes_by_season=scope_episodes_by_season,
+                        target_seasons=target_seasons,
+                    ):
+                        # Converge like the collision loser below: the winner already
+                        # carries every target scope, so report its row.
+                        return owner
+                    # It owns the hash but not this grab's full scope, and a season
+                    # it already moved can never be re-CASed out of ``downloading``
+                    # -- refuse honestly rather than report untracked targets as
+                    # success, leaving the winner's torrent untouched.
+                    raise RequestNotActiveError(request_id)
                 if qbt is not None:
                     await _remove_torrent_if_added(
                         qbt,

@@ -1806,6 +1806,140 @@ async def test_grab_reuses_a_terminal_same_hash_after_attach_collision(
         await engine.dispose()
 
 
+class _CommitSameHashOwnerDuringAddQbt(FakeQbittorrent):
+    """``add`` lets a SECOND session commit the whole grab for the SAME hash before
+    returning -- issue #480's window, made deterministic: this caller's
+    ``created=True`` was observed BEFORE any ownership of the hash was durable."""
+
+    def __init__(self, sm: SessionMaker, scored: ScoredRelease, request_id: int) -> None:
+        super().__init__()
+        self._sm = sm
+        self._scored = scored
+        self._request_id = request_id
+        self.winner: DownloadRecord | None = None
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        async with self._sm() as session:
+            self.winner = await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=self._scored,
+                request_id=self._request_id,
+                tmdb_id=900,
+                season=1,
+            )
+        return await super().add(magnet_or_url, save_path, category)
+
+
+async def test_grab_keeps_a_same_hash_torrent_a_committed_owner_holds(
+    tmp_path: Any,
+) -> None:
+    """Issue #480: this grab physically added the hash, then a concurrent session
+    committed the Download + scope for it and advanced the season -- which is
+    exactly why this grab's season CAS then loses. The winner's torrent is live
+    and tracked, so it must survive (with its files); the loser converges on the
+    winner's row instead of reporting an error over a hole it just punched."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_committed_owner.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "e" * 40
+        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
+        async with sm() as session:
+            record = await grab_service.grab(
+                qbt,
+                session,
+                scored=scored,
+                request_id=request_id,
+                tmdb_id=900,
+                season=1,
+            )
+
+        assert qbt.added != []  # this grab really did hand the torrent to the client
+        assert qbt.removed == []  # ... and never deleted the committed owner's copy
+        assert qbt.winner is not None
+        assert record.id == qbt.winner.id
+        async with sm() as session:
+            row = (
+                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
+            ).scalar_one()
+            season_row = (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+            ).scalar_one()
+        assert row.status == "downloading"  # the winner keeps its live row
+        assert season_row.status is RequestStatus.downloading
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_still_removes_its_orphan_when_no_committed_owner_remains(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the same lost season CAS, but the hash's row terminalizes before
+    the ownership re-check reads it. Nothing tracks the torrent this grab created,
+    so the orphan cleanup still removes it (with its data) and refuses honestly."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_orphan_control.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        pack_hash = "f" * 40
+        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
+
+        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
+        terminalized = False
+
+        async def terminalize_before_ownership_check(
+            self: grab_service.SqlDownloadRepository,
+            torrent_hash: str,
+            *,
+            populate_existing: bool = False,
+        ) -> DownloadRecord | None:
+            nonlocal terminalized
+            if populate_existing and not terminalized:
+                terminalized = True
+                async with sm() as other_session:
+                    winner = qbt.winner
+                    assert winner is not None
+                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
+                        winner.id,
+                        "failed",
+                        frozenset({"downloading"}),
+                    )
+                    assert moved
+                    await other_session.commit()
+            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
+        )
+        async with sm() as session:
+            with pytest.raises(RequestNotActiveError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
+
+        assert terminalized
+        assert (pack_hash, True) in qbt.removed
+        async with sm() as session:
+            row = (
+                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
+            ).scalar_one()
+        assert row.status == "failed"
+    finally:
+        await engine.dispose()
+
+
 async def test_grab_fresh_multi_season_pack_returns_all_attached_scopes(
     sessionmaker_: SessionMaker,
 ) -> None:
