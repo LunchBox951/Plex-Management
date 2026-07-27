@@ -874,7 +874,7 @@ def test_hardlink_or_copy_refuses_without_unlinking_a_third_party_entry_swap(
         # entry at the same name with an unrelated file (a different inode).
         os.unlink(_dst, dir_fd=dst_dir_fd)
         replacement_fd = os.open(
-            _dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644, dir_fd=dst_dir_fd
+            _dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dst_dir_fd
         )
         try:
             os.write(replacement_fd, b"third-party file")
