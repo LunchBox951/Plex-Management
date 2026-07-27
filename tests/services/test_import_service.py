@@ -3881,6 +3881,82 @@ async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
         await engine.dispose()
 
 
+async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: a failed movie promotion routes both log extras through
+    ``safe_int`` before emitting the warning."""
+    tmdb_id = 811
+    request_id = await _seed_movie_request(sessionmaker_, tmdb_id=tmdb_id)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(SqlRequestRepository, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=FakeLibrary(available={tmdb_id}), session=session)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "availability promotion failed; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [tmdb_id, request_id]
+
+
+async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: the season promotion warning sanitizes its request-derived
+    extras independently of the movie loop."""
+    tmdb_id = 812
+    request_id = await _seed_show_request(sessionmaker_, tmdb_id=tmdb_id)
+    await _seed_season(sessionmaker_, media_request_id=request_id, season_number=1)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(
+        _session: AsyncSession, *, media_request_id: int, season_number: int
+    ) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(season_request_service, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=FakeLibrary(available_tv_seasons={tmdb_id: frozenset({1})}), session=session
+            )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "availability promotion failed for season 1000001; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [1, tmdb_id, request_id]
+
+
 # --------------------------------------------------------------------------- #
 # run_availability_cycle — batched checks, not one Plex call per row (issue #136)
 # --------------------------------------------------------------------------- #
