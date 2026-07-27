@@ -7,10 +7,12 @@ import os
 import shutil
 import time
 from pathlib import Path
+from typing import IO
 
 import pytest
 
 from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
+from plex_manager.adapters.filesystem import local as local_fs
 from plex_manager.adapters.filesystem.local import (
     _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -30,7 +32,7 @@ def test_move_relocates_file_and_creates_parent(tmp_path: Path) -> None:
     src.write_text("payload")
     dst = tmp_path / "library" / "movie" / "dst.mkv"
 
-    LocalFileSystem().move(src, dst)
+    LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert not src.exists()
     assert dst.read_text() == "payload"
@@ -44,7 +46,7 @@ def test_move_refuses_existing_destination_and_preserves_both_files(tmp_path: Pa
     dst.write_text("existing payload")
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert src.read_text() == "new payload"
     assert dst.read_text() == "existing payload"
@@ -57,11 +59,11 @@ def test_move_cross_device_copy_removes_source_after_publish(
     src.write_text("payload")
     dst = tmp_path / "library" / "dst.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().move(src, dst)
+    LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert not src.exists()
     assert dst.read_text() == "payload"
@@ -76,13 +78,13 @@ def test_move_cross_device_copy_refuses_existing_destination(
     dst.parent.mkdir(parents=True)
     dst.write_text("existing payload")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert src.read_text() == "new payload"
     assert dst.read_text() == "existing payload"
@@ -93,7 +95,7 @@ def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src.write_text("payload")
     dst = tmp_path / "linked" / "dst.mkv"
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()  # source preserved
     assert dst.read_text() == "payload"
@@ -110,7 +112,7 @@ def test_hardlink_or_copy_hardlink_path_preserves_active_publish_lock(tmp_path: 
     lock.write_text(str(os.getpid()))
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()
     assert not dst.exists()
@@ -125,13 +127,15 @@ def test_hardlink_or_copy_falls_back_to_copy(
     dst = tmp_path / "copied.mkv"
     real_link = os.link
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
@@ -145,18 +149,20 @@ def test_cross_device_copy_refuses_destination_created_during_publish(
     dst = tmp_path / "copied.mkv"
     real_link = os.link
 
-    def _race_link(_src: str, _dst: str) -> None:
+    def _race_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        if _dst == os.fspath(dst):
+        if _dst == dst.name:
             dst.write_text("race winner")
             raise FileExistsError(os.fspath(dst))
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(os, "link", _race_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.read_text() == "copy-path-loser"
     assert dst.read_text() == "race winner"
@@ -169,11 +175,11 @@ def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
     src.write_text("payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()
     assert dst.read_text() == "payload"
@@ -191,34 +197,33 @@ def test_hardlinkless_publish_renames_temp_without_second_copy(
     src.write_text("payload")
     dst = tmp_path / "movie" / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
-    real_copy2 = shutil.copy2
-    copies: list[tuple[str, str]] = []
+    real_copyfileobj = shutil.copyfileobj
+    copies: list[int] = []
 
-    def _counting_copy2(copy_src: str, copy_dst: str) -> None:
-        copies.append((copy_src, copy_dst))
-        real_copy2(copy_src, copy_dst)
+    def _counting_copy(source: IO[bytes], target: IO[bytes]) -> None:
+        copies.append(source.fileno())
+        real_copyfileobj(source, target)
 
     real_rename = os.rename
-    renames: list[tuple[str, str]] = []
+    renames: list[str] = []
 
-    def _recording_rename(rename_src: str, rename_dst: str) -> None:
-        renames.append((os.fspath(rename_src), os.fspath(rename_dst)))
-        real_rename(rename_src, rename_dst)
+    def _recording_rename(rename_src: str, rename_dst: str, **_dir_fds: int) -> None:
+        renames.append(os.fspath(rename_dst))
+        real_rename(rename_src, rename_dst, **_dir_fds)
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _counting_copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _counting_copy)
     monkeypatch.setattr(os, "rename", _recording_rename)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     # The content was written exactly ONCE (src -> temp); the publish is a rename.
     assert len(copies) == 1
-    assert copies[0][0] == os.fspath(src)
-    assert [rename_dst for _s, rename_dst in renames] == [os.fspath(dst)]
+    assert renames == [dst.name]
     # The rename consumed the temp: nothing left over next to the final file.
     leftovers = [p for p in dst.parent.iterdir() if p != dst]
     assert leftovers == []
@@ -234,13 +239,13 @@ def test_hardlinkless_publish_still_refuses_existing_destination(
     dst = tmp_path / "copied.mkv"
     dst.write_text("existing library file")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "existing library file"
     # The temp copy was cleaned up; only src and dst remain in the directory.
@@ -263,13 +268,13 @@ def test_hardlinkless_publish_refuses_dangling_symlink_destination(
     assert dst.is_symlink()
     assert not dst.exists()  # confirms the dangling shape this test exercises
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -286,13 +291,13 @@ def test_move_refuses_dangling_symlink_destination(
     target = tmp_path / "gone.mkv"
     dst.symlink_to(target)
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -316,13 +321,13 @@ def test_publish_lock_refuses_dangling_symlink_under_stale_lock(
     lock_path = tmp_path / f".{dst.name}.publish.lock"
     lock_path.write_text("999999999")  # a pid that cannot be running -- reclaimable
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -335,29 +340,33 @@ def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = tmp_path / "copied.mkv"
-    observed_copy_dst: list[Path] = []
+    in_flight: list[list[str]] = []
     real_link = os.link
+    real_copyfileobj = shutil.copyfileobj
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    def _copy2(_src: str, dst_arg: str) -> None:
-        copy_dst = Path(dst_arg)
-        observed_copy_dst.append(copy_dst)
-        copy_dst.write_text("partial")
-        assert not dst.exists(), "final path must not exist while copy is in progress"
-        copy_dst.write_text("payload")
+    def _observing_copy(source: IO[bytes], target: IO[bytes]) -> None:
+        real_copyfileobj(source, target)
+        target.flush()
+        in_flight.append(sorted(p.name for p in tmp_path.iterdir()))
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _observing_copy)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
-    assert observed_copy_dst and observed_copy_dst[0] != dst
-    assert not observed_copy_dst[0].exists()
+    # Mid-copy the bytes lived in a temp entry, never at the final name...
+    assert in_flight and dst.name not in in_flight[0]
+    assert [name for name in in_flight[0] if name != src.name]
+    # ...and that temp is gone once the publish completes.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dst.name, src.name]
 
 
 def test_cross_device_copy_recovers_stale_publish_lock(
@@ -369,12 +378,12 @@ def test_cross_device_copy_recovers_stale_publish_lock(
     lock = tmp_path / ".copied.mkv.publish.lock"
     lock.write_text("999999999")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
@@ -392,7 +401,7 @@ def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     aged = time.time() - (_EMPTY_LOCK_STALE_SECONDS + 5)
     os.utime(lock, (aged, aged))
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
@@ -408,7 +417,7 @@ def test_publish_lock_fresh_empty_lock_is_not_reclaimed(tmp_path: Path) -> None:
     lock.write_text("")  # empty but fresh (mtime == now)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()
     assert lock.exists()  # preserved for the in-flight creator
@@ -423,13 +432,13 @@ def test_cross_device_copy_preserves_active_publish_lock(
     lock = tmp_path / ".copied.mkv.publish.lock"
     lock.write_text(str(os.getpid()))
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()
     assert lock.read_text() == str(os.getpid())
@@ -442,7 +451,7 @@ def test_hardlink_or_copy_raises_when_destination_too_small(
     src.write_text("a sizeable payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     def _plenty(_self: LocalFileSystem, _path: str) -> int:
@@ -452,7 +461,7 @@ def test_hardlink_or_copy_raises_when_destination_too_small(
     monkeypatch.setattr(LocalFileSystem, "available_bytes", _plenty)
 
     with pytest.raises(OSError, match="insufficient space"):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()  # nothing written on a failed preflight
 
@@ -464,19 +473,151 @@ def test_hardlink_or_copy_rolls_back_partial_copy_on_size_mismatch(
     src.write_text("the full expected payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
-    def _short_copy2(_src: str, dst_arg: str) -> None:
-        Path(dst_arg).write_text("short")  # truncated write
+    def _short_copy(_source: IO[bytes], target: IO[bytes]) -> None:
+        target.write(b"short")  # truncated write
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _short_copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _short_copy)
 
     with pytest.raises(OSError, match="incomplete"):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()  # partial destination rolled back
+
+
+# --------------------------------------------------------------------------- #
+# GHSA-r5vh: publication must not follow symlinked ancestors out of the root
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("relative_dst", "linked_ancestor"),
+    [
+        ("The Matrix (1999)/The Matrix (1999).mkv", "The Matrix (1999)"),
+        ("Some Show (2020)/Season 01/Some Show - S01E01.mkv", "Some Show (2020)"),
+        ("Some Show (2020)/Season 01/Some Show - S01E01.mkv", "Some Show (2020)/Season 01"),
+    ],
+    ids=["movie-title", "show", "season"],
+)
+def test_hardlink_or_copy_refuses_pre_existing_symlinked_ancestor(
+    tmp_path: Path, relative_dst: str, linked_ancestor: str
+) -> None:
+    """A destination ancestor replaced by a symlink out of the library must refuse:
+    the file is what an operator later corrects/evicts by its in-root breadcrumb, and
+    the delete-side guard rightly refuses an escaped target, so publishing through
+    the link would be uncorrectable from the web UI."""
+    root = tmp_path / "library"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    linked_path = root / linked_ancestor
+    linked_path.parent.mkdir(parents=True, exist_ok=True)
+    linked_path.symlink_to(outside)
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().hardlink_or_copy(src, root / relative_dst, root=root)
+
+    assert list(outside.iterdir()) == []  # nothing created at the link's target
+
+
+def test_hardlink_or_copy_refuses_non_directory_ancestor(tmp_path: Path) -> None:
+    """The same refusal for an ancestor that is a plain file: ``O_DIRECTORY`` is
+    what makes the walk trustworthy, so a non-directory component is a refusal, not
+    a mkdir attempt that would fail with a bare, unexplained EEXIST."""
+    root = tmp_path / "library"
+    root.mkdir()
+    (root / "The Matrix (1999)").write_text("not a directory")
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().hardlink_or_copy(
+            src, root / "The Matrix (1999)" / "The Matrix (1999).mkv", root=root
+        )
+
+
+def test_hardlink_or_copy_refuses_destination_outside_root(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    escaped = tmp_path / "outside" / "escaped.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="outside the library root"):
+        LocalFileSystem().hardlink_or_copy(src, escaped, root=root)
+
+    assert not escaped.parent.exists()  # refused before anything was created
+
+
+def test_hardlink_or_copy_refuses_when_platform_cannot_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``dir_fd``-relative, no-follow primitives there is no containment to
+    enforce; publication refuses rather than silently falling back to the pathname
+    publication GHSA-r5vh exploits."""
+    monkeypatch.setattr(local_fs, "_PUBLICATION_CONTAINMENT_SUPPORTED", False)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert not dst.exists()
+
+
+def test_hardlink_or_copy_survives_ancestor_swapped_to_symlink_mid_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ancestor-swap race a one-time ``realpath()`` check cannot close: the
+    season directory is renamed away and replaced with a symlink out of the library
+    at the instant of publication. The descriptor the walk holds still refers to the
+    directory it verified, so the episode lands there -- inside the root -- and never
+    at the symlink's target."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    real_link = os.link
+
+    def _swap_then_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        # The swap lands AFTER the no-follow walk verified the season directory and
+        # BEFORE the entry is created -- the exact window the pathname publish lost.
+        if season.is_dir() and not season.is_symlink():
+            season.rename(season.parent / "Season 01.real")
+            season.symlink_to(outside)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "link", _swap_then_link)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(outside.iterdir()) == []  # the swapped-in link never received bytes
+    landed = season.parent / "Season 01.real" / dst.name
+    assert landed.read_text() == "payload"  # still inside the configured root
+
+
+def test_hardlink_or_copy_publishes_into_a_nested_library_root(tmp_path: Path) -> None:
+    """ADR-0015 nests the anime root inside the normal one; the SELECTED root is the
+    anchor, so a destination beneath the nested root is published normally."""
+    movies_root = tmp_path / "library" / "Movies"
+    anime_root = movies_root / "Anime"
+    anime_root.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = anime_root / "Akira (1988)" / "Akira (1988).mkv"
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=anime_root)
+
+    assert dst.read_text() == "payload"
 
 
 def test_largest_video_file_picks_largest_and_skips_sample_and_extras(
@@ -585,32 +726,33 @@ def test_adapter_satisfies_filesystem_port() -> None:
     assert isinstance(LocalFileSystem(), FileSystemPort)
 
 
-def test_hardlink_or_copy_removes_partial_dst_when_copy_raises(
+def test_hardlink_or_copy_removes_partial_temp_when_copy_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # copy2 can die mid-write AFTER creating dst (e.g. ENOSPC when another writer
-    # ate the preflighted free space). The partial file must be removed and the
-    # ORIGINAL error surfaced, so a retry sees a clean slate instead of a
-    # differently-sized dst that _place_file would reject as a persistent conflict.
+    # The copy can die mid-write AFTER writing part of the temp (e.g. ENOSPC when
+    # another writer ate the preflighted free space). The partial temp must be
+    # removed and the ORIGINAL error surfaced, so a retry sees a clean slate
+    # instead of leftovers next to the destination.
     src = tmp_path / "src.mkv"
     src.write_text("the full expected payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
-    def _partial_then_raise(_src: str, dst_arg: str) -> None:
-        Path(dst_arg).write_text("partial")  # dst created/truncated...
+    def _partial_then_raise(_source: IO[bytes], target: IO[bytes]) -> None:
+        target.write(b"partial")  # temp partially written...
         raise OSError(errno.ENOSPC, "no space left on device")  # ...then the write dies
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _partial_then_raise)
+    monkeypatch.setattr(shutil, "copyfileobj", _partial_then_raise)
 
     with pytest.raises(OSError) as exc_info:
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert exc_info.value.errno == errno.ENOSPC  # original error, not masked
-    assert not dst.exists()  # partial destination removed so a retry is clean
+    assert not dst.exists()  # nothing published
+    assert [p.name for p in tmp_path.iterdir()] == [src.name]  # partial temp removed
 
 
 def test_largest_video_file_rejects_symlinked_root_escaping_its_parent(

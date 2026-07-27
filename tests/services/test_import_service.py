@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSystemError
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
@@ -470,7 +470,7 @@ class _LosingRaceFs(LocalFileSystem):
         super().__init__()
         self._winner_size = winner_size
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
         _make_video(dst, self._winner_size)
         raise FileExistsError(str(dst))
 
@@ -478,7 +478,7 @@ class _LosingRaceFs(LocalFileSystem):
 class _WrongSameSizeFs(LocalFileSystem):
     """Loses placement to a same-size but different file."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         size = os.path.getsize(src)
         with dst.open("wb") as handle:
@@ -553,6 +553,42 @@ async def test_scan_failure_after_lost_race_does_not_delete_winners_file(
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
     assert dst.exists(), "scan-failure rollback orphaned a concurrent import's file"
     assert dst.stat().st_size == 60 * 1024 * 1024
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_import_movie_refuses_symlinked_title_ancestor_and_blocks_retryably(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, end to end: the movie's title directory beneath ``movies_root`` is a
+    symlink out of the library. The import must refuse rather than publish through it
+    -- nothing at the link's target, no Plex scan, no ``completed`` request -- and it
+    must land on the ordinary retryable ``ImportBlocked`` surface (the operator's
+    POST /queue/{id}/import button), never an unhandled error."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (movies_root / "The Matrix (1999)").symlink_to(outside)
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "symlink or non-directory" in record.failed_reason
+    assert record.download_path is None  # no breadcrumb for a file never published
+    assert list(outside.iterdir()) == []
+    assert library.scanned == []
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
@@ -1712,11 +1748,32 @@ def test_place_file_refuses_dangling_symlink_destination(tmp_path: Path) -> None
 
     with pytest.raises(FileExistsError):
         import_service._place_file(  # pyright: ignore[reportPrivateUsage]
-            LocalFileSystem(), str(src), dst
+            LocalFileSystem(), str(src), dst, tmp_path
         )
 
     assert dst.is_symlink()
     assert not target.exists()
+
+
+def test_place_file_refuses_symlinked_destination_ancestor(tmp_path: Path) -> None:
+    """GHSA-r5vh: a movie-title directory replaced by a symlink out of the library
+    made ``_place_file`` publish the media outside every configured root while the
+    caller recorded an in-root breadcrumb. Refuse, and create nothing at the target."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (movies_root / "The Matrix (1999)").symlink_to(outside)
+    src = tmp_path / "src.mkv"
+    src.write_text("new-download")
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        import_service._place_file(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(), str(src), dst, movies_root
+        )
+
+    assert list(outside.iterdir()) == []
 
 
 def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
@@ -2270,6 +2327,40 @@ async def _import_tv(
             tv_root=str(tv_root),
             anime_tv_root=str(anime_tv_root) if anime_tv_root is not None else None,
         )
+
+
+@pytest.mark.parametrize("linked", ["Some Show (2020)", "Some Show (2020)/Season 02"])
+async def test_import_tv_refuses_symlinked_show_or_season_ancestor(
+    tmp_path: Path, sessionmaker_: SessionMaker, linked: str
+) -> None:
+    """GHSA-r5vh on the TV side: a symlinked show OR season directory beneath
+    ``tv_root`` must refuse, leave nothing at the link's target, and surface the
+    retryable ``ImportBlocked`` reason rather than publish episodes out of the
+    library behind an in-root breadcrumb."""
+    tv_root = tmp_path / "tv"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_path = tv_root / linked
+    linked_path.parent.mkdir(parents=True)
+    linked_path.symlink_to(outside)
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "symlink or non-directory" in record.failed_reason
+    assert list(outside.iterdir()) == []
+    assert library.scan_calls == []
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value != "completed"
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
@@ -3554,11 +3645,11 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
-        super().hardlink_or_copy(src, dst)
+        super().hardlink_or_copy(src, dst, root=root)
 
 
 async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(

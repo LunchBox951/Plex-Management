@@ -17,10 +17,10 @@ import errno
 import os
 import shutil
 import stat
-import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from pathlib import Path
+from typing import IO, NoReturn
 
 from plex_manager.domain.plex_video import is_plex_disc_structure_path, plex_video_extension
 
@@ -42,8 +42,11 @@ _EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
 
 
 class LocalFileSystemError(RuntimeError):
-    """Raised when :meth:`LocalFileSystem.delete` is asked to remove a path that
-    does not resolve within any of the instance's configured library roots.
+    """Raised when a containment guard refuses a path: :meth:`LocalFileSystem.delete`
+    asked to remove something that does not resolve within any of the instance's
+    configured library roots, or :meth:`LocalFileSystem.move` /
+    :meth:`LocalFileSystem.hardlink_or_copy` asked to publish through a symlinked
+    (or non-directory) ancestor beneath the selected library root.
 
     A surfaced, honest refusal (ADR-0012's disk-pressure eviction): the message
     names the offending path only (never a root's real filesystem layout beyond
@@ -51,7 +54,11 @@ class LocalFileSystemError(RuntimeError):
     swallowed even though the path might not exist. Letting a misconfigured or
     mismatched breadcrumb silently no-op would defeat the whole point of the
     guard, which is to make it structurally impossible for eviction to delete
-    anything outside a configured library root.
+    anything outside a configured library root. The publication guard is raised
+    for the mirror-image reason: a silent fall back to pathname publication would
+    place media outside every configured root while the caller records an in-root
+    breadcrumb, which the delete-side guard then correctly refuses to clean up
+    (GHSA-r5vh) — an uncorrectable state, violating north-star #1.
     """
 
 
@@ -72,16 +79,16 @@ def _pid_is_running(pid: int) -> bool:
 _EMPTY_LOCK_STALE_SECONDS = 60.0
 
 
-def _lock_is_expired(lock_path: Path) -> bool:
+def _lock_is_expired(dir_fd: int, lock_name: str) -> bool:
     """Whether an empty/unparseable lock is old enough (by mtime) to reclaim."""
     try:
-        age = time.time() - lock_path.stat().st_mtime
+        mtime = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False).st_mtime
     except OSError:
         return False
-    return age > _EMPTY_LOCK_STALE_SECONDS
+    return time.time() - mtime > _EMPTY_LOCK_STALE_SECONDS
 
 
-def _lock_is_stale(lock_path: Path) -> bool:
+def _lock_is_stale(dir_fd: int, lock_name: str) -> bool:
     """Whether a publish lock can be reclaimed.
 
     A parseable pid is authoritative: the lock is stale iff that process is gone.
@@ -93,33 +100,56 @@ def _lock_is_stale(lock_path: Path) -> bool:
     lock is presumed to be a concurrent creator mid-write and is left untouched.
     """
     try:
-        raw = lock_path.read_text(encoding="utf-8").strip()
+        lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
         return False
+    try:
+        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    finally:
+        os.close(lock_fd)
     if not raw:
-        return _lock_is_expired(lock_path)
+        return _lock_is_expired(dir_fd, lock_name)
     try:
         pid = int(raw)
     except ValueError:
-        return _lock_is_expired(lock_path)
+        return _lock_is_expired(dir_fd, lock_name)
     return not _pid_is_running(pid)
 
 
+def _entry_exists(dir_fd: int, name: str) -> bool:
+    """``os.path.lexists`` semantics, resolved relative to ``dir_fd``.
+
+    ``follow_symlinks=False``, not a plain stat: a DANGLING symlink at the
+    destination must read as PRESENT (GHSA-8fj8) -- a following stat reads it as
+    absent, which would let a stale/planted link fall through as if the
+    destination were free.
+    """
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
+
+
 @contextlib.contextmanager
-def _publish_lock(dst: Path):
-    lock_path = dst.parent / f".{dst.name}.publish.lock"
+def _publish_lock(dir_fd: int, name: str, display: str) -> Generator[None, None, None]:
+    lock_name = f".{name}.publish.lock"
     while True:
         try:
-            lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            lock_fd = os.open(
+                lock_name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=dir_fd,
+            )
         except FileExistsError:
-            # lexists, not exists: a DANGLING symlink at dst must still refuse (GHSA-8fj8)
-            # -- exists() follows the link and reads a dangling one as absent, which
-            # would let a stale/planted symlink fall through as if dst were free.
-            if os.path.lexists(os.fspath(dst)):
-                raise FileExistsError(os.fspath(dst)) from None
-            if _lock_is_stale(lock_path):
+            if _entry_exists(dir_fd, name):
+                raise FileExistsError(display) from None
+            if _lock_is_stale(dir_fd, lock_name):
                 with contextlib.suppress(FileNotFoundError):
-                    os.unlink(lock_path)
+                    os.unlink(lock_name, dir_fd=dir_fd)
                 continue
             raise
         break
@@ -129,50 +159,180 @@ def _publish_lock(dst: Path):
     finally:
         os.close(lock_fd)
         with contextlib.suppress(OSError):
-            os.unlink(lock_path)
+            os.unlink(lock_name, dir_fd=dir_fd)
 
 
-def _publish_temp_no_overwrite(tmp_path: str, dst: Path) -> None:
+def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: str) -> None:
     """Publish a complete temp copy under a per-destination lock.
+
+    Every operation is resolved relative to ``dir_fd`` -- the verified destination
+    directory descriptor :func:`_anchored_publication` handed the caller -- so a
+    concurrent ancestor swap cannot redirect the publish (GHSA-r5vh).
 
     The hardlink is the preferred publish (an atomic exclusive create — it fails
     ``EEXIST`` on its own, catching even a non-cooperating writer). On a
     filesystem that refuses hardlinks outright (SMB / FAT — ``EPERM`` /
     ``EOPNOTSUPP``, the same refusal that routed the caller here in the first
     place) the temp file is RENAMED into place instead: it already holds the
-    fully verified bytes and already lives in ``dst.parent``, so the rename is a
-    same-directory atomic move that costs no second content copy — previously
-    this fell back to re-copying the temp's bytes into the final path, needing
-    ~2x the title's size transiently and failing with a spurious ENOSPC on a
-    barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
+    fully verified bytes and already lives in that same directory, so the rename
+    is a same-directory atomic move that costs no second content copy —
+    previously this fell back to re-copying the temp's bytes into the final path,
+    needing ~2x the title's size transiently and failing with a spurious ENOSPC
+    on a barely-fitting disk. The exclusive-create guarantee against a CONCURRENT
     PUBLISHER is preserved by the per-destination ``_publish_lock`` plus the
-    ``os.path.lexists(dst)`` check made under it — every publisher in this
-    module takes that same lock before touching ``dst``.
+    ``_entry_exists`` check made under it — every publisher in this module takes
+    that same lock before touching the destination entry.
     """
-    with _publish_lock(dst):
+    with _publish_lock(dir_fd, name, display):
         # lexists, not exists: on a hardlink-refusing filesystem the copy fallback
         # below is os.rename, which WOULD silently replace a dangling symlink's
         # entry (exists() reads a dangling link as absent) -- GHSA-8fj8. This is
         # the critical backstop, immediately before the link/rename attempt, under
         # the lock every publisher in this module takes before touching dst.
-        if os.path.lexists(os.fspath(dst)):
-            raise FileExistsError(os.fspath(dst))
+        if _entry_exists(dir_fd, name):
+            raise FileExistsError(display)
         try:
-            os.link(tmp_path, os.fspath(dst))
+            os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except OSError as exc:
             if exc.errno not in _COPY_FALLBACK_ERRNOS:
                 raise
             # The rename consumes the temp — nothing left to unlink.
-            os.rename(tmp_path, os.fspath(dst))
+            os.rename(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             return
         with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
+            os.unlink(tmp_name, dir_fd=dir_fd)
 
 
-def _publish_link_no_overwrite(src: Path, dst: Path) -> None:
-    """Publish ``src`` at ``dst`` via an exclusive hardlink under the destination lock."""
-    with _publish_lock(dst):
-        os.link(os.fspath(src), os.fspath(dst))
+def _publish_link_no_overwrite(src: Path, dir_fd: int, name: str, display: str) -> None:
+    """Publish ``src`` at ``name`` (relative to ``dir_fd``) via an exclusive hardlink."""
+    with _publish_lock(dir_fd, name, display):
+        os.link(os.fspath(src), name, dst_dir_fd=dir_fd)
+
+
+def _copy_contents(src: Path, target: IO[bytes]) -> None:
+    """Stream ``src``'s bytes into the already-open ``target``, preserving mode and
+    timestamps -- the ``shutil.copy2`` equivalent for a destination that exists only
+    as a descriptor inside a verified directory (it has no pathname a second lookup
+    could re-resolve).
+    """
+    with open(src, "rb") as source:
+        shutil.copyfileobj(source, target)
+        source_stat = os.fstat(source.fileno())
+    target.flush()
+    os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
+    os.utime(target.fileno(), ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+
+#: Flags for every directory descriptor the publication walk holds. ``O_PATH``
+#: (Linux) where available, exactly as the delete-side walk does: it needs only
+#: SEARCH (execute) permission on the destination directories -- what pathname
+#: publication demanded of them -- where ``O_RDONLY`` would newly demand READ on
+#: every one and spuriously ``EACCES`` on a search-only library tree. An ``O_PATH``
+#: descriptor is valid as the ``dir_fd`` of the whole ``openat``/``mkdirat``/
+#: ``linkat``/``renameat``/``unlinkat``/``fstatat`` family this module publishes
+#: with, and still fails ``ENOTDIR`` on a swapped-in symlink under ``O_NOFOLLOW``.
+_PUBLISH_DIR_FLAGS: int = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+#: Whether this platform can guarantee fd-anchored, no-follow publication. The
+#: write-side counterpart of :func:`_delete_containment_supported`: without
+#: ``O_NOFOLLOW``/``O_DIRECTORY`` and ``dir_fd``-relative ``open``/``mkdir``/
+#: ``link``/``rename``/``unlink``/``stat``, a destination's ancestors can only be
+#: traversed by pathname -- exactly the traversal GHSA-r5vh exploits -- so
+#: publication refuses every path rather than degrade silently (north-star #3).
+#: The deployment target is Linux/Docker, where all of these exist. Resolved at
+#: import, against the interpreter's own os functions: ``os.supports_dir_fd``
+#: holds those objects by identity, so a later reassignment of ``os.link`` (a test
+#: double) must not be read as a platform that lost the capability.
+_PUBLICATION_CONTAINMENT_SUPPORTED: bool = (
+    hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+    and {os.open, os.mkdir, os.link, os.rename, os.unlink, os.stat} <= os.supports_dir_fd
+)
+
+
+def _open_or_create_child_dir(parent_fd: int, component: str, display: str) -> int:
+    """Open (creating it if absent) ``component`` inside ``parent_fd``, no-follow.
+
+    ``O_NOFOLLOW | O_DIRECTORY`` is what makes this a containment primitive: an
+    existing symlink -- or any non-directory -- at ``component`` fails
+    ``ELOOP``/``ENOTDIR`` in the kernel instead of being traversed, and is
+    SURFACED as a refusal. The ``mkdir`` is allowed to lose to a concurrent import
+    creating the same season directory (``EEXIST``); the open that follows is what
+    decides whether what now sits there is trustworthy.
+    """
+    flags = _PUBLISH_DIR_FLAGS | os.O_NOFOLLOW
+    try:
+        return os.open(component, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _reraise_ancestor_failure(component, display, exc)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(component, dir_fd=parent_fd)
+    try:
+        return os.open(component, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        _reraise_ancestor_failure(component, display, exc)
+
+
+def _reraise_ancestor_failure(component: str, display: str, exc: OSError) -> NoReturn:
+    """Re-raise a destination ancestor's open failure: a symlink / non-directory is a
+    containment breach and becomes a :class:`LocalFileSystemError`; anything else (a
+    permission problem, a vanished mount) is surfaced unchanged."""
+    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+        raise LocalFileSystemError(
+            f"refusing to publish {display!r}: destination ancestor {component!r} is a "
+            "symlink or non-directory (containment could not be guaranteed)"
+        ) from exc
+    raise exc
+
+
+@contextlib.contextmanager
+def _anchored_publication(root: Path, dst: Path) -> Generator[tuple[int, str], None, None]:
+    """Yield ``(parent_fd, leaf_name)`` for publishing ``dst`` beneath ``root``.
+
+    The enforcement layer for GHSA-r5vh. ``root`` -- the library root the caller
+    SELECTED for this title (the anime root when ADR-0015 routed there, otherwise
+    the normal one) -- is admin-configured and may legitimately be reached through
+    symlinks (``/data -> /mnt/store``), so it is resolved by pathname exactly
+    once, here, and opened as a directory descriptor. EVERY component below it is
+    then opened relative to the PREVIOUS component's descriptor with
+    ``O_NOFOLLOW | O_DIRECTORY``, creating what is missing with ``mkdir`` relative
+    to that same descriptor. Nothing beneath the root is ever trusted by pathname,
+    so a symlinked movie-title / show / season directory -- planted beforehand or
+    swapped in mid-walk -- cannot redirect the publish outside the root: the
+    kernel refuses the open, and the caller gets a raised
+    :class:`LocalFileSystemError` rather than a silent traversal.
+
+    The yielded descriptor is what the final link/copy/rename must be anchored to.
+    A pathname re-check before publishing by name would reopen the very TOCTOU
+    this closes -- the descriptor keeps pointing at the directory that was
+    verified even if its name is later swapped underneath.
+
+    ``dst`` must lie beneath ``root``; a lexically escaping destination (``..``)
+    is refused before any descriptor is opened.
+    """
+    display = os.fspath(dst)
+    if not _PUBLICATION_CONTAINMENT_SUPPORTED:
+        raise LocalFileSystemError(
+            f"refusing to publish {display!r}: this platform cannot guarantee "
+            "fd-anchored, no-follow publication containment"
+        )
+    components = os.path.relpath(display, os.fspath(root)).split(os.sep)
+    if os.pardir in components or components == [os.curdir]:
+        raise LocalFileSystemError(
+            f"refusing to publish {display!r}: outside the library root {os.fspath(root)!r}"
+        )
+    dir_fd = os.open(os.fspath(root), _PUBLISH_DIR_FLAGS)
+    try:
+        for component in components[:-1]:
+            next_fd = _open_or_create_child_dir(dir_fd, component, display)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        yield dir_fd, components[-1]
+    finally:
+        os.close(dir_fd)
 
 
 def _is_within(root_real: str, candidate_real: str) -> bool:
@@ -383,40 +543,41 @@ class LocalFileSystem:
             probe = parent
         return shutil.disk_usage(probe).free
 
-    def move(self, src: Path, dst: Path) -> None:
-        """Move ``src`` to ``dst`` without replacing an existing destination file."""
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            _publish_link_no_overwrite(src, dst)
-        except OSError as exc:
-            if exc.errno not in _COPY_FALLBACK_ERRNOS:
-                raise
-            self._copy_no_overwrite(src, dst)
+    def move(self, src: Path, dst: Path, *, root: Path) -> None:
+        """Move ``src`` to ``dst`` (beneath ``root``) without replacing an existing
+        destination file."""
+        self.hardlink_or_copy(src, dst, root=root)
         src.unlink()
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        ``dst`` must lie beneath the library ``root`` the caller selected for this
+        title, and every destination component below that root is created and
+        opened no-follow relative to a held directory descriptor
+        (:func:`_anchored_publication`) — a symlinked movie-title / show / season
+        ancestor is refused, never followed outside the root (GHSA-r5vh).
 
         A cross-device link raises ``OSError`` (``EXDEV``); some filesystems also
         reject hardlinks with ``EPERM``. Either way we fall back to a metadata-
         preserving copy rather than failing the import.
         """
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            _publish_link_no_overwrite(src, dst)
-        except OSError as exc:
-            # Only a genuine cross-device / hardlink-unsupported failure warrants a
-            # copy. EEXIST (the destination already exists — e.g. a concurrent import
-            # won the race) or any other errno is surfaced, never silently masked as
-            # cross-device into an overwriting copy.
-            if exc.errno not in _COPY_FALLBACK_ERRNOS:
-                raise
-            # Cross-device (or hardlink-refusing) filesystem: copy instead. A
-            # copy actually consumes space, so preflight that the destination
-            # filesystem can hold the source before writing a partial file.
-            self._copy_no_overwrite(src, dst)
+        with _anchored_publication(root, dst) as (parent_fd, name):
+            try:
+                _publish_link_no_overwrite(src, parent_fd, name, os.fspath(dst))
+            except OSError as exc:
+                # Only a genuine cross-device / hardlink-unsupported failure warrants a
+                # copy. EEXIST (the destination already exists — e.g. a concurrent import
+                # won the race) or any other errno is surfaced, never silently masked as
+                # cross-device into an overwriting copy.
+                if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                    raise
+                # Cross-device (or hardlink-refusing) filesystem: copy instead. A
+                # copy actually consumes space, so preflight that the destination
+                # filesystem can hold the source before writing a partial file.
+                self._copy_no_overwrite(src, dst, parent_fd, name)
 
-    def _copy_no_overwrite(self, src: Path, dst: Path) -> None:
+    def _copy_no_overwrite(self, src: Path, dst: Path, parent_fd: int, name: str) -> None:
         src_size = src.stat().st_size
         free = self.available_bytes(dst.parent)
         if free < src_size:
@@ -424,38 +585,38 @@ class LocalFileSystem:
                 f"insufficient space to copy {src.name}: need {src_size} bytes, "
                 f"{free} available on destination filesystem"
             ) from None
-        tmp_path: str | None = None
+        # The temp is created relative to the SAME verified descriptor as the final
+        # entry, so the bytes cannot land outside the root even if the destination
+        # directory's name is swapped mid-copy; a random suffix keeps the exclusive
+        # create from colliding with a concurrent import of another title.
+        tmp_name = f".{name}.{os.urandom(8).hex()}.tmp"
+        tmp_fd = os.open(
+            tmp_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        published = False
         try:
-            with tempfile.NamedTemporaryFile(
-                prefix=f".{dst.name}.",
-                suffix=".tmp",
-                dir=dst.parent,
-                delete=False,
-            ) as tmp:
-                tmp_path = tmp.name
-            shutil.copy2(os.fspath(src), tmp_path)
+            with os.fdopen(tmp_fd, "wb") as target:
+                _copy_contents(src, target)
             # Verify the copy is complete before exposing it at the final path.
-            copied_size = Path(tmp_path).stat().st_size
+            copied_size = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False).st_size
             if copied_size != src_size:
                 raise OSError(
                     f"copy of {src.name} is incomplete: expected {src_size} bytes, "
                     f"wrote {copied_size}; partial destination removed"
                 )
-            _publish_temp_no_overwrite(tmp_path, dst)
-            tmp_path = None
-        except OSError:
-            # The copy target is a temp file in dst.parent, never the final path,
-            # so a process crash cannot leave a partial library file that blocks
-            # every retry. Clean the temp best-effort and re-raise the original
-            # error, unmasked (north-star #3: honesty).
-            if tmp_path is not None:
+            _publish_temp_no_overwrite(parent_fd, tmp_name, name, os.fspath(dst))
+            published = True
+        finally:
+            # The copy target is a temp entry in the destination directory, never
+            # the final name, so a process crash cannot leave a partial library file
+            # that blocks every retry. Clean it best-effort and let the original
+            # error propagate unmasked (north-star #3: honesty).
+            if not published:
                 with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-            raise
-        else:
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
+                    os.unlink(tmp_name, dir_fd=parent_fd)
 
     def largest_video_file(self, root: str) -> str | None:
         """Return the absolute path of the largest video file under ``root``.

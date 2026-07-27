@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
     EpisodeImportResult,
@@ -738,8 +739,9 @@ async def _refresh_resumed_import_after_probe_outage(
     return await download_repo.get_by_hash(torrent_hash)
 
 
-def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
-    """Hardlink/copy ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
+def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> bool:
+    """Hardlink/copy ``src`` to ``dst`` under ``root``, idempotently (sync I/O, run
+    in a thread).
 
     Returns ``True`` iff THIS call created ``dst``; ``False`` when ``dst`` was
     already supplied by another writer — a prior fully-imported copy (idempotent
@@ -751,27 +753,32 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
     file already at ``dst`` (a user's library file, or a stale partial) is NEVER
     blind-deleted — it is surfaced as a ``FileExistsError`` conflict for the operator
     to resolve, so a re-import never silently overwrites someone else's file.
+
+    ``root`` (the selected library root) is handed to the adapter, which creates the
+    destination's directories and publishes the file anchored to no-follow directory
+    descriptors below it. Neither the directory creation nor the "is something
+    already here?" decision may be made by pathname up here: an ancestor that is a
+    symlink out of the library would make ``os.makedirs`` publish outside every
+    configured root, and would make a pathname existence check report on a file that
+    is not in the library at all (GHSA-r5vh). Both now happen fd-relative inside
+    ``hardlink_or_copy``, which refuses such an ancestor outright; the checks below
+    run only once that walk has proved every ancestor a real directory.
     """
-    os.makedirs(dst.parent, exist_ok=True)
-    # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
-    # absent, which would let hardlink_or_copy's rename fallback silently replace
-    # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
-    if os.path.lexists(os.fspath(dst)):
-        if _same_file_content(src, dst):
-            return False  # already fully imported here — idempotent skip; not ours
-        # A differently-sized file is already at the destination: a user's
-        # manually-managed library file, or a title Plex availability missed. NEVER
-        # blind-delete it (that is data loss) — surface it as an import conflict the
-        # operator resolves, instead of overwriting their file with the download.
-        raise FileExistsError(f"destination already exists with different content: {dst}")
     try:
-        fs.hardlink_or_copy(Path(src), dst)
+        fs.hardlink_or_copy(Path(src), dst, root=root)
     except FileExistsError:
-        # Lost a placement race: a concurrent import (the reconcile loop racing the
-        # operator's POST /queue/{id}/import retry) created ``dst`` between the
-        # lexists check above and this link. Same content (same size) is an
-        # idempotent win for the other attempt, NOT a failure to block on; a
-        # different size is a genuine conflict, surfaced like the pre-existing case.
+        # Something is already at ``dst``: a prior fully-imported copy, or a
+        # concurrent import (the reconcile loop racing the operator's
+        # POST /queue/{id}/import retry) that won the placement race. Same content
+        # (same size + digest) is an idempotent win for the other attempt, NOT a
+        # failure to block on. A differently-sized file is a user's manually-managed
+        # library file, or a title Plex availability missed: NEVER blind-delete it
+        # (that is data loss) — surface it as an import conflict the operator
+        # resolves, instead of overwriting their file with the download.
+        #
+        # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
+        # absent (GHSA-8fj8), which would report "nothing there" for an entry the
+        # adapter just refused to publish over.
         if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
             return False  # the race winner's file — not ours to roll back
         raise FileExistsError(f"destination already exists with different content: {dst}") from None
@@ -1480,10 +1487,17 @@ async def _import_download_locked(
         await session.commit()
 
         try:
-            placed = await asyncio.to_thread(_place_file, fs, src, dst)
+            placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(effective_movies_root))
         except FileExistsError as exc:
             # A pre-existing, differently-sized file at the destination (a user's file,
             # or a stale partial) — surfaced as a conflict, never overwritten.
+            await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+            return await download_repo.get_by_hash(torrent_hash)
+        except LocalFileSystemError as exc:
+            # A symlinked (or non-directory) destination ancestor: publication is
+            # refused rather than followed outside the library root (GHSA-r5vh). The
+            # operator fixes the tree and retries — a visible, retryable block, never
+            # a silent placement somewhere the correction paths cannot reach.
             await _block(session, download_repo, download_id, str(exc), request_id=request.id)
             return await download_repo.get_by_hash(torrent_hash)
         except OSError as exc:
@@ -1892,12 +1906,12 @@ async def _import_tv_targets_locked(
                 src = plan.abs_by_rel[result.video.relative_path]
                 dst = Path(tv_root) / relative
                 try:
-                    placed = await asyncio.to_thread(_place_file, fs, src, dst)
-                except (FileExistsError, OSError) as exc:
+                    placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                except (FileExistsError, LocalFileSystemError, OSError) as exc:
                     await asyncio.to_thread(_remove_quietly_many, placed_paths)
                     reason = (
                         str(exc)
-                        if isinstance(exc, FileExistsError)
+                        if isinstance(exc, FileExistsError | LocalFileSystemError)
                         else f"import copy failed: {type(exc).__name__}"
                     )
                     failures.append(_TvImportFailure(plan.target, reason))
@@ -2422,12 +2436,12 @@ async def _import_tv_locked(
             src = abs_by_rel[result.video.relative_path]
             dst = Path(tv_root) / relative
             try:
-                placed = await asyncio.to_thread(_place_file, fs, src, dst)
-            except (FileExistsError, OSError) as exc:
+                placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+            except (FileExistsError, LocalFileSystemError, OSError) as exc:
                 await asyncio.to_thread(_remove_quietly_many, placed_paths)
                 reason = (
                     str(exc)
-                    if isinstance(exc, FileExistsError)
+                    if isinstance(exc, FileExistsError | LocalFileSystemError)
                     else f"import copy failed: {type(exc).__name__}"
                 )
                 await _block(

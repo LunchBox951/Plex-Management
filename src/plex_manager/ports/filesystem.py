@@ -28,8 +28,11 @@ class FileSystemPort(Protocol):
         """Return free bytes on the filesystem containing ``path``."""
         raise NotImplementedError
 
-    def move(self, src: Path, dst: Path) -> None:
+    def move(self, src: Path, dst: Path, *, root: Path) -> None:
         """Move ``src`` to ``dst`` (atomic rename when on the same device).
+
+        ``root`` is the library root the caller selected for this title; see
+        :meth:`hardlink_or_copy` for the containment implementations MUST enforce.
 
         Raises ``NotImplementedError`` by default (issue #80): this is a
         mutating operation the import pipeline depends on to actually place a
@@ -39,8 +42,18 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> None:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        ``dst`` MUST lie beneath ``root`` -- the library root the caller selected
+        for this title (the ADR-0015 anime root, or the normal one). Implementations
+        MUST create and traverse every destination component below ``root`` without
+        following symlinks, and MUST REFUSE (raise, never silently fall back to
+        pathname publication) when an ancestor is a symlink or not a directory: a
+        lexically in-root destination whose ancestor is a symlink otherwise writes
+        media outside every configured root while the caller records an in-root
+        breadcrumb, which the containment guard on :meth:`delete` then correctly
+        refuses to clean up -- media that can no longer be corrected from the web UI.
 
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline
