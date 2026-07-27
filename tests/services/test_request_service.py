@@ -319,7 +319,10 @@ async def test_removed_then_reacquired_yields_a_second_available_row(
         assert pending_row is not None
         assert pending_row.status is RequestStatus.pending
 
-    # 4. It downloads and Plex confirms it -> mark_available (the SECOND available row).
+    # 4. It downloads, imports, and Plex confirms it -> the honest two-phase
+    #    completed -> mark_available (the SECOND available row).
+    async with sessionmaker_() as session:
+        await request_service.mark_completed(session, reacquired.id)
     async with sessionmaker_() as session:
         await request_service.mark_available(session, reacquired.id)
 

@@ -535,23 +535,36 @@ class SqlSeasonRequestRepository:
         """Set ``completed`` (imported, scan triggered) -- the honest pre-``available`` state."""
         await self.set_status(season_request_id, RequestStatus.completed.value)
 
-    async def mark_available(self, season_request_id: int) -> None:
-        """Set ``available`` (Plex-confirmed: ``leafCount>0`` for this season).
+    async def mark_available(self, season_request_id: int) -> bool:
+        """CAS to ``available`` (Plex-confirmed: ``leafCount>0`` for this season).
+
+        The season-level twin of ``SqlRequestRepository.mark_available`` -- same
+        ``completed``/``available`` allowed set, same reason (issue #479: a
+        report-issue re-arm to ``searching`` commits inside the availability
+        cycle's Plex round-trip and must never be overwritten by that tick's
+        stale answer); see its docstring for the full rationale. Returns whether
+        the season was actually promoted.
 
         Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2) --
-        the season-level twin of ``SqlRequestRepository.mark_available``'s same
-        clear; see its docstring for the full rationale. Deliberately its OWN
-        write (not a delegation to :meth:`set_status`, which every OTHER
+        again the twin of that method's same clear. Deliberately its OWN write
+        (not a delegation to :meth:`set_status`, which every OTHER
         in-flight transition -- e.g. ``downloading`` -- also uses and where the
         marker must still stand): only THIS confirmed-watchable moment retires
         the marker.
         """
-        row = await self._session.get(SeasonRequest, season_request_id)
-        if row is None:
-            raise LookupError(f"season request {season_request_id} does not exist")
-        row.status = RequestStatus.available
-        row.eviction_regrab = False
-        await self._session.flush()
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(SeasonRequest)
+                .where(
+                    SeasonRequest.id == season_request_id,
+                    SeasonRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
+                )
+                .values(status=RequestStatus.available, eviction_regrab=False)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def set_library_path(self, season_request_id: int, library_path: str) -> None:
         """Store the final placed path this season's import wrote into (ADR-0012)."""

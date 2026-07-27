@@ -1150,8 +1150,23 @@ class SqlRequestRepository:
         row.completed_at = datetime.now(UTC)
         await self._session.flush()
 
-    async def mark_available(self, request_id: int) -> None:
-        """Set ``available`` + stamp ``library_verified_at`` (Plex-confirmed).
+    async def mark_available(self, request_id: int) -> bool:
+        """CAS to ``available`` + stamp ``library_verified_at`` (Plex-confirmed).
+
+        A single ``UPDATE ... WHERE id = ? AND status IN ('completed','available')``
+        -- the DATABASE, not the availability cycle's snapshot, decides (mirrors
+        :meth:`set_status_if_in`'s discipline). ``run_availability_cycle`` reads
+        this tick's ``completed`` rows, awaits a Plex round-trip, and only THEN
+        lands here; report-issue commits its re-arm to ``searching`` inside that
+        window (before any irreversible step), so an unconditional write by pk
+        would flip the correction back to ``available`` and abandon the
+        replacement while the purged title reads watchable (issue #479). Every
+        other status -- ``searching``, ``pending``, ``evicted``, ``failed``, ...
+        -- is excluded for exactly that reason. ``available`` stays in the
+        allowed set so the create-time "already in Plex" stamping call
+        (``request_service.create_request``, whose row is created ``available``)
+        still lands. Returns whether the row was actually promoted; ``False`` is
+        a benign stale result, and the caller must not count it as a promotion.
 
         Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2):
         the marker means "this row is THIS eviction's own still-in-flight regrab",
@@ -1163,16 +1178,29 @@ class SqlRequestRepository:
         purely because it once was a regrab, even though its own content is now
         the genuinely watchable copy.
         """
-        row = await self._session.get(MediaRequest, request_id)
-        if row is None:
-            raise LookupError(f"media request {request_id} does not exist")
-        now = datetime.now(UTC)
-        row.status = RequestStatus.available
-        row.library_verified_at = now
-        if row.completed_at is None:
-            row.completed_at = now
-        row.eviction_regrab = False
-        await self._session.flush()
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
+                )
+                .values(
+                    status=RequestStatus.available,
+                    library_verified_at=datetime.now(UTC),
+                    eviction_regrab=False,
+                )
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        if result.rowcount != 1:
+            return False
+        # ``completed_at`` records a request's FIRST completion and never moves, so
+        # it goes through the same guarded stamp the TV rollup uses rather than
+        # being rewritten here.
+        await self.stamp_completed_at_if_unset(request_id)
+        return True
 
     async def claim_if_unowned(self, request_id: int, user_id: int) -> bool:
         """Assign ``user_id`` to a request that currently has NO owner.

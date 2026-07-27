@@ -11,6 +11,7 @@ import gc
 import logging
 import os
 import threading
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import cast
@@ -1392,6 +1393,267 @@ async def test_visible_content_path_tolerates_a_failed_file_list_fetch() -> None
         qbt, "a" * 40, "/srv/downloads/gone.mkv", "/srv/downloads"
     )
     assert result is None
+
+
+class _WedgedContentProbe:
+    """A mount-sensitive torrent-content read that parks in its worker thread until
+    the test releases it -- the wedged ``/downloads`` mount of issue #483. Records
+    the thread it ran on so a test can prove the read landed on the abandonable
+    DAEMON substrate rather than the default executor the interpreter rejoins."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.thread_name: str | None = None
+        self.thread_daemon: bool | None = None
+
+    def __call__(self, *_args: object) -> bool:
+        worker = threading.current_thread()
+        self.thread_name = worker.name
+        self.thread_daemon = worker.daemon
+        self.started.set()
+        self.release.wait(timeout=5)
+        self.finished.set()
+        return True
+
+
+def _unreadable_content_path(_path: str) -> bool:
+    raise OSError("dead mount")
+
+
+def _timed_out_content_path(_path: str) -> bool:
+    # A filesystem layer surfacing its OWN ``ETIMEDOUT`` (a soft-mounted NFS export
+    # giving up on the server). ``TimeoutError`` subclasses ``OSError``, so this
+    # FAST failure is what a bound-elapsed probe must never be confused with.
+    raise TimeoutError("ETIMEDOUT")
+
+
+async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Issue #483: the pre-removal visibility reads were UNBOUNDED
+    # ``asyncio.to_thread`` calls, so a wedged /downloads mount stalled the whole
+    # correction before ``qbt.remove`` ever ran. They now share one bounded budget
+    # on the abandonable PROBE substrate: the bound is honoured, the path is
+    # treated as not visible, and the removal itself still happens.
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.2)
+    wedged = _WedgedContentProbe()
+    monkeypatch.setattr(purge_service, "_content_path_exists", wedged)
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash="a" * 40,
+                name="clip.mkv",
+                raw_state="stalledUP",
+                save_path="/srv/downloads",
+                content_path="/srv/downloads/clip.mkv",
+            )
+        ],
+        files={("a" * 40): [DownloadedFile(name="clip.mkv", size_bytes=1024)]},
+    )
+
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+            ok = await asyncio.wait_for(
+                purge_service.remove_torrent(qbt, "a" * 40, context="a test"), timeout=5.0
+            )
+        elapsed = time.monotonic() - started
+
+        assert ok is True
+        assert qbt.removed == [("a" * 40, True)]  # the correction was never held up
+        assert elapsed < 2.0
+        assert "did not answer within the 0.2s pre-removal mount-read bound" in caplog.text
+        # The wedged read is still parked -- on a DAEMON thread the interpreter
+        # never rejoins, so it cannot hang the web lifespan's shutdown wait.
+        assert wedged.thread_name == "filesystem-probe"
+        assert wedged.thread_daemon is True
+        assert not wedged.finished.is_set()
+    finally:
+        wedged.release.set()
+        assert await asyncio.to_thread(wedged.finished.wait, 2.0)
+
+
+async def test_visible_content_path_treats_an_unreadable_path_as_not_visible(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ``remove_torrent`` never raises over its caller's already-committed writes, so
+    # an ``OSError`` from a dead mount is an honest "not visible" (skip the poll),
+    # logged rather than swallowed -- not an exception escaping the best-effort call.
+    monkeypatch.setattr(purge_service, "_content_path_exists", _unreadable_content_path)
+    qbt = FakeQbittorrent()
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+            qbt, "a" * 40, "/srv/downloads/clip.mkv", "/srv/downloads"
+        )
+
+    assert result is None
+    assert "OSError" in caplog.text
+
+
+async def test_visible_content_path_distinguishes_an_operation_timeout_from_the_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ``TimeoutError`` subclasses ``OSError``, so a read that FAILS FAST with its own
+    # ``ETIMEDOUT`` reaches the awaiter looking exactly like the mount-read bound
+    # elapsing. It must keep the ``OSError`` classification and must NOT be recorded
+    # as a 5s bound that never elapsed -- an operator record of an event that did not
+    # happen is worse than none.
+    monkeypatch.setattr(purge_service, "_content_path_exists", _timed_out_content_path)
+    qbt = FakeQbittorrent()
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+            qbt, "a" * 40, "/srv/downloads/clip.mkv", "/srv/downloads"
+        )
+
+    assert result is None
+    assert time.monotonic() - started < 1.0
+    assert "failed (TimeoutError)" in caplog.text
+    assert "pre-removal mount-read bound" not in caplog.text
+
+
+async def test_visible_content_path_still_remaps_when_the_verbatim_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An ``OSError`` on the VERBATIM read means "this path is not visible", which is
+    # the same fall-through a phantom gets -- not "give up". The proof-gated remap is
+    # the authority on where the content really is and does not consult the verbatim
+    # answer, so returning ``None`` here instead would drop the post-ack same-hash
+    # guard (issue #240) precisely when the real mounted path is still provable.
+    mount = tmp_path / "downloads"
+    mount.mkdir()
+    real = mount / "clip.mkv"
+    real.write_bytes(b"x" * 512)
+    host_save_path = str(tmp_path / "srv" / "downloads")
+    monkeypatch.setattr(path_visibility, "KNOWN_DOWNLOAD_MOUNTS", (str(mount),))
+    monkeypatch.setattr(path_visibility, "is_live_mount", os.path.isdir)
+    monkeypatch.setattr(purge_service, "_content_path_exists", _unreadable_content_path)
+    qbt = FakeQbittorrent(files={("a" * 40): [DownloadedFile(name="clip.mkv", size_bytes=512)]})
+
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, f"{host_save_path}/clip.mkv", host_save_path
+    )
+
+    assert result == str(real)
+
+
+async def test_content_path_poll_bound_covers_the_blocking_read(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Issue #483: the post-ack poll checked its deadline only AFTER the blocking
+    # existence read returned, so a wedged mount defeated the advertised bound
+    # entirely. Each iteration now runs under the REMAINING budget, and a probe
+    # that never answers is logged as an UNKNOWN fate (not as "still present",
+    # which was never observed).
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.02)
+    wedged = _WedgedContentProbe()
+    monkeypatch.setattr(purge_service, "_content_path_exists", wedged)
+
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+            await asyncio.wait_for(
+                purge_service._wait_for_content_path_gone(  # pyright: ignore[reportPrivateUsage]
+                    "/downloads/clip.mkv", context="a test", extra=None
+                ),
+                timeout=5.0,
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+        assert "content path probe did not answer within 0.2s" in caplog.text
+        assert "content path still present" not in caplog.text
+        assert wedged.thread_name == "filesystem-probe"
+        assert wedged.thread_daemon is True
+        assert not wedged.finished.is_set()
+    finally:
+        wedged.release.set()
+        assert await asyncio.to_thread(wedged.finished.wait, 2.0)
+
+
+async def test_content_path_poll_keeps_the_still_present_record_once_presence_is_known(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A mount that answers "present" and only THEN wedges must keep the operator-
+    # facing "still present" record: the last known state is unchanged, so
+    # reporting an unknown fate would understate what the poll actually
+    # established about the same-hash race window.
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS", 0.01)
+    wedged = _WedgedContentProbe()
+    answered_once = threading.Event()
+
+    def _present_then_wedged(path: str) -> bool:
+        if not answered_once.is_set():
+            answered_once.set()
+            return True
+        return wedged(path)
+
+    monkeypatch.setattr(purge_service, "_content_path_exists", _present_then_wedged)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+            await asyncio.wait_for(
+                purge_service._wait_for_content_path_gone(  # pyright: ignore[reportPrivateUsage]
+                    "/downloads/clip.mkv", context="a test", extra=None
+                ),
+                timeout=5.0,
+            )
+
+        assert "content path still present 0.3s" in caplog.text
+        assert "did not answer" not in caplog.text
+    finally:
+        wedged.release.set()
+        assert await asyncio.to_thread(wedged.finished.wait, 2.0)
+
+
+async def test_content_path_poll_treats_an_unreadable_path_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pre-existing OSError classification survives the move onto the substrate:
+    # an unreadable path (e.g. its parent removed out from under it) is as good as
+    # gone, so the poll returns at once rather than spinning out the whole bound.
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(purge_service, "_content_path_exists", _unreadable_content_path)
+
+    started = time.monotonic()
+    await asyncio.wait_for(
+        purge_service._wait_for_content_path_gone(  # pyright: ignore[reportPrivateUsage]
+            "/downloads/clip.mkv", context="a test", extra=None
+        ),
+        timeout=2.0,
+    )
+
+    assert time.monotonic() - started < 1.0
+
+
+async def test_content_path_poll_distinguishes_an_operation_timeout_from_the_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Same conflation on the poll side: a probe that returns AT ONCE with its own
+    # ``ETIMEDOUT`` is an unreadable path (as good as gone), not the 5s bound
+    # elapsing on a mount that never answered. Reporting the latter would tell the
+    # operator the path's fate is unknown after a wait that never happened.
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(purge_service, "_content_path_exists", _timed_out_content_path)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        await asyncio.wait_for(
+            purge_service._wait_for_content_path_gone(  # pyright: ignore[reportPrivateUsage]
+                "/downloads/clip.mkv", context="a test", extra=None
+            ),
+            timeout=2.0,
+        )
+
+    assert time.monotonic() - started < 1.0
+    assert "did not answer" not in caplog.text
+    assert "still present" not in caplog.text
 
 
 class _MissingRemoveQbt(DownloadClientPort):

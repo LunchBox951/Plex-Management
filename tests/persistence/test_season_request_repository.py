@@ -249,10 +249,31 @@ async def test_mark_completed_and_mark_available(session: AsyncSession) -> None:
     assert fetched is not None
     assert fetched.status == "completed"
 
-    await repo.mark_available(created.id)
+    assert await repo.mark_available(created.id) is True
     fetched = await repo.get(created.id)
     assert fetched is not None
     assert fetched.status == "available"
+
+
+async def test_mark_available_cas_only_promotes_completed_or_available(
+    session: AsyncSession,
+) -> None:
+    """Issue #479, season twin: the promotion is a CAS over ``completed``/
+    ``available`` only, so a report-issue re-arm to ``searching`` survives the
+    availability cycle's stale write."""
+    show = await _make_show(session)
+    repo = SqlSeasonRequestRepository(session)
+    finalizing = await repo.ensure(show.id, 1, status="completed")
+    assert await repo.mark_available(finalizing.id) is True
+    # Re-stamping an already-available season must still succeed.
+    assert await repo.mark_available(finalizing.id) is True
+
+    rearmed = await repo.ensure(show.id, 2, status="completed")
+    await repo.set_status(rearmed.id, "searching")  # the report-issue re-arm
+    assert await repo.mark_available(rearmed.id) is False
+    fetched = await repo.get(rearmed.id)
+    assert fetched is not None
+    assert fetched.status == "searching"
 
 
 async def test_library_path_defaults_none_and_round_trips(session: AsyncSession) -> None:

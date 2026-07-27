@@ -1171,6 +1171,124 @@ def _snapshot_content_path(status: DownloadStatus) -> str | None:
     return None
 
 
+def _content_path_exists(path: str) -> bool:
+    """``os.path.exists`` behind a module-level name: THE torrent-content existence
+    read, used by both the pre-removal visibility resolution and the post-ack poll,
+    so a test can stand a wedged mount in its place (the same convention
+    ``path_visibility.is_live_mount`` documents for its own consumers)."""
+    return os.path.exists(path)
+
+
+class _ProbeBoundExceeded(Exception):
+    """A bounded probe's budget elapsed with the read still UNANSWERED.
+
+    Deliberately not ``TimeoutError``: that subclasses ``OSError`` (it IS
+    ``ETIMEDOUT``), so a filesystem layer raising one of its own — a soft-mounted
+    NFS export giving up on the server — is indistinguishable at the await from
+    ``asyncio.wait_for``'s deadline. The two demand opposite handling: a mount that
+    never answered leaves the path's fate unknown, whereas a read that FAILED FAST
+    keeps the caller's ordinary ``OSError`` classification and warrants no
+    bound-elapsed record of a wait that never happened.
+    """
+
+
+async def _probe_within_bound[T](
+    operation: Callable[[], T], path: str, *, operation_name: str, bound: float
+) -> T:
+    """Run one abandonable PROBE-budget read of ``path`` under a ``bound``-second cap.
+
+    Raises :class:`_ProbeBoundExceeded` — and ONLY then — when the bound elapses with
+    the probe still unanswered. ``operation``'s own result and exceptions are
+    otherwise delivered unchanged, so callers keep their narrow ``OSError``
+    classifications (:func:`_run_abandonable_probe`). Racing the probe TASK against
+    the bound is what makes those two outcomes distinguishable at all;
+    ``asyncio.wait_for`` reports its deadline as a ``TimeoutError`` the read itself
+    can equally raise, collapsing them.
+
+    Losing the race cancels the probe, which DETACHES it: this caller unwinds now and
+    the daemon worker wedged on the mount runs to completion unobserved, releasing its
+    own permit (issue #483). ``asyncio.wait`` leaves its futures untouched when the
+    WAITER is itself cancelled, so that path must cancel the probe explicitly for the
+    same reason — otherwise a shutdown-cancelled correction would strand a task
+    awaiting a worker that never returns.
+    """
+    if bound <= 0:
+        # An exhausted budget could only ever end in this raise, so never spend a
+        # permit or start a physical worker to prove it.
+        raise _ProbeBoundExceeded
+    probe = asyncio.ensure_future(
+        _run_abandonable_probe(
+            operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+        )
+    )
+    try:
+        done, _pending = await asyncio.wait((probe,), timeout=bound)
+    except asyncio.CancelledError:
+        probe.cancel()
+        raise
+    if not done:
+        probe.cancel()
+        raise _ProbeBoundExceeded
+    return probe.result()
+
+
+async def _bounded_content_probe[T](
+    operation: Callable[[], T], content_path: str, *, operation_name: str, timeout: float
+) -> T | None:
+    """One mount-sensitive torrent-content read, bounded by ``timeout``, abandonable.
+
+    ``None`` means "no usable answer": the bound elapsed with the mount still not
+    answering, or the read failed with an ``OSError``. Both are treated by
+    :func:`_visible_content_path` exactly like a path that is NOT VISIBLE, because
+    :func:`remove_torrent` is best-effort and never raises over its caller's
+    already-committed DB writes. That is the same fall-through a phantom verbatim
+    path gets, NOT an early return: only the terminal remap's ``None`` skips the
+    post-ack poll. Both are LOGGED rather than swallowed, and they are logged
+    DISTINCTLY — an unanswered mount and a read that failed fast are different
+    operator facts (:class:`_ProbeBoundExceeded`).
+
+    The worker runs on the shared read-only PROBE budget
+    (:data:`_ABANDONABLE_PROBE_THREAD_LIMIT`) rather than via
+    ``asyncio.to_thread``: these are ordinary best-effort reads, not a destructive
+    correction's preflight, and a default-executor worker wedged on a dead mount is
+    rejoined at interpreter teardown, defeating the web lifespan's bounded shutdown
+    wait (issue #483). :func:`_probe_within_bound` is what makes the bound cover the
+    await itself; the probe DETACHES promptly on that cancellation
+    (:func:`_run_abandonable_probe`), leaving its daemon worker to finish unobserved
+    and release its own permit.
+
+    The shared core is used directly rather than the public
+    :func:`run_abandonable_probe` because that entry point COALESCES by normalized
+    path alone (issue #466). The reads around one torrent removal are DIFFERENT
+    operations over the SAME content path — an existence/mount predicate, a remap
+    returning ``str | None``, and :func:`_wait_for_content_path_gone`'s bare
+    existence read — so two concurrent removals of the same torrent could be handed
+    each other's answer, including a ``str`` where a ``bool`` was asked for. Same
+    PROBE budget, no cross-semantics coalescing.
+    """
+    try:
+        return await _probe_within_bound(
+            operation, content_path, operation_name=operation_name, bound=timeout
+        )
+    except _ProbeBoundExceeded:
+        _logger.warning(
+            "%s of %r did not answer within the %.1fs pre-removal mount-read bound; "
+            "treating the path as not visible for this read",
+            operation_name,
+            safe_text(content_path),
+            _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+        )
+        return None
+    except OSError as error:
+        _logger.warning(
+            "%s of %r failed (%s); treating the path as not visible",
+            operation_name,
+            safe_text(content_path),
+            type(error).__name__,
+        )
+        return None
+
+
 async def _visible_content_path(
     qbt: DownloadClientPort, torrent_hash: str, content_path: str, save_path: str
 ) -> str | None:
@@ -1195,20 +1313,48 @@ async def _visible_content_path(
     the post-ack poll watch the WRONG location — releasing the same-hash guard
     while qBittorrent is still deleting the real, mounted file. So a phantom
     verbatim path falls through to the proof-gated remap, which prefers the real
-    mounted path.
+    mounted path. A verbatim read that FAILS (``OSError``) or exceeds the bound
+    takes that same fall-through rather than returning early: it establishes only
+    that this path is not usably visible, and the remap's proof does not consult
+    it. Giving up instead would drop the post-ack guard exactly when one dead mount
+    still leaves the real one provable.
 
     Called BEFORE the torrent is removed (unlike the poll itself): the proof
     needs the client's own file list, which ``list_files`` can no longer answer
     once the torrent is gone. Returns ``None`` — the caller then skips the poll
     rather than checking the wrong path — when there is no live ``save_path``
     anchor, when ``list_files`` itself fails (a client hiccup here must not
-    block the removal that's about to happen regardless), or when no candidate
-    is proven.
+    block the removal that's about to happen regardless), or when the remap
+    proves no candidate, fails, or exhausts the shared bound below.
+
+    Every filesystem read here is mount-sensitive and runs BEFORE ``qbt.remove``, so
+    together they draw ONE ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` budget
+    (:func:`_bounded_content_probe`): a wedged ``/downloads`` mount must never hold
+    up the removal it precedes (issue #483). Only the mount reads spend that budget —
+    the ``list_files`` round trip between them is network I/O the download client
+    adapter bounds itself, so charging it here would let a merely slow client turn a
+    resolvable remap into an honest-but-wrong "not visible".
     """
-    if await asyncio.to_thread(os.path.exists, content_path) and await asyncio.to_thread(
-        path_visibility.content_is_mounted, content_path
+    budget = _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS
+    started = time.monotonic()
+    if await _bounded_content_probe(
+        lambda: (
+            _content_path_exists(content_path) and path_visibility.content_is_mounted(content_path)
+        ),
+        content_path,
+        operation_name="content path visibility probe",
+        timeout=budget,
     ):
+        # One probe, not two: the existence check and the mount check are a single
+        # short-circuiting read, so they cost one worker and one permit.
         return content_path
+    budget -= time.monotonic() - started
+    if budget <= 0:
+        # The verbatim probe consumed the entire pre-removal bound (a wedged
+        # mount), so the remap probe below could only raise the same
+        # bound-exceeded answer -- don't spend a client round trip (up to the
+        # adapter's own HTTP timeout) discovering that.
+        return None
     if not save_path:
         # No live anchor to remap against (a torrent status with no save path):
         # only the verbatim path counts, exactly as ``_resolve_visible_content``
@@ -1222,8 +1368,11 @@ async def _visible_content_path(
         # provable to poll — never a reason to hold up the torrent removal itself.
         return None
     expected = [(entry.name, entry.size_bytes) for entry in files]
-    return await asyncio.to_thread(
-        path_visibility.remap_download_content, content_path, save_path, expected
+    return await _bounded_content_probe(
+        lambda: path_visibility.remap_download_content(content_path, save_path, expected),
+        content_path,
+        operation_name="content path remap",
+        timeout=budget,
     )
 
 
@@ -1237,11 +1386,14 @@ async def _wait_for_content_path_gone(
     finishes, so a same-hash re-grab landing right after the ACK can start writing
     fresh data at ``content_path`` while the OLD deletion is still tearing it down
     — the tail of that deletion can then clobber the new data. Polls
-    ``os.path.exists`` off the event loop (mirrors every other blocking FS probe in
-    this module/``import_service``), bounded by
+    ``os.path.exists`` on the abandonable read-only PROBE substrate (never
+    ``asyncio.to_thread``: a default-executor worker wedged on a dead mount is
+    rejoined at interpreter teardown), bounded by
     ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` so this best-effort check can never
     hang a caller indefinitely (it runs inline in operator-facing correction
-    endpoints, not just the reconcile background loop). A path still present once
+    endpoints, not just the reconcile background loop). Each iteration's probe runs
+    under the REMAINING budget, so the bound covers the blocking read itself and
+    not merely the gaps between reads (issue #483). A path still present once
     the bound elapses is logged (honesty over silence) and left as-is — the
     caller's DB state change already committed, and every actor's removal-physics
     guard release proceeds regardless; a client this slow to finish its own
@@ -1249,23 +1401,63 @@ async def _wait_for_content_path_gone(
     eliminate.
     """
     deadline = time.monotonic() + _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS
+    seen_present = False
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The bound elapsed BETWEEN polls, with the path last seen present. The
+            # first iteration always holds the full bound, so this is unreachable
+            # before a probe has reported presence -- and a zero-budget probe (which
+            # could only time out) is never started.
+            _log_content_path_still_present(context, extra)
+            return
         try:
-            still_present = await asyncio.to_thread(os.path.exists, content_path)
+            still_present = await _probe_within_bound(
+                lambda: _content_path_exists(content_path),
+                content_path,
+                operation_name="content path removal poll",
+                bound=remaining,
+            )
+        except _ProbeBoundExceeded:
+            # Each iteration's budget IS the remaining bound, so this is the bound
+            # elapsing INSIDE the read -- never a read that failed fast with its own
+            # ``ETIMEDOUT``, which stays an ``OSError`` below. Which log that warrants
+            # depends on what was already established: once a probe has reported the
+            # path present, "still present" remains the honest summary (the last known
+            # state, unchanged); with no answer ever -- a wedged mount -- the path's
+            # fate is genuinely unknown and must be reported as such rather than as
+            # an observation that never happened.
+            if seen_present:
+                _log_content_path_still_present(context, extra)
+            else:
+                _logger.warning(
+                    "content path probe did not answer within %.1fs of %s's torrent "
+                    "removal being acknowledged; the path's fate is unknown and a fast "
+                    "same-hash re-grab could still race the client's own asynchronous "
+                    "file deletion",
+                    _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+                    context,
+                    extra=extra,
+                )
+            return
         except OSError:
             # An unreadable path (e.g. a parent directory removed out from under
-            # it) is as good as gone for this best-effort check.
+            # it, or a soft mount surfacing its own ``ETIMEDOUT``) is as good as
+            # gone for this best-effort check.
             still_present = False
         if not still_present:
             return
-        if time.monotonic() >= deadline:
-            _logger.warning(
-                "content path still present %.1fs after %s's torrent removal "
-                "was acknowledged; a fast same-hash re-grab could still race the "
-                "client's own asynchronous file deletion",
-                _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
-                context,
-                extra=extra,
-            )
-            return
+        seen_present = True
         await asyncio.sleep(_CONTENT_PATH_GONE_POLL_INTERVAL_SECONDS)
+
+
+def _log_content_path_still_present(context: str, extra: dict[str, object] | None) -> None:
+    """The post-ack poll's bound-exceeded record for a path last observed present."""
+    _logger.warning(
+        "content path still present %.1fs after %s's torrent removal "
+        "was acknowledged; a fast same-hash re-grab could still race the "
+        "client's own asynchronous file deletion",
+        _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+        context,
+        extra=extra,
+    )

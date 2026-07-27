@@ -48,6 +48,24 @@ async def _make_show(sm: SessionMaker, tmdb_id: int = 700) -> int:
         return show.id
 
 
+async def _settle_available(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """Drive a season all the way to ``available`` the way the pipeline does.
+
+    The promotion is a CAS over ``completed``/``available`` (issue #479), so a
+    season staged straight from ``pending`` would never reach ``available``;
+    tests that only need the settled end state go through both phases here and
+    assert the promotion actually landed.
+    """
+    await season_request_service.mark_completed(
+        session, media_request_id=media_request_id, season_number=season_number
+    )
+    assert await season_request_service.mark_available(
+        session, media_request_id=media_request_id, season_number=season_number
+    )
+
+
 async def test_ensure_seasons_creates_pending_rows_and_rolls_up_pending(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -162,9 +180,7 @@ async def test_ensure_seasons_re_arms_an_evicted_season_to_pending(
         await season_request_service.ensure_seasons(
             session, None, media_request_id=show_id, tmdb_id=710, seasons=[1, 2]
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await season_request_service.set_status(
             session, media_request_id=show_id, season_number=2, status="evicted"
         )
@@ -250,9 +266,7 @@ async def test_ensure_seasons_rearm_loses_cleanly_to_a_concurrent_recovery_resto
             session, None, media_request_id=show_id, tmdb_id=730, seasons=[1]
         )
         # The recovery restore's end state: 'available' over a live file.
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         stmt = select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
@@ -459,9 +473,7 @@ async def test_one_finalizing_season_with_others_available_rolls_up_completed(
 
     async with sessionmaker_() as session:
         # Season 1 fully settled (Plex-confirmed available).
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         # Season 2 still finalizing (imported, not yet Plex-confirmed).
@@ -552,9 +564,7 @@ async def test_set_status_skip_if_terminal_leaves_a_finished_season_untouched(
         await season_request_service.ensure_seasons(
             session, None, media_request_id=show_id, tmdb_id=707, seasons=[1]
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
 
     async with sessionmaker_() as session:
@@ -590,9 +600,7 @@ async def test_set_status_defaults_to_overwriting_a_finished_season(
         await season_request_service.ensure_seasons(
             session, None, media_request_id=show_id, tmdb_id=708, seasons=[1]
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
 
     async with sessionmaker_() as session:
@@ -617,9 +625,7 @@ async def test_mark_no_acceptable_release_never_unterminates_a_finished_season(
         await season_request_service.ensure_seasons(
             session, None, media_request_id=show_id, tmdb_id=706, seasons=[1]
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
 
     async with sessionmaker_() as session:
@@ -935,9 +941,7 @@ async def test_reset_for_research_leaves_completed_at_when_a_sibling_is_still_do
             season_number=2,
             library_path="/media/tv/Some Show/Season 02",
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=2
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=2)
         await session.commit()
 
     async with sessionmaker_() as session:
@@ -1191,9 +1195,7 @@ async def test_reset_keeps_stamp_backed_by_legacy_imported_season_without_breadc
                 season=1,
             )
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         # S2: a modern import with the breadcrumb.
         await season_request_service.set_library_path(
             session,
@@ -1269,9 +1271,7 @@ async def test_ensure_seasons_evicted_re_arm_heals_stale_completed_at(
             season_number=1,
             library_path="/media/tv/Some Show/Season 01",
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
@@ -1358,9 +1358,7 @@ async def test_ensure_seasons_evicted_re_arm_preserves_stamp_backed_by_done_sibl
             season_number=1,
             library_path="/media/tv/Some Show/Season 01",
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await season_request_service.set_library_path(
             session,
             media_request_id=show_id,
@@ -1462,9 +1460,7 @@ async def test_evicted_re_arm_to_pending_does_not_resurrect_stamp_via_stale_down
             season_number=1,
             library_path="/media/tv/Some Show/Season 01",
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
@@ -1581,9 +1577,7 @@ async def test_reimport_after_eviction_restores_download_evidence(
                 message="imported Some.Show.S01.mkv to Some Show/Season 01",
             )
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         season1_id = (
@@ -1647,9 +1641,7 @@ async def test_reimport_after_eviction_restores_download_evidence(
                 message="imported Some.Show.S01.mkv to Some Show/Season 01",
             )
         )
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
     async with sessionmaker_() as session:
         show = await session.get(MediaRequest, show_id)
@@ -1732,9 +1724,7 @@ async def test_mark_completed_if_in_skips_when_status_moved_out_of_due(
     # Simulate the concurrent actor: the season is already settled 'available'
     # (outside DUE_SEARCH_STATUSES) by the time this call runs.
     async with sessionmaker_() as session:
-        await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
-        )
+        await _settle_available(session, media_request_id=show_id, season_number=1)
         await session.commit()
 
     async with sessionmaker_() as session:
