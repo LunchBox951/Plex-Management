@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import os
 import threading
@@ -45,6 +44,7 @@ from typing import TYPE_CHECKING, Final, Literal, NamedTuple, cast
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.adapters.filesystem.local import LocalFileSystemError
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.import_validation import (
     EpisodeImportResult,
@@ -61,7 +61,7 @@ from plex_manager.domain.plex_video import plex_video_extension
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -89,7 +89,11 @@ if TYPE_CHECKING:
 
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
-    from plex_manager.ports.filesystem import FileSystemPort
+    from plex_manager.ports.filesystem import (
+        FilePublication,
+        FileSystemPort,
+        PublishedFileIdentity,
+    )
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.media_probe import MediaProbePort
     from plex_manager.ports.parser import ParserPort
@@ -738,87 +742,77 @@ async def _refresh_resumed_import_after_probe_outage(
     return await download_repo.get_by_hash(torrent_hash)
 
 
-def _place_file(fs: FileSystemPort, src: str, dst: Path) -> bool:
-    """Hardlink/copy ``src`` to ``dst``, idempotently (sync I/O, run in a thread).
+def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> FilePublication:
+    """Hardlink/copy ``src`` to ``dst`` under ``root``, idempotently (sync I/O, run
+    in a thread).
 
-    Returns ``True`` iff THIS call created ``dst``; ``False`` when ``dst`` was
-    already supplied by another writer — a prior fully-imported copy (idempotent
-    skip) or a concurrent import that won a placement race. The caller rolls ``dst``
-    back on a later failure ONLY when it actually placed it, so it never unlinks a
-    file another import (or the user) owns.
+    Returns whether THIS call created ``dst`` plus the published inode identity used to
+    authorize a later rollback. ``placed`` is false when ``dst`` was already supplied by
+    another writer — a prior fully-imported copy (idempotent skip) or a concurrent import
+    that won a placement race. The caller rolls ``dst`` back on a later failure ONLY when
+    it actually placed it, and presents the identity token so a post-publication
+    replacement is never unlinked.
 
     A fully-imported destination (same size) is left untouched. A *differently*-sized
     file already at ``dst`` (a user's library file, or a stale partial) is NEVER
     blind-deleted — it is surfaced as a ``FileExistsError`` conflict for the operator
     to resolve, so a re-import never silently overwrites someone else's file.
+
+    ``root`` (the selected library root) is handed to the adapter, which creates the
+    destination's directories, publishes the file, and decides "is something already
+    here, and is it ours?" — all anchored to no-follow directory descriptors below
+    that root. NONE of it may be done by pathname up here: an ancestor that is a
+    symlink out of the library would make ``os.makedirs`` publish outside every
+    configured root, and would make a pathname existence/content check answer for a
+    file that is not in the library at all — including one swapped in AFTER the
+    adapter refused the exclusive create (GHSA-r5vh).
     """
-    os.makedirs(dst.parent, exist_ok=True)
-    # lexists, not exists: exists() follows a symlink and reads a DANGLING one as
-    # absent, which would let hardlink_or_copy's rename fallback silently replace
-    # the symlink entry (GHSA-8fj8) instead of surfacing the conflict below.
-    if os.path.lexists(os.fspath(dst)):
-        if _same_file_content(src, dst):
-            return False  # already fully imported here — idempotent skip; not ours
-        # A differently-sized file is already at the destination: a user's
-        # manually-managed library file, or a title Plex availability missed. NEVER
-        # blind-delete it (that is data loss) — surface it as an import conflict the
-        # operator resolves, instead of overwriting their file with the download.
-        raise FileExistsError(f"destination already exists with different content: {dst}")
+    return fs.hardlink_or_copy(Path(src), dst, root=root)
+
+
+def _remove_quietly(
+    fs: FileSystemPort, path: Path, root: Path, identity: PublishedFileIdentity
+) -> None:
+    """Best-effort rollback of a file THIS attempt placed, when a later step fails.
+
+    Routed through the adapter's descriptor-anchored removal rather than
+    ``Path.unlink``: a pathname unlink re-resolves every ancestor, so a title/season
+    directory renamed and replaced by a symlink after publication would send the
+    rollback outside ``root`` and delete an unrelated same-named file there
+    (GHSA-r5vh, CWE-59). A refusal there means the tree changed underneath us — the
+    file stays on disk, which a later retry re-adopts, and deleting nothing beats
+    deleting someone else's file.
+
+    Failures are logged and swallowed, never raised: every caller is already blocking
+    the import for the failure that triggered this rollback, and raising here would
+    replace that honest, retryable block with an unhandled error.
+    """
     try:
-        fs.hardlink_or_copy(Path(src), dst)
-    except FileExistsError:
-        # Lost a placement race: a concurrent import (the reconcile loop racing the
-        # operator's POST /queue/{id}/import retry) created ``dst`` between the
-        # lexists check above and this link. Same content (same size) is an
-        # idempotent win for the other attempt, NOT a failure to block on; a
-        # different size is a genuine conflict, surfaced like the pre-existing case.
-        if os.path.lexists(os.fspath(dst)) and _same_file_content(src, dst):
-            return False  # the race winner's file — not ours to roll back
-        raise FileExistsError(f"destination already exists with different content: {dst}") from None
-    return True  # we created dst; a later failure may roll it back
+        fs.remove_published(path, root=root, identity=identity)
+    except (OSError, LocalFileSystemError) as exc:
+        # ``path`` carries a request-derived title (newlines survive clean_title) and
+        # ``exc`` frequently repeats it, so both are sanitized before they reach the
+        # message args -- an unsanitized value could forge a second log record.
+        _logger.warning(
+            "could not roll back placed file %s: %s",
+            safe_text(str(path)),
+            safe_text(str(exc)),
+        )
 
 
-def _file_digest(path: str | Path) -> bytes:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.digest()
-
-
-def _same_file_content(src: str, dst: Path) -> bool:
-    # samefile is only the cheap same-inode short-circuit; on any OSError (a side
-    # not stat-able) fall through to the honest size + digest comparison below.
-    with contextlib.suppress(OSError):
-        if os.path.samefile(src, dst):
-            return True
-    try:
-        dst_size = dst.stat().st_size
-    except OSError:
-        # A dangling symlink (or dst vanished between the lexists check and here)
-        # is NOT our identical file -- never raise FileNotFoundError out of a
-        # content check; the caller surfaces this as an honest conflict instead.
-        return False
-    if dst_size != os.path.getsize(src):
-        return False
-    return _file_digest(src) == _file_digest(dst)
-
-
-def _remove_quietly(path: Path) -> None:
-    """Best-effort unlink (rolling back a placed file when a later step fails)."""
-    with contextlib.suppress(OSError):
-        path.unlink()
-
-
-def _remove_quietly_many(paths: list[Path]) -> None:
-    """Best-effort unlink of every path THIS call placed (TV scan-failure rollback).
+def _remove_quietly_many(
+    fs: FileSystemPort,
+    publications: list[tuple[Path, PublishedFileIdentity]],
+    root: Path,
+) -> None:
+    """Best-effort rollback of every path THIS call placed (TV scan-failure rollback).
 
     Unlike the movie path's single ``dst``, a season import can place several
     episode files before its one combined scan fails; each is rolled back the
     same best-effort way.
     """
-    for path in paths:
-        _remove_quietly(path)
+    for path, identity in publications:
+        _remove_quietly(fs, path, root, identity)
 
 
 # Per-download serialization. The reconcile loop and an operator's
@@ -1480,10 +1474,20 @@ async def _import_download_locked(
         await session.commit()
 
         try:
-            placed = await asyncio.to_thread(_place_file, fs, src, dst)
+            publication = await asyncio.to_thread(
+                _place_file, fs, src, dst, Path(effective_movies_root)
+            )
+            placed = publication.placed
         except FileExistsError as exc:
             # A pre-existing, differently-sized file at the destination (a user's file,
             # or a stale partial) — surfaced as a conflict, never overwritten.
+            await _block(session, download_repo, download_id, str(exc), request_id=request.id)
+            return await download_repo.get_by_hash(torrent_hash)
+        except LocalFileSystemError as exc:
+            # A symlinked (or non-directory) destination ancestor: publication is
+            # refused rather than followed outside the library root (GHSA-r5vh). The
+            # operator fixes the tree and retries — a visible, retryable block, never
+            # a silent placement somewhere the correction paths cannot reach.
             await _block(session, download_repo, download_id, str(exc), request_id=request.id)
             return await download_repo.get_by_hash(torrent_hash)
         except OSError as exc:
@@ -1541,7 +1545,13 @@ async def _import_download_locked(
             # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
             owns_placement = placed or row.download_path == str(dst)
             if owns_placement:
-                await asyncio.to_thread(_remove_quietly, dst)
+                await asyncio.to_thread(
+                    _remove_quietly,
+                    fs,
+                    dst,
+                    Path(effective_movies_root),
+                    publication.identity,
+                )
             await _block(
                 session,
                 download_repo,
@@ -1888,24 +1898,25 @@ async def _import_tv_targets_locked(
         successful_dirs: list[Path] = []
         pack_blocklisted = False
         for plan in plans:
-            placed_paths: list[Path] = []
+            placed_paths: list[tuple[Path, PublishedFileIdentity]] = []
             imported: list[tuple[str, PurePosixPath]] = []
             for relative, result in plan.by_relative.items():
                 src = plan.abs_by_rel[result.video.relative_path]
                 dst = Path(tv_root) / relative
                 try:
-                    placed = await asyncio.to_thread(_place_file, fs, src, dst)
-                except (FileExistsError, OSError) as exc:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    publication = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                    placed = publication.placed
+                except (FileExistsError, LocalFileSystemError, OSError) as exc:
+                    await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                     reason = (
                         str(exc)
-                        if isinstance(exc, FileExistsError)
+                        if isinstance(exc, FileExistsError | LocalFileSystemError)
                         else f"import copy failed: {type(exc).__name__}"
                     )
                     failures.append(_TvImportFailure(plan.target, reason))
                     break
                 if placed:
-                    placed_paths.append(dst)
+                    placed_paths.append((dst, publication.identity))
                 imported.append((os.path.basename(src), relative))
             else:
                 await download_repo.update_status(
@@ -1917,7 +1928,7 @@ async def _import_tv_targets_locked(
                 try:
                     await library.trigger_scan(str(plan.season_dir), "tv")
                 except (PlexLibraryError, PlexAuthError) as exc:
-                    await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                    await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                     failures.append(
                         _TvImportFailure(plan.target, f"plex scan failed: {type(exc).__name__}")
                     )
@@ -2418,18 +2429,19 @@ async def _import_tv_locked(
         # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
         # the audit trail claim an episode was imported when it was in fact deleted
         # moments later (honesty over silence: history must never lie about a rollback).
-        placed_paths: list[Path] = []
+        placed_paths: list[tuple[Path, PublishedFileIdentity]] = []
         imported: list[tuple[str, PurePosixPath]] = []
         for relative, result in by_relative.items():
             src = abs_by_rel[result.video.relative_path]
             dst = Path(tv_root) / relative
             try:
-                placed = await asyncio.to_thread(_place_file, fs, src, dst)
-            except (FileExistsError, OSError) as exc:
-                await asyncio.to_thread(_remove_quietly_many, placed_paths)
+                publication = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                placed = publication.placed
+            except (FileExistsError, LocalFileSystemError, OSError) as exc:
+                await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                 reason = (
                     str(exc)
-                    if isinstance(exc, FileExistsError)
+                    if isinstance(exc, FileExistsError | LocalFileSystemError)
                     else f"import copy failed: {type(exc).__name__}"
                 )
                 await _block(
@@ -2442,7 +2454,7 @@ async def _import_tv_locked(
                 )
                 return await download_repo.get_by_hash(torrent_hash)
             if placed:
-                placed_paths.append(dst)
+                placed_paths.append((dst, publication.identity))
             imported.append((os.path.basename(src), relative))
 
         # download_path is stamped with the SEASON folder (not one file) purely for
@@ -2457,7 +2469,7 @@ async def _import_tv_locked(
         try:
             await library.trigger_scan(str(season_dir), "tv")
         except (PlexLibraryError, PlexAuthError) as exc:
-            await asyncio.to_thread(_remove_quietly_many, placed_paths)
+            await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
             await _block(
                 session,
                 download_repo,
