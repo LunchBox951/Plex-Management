@@ -1622,6 +1622,54 @@ async def _mark_tv_scope_blocked(
     )
 
 
+class _LateScopeReadout(NamedTuple):
+    """What the finalize-time scope re-read saw (issue #476)."""
+
+    late_seasons: tuple[int, ...]
+    observed_scope_ids: frozenset[int]
+
+
+async def _reread_scopes_for_finalize(
+    download_repo: SqlDownloadRepository,
+    *,
+    download_id: int,
+    request_id: int,
+    planned_scope_ids: frozenset[int],
+) -> _LateScopeReadout:
+    """Re-read this download's scopes immediately before the finalize swap (#476).
+
+    The scope set a pass plans from is read BEFORE its probe/copy/scan work, and the
+    same-hash attach path legitimately gives a still-``importing`` row a new scope,
+    season and coverage claim in that window. Terminalizing on the stale snapshot
+    would release that claim along with every other one and strand the scope behind a
+    finished row -- never imported, and no longer guarded against a duplicate
+    physical grab.
+
+    ``late_seasons`` are the seasons of the importable scopes (the same filter the
+    pass planned with) that the plan does not cover. ``observed_scope_ids`` is every
+    scope this read saw as non-``imported`` plus the plan's own: the terminal swap
+    rides it so a scope that commits AFTER this read cannot be terminalized over,
+    while one already accounted for here -- another request's, or a season-less
+    legacy scope, neither of which this import can resolve -- cannot wedge the swap
+    into never succeeding.
+    """
+    scopes = await download_repo.list_scopes(download_id)
+    unimported = [scope for scope in scopes if scope.status != "imported"]
+    late_seasons = tuple(
+        dict.fromkeys(
+            scope.season
+            for scope in unimported
+            if scope.media_request_id == request_id
+            and scope.season is not None
+            and scope.id not in planned_scope_ids
+        )
+    )
+    return _LateScopeReadout(
+        late_seasons=late_seasons,
+        observed_scope_ids=planned_scope_ids | {scope.id for scope in unimported},
+    )
+
+
 async def _import_tv_targets_locked(
     *,
     download_id: int,
@@ -1971,7 +2019,15 @@ async def _import_tv_targets_locked(
 
         for failure in failures:
             await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
-        if failures:
+        readout = await _reread_scopes_for_finalize(
+            download_repo,
+            download_id=download_id,
+            request_id=request.id,
+            planned_scope_ids=frozenset(
+                target.scope_id for target in targets if target.scope_id is not None
+            ),
+        )
+        if failures or readout.late_seasons:
             await download_repo.align_scalar_scope_with_active(download_id)
             # Partial pack: the physical row stays non-terminal (ImportBlocked) for the
             # unresolved sibling, so its whole-download claim release (#456) will not
@@ -1982,17 +2038,49 @@ async def _import_tv_targets_locked(
             # Scope the release to THIS import's target seasons (#461): a reused
             # terminal row retains its prior life's ``imported`` scopes, so a stale
             # ride-along season must not be mistaken for a resolved target and have its
-            # still-active coverage claim freed while the torrent still covers it.
+            # still-active coverage claim freed while the torrent still covers it. A
+            # deferred late attach (below) keeps the row non-terminal for exactly the
+            # same reason a blocked sibling does, so it frees its resolved targets the
+            # same way.
             await download_repo.release_resolved_target_coverage_claims(
                 download_id, target_seasons=target_seasons
             )
+        if failures:
+            finalize_status = DownloadState.ImportBlocked.value
+        elif readout.late_seasons:
+            # A scope attached mid-pass (#476): this download is NOT done, so hold the
+            # row in ``Importing`` -- the one status the state machine already leaves
+            # here, and which ``_RESUMABLE``/``_AUTO_DRAIN`` re-enter on the next
+            # cycle. The plan's own targets are ``imported`` and their claims freed
+            # above, so that pass plans from a fresh snapshot whose only remaining
+            # target is the late scope, and terminalizes (releasing every claim) once
+            # it too resolves. A late scope that cannot import blocks the row exactly
+            # like any other unimportable target, so this can never spin forever.
+            finalize_status = DownloadState.Importing.value
+            _logger.info(
+                "import of download %s deferred terminalization: season(s) %s were "
+                "attached while this pass was importing; the next cycle imports them",
+                safe_int(download_id),
+                ", ".join(str(safe_int(season)) for season in readout.late_seasons),
+                extra={"request_id": safe_int(request.id)},
+            )
+        else:
+            finalize_status = DownloadState.Imported.value
         finalized = await download_repo.update_status_if_in(
             download_id,
-            DownloadState.ImportBlocked.value if failures else DownloadState.Imported.value,
+            finalize_status,
             frozenset({DownloadState.Importing.value}),
             download_path=str(successful_dirs[-1]),
             failed_reason=_failure_summary(failures) if failures else None,
             clear_failed_reason=not failures,
+            # The re-read above and this swap are two statements; only the terminal
+            # one can strand a scope that committed between them (#476), so only it
+            # rides the observed scope set.
+            require_no_unimported_scope_outside=(
+                readout.observed_scope_ids
+                if finalize_status == DownloadState.Imported.value
+                else None
+            ),
         )
         if not finalized:
             await session.rollback()
@@ -2365,9 +2453,21 @@ async def _import_tv_locked(
         # Imported. The season is 'completed' ("Finalizing") until a reconcile cycle
         # confirms availability via is_available (phase 2). Finalize with a
         # compare-and-swap, conditional on STILL holding the Importing claim.
+        #
+        # This path is entered with NO importable scope, so any the re-read finds now
+        # was attached to the still-``importing`` row mid-pass (#476): hold the row in
+        # ``Importing`` rather than terminalize (and blanket-release the claims) over
+        # it. The bookkeeping below still runs -- the scalar season really did import
+        # -- and the next cycle takes the scope path for the late season.
+        readout = await _reread_scopes_for_finalize(
+            download_repo,
+            download_id=download_id,
+            request_id=request.id,
+            planned_scope_ids=frozenset(),
+        )
         finalized = await download_repo.update_status_if_in(
             download_id,
-            DownloadState.Imported.value,
+            DownloadState.Importing.value if readout.late_seasons else DownloadState.Imported.value,
             frozenset({DownloadState.Importing.value}),
             download_path=str(season_dir),
             # Clear any prior block reason on finalize (issue #73), mirroring the movie
@@ -2375,6 +2475,9 @@ async def _import_tv_locked(
             # ``failed_reason`` so a successfully-imported season never displays a stale
             # import-block reason (honesty over silence - the state and the reason agree).
             clear_failed_reason=True,
+            require_no_unimported_scope_outside=(
+                None if readout.late_seasons else readout.observed_scope_ids
+            ),
         )
         if not finalized:
             await session.rollback()

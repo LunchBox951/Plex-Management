@@ -22,16 +22,25 @@ from typing import Literal
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
+from plex_manager.db import Base, enable_sqlite_fk_enforcement
+from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.quality_profile import default_profile
+from plex_manager.domain.release import ParsedRelease, ScoredRelease
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Blocklist,
     Download,
+    DownloadCoverageClaim,
     DownloadHistory,
     DownloadHistoryEvent,
     DownloadScope,
@@ -48,11 +57,12 @@ from plex_manager.ports.media_probe import (
     MediaProbeResult,
     MediaProbeUnavailableError,
 )
-from plex_manager.ports.repositories import DownloadRecord
+from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
     eviction_service,
+    grab_service,
     import_service,
     path_visibility,
     purge_service,
@@ -63,7 +73,7 @@ from plex_manager.services.import_service import (
     run_availability_cycle,
     run_import_cycle,
 )
-from tests.web.fakes import FakeLibrary, FakeMediaProbe, FakeQbittorrent
+from tests.web.fakes import FakeLibrary, FakeMediaProbe, FakeQbittorrent, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -2713,6 +2723,350 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
                 season=2,
                 media_type="tv",
             )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #476: the same-hash attach path accepts any NON-TERMINAL row, ``importing``
+# included, so a second season can gain a scope + coverage claim AFTER the running
+# import snapshotted its targets. Terminalizing on that stale snapshot released
+# every claim (the terminal transition frees them all) and stranded the new scope
+# behind a finished row: never imported, and no longer guarded against a duplicate
+# physical grab. Both tests below drive the REAL grab path from a genuinely separate
+# session/connection (the #475 file-backed harness), so the attach commits exactly
+# where production's does.
+# --------------------------------------------------------------------------- #
+
+
+async def _file_backed_sessionmaker(tmp_path: Path, name: str) -> tuple[SessionMaker, AsyncEngine]:
+    """A real file-backed engine (two sessions = two real connections)."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    enable_sqlite_fk_enforcement(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return async_sessionmaker(engine, expire_on_commit=False), engine
+
+
+def _scored_tv_season(info_hash: str, season: int) -> ScoredRelease:
+    cand = candidate(f"Some.Show.S{season:02d}.1080p.WEB-DL.x264-GRP", info_hash=info_hash)
+    parsed = ParsedRelease(
+        raw_title=cand.title, clean_title="Some Show", source=QualitySource.WEBDL
+    )
+    return ScoredRelease(
+        candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
+    )
+
+
+class _AttachSeasonDuringScanLibrary(FakeLibrary):
+    """A FakeLibrary whose FIRST targeted scan runs a real same-hash grab for another
+    season in a separate session — the attach landing after this pass snapshotted its
+    scopes and before it finalizes."""
+
+    def __init__(self, sm: SessionMaker, *, request_id: int, season: int) -> None:
+        super().__init__()
+        self._sm = sm
+        self._request_id = request_id
+        self._season = season
+        self.attached = False
+
+    async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+        await super().trigger_scan(path, media_type)
+        if self.attached:
+            return
+        self.attached = True
+        async with self._sm() as session:
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=_scored_tv_season(_HASH, self._season),
+                request_id=self._request_id,
+                tmdb_id=_TMDB_ID,
+                season=self._season,
+            )
+
+
+async def _seed_tv_pack_with_s1_scope(sm: SessionMaker) -> tuple[int, int]:
+    """One importing-capable S1 download (scope + coverage claim) whose S2 is still
+    searching, so a later same-hash grab for S2 attaches to it."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season_1 = SeasonRequest(
+            media_request_id=request.id, season_number=1, status=RequestStatus.downloading.value
+        )
+        season_2 = SeasonRequest(
+            media_request_id=request.id, season_number=2, status=RequestStatus.searching.value
+        )
+        session.add_all([season_1, season_2])
+        await session.flush()
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season_1.id,
+                    season_number=1,
+                    scope_key="season:1|episodes:*",
+                    status="active",
+                ),
+                DownloadCoverageClaim(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_number=1,
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+        return download.id, request.id
+
+
+async def _scope_and_claim_state(
+    sm: SessionMaker, download_id: int
+) -> tuple[dict[int | None, str], dict[int | None, str]]:
+    async with sm() as session:
+        scopes = (
+            (
+                await session.execute(
+                    select(DownloadScope).where(DownloadScope.download_id == download_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        claims = (
+            (
+                await session.execute(
+                    select(DownloadCoverageClaim).where(
+                        DownloadCoverageClaim.download_id == download_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return (
+        {scope.season_number: scope.status for scope in scopes},
+        {claim.season_number: claim.status for claim in claims},
+    )
+
+
+async def test_import_tv_scope_attached_mid_import_survives_and_imports_next_pass(
+    tmp_path: Path,
+) -> None:
+    """The S2 grab attaches while S1 is mid-import. The pass must NOT terminalize:
+    S2's coverage claim has to outlive S1's import (it still guards a season nothing
+    has downloaded twice), and the next cycle must import S2 from a fresh snapshot."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "late_attach_defer.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_tv_pack_with_s1_scope(sm)
+        season_1_dir = tv_root / "Some Show (2020)" / "Season 01"
+        season_2_dir = tv_root / "Some Show (2020)" / "Season 02"
+
+        library = _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=2)
+        first = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), library)
+
+        assert library.attached
+        assert first is not None
+        # NOT terminal: S2 is attached and unimported, so the row is still importing.
+        assert first.status == DownloadState.Importing.value
+        assert (season_1_dir / "Some Show - S01E01.mkv").exists()
+        assert not season_2_dir.exists()
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "imported", 2: "active"}
+        # S1 resolved, so its claim frees for a replacement/upgrade; S2's is intact.
+        assert claims == {1: "released", 2: "active"}
+
+        second = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+        assert second is not None
+        assert second.status == DownloadState.Imported.value
+        assert (season_2_dir / "Some Show - S02E01.mkv").exists()
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "imported", 2: "imported"}
+        assert claims == {1: "released", 2: "released"}  # only now is S2's freed
+        async with sm() as session:
+            seasons = (
+                (
+                    await session.execute(
+                        select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert {season.season_number: season.status for season in seasons} == {
+            1: "completed",
+            2: "completed",
+        }
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_terminal_swap_refuses_a_scope_the_finalize_reread_missed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read and the finalize swap are two statements. With the re-read blinded
+    to S2 (a snapshot older than the attach's commit), the terminal swap itself must
+    refuse — leaving the row resumable rather than releasing a claim for a season it
+    never imported — and the next pass must still make progress."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "late_attach_blind_reread.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_tv_pack_with_s1_scope(sm)
+
+        real_list_scopes = SqlDownloadRepository.list_scopes
+
+        async def hide_the_late_scope(
+            self: SqlDownloadRepository, download_id: int
+        ) -> list[DownloadScopeRecord]:
+            return [
+                scope for scope in await real_list_scopes(self, download_id) if scope.season != 2
+            ]
+
+        monkeypatch.setattr(SqlDownloadRepository, "list_scopes", hide_the_late_scope)
+        library = _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=2)
+        blind = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), library)
+
+        assert library.attached
+        assert blind is not None
+        assert blind.status == DownloadState.Importing.value  # the swap matched 0 rows
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "active", 2: "active"}  # this pass's bookkeeping rolled back
+        assert claims == {1: "active", 2: "active"}  # nothing released over the late scope
+
+        monkeypatch.undo()
+        retried = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+        assert retried is not None
+        assert retried.status == DownloadState.Imported.value  # converges, no wedge
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "imported", 2: "imported"}
+        assert claims == {1: "released", 2: "released"}
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_scalar_row_defers_for_a_scope_attached_mid_import(
+    tmp_path: Path,
+) -> None:
+    """The legacy scalar path (#476, sibling audit): it is entered with NO importable
+    scope, so one present at finalize can only have been attached mid-pass. Same
+    outcome — the row is not terminalized, and the next cycle imports the newcomer
+    through the scope path."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "late_attach_scalar.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01-S02.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+        async with sm() as session:
+            request = MediaRequest(
+                tmdb_id=_TMDB_ID,
+                media_type=MediaType.tv,
+                title="Some Show",
+                year=2020,
+                status=RequestStatus.downloading,
+            )
+            session.add(request)
+            await session.flush()
+            session.add_all(
+                [
+                    SeasonRequest(
+                        media_request_id=request.id,
+                        season_number=1,
+                        status=RequestStatus.searching.value,
+                    ),
+                    SeasonRequest(
+                        media_request_id=request.id,
+                        season_number=2,
+                        status=RequestStatus.downloading.value,
+                    ),
+                ]
+            )
+            download = Download(  # no scope row at all: the scalar season is the target
+                torrent_hash=_HASH,
+                status=DownloadState.ImportPending.value,
+                media_request_id=request.id,
+                tmdb_id=_TMDB_ID,
+                year=2020,
+                season=2,
+                media_type=MediaType.tv,
+            )
+            session.add(download)
+            await session.commit()
+            download_id, request_id = download.id, request.id
+
+        library = _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=1)
+        first = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), library)
+
+        assert library.attached
+        assert first is not None
+        assert first.status == DownloadState.Importing.value
+        assert (tv_root / "Some Show (2020)" / "Season 02" / "Some Show - S02E01.mkv").exists()
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "active"}
+        assert claims == {1: "active"}
+
+        second = await _import_tv(sm, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+        assert second is not None
+        assert second.status == DownloadState.Imported.value
+        assert (tv_root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv").exists()
+        scopes, claims = await _scope_and_claim_state(sm, download_id)
+        assert scopes == {1: "imported"}
+        assert claims == {1: "released"}
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_releases_every_coverage_claim_when_nothing_attaches_late(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """The unchanged clean path: no late scope means ONE terminalization, and the
+    terminal transition frees the download's coverage claims (#456)."""
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id = await _seed_tv_pack_with_s1_scope(sessionmaker_)
+
+    library = FakeLibrary()
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    assert library.scan_calls == [(str(tv_root / "Some Show (2020)" / "Season 01"), "tv")]
+    scopes, claims = await _scope_and_claim_state(sessionmaker_, download_id)
+    assert scopes == {1: "imported"}
+    assert claims == {1: "released"}
 
 
 async def test_import_tv_retry_success_clears_stale_failed_reason(
