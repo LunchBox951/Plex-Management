@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, NavLink, Outlet } from 'react-router-dom'
+import { Link, NavLink, Outlet } from 'react-router'
 import { useAuthMe, useLogout, useRequests } from '../api/hooks'
 import { cn } from '../lib/cn'
 import { isInFlightRequestStatus } from '../lib/status'
