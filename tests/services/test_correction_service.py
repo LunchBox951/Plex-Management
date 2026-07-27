@@ -9,6 +9,7 @@ the I/O edges (qBittorrent / Prowlarr / Plex).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,7 @@ from plex_manager.services.grab_service import (
 )
 from plex_manager.services.import_service import PATH_NOT_VISIBLE_REASON_PREFIX
 from plex_manager.services.library_roots import LibraryRoots
+from plex_manager.services.purge_service import PurgeResult
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, FakeTmdb, candidate
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -2191,6 +2193,95 @@ async def test_report_issue_tv_clean_purge_leaves_no_incomplete_delete_marker(
         ).scalar_one()
     assert season.library_path is None
     assert season.partial_delete_path is None
+
+
+async def test_report_issue_commits_the_incomplete_delete_marker_before_purging(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #482 / #485: the marker has to be DURABLE before the delete starts.
+
+    The dangerous report-issue failure is not the one that returns
+    ``PurgeOutcome.partial`` -- that one gets to record itself. It is the one that
+    never returns at all: the request is cancelled (or the process dies) while the
+    delete worker has already unlinked part of the tree. Everything ``report_issue``
+    wrote up to that point is still an OPEN transaction, so the unwind rolls it
+    back and the row reverts to the pre-correction ``available`` + breadcrumb with
+    NO marker -- while the files under that breadcrumb are now incomplete. Eviction's
+    re-armed-season recovery then stats the surviving directory, reads "still
+    there" as "still complete", and publishes a gutted season as watchable.
+
+    So the claim and the marker must be COMMITTED before the first destructive
+    step, which is what a fresh session (this test's stand-in for the next process)
+    asserts here.
+    """
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Interrupted Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Interrupted.Show.S01E01.mkv").write_bytes(b"x" * 1024)
+    (season_dir / "Interrupted.Show.S01E02.mkv").write_bytes(b"x" * 1024)
+
+    async with sessionmaker_() as session:
+        show = MediaRequest(
+            tmdb_id=4822,
+            media_type=MediaType.tv,
+            title="Interrupted Show",
+            status=RequestStatus.available,
+        )
+        session.add(show)
+        await session.flush()
+        session.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_dir),
+            )
+        )
+        await session.commit()
+        request_id = show.id
+
+    async def interrupted_purge(
+        fs: object, library_path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        # The delete worker got partway through the tree and then the caller was
+        # cancelled: PART of the season is gone and NO PurgeResult is ever returned,
+        # so nothing downstream of the purge in report_issue runs.
+        (Path(library_path) / "Interrupted.Show.S01E01.mkv").unlink()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(correction_service.purge_service, "purge_library_path", interrupted_purge)
+
+    async with sessionmaker_() as session:
+        with pytest.raises(asyncio.CancelledError):
+            await correction_service.report_issue(
+                session,
+                FakeQbittorrent(),
+                LocalFileSystem(library_roots=[str(tv_root)]),
+                FakeLibrary(),
+                FakeProwlarr([]),
+                GuessitParser(),
+                default_profile(),
+                request_id=request_id,
+                reason="user_reported",
+                season=1,
+                roots=LibraryRoots(tv=str(tv_root)),
+            )
+
+    # The next process reads the DB, not the dead request's memory.
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+    # The correction's claim survived (it is not 'available' again over files that
+    # are now missing an episode)...
+    assert season.status is RequestStatus.searching
+    # ...the breadcrumb survived (the only handle on the remains)...
+    assert season.library_path == str(season_dir)
+    # ...and so did the incomplete-delete marker, so recovery routes this season
+    # through retry/converge instead of folding it back to 'available'.
+    assert season.partial_delete_path == str(season_dir)
 
 
 async def test_report_issue_researches_the_whole_season_after_an_episode_scoped_import(

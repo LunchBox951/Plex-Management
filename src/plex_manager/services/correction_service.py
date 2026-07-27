@@ -33,11 +33,16 @@ a terminal):
   (the content comes back), which is why no recycle bin is needed for the beta.
 
   Ordering rationale (ADR-0014 race fix): steps (c)/(d) are IRREVERSIBLE, so the
-  slot claim (b) runs first and is committed atomically WITH them -- SQLite
-  serializes writers, so once (b)'s flush holds the slot no competitor can commit a
-  conflicting active row before this transaction's own commit, and the earlier bug
-  (the claim happening AFTER the purge, letting a concurrent re-request's collision
-  roll the DB back while the deletions stood) cannot recur.
+  slot claim (b) runs -- and COMMITS -- first, together with the durable
+  incomplete-delete marker over the breadcrumb it is about to purge (issues #482 /
+  #485). A concurrent re-request's collision therefore lands at (b) with nothing yet
+  deleted (the earlier bug: the claim happened AFTER the purge, letting the collision
+  roll the DB back while the deletions stood), and -- because the claim is durable
+  rather than merely flushed -- an INTERRUPTION during (c)/(d) can no longer roll it
+  back either, which would resurrect the pre-correction ``available`` row over files
+  a partly-finished delete had already gutted. From (b)'s commit onward this row
+  itself holds ``uq_media_requests_active``, so no competitor can take the slot while
+  the irreversible steps run and the final commit at (f) still cannot collide.
 
   Hardlink caveat (ADR-0014): a same-filesystem import hardlinks the library file
   to the download client's seed copy, so purging the library file ALONE frees
@@ -977,6 +982,13 @@ async def report_issue(
     # AUTHORITATIVE guard for a sibling appearing in the check->claim gap. The breadcrumb
     # is deliberately KEPT here (``clear_library_path=False``): ``purge_ok`` is not known
     # until (d), which clears it only if the file was actually removed.
+    #
+    # This block COMMITS (blocklist + re-arm + sibling rescue + the incomplete-delete
+    # marker) before returning, so the claim is durable rather than merely flushed
+    # once the irreversible steps start -- see the marker comment below for why. The
+    # commit does not weaken the collision guard: the slot is now held by a COMMITTED
+    # active row of ours, so a competitor cannot take it while (c)-(f) run, whereas
+    # before it was held only by SQLite's writer lock.
     try:
         if is_tv and target.season is not None:
             await season_request_service.reset_for_research(
@@ -1001,9 +1013,44 @@ async def report_issue(
                 reported_season=target.season,
                 log_extra=log_extra,
             )
+
+        # ARM the row's durable incomplete-delete marker (issues #482 / #485) here,
+        # in the claim's OWN transaction, and COMMIT before the first irreversible
+        # step below -- exactly the protocol the eviction sweep follows.
+        #
+        # Arming it later (just before the purge at (d)) would only be a flush, and
+        # this function's first commit is at (f), AFTER the purge. An interruption
+        # in between -- the request cancelled, the worker killed, the process dead
+        # mid-``rmtree`` -- unwinds without ever reaching (f), so the whole claim
+        # AND its marker roll back while the delete that already ate into the tree
+        # does not. The row would come back as pre-correction ``available`` +
+        # breadcrumb with nothing recording the incomplete delete: eviction's
+        # re-armed-season recovery then stats the surviving directory, reads "still
+        # there" as "still complete", and republishes a season missing episodes as
+        # watchable. Committing first inverts that failure: an interruption leaves
+        # the claim standing WITH the marker armed, which is the honest default
+        # (recovery routes it through retry/converge, never restore), and the marker
+        # is retired again at (d) by any outcome that proves the tree intact-or-gone.
+        #
+        # This is also why the marker is armed for the WHOLE destructive stretch,
+        # not just around the library purge: (c) removes the culprit torrent WITH
+        # data, and a hardlinked library file shares those inodes, so an interrupted
+        # correction between (c) and (d) is a delete this row has started too.
+        if target.library_path is not None:
+            if is_tv and target.season is not None:
+                await season_request_service.set_partial_delete_path(
+                    session,
+                    media_request_id=request_id,
+                    season_number=target.season,
+                    library_path=target.library_path,
+                )
+            else:
+                await request_repo.set_partial_delete_path(request_id, target.library_path)
+        await session.commit()
     except IntegrityError as exc:
         # The re-arm collided on ``uq_media_requests_active`` -- a newer active sibling
-        # grabbed the slot between the upfront check and this flush. Roll back (undoing
+        # grabbed the slot between the upfront check and this flush (or the commit that
+        # follows it, which is the same collision surfaced later). Roll back (undoing
         # the blocklist + partial re-arm) so NOTHING is left half-written, then surface
         # the honest 409. Re-read the sibling for the error's id (best-effort -- it is
         # informational; the endpoint keys only on the type).
@@ -1034,26 +1081,18 @@ async def report_issue(
     # eviction has to reclaim the orphan; losing it would strand the bad file with no
     # way to purge it (honesty over silence).
     #
-    # ARM the row's durable incomplete-delete marker BEFORE the purge (issues #482 /
-    # #485), exactly as the eviction sweep does. Report-issue keeps its breadcrumb
-    # over a PRE-GRAB row, which is a shape eviction's crash-recovery pass enumerates
-    # and -- absent this marker -- folds back to ``available`` off a bare ``os.stat``
-    # of the surviving directory. If this purge ate into the tree first, that fold
-    # publishes a season missing episodes as fully watchable AND cancels the
-    # replacement search that was going to restore it. The marker is cleared again
-    # below for every outcome that PROVES the tree needs no further reclaiming, so
-    # only a genuinely incomplete delete leaves it standing.
+    # The row's durable incomplete-delete marker (issues #482 / #485) is ALREADY
+    # armed and committed at (b), covering this purge and the torrent removal above.
+    # Report-issue keeps its breadcrumb over a PRE-GRAB row, which is a shape
+    # eviction's crash-recovery pass enumerates and -- absent that marker -- folds
+    # back to ``available`` off a bare ``os.stat`` of the surviving directory. If
+    # this purge ate into the tree first, that fold publishes a season missing
+    # episodes as fully watchable AND cancels the replacement search that was going
+    # to restore it. The marker is cleared again below for every outcome that PROVES
+    # the tree needs no further reclaiming, so only a genuinely incomplete delete
+    # (or an interruption, which never reaches these clears at all) leaves it up.
     purge_ok = True
     if target.library_path is not None:
-        if is_tv and target.season is not None:
-            await season_request_service.set_partial_delete_path(
-                session,
-                media_request_id=request_id,
-                season_number=target.season,
-                library_path=target.library_path,
-            )
-        else:
-            await request_repo.set_partial_delete_path(request_id, target.library_path)
         purge = await purge_service.purge_library_path(fs, target.library_path)
         if purge.outcome is not PurgeOutcome.partial:
             # Every other outcome establishes the tree's state: it is fully gone
@@ -1128,11 +1167,13 @@ async def report_issue(
             extra=log_extra,
         )
 
-    # (f) audit history row + commit. The blocklist (a), slot claim (b), breadcrumb
-    # clear (d) and this audit row all commit TOGETHER: because SQLite serializes
-    # writers, once (b)'s flush holds the slot no competitor can commit a conflicting
-    # active row before this commit, so the commit cannot fail on the dedup index after
-    # the irreversible (c)/(d) already ran.
+    # (f) audit history row + commit. The blocklist (a) and slot claim (b) already
+    # committed at (b) (they have to: the destructive (c)/(d) must never be able to
+    # run with the claim still rollback-able -- see the marker comment there), so
+    # this commit carries (d)'s breadcrumb/marker clears and this audit row. It still
+    # cannot fail on the dedup index after the irreversible (c)/(d) already ran: our
+    # own row holds ``uq_media_requests_active`` in COMMITTED form from (b) onward,
+    # so no competitor can have taken the slot, and nothing here is a status change.
     session.add(
         DownloadHistory(
             tmdb_id=request.tmdb_id,
