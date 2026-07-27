@@ -28,6 +28,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
+from plex_manager.ports.filesystem import FilePublication, PublishedFileIdentity
 from plex_manager.ports.library import WatchState
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service, log_capture_service, retention_telemetry_service
@@ -77,10 +78,10 @@ class _MappedReclaimFileSystem:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         raise NotImplementedError
 
-    def remove_published(self, dst: Path, *, root: Path) -> None:
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:

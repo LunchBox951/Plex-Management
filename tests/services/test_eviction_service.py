@@ -49,6 +49,7 @@ from plex_manager.models import (
     User,
     WatchlistItem,
 )
+from plex_manager.ports.filesystem import FilePublication, PublishedFileIdentity
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
@@ -2152,10 +2153,10 @@ class _SlowDeleteFileSystem:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         raise NotImplementedError
 
-    def remove_published(self, dst: Path, *, root: Path) -> None:
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
@@ -2771,10 +2772,10 @@ class _PinsSecondCandidateOnFirstDeleteFs:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         raise NotImplementedError
 
-    def remove_published(self, dst: Path, *, root: Path) -> None:
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:
@@ -2913,10 +2914,10 @@ class _ConcurrentSecondEvictFs:
     def move(self, src: Path, dst: Path, *, root: Path) -> None:
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         raise NotImplementedError
 
-    def remove_published(self, dst: Path, *, root: Path) -> None:
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
         raise NotImplementedError
 
     def largest_video_file(self, root: str) -> str | None:

@@ -89,7 +89,11 @@ if TYPE_CHECKING:
 
     from plex_manager.domain.quality_profile import QualityProfile
     from plex_manager.ports.download_client import DownloadClientPort, DownloadStatus
-    from plex_manager.ports.filesystem import FileSystemPort
+    from plex_manager.ports.filesystem import (
+        FilePublication,
+        FileSystemPort,
+        PublishedFileIdentity,
+    )
     from plex_manager.ports.library import LibraryPort
     from plex_manager.ports.media_probe import MediaProbePort
     from plex_manager.ports.parser import ParserPort
@@ -738,15 +742,16 @@ async def _refresh_resumed_import_after_probe_outage(
     return await download_repo.get_by_hash(torrent_hash)
 
 
-def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> bool:
+def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> FilePublication:
     """Hardlink/copy ``src`` to ``dst`` under ``root``, idempotently (sync I/O, run
     in a thread).
 
-    Returns ``True`` iff THIS call created ``dst``; ``False`` when ``dst`` was
-    already supplied by another writer — a prior fully-imported copy (idempotent
-    skip) or a concurrent import that won a placement race. The caller rolls ``dst``
-    back on a later failure ONLY when it actually placed it, so it never unlinks a
-    file another import (or the user) owns.
+    Returns whether THIS call created ``dst`` plus the published inode identity used to
+    authorize a later rollback. ``placed`` is false when ``dst`` was already supplied by
+    another writer — a prior fully-imported copy (idempotent skip) or a concurrent import
+    that won a placement race. The caller rolls ``dst`` back on a later failure ONLY when
+    it actually placed it, and presents the identity token so a post-publication
+    replacement is never unlinked.
 
     A fully-imported destination (same size) is left untouched. A *differently*-sized
     file already at ``dst`` (a user's library file, or a stale partial) is NEVER
@@ -765,7 +770,9 @@ def _place_file(fs: FileSystemPort, src: str, dst: Path, root: Path) -> bool:
     return fs.hardlink_or_copy(Path(src), dst, root=root)
 
 
-def _remove_quietly(fs: FileSystemPort, path: Path, root: Path) -> None:
+def _remove_quietly(
+    fs: FileSystemPort, path: Path, root: Path, identity: PublishedFileIdentity
+) -> None:
     """Best-effort rollback of a file THIS attempt placed, when a later step fails.
 
     Routed through the adapter's descriptor-anchored removal rather than
@@ -781,7 +788,7 @@ def _remove_quietly(fs: FileSystemPort, path: Path, root: Path) -> None:
     replace that honest, retryable block with an unhandled error.
     """
     try:
-        fs.remove_published(path, root=root)
+        fs.remove_published(path, root=root, identity=identity)
     except (OSError, LocalFileSystemError) as exc:
         # ``path`` carries a request-derived title (newlines survive clean_title) and
         # ``exc`` frequently repeats it, so both are sanitized before they reach the
@@ -793,15 +800,19 @@ def _remove_quietly(fs: FileSystemPort, path: Path, root: Path) -> None:
         )
 
 
-def _remove_quietly_many(fs: FileSystemPort, paths: list[Path], root: Path) -> None:
+def _remove_quietly_many(
+    fs: FileSystemPort,
+    publications: list[tuple[Path, PublishedFileIdentity]],
+    root: Path,
+) -> None:
     """Best-effort rollback of every path THIS call placed (TV scan-failure rollback).
 
     Unlike the movie path's single ``dst``, a season import can place several
     episode files before its one combined scan fails; each is rolled back the
     same best-effort way.
     """
-    for path in paths:
-        _remove_quietly(fs, path, root)
+    for path, identity in publications:
+        _remove_quietly(fs, path, root, identity)
 
 
 # Per-download serialization. The reconcile loop and an operator's
@@ -1463,7 +1474,10 @@ async def _import_download_locked(
         await session.commit()
 
         try:
-            placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(effective_movies_root))
+            publication = await asyncio.to_thread(
+                _place_file, fs, src, dst, Path(effective_movies_root)
+            )
+            placed = publication.placed
         except FileExistsError as exc:
             # A pre-existing, differently-sized file at the destination (a user's file,
             # or a stale partial) — surfaced as a conflict, never overwritten.
@@ -1531,7 +1545,13 @@ async def _import_download_locked(
             # would turn this into a post-commit lazy-load (MissingGreenlet) hazard.
             owns_placement = placed or row.download_path == str(dst)
             if owns_placement:
-                await asyncio.to_thread(_remove_quietly, fs, dst, Path(effective_movies_root))
+                await asyncio.to_thread(
+                    _remove_quietly,
+                    fs,
+                    dst,
+                    Path(effective_movies_root),
+                    publication.identity,
+                )
             await _block(
                 session,
                 download_repo,
@@ -1876,13 +1896,14 @@ async def _import_tv_targets_locked(
         successful_dirs: list[Path] = []
         pack_blocklisted = False
         for plan in plans:
-            placed_paths: list[Path] = []
+            placed_paths: list[tuple[Path, PublishedFileIdentity]] = []
             imported: list[tuple[str, PurePosixPath]] = []
             for relative, result in plan.by_relative.items():
                 src = plan.abs_by_rel[result.video.relative_path]
                 dst = Path(tv_root) / relative
                 try:
-                    placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                    publication = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                    placed = publication.placed
                 except (FileExistsError, LocalFileSystemError, OSError) as exc:
                     await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                     reason = (
@@ -1893,7 +1914,7 @@ async def _import_tv_targets_locked(
                     failures.append(_TvImportFailure(plan.target, reason))
                     break
                 if placed:
-                    placed_paths.append(dst)
+                    placed_paths.append((dst, publication.identity))
                 imported.append((os.path.basename(src), relative))
             else:
                 await download_repo.update_status(
@@ -2406,13 +2427,14 @@ async def _import_tv_locked(
         # ``_remove_quietly_many`` / ``_block`` — writing history eagerly here would let
         # the audit trail claim an episode was imported when it was in fact deleted
         # moments later (honesty over silence: history must never lie about a rollback).
-        placed_paths: list[Path] = []
+        placed_paths: list[tuple[Path, PublishedFileIdentity]] = []
         imported: list[tuple[str, PurePosixPath]] = []
         for relative, result in by_relative.items():
             src = abs_by_rel[result.video.relative_path]
             dst = Path(tv_root) / relative
             try:
-                placed = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                publication = await asyncio.to_thread(_place_file, fs, src, dst, Path(tv_root))
+                placed = publication.placed
             except (FileExistsError, LocalFileSystemError, OSError) as exc:
                 await asyncio.to_thread(_remove_quietly_many, fs, placed_paths, Path(tv_root))
                 reason = (
@@ -2430,7 +2452,7 @@ async def _import_tv_locked(
                 )
                 return await download_repo.get_by_hash(torrent_hash)
             if placed:
-                placed_paths.append(dst)
+                placed_paths.append((dst, publication.identity))
             imported.append((os.path.basename(src), relative))
 
         # download_path is stamped with the SEASON folder (not one file) purely for

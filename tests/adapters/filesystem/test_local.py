@@ -698,14 +698,23 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
         name: str,
         published_identity: tuple[int, int],
         *,
+        published_fd: int | None,
         placed: bool,
     ) -> None:
         calls.append((placed, published_identity))
-        real_verify(verify_root, verify_dst, parent_fd, name, published_identity, placed=placed)
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
 
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _spy)
 
-    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is True
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root).placed is True
 
     # Ran once, for the file this call placed, and was handed the identity captured at
     # publication time -- the very inode the source was hardlinked to.
@@ -713,6 +722,111 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
     assert dst.read_text() == "payload"
     # ...and the property it asserted actually holds: the lexical path names the inode.
     assert dst.stat().st_ino == src.stat().st_ino
+
+
+def test_copy_publication_keeps_written_inode_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy inode cannot be freed and reused before lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "copied.mkv"
+    real_link = os.link
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    verified_fds: list[int] = []
+
+    def _refuse_source_link(
+        link_src: str,
+        link_dst: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if link_src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _verify_with_held_fd(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert published_fd is not None
+        held = os.fstat(published_fd)
+        verified_fds.append(published_fd)
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert len(verified_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(verified_fds[0])
+
+
+def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A digest-matched inode stays descriptor-pinned until lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "copied.mkv"
+    dst.write_text("payload")  # same bytes, distinct inode: forces digest matching
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    verified_fds: list[int] = []
+
+    def _verify_with_held_fd(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert published_fd is not None
+        held = os.fstat(published_fd)
+        verified_fds.append(published_fd)
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
+
+    result = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert result.placed is False
+    assert len(verified_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(verified_fds[0])
 
 
 @contextlib.contextmanager
@@ -957,7 +1071,7 @@ def test_hardlink_or_copy_idempotent_retry_still_matches_identical_prior_placeme
     dst = title / "The Matrix (1999).mkv"
     dst.write_bytes(b"identical-bytes!")  # a true prior placement, same bytes, diff inode
 
-    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is False
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root).placed is False
     assert dst.read_bytes() == b"identical-bytes!"
 
 
@@ -2083,16 +2197,20 @@ def test_reclaimable_bytes_for_a_directory_skips_a_symlinked_file(tmp_path: Path
 
 
 def test_hardlink_or_copy_reports_placement_and_idempotent_skip(tmp_path: Path) -> None:
-    """The publish result the import pipeline's rollback ownership turns on: True the
-    first time, False when the very same bytes are already there."""
+    """The publish result carries both rollback ownership and the published inode."""
     root = tmp_path / "library"
     root.mkdir()
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
 
-    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is True
-    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root) is False
+    placed = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+    idempotent = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert placed.placed is True
+    assert placed.identity == (dst.stat().st_dev, dst.stat().st_ino)
+    assert idempotent.placed is False
+    assert idempotent.identity == placed.identity
 
 
 def test_hardlink_or_copy_conflicts_on_a_same_size_different_file(tmp_path: Path) -> None:
@@ -2175,12 +2293,34 @@ def test_remove_published_unlinks_the_file_it_placed(tmp_path: Path) -> None:
     src.write_text("payload")
     dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
     fs = LocalFileSystem()
-    fs.hardlink_or_copy(src, dst, root=root)
+    publication = fs.hardlink_or_copy(src, dst, root=root)
 
-    fs.remove_published(dst, root=root)
+    fs.remove_published(dst, root=root, identity=publication.identity)
 
     assert not dst.exists()
     assert dst.parent.is_dir()  # only the file goes, never the season directory
+
+
+def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
+    """Rollback ownership is the inode captured at publication, not just the path.
+
+    A writer that replaces ``dst`` after publication but before scan-failure rollback
+    owns the new entry. The old unconditional unlink deleted that replacement.
+    """
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    replacement = tmp_path / "replacement.mkv"
+    replacement.write_text("third-party file")
+    os.replace(replacement, dst)
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.read_text() == "third-party file"
 
 
 def test_remove_published_is_a_no_op_when_already_gone(tmp_path: Path) -> None:
@@ -2190,9 +2330,9 @@ def test_remove_published_is_a_no_op_when_already_gone(tmp_path: Path) -> None:
     root.mkdir()
     fs = LocalFileSystem()
 
-    fs.remove_published(root / "Show" / "Season 01" / "gone.mkv", root=root)
+    fs.remove_published(root / "Show" / "Season 01" / "gone.mkv", root=root, identity=(0, 0))
     (root / "Show").mkdir()
-    fs.remove_published(root / "Show" / "gone.mkv", root=root)
+    fs.remove_published(root / "Show" / "gone.mkv", root=root, identity=(0, 0))
 
 
 def test_remove_published_refuses_an_ancestor_swapped_after_publication(
@@ -2220,7 +2360,9 @@ def test_remove_published_refuses_an_ancestor_swapped_after_publication(
     season.symlink_to(outside)
 
     with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
-        LocalFileSystem().remove_published(dst, root=root)
+        LocalFileSystem().remove_published(
+            dst, root=root, identity=(dst.stat().st_dev, dst.stat().st_ino)
+        )
 
     assert victim.read_text() == "someone else's file"
     assert (season.parent / "Season 01.real" / dst.name).exists()
@@ -2234,7 +2376,7 @@ def test_remove_published_refuses_a_destination_outside_the_root(tmp_path: Path)
     escaped.write_text("payload")
 
     with pytest.raises(LocalFileSystemError, match="outside the library root"):
-        LocalFileSystem().remove_published(escaped, root=root)
+        LocalFileSystem().remove_published(escaped, root=root, identity=(0, 0))
 
     assert escaped.exists()
 
@@ -2247,7 +2389,9 @@ def test_remove_published_refuses_when_platform_cannot_anchor(
     dst.write_text("payload")
 
     with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
-        LocalFileSystem().remove_published(dst, root=tmp_path)
+        LocalFileSystem().remove_published(
+            dst, root=tmp_path, identity=(dst.stat().st_dev, dst.stat().st_ino)
+        )
 
     assert dst.exists()
 

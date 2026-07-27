@@ -8,11 +8,29 @@ when possible and falls back to a copy across devices.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 
-__all__ = ["PLEX_VIDEO_EXTENSIONS", "VIDEO_EXTENSIONS", "FileSystemPort"]
+__all__ = [
+    "PLEX_VIDEO_EXTENSIONS",
+    "VIDEO_EXTENSIONS",
+    "FilePublication",
+    "FileSystemPort",
+    "PublishedFileIdentity",
+]
+
+# The device/inode pair captured while publication still holds the inode open. It is
+# the ownership token rollback must present before deleting the destination entry.
+PublishedFileIdentity = tuple[int, int]
+
+
+class FilePublication(NamedTuple):
+    """Result of publishing a file and the identity authorizing its rollback."""
+
+    placed: bool
+    identity: PublishedFileIdentity
+
 
 # Compatibility export for callers that predate the Plex-specific policy name.
 # New code should use ``PLEX_VIDEO_EXTENSIONS`` so the acceptance boundary is
@@ -42,19 +60,21 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
 
-        Returns ``True`` iff THIS call created ``dst``, and ``False`` when an entry
-        holding exactly ``src``'s bytes was already there (an idempotent re-import,
-        or a concurrent import that won the placement race). A DIFFERENT file at
-        ``dst`` is raised as ``FileExistsError`` -- never overwritten, and never
-        reported as placed. Callers roll ``dst`` back only on ``True``, so the
-        already/identical answer decides whether a file is theirs to delete; it MUST
-        therefore be computed against the same verified destination directory the
-        publish attempt used, never by a second pathname lookup the caller makes
-        afterwards (an ancestor swapped in between would answer for a file outside
-        the root -- GHSA-r5vh).
+        Returns whether THIS call created ``dst`` plus the published entry's device/inode
+        identity. The identity is an ownership token for :meth:`remove_published`; callers
+        MUST pass it when rolling back a placement so a later replacement is never deleted.
+        ``placed`` is ``False`` when an entry holding exactly ``src``'s bytes was already
+        there (an idempotent re-import, or a concurrent import that won the placement race).
+        A DIFFERENT file at ``dst`` is raised as ``FileExistsError`` -- never overwritten,
+        and never reported as placed. Callers roll ``dst`` back only when ``placed`` is
+        true, so the already/identical answer decides whether a file is theirs to delete;
+        it MUST therefore be computed against the same verified destination directory the
+        publish attempt used, never by a second pathname lookup the caller makes afterwards
+        (an ancestor swapped in between would answer for a file outside the root --
+        GHSA-r5vh).
 
         ``dst`` MUST lie beneath ``root`` -- the library root the caller selected
         for this title (the ADR-0015 anime root, or the normal one). Implementations
@@ -97,8 +117,12 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def remove_published(self, dst: Path, *, root: Path) -> None:
-        """Remove a file :meth:`hardlink_or_copy` published at ``dst`` beneath ``root``.
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
+        """Remove the matching file :meth:`hardlink_or_copy` published beneath ``root``.
+
+        ``identity`` MUST be the ownership token returned by the publication being rolled
+        back. Implementations MUST leave ``dst`` untouched when its current entry has a
+        different device/inode identity: another writer replaced it and owns that entry.
 
         The rollback counterpart of :meth:`hardlink_or_copy`, for the import that
         placed a file and then failed a later step (a Plex scan error). It carries

@@ -53,6 +53,7 @@ from plex_manager.models import (
     User,
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
+from plex_manager.ports.filesystem import FilePublication
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.media_probe import (
     MediaProbePort,
@@ -473,7 +474,7 @@ class _LosingRaceFs(LocalFileSystem):
         super().__init__()
         self._winner_size = winner_size
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         _make_video(dst, self._winner_size)
         # Delegate so the REAL adapter meets the winner's file and makes the
         # already-there-and-identical call itself: that decision now happens behind
@@ -485,7 +486,7 @@ class _LosingRaceFs(LocalFileSystem):
 class _WrongSameSizeFs(LocalFileSystem):
     """Loses placement to a same-size but different file."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         dst.parent.mkdir(parents=True, exist_ok=True)
         size = os.path.getsize(src)
         with dst.open("wb") as handle:
@@ -615,7 +616,7 @@ class _EscapesTitleDirMidPlacementFs(LocalFileSystem):
         self.escaped_dir: Path | None = None
         self._outside = outside
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         real_link = os.link
 
         def _escape_then_link(
@@ -750,6 +751,49 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
         assert request is not None and request.status == RequestStatus.import_blocked
 
 
+class _ReplacesDestinationAfterPlacementFs(LocalFileSystem):
+    """Publishes normally, then replaces the destination before rollback."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
+        publication = super().hardlink_or_copy(src, dst, root=root)
+        replacement = root / "replacement.mkv"
+        replacement.write_text("third-party file")
+        os.replace(replacement, dst)
+        return publication
+
+
+async def test_scan_failure_rollback_does_not_delete_a_post_publish_replacement(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """The import service must thread the publication identity into rollback."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        _ScanFailsLibrary(),
+        _ReplacesDestinationAfterPlacementFs(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.read_text() == "third-party file"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
 class _SwapsAncestorAfterPlacementFs(LocalFileSystem):
     """Publishes normally, then renames the movie-title directory away and drops a
     symlink out of the library in its place -- the post-publication window in which a
@@ -759,12 +803,12 @@ class _SwapsAncestorAfterPlacementFs(LocalFileSystem):
         super().__init__()
         self._outside = outside
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
-        placed = super().hardlink_or_copy(src, dst, root=root)
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
+        publication = super().hardlink_or_copy(src, dst, root=root)
         title_dir = dst.parent
         title_dir.rename(title_dir.parent / f"{title_dir.name}.real")
         title_dir.symlink_to(self._outside)
-        return placed
+        return publication
 
 
 async def test_scan_failure_rollback_never_unlinks_through_a_swapped_ancestor(
@@ -861,7 +905,7 @@ def test_remove_quietly_sanitizes_newlines_in_the_rollback_warning(
     malicious = tmp_path / "Evil\nFAKE LOG RECORD (2020)" / "movie.mkv"
 
     with caplog.at_level(logging.WARNING, logger="plex_manager.services.import_service"):
-        _remove_quietly(LocalFileSystem(), malicious, root)
+        _remove_quietly(LocalFileSystem(), malicious, root, (0, 0))
 
     record = next(r for r in caplog.records if "could not roll back" in r.getMessage())
     message = record.getMessage()
@@ -3838,7 +3882,7 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> bool:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
