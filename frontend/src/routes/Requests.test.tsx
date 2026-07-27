@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { useAuthMe, useRequests, useSearchPreview } from '../api/hooks'
 import type { RequestResponse, SearchPreviewResponse } from '../api/types'
