@@ -1434,6 +1434,57 @@ def test_delete_propagates_an_untouched_failure_unchanged(tmp_path: Path) -> Non
     assert nested.read_bytes() == b"x" * 100
 
 
+def test_delete_reports_partial_when_the_pre_inventory_walk_could_not_read_the_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An INCOMPLETE pre-removal inventory must never certify a failure as
+    "untouched": ``before <= after`` only proves nothing was removed when
+    ``before`` actually held everything the tree contained.
+
+    A nested directory unreadable at inventory time contributes only its own
+    entry (its children are never listed), so if access recovers before
+    ``shutil.rmtree`` runs -- a permission flap, or an operator fixing modes
+    mid-sweep -- the removal can unlink those children and still leave both
+    inventoried entries in place. The diff then reads as untouched over a tree
+    that really did lose files, and the caller restores it to 'available'."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    season = root / "Some Show" / "Season 01"
+    specials = season / "Specials"
+    specials.mkdir(parents=True)
+    nested = specials / "Some Show - S01E02.mkv"
+    nested.write_bytes(b"x" * 100)
+
+    real_rmtree = shutil.rmtree
+
+    class RecoveringRmtree:
+        """``shutil.rmtree`` with access to ``specials`` restored just before it
+        runs -- the flap ``delete``'s pre-inventory walk cannot see coming.
+        Carries ``avoids_symlink_attacks`` because ``delete`` gates on it."""
+
+        avoids_symlink_attacks = real_rmtree.avoids_symlink_attacks
+
+        def __call__(self, path: str, *, dir_fd: int | None = None) -> None:
+            os.chmod(specials, 0o700)
+            real_rmtree(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(shutil, "rmtree", RecoveringRmtree())
+
+    fs = LocalFileSystem([os.fspath(root)])
+    os.chmod(specials, 0o000)  # unlistable while the inventory is taken
+    os.chmod(season, 0o500)  # not writable, so removing 'Specials' itself still fails
+    try:
+        with pytest.raises(PartialDeleteError):
+            fs.delete(os.fspath(season))
+    finally:
+        os.chmod(season, 0o700)
+        os.chmod(specials, 0o700)
+
+    assert not nested.exists()  # a file really did leave, despite the equal diff
+    assert specials.is_dir()
+
+
 # --------------------------------------------------------------------------- #
 # reclaimable_bytes — hardlink-aware freed-bytes accounting (R4-6, ADR-0012)
 # --------------------------------------------------------------------------- #

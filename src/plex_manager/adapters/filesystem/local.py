@@ -72,8 +72,9 @@ class PartialDeleteError(OSError):
     """
 
 
-def _tree_entries(leaf: str, parent_fd: int) -> frozenset[str]:
-    """Every path in the tree rooted at ``leaf``, relative to ``parent_fd``.
+def _tree_entries(leaf: str, parent_fd: int) -> tuple[frozenset[str], bool]:
+    """Every path in the tree rooted at ``leaf``, relative to ``parent_fd``, plus
+    whether that inventory is COMPLETE (no directory went unlisted).
 
     A classification probe for :meth:`LocalFileSystem.delete` ONLY: taken once
     BEFORE ``shutil.rmtree`` and once again after it raises, the two sets are
@@ -86,26 +87,39 @@ def _tree_entries(leaf: str, parent_fd: int) -> frozenset[str]:
     dereferences a symlinked directory out of the tree. A symlink TO a directory
     is inventoried as a single entry and not descended, mirroring the removal.
 
-    Walk errors are DELIBERATELY not raised: an unreadable subtree, or a top that
-    has vanished mid-walk, contributes nothing rather than aborting the
-    classification. Both directions of that bias are safe. In the AFTER set,
-    missing entries read as removed -- an unverifiable tree is classified partial,
-    which is the honest direction (never restore availability over a tree that
-    cannot be shown intact). In the BEFORE set, a subtree that cannot even be
-    LISTED is a subtree ``rmtree`` cannot descend into and therefore cannot empty,
-    so leaving it uninventoried cannot hide a removal; its own directory entry is
-    still inventoried by the parent level.
+    Walk errors are DELIBERATELY not raised -- an unreadable subtree contributes
+    nothing rather than aborting the classification -- but they ARE reported, and
+    the caller must not certify "untouched" off an incomplete BEFORE inventory.
+    An unlistable directory contributes only its own entry (inventoried by its
+    parent level), never its children, so if access recovers before the removal
+    runs -- a permission flap, an operator fixing modes mid-sweep -- ``rmtree``
+    can unlink those children while both inventoried entries stay in place, and
+    the diff reads as untouched over a tree that really did lose files. The
+    AFTER inventory needs no such flag: entries it cannot verify are simply
+    missing, which already classifies as partial -- the honest direction (never
+    restore availability over a tree that cannot be shown intact).
     """
     entries: set[str] = set()
+    complete = True
+
+    def _note_unlisted(_error: OSError) -> None:
+        nonlocal complete
+        complete = False
+
     try:
         for dirpath, dirnames, filenames, _dirfd in os.fwalk(
-            leaf, dir_fd=parent_fd, follow_symlinks=False
+            leaf, dir_fd=parent_fd, follow_symlinks=False, onerror=_note_unlisted
         ):
             entries.add(dirpath)
             entries.update(os.path.join(dirpath, name) for name in (*dirnames, *filenames))
     except OSError:
-        pass  # see the docstring: an unwalkable top is classified, never raised
-    return frozenset(entries)
+        # ``onerror`` already absorbs every per-directory error, so this only
+        # catches the walk's own teardown -- reported as incomplete like any
+        # other unlisted directory. Caught rather than raised because the AFTER
+        # call runs INSIDE the removal's ``except``, where raising would replace
+        # the real delete failure with a probe's.
+        complete = False
+    return frozenset(entries), complete
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -732,8 +746,12 @@ class LocalFileSystem:
         untouched and the original error propagates unchanged; ANY inventoried
         path now gone means partial, raised as :class:`PartialDeleteError` (an
         ``OSError`` subclass, so callers that never cared still behave exactly
-        as before). ``shutil.rmtree`` itself is untouched by this -- it carries
-        the ancestor-symlink-race containment above and is not reimplemented.
+        as before). An INCOMPLETE up-front inventory is partial too: a directory
+        that could not be listed then can still be emptied by a removal running
+        after access recovers, so a set diff over it cannot prove "untouched"
+        and must not be allowed to claim it. ``shutil.rmtree`` itself is
+        untouched by this -- it carries the ancestor-symlink-race containment
+        above and is not reimplemented.
 
         A path (or an intermediate ancestor) that no longer exists at all is a
         no-op, not an error, so a retried eviction (a previous partial success,
@@ -789,11 +807,12 @@ class LocalFileSystem:
                 # classified afterwards (issue #482): `shutil.rmtree` is left
                 # EXACTLY as it was -- it carries the ancestor-symlink-race
                 # guards above -- and only the diff around it is new.
-                before = _tree_entries(leaf, parent_fd)
+                before, before_complete = _tree_entries(leaf, parent_fd)
                 try:
                     shutil.rmtree(leaf, dir_fd=parent_fd)
                 except OSError as exc:
-                    if not before <= _tree_entries(leaf, parent_fd):
+                    after, _after_complete = _tree_entries(leaf, parent_fd)
+                    if not before_complete or not before <= after:
                         raise PartialDeleteError(
                             f"partially deleted before failing ({type(exc).__name__})"
                         ) from exc
