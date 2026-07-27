@@ -765,6 +765,118 @@ def test_hardlink_or_copy_refuses_non_regular_destination_on_the_copy_path(
     assert list(title.iterdir()) == [dst]  # no temp copy left behind
 
 
+def _library_with_fifo_source(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A library root, a FIFO standing where the validated video was, and the intended
+    destination -- the scan-to-place race an unprivileged local actor wins with
+    ``mkfifo``."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    os.mkfifo(src)
+    return root, src, title / "The Matrix (1999).mkv"
+
+
+def test_hardlink_or_copy_refuses_fifo_source_on_the_copy_path_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SOURCE-side counterpart of the destination-side FIFO guard above.
+
+    The copy fallback used to stream the source with a plain ``open(src, "rb")`` --
+    blocking, and never asking what ``src`` actually is. An actor who swaps the
+    validated video for a same-named FIFO after the scan makes that open sleep until a
+    writer appears, inside ``asyncio.to_thread``: an executor thread no cancellation
+    can reach, holding the hash's download lock, until the pool is exhausted and the
+    whole app stalls with only a process restart left as recovery. The source must be
+    proven ``S_ISREG`` before a byte is read, and refused honestly if it is not.
+    """
+    root, src, dst = _library_with_fifo_source(tmp_path)
+
+    def _refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)  # force the copy fallback
+
+    with (
+        _bounded(5.0, "hardlink_or_copy from a FIFO source via the copy path"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert not dst.exists()
+    assert list(dst.parent.iterdir()) == []  # nothing published, no temp left behind
+
+
+def test_hardlink_or_copy_refuses_fifo_source_on_the_hardlink_path(tmp_path: Path) -> None:
+    """The same refusal on the path that never copies at all.
+
+    ``os.link`` happily hardlinks a FIFO, and the resulting entry then passes
+    :func:`_verify_lexical_publication` on its (correctly identical) inode -- so the
+    call used to report success and the pipeline would persist a breadcrumb and fire a
+    Plex scan for a FIFO sitting in the library. A regular-file proof of the SOURCE has
+    to gate the link, not just the copy stream.
+    """
+    root, src, dst = _library_with_fifo_source(tmp_path)
+
+    with (
+        _bounded(5.0, "hardlink_or_copy from a FIFO source via the hardlink path"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert not dst.exists()  # no success, no breadcrumb-worthy entry
+    assert list(dst.parent.iterdir()) == []
+    assert stat.S_ISFIFO(src.lstat().st_mode)  # source untouched, for the operator
+
+
+@pytest.mark.parametrize("maker", ["directory", "symlink"], ids=["directory", "symlink"])
+def test_hardlink_or_copy_refuses_other_non_regular_sources(tmp_path: Path, maker: str) -> None:
+    """Every non-regular source fails fast and visibly, not just the FIFO that can hang:
+    a directory is not publishable media, and a symlinked source is refused rather than
+    silently followed to whatever it now names."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    if maker == "directory":
+        src.mkdir()
+    else:
+        os.symlink(tmp_path / "elsewhere.mkv", src)
+    dst = title / "The Matrix (1999).mkv"
+
+    with (
+        _bounded(5.0, f"hardlink_or_copy from a {maker} source"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(title.iterdir()) == []
+
+
+def test_hardlink_or_copy_refusing_a_fifo_source_does_not_leak_a_descriptor(
+    tmp_path: Path,
+) -> None:
+    """The source is now opened before it is inspected, so the refusal path is an
+    early return holding a live descriptor. A daemon retrying a poisoned import (an
+    ``ImportBlocked`` row the operator keeps re-submitting) would leak one fd per
+    attempt and walk the process into ``EMFILE``, taking every other file operation
+    down with it."""
+    root, src, dst = _library_with_fifo_source(tmp_path)
+    fs = LocalFileSystem()
+
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("requires /proc/self/fd (Linux)")
+
+    before = len(os.listdir(fd_dir))
+    for _ in range(300):
+        with pytest.raises(LocalFileSystemError):
+            fs.hardlink_or_copy(src, dst, root=root)
+    after = len(os.listdir(fd_dir))
+
+    assert after == before
+
+
 def test_hardlink_or_copy_publishes_into_a_nested_library_root(tmp_path: Path) -> None:
     """ADR-0015 nests the anime root inside the normal one; the SELECTED root is the
     anchor, so a destination beneath the nested root is published normally."""

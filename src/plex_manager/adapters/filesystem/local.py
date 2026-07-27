@@ -209,21 +209,113 @@ def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: s
             os.unlink(tmp_name, dir_fd=dir_fd)
 
 
-def _publish_link_no_overwrite(src: Path, dir_fd: int, name: str, display: str) -> None:
-    """Publish ``src`` at ``name`` (relative to ``dir_fd``) via an exclusive hardlink."""
+def _open_regular_source(src: Path, display: str) -> int:
+    """Open the import SOURCE and prove it a regular file, returning its descriptor.
+
+    The source-side counterpart of the destination-side guard in
+    :func:`_entry_matches_source`, and the same idiom for the same reason. The
+    destination was hardened to ``fstat``-before-read because a blocking ``O_RDONLY``
+    open of a FIFO sleeps until a writer appears -- forever, for a FIFO nobody writes.
+    The SOURCE is reachable by exactly the same trick: the import pipeline validates a
+    downloaded video and then publishes it a moment later, and an actor who wins that
+    scan-to-place race can swap the validated file for a same-named FIFO. The copy
+    path's ``open(src, "rb")`` would then block inside ``asyncio.to_thread`` in an
+    executor thread no cancellation can reach, holding that hash's download lock and
+    eventually starving the whole pool -- an app-wide stall recoverable only by
+    restarting the process, which is precisely the terminal-only recovery north-star
+    #2 forbids.
+
+    So the source is resolved ONCE, here, into a descriptor: ``O_NONBLOCK`` means the
+    open of a FIFO (or any other slow-to-open object) returns immediately instead of
+    sleeping, ``O_NOFOLLOW`` means a symlink swapped in at the source path is refused
+    rather than silently followed to whatever it names, and the ``fstat`` that follows
+    is the authoritative check -- made on the very object the caller is about to link
+    or read, not on a pathname that can be re-pointed afterwards. Only
+    ``S_ISREG`` proceeds. Every other type (FIFO, socket, device, directory, symlink)
+    is REFUSED and surfaced as a :class:`LocalFileSystemError`, never skipped: the
+    import lands as a visible, retryable ``ImportBlocked`` the operator can see and
+    correct (north-star #3), exactly as the destination-side conflict does.
+
+    The returned descriptor is what BOTH publication paths must then use -- the
+    hardlink's identity proof and the copy's byte stream -- so there is no second,
+    unproven ``open`` of ``src`` by pathname for a swap to slip into. The caller owns
+    the descriptor and must close it.
+    """
+    try:
+        source_fd = os.open(
+            os.fspath(src), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            # ELOOP: a symlink at the source path (O_NOFOLLOW refused it). ENXIO: a
+            # socket, or a device with no reader. Both are "not a regular file", and
+            # the raw errno would read as an unrelated infrastructure fault.
+            raise LocalFileSystemError(_non_regular_source_message(src, display)) from exc
+        raise
+    try:
+        source_info = os.fstat(source_fd)
+    except OSError:
+        os.close(source_fd)
+        raise
+    if not stat.S_ISREG(source_info.st_mode):
+        os.close(source_fd)
+        raise LocalFileSystemError(_non_regular_source_message(src, display))
+    return source_fd
+
+
+def _non_regular_source_message(src: Path, display: str) -> str:
+    """The one refusal wording for every non-regular import source."""
+    return (
+        f"refusing to publish {display!r}: the import source {os.fspath(src)!r} is not a "
+        "regular file (a FIFO, socket, device, directory or symlink is never publishable "
+        "media, and reading one can block the import worker indefinitely)"
+    )
+
+
+def _publish_link_no_overwrite(
+    src: Path, source_fd: int, dir_fd: int, name: str, display: str
+) -> None:
+    """Publish the file behind ``source_fd`` at ``name`` (relative to ``dir_fd``) via an
+    exclusive hardlink.
+
+    ``os.link`` takes a PATHNAME, and ``linkat(AT_EMPTY_PATH)`` -- the only way to link
+    a descriptor directly -- needs ``CAP_DAC_READ_SEARCH`` this process does not have.
+    So the link is made by name and then PROVEN: the entry just created must carry the
+    same ``(st_dev, st_ino)`` as the descriptor :func:`_open_regular_source` already
+    proved regular. A source swapped between that proof and this link (the FIFO the
+    scan-to-place race plants) links a different inode, fails the comparison, and is
+    unlinked again -- so a non-regular file can never acquire a name in the library,
+    pass :func:`_verify_lexical_publication` on its identical inode, and have a
+    breadcrumb plus a Plex scan born for it.
+    """
+    source_info = os.fstat(source_fd)
     with _publish_lock(dir_fd, name, display):
         os.link(os.fspath(src), name, dst_dir_fd=dir_fd)
+        if _entry_identity(dir_fd, name) == (source_info.st_dev, source_info.st_ino):
+            return
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=dir_fd)
+    raise LocalFileSystemError(
+        f"refusing to publish {display!r}: the import source changed identity between "
+        "validation and the hardlink (containment could not be guaranteed); the link was "
+        "removed"
+    )
 
 
-def _copy_contents(src: Path, target: IO[bytes]) -> None:
-    """Stream ``src``'s bytes into the already-open ``target``, preserving mode and
-    timestamps -- the ``shutil.copy2`` equivalent for a destination that exists only
-    as a descriptor inside a verified directory (it has no pathname a second lookup
+def _copy_contents(source_fd: int, target: IO[bytes]) -> None:
+    """Stream the bytes behind ``source_fd`` into the already-open ``target``, preserving
+    mode and timestamps -- the ``shutil.copy2`` equivalent for a destination that exists
+    only as a descriptor inside a verified directory (it has no pathname a second lookup
     could re-resolve).
+
+    Reads the descriptor :func:`_open_regular_source` already proved regular rather than
+    re-opening ``src`` by pathname: a second open is a second TOCTOU, and a blocking one
+    on a FIFO swapped in meanwhile would wedge this thread forever.
     """
-    with open(src, "rb") as source:
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    with os.fdopen(source_fd, "rb", closefd=False) as source:
         shutil.copyfileobj(source, target)
-        source_stat = os.fstat(source.fileno())
+    source_stat = os.fstat(source_fd)
     target.flush()
     os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
     os.utime(target.fileno(), ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
@@ -773,31 +865,39 @@ class LocalFileSystem:
         """
         with _anchored_publication(root, dst) as (parent_fd, name):
             display = os.fspath(dst)
+            # Resolved ONCE, before anything is linked or read: every publication path
+            # below works from this proven-regular descriptor, so a source swapped for a
+            # FIFO after validation can neither be linked into the library nor block an
+            # executor thread on a read that never returns.
+            source_fd = _open_regular_source(src, display)
             try:
-                _publish_link_no_overwrite(src, parent_fd, name, display)
-            except FileExistsError:
-                # Something is already at dst: a prior fully-imported copy, or a
-                # concurrent import (the reconcile loop racing the operator's
-                # POST /queue/{id}/import retry) that won the placement race. Checked
-                # BEFORE the cross-device branch below — EEXIST must never be masked
-                # as cross-device into an overwriting copy.
-                placed = _idempotent_or_conflict(src, parent_fd, name, display)
-            except OSError as exc:
-                # Only a genuine cross-device / hardlink-unsupported failure warrants a
-                # copy. Any other errno is surfaced.
-                if exc.errno not in _COPY_FALLBACK_ERRNOS:
-                    raise
-                # Cross-device (or hardlink-refusing) filesystem: copy instead. A
-                # copy actually consumes space, so preflight that the destination
-                # filesystem can hold the source before writing a partial file.
                 try:
-                    self._copy_no_overwrite(src, dst, parent_fd, name)
+                    _publish_link_no_overwrite(src, source_fd, parent_fd, name, display)
                 except FileExistsError:
+                    # Something is already at dst: a prior fully-imported copy, or a
+                    # concurrent import (the reconcile loop racing the operator's
+                    # POST /queue/{id}/import retry) that won the placement race. Checked
+                    # BEFORE the cross-device branch below — EEXIST must never be masked
+                    # as cross-device into an overwriting copy.
                     placed = _idempotent_or_conflict(src, parent_fd, name, display)
+                except OSError as exc:
+                    # Only a genuine cross-device / hardlink-unsupported failure warrants
+                    # a copy. Any other errno is surfaced.
+                    if exc.errno not in _COPY_FALLBACK_ERRNOS:
+                        raise
+                    # Cross-device (or hardlink-refusing) filesystem: copy instead. A
+                    # copy actually consumes space, so preflight that the destination
+                    # filesystem can hold the source before writing a partial file.
+                    try:
+                        self._copy_no_overwrite(src, dst, source_fd, parent_fd, name)
+                    except FileExistsError:
+                        placed = _idempotent_or_conflict(src, parent_fd, name, display)
+                    else:
+                        placed = True
                 else:
                     placed = True
-            else:
-                placed = True
+            finally:
+                os.close(source_fd)
             # Success is reported ONLY once the lexical destination is proven to name
             # the inode just placed: the held descriptor cannot stop the directory it
             # points at from being renamed out of the library underneath it.
@@ -835,8 +935,14 @@ class LocalFileSystem:
         except FileNotFoundError:
             return  # an ancestor is already gone -- nothing we placed remains there
 
-    def _copy_no_overwrite(self, src: Path, dst: Path, parent_fd: int, name: str) -> None:
-        src_size = src.stat().st_size
+    def _copy_no_overwrite(
+        self, src: Path, dst: Path, source_fd: int, parent_fd: int, name: str
+    ) -> None:
+        # Sized from the proven-regular descriptor, not a fresh pathname stat: the
+        # preflight, the bytes copied and the completeness check below must all be
+        # about the same inode, or a source swapped mid-import turns a short copy into
+        # a spurious "incomplete" error (or, worse, a passing one).
+        src_size = os.fstat(source_fd).st_size
         free = self.available_bytes(dst.parent)
         if free < src_size:
             raise OSError(
@@ -857,7 +963,7 @@ class LocalFileSystem:
         published = False
         try:
             with os.fdopen(tmp_fd, "wb") as target:
-                _copy_contents(src, target)
+                _copy_contents(source_fd, target)
             # Verify the copy is complete before exposing it at the final path.
             copied_size = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False).st_size
             if copied_size != src_size:

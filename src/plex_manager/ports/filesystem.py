@@ -79,6 +79,18 @@ class FileSystemPort(Protocol):
         not a containment failure -- but a breadcrumb must never be BORN pointing
         outside the root.
 
+        Implementations MUST also prove ``src`` is a REGULAR FILE before linking or
+        reading it, and MUST refuse anything else (FIFO, socket, device, directory,
+        symlink): a blocking read of a FIFO swapped in at ``src`` after validation
+        never returns and wedges the calling worker, and a hardlink of one publishes a
+        non-media entry that every later containment check would (correctly) wave
+        through on its identical inode.
+
+        Every refusal above is signalled by RAISING -- ``LocalFileSystemError`` or an
+        ``OSError`` subclass, the two the import pipeline catches and turns into a
+        visible, retryable ``ImportBlocked``. There is deliberately no port-level
+        exception type: callers must treat both as the same honest refusal.
+
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline
         report a file as placed without writing or linking anything.
