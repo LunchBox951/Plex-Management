@@ -3403,7 +3403,7 @@ async def run_availability_cycle(
                 _logger.debug(
                     "availability promotion skipped for season %s; it left 'completed' "
                     "during this tick's Plex check",
-                    season_request.season_number,
+                    safe_int(season_request.season_number),
                     extra={
                         "tmdb_id": safe_int(season_request.tmdb_id),
                         "request_id": safe_int(season_request.media_request_id),
