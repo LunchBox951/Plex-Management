@@ -277,6 +277,24 @@ async def _disarm_partial_delete(session: AsyncSession, pending: _Pending) -> No
         await SqlRequestRepository(session).clear_partial_delete_path(pending.media_request_id)
 
 
+async def _coverage_claim_active(session: AsyncSession, pending: _Pending) -> bool:
+    """Whether a LIVE pack holds an active ride-along coverage claim over this
+    season (issue #465).
+
+    A pack's ``download_coverage_claims`` row is scopeless, so neither the status
+    CAS nor ``find_active_for_request`` can see it; every destructive path in this
+    module therefore consults it directly off the committed snapshot immediately
+    before deleting. Movies never hold a claim, so a movie is honestly ``False``.
+    """
+    if not isinstance(pending, _SeasonPending):
+        return False
+    return (
+        await SqlDownloadRepository(session).find_active_coverage_title(
+            pending.tmdb_id, pending.season_number
+        )
+    ) is not None
+
+
 def _size_bytes(path: str) -> int | None:
     """Best-effort on-disk footprint of ``path`` (a file or a directory tree).
 
@@ -1245,6 +1263,24 @@ async def _recover_rearmed_season(
             # file-gone finalize below, which flips 'cancelled' -> 'evicted' on
             # disk truth. The registration is held across that finalize for the
             # same reason ``_resume_one`` holds it.
+            #
+            # Coverage re-check first, for the same reason ``_resume_one`` runs one
+            # (Codex round-3 P2): a cancelled re-grab does not mean nothing is
+            # fetching this season -- a scopeless ride-along pack can be mid-transfer
+            # over it, and this is a force-purge with no post-claim guard ahead of it.
+            if await _coverage_claim_active(session, pending):
+                _logger.info(
+                    "deferring the incomplete-delete retry of %r season %s: a live pack "
+                    "holds an active ride-along coverage claim over it; keeping the "
+                    "breadcrumb and marker rather than deleting a file a pack is fetching",
+                    title,
+                    safe_int(pending.season_number),
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
+                )
+                return False
             retry = await purge_service.purge_library_path(
                 fs, library_path, hold_purge_registration=True
             )
@@ -1260,6 +1296,21 @@ async def _recover_rearmed_season(
                     retry.detail,
                     extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
                 )
+                # The same best-effort refresh ``_resume_one``'s retry takes: files
+                # this (or the interrupted original) delete already removed are still
+                # advertised by Plex. ``refused`` names an out-of-root path with no
+                # section to scan, so it is the one outcome skipped.
+                if retry.outcome is not PurgeOutcome.refused:
+                    await purge_service.trigger_library_scan(
+                        library,
+                        library_path=library_path,
+                        media_type="tv",
+                        context="eviction",
+                        extra={
+                            "request_id": pending.media_request_id,
+                            "tmdb_id": pending.tmdb_id,
+                        },
+                    )
                 return retry.outcome is PurgeOutcome.partial
             try:
                 await _finalize_gone_rearmed_season(
@@ -1426,6 +1477,15 @@ async def _resume_one(
     bare ``os.stat`` success cannot tell an intact tree from a gutted one, which
     is the whole of #485.
 
+    That retry is a force-purge with no post-claim guard ahead of it (the marker
+    is committed BEFORE :func:`_evict_one`'s authoritative coverage re-check, so a
+    process that exits in between never ran one), so it re-checks the ride-along
+    coverage claim itself and DEFERS while a live pack holds one -- never restores,
+    since the tree still cannot be shown complete. A retry that destroys more
+    without clearing the remains refreshes Plex best-effort before returning: the
+    interrupted original may never have scanned at all, leaving Plex advertising
+    files that are already gone.
+
     Returns whether this recovery DESTROYED data whose freed bytes it cannot
     measure, so the sweep can re-baseline its pressure accounting (its disk
     snapshot is taken before recovery runs)."""
@@ -1508,6 +1568,32 @@ async def _resume_one(
         # the delete could otherwise re-place this exact path and re-stamp the
         # breadcrumb the value-predicated clear is about to match, erasing a live
         # import's only handle.
+        #
+        # FIRST, though, re-check the ride-along coverage claim (#465, Codex
+        # round-3 P2). The marker is armed and committed with the eviction claim,
+        # BEFORE ``_evict_one`` runs its authoritative post-claim coverage guard,
+        # so a pack whose claim lands in that gap is normally rescued by that guard
+        # -- but a process that exits right after the marker commit never reaches
+        # it, and this pass would then force-purge a season a live pack is
+        # mid-transfer, the one thing the normal path explicitly refuses to do.
+        # DEFER rather than restore: the tree cannot be shown complete, so
+        # 'available' would still be a lie; the claim, breadcrumb and marker all
+        # stand and the next sweep re-decides once the pack settles (its import
+        # re-places the path and retires the marker via ``set_library_path``).
+        if await _coverage_claim_active(session, pending):
+            _logger.info(
+                "deferring the incomplete-delete retry of %r%s: a live pack holds an "
+                "active ride-along coverage claim over this season; keeping the claim, "
+                "its breadcrumb and its marker rather than deleting a file a pack is "
+                "fetching",
+                title,
+                season_note,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            return False
         retry = await purge_service.purge_library_path(
             fs, library_path, hold_purge_registration=True
         )
@@ -1522,6 +1608,23 @@ async def _resume_one(
                 retry.detail,
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
+            # Best-effort Plex refresh (Codex round-3 P2), the same one
+            # ``_evict_one``'s direct partial-outcome branch takes: an armed marker
+            # means a destructive delete began on this path and was never shown to
+            # have left it intact, so Plex may well be advertising entries that are
+            # already gone -- most sharply after a crash, whose original attempt
+            # never reached any scan at all. ``refused`` is the one outcome skipped:
+            # it names a path outside every configured library root, so there is no
+            # section to refresh. The DB state (claim + breadcrumb + marker) is
+            # untouched by the scan, so the retry path stays exactly as it was.
+            if retry.outcome is not PurgeOutcome.refused:
+                await purge_service.trigger_library_scan(
+                    library,
+                    library_path=library_path,
+                    media_type=media_type,
+                    context="eviction",
+                    extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                )
             return retry.outcome is PurgeOutcome.partial
         destroyed_unmeasured = True  # the retry deleted real bytes it never counted
         purge_held = True
@@ -1773,6 +1876,10 @@ async def _evict_one(
     over this season lands AFTER the pre-claim   NOTHING deleted (#465) -- re-checked
     read (during the watch-state re-read) --    post-claim/pre-delete, same shape as
     the scopeless-ride-along shape (#465)        the twins guard; the pack keeps its file
+    that same coverage claim lands, then the    recovery re-checks coverage before its
+    process EXITS before the post-claim guard   force-purge and DEFERS: claim, breadcrumb
+    can run                                     and marker all stand, nothing deleted,
+                                                re-decided once the pack settles
     rewatch (or watch-state error) lands       skipped BEFORE the claim (invariant
     between candidate assembly and the claim   #8, #209); row stays ``available``,
     (#209)                                     file untouched, re-decided next sweep
@@ -1997,15 +2104,7 @@ async def _evict_one(
     # post-commit filesystem delete -- so this mirrors the module's established
     # post-claim/pre-delete recheck-and-restore pattern (twins #155, rewatch #209),
     # narrowing the window to the same irreducible micro-window those do.
-    if (
-        isinstance(pending, _SeasonPending)
-        and (
-            await SqlDownloadRepository(session).find_active_coverage_title(
-                pending.tmdb_id, pending.season_number
-            )
-        )
-        is not None
-    ):
+    if await _coverage_claim_active(session, pending):
         await _restore_after_failed_delete(session, pending)
         _logger.warning(
             "skipping eviction of %r%s: a live pack holds an active ride-along "
