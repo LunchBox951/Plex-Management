@@ -1273,7 +1273,7 @@ async def _bounded_content_probe[T](
     except _ProbeBoundExceeded:
         _logger.warning(
             "%s of %r did not answer within the %.1fs pre-removal mount-read bound; "
-            "treating the path as not visible and proceeding without the post-ack poll",
+            "treating the path as not visible for this read",
             operation_name,
             safe_text(content_path),
             _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
@@ -1349,6 +1349,12 @@ async def _visible_content_path(
         # short-circuiting read, so they cost one worker and one permit.
         return content_path
     budget -= time.monotonic() - started
+    if budget <= 0:
+        # The verbatim probe consumed the entire pre-removal bound (a wedged
+        # mount), so the remap probe below could only raise the same
+        # bound-exceeded answer -- don't spend a client round trip (up to the
+        # adapter's own HTTP timeout) discovering that.
+        return None
     if not save_path:
         # No live anchor to remap against (a torrent status with no save path):
         # only the verbatim path counts, exactly as ``_resolve_visible_content``
