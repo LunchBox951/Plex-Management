@@ -3078,13 +3078,14 @@ async def test_import_tv_finalize_reread_locks_the_download_row_first(
 
     Without the lock the re-read and the terminal swap only serialize through the swap's
     own ``NOT EXISTS`` predicate, and that predicate cannot close the window on
-    PostgreSQL: under READ COMMITTED a blocked ``UPDATE`` re-checks its WHERE against the
-    updated target tuple but still evaluates the subquery on the older command snapshot,
-    so a ``download_scopes`` row the attach committed while the swap waited on the row
-    lock stays invisible, the swap matches, and the late scope is terminalized over.
-    SQLite's single-writer behaviour cannot express that anomaly, so this pins the lock
-    ORDER -- which is what makes the read observe the attach's commit -- rather than
-    trying to reproduce the interleaving.
+    PostgreSQL: under READ COMMITTED, a blocked ``UPDATE`` is expected (but unverified
+    here) to re-check its WHERE against the updated target tuple while still evaluating
+    the subquery on the older command snapshot, so a ``download_scopes`` row the attach
+    committed while the swap waited on the row lock stays invisible, the swap matches,
+    and the late scope is terminalized over. No PostgreSQL-backed test exercises this
+    expectation. SQLite's single-writer behaviour cannot express that anomaly, so this
+    pins the lock ORDER -- which is what makes the read observe the attach's commit --
+    rather than trying to reproduce the interleaving.
     """
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
