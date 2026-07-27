@@ -596,11 +596,16 @@ class RequestRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def mark_available(self, request_id: int) -> None:
-        """Mark a request ``available`` + stamp ``library_verified_at``.
+    async def mark_available(self, request_id: int) -> bool:
+        """CAS a ``completed``/``available`` request to ``available`` + stamp
+        ``library_verified_at``. Returns whether the row was actually promoted.
 
         Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
-        the title — never asserts watchable before Plex actually has it.
+        the title — never asserts watchable before Plex actually has it. The
+        allowed-from set is the guard: a row re-armed to ``searching`` by
+        report-issue during that confirmation round-trip must never be
+        overwritten by the stale answer (issue #479), so a ``False`` return is a
+        benign "someone else moved this row", not a promotion.
         """
         raise NotImplementedError
 
@@ -949,12 +954,14 @@ class SeasonRequestRepository(Protocol):
         """
         raise NotImplementedError
 
-    async def mark_available(self, season_request_id: int) -> None:
-        """Mark a season ``available``.
+    async def mark_available(self, season_request_id: int) -> bool:
+        """CAS a ``completed``/``available`` season to ``available``. Returns
+        whether the season was actually promoted.
 
         Set only once :meth:`LibraryPort.is_available` confirms Plex has indexed
         the season (``leafCount>0``) -- never asserts watchable before Plex
-        actually has it.
+        actually has it. Same stale-promotion guard as
+        :meth:`RequestRepository.mark_available` (issue #479).
         """
         raise NotImplementedError
 

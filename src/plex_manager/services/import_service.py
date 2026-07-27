@@ -3164,14 +3164,29 @@ async def run_availability_cycle(
                 )
             continue
         try:
-            await request_repo.mark_available(request.id)
+            did_promote = await request_repo.mark_available(request.id)
             await session.commit()
-            promoted += 1
-            _forget_unconfirmed(key)
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
             _logger.warning(
                 "availability promotion failed; will retry next cycle",
+                extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
+            )
+            continue
+        if did_promote:
+            promoted += 1
+            _forget_unconfirmed(key)
+        else:
+            # The row left ``completed`` while this tick awaited Plex -- a
+            # report-issue re-arm to ``searching`` is the canonical case -- so the
+            # CAS refused this now-stale answer (issue #479). An EXPECTED outcome,
+            # never a fault: the concurrent writer's row carries the current
+            # intent. The bookkeeping is deliberately NOT forgotten here (this
+            # tick's snapshot still names the row); the NEXT tick's sweep drops it,
+            # once the row is genuinely absent from the completed set.
+            _logger.debug(
+                "availability promotion skipped; the request left 'completed' during "
+                "this tick's Plex check",
                 extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
             )
 
@@ -3322,18 +3337,34 @@ async def run_availability_cycle(
                     )
                 continue
             try:
-                await season_request_service.mark_available(
+                did_promote = await season_request_service.mark_available(
                     session,
                     media_request_id=season_request.media_request_id,
                     season_number=season_request.season_number,
                 )
                 await session.commit()
-                promoted += 1
-                _forget_unconfirmed(key)
             except (PlexLibraryError, PlexAuthError, NotImplementedError):
                 await session.rollback()
                 _logger.warning(
                     "availability promotion failed for season %s; will retry next cycle",
+                    season_request.season_number,
+                    extra={
+                        "tmdb_id": season_request.tmdb_id,
+                        "request_id": season_request.media_request_id,
+                    },
+                )
+                continue
+            if did_promote:
+                promoted += 1
+                _forget_unconfirmed(key)
+            else:
+                # The season left ``completed`` during this tick's Plex check (the
+                # movie loop's own lost-CAS branch above documents the case); the
+                # parent rollup is deliberately NOT recomputed either -- see
+                # ``season_request_service.mark_available`` (issue #479).
+                _logger.debug(
+                    "availability promotion skipped for season %s; it left 'completed' "
+                    "during this tick's Plex check",
                     season_request.season_number,
                     extra={
                         "tmdb_id": season_request.tmdb_id,
