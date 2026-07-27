@@ -1333,7 +1333,7 @@ async def _bounded_content_probe[T](
             "treating the path as not visible for this read",
             operation_name,
             safe_text(content_path),
-            _CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS,
+            timeout,
         )
         return None
     except OSError as error:

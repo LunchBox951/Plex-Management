@@ -257,7 +257,7 @@ def test_filesystem_port_move_default_raises_not_implemented() -> None:
     import pipeline report a file as placed without ever moving it."""
     fs = _FileSystemMissingMutators()  # pyright: ignore[reportAbstractUsage]
     with pytest.raises(NotImplementedError):
-        fs.move(Path("/src"), Path("/dst"))
+        fs.move(Path("/src"), Path("/dst"), root=Path("/"))
 
 
 def test_filesystem_port_hardlink_or_copy_default_raises_not_implemented() -> None:
@@ -265,7 +265,7 @@ def test_filesystem_port_hardlink_or_copy_default_raises_not_implemented() -> No
     for ``hardlink_or_copy`` (issue #80)."""
     fs = _FileSystemMissingMutators()  # pyright: ignore[reportAbstractUsage]
     with pytest.raises(NotImplementedError):
-        fs.hardlink_or_copy(Path("/src"), Path("/dst"))
+        fs.hardlink_or_copy(Path("/src"), Path("/dst"), root=Path("/"))
 
 
 class _LibraryMissingTriggerScan(LibraryPort):

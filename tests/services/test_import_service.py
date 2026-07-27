@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
+from unittest import mock
 
 import pytest
 from sqlalchemy import select
@@ -29,7 +31,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from plex_manager.adapters.filesystem.local import LocalFileSystem
+from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSystemError
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
@@ -51,6 +53,7 @@ from plex_manager.models import (
     User,
 )
 from plex_manager.ports.download_client import DownloadedFile, DownloadStatus
+from plex_manager.ports.filesystem import FilePublication
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.media_probe import (
     MediaProbePort,
@@ -70,6 +73,7 @@ from plex_manager.services import (
     season_request_service,
 )
 from plex_manager.services.import_service import (
+    _remove_quietly,  # pyright: ignore[reportPrivateUsage]
     import_download,
     run_availability_cycle,
     run_import_cycle,
@@ -470,21 +474,25 @@ class _LosingRaceFs(LocalFileSystem):
         super().__init__()
         self._winner_size = winner_size
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         _make_video(dst, self._winner_size)
-        raise FileExistsError(str(dst))
+        # Delegate so the REAL adapter meets the winner's file and makes the
+        # already-there-and-identical call itself: that decision now happens behind
+        # the publish walk's descriptor, and a fake that short-circuits it would
+        # assert nothing about the code the pipeline actually runs.
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 class _WrongSameSizeFs(LocalFileSystem):
     """Loses placement to a same-size but different file."""
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         dst.parent.mkdir(parents=True, exist_ok=True)
         size = os.path.getsize(src)
         with dst.open("wb") as handle:
             handle.seek(size - 1)
             handle.write(b"x")
-        raise FileExistsError(str(dst))
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 async def _import_with_fs(
@@ -558,6 +566,162 @@ async def test_scan_failure_after_lost_race_does_not_delete_winners_file(
         assert request is not None and request.status == RequestStatus.import_blocked
 
 
+async def test_import_movie_refuses_symlinked_title_ancestor_and_blocks_retryably(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, end to end: the movie's title directory beneath ``movies_root`` is a
+    symlink out of the library. The import must refuse rather than publish through it
+    -- nothing at the link's target, no Plex scan, no ``completed`` request -- and it
+    must land on the ordinary retryable ``ImportBlocked`` surface (the operator's
+    POST /queue/{id}/import button), never an unhandled error."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (movies_root / "The Matrix (1999)").symlink_to(outside)
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "symlink or non-directory" in record.failed_reason
+    assert record.download_path is None  # no breadcrumb for a file never published
+    assert list(outside.iterdir()) == []
+    assert library.scanned == []
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _EscapesTitleDirMidPlacementFs(LocalFileSystem):
+    """Renames the VERIFIED title directory out of the library (same filesystem) at the
+    instant of publication and leaves a symlink to it behind.
+
+    The descriptor the publish walk holds keeps working -- it refers to the directory,
+    not its name -- so the write itself succeeds, into a directory that is no longer in
+    the library. This is the escape a no-follow walk alone cannot see.
+    """
+
+    def __init__(self, outside: Path) -> None:
+        super().__init__()
+        self.escaped_dir: Path | None = None
+        self._outside = outside
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
+        real_link = os.link
+
+        def _escape_then_link(
+            link_src: str,
+            link_dst: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            title_dir = dst.parent
+            if title_dir.is_dir() and not title_dir.is_symlink():
+                self.escaped_dir = self._outside / f"{title_dir.name}.real"
+                title_dir.rename(self.escaped_dir)
+                title_dir.symlink_to(self.escaped_dir)
+            real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with mock.patch.object(os, "link", _escape_then_link):
+            return super().hardlink_or_copy(src, dst, root=root)
+
+
+async def test_import_movie_refuses_title_dir_renamed_out_of_root_mid_placement(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, the descriptor-can't-fix-this half, end to end: the title directory
+    is renamed OUT of the library mid-publication. The bytes land through the held
+    descriptor -- outside every configured root -- while the lexical destination
+    becomes a symlink.
+
+    Reported as success, this is the worst outcome the fix exists to prevent: the row
+    would carry an in-root ``download_path`` breadcrumb naming a path that holds
+    nothing of ours, so eviction, correction and purge could never reach the escaped
+    media. The post-placement verification must catch it, remove the escaped file, and
+    block retryably with no breadcrumb and no Plex scan."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+    fs = _EscapesTitleDirMidPlacementFs(outside)
+
+    record = await _import_with_fs(
+        sessionmaker_, download_id, movies_root, _qbt(video), library, fs
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value  # visible and retryable
+    assert record.failed_reason is not None
+    assert "no longer names the file that was placed" in record.failed_reason
+    assert record.download_path is None  # no breadcrumb was ever born pointing nowhere
+    assert library.scanned == []
+    # Nothing escaped: the file briefly published into the moved directory is gone.
+    assert fs.escaped_dir is not None
+    assert list(fs.escaped_dir.iterdir()) == []
+    assert video.exists()  # the source survives, so the operator's retry is real
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+async def test_import_movie_with_fifo_destination_conflicts_without_hanging(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """A FIFO planted at the destination must resolve as the ordinary conflict block,
+    promptly. Checking the existing entry's type only AFTER opening it readable meant a
+    blocking ``O_RDONLY`` on a writer-less FIFO never returned, wedging the import
+    worker (and, on the shared task, everything queued behind it) forever.
+
+    ``asyncio.timeout`` is the assertion: a regression here is a HANG, which without a
+    bound would stall the whole suite rather than fail one test."""
+    movies_root = tmp_path / "library"
+    title_dir = movies_root / "The Matrix (1999)"
+    title_dir.mkdir(parents=True)
+    os.mkfifo(title_dir / "The Matrix (1999).mkv")
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    library = FakeLibrary()
+
+    async with asyncio.timeout(30):
+        record = await _import(sessionmaker_, download_id, movies_root, _qbt(video), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "already exists with different content" in record.failed_reason
+    assert record.download_path is None
+    assert library.scanned == []
+    # The operator's file is never touched -- they remove it and press retry.
+    assert stat.S_ISFIFO((title_dir / "The Matrix (1999).mkv").lstat().st_mode)
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
 async def test_scan_failure_after_real_placement_rolls_back_dst(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:
@@ -582,6 +746,106 @@ async def test_scan_failure_after_real_placement_rolls_back_dst(
     assert record.status == DownloadState.ImportBlocked.value
     dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
     assert not dst.exists(), "a file THIS import placed must be rolled back on scan failure"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _ReplacesDestinationAfterPlacementFs(LocalFileSystem):
+    """Publishes normally, then replaces the destination before rollback."""
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
+        publication = super().hardlink_or_copy(src, dst, root=root)
+        replacement = root / "replacement.mkv"
+        replacement.write_text("third-party file")
+        os.replace(replacement, dst)
+        return publication
+
+
+async def test_scan_failure_rollback_does_not_delete_a_post_publish_replacement(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """The import service must thread the publication identity into rollback."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        _ScanFailsLibrary(),
+        _ReplacesDestinationAfterPlacementFs(),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert dst.read_text() == "third-party file"
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+class _SwapsAncestorAfterPlacementFs(LocalFileSystem):
+    """Publishes normally, then renames the movie-title directory away and drops a
+    symlink out of the library in its place -- the post-publication window in which a
+    pathname rollback resolves somewhere the publish never wrote."""
+
+    def __init__(self, outside: Path) -> None:
+        super().__init__()
+        self._outside = outside
+
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
+        publication = super().hardlink_or_copy(src, dst, root=root)
+        title_dir = dst.parent
+        title_dir.rename(title_dir.parent / f"{title_dir.name}.real")
+        title_dir.symlink_to(self._outside)
+        return publication
+
+
+async def test_scan_failure_rollback_never_unlinks_through_a_swapped_ancestor(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    """GHSA-r5vh, CWE-59: the movie-title directory is renamed away and replaced by an
+    out-of-root symlink AFTER the file is published. Rolling the placement back by
+    pathname re-resolves through that link and unlinks an unrelated same-named file
+    outside every configured root, while leaving the published file behind. The
+    anchored rollback refuses instead, and the import still blocks honestly."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "The Matrix (1999).mkv"
+    victim.write_text("someone else's file")
+    video = tmp_path / "downloads" / "The.Matrix.1999.1080p.WEB-DL.x264-GRP.mkv"
+    _make_video(video)
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import_with_fs(
+        sessionmaker_,
+        download_id,
+        movies_root,
+        _qbt(video),
+        _ScanFailsLibrary(),
+        _SwapsAncestorAfterPlacementFs(outside),
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert victim.read_text() == "someone else's file"
+    assert (movies_root / "The Matrix (1999).real" / "The Matrix (1999).mkv").exists()
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
@@ -624,6 +888,29 @@ async def test_scan_failure_never_deletes_unproven_identical_destination_file(
     async with sessionmaker_() as session:
         request = await session.get(MediaRequest, request_id)
         assert request is not None and request.status == RequestStatus.import_blocked
+
+
+def test_remove_quietly_sanitizes_newlines_in_the_rollback_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The rollback-failure warning logs the placed path and the exception, both of
+    which are request-derived: a movie/show title carries embedded newlines through
+    ``clean_title``, and the adapter refusal echoes that path back into its message. An
+    unsanitized CR/LF would forge a second log record, so both args pass through
+    ``safe_text`` and the emitted record must contain no raw newline."""
+    root = tmp_path / "library"
+    root.mkdir()
+    # Outside the root, so the real descriptor-anchored removal refuses with a
+    # LocalFileSystemError that echoes this newline-bearing path back into ``exc``.
+    malicious = tmp_path / "Evil\nFAKE LOG RECORD (2020)" / "movie.mkv"
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.import_service"):
+        _remove_quietly(LocalFileSystem(), malicious, root, (0, 0))
+
+    record = next(r for r in caplog.records if "could not roll back" in r.getMessage())
+    message = record.getMessage()
+    assert "\n" not in message  # the newline in both path and exc is collapsed
+    assert "Evil FAKE LOG RECORD (2020)" in message  # collapsed to a space, still present
 
 
 async def test_import_idempotent_when_placement_race_lost_to_same_size(
@@ -1712,25 +1999,32 @@ def test_place_file_refuses_dangling_symlink_destination(tmp_path: Path) -> None
 
     with pytest.raises(FileExistsError):
         import_service._place_file(  # pyright: ignore[reportPrivateUsage]
-            LocalFileSystem(), str(src), dst
+            LocalFileSystem(), str(src), dst, tmp_path
         )
 
     assert dst.is_symlink()
     assert not target.exists()
 
 
-def test_same_file_content_false_for_dangling_symlink(tmp_path: Path) -> None:
-    """``_same_file_content`` must not raise ``FileNotFoundError`` on a dangling
-    symlink dst -- it is honestly NOT the same content as a real src file."""
+def test_place_file_refuses_symlinked_destination_ancestor(tmp_path: Path) -> None:
+    """GHSA-r5vh: a movie-title directory replaced by a symlink out of the library
+    made ``_place_file`` publish the media outside every configured root while the
+    caller recorded an in-root breadcrumb. Refuse, and create nothing at the target."""
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (movies_root / "The Matrix (1999)").symlink_to(outside)
     src = tmp_path / "src.mkv"
-    src.write_text("payload")
-    dst = tmp_path / "dst.mkv"
-    dst.symlink_to(tmp_path / "gone.mkv")
+    src.write_text("new-download")
+    dst = movies_root / "The Matrix (1999)" / "The Matrix (1999).mkv"
 
-    assert (
-        import_service._same_file_content(str(src), dst)  # pyright: ignore[reportPrivateUsage]
-        is False
-    )
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        import_service._place_file(  # pyright: ignore[reportPrivateUsage]
+            LocalFileSystem(), str(src), dst, movies_root
+        )
+
+    assert list(outside.iterdir()) == []
 
 
 async def test_import_is_idempotent_on_an_already_imported_row(
@@ -2270,6 +2564,40 @@ async def _import_tv(
             tv_root=str(tv_root),
             anime_tv_root=str(anime_tv_root) if anime_tv_root is not None else None,
         )
+
+
+@pytest.mark.parametrize("linked", ["Some Show (2020)", "Some Show (2020)/Season 02"])
+async def test_import_tv_refuses_symlinked_show_or_season_ancestor(
+    tmp_path: Path, sessionmaker_: SessionMaker, linked: str
+) -> None:
+    """GHSA-r5vh on the TV side: a symlinked show OR season directory beneath
+    ``tv_root`` must refuse, leave nothing at the link's target, and surface the
+    retryable ``ImportBlocked`` reason rather than publish episodes out of the
+    library behind an in-root breadcrumb."""
+    tv_root = tmp_path / "tv"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_path = tv_root / linked
+    linked_path.parent.mkdir(parents=True)
+    linked_path.symlink_to(outside)
+    release_dir = tmp_path / "downloads" / "Some.Show.S02.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, request_id, season_id = await _seed_tv(sessionmaker_, season=2)
+    library = FakeLibrary()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert record.failed_reason is not None
+    assert "symlink or non-directory" in record.failed_reason
+    assert list(outside.iterdir()) == []
+    assert library.scan_calls == []
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+        request = await session.get(MediaRequest, request_id)
+    assert season_row is not None and season_row.status.value != "completed"
+    assert request is not None and request.status is RequestStatus.import_blocked
 
 
 async def test_import_tv_happy_path_places_every_accepted_episode_with_one_scan(
@@ -3078,13 +3406,14 @@ async def test_import_tv_finalize_reread_locks_the_download_row_first(
 
     Without the lock the re-read and the terminal swap only serialize through the swap's
     own ``NOT EXISTS`` predicate, and that predicate cannot close the window on
-    PostgreSQL: under READ COMMITTED a blocked ``UPDATE`` re-checks its WHERE against the
-    updated target tuple but still evaluates the subquery on the older command snapshot,
-    so a ``download_scopes`` row the attach committed while the swap waited on the row
-    lock stays invisible, the swap matches, and the late scope is terminalized over.
-    SQLite's single-writer behaviour cannot express that anomaly, so this pins the lock
-    ORDER -- which is what makes the read observe the attach's commit -- rather than
-    trying to reproduce the interleaving.
+    PostgreSQL: under READ COMMITTED, a blocked ``UPDATE`` is expected (but unverified
+    here) to re-check its WHERE against the updated target tuple while still evaluating
+    the subquery on the older command snapshot, so a ``download_scopes`` row the attach
+    committed while the swap waited on the row lock stays invisible, the swap matches,
+    and the late scope is terminalized over. No PostgreSQL-backed test exercises this
+    expectation. SQLite's single-writer behaviour cannot express that anomaly, so this
+    pins the lock ORDER -- which is what makes the read observe the attach's commit --
+    rather than trying to reproduce the interleaving.
     """
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
@@ -3554,11 +3883,11 @@ class _FailsOnSecondCallFs(LocalFileSystem):
         super().__init__()
         self._calls = 0
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:  # type: ignore[override]
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         self._calls += 1
         if self._calls >= 2:
             raise OSError("simulated copy failure")
-        super().hardlink_or_copy(src, dst)
+        return super().hardlink_or_copy(src, dst, root=root)
 
 
 async def test_import_tv_mid_pack_copy_failure_never_leaves_a_lying_imported_history_row(
@@ -3878,6 +4207,82 @@ async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
         assert not import_service.is_movie_unconfirmed_tracked(request_id)
     finally:
         await engine.dispose()
+
+
+async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: a failed movie promotion routes both log extras through
+    ``safe_int`` before emitting the warning."""
+    tmdb_id = 811
+    request_id = await _seed_movie_request(sessionmaker_, tmdb_id=tmdb_id)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(SqlRequestRepository, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=FakeLibrary(available={tmdb_id}), session=session)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "availability promotion failed; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [tmdb_id, request_id]
+
+
+async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: the season promotion warning sanitizes its request-derived
+    extras independently of the movie loop."""
+    tmdb_id = 812
+    request_id = await _seed_show_request(sessionmaker_, tmdb_id=tmdb_id)
+    await _seed_season(sessionmaker_, media_request_id=request_id, season_number=1)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(
+        _session: AsyncSession, *, media_request_id: int, season_number: int
+    ) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(season_request_service, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=FakeLibrary(available_tv_seasons={tmdb_id: frozenset({1})}), session=session
+            )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "availability promotion failed for season 1000001; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [1, tmdb_id, request_id]
 
 
 # --------------------------------------------------------------------------- #

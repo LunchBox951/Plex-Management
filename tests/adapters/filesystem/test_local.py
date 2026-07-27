@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
+import signal
+import stat
 import time
+from collections.abc import Generator
 from pathlib import Path
+from types import FrameType
+from typing import IO
 
 import pytest
 
@@ -15,6 +21,7 @@ from plex_manager.adapters.filesystem import (
     LocalFileSystemError,
     PartialDeleteError,
 )
+from plex_manager.adapters.filesystem import local as local_fs
 from plex_manager.adapters.filesystem.local import (
     _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
 )
@@ -34,7 +41,7 @@ def test_move_relocates_file_and_creates_parent(tmp_path: Path) -> None:
     src.write_text("payload")
     dst = tmp_path / "library" / "movie" / "dst.mkv"
 
-    LocalFileSystem().move(src, dst)
+    LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert not src.exists()
     assert dst.read_text() == "payload"
@@ -48,7 +55,7 @@ def test_move_refuses_existing_destination_and_preserves_both_files(tmp_path: Pa
     dst.write_text("existing payload")
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert src.read_text() == "new payload"
     assert dst.read_text() == "existing payload"
@@ -61,11 +68,11 @@ def test_move_cross_device_copy_removes_source_after_publish(
     src.write_text("payload")
     dst = tmp_path / "library" / "dst.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().move(src, dst)
+    LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert not src.exists()
     assert dst.read_text() == "payload"
@@ -80,16 +87,35 @@ def test_move_cross_device_copy_refuses_existing_destination(
     dst.parent.mkdir(parents=True)
     dst.write_text("existing payload")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert src.read_text() == "new payload"
     assert dst.read_text() == "existing payload"
+
+
+def test_move_onto_the_same_file_is_a_noop_and_preserves_it(tmp_path: Path) -> None:
+    """``move(p, p)`` must not self-destruct. ``src`` and ``dst`` being the SAME entry
+    makes :meth:`hardlink_or_copy` report the idempotent match (returns ``False``,
+    creates nothing); the follow-up ``src.unlink()`` would then delete the file's only
+    name. The move short-circuits to a no-op instead."""
+    root = tmp_path / "library"
+    root.mkdir()
+    path = root / "movie.mkv"
+    path.write_text("payload")
+    before = path.stat()
+
+    LocalFileSystem().move(path, path, root=root)
+
+    assert path.exists()
+    assert path.read_text() == "payload"
+    after = path.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
 
 
 def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
@@ -97,7 +123,7 @@ def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     src.write_text("payload")
     dst = tmp_path / "linked" / "dst.mkv"
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()  # source preserved
     assert dst.read_text() == "payload"
@@ -114,7 +140,7 @@ def test_hardlink_or_copy_hardlink_path_preserves_active_publish_lock(tmp_path: 
     lock.write_text(str(os.getpid()))
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()
     assert not dst.exists()
@@ -129,13 +155,15 @@ def test_hardlink_or_copy_falls_back_to_copy(
     dst = tmp_path / "copied.mkv"
     real_link = os.link
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
@@ -149,18 +177,20 @@ def test_cross_device_copy_refuses_destination_created_during_publish(
     dst = tmp_path / "copied.mkv"
     real_link = os.link
 
-    def _race_link(_src: str, _dst: str) -> None:
+    def _race_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        if _dst == os.fspath(dst):
+        if _dst == dst.name:
             dst.write_text("race winner")
             raise FileExistsError(os.fspath(dst))
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(os, "link", _race_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.read_text() == "copy-path-loser"
     assert dst.read_text() == "race winner"
@@ -173,11 +203,11 @@ def test_hardlink_or_copy_falls_back_when_all_hardlinks_are_unsupported(
     src.write_text("payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert src.exists()
     assert dst.read_text() == "payload"
@@ -195,34 +225,33 @@ def test_hardlinkless_publish_renames_temp_without_second_copy(
     src.write_text("payload")
     dst = tmp_path / "movie" / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
-    real_copy2 = shutil.copy2
-    copies: list[tuple[str, str]] = []
+    real_copyfileobj = shutil.copyfileobj
+    copies: list[int] = []
 
-    def _counting_copy2(copy_src: str, copy_dst: str) -> None:
-        copies.append((copy_src, copy_dst))
-        real_copy2(copy_src, copy_dst)
+    def _counting_copy(source: IO[bytes], target: IO[bytes]) -> None:
+        copies.append(source.fileno())
+        real_copyfileobj(source, target)
 
     real_rename = os.rename
-    renames: list[tuple[str, str]] = []
+    renames: list[str] = []
 
-    def _recording_rename(rename_src: str, rename_dst: str) -> None:
-        renames.append((os.fspath(rename_src), os.fspath(rename_dst)))
-        real_rename(rename_src, rename_dst)
+    def _recording_rename(rename_src: str, rename_dst: str, **_dir_fds: int) -> None:
+        renames.append(os.fspath(rename_dst))
+        real_rename(rename_src, rename_dst, **_dir_fds)
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _counting_copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _counting_copy)
     monkeypatch.setattr(os, "rename", _recording_rename)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     # The content was written exactly ONCE (src -> temp); the publish is a rename.
     assert len(copies) == 1
-    assert copies[0][0] == os.fspath(src)
-    assert [rename_dst for _s, rename_dst in renames] == [os.fspath(dst)]
+    assert renames == [dst.name]
     # The rename consumed the temp: nothing left over next to the final file.
     leftovers = [p for p in dst.parent.iterdir() if p != dst]
     assert leftovers == []
@@ -238,13 +267,13 @@ def test_hardlinkless_publish_still_refuses_existing_destination(
     dst = tmp_path / "copied.mkv"
     dst.write_text("existing library file")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "existing library file"
     # The temp copy was cleaned up; only src and dst remain in the directory.
@@ -267,13 +296,13 @@ def test_hardlinkless_publish_refuses_dangling_symlink_destination(
     assert dst.is_symlink()
     assert not dst.exists()  # confirms the dangling shape this test exercises
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -290,13 +319,13 @@ def test_move_refuses_dangling_symlink_destination(
     target = tmp_path / "gone.mkv"
     dst.symlink_to(target)
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().move(src, dst)
+        LocalFileSystem().move(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -320,13 +349,13 @@ def test_publish_lock_refuses_dangling_symlink_under_stale_lock(
     lock_path = tmp_path / f".{dst.name}.publish.lock"
     lock_path.write_text("999999999")  # a pid that cannot be running -- reclaimable
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EPERM, "hardlinks unsupported")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.is_symlink()
     assert os.readlink(dst) == os.fspath(target)
@@ -339,29 +368,33 @@ def test_hardlink_or_copy_cross_device_copy_uses_temp_file_until_complete(
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = tmp_path / "copied.mkv"
-    observed_copy_dst: list[Path] = []
+    in_flight: list[list[str]] = []
     real_link = os.link
+    real_copyfileobj = shutil.copyfileobj
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
         if _src == os.fspath(src):
             raise OSError(errno.EXDEV, "simulated cross-device link")
-        real_link(_src, _dst)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    def _copy2(_src: str, dst_arg: str) -> None:
-        copy_dst = Path(dst_arg)
-        observed_copy_dst.append(copy_dst)
-        copy_dst.write_text("partial")
-        assert not dst.exists(), "final path must not exist while copy is in progress"
-        copy_dst.write_text("payload")
+    def _observing_copy(source: IO[bytes], target: IO[bytes]) -> None:
+        real_copyfileobj(source, target)
+        target.flush()
+        in_flight.append(sorted(p.name for p in tmp_path.iterdir()))
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _observing_copy)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
-    assert observed_copy_dst and observed_copy_dst[0] != dst
-    assert not observed_copy_dst[0].exists()
+    # Mid-copy the bytes lived in a temp entry, never at the final name...
+    assert in_flight and dst.name not in in_flight[0]
+    assert [name for name in in_flight[0] if name != src.name]
+    # ...and that temp is gone once the publish completes.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dst.name, src.name]
 
 
 def test_cross_device_copy_recovers_stale_publish_lock(
@@ -373,12 +406,12 @@ def test_cross_device_copy_recovers_stale_publish_lock(
     lock = tmp_path / ".copied.mkv.publish.lock"
     lock.write_text("999999999")
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
@@ -396,7 +429,7 @@ def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     aged = time.time() - (_EMPTY_LOCK_STALE_SECONDS + 5)
     os.utime(lock, (aged, aged))
 
-    LocalFileSystem().hardlink_or_copy(src, dst)
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
@@ -412,7 +445,7 @@ def test_publish_lock_fresh_empty_lock_is_not_reclaimed(tmp_path: Path) -> None:
     lock.write_text("")  # empty but fresh (mtime == now)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()
     assert lock.exists()  # preserved for the in-flight creator
@@ -427,13 +460,13 @@ def test_cross_device_copy_preserves_active_publish_lock(
     lock = tmp_path / ".copied.mkv.publish.lock"
     lock.write_text(str(os.getpid()))
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     monkeypatch.setattr(os, "link", _refuse_link)
 
     with pytest.raises(FileExistsError):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()
     assert lock.read_text() == str(os.getpid())
@@ -446,7 +479,7 @@ def test_hardlink_or_copy_raises_when_destination_too_small(
     src.write_text("a sizeable payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
     def _plenty(_self: LocalFileSystem, _path: str) -> int:
@@ -456,7 +489,7 @@ def test_hardlink_or_copy_raises_when_destination_too_small(
     monkeypatch.setattr(LocalFileSystem, "available_bytes", _plenty)
 
     with pytest.raises(OSError, match="insufficient space"):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()  # nothing written on a failed preflight
 
@@ -468,19 +501,793 @@ def test_hardlink_or_copy_rolls_back_partial_copy_on_size_mismatch(
     src.write_text("the full expected payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
-    def _short_copy2(_src: str, dst_arg: str) -> None:
-        Path(dst_arg).write_text("short")  # truncated write
+    def _short_copy(_source: IO[bytes], target: IO[bytes]) -> None:
+        target.write(b"short")  # truncated write
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _short_copy2)
+    monkeypatch.setattr(shutil, "copyfileobj", _short_copy)
 
     with pytest.raises(OSError, match="incomplete"):
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert not dst.exists()  # partial destination rolled back
+
+
+# --------------------------------------------------------------------------- #
+# GHSA-r5vh: publication must not follow symlinked ancestors out of the root
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("relative_dst", "linked_ancestor"),
+    [
+        ("The Matrix (1999)/The Matrix (1999).mkv", "The Matrix (1999)"),
+        ("Some Show (2020)/Season 01/Some Show - S01E01.mkv", "Some Show (2020)"),
+        ("Some Show (2020)/Season 01/Some Show - S01E01.mkv", "Some Show (2020)/Season 01"),
+    ],
+    ids=["movie-title", "show", "season"],
+)
+def test_hardlink_or_copy_refuses_pre_existing_symlinked_ancestor(
+    tmp_path: Path, relative_dst: str, linked_ancestor: str
+) -> None:
+    """A destination ancestor replaced by a symlink out of the library must refuse:
+    the file is what an operator later corrects/evicts by its in-root breadcrumb, and
+    the delete-side guard rightly refuses an escaped target, so publishing through
+    the link would be uncorrectable from the web UI."""
+    root = tmp_path / "library"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    linked_path = root / linked_ancestor
+    linked_path.parent.mkdir(parents=True, exist_ok=True)
+    linked_path.symlink_to(outside)
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().hardlink_or_copy(src, root / relative_dst, root=root)
+
+    assert list(outside.iterdir()) == []  # nothing created at the link's target
+
+
+def test_hardlink_or_copy_refuses_non_directory_ancestor(tmp_path: Path) -> None:
+    """The same refusal for an ancestor that is a plain file: ``O_DIRECTORY`` is
+    what makes the walk trustworthy, so a non-directory component is a refusal, not
+    a mkdir attempt that would fail with a bare, unexplained EEXIST."""
+    root = tmp_path / "library"
+    root.mkdir()
+    (root / "The Matrix (1999)").write_text("not a directory")
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().hardlink_or_copy(
+            src, root / "The Matrix (1999)" / "The Matrix (1999).mkv", root=root
+        )
+
+
+def test_hardlink_or_copy_refuses_destination_outside_root(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    escaped = tmp_path / "outside" / "escaped.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="outside the library root"):
+        LocalFileSystem().hardlink_or_copy(src, escaped, root=root)
+
+    assert not escaped.parent.exists()  # refused before anything was created
+
+
+def test_hardlink_or_copy_refuses_when_platform_cannot_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``dir_fd``-relative, no-follow primitives there is no containment to
+    enforce; publication refuses rather than silently falling back to the pathname
+    publication GHSA-r5vh exploits."""
+    monkeypatch.setattr(local_fs, "_PUBLICATION_CONTAINMENT_SUPPORTED", False)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+
+    with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert not dst.exists()
+
+
+def test_hardlink_or_copy_refuses_ancestor_swapped_to_symlink_mid_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ancestor-swap race a one-time ``realpath()`` check cannot close: the
+    season directory is renamed away and replaced with a symlink out of the library
+    at the instant of publication.
+
+    The descriptor the walk holds still refers to the directory it verified, so the
+    bytes never reach the symlink's target. But the LEXICAL destination no longer
+    names them, so the breadcrumb the caller would persist is already wrong the
+    moment it is written -- the post-placement verification catches that, rolls the
+    entry back through the held descriptor, and refuses."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    real_link = os.link
+
+    def _swap_then_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        # The swap lands AFTER the no-follow walk verified the season directory and
+        # BEFORE the entry is created -- the exact window the pathname publish lost.
+        if season.is_dir() and not season.is_symlink():
+            season.rename(season.parent / "Season 01.real")
+            season.symlink_to(outside)
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "link", _swap_then_link)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(outside.iterdir()) == []  # the swapped-in link never received bytes
+    # The entry created through the held descriptor is undone, so no orphan is left
+    # at a path the caller was never told about.
+    assert list((season.parent / "Season 01.real").iterdir()) == []
+
+
+def test_hardlink_or_copy_refuses_when_destination_dir_is_renamed_out_of_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, the half a held descriptor cannot close: the verified season
+    directory is renamed OUT of the library (same filesystem) and a symlink to it is
+    left at the original name. The publish through the descriptor is itself correct --
+    and lands outside every configured root.
+
+    Nothing may be reported as placed here: the caller would store the in-root path as
+    its breadcrumb, and correction/eviction/purge would then address a path that names
+    nothing, while the real bytes sit somewhere they can never be reached."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped_dir = outside / "Season 01.real"
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    real_link = os.link
+
+    def _escape_then_link(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if season.is_dir() and not season.is_symlink():
+            season.rename(escaped_dir)  # the opened directory leaves the library
+            season.symlink_to(escaped_dir)  # ...and its name becomes a link to it
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "link", _escape_then_link)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The bytes that briefly landed outside the root are gone: no escaped file
+    # survives a call that did not report success.
+    assert list(escaped_dir.iterdir()) == []
+    assert src.read_text() == "payload"  # the source is untouched, so a retry is real
+
+
+def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The containment verification is not a failure-path-only branch: an ordinary
+    import runs it and passes it. Without this, the check could regress to never
+    running and every escape test would still pass for the wrong reason."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    calls: list[tuple[bool, tuple[int, int]]] = []
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+
+    def _spy(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        calls.append((placed, published_identity))
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _spy)
+
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root).placed is True
+
+    # Ran once, for the file this call placed, and was handed the identity captured at
+    # publication time -- the very inode the source was hardlinked to.
+    assert calls == [(True, (src.stat().st_dev, src.stat().st_ino))]
+    assert dst.read_text() == "payload"
+    # ...and the property it asserted actually holds: the lexical path names the inode.
+    assert dst.stat().st_ino == src.stat().st_ino
+
+
+def test_hardlink_publication_keeps_source_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The linked inode cannot be freed and reused before lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "linked.mkv"
+    real_open_source = local_fs._open_regular_source  # pyright: ignore[reportPrivateUsage]
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    source_fds: list[int] = []
+
+    def _record_source_fd(source: Path, display: str) -> int:
+        source_fd = real_open_source(source, display)
+        source_fds.append(source_fd)
+        return source_fd
+
+    def _verify_while_source_is_held(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert len(source_fds) == 1
+        held = os.fstat(source_fds[0])
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(local_fs, "_open_regular_source", _record_source_fd)
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_while_source_is_held)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert len(source_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(source_fds[0])
+
+
+def test_copy_publication_keeps_written_inode_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy inode cannot be freed and reused before lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "copied.mkv"
+    real_link = os.link
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    verified_fds: list[int] = []
+
+    def _refuse_source_link(
+        link_src: str,
+        link_dst: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if link_src == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _verify_with_held_fd(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert published_fd is not None
+        held = os.fstat(published_fd)
+        verified_fds.append(published_fd)
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert len(verified_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(verified_fds[0])
+
+
+def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A digest-matched inode stays descriptor-pinned until lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "copied.mkv"
+    dst.write_text("payload")  # same bytes, distinct inode: forces digest matching
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    verified_fds: list[int] = []
+
+    def _verify_with_held_fd(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert published_fd is not None
+        held = os.fstat(published_fd)
+        verified_fds.append(published_fd)
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
+
+    result = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert result.placed is False
+    assert len(verified_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(verified_fds[0])
+
+
+@contextlib.contextmanager
+def _bounded(seconds: float, what: str) -> Generator[None]:
+    """Turn a HANG in the body into a test FAILURE.
+
+    The FIFO regressions below are hang bugs, so an unbounded test would stop the
+    whole suite instead of reporting one red test. ``SIGALRM`` interrupts the
+    blocking syscall itself -- which is the only thing that can unwedge a blocking
+    ``open`` of a writer-less FIFO, and something no after-the-fact wall-clock
+    assertion could ever reach.
+    """
+
+    def _fire(_signum: int, _frame: FrameType | None) -> None:
+        raise TimeoutError(f"{what} blocked for more than {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_hardlink_or_copy_refuses_fifo_destination_without_blocking(tmp_path: Path) -> None:
+    """A pre-existing FIFO at the destination is an ordinary conflict, resolved by
+    ``fstatat`` -- never opened for reading. A blocking ``O_RDONLY`` open of a FIFO
+    with no writer never returns, which would wedge the import worker forever on a
+    path any local actor can plant with ``mkfifo``."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    os.mkfifo(dst)
+
+    with (
+        _bounded(10.0, "hardlink_or_copy onto a FIFO destination"),
+        pytest.raises(FileExistsError, match="already exists with different content"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert stat.S_ISFIFO(dst.lstat().st_mode)  # untouched, for the operator to remove
+
+
+@pytest.mark.parametrize("maker", ["fifo", "directory"], ids=["fifo", "directory"])
+def test_hardlink_or_copy_refuses_non_regular_destination_on_the_copy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: str
+) -> None:
+    """The same guarantee on the cross-device COPY fallback, whose publish also lands
+    on the existing entry: a non-regular destination is a conflict, decided without a
+    readable open."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    if maker == "fifo":
+        os.mkfifo(dst)
+    else:
+        dst.mkdir()
+
+    def _refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)
+
+    with (
+        _bounded(10.0, f"hardlink_or_copy onto a {maker} destination via the copy path"),
+        pytest.raises(FileExistsError, match="already exists with different content"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(title.iterdir()) == [dst]  # no temp copy left behind
+
+
+def _library_with_fifo_source(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A library root, a FIFO standing where the validated video was, and the intended
+    destination -- the scan-to-place race an unprivileged local actor wins with
+    ``mkfifo``."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    os.mkfifo(src)
+    return root, src, title / "The Matrix (1999).mkv"
+
+
+def test_hardlink_or_copy_refuses_fifo_source_on_the_copy_path_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SOURCE-side counterpart of the destination-side FIFO guard above.
+
+    The copy fallback used to stream the source with a plain ``open(src, "rb")`` --
+    blocking, and never asking what ``src`` actually is. An actor who swaps the
+    validated video for a same-named FIFO after the scan makes that open sleep until a
+    writer appears, inside ``asyncio.to_thread``: an executor thread no cancellation
+    can reach, holding the hash's download lock, until the pool is exhausted and the
+    whole app stalls with only a process restart left as recovery. The source must be
+    proven ``S_ISREG`` before a byte is read, and refused honestly if it is not.
+    """
+    root, src, dst = _library_with_fifo_source(tmp_path)
+
+    def _refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", _refuse_link)  # force the copy fallback
+
+    with (
+        _bounded(5.0, "hardlink_or_copy from a FIFO source via the copy path"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert not dst.exists()
+    assert list(dst.parent.iterdir()) == []  # nothing published, no temp left behind
+
+
+def test_hardlink_or_copy_refuses_fifo_source_on_the_hardlink_path(tmp_path: Path) -> None:
+    """The same refusal on the path that never copies at all.
+
+    ``os.link`` happily hardlinks a FIFO, and the resulting entry then passes
+    :func:`_verify_lexical_publication` on its (correctly identical) inode -- so the
+    call used to report success and the pipeline would persist a breadcrumb and fire a
+    Plex scan for a FIFO sitting in the library. A regular-file proof of the SOURCE has
+    to gate the link, not just the copy stream.
+    """
+    root, src, dst = _library_with_fifo_source(tmp_path)
+
+    with (
+        _bounded(5.0, "hardlink_or_copy from a FIFO source via the hardlink path"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert not dst.exists()  # no success, no breadcrumb-worthy entry
+    assert list(dst.parent.iterdir()) == []
+    assert stat.S_ISFIFO(src.lstat().st_mode)  # source untouched, for the operator
+
+
+def test_hardlink_or_copy_refuses_without_unlinking_a_third_party_entry_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unlink-after-hardlink race the mismatch branch must NOT lose: ``os.link``
+    succeeding proves WE created the entry AT LINK TIME, but the identity read happens
+    later. A non-cooperating writer with access to the destination directory unlinks
+    our fresh link and drops ITS OWN file at the same name before that read. The
+    identity no longer matches the proven-regular source, so the publish is REFUSED --
+    but the third party's file must survive: an entry whose ownership can no longer be
+    proven is never unlinked (pre-fix, this branch deleted it)."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    real_link = os.link
+
+    def _link_then_swap_entry(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        # Between our exclusive link and the identity read, a third party replaces the
+        # entry at the same name with an unrelated file (a different inode).
+        os.unlink(_dst, dir_fd=dst_dir_fd)
+        replacement_fd = os.open(
+            _dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dst_dir_fd
+        )
+        try:
+            os.write(replacement_fd, b"third-party file")
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(os, "link", _link_then_swap_entry)
+
+    with pytest.raises(LocalFileSystemError, match="changed identity"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The third party's file was NOT unlinked -- it survives with its own bytes.
+    assert dst.read_bytes() == b"third-party file"
+
+
+def test_hardlink_or_copy_idempotency_compares_held_source_not_a_reopened_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, the idempotent-retry window (Finding 1): on ``EEXIST`` the existing
+    destination must be compared against the descriptor :func:`_open_regular_source`
+    already proved regular -- NEVER a fresh ``open(src)`` by pathname.
+
+    An actor pre-places arbitrary destination bytes, then swaps ``src`` to a NEW inode
+    holding those same bytes in the window between the proof and the compare. A re-open
+    by name would read the decoy, match the destination, and report a false idempotent
+    success -- finalizing and scanning attacker-chosen content. Reading the held
+    descriptor sees the ORIGINAL inode's bytes, so the decoy never matches and the
+    publish is refused as an honest conflict. Pre-fix this returned ``False`` (a false
+    idempotent win); the fix RAISES."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"original-payload")  # the validated bytes, behind the held fd
+    dst = title / "The Matrix (1999).mkv"
+    # Pre-placed by the actor: same length, DIFFERENT bytes -> the link fails EEXIST and
+    # the idempotency compare runs.
+    dst.write_bytes(b"decoy-aaaaaaaaaa")
+
+    real_open = local_fs._open_regular_source  # pyright: ignore[reportPrivateUsage]
+
+    def _open_then_swap_source(swap_src: Path, display: str) -> int:
+        fd = real_open(swap_src, display)  # holds the ORIGINAL inode (original-payload)
+        # The source PATH is repointed to a new inode whose bytes equal the decoy, in
+        # the window before the idempotency compare. The held fd keeps the old inode.
+        planted = tmp_path / "planted.mkv"
+        planted.write_bytes(b"decoy-aaaaaaaaaa")
+        os.rename(planted, src)
+        return fd
+
+    monkeypatch.setattr(local_fs, "_open_regular_source", _open_then_swap_source)
+
+    # A false idempotent success would RETURN False (no exception); the fix REFUSES.
+    with pytest.raises(FileExistsError, match="already exists with different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The decoy was never adopted as "ours" -- it is left untouched for the operator.
+    assert dst.read_bytes() == b"decoy-aaaaaaaaaa"
+
+
+def test_hardlink_or_copy_idempotent_retry_still_matches_identical_prior_placement(
+    tmp_path: Path,
+) -> None:
+    """The held-descriptor compare must not break the legitimate retry: a prior attempt
+    that already placed exactly these bytes (an independent copy -- a different inode) is
+    still recognized as an idempotent win (``False``), not a spurious conflict."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"identical-bytes!")
+    dst = title / "The Matrix (1999).mkv"
+    dst.write_bytes(b"identical-bytes!")  # a true prior placement, same bytes, diff inode
+
+    assert LocalFileSystem().hardlink_or_copy(src, dst, root=root).placed is False
+    assert dst.read_bytes() == b"identical-bytes!"
+
+
+def test_hardlink_or_copy_verifier_rejects_destination_replaced_before_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, Finding 2: a writer replaces the destination AFTER the placement helper
+    returns but BEFORE the verifier runs.
+
+    A verifier that re-STATS the placed entry here would see the replacement, and so
+    would the lexical resolution -- the two would compare equal and the call would report
+    the wrong file as placed. Comparing the lexical path against the identity captured at
+    PUBLICATION time catches the swap instead. Pre-fix this returned ``True`` (a false
+    success on attacker content); the fix RAISES and reports nothing placed."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    dst = title / "The Matrix (1999).mkv"
+
+    real_publish = local_fs._publish_link_no_overwrite  # pyright: ignore[reportPrivateUsage]
+
+    def _publish_then_replace(
+        publish_src: Path, source_fd: int, dir_fd: int, name: str, display: str
+    ) -> object:
+        # Placement completes normally; THEN a writer replaces our entry with a different
+        # regular file (same directory, no escape) before the verifier runs.
+        result = real_publish(publish_src, source_fd, dir_fd, name, display)
+        os.unlink(name, dir_fd=dir_fd)
+        replacement_fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+        try:
+            os.write(replacement_fd, b"attacker-chosen")
+        finally:
+            os.close(replacement_fd)
+        return result
+
+    monkeypatch.setattr(local_fs, "_publish_link_no_overwrite", _publish_then_replace)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The swapped-in file was neither adopted as placed nor (it is not ours) unlinked.
+    assert dst.read_bytes() == b"attacker-chosen"
+
+
+def test_hardlink_or_copy_verifier_rollback_never_unlinks_a_third_party_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GHSA-r5vh, Finding 3: the verifier's rollback carries the same hazard already
+    fixed in :func:`_publish_link_no_overwrite`.
+
+    The verified season directory escapes the library (forcing the rollback branch), and
+    a third party replaces our placed entry with its own file before the rollback unlink.
+    An unconditional unlink would destroy the third party's file. The fix rolls back ONLY
+    when the entry is still provably the inode we published, and otherwise REFUSES WITHOUT
+    UNLINKING -- an entry whose ownership can no longer be proven is never deleted (the
+    residual is an in-root orphan whose breadcrumb is never persisted -- reconciler
+    territory, not the ancestor-escape GHSA-r5vh concerns). Pre-fix the rollback deleted
+    the third party's file."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped_dir = outside / "Season 01.real"
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"payload")
+    dst = season / "Some Show - S01E01.mkv"
+
+    real_publish = local_fs._publish_link_no_overwrite  # pyright: ignore[reportPrivateUsage]
+
+    def _publish_then_escape_and_swap(
+        publish_src: Path, source_fd: int, dir_fd: int, name: str, display: str
+    ) -> object:
+        result = real_publish(publish_src, source_fd, dir_fd, name, display)
+        # The verified directory leaves the library (its held descriptor still reaches
+        # it), so the lexical re-walk hits a symlink and the verifier enters rollback.
+        season.rename(escaped_dir)
+        season.symlink_to(escaped_dir)
+        # A third party replaces OUR placed file with its own, via the held descriptor --
+        # the window the rollback unlink must not act blindly in.
+        os.unlink(name, dir_fd=dir_fd)
+        replacement_fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+        try:
+            os.write(replacement_fd, b"third-party file")
+        finally:
+            os.close(replacement_fd)
+        return result
+
+    monkeypatch.setattr(local_fs, "_publish_link_no_overwrite", _publish_then_escape_and_swap)
+
+    with pytest.raises(LocalFileSystemError, match="no longer names the file that was placed"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    # The third party's file SURVIVES -- the rollback refused to unlink an entry it could
+    # no longer prove it owned (pre-fix, the unconditional unlink deleted it).
+    assert (escaped_dir / dst.name).read_bytes() == b"third-party file"
+
+
+@pytest.mark.parametrize("maker", ["directory", "symlink"], ids=["directory", "symlink"])
+def test_hardlink_or_copy_refuses_other_non_regular_sources(tmp_path: Path, maker: str) -> None:
+    """Every non-regular source fails fast and visibly, not just the FIFO that can hang:
+    a directory is not publishable media, and a symlinked source is refused rather than
+    silently followed to whatever it now names."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    if maker == "directory":
+        src.mkdir()
+    else:
+        os.symlink(tmp_path / "elsewhere.mkv", src)
+    dst = title / "The Matrix (1999).mkv"
+
+    with (
+        _bounded(5.0, f"hardlink_or_copy from a {maker} source"),
+        pytest.raises(LocalFileSystemError, match="is not a regular file"),
+    ):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert list(title.iterdir()) == []
+
+
+def test_hardlink_or_copy_refusing_a_fifo_source_does_not_leak_a_descriptor(
+    tmp_path: Path,
+) -> None:
+    """The source is now opened before it is inspected, so the refusal path is an
+    early return holding a live descriptor. A daemon retrying a poisoned import (an
+    ``ImportBlocked`` row the operator keeps re-submitting) would leak one fd per
+    attempt and walk the process into ``EMFILE``, taking every other file operation
+    down with it."""
+    root, src, dst = _library_with_fifo_source(tmp_path)
+    fs = LocalFileSystem()
+
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("requires /proc/self/fd (Linux)")
+
+    before = len(os.listdir(fd_dir))
+    for _ in range(300):
+        with pytest.raises(LocalFileSystemError):
+            fs.hardlink_or_copy(src, dst, root=root)
+    after = len(os.listdir(fd_dir))
+
+    assert after == before
+
+
+def test_hardlink_or_copy_publishes_into_a_nested_library_root(tmp_path: Path) -> None:
+    """ADR-0015 nests the anime root inside the normal one; the SELECTED root is the
+    anchor, so a destination beneath the nested root is published normally."""
+    movies_root = tmp_path / "library" / "Movies"
+    anime_root = movies_root / "Anime"
+    anime_root.mkdir(parents=True)
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = anime_root / "Akira (1988)" / "Akira (1988).mkv"
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=anime_root)
+
+    assert dst.read_text() == "payload"
 
 
 def test_largest_video_file_picks_largest_and_skips_sample_and_extras(
@@ -589,32 +1396,33 @@ def test_adapter_satisfies_filesystem_port() -> None:
     assert isinstance(LocalFileSystem(), FileSystemPort)
 
 
-def test_hardlink_or_copy_removes_partial_dst_when_copy_raises(
+def test_hardlink_or_copy_removes_partial_temp_when_copy_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # copy2 can die mid-write AFTER creating dst (e.g. ENOSPC when another writer
-    # ate the preflighted free space). The partial file must be removed and the
-    # ORIGINAL error surfaced, so a retry sees a clean slate instead of a
-    # differently-sized dst that _place_file would reject as a persistent conflict.
+    # The copy can die mid-write AFTER writing part of the temp (e.g. ENOSPC when
+    # another writer ate the preflighted free space). The partial temp must be
+    # removed and the ORIGINAL error surfaced, so a retry sees a clean slate
+    # instead of leftovers next to the destination.
     src = tmp_path / "src.mkv"
     src.write_text("the full expected payload")
     dst = tmp_path / "copied.mkv"
 
-    def _refuse_link(_src: str, _dst: str) -> None:
+    def _refuse_link(_src: str, _dst: str, **_dir_fds: int) -> None:
         raise OSError(errno.EXDEV, "simulated cross-device link")
 
-    def _partial_then_raise(_src: str, dst_arg: str) -> None:
-        Path(dst_arg).write_text("partial")  # dst created/truncated...
+    def _partial_then_raise(_source: IO[bytes], target: IO[bytes]) -> None:
+        target.write(b"partial")  # temp partially written...
         raise OSError(errno.ENOSPC, "no space left on device")  # ...then the write dies
 
     monkeypatch.setattr(os, "link", _refuse_link)
-    monkeypatch.setattr(shutil, "copy2", _partial_then_raise)
+    monkeypatch.setattr(shutil, "copyfileobj", _partial_then_raise)
 
     with pytest.raises(OSError) as exc_info:
-        LocalFileSystem().hardlink_or_copy(src, dst)
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert exc_info.value.errno == errno.ENOSPC  # original error, not masked
-    assert not dst.exists()  # partial destination removed so a retry is clean
+    assert not dst.exists()  # nothing published
+    assert [p.name for p in tmp_path.iterdir()] == [src.name]  # partial temp removed
 
 
 def test_largest_video_file_rejects_symlinked_root_escaping_its_parent(
@@ -1566,3 +2374,222 @@ def test_reclaimable_bytes_for_a_directory_skips_a_symlinked_file(tmp_path: Path
     # Only E01 (300 bytes, real single-linked file) counts; the symlinked E02
     # must NOT contribute its target's 900 bytes.
     assert LocalFileSystem().reclaimable_bytes(os.fspath(season_dir)) == 300
+
+
+def test_hardlink_or_copy_reports_placement_and_idempotent_skip(tmp_path: Path) -> None:
+    """The publish result carries both rollback ownership and the published inode."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+
+    placed = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+    idempotent = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert placed.placed is True
+    assert placed.identity == (dst.stat().st_dev, dst.stat().st_ino)
+    assert idempotent.placed is False
+    assert idempotent.identity == placed.identity
+
+
+def test_hardlink_or_copy_conflicts_on_a_same_size_different_file(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    dst.parent.mkdir(parents=True)
+    dst.write_text("PAYLOAD")  # same size, different bytes
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.read_text() == "PAYLOAD"  # never overwritten
+
+
+def test_hardlink_or_copy_never_treats_a_dangling_symlink_as_an_idempotent_skip(
+    tmp_path: Path,
+) -> None:
+    """GHSA-8fj8: a dangling symlink at dst reads as "absent" under ``exists()``. The
+    entry comparison opens ``O_NOFOLLOW``, so it is an honest conflict -- never a
+    "someone already placed our file" skip that would finalize a breadcrumb pointing
+    at nothing."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "dst.mkv"
+    target = root / "gone.mkv"  # never created
+    dst.symlink_to(target)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.is_symlink()
+    assert not target.exists()
+
+
+def test_hardlink_or_copy_idempotent_skip_ignores_a_swapped_in_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ancestor swap landing between the refused exclusive create and the
+    already-there-and-identical decision. That decision is made against the held
+    descriptor, so a same-content decoy planted outside the root can never be
+    mistaken for our destination and reported as an idempotent skip."""
+    root = tmp_path / "library"
+    title = root / "The Matrix (1999)"
+    title.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = title / "The Matrix (1999).mkv"
+    dst.write_text("occupied")  # in-root: a DIFFERENT file -- an honest conflict
+    (outside / dst.name).write_text("payload")  # out-of-root decoy: same content
+    real_link = os.link
+
+    def _swap_after_eexist(
+        _src: str, _dst: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        try:
+            real_link(_src, _dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        except FileExistsError:
+            if title.is_dir() and not title.is_symlink():
+                title.rename(title.parent / "The Matrix (1999).real")
+                title.symlink_to(outside)
+            raise
+
+    monkeypatch.setattr(os, "link", _swap_after_eexist)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+
+def test_remove_published_unlinks_the_file_it_placed(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert not dst.exists()
+    assert dst.parent.is_dir()  # only the file goes, never the season directory
+
+
+def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
+    """Rollback ownership is the inode captured at publication, not just the path.
+
+    A writer that replaces ``dst`` after publication but before scan-failure rollback
+    owns the new entry. The old unconditional unlink deleted that replacement.
+    """
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    replacement = tmp_path / "replacement.mkv"
+    replacement.write_text("third-party file")
+    os.replace(replacement, dst)
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.read_text() == "third-party file"
+
+
+def test_remove_published_is_a_no_op_when_already_gone(tmp_path: Path) -> None:
+    """Rollback runs on failure paths that may already be partly applied; a missing
+    leaf OR a missing ancestor is an honest no-op, not an error."""
+    root = tmp_path / "library"
+    root.mkdir()
+    fs = LocalFileSystem()
+
+    fs.remove_published(root / "Show" / "Season 01" / "gone.mkv", root=root, identity=(0, 0))
+    (root / "Show").mkdir()
+    fs.remove_published(root / "Show" / "gone.mkv", root=root, identity=(0, 0))
+
+
+def test_remove_published_refuses_an_ancestor_swapped_after_publication(
+    tmp_path: Path,
+) -> None:
+    """GHSA-r5vh, CWE-59: publication legitimately completes into the directory whose
+    descriptor the walk verified, even when that directory is renamed away mid-publish.
+    Rolling that placement back by pathname afterwards would re-resolve through the
+    symlink left in its place and unlink an unrelated same-named file OUTSIDE the root.
+    The anchored removal refuses instead."""
+    root = tmp_path / "library"
+    season = root / "Some Show (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = season / "Some Show - S01E01.mkv"
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+    victim = outside / dst.name
+    victim.write_text("someone else's file")
+
+    # The swap the publish walk's descriptor rode out, now visible by pathname.
+    season.rename(season.parent / "Season 01.real")
+    season.symlink_to(outside)
+
+    with pytest.raises(LocalFileSystemError, match="symlink or non-directory"):
+        LocalFileSystem().remove_published(
+            dst, root=root, identity=(dst.stat().st_dev, dst.stat().st_ino)
+        )
+
+    assert victim.read_text() == "someone else's file"
+    assert (season.parent / "Season 01.real" / dst.name).exists()
+
+
+def test_remove_published_refuses_a_destination_outside_the_root(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    escaped = tmp_path / "outside" / "escaped.mkv"
+    escaped.parent.mkdir()
+    escaped.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="outside the library root"):
+        LocalFileSystem().remove_published(escaped, root=root, identity=(0, 0))
+
+    assert escaped.exists()
+
+
+def test_remove_published_refuses_when_platform_cannot_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_fs, "_PUBLICATION_CONTAINMENT_SUPPORTED", False)
+    dst = tmp_path / "dst.mkv"
+    dst.write_text("payload")
+
+    with pytest.raises(LocalFileSystemError, match="platform cannot guarantee"):
+        LocalFileSystem().remove_published(
+            dst, root=tmp_path, identity=(dst.stat().st_dev, dst.stat().st_ino)
+        )
+
+    assert dst.exists()
+
+
+def test_hardlink_or_copy_conflicts_when_a_directory_occupies_the_destination(
+    tmp_path: Path,
+) -> None:
+    """A directory sitting where the media file belongs is a conflict for the operator
+    to resolve, never an idempotent skip -- only a REGULAR file can be the file a
+    previous attempt placed."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    dst.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="different content"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert dst.is_dir()  # left for the operator, never removed

@@ -1513,6 +1513,37 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
         assert await asyncio.to_thread(wedged.finished.wait, 2.0)
 
 
+async def test_bounded_content_probe_logs_the_per_probe_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #502: the warning must name the remap probe's remaining budget,
+    not the full shared pre-removal budget."""
+
+    async def exhaust_probe_bound(
+        _operation: Callable[[], bool],
+        _path: str,
+        *,
+        operation_name: str,
+        bound: float,
+    ) -> bool:
+        assert operation_name == "content path remap"
+        assert bound == 0.3
+        raise purge_service._ProbeBoundExceeded  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(purge_service, "_probe_within_bound", exhaust_probe_bound)
+
+    with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+        result = await purge_service._bounded_content_probe(  # pyright: ignore[reportPrivateUsage]
+            lambda: True,
+            "/downloads/clip.mkv",
+            operation_name="content path remap",
+            timeout=0.3,
+        )
+
+    assert result is None
+    assert "did not answer within the 0.3s pre-removal mount-read bound" in caplog.text
+
+
 async def test_visible_content_path_treats_an_unreadable_path_as_not_visible(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

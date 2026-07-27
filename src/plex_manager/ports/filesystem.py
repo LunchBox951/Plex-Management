@@ -8,11 +8,29 @@ when possible and falls back to a copy across devices.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 from plex_manager.domain.plex_video import PLEX_VIDEO_EXTENSIONS
 
-__all__ = ["PLEX_VIDEO_EXTENSIONS", "VIDEO_EXTENSIONS", "FileSystemPort"]
+__all__ = [
+    "PLEX_VIDEO_EXTENSIONS",
+    "VIDEO_EXTENSIONS",
+    "FilePublication",
+    "FileSystemPort",
+    "PublishedFileIdentity",
+]
+
+# The device/inode pair captured while publication still holds the inode open. It is
+# the ownership token rollback must present before deleting the destination entry.
+PublishedFileIdentity = tuple[int, int]
+
+
+class FilePublication(NamedTuple):
+    """Result of publishing a file and the identity authorizing its rollback."""
+
+    placed: bool
+    identity: PublishedFileIdentity
+
 
 # Compatibility export for callers that predate the Plex-specific policy name.
 # New code should use ``PLEX_VIDEO_EXTENSIONS`` so the acceptance boundary is
@@ -28,8 +46,11 @@ class FileSystemPort(Protocol):
         """Return free bytes on the filesystem containing ``path``."""
         raise NotImplementedError
 
-    def move(self, src: Path, dst: Path) -> None:
+    def move(self, src: Path, dst: Path, *, root: Path) -> None:
         """Move ``src`` to ``dst`` (atomic rename when on the same device).
+
+        ``root`` is the library root the caller selected for this title; see
+        :meth:`hardlink_or_copy` for the containment implementations MUST enforce.
 
         Raises ``NotImplementedError`` by default (issue #80): this is a
         mutating operation the import pipeline depends on to actually place a
@@ -39,12 +60,82 @@ class FileSystemPort(Protocol):
         """
         raise NotImplementedError
 
-    def hardlink_or_copy(self, src: Path, dst: Path) -> None:
+    def hardlink_or_copy(self, src: Path, dst: Path, *, root: Path) -> FilePublication:
         """Hardlink ``src`` to ``dst``, falling back to a copy across devices.
+
+        Returns whether THIS call created ``dst`` plus the published entry's device/inode
+        identity. The identity is an ownership token for :meth:`remove_published`; callers
+        MUST pass it when rolling back a placement so a later replacement is never deleted.
+        ``placed`` is ``False`` when an entry holding exactly ``src``'s bytes was already
+        there (an idempotent re-import, or a concurrent import that won the placement race).
+        A DIFFERENT file at ``dst`` is raised as ``FileExistsError`` -- never overwritten,
+        and never reported as placed. Callers roll ``dst`` back only when ``placed`` is
+        true, so the already/identical answer decides whether a file is theirs to delete;
+        it MUST therefore be computed against the same verified destination directory the
+        publish attempt used, never by a second pathname lookup the caller makes afterwards
+        (an ancestor swapped in between would answer for a file outside the root --
+        GHSA-r5vh).
+
+        ``dst`` MUST lie beneath ``root`` -- the library root the caller selected
+        for this title (the ADR-0015 anime root, or the normal one). Implementations
+        MUST create and traverse every destination component below ``root`` without
+        following symlinks, and MUST REFUSE (raise, never silently fall back to
+        pathname publication) when an ancestor is a symlink or not a directory: a
+        lexically in-root destination whose ancestor is a symlink otherwise writes
+        media outside every configured root while the caller records an in-root
+        breadcrumb, which the containment guard on :meth:`delete` then correctly
+        refuses to clean up -- media that can no longer be corrected from the web UI.
+
+        No-follow traversal alone is NOT sufficient, and implementations MUST also
+        verify containment AFTER placing the file: an anchoring directory handle stops
+        a replacement symlink from being followed, but nothing stops the directory it
+        refers to from being RENAMED out of the library mid-publication, which lands
+        the bytes outside every root by way of a perfectly correct write through that
+        handle. Implementations MUST therefore re-resolve ``dst`` no-follow from
+        ``root`` once placement is complete and confirm it names the very file just
+        placed (same device and inode), MUST undo a placement of their own that fails
+        this check, and MUST report success only when it passes. A rename after that
+        verification is an ordinary post-import library mutation for the reconciler,
+        not a containment failure -- but a breadcrumb must never be BORN pointing
+        outside the root.
+
+        Implementations MUST also prove ``src`` is a REGULAR FILE before linking or
+        reading it, and MUST refuse anything else (FIFO, socket, device, directory,
+        symlink): a blocking read of a FIFO swapped in at ``src`` after validation
+        never returns and wedges the calling worker, and a hardlink of one publishes a
+        non-media entry that every later containment check would (correctly) wave
+        through on its identical inode.
+
+        Every refusal above is signalled by RAISING -- ``LocalFileSystemError`` or an
+        ``OSError`` subclass, the two the import pipeline catches and turns into a
+        visible, retryable ``ImportBlocked``. There is deliberately no port-level
+        exception type: callers must treat both as the same honest refusal.
 
         Raises ``NotImplementedError`` by default (issue #80): same rationale
         as :meth:`move` — a silent no-op default would let an import pipeline
         report a file as placed without writing or linking anything.
+        """
+        raise NotImplementedError
+
+    def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
+        """Remove the matching file :meth:`hardlink_or_copy` published beneath ``root``.
+
+        ``identity`` MUST be the ownership token returned by the publication being rolled
+        back. Implementations MUST leave ``dst`` untouched when its current entry has a
+        different device/inode identity: another writer replaced it and owns that entry.
+
+        The rollback counterpart of :meth:`hardlink_or_copy`, for the import that
+        placed a file and then failed a later step (a Plex scan error). It carries
+        the SAME containment obligation, for the same reason: implementations MUST
+        open every component below ``root`` without following symlinks and MUST
+        REFUSE (raise) a symlinked or non-directory ancestor. A plain pathname
+        unlink re-resolves the whole chain, so a title/season directory renamed and
+        replaced by a symlink after publication would send the rollback outside every
+        configured root and delete an unrelated same-named file there (GHSA-r5vh,
+        CWE-59) while leaving the published file behind.
+
+        A ``dst`` (or an ancestor) that no longer exists is a no-op, not an error --
+        rollback runs on failure paths that may already have been partly applied.
         """
         raise NotImplementedError
 
