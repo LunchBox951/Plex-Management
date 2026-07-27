@@ -1541,11 +1541,14 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
                 purge_service.remove_torrent(qbt, "a" * 40, context="a test"), timeout=5.0
             )
         elapsed = time.monotonic() - started
+        await asyncio.sleep(0)  # let the cancelled probe record its detach cause
 
         assert ok is True
         assert qbt.removed == [("a" * 40, True)]  # the correction was never held up
         assert elapsed < 2.0
         assert "did not answer within the 0.2s pre-removal mount-read bound" in caplog.text
+        assert "detached after internal probe deadline" in caplog.text
+        assert "detached on caller cancellation" not in caplog.text
         # The wedged read is still parked -- on a DAEMON thread the interpreter
         # never rejoins, so it cannot hang the web lifespan's shutdown wait.
         assert wedged.thread_name == "filesystem-probe"
