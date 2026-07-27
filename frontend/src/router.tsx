@@ -1,4 +1,4 @@
-import { createBrowserRouter } from 'react-router-dom'
+import { createBrowserRouter } from 'react-router'
 import { AdminGate } from './components/AdminGate'
 import { Layout } from './components/Layout'
 import { SetupGate } from './components/SetupGate'
