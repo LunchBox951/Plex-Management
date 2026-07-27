@@ -35,12 +35,21 @@ trigger) is expected to call it once per configured root. Per call:
    ``evicted`` + a still-set breadcrumb thereby always means "claimed but not
    finalized", which is what step 0.5's crash recovery keys on. Claiming BEFORE
    deleting is what stops a concurrent pin/keep from ever losing a kept file to a
-   delete that had already run; if the delete then fails, the claim is restored
-   to ``available`` (and any in-window re-grab it spawned is reconciled away) so
-   a failed unlink can never strand an ``evicted`` row over a still-watchable
-   file. A candidate missing its ``library_path`` breadcrumb, or one the
-   filesystem guard refuses, is skipped + logged — NEVER guessed at, never a
-   silent no-op, and never lets one bad candidate abort the rest of the sweep.
+   delete that had already run; if the delete then fails WITHOUT having removed
+   anything, the claim is restored to ``available`` (and any in-window re-grab it
+   spawned is reconciled away) so a failed unlink can never strand an ``evicted``
+   row over a still-watchable file. A delete that removed PART of a tree before
+   failing (issue #482) is the opposite case and keeps its claim: the media is no
+   longer complete, so restoring it would publish an unplayable ``available``.
+   Which of the two happened is recorded DURABLY on the claim row itself
+   (``partial_delete_path``, issues #482 / #485): armed in the claim's own commit
+   BEFORE the delete and cleared only by an outcome that proves the tree
+   intact-or-gone, so a crash, a cancelled sweep, or a restart mid-``rmtree`` --
+   none of which produce a classifiable result at all -- still leaves the honest
+   answer where step 0.5 can read it.
+   A candidate missing its ``library_path`` breadcrumb, or one the filesystem
+   guard refuses, is skipped + logged — NEVER guessed at, never a silent no-op,
+   and never lets one bad candidate abort the rest of the sweep.
    Between the claim commit and the delete, a shared-breadcrumb TWIN (#155) --
    another live row also carrying this exact ``library_path`` -- is likewise
    released back to ``available`` rather than deleted out from under it (the
@@ -85,10 +94,11 @@ from plex_manager.services.library_roots import deepest_containing_root
 from plex_manager.services.purge_service import PurgeOutcome
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from plex_manager.domain.disk_usage import DiskUsage
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
 
@@ -113,6 +123,13 @@ class EvictionOutcome:
     season: int | None
     library_path: str
     freed_bytes: int | None
+    #: ``True`` when the delete removed only PART of the tree before failing
+    #: (issue #482): the row is committed ``evicted`` and files really did leave,
+    #: but reclaimable remains are still on disk pending a recovery retry, and
+    #: ``freed_bytes`` is unknowable. Callers still publish/refresh on it (the
+    #: state change is real); the periodic loop's summary names it separately so
+    #: "evicted 3 titles" never silently means "…and one is half-deleted".
+    partial: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +189,39 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
 _REARMED_RECOVERY_STATUSES: frozenset[str] = _PRE_GRAB_STATUSES | {RequestStatus.cancelled.value}
 
+# The MARKER-GATED extension of the enumeration above (Codex round-4 P1): a
+# season whose replacement import was BLOCKED by the very remnants an incomplete
+# purge left behind. ``LocalFileSystem.hardlink_or_copy`` refuses to overwrite a
+# different file at a deterministic destination, so a season directory still
+# holding an old episode file makes the replacement import fail with
+# ``FileExistsError`` -> ``import_blocked`` -- a status the re-armed enumeration
+# does not cover, leaving the row stuck forever with remains on disk and every
+# operator retry hitting the same conflict (a terminal, exactly what north star 1
+# forbids). Enumerated ONLY when the incomplete-delete marker is ARMED over the
+# row's own breadcrumb, so a plain ``import_blocked`` season (an import conflict
+# of its own, nothing to do with an interrupted purge) is never touched by this
+# pass -- it is emphatically NOT folded to ``available`` or finalized.
+_BLOCKED_BY_REMNANTS_STATUS: str = RequestStatus.import_blocked.value
+
+# Every status the re-armed pass can adjudicate, for the breadcrumb-release CAS
+# (a subset of ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` below).
+_REARMED_OR_BLOCKED_STATUSES: frozenset[str] = _REARMED_RECOVERY_STATUSES | {
+    _BLOCKED_BY_REMNANTS_STATUS
+}
+
+# Why the recovery pass finished an incomplete purge, per the status it observed
+# -- the history row's ``recovery_note``. Only the audit wording differs; the
+# remains are cleared identically for all of them.
+_REMNANT_PURGE_NOTES: dict[str, str] = {
+    RequestStatus.cancelled.value: (
+        "its re-grab was cancelled and the incomplete purge was finished here"
+    ),
+    _BLOCKED_BY_REMNANTS_STATUS: (
+        "its replacement import was blocked by the remains, so the incomplete "
+        "purge was finished here"
+    ),
+}
+
 # Statuses in which a season breadcrumb is still the stale eviction/recovery
 # breadcrumb and can be cleared after the file is gone. Imported-content states
 # (``completed``/``available``) are deliberately absent: a same-row TV import
@@ -210,6 +260,116 @@ _STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = frozenset({RequestStatu
 # silently. (A one-slot dict instead of a module bool: mutation needs no
 # ``global`` statement, which static scanners misread as an unused global.)
 _sweep_latch: dict[str, bool] = {"busy": False}
+
+
+def _partial_delete_outstanding(partial_delete_path: str | None, library_path: str) -> bool:
+    """Whether the row's DURABLE incomplete-delete marker still covers
+    ``library_path`` (issues #482 / #485).
+
+    The marker (``MediaRequest``/``SeasonRequest.partial_delete_path``) is armed on
+    the claim row BEFORE any destructive delete and disarmed only once the outcome
+    PROVES the tree needs no further reclaiming -- see those columns' docstrings.
+    ``True`` here therefore means "a delete of exactly this path began and nothing
+    has established that the media at it is still complete", which covers all of:
+    a classified ``PurgeOutcome.partial``, a crash mid-``rmtree``, a cancelled
+    sweep whose worker settled unobserved, and a process restart in any of those
+    windows. Recovery must never restore such a row to ``available`` off a bare
+    ``os.stat`` -- a gutted directory stats exactly like an intact one.
+
+    The equality against the row's CURRENT breadcrumb is the second half of the
+    guard: a replacement import that stamps a DIFFERENT path has superseded the
+    marker's subject even if the clear in ``set_library_path`` were somehow
+    bypassed, and a NULL breadcrumb names no tree left to reclaim at all.
+    """
+    return partial_delete_path is not None and partial_delete_path == library_path
+
+
+async def _arm_partial_delete(session: AsyncSession, pending: _Pending, library_path: str) -> None:
+    """ARM the row's durable incomplete-delete marker over ``library_path``.
+
+    Called BEFORE every destructive delete this module performs, in the SAME
+    transaction as the eviction claim, so no window exists in which a delete is
+    running with nothing on disk-of-record saying so. Flushes only -- the caller
+    owns the commit (issues #482 / #485).
+    """
+    if isinstance(pending, _SeasonPending):
+        await SqlSeasonRequestRepository(session).set_partial_delete_path(
+            pending.season_request_id, library_path
+        )
+    else:
+        await SqlRequestRepository(session).set_partial_delete_path(
+            pending.media_request_id, library_path
+        )
+
+
+async def _disarm_partial_delete(session: AsyncSession, pending: _Pending) -> None:
+    """DISARM the row's durable incomplete-delete marker (issues #482 / #485).
+
+    Called ONLY where the delete's outcome proves the tree needs no further
+    reclaiming: it completed, it provably removed nothing, or it never started.
+    Idempotent; flushes only, so it joins whatever commit the caller is building.
+    """
+    if isinstance(pending, _SeasonPending):
+        await SqlSeasonRequestRepository(session).clear_partial_delete_path(
+            pending.season_request_id
+        )
+    else:
+        await SqlRequestRepository(session).clear_partial_delete_path(pending.media_request_id)
+
+
+def _safe_title(title: str | None) -> str | None:
+    """:func:`~plex_manager.logsafe.safe_text` for an OPTIONAL stored title.
+
+    Titles come from request/TMDB metadata, so they can carry line boundaries that
+    would forge a second log record (AGENTS.md's logging rule). ``None`` -- a
+    parent row that vanished mid-recovery -- passes through as ``None`` so the
+    log still says so honestly rather than printing an invented empty title.
+    """
+    return safe_text(title) if title is not None else None
+
+
+async def _partial_delete_still_armed(
+    session: AsyncSession, pending: _SeasonPending, library_path: str
+) -> bool:
+    """Re-read the season row and confirm its incomplete-delete marker STILL
+    covers ``library_path`` (issues #482 / #485).
+
+    The enumeration's snapshot can be stale by the time a destructive retry runs:
+    a replacement import committing in between re-stamps ``library_path`` and
+    retires the marker in that SAME commit, and purging then would delete the
+    content that import just placed. ``get_fresh``'s ``populate_existing=True``
+    forces this session to see that commit rather than its own snapshot -- the
+    same discipline :func:`_still_evictable` uses before a claim.
+
+    This closes the window AFTER an import commits; the window DURING one is
+    closed by the placement registration (``purge_library_path`` defers on a
+    conflicting path), and the registration is held until that commit completes,
+    so the two leave no gap between them.
+    """
+    fresh = await SqlSeasonRequestRepository(session).get_fresh(pending.season_request_id)
+    return (
+        fresh is not None
+        and fresh.library_path == library_path
+        and _partial_delete_outstanding(fresh.partial_delete_path, library_path)
+    )
+
+
+async def _coverage_claim_active(session: AsyncSession, pending: _Pending) -> bool:
+    """Whether a LIVE pack holds an active ride-along coverage claim over this
+    season (issue #465).
+
+    A pack's ``download_coverage_claims`` row is scopeless, so neither the status
+    CAS nor ``find_active_for_request`` can see it; every destructive path in this
+    module therefore consults it directly off the committed snapshot immediately
+    before deleting. Movies never hold a claim, so a movie is honestly ``False``.
+    """
+    if not isinstance(pending, _SeasonPending):
+        return False
+    return (
+        await SqlDownloadRepository(session).find_active_coverage_title(
+            pending.tmdb_id, pending.season_number
+        )
+    ) is not None
 
 
 def _size_bytes(path: str) -> int | None:
@@ -622,7 +782,16 @@ async def _restore_after_failed_delete(session: AsyncSession, pending: _Pending)
     every branch: a grab already happened, and the reconciler / import dedup
     own resolving that duplicate download (the import simply re-places the
     file); cancelling underneath it would orphan a live torrent.
+
+    Every caller of this function has ESTABLISHED that the tree is intact -- the
+    delete was refused, errored with its up-front inventory provably untouched, or
+    never ran at all -- so the durable incomplete-delete marker (issues #482 /
+    #485) is disarmed in the same transaction. That is the whole precondition of
+    restoring: a tree a delete already ate into is NOT a live file, and this
+    function must never be reached for one (see :func:`_evict_one`'s ``partial``
+    branch, which keeps its claim instead).
     """
+    await _disarm_partial_delete(session, pending)
     if isinstance(pending, _SeasonPending):
         restored = await season_request_service.set_status_if_in(
             session,
@@ -840,10 +1009,11 @@ async def _resume_interrupted_evictions(
     *,
     session: AsyncSession,
     library: LibraryPort,
+    fs: FileSystemPort,
     media_type: Literal["movie", "tv"],
     root_path: str,
     all_roots: Sequence[str],
-) -> None:
+) -> bool:
     """Recover every CLAIMED-BUT-NOT-FINALIZED eviction owned by this root
     (ADR-0012 #67, crash resumability). Keyed on the BREADCRUMB, not only on the
     ``evicted`` status.
@@ -894,6 +1064,23 @@ async def _resume_interrupted_evictions(
     restoring, so a later sweep can never delete the shared path out from under
     the row that actually owns it.
 
+    "File still on disk" is decided by a bare ``os.stat`` of the breadcrumb, which
+    cannot tell a COMPLETE tree from one a previous delete already ate into
+    (issues #482 / #485) -- a gutted directory stats exactly like an intact one.
+    So the row's DURABLE incomplete-delete marker (``partial_delete_path``, armed
+    with the eviction claim BEFORE the delete and cleared only by an outcome that
+    proves the tree intact-or-gone) is read alongside the stat and OVERRIDES it:
+    a row still carrying it is routed through the retry/converge path, never the
+    restore. Because the marker lives on the row rather than in process memory,
+    this holds across a restart, a cancelled sweep, and a crash mid-``rmtree``
+    identically -- the boundaries where an in-process record silently evaporates.
+    Retrying is also the only retry such a row can ever get: an ``evicted`` row is
+    invisible to candidate assembly.
+
+    Returns whether recovery destroyed data the caller's disk snapshot (taken
+    BEFORE this pass runs) does not reflect, so the sweep can re-baseline its
+    pressure accounting rather than pick further victims against a stale reading.
+
     Runs at the START of every sweep, BEFORE the pressure pre-check (recovery
     must not wait for pressure) and only after the root's disk stat succeeded
     (an unmounted root must never make its files read as "gone"). Sweeps are
@@ -902,8 +1089,9 @@ async def _resume_interrupted_evictions(
     is a leftover. A transient stat error skips the row (never guess "gone" off
     an I/O error); one row's failure never aborts the rest.
     """
-    pairs: list[tuple[str, str | None, _Pending]] = []  # (library_path, title, pending)
-    rearmed: list[tuple[str, str | None, str, _SeasonPending]] = []
+    # (library_path, title, partial_delete_path, pending)
+    pairs: list[tuple[str, str | None, str | None, _Pending]] = []
+    rearmed: list[tuple[str, str | None, str, str | None, _SeasonPending]] = []
     if media_type == "movie":
         request_repo = SqlRequestRepository(session)
         for row in await request_repo.list_by_status(RequestStatus.evicted.value):
@@ -916,7 +1104,7 @@ async def _resume_interrupted_evictions(
             pending: _Pending = _MoviePending(
                 media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
             )
-            pairs.append((row.library_path, row.title, pending))
+            pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
     else:
         season_repo = SqlSeasonRequestRepository(session)
         request_repo = SqlRequestRepository(session)
@@ -933,7 +1121,14 @@ async def _resume_interrupted_evictions(
                 tmdb_id=season.tmdb_id,
                 size_bytes=None,
             )
-            pairs.append((season.library_path, parent.title if parent else None, pending))
+            pairs.append(
+                (
+                    season.library_path,
+                    parent.title if parent else None,
+                    season.partial_delete_path,
+                    pending,
+                )
+            )
         # The re-armed shape: PRE-GRAB-or-CANCELLED + breadcrumb (see the
         # docstring) -- the crash-window re-request already rewrote the status,
         # so the 'evicted' enumeration above cannot see it; auto-grab can have
@@ -942,11 +1137,18 @@ async def _resume_interrupted_evictions(
         # CANCELLED the re-arm outright (see _REARMED_RECOVERY_STATUSES). The
         # status each row was READ at travels with it: the fold CAS compares
         # against exactly that status, never the whole set.
-        for pre_grab_status in sorted(_REARMED_RECOVERY_STATUSES):
+        for pre_grab_status in [*sorted(_REARMED_RECOVERY_STATUSES), _BLOCKED_BY_REMNANTS_STATUS]:
             for season in await season_repo.list_by_status(pre_grab_status):
                 if season.library_path is None or not _owned_by_root(
                     season.library_path, root_path, all_roots
                 ):
+                    continue
+                if pre_grab_status == _BLOCKED_BY_REMNANTS_STATUS and not (
+                    _partial_delete_outstanding(season.partial_delete_path, season.library_path)
+                ):
+                    # A plain import conflict of its own, with no interrupted purge
+                    # behind it -- none of this pass's business (see
+                    # :data:`_BLOCKED_BY_REMNANTS_STATUS`).
                     continue
                 parent = await request_repo.get(season.media_request_id)
                 rearmed.append(
@@ -954,6 +1156,7 @@ async def _resume_interrupted_evictions(
                         season.library_path,
                         parent.title if parent else None,
                         pre_grab_status,
+                        season.partial_delete_path,
                         _SeasonPending(
                             media_request_id=season.media_request_id,
                             season_request_id=season.id,
@@ -964,36 +1167,44 @@ async def _resume_interrupted_evictions(
                     )
                 )
 
-    for library_path, title, pending in pairs:
+    destroyed_unmeasured = False
+    for library_path, title, partial_delete_path, pending in pairs:
         try:
-            await _resume_one(
+            destroyed_unmeasured |= await _resume_one(
                 session=session,
                 library=library,
+                fs=fs,
                 media_type=media_type,
                 library_path=library_path,
                 title=title,
+                partial_delete_path=partial_delete_path,
                 pending=pending,
             )
         except Exception:
             # One interrupted eviction's recovery failing must never abort the
             # rest (nor poison the next row's transaction) -- same posture as the
-            # sweep's per-candidate guard.
+            # sweep's per-candidate guard. The disk snapshot is conservatively
+            # treated as stale: a failure mid-recovery may well have deleted first.
+            destroyed_unmeasured = True
             await session.rollback()
             _logger.exception(
                 "resuming an interrupted eviction failed unexpectedly; will retry next sweep",
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
-    for library_path, title, observed_status, season_pending in rearmed:
+    for library_path, title, observed_status, partial_delete_path, season_pending in rearmed:
         try:
-            await _recover_rearmed_season(
+            destroyed_unmeasured |= await _recover_rearmed_season(
                 session=session,
                 library=library,
+                fs=fs,
                 library_path=library_path,
                 title=title,
                 observed_status=observed_status,
+                partial_delete_path=partial_delete_path,
                 pending=season_pending,
             )
         except Exception:
+            destroyed_unmeasured = True
             await session.rollback()
             _logger.exception(
                 "recovering a re-armed interrupted eviction failed unexpectedly; "
@@ -1003,17 +1214,20 @@ async def _resume_interrupted_evictions(
                     "tmdb_id": season_pending.tmdb_id,
                 },
             )
+    return destroyed_unmeasured
 
 
 async def _recover_rearmed_season(
     *,
     session: AsyncSession,
     library: LibraryPort,
+    fs: FileSystemPort,
     library_path: str,
     title: str | None,
     observed_status: str,
+    partial_delete_path: str | None,
     pending: _SeasonPending,
-) -> None:
+) -> bool:
     """Recover ONE re-armed (pre-grab-or-cancelled + breadcrumb) crash-window
     season -- the second enumeration shape of
     :func:`_resume_interrupted_evictions`.
@@ -1048,12 +1262,44 @@ async def _recover_rearmed_season(
     supported operator action on a rare double-failure (purge failed AND no
     replacement found).
 
+    File present but the row carries an OUTSTANDING incomplete-delete marker over
+    exactly this path (``partial_delete_path``, issues #482 / #485) -> no fold:
+    a destructive delete began here and nothing proved it left the season intact,
+    so the season is not watchable and the re-grab a fold would cancel is fetching
+    files that really did leave. Instead the purge is FINISHED here, for every
+    enumerated status (Codex round-4 P1):
+
+    * the re-arm is still PRE-GRAB -- this pass used to leave the remains for the
+      replacement import to overwrite, but an import cannot do that: TV
+      destinations are deterministic and ``hardlink_or_copy`` REFUSES an existing
+      different-content file, so a surviving episode makes the import fail
+      (``import_blocked``) and every retry hit the same conflict forever. Clearing
+      the remains first is what lets the replacement land at all.
+    * the re-arm was CANCELLED -- no import is coming either way, and waiting would
+      strand the remains forever: an ``evicted``-less, breadcrumb-bearing row is
+      invisible to candidate assembly and no other pass retries it.
+    * the replacement import ALREADY hit the remains (``import_blocked`` + an armed
+      marker, :data:`_BLOCKED_BY_REMNANTS_STATUS`) -- the deadlock, observed. The
+      remains are cleared and the row keeps its surfaced, retryable status, now
+      over a clean directory.
+
+    All three converge on the SAME file-gone finalize below, which only flips
+    ``cancelled`` -> ``evicted`` (disk truth over an aborted intent) and otherwise
+    leaves the status alone. A retry that cannot clear the remains keeps the
+    breadcrumb + marker for the next sweep, never a fold. Deleting under a LIVE
+    import is prevented by the purge primitive's placement deferral plus a fresh
+    re-read of the marker (:func:`_partial_delete_still_armed`), not by waiting;
+    an active ride-along coverage claim defers the retry entirely.
+
     File present but another live row claims the path -> release the stale
     breadcrumb and leave the row as it is (the re-grab/search is legitimate; its
     import will stamp a fresh breadcrumb). File gone -> the interrupted purge
     actually completed: record the eviction history it never got, release the
     breadcrumb (single-winner CAS), refresh Plex, and leave the status alone --
     a re-grab/search over a truly-gone file is exactly right.
+
+    Returns whether this recovery destroyed data the sweep's pressure ledger has
+    not accounted for (see :func:`_resume_one`).
     """
     try:
         await asyncio.to_thread(os.stat, library_path)
@@ -1065,9 +1311,12 @@ async def _recover_rearmed_season(
             "cannot stat a re-armed eviction's path (%s); leaving it for the "
             "next sweep rather than guessing",
             type(exc).__name__,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
         )
-        return
+        return False
 
     if file_present:
         if await _path_claimed_by_another_row(session, library_path, pending):
@@ -1075,16 +1324,138 @@ async def _recover_rearmed_season(
                 session,
                 pending,
                 expected_path=library_path,
-                expected_statuses=_REARMED_RECOVERY_STATUSES,
+                expected_statuses=_REARMED_OR_BLOCKED_STATUSES,
             ):
                 _logger.info(
                     "released a stale eviction breadcrumb of %r season %s: a newer "
                     "row owns the same path; the re-request proceeds normally",
-                    title,
-                    pending.season_number,
-                    extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                    _safe_title(title),
+                    safe_int(pending.season_number),
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
                 )
-            return
+            # The marker is released together with the breadcrumb by that CAS --
+            # the path belongs to the newer row now.
+            return False
+        if _partial_delete_outstanding(partial_delete_path, library_path):
+            # Issues #482 / #485, the re-armed twin: the surviving directory stats
+            # fine but the row durably records a destructive delete of exactly this
+            # path that was never shown to have left the season intact, so the
+            # season is NOT watchable and folding it to 'available' would cancel a
+            # re-grab that is fetching genuinely absent files.
+            #
+            # FINISH THE PURGE -- for EVERY enumerated status, not just the
+            # cancelled one (Codex round-4 P1). This branch used to leave a
+            # still-pre-grab row alone on the theory that its replacement import
+            # would re-place the tree, but an import cannot: TV destinations are
+            # deterministic and ``LocalFileSystem.hardlink_or_copy`` REFUSES an
+            # existing file with different content, so a surviving old episode
+            # makes the replacement fail with ``FileExistsError`` ->
+            # ``import_blocked`` -- and every operator retry then hits the same
+            # conflict forever. The remnants must be gone BEFORE the placement,
+            # so the marker's owner (this pass) completes its own purge instead of
+            # delegating it to an import that is not allowed to overwrite.
+            #
+            # Deleting under a live import is prevented by the two guards below
+            # plus the purge primitive itself, not by waiting:
+            #   * an import MID-PLACEMENT holds a placement registration, and
+            #     ``purge_library_path`` returns ``deferred`` for a conflicting
+            #     path rather than deleting into it;
+            #   * an import that already COMMITTED re-stamped ``library_path`` and
+            #     retired the marker in that same commit, which the fresh re-read
+            #     below observes -- and because the placement registration is held
+            #     until that commit is done, the two windows have no gap between
+            #     them.
+            if await _coverage_claim_active(session, pending):
+                # A scopeless ride-along pack can be mid-transfer over this season
+                # (Codex round-3 P2), and this is a force-purge with no post-claim
+                # guard ahead of it.
+                _logger.info(
+                    "deferring the incomplete-delete retry of %r season %s: a live pack "
+                    "holds an active ride-along coverage claim over it; keeping the "
+                    "breadcrumb and marker rather than deleting a file a pack is fetching",
+                    _safe_title(title),
+                    safe_int(pending.season_number),
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
+                )
+                return False
+            if not await _partial_delete_still_armed(session, pending, library_path):
+                _logger.info(
+                    "leaving %r season %s alone: its incomplete-delete marker was retired "
+                    "between this sweep's enumeration and now (a replacement import owns "
+                    "the path); nothing purged",
+                    _safe_title(title),
+                    safe_int(pending.season_number),
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
+                )
+                return False
+            retry = await purge_service.purge_library_path(
+                fs, library_path, hold_purge_registration=True
+            )
+            if retry.outcome is not PurgeOutcome.deleted:
+                _logger.warning(
+                    "retrying the incompletely deleted eviction of %r season %s (%s) did "
+                    "not clear the remains (%s: %s); keeping the breadcrumb for the next "
+                    "sweep rather than folding a season that cannot be shown to be "
+                    "complete back to 'available'",
+                    _safe_title(title),
+                    safe_int(pending.season_number),
+                    safe_text(observed_status),
+                    retry.outcome.value,
+                    retry.detail,
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
+                )
+                # The same best-effort refresh ``_resume_one``'s retry takes: files
+                # this (or the interrupted original) delete already removed are still
+                # advertised by Plex. ``refused`` names an out-of-root path with no
+                # section to scan, so it is the one outcome skipped.
+                if retry.outcome is not PurgeOutcome.refused:
+                    await purge_service.trigger_library_scan(
+                        library,
+                        library_path=library_path,
+                        media_type="tv",
+                        context="eviction",
+                        extra={
+                            "request_id": safe_int(pending.media_request_id),
+                            "tmdb_id": safe_int(pending.tmdb_id),
+                        },
+                    )
+                return retry.outcome is PurgeOutcome.partial
+            # The remains are gone: take the SAME file-gone finalize below. It is
+            # status-safe for every enumerated shape -- it only CASes ``cancelled``
+            # -> ``evicted`` (disk truth over an aborted intent) and otherwise
+            # leaves the status exactly as it found it, so a pre-grab re-grab keeps
+            # searching and a blocked import keeps its surfaced, retryable state
+            # (now over a CLEAN directory, so the retry can actually succeed). The
+            # registration is held across it so a replacement import starting right
+            # after the delete cannot re-stamp the breadcrumb the value-predicated
+            # clear is about to match.
+            try:
+                await _finalize_gone_rearmed_season(
+                    session=session,
+                    library=library,
+                    library_path=library_path,
+                    title=title,
+                    pending=pending,
+                    recovery_note=_REMNANT_PURGE_NOTES.get(
+                        observed_status,
+                        "the incomplete purge was finished here so a replacement can land",
+                    ),
+                )
+            finally:
+                purge_service.end_purge(library_path)
+            return True
         folded = await season_request_service.set_status_if_in(
             session,
             media_request_id=pending.media_request_id,
@@ -1098,29 +1469,61 @@ async def _recover_rearmed_season(
             _logger.info(
                 "recovered a re-armed re-request of %r season %s: the interrupted "
                 "eviction's file never left disk, folded back to 'available'",
-                title,
-                pending.season_number,
-                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                _safe_title(title),
+                safe_int(pending.season_number),
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
             )
         else:
             await session.rollback()
             _logger.info(
                 "re-armed season %s moved on before recovery (advanced past the "
                 "status it was read at); leaving it to auto-grab/the reconciler",
-                pending.season_number,
-                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+                safe_int(pending.season_number),
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
             )
-        return
+        return False
 
-    # File gone: the interrupted purge completed before the crash, so the
-    # re-grab/search is legitimate -- record the eviction it never got to log,
-    # release the breadcrumb, refresh Plex, and leave the status alone. The
-    # clear is VALUE-predicated on the exact stale path recovery observed: a
-    # replacement import can commit between the stat above and this write,
-    # stamping a FRESH breadcrumb (and its imported content) onto this very row
-    # -- an unconditional clear would wipe that fresh breadcrumb, leaving a
-    # playing season with no eviction/report handle. A mismatch means the
-    # import owns the row now: leave everything, log, done.
+    await _finalize_gone_rearmed_season(
+        session=session,
+        library=library,
+        library_path=library_path,
+        title=title,
+        pending=pending,
+        recovery_note="the file was already gone and the season was re-requested",
+    )
+    return False
+
+
+async def _finalize_gone_rearmed_season(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    library_path: str,
+    title: str | None,
+    pending: _SeasonPending,
+    recovery_note: str,
+) -> None:
+    """Finalize ONE re-armed crash-window season whose library tree is now GONE --
+    the shared tail of :func:`_recover_rearmed_season`'s two converging paths (the
+    purge completed before the crash, or its cancelled re-grab's remains were
+    cleared by the retry here; ``recovery_note`` says which, in the history row).
+
+    Records the eviction history the interrupted sweep never wrote, releases the
+    breadcrumb, applies the disk-truth status flip, and refreshes Plex.
+
+    The clear is VALUE-predicated on the exact stale path recovery observed: a
+    replacement import can commit between the caller's stat and this write,
+    stamping a FRESH breadcrumb (and its imported content) onto this very row --
+    an unconditional clear would wipe that fresh breadcrumb, leaving a playing
+    season with no eviction/report handle. A mismatch means the import owns the
+    row now: leave everything, log, done.
+    """
     cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
         pending.season_request_id,
         expected_path=library_path,
@@ -1132,8 +1535,11 @@ async def _recover_rearmed_season(
             "leaving season %s untouched: its breadcrumb no longer matches the stale "
             "path recovery observed (a replacement import re-stamped the row "
             "mid-recovery, or a concurrent pass already released it)",
-            pending.season_number,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            safe_int(pending.season_number),
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
         )
         return
     # DISK-TRUTH-OVER-INTENT: if the re-armed row was CANCELLED before this
@@ -1162,11 +1568,14 @@ async def _recover_rearmed_season(
             source_title=title,
             message=(
                 f"eviction finalized season {pending.season_number}: recovered after "
-                f"an interrupted sweep, the file was already gone and the season was "
-                f"re-requested ({library_path})"
+                f"an interrupted sweep, {recovery_note} ({library_path})"
             ),
         )
     )
+    # The tree is gone: retire the incomplete-delete marker unconditionally, the
+    # same backstop the other finalizes keep for a breadcrumb clear that did not
+    # match (issues #482 / #485).
+    await SqlSeasonRequestRepository(session).clear_partial_delete_path(pending.season_request_id)
     await session.commit()
     await purge_service.trigger_library_scan(
         library,
@@ -1176,11 +1585,14 @@ async def _recover_rearmed_season(
         extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
     )
     _logger.info(
-        "finalized an interrupted eviction of %r season %s: the file was already "
-        "gone; the re-requested season re-grabs normally",
-        title,
-        pending.season_number,
-        extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        "finalized an interrupted eviction of %r season %s: %s",
+        _safe_title(title),
+        safe_int(pending.season_number),
+        recovery_note,
+        extra={
+            "request_id": safe_int(pending.media_request_id),
+            "tmdb_id": safe_int(pending.tmdb_id),
+        },
     )
 
 
@@ -1188,13 +1600,37 @@ async def _resume_one(
     *,
     session: AsyncSession,
     library: LibraryPort,
+    fs: FileSystemPort,
     media_type: Literal["movie", "tv"],
     library_path: str,
     title: str | None,
+    partial_delete_path: str | None,
     pending: _Pending,
-) -> None:
+) -> bool:
     """Recover ONE claimed-but-not-finalized eviction — see
-    :func:`_resume_interrupted_evictions` for the three-way decision."""
+    :func:`_resume_interrupted_evictions` for the three-way decision.
+
+    ``partial_delete_path`` is the row's DURABLE incomplete-delete marker as the
+    enumeration read it (issues #482 / #485). When it still covers
+    ``library_path``, a destructive delete of exactly this tree began and nothing
+    proved it left the media intact — a classified partial, a crash mid-``rmtree``,
+    a cancelled sweep, or any of those followed by a restart. Such a row is routed
+    through the RETRY/converge path, never the restore-to-``available`` path; a
+    bare ``os.stat`` success cannot tell an intact tree from a gutted one, which
+    is the whole of #485.
+
+    That retry is a force-purge with no post-claim guard ahead of it (the marker
+    is committed BEFORE :func:`_evict_one`'s authoritative coverage re-check, so a
+    process that exits in between never ran one), so it re-checks the ride-along
+    coverage claim itself and DEFERS while a live pack holds one -- never restores,
+    since the tree still cannot be shown complete. A retry that destroys more
+    without clearing the remains refreshes Plex best-effort before returning: the
+    interrupted original may never have scanned at all, leaving Plex advertising
+    files that are already gone.
+
+    Returns whether this recovery DESTROYED data whose freed bytes it cannot
+    measure, so the sweep can re-baseline its pressure accounting (its disk
+    snapshot is taken before recovery runs)."""
     season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
     try:
         await asyncio.to_thread(os.stat, library_path)
@@ -1211,7 +1647,7 @@ async def _resume_one(
             type(exc).__name__,
             extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
         )
-        return
+        return False
 
     if file_present:
         if await _path_claimed_by_another_row(session, library_path, pending):
@@ -1235,82 +1671,185 @@ async def _resume_one(
                 _logger.info(
                     "released a stale eviction breadcrumb of %r%s: a newer row "
                     "owns the same path (finalized, not interrupted); nothing restored",
-                    title,
+                    _safe_title(title),
                     season_note,
+                    extra={
+                        "request_id": safe_int(pending.media_request_id),
+                        "tmdb_id": safe_int(pending.tmdb_id),
+                    },
+                )
+            # The path belongs to that row now (its own import stamped it), so
+            # this row's incomplete-delete marker is spent -- released together
+            # with the breadcrumb by the CAS above.
+            return False
+        if not _partial_delete_outstanding(partial_delete_path, library_path):
+            # The claim committed but the purge never completed AND nothing on the
+            # row says a destructive delete ever started: the file is still
+            # watchable, so restore 'available' (+ the re-grab reconciliation) and
+            # let THIS sweep's normal candidate assembly re-decide the eviction
+            # fresh -- through the standard claim -> purge path, or not at all if
+            # the pressure that justified it is gone.
+            _logger.info(
+                "resuming an interrupted eviction of %r%s: the file is still on disk; "
+                "restored to 'available' for a fresh sweep decision",
+                _safe_title(title),
+                season_note,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            await _restore_after_failed_delete(session, pending)
+            return False
+        # An OUTSTANDING delete of exactly this path (issues #482 / #485): the
+        # path stats fine, but the row durably says a destructive delete began
+        # here and nothing proved it left the media intact -- a classified
+        # partial, a crash or cancellation mid-``rmtree``, or any of those plus a
+        # restart. ``os.stat`` cannot tell the difference (a gutted directory
+        # stats exactly like a whole one), so restoring is exactly the wrong move.
+        # Finish the purge instead -- idempotent, and the only retry an 'evicted'
+        # row can ever get (it is invisible to candidate assembly). Anything short
+        # of a clean delete keeps the claim and the breadcrumb for the next sweep,
+        # never a restore over a tree that cannot be shown complete. The purge
+        # registration is HELD across the finalize below for the same reason
+        # ``_evict_one`` holds it: a same-row replacement import starting after
+        # the delete could otherwise re-place this exact path and re-stamp the
+        # breadcrumb the value-predicated clear is about to match, erasing a live
+        # import's only handle.
+        #
+        # FIRST, though, re-check the ride-along coverage claim (#465, Codex
+        # round-3 P2). The marker is armed and committed with the eviction claim,
+        # BEFORE ``_evict_one`` runs its authoritative post-claim coverage guard,
+        # so a pack whose claim lands in that gap is normally rescued by that guard
+        # -- but a process that exits right after the marker commit never reaches
+        # it, and this pass would then force-purge a season a live pack is
+        # mid-transfer, the one thing the normal path explicitly refuses to do.
+        # DEFER rather than restore: the tree cannot be shown complete, so
+        # 'available' would still be a lie; the claim, breadcrumb and marker all
+        # stand and the next sweep re-decides once the pack settles (its import
+        # re-places the path and retires the marker via ``set_library_path``).
+        if await _coverage_claim_active(session, pending):
+            _logger.info(
+                "deferring the incomplete-delete retry of %r%s: a live pack holds an "
+                "active ride-along coverage claim over this season; keeping the claim, "
+                "its breadcrumb and its marker rather than deleting a file a pack is "
+                "fetching",
+                _safe_title(title),
+                season_note,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            return False
+        retry = await purge_service.purge_library_path(
+            fs, library_path, hold_purge_registration=True
+        )
+        if retry.outcome is not PurgeOutcome.deleted:
+            _logger.warning(
+                "retrying the incompletely deleted eviction of %r%s did not clear the "
+                "remains (%s: %s); keeping the claim and its breadcrumb rather than "
+                "restoring media that cannot be shown to be complete",
+                _safe_title(title),
+                season_note,
+                retry.outcome.value,
+                retry.detail,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            # Best-effort Plex refresh (Codex round-3 P2), the same one
+            # ``_evict_one``'s direct partial-outcome branch takes: an armed marker
+            # means a destructive delete began on this path and was never shown to
+            # have left it intact, so Plex may well be advertising entries that are
+            # already gone -- most sharply after a crash, whose original attempt
+            # never reached any scan at all. ``refused`` is the one outcome skipped:
+            # it names a path outside every configured library root, so there is no
+            # section to refresh. The DB state (claim + breadcrumb + marker) is
+            # untouched by the scan, so the retry path stays exactly as it was.
+            if retry.outcome is not PurgeOutcome.refused:
+                await purge_service.trigger_library_scan(
+                    library,
+                    library_path=library_path,
+                    media_type=media_type,
+                    context="eviction",
                     extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
                 )
-            return
-        # The claim committed but the purge never completed: the file is still
-        # watchable, so restore 'available' (+ the re-grab reconciliation) and
-        # let THIS sweep's normal candidate assembly re-decide the eviction
-        # fresh -- through the standard claim -> purge path, or not at all if
-        # the pressure that justified it is gone.
-        _logger.info(
-            "resuming an interrupted eviction of %r%s: the file is still on disk; "
-            "restored to 'available' for a fresh sweep decision",
-            title,
-            season_note,
-            extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
-        )
-        await _restore_after_failed_delete(session, pending)
-        return
+            return retry.outcome is PurgeOutcome.partial
+        destroyed_unmeasured = True  # the retry deleted real bytes it never counted
+        purge_held = True
+        recovery_note = "the incomplete purge was finished here"
+    else:
+        purge_held = False  # nothing was deleted here, so nothing is registered
+        destroyed_unmeasured = False
+        recovery_note = "the file was already gone"
 
     # The purge completed but the finalize never ran (crash after the delete, or
-    # a legacy eviction predating breadcrumb-clearing): finalize now. The
+    # a legacy eviction predating breadcrumb-clearing) -- or the retry above just
+    # cleared a partial delete's remains: finalize now, identically. The
     # CAS-clear is the single-winner gate -- only the pass that actually clears
     # the breadcrumb writes the history row, so two concurrent resumes (or a
     # resume racing the sweep that just finalized) never double-record -- and it
     # is VALUE-predicated on the exact stale path observed, so a replacement
     # import re-stamping this row mid-recovery keeps its fresh breadcrumb.
-    if isinstance(pending, _SeasonPending):
-        cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
-            pending.season_request_id,
-            expected_path=library_path,
-            expected_statuses=_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES,
+    try:
+        if isinstance(pending, _SeasonPending):
+            cleared = await SqlSeasonRequestRepository(session).clear_library_path_if_set(
+                pending.season_request_id,
+                expected_path=library_path,
+                expected_statuses=_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES,
+            )
+        else:
+            cleared = await SqlRequestRepository(session).clear_library_path_if_set(
+                pending.media_request_id,
+                expected_path=library_path,
+                expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
+            )
+        if not cleared:
+            # A concurrent pass finalized first, or a replacement import owns the
+            # row's breadcrumb now -- honor it either way.
+            await session.rollback()
+            return destroyed_unmeasured
+        if isinstance(pending, _SeasonPending):
+            # DISK-TRUTH-OVER-INTENT (see _recover_rearmed_season's twin): a season
+            # re-armed then CANCELLED between this row's enumeration and now would
+            # otherwise finalize as 'cancelled' -- invisible to ``evicted_seasons``,
+            # letting a re-request mint 'available' off stale Plex over the
+            # just-deleted file. The file is genuinely gone; flip to 'evicted' (CAS
+            # from {cancelled} only -- every other status is left exactly as the
+            # normal finalize leaves it). Movies never need this: their re-grabs are
+            # SEPARATE rows, so the original row stays 'evicted' and the
+            # newest-non-cancelled guard already holds (and an 'evicted' movie row
+            # itself is not cancellable at all).
+            await season_request_service.set_status_if_in(
+                session,
+                media_request_id=pending.media_request_id,
+                season_request_id=pending.season_request_id,
+                status=RequestStatus.evicted.value,
+                allowed_from=frozenset({RequestStatus.cancelled.value}),
+                tolerate_active_conflict=True,
+            )
+        session.add(
+            DownloadHistory(
+                tmdb_id=pending.tmdb_id,
+                torrent_hash=None,
+                event_type=DownloadHistoryEvent.evicted,
+                source_title=title,
+                message=(
+                    f"eviction finalized{season_note}: recovered after an interrupted "
+                    f"sweep, {recovery_note} ({library_path})"
+                ),
+            )
         )
-    else:
-        cleared = await SqlRequestRepository(session).clear_library_path_if_set(
-            pending.media_request_id,
-            expected_path=library_path,
-            expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
-        )
-    if not cleared:
-        # A concurrent pass finalized first, or a replacement import owns the
-        # row's breadcrumb now -- honor it either way.
-        await session.rollback()
-        return
-    if isinstance(pending, _SeasonPending):
-        # DISK-TRUTH-OVER-INTENT (see _recover_rearmed_season's twin): a season
-        # re-armed then CANCELLED between this row's enumeration and now would
-        # otherwise finalize as 'cancelled' -- invisible to ``evicted_seasons``,
-        # letting a re-request mint 'available' off stale Plex over the
-        # just-deleted file. The file is genuinely gone; flip to 'evicted' (CAS
-        # from {cancelled} only -- every other status is left exactly as the
-        # normal finalize leaves it). Movies never need this: their re-grabs are
-        # SEPARATE rows, so the original row stays 'evicted' and the
-        # newest-non-cancelled guard already holds (and an 'evicted' movie row
-        # itself is not cancellable at all).
-        await season_request_service.set_status_if_in(
-            session,
-            media_request_id=pending.media_request_id,
-            season_request_id=pending.season_request_id,
-            status=RequestStatus.evicted.value,
-            allowed_from=frozenset({RequestStatus.cancelled.value}),
-            tolerate_active_conflict=True,
-        )
-    session.add(
-        DownloadHistory(
-            tmdb_id=pending.tmdb_id,
-            torrent_hash=None,
-            event_type=DownloadHistoryEvent.evicted,
-            source_title=title,
-            message=(
-                f"eviction finalized{season_note}: recovered after an interrupted "
-                f"sweep, the file was already gone ({library_path})"
-            ),
-        )
-    )
-    await session.commit()
+        # The tree is gone: retire the incomplete-delete marker unconditionally,
+        # the same backstop ``_evict_one``'s finalize keeps for the case where the
+        # value-predicated breadcrumb clear above did not match (issues #482/#485).
+        await _disarm_partial_delete(session, pending)
+        await session.commit()
+    finally:
+        if purge_held:
+            purge_service.end_purge(library_path)
     # The Plex refresh the interrupted sweep never got to -- same best-effort
     # posture as the normal finalize (Plex catches up on its next scheduled scan).
     await purge_service.trigger_library_scan(
@@ -1321,11 +1860,16 @@ async def _resume_one(
         extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
     )
     _logger.info(
-        "finalized an interrupted eviction of %r%s: the file was already gone",
-        title,
+        "finalized an interrupted eviction of %r%s: %s",
+        _safe_title(title),
         season_note,
-        extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+        recovery_note,
+        extra={
+            "request_id": safe_int(pending.media_request_id),
+            "tmdb_id": safe_int(pending.tmdb_id),
+        },
     )
+    return destroyed_unmeasured
 
 
 async def _evict_one(
@@ -1336,6 +1880,7 @@ async def _evict_one(
     candidate: EvictionCandidate,
     pending: _Pending,
     grace_cutoff: datetime,
+    note_unmeasured_free: Callable[[], None] | None = None,
 ) -> EvictionOutcome | None:
     """Claim (status CAS) + delete + log ONE selected candidate, in that order
     (#67): the atomic claim runs BEFORE the delete, so nothing is deleted until
@@ -1350,7 +1895,18 @@ async def _evict_one(
        assembly makes the claim match zero rows.
     2. A failed/refused delete NEVER strands a terminal-status row over a live
        file -- ``_restore_after_failed_delete`` compare-and-swaps the row back
-       ``evicted`` -> ``available`` (recomputing the TV parent rollup).
+       ``evicted`` -> ``available`` (recomputing the TV parent rollup). Its
+       precondition is that the file is INTACT, which is why the purge
+       primitive distinguishes an untouched failure from a PARTIAL one (issue
+       #482): a tree the delete already ate into is not a live file, and
+       restoring it would publish media the UI calls watchable and cannot play.
+       A partial delete therefore keeps the claim instead (see the table below).
+       Because a crash / cancellation / restart can stop an ``rmtree`` halfway
+       with NO in-band result to classify (issue #485), that distinction is also
+       recorded DURABLY on the claim row -- ``partial_delete_path`` is armed in
+       the claim's own commit, before the delete, and disarmed only by an outcome
+       that proves the tree intact-or-gone. Recovery reads the row, not process
+       memory, so every restart/cancellation boundary sees the same truth.
     3. Concurrent sweep ticks NEVER double-process -- sweeps are serialized
        in-process (:data:`_sweep_latch`: a second invocation no-ops with a
        log), and the claim CAS (only the winning ``rowcount == 1`` proceeds to
@@ -1419,10 +1975,25 @@ async def _evict_one(
     ========================================  =======================================
     purge ok                                  ``evicted``, breadcrumb CLEARED,
                                               history row, Plex refreshed (finalized)
-    purge refused / error                     restored ``available`` (+ TV rollup);
+    purge refused / error (tree UNTOUCHED)    restored ``available`` (+ TV rollup);
                                               breadcrumb kept; retried next sweep
-    crash, file still present                 resumed next sweep: restored
-                                              ``available``, re-decided fresh
+    purge PARTIAL -- some of the tree was     claim KEPT (``evicted`` + breadcrumb,
+    removed, then the delete failed (#482)    the "still in progress" shape); NOT
+                                              restored (the media is incomplete);
+                                              no re-grab cancelled; a retried purge
+                                              of the remains converges to deleted;
+                                              REPORTED as a ``partial`` outcome so
+                                              callers publish/refresh on it
+    a re-armed season's replacement import    recovered next sweep: the remains are
+    is BLOCKED by the surviving remnants      PURGED by the marker's owner (an import
+    (``import_blocked`` + armed marker)       may not overwrite them), status left
+                                              alone so the retry can now succeed
+    crash, file still present, NO armed        resumed next sweep: restored
+    incomplete-delete marker                   ``available``, re-decided fresh
+    crash / cancellation mid-delete -- the      resumed next sweep: the armed marker
+    marker armed with the claim is still on     routes it to a RETRY of the purge,
+    the row (#485)                              never a restore; converges to the
+                                                finalize once the remains clear
     crash, file already purged                resumed next sweep: finalized
                                               (breadcrumb cleared, history, refresh)
     re-request in-window                      lands ``pending`` (invariant #4), the
@@ -1465,10 +2036,23 @@ async def _evict_one(
     over this season lands AFTER the pre-claim   NOTHING deleted (#465) -- re-checked
     read (during the watch-state re-read) --    post-claim/pre-delete, same shape as
     the scopeless-ride-along shape (#465)        the twins guard; the pack keeps its file
+    that same coverage claim lands, then the    recovery re-checks coverage before its
+    process EXITS before the post-claim guard   force-purge and DEFERS: claim, breadcrumb
+    can run                                     and marker all stand, nothing deleted,
+                                                re-decided once the pack settles
     rewatch (or watch-state error) lands       skipped BEFORE the claim (invariant
     between candidate assembly and the claim   #8, #209); row stays ``available``,
     (#209)                                     file untouched, re-decided next sweep
     ========================================  =======================================
+
+    ``note_unmeasured_free`` is the sweep's re-baseline hook: invoked exactly when
+    this eviction DESTROYED data whose freed byte count is unknowable (a partial
+    delete -- the reclaimable-bytes measurement necessarily precedes the delete,
+    and a delete that got part-way frees an unmeasured subset of it). The sweep
+    uses it to re-stat the root before choosing further victims, so a partial
+    delete that already relieved the pressure cannot make it keep deleting watched
+    titles against a snapshot taken before that destruction. ``None`` (the default)
+    for callers with no pressure ledger to keep.
     """
     library_path = candidate.library_path
     if library_path is None:
@@ -1617,6 +2201,19 @@ async def _evict_one(
     # the doomed file -- the request side closes that window by consulting
     # ``latest_request_evicted`` / ``evicted_seasons`` and re-grabbing instead (see
     # invariant #4 above; ``request_service`` / ``season_request_service``).
+    #
+    # ARM the durable incomplete-delete marker in this SAME commit (issues #482 /
+    # #485). ``shutil.rmtree`` is not atomic, and the ways a delete can stop
+    # halfway through a tree are not all in-band: a classified
+    # ``PurgeOutcome.partial`` is, but a crash, a cancelled sweep (whose worker
+    # settles unobserved -- cancellation wins over the classified result), and a
+    # process restart are not. So the marker records the delete as OUTSTANDING
+    # before it starts and is cleared only by an outcome that PROVES the tree
+    # needs no further reclaiming; anything that ends without such proof leaves
+    # the row honestly saying "this media cannot be assumed complete", which is
+    # exactly what stops the next sweep's recovery restoring gutted media to
+    # 'available' off a bare ``os.stat``.
+    await _arm_partial_delete(session, pending, library_path)
     await session.commit()
 
     # Shared-breadcrumb-twins guard (#155): the claim above only compares THIS
@@ -1667,15 +2264,7 @@ async def _evict_one(
     # post-commit filesystem delete -- so this mirrors the module's established
     # post-claim/pre-delete recheck-and-restore pattern (twins #155, rewatch #209),
     # narrowing the window to the same irreducible micro-window those do.
-    if (
-        isinstance(pending, _SeasonPending)
-        and (
-            await SqlDownloadRepository(session).find_active_coverage_title(
-                pending.tmdb_id, pending.season_number
-            )
-        )
-        is not None
-    ):
+    if await _coverage_claim_active(session, pending):
         await _restore_after_failed_delete(session, pending)
         _logger.warning(
             "skipping eviction of %r%s: a live pack holds an active ride-along "
@@ -1703,6 +2292,13 @@ async def _evict_one(
         purge_held = True
     if purge.outcome is not PurgeOutcome.deleted:
         if purge.outcome is PurgeOutcome.deferred:
+            # The deferral is decided BEFORE any destructive work starts (the
+            # placement-conflict check precedes the delete), so nothing left disk
+            # and the marker armed above must come back off -- otherwise recovery
+            # would later force-purge the very content the import is placing,
+            # instead of restoring the row once that import settles.
+            await _disarm_partial_delete(session, pending)
+            await session.commit()
             _logger.info(
                 "eviction of %r%s deferred because an import is placing into the "
                 "same path (%s); leaving the eviction claim for recovery after "
@@ -1713,12 +2309,83 @@ async def _evict_one(
                 extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
             )
             return None
+        if purge.outcome is PurgeOutcome.partial:
+            # The recursive delete removed SOME of the tree and then failed
+            # (issue #482). Everything below this branch assumes the media is
+            # untouched and still watchable -- here it demonstrably is not, so
+            # the restore is exactly the wrong move: it would put the row back
+            # to 'available' over a tree missing files and let the UI claim
+            # media it can no longer play, silently and forever. The eviction is
+            # instead still IN PROGRESS, which is the same shape as the
+            # ``deferred`` branch above: the committed 'evicted' claim and its
+            # breadcrumb both STAY, so the remains stay reclaimable and a
+            # retried purge (idempotent -- an already-gone entry is a no-op)
+            # converges to 'deleted' once whatever blocked the removal clears.
+            # For the same reason no re-grab is cancelled: unlike a restore,
+            # this file really did leave, so an in-window re-request re-fetching
+            # it is legitimate and its import re-places the path. The durable
+            # incomplete-delete marker armed with the claim above simply STAYS
+            # armed -- this is the one outcome that proves nothing, so recovery
+            # FINISHES the purge off the kept breadcrumb rather than reading the
+            # surviving directory as intact media (see
+            # :func:`_partial_delete_outstanding`). Keeping the claim is only safe
+            # because the next sweep honors that marker.
+            if note_unmeasured_free is not None:
+                # Bytes really did leave disk, but the primitive cannot say how
+                # many (it measured the tree before the delete and the delete only
+                # got part-way). Tell the sweep so it re-baselines its pressure
+                # accounting instead of continuing to pick victims against a
+                # snapshot that predates this destruction (issue #482 review).
+                note_unmeasured_free()
+            _logger.warning(
+                "eviction of %r%s deleted only PART of the tree before failing (%s); "
+                "leaving the eviction claim and its breadcrumb -- the media is no "
+                "longer complete, so it is NOT restored to 'available'",
+                safe_text(candidate.title),
+                season_note,
+                purge.detail,
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            # Best-effort Plex refresh (Codex P2): the episodes the delete DID
+            # remove are gone from disk but still advertised by Plex, so without a
+            # scan users hit playback failures on entries the library still lists.
+            # Same posture as every other scan here -- the DB state already stands,
+            # and Plex catches up on its next scheduled scan if this fails. The
+            # breadcrumb and claim are untouched by it, so the retry path is intact.
+            await purge_service.trigger_library_scan(
+                library,
+                library_path=library_path,
+                media_type=candidate.media_type,
+                context="eviction",
+                extra={"request_id": pending.media_request_id, "tmdb_id": pending.tmdb_id},
+            )
+            # Report it as an OUTCOME, not ``None`` (Codex round-4 P2): the row is
+            # committed ``evicted`` and files really did leave disk, so returning
+            # nothing would make ``POST /ops/evict`` answer an empty list with no
+            # error and make BOTH sweep callers skip their realtime invalidation --
+            # clients would keep showing the title as watchable. ``freed_bytes`` is
+            # honestly ``None`` (the measurement necessarily predates the delete and
+            # the delete only got part-way), and ``partial`` marks it as still
+            # having reclaimable remains so the periodic loop's summary can say so.
+            return EvictionOutcome(
+                request_id=candidate.request_id,  # the same id the success path reports
+                media_type=candidate.media_type,
+                title=candidate.title,
+                season=candidate.season,
+                library_path=library_path,
+                freed_bytes=None,
+                partial=True,
+            )
         # The delete refused (a stale/misconfigured breadcrumb pointing outside
-        # every currently-configured library root) or errored (permission/I/O).
-        # The file is STILL on disk and still watchable -- so RESTORE the row to
-        # 'available' (#67): a failed unlink must never strand an 'evicted' status
-        # over a live file (a re-request would then re-grab content that never
-        # left). Never silently skipped, never mis-deleted; a later sweep retries.
+        # every currently-configured library root) or errored (permission/I/O)
+        # with the tree provably untouched. The file is STILL on disk and still
+        # watchable -- so RESTORE the row to 'available' (#67): a failed unlink
+        # must never strand an 'evicted' status over a live file (a re-request
+        # would then re-grab content that never left). Never silently skipped,
+        # never mis-deleted; a later sweep retries.
         await _restore_after_failed_delete(session, pending)
         if purge.outcome is PurgeOutcome.refused:
             _logger.warning(
@@ -1800,6 +2467,14 @@ async def _evict_one(
                 expected_path=library_path,
                 expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
             )
+        # The tree is GONE, so the incomplete-delete marker armed with the claim
+        # has nothing left to describe (issues #482 / #485). The breadcrumb clears
+        # above already null it when their value-predicated CAS matches; this is
+        # the unconditional backstop for the case where it did NOT (a replacement
+        # import re-stamped the row mid-purge and owns its breadcrumb now) --
+        # leaving a marker armed there would let a later eviction of the
+        # replacement content skip its restore.
+        await _disarm_partial_delete(session, pending)
         await session.commit()
     finally:
         if purge_held:
@@ -2064,6 +2739,41 @@ async def run_eviction_sweep(
         _sweep_latch["busy"] = False
 
 
+async def _reprobe_disk(root_path: str, *, fallback: DiskUsage) -> DiskUsage:
+    """Re-read ``root_path``'s disk usage after a destructive step whose freed
+    bytes the sweep's ledger cannot account for (issues #482 / #485).
+
+    The sweep takes ONE disk snapshot up front and then reasons about "have we
+    freed enough yet?" from that snapshot plus the bytes each successful eviction
+    reports. Two things break that arithmetic: crash-recovery finishing an
+    incomplete purge (it runs AFTER the snapshot), and a PARTIAL delete (real
+    bytes leave disk, but the hardlink-aware measurement necessarily precedes the
+    delete and the delete only got part-way, so the primitive honestly reports
+    ``0`` rather than guessing). Either way the picture is stale in the direction
+    that keeps deleting, so it is re-read here before further victims are chosen.
+
+    A failed re-probe returns ``fallback`` -- the ORIGINAL snapshot -- rather than
+    aborting: every step this compensates for only ever FREES space, so the stale
+    reading can only over-state pressure, and over-stating is the same behavior
+    the sweep had before this correction existed. Logged, never swallowed.
+    """
+    try:
+        return await purge_service.run_abandonable_probe(
+            lambda: read_disk_usage(root_path),
+            root_path,
+            operation_name="eviction sweep pressure re-baseline probe",
+        )
+    except OSError as exc:
+        _logger.warning(
+            "could not re-read disk usage for %s after a destructive eviction step "
+            "(%s); continuing on the pre-sweep snapshot, which can only over-state "
+            "pressure",
+            safe_text(root_path),
+            type(exc).__name__,
+        )
+        return fallback
+
+
 async def _run_sweep(
     *,
     session: AsyncSession,
@@ -2112,13 +2822,21 @@ async def _run_sweep(
     # "gone" and be wrongly finalized. A row restored here (file still present)
     # is 'available' again by the time candidates are assembled below, so THIS
     # same sweep re-decides its eviction fresh through the normal claim path.
-    await _resume_interrupted_evictions(
+    # Recovery can DELETE (it finishes an incompletely-deleted eviction, issues
+    # #482 / #485), and the snapshot above predates it. Re-probe before any
+    # pressure arithmetic reads it, so a recovery that already relieved the disk
+    # cannot make this sweep go on to evict watched titles it no longer needs to.
+    # A re-probe failure is not fatal: fall back to the original snapshot, which
+    # can only OVER-estimate pressure (recovery only ever frees), and log it.
+    if await _resume_interrupted_evictions(
         session=session,
         library=library,
+        fs=fs,
         media_type=media_type,
         root_path=root_path,
         all_roots=scope,
-    )
+    ):
+        disk = await _reprobe_disk(root_path, fallback=disk)
 
     disk_used_pct = used_percent(disk)
     if not proactive and disk_used_pct < threshold_pct:
@@ -2165,6 +2883,17 @@ async def _run_sweep(
 
     outcomes: list[EvictionOutcome] = []
     freed_bytes_total = 0
+    # Set when an eviction destroyed data whose freed bytes could not be measured
+    # (a partial delete, issue #482). The extra-pool loop below decides "have we
+    # freed enough yet?" from ``disk_used_pct`` + ``freed_bytes_total``, and a
+    # partial delete contributes real bytes to NEITHER -- so without this flag the
+    # sweep would keep selecting further victims as though its destruction freed
+    # nothing, deleting watched titles after the target was already reached.
+    pressure_stale = False
+
+    def _note_unmeasured_free() -> None:
+        nonlocal pressure_stale
+        pressure_stale = True
 
     async def _attempt(candidate: EvictionCandidate) -> None:
         nonlocal freed_bytes_total
@@ -2176,6 +2905,7 @@ async def _run_sweep(
                 candidate=candidate,
                 pending=pending_by_id[id(candidate)],
                 grace_cutoff=grace_cutoff,
+                note_unmeasured_free=_note_unmeasured_free,
             )
         except Exception:
             # Mirrors import_service.run_import_cycle / run_availability_cycle:
@@ -2192,7 +2922,42 @@ async def _run_sweep(
             if outcome.freed_bytes is not None:
                 freed_bytes_total += outcome.freed_bytes
 
+    async def _rebaseline() -> bool:
+        """Re-stat the root after an UNMEASURED destructive delete and restart the
+        pressure accounting from that fresh reading.
+
+        ``False`` means the reading is unusable (an unmounted/zero-total root), so
+        the caller must stop rather than keep deleting against arithmetic it can no
+        longer check. Clears the flag first, so one re-stat serves one destruction.
+        """
+        nonlocal pressure_stale, disk, disk_used_pct, freed_bytes_total
+        pressure_stale = False
+        disk = await _reprobe_disk(root_path, fallback=disk)
+        if disk.total_bytes <= 0:  # pragma: no cover - defensive
+            return False
+        disk_used_pct = used_percent(disk)
+        freed_bytes_total = 0
+        return True
+
     for candidate in selected:
+        # RE-BASELINE MID-PREFIX (Codex round-4 P1). ``selected`` is the domain's
+        # target-seeking prefix, sized from ESTIMATED reclaimable bytes, and the
+        # whole prefix is normally deleted. But a partial delete frees real bytes
+        # that neither ``freed_bytes_total`` nor the pre-sweep snapshot can see, so
+        # an early victim's partial delete can already have reached the target
+        # while every later victim in this prefix is still queued for deletion.
+        # Re-stat the moment that happens and stop if the pressure is genuinely
+        # gone -- deleting a watched title the operator did not need to lose is
+        # exactly the harm the target exists to bound. ONLY when the flag is set:
+        # with no unmeasured destruction the estimate-based prefix is honest and
+        # keeps its existing all-or-nothing semantics. A proactive sweep has no
+        # pressure target at all (it deliberately clears every eligible
+        # candidate), so it never stops early.
+        if pressure_stale and not proactive and disk.total_bytes > 0:
+            if not await _rebaseline():
+                break
+            if pressure_relieved(disk_used_pct, freed_bytes_total, disk.total_bytes, target_pct):
+                break
         await _attempt(candidate)
 
     # R4-6: the estimate-based selection above can under-deliver (a hardlinked
@@ -2203,6 +2968,14 @@ async def _run_sweep(
     # very first check below already finds `projected <= target_pct`.
     if extra_pool and disk.total_bytes > 0:
         for candidate in extra_pool:
+            # RE-BASELINE (issue #482 review): an unmeasured destructive delete
+            # landed, so the snapshot + running-total arithmetic below is no
+            # longer an honest picture of the disk. Re-stat it and restart the
+            # accounting from the fresh reading rather than keep deleting against
+            # a stale one. Done lazily, only when it actually happened -- the same
+            # helper the selected prefix above uses.
+            if pressure_stale and not await _rebaseline():
+                break
             if pressure_relieved(disk_used_pct, freed_bytes_total, disk.total_bytes, target_pct):
                 break
             await _attempt(candidate)

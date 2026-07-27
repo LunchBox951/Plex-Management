@@ -35,7 +35,7 @@ from plex_manager.models import (
 )
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.repositories import DownloadRecord
-from plex_manager.services import auto_grab_service, log_capture_service
+from plex_manager.services import auto_grab_service, log_capture_service, purge_service
 from plex_manager.services.auto_grab_service import (
     BACKOFF_SCHEDULE,
     COOLDOWN_SCHEDULE,
@@ -1700,3 +1700,72 @@ async def test_multi_season_pack_does_not_duplicate_in_flight_seasons(
     assert all(status_by_season[n] == RequestStatus.downloading.value for n in range(1, 8))
     assert status_by_season[8] == RequestStatus.no_acceptable_release.value
     assert status_by_season[9] == RequestStatus.no_acceptable_release.value
+
+
+# --------------------------------------------------------------------------- #
+# Purge-claim exclusion (Codex round-3 P1)
+# --------------------------------------------------------------------------- #
+async def test_a_scope_whose_tree_is_under_an_active_purge_claim_is_not_searched(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Codex round-3 P1: a correction publishes an eager ``searching`` scope
+    BEFORE it removes the culprit torrent and purges the library tree, and holds
+    a purge claim over that tree for the whole destructive stretch. The worker
+    must leave such a scope alone: grabbing it there can (via a same-hash attach)
+    land an import in the very directory the purge is about to walk, and the
+    correction would then delete the freshly imported replacement.
+
+    The exclusion is a WINDOW, not a park: the moment the claim is released the
+    scope is due again on the very next cycle, with no backoff of its own.
+    """
+    library_path = "/library/movies/Purge Racer (2020).mkv"
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=615, status=RequestStatus.searching)
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.library_path = library_path
+        await session.commit()
+
+    prowlarr = FakeProwlarr(_two_good_candidates())
+    qbt = FakeQbittorrent()
+
+    purge_service.begin_purge(library_path)
+    try:
+        blocked = await _run(sessionmaker_, prowlarr, qbt)
+    finally:
+        purge_service.end_purge(library_path)
+
+    assert blocked.searched == 0
+    assert prowlarr.searched == []
+    assert qbt.added == []
+
+    resumed = await _run(sessionmaker_, prowlarr, qbt)
+
+    assert resumed.searched == 1
+    assert resumed.grabbed == 1
+
+
+async def test_a_scope_outside_the_claimed_tree_is_still_searched(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The exclusion is path-scoped, never a global pause: an unrelated scope is
+    searched normally while some other title's purge claim is held (and a scope
+    with no breadcrumb at all has no tree to be racing over)."""
+    request_id = await _seed_movie(sessionmaker_, tmdb_id=616, status=RequestStatus.searching)
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.library_path = "/library/movies/Unrelated (2020).mkv"
+        await session.commit()
+
+    prowlarr = FakeProwlarr(_two_good_candidates())
+    qbt = FakeQbittorrent()
+
+    purge_service.begin_purge("/library/movies/Some Other Title (2019).mkv")
+    try:
+        result = await _run(sessionmaker_, prowlarr, qbt)
+    finally:
+        purge_service.end_purge("/library/movies/Some Other Title (2019).mkv")
+
+    assert result.searched == 1
+    assert result.grabbed == 1

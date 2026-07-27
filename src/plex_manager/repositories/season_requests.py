@@ -59,6 +59,7 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         status=row.status.value,
         tmdb_id=tmdb_id,
         library_path=row.library_path,
+        partial_delete_path=row.partial_delete_path,
         installed_quality_id=row.installed_quality_id,
         installed_profile_index=row.installed_profile_index,
         search_attempts=row.search_attempts,
@@ -254,8 +255,11 @@ class SqlSeasonRequestRepository:
             CursorResult[Any],
             await self._session.execute(
                 update(SeasonRequest)
+                # The incomplete-delete marker (issues #482 / #485) dies with the
+                # breadcrumb it describes -- see the movie mirror in
+                # ``SqlRequestRepository.clear_library_path_if_set``.
+                .values(library_path=None, partial_delete_path=None)
                 .where(*predicates)
-                .values(library_path=None)
                 .execution_options(synchronize_session="fetch")
             ),
         )
@@ -567,11 +571,44 @@ class SqlSeasonRequestRepository:
         return result.rowcount == 1
 
     async def set_library_path(self, season_request_id: int, library_path: str) -> None:
-        """Store the final placed path this season's import wrote into (ADR-0012)."""
+        """Store the final placed path this season's import wrote into (ADR-0012).
+
+        Also RETIRES any outstanding incomplete-delete marker (issues #482 / #485) --
+        the season mirror of ``SqlRequestRepository.set_library_path``'s clear, and
+        the one that matters most: a TV re-grab re-imports into the SAME row and the
+        SAME deterministic season directory, so without this clear a fully-restored
+        season would still carry the previous eviction's marker and a later eviction
+        could force-purge it instead of reconsidering the claim.
+        """
         row = await self._session.get(SeasonRequest, season_request_id)
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = library_path
+        row.partial_delete_path = None
+        await self._session.flush()
+
+    async def set_partial_delete_path(self, season_request_id: int, library_path: str) -> None:
+        """ARM the durable incomplete-delete marker over ``library_path`` (#482 / #485).
+
+        The season mirror of ``SqlRequestRepository.set_partial_delete_path`` -- see
+        there, and ``SeasonRequest.partial_delete_path``'s docstring, for the full
+        arm-before-delete / disarm-only-on-proof protocol.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.partial_delete_path = library_path
+        await self._session.flush()
+
+    async def clear_partial_delete_path(self, season_request_id: int) -> None:
+        """DISARM the incomplete-delete marker (#482 / #485) -- idempotent.
+
+        The season mirror of ``SqlRequestRepository.clear_partial_delete_path``.
+        """
+        row = await self._session.get(SeasonRequest, season_request_id)
+        if row is None:
+            raise LookupError(f"season request {season_request_id} does not exist")
+        row.partial_delete_path = None
         await self._session.flush()
 
     async def set_installed_quality(
@@ -597,6 +634,9 @@ class SqlSeasonRequestRepository:
         if row is None:
             raise LookupError(f"season request {season_request_id} does not exist")
         row.library_path = None
+        # The marker dies with the breadcrumb it describes (issues #482 / #485):
+        # the caller only reaches here once the purge ACTUALLY removed the file.
+        row.partial_delete_path = None
         await self._session.flush()
 
     async def clear_eviction_regrab(self, season_request_id: int) -> None:

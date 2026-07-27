@@ -55,7 +55,12 @@ from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import eviction_service, request_service, season_request_service
+from plex_manager.services import (
+    eviction_service,
+    purge_service,
+    request_service,
+    season_request_service,
+)
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
 from tests.web.fakes import FakeLibrary, FakeTmdb
 
@@ -3422,6 +3427,815 @@ async def test_deferred_purge_does_not_restore_while_replacement_import_owns_pat
     assert history == []
 
 
+async def test_partial_purge_never_restores_the_claimed_row_to_available(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482: the purge removed PART of the tree and then failed. Every
+    other failure branch restores the row to 'available' on the premise that
+    nothing left disk -- here that premise is false, and restoring would hand
+    the UI media it calls fully watchable while files are missing, silently and
+    forever. The claim and its breadcrumb must both stay (the eviction is still
+    in progress, the remains stay reclaimable), no eviction history is written
+    for a delete that has not finished, and -- unlike a restore -- the in-window
+    re-grab must SURVIVE: this file really did leave, so re-fetching it is
+    legitimate rather than a duplicate of on-disk content."""
+    library_path = _movie_file(tmp_path, "Half Eaten.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=482, title="Half Eaten", library_path=library_path
+    )
+    async with sessionmaker_() as session:
+        regrab = MediaRequest(
+            tmdb_id=482,
+            media_type=MediaType.movie,
+            title="Half Eaten",
+            status=RequestStatus.pending,
+            eviction_regrab=True,
+        )
+        session.add(regrab)
+        await session.commit()
+        regrab_id = regrab.id
+
+    async def _partial_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(
+            PurgeOutcome.partial, 0, "partially deleted before failing (PermissionError)"
+        )
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_purge)
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Half Eaten",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=482, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(482, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=stale,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    # Reported as an OUTCOME, not swallowed (Codex round-4 P2): the row is
+    # committed 'evicted' and files really did leave disk, so callers must
+    # publish/refresh on it. ``freed_bytes`` is honestly unknown and ``partial``
+    # marks the reclaimable remains.
+    assert outcome is not None
+    assert outcome.partial is True
+    assert outcome.freed_bytes is None
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        regrab_row = await session.get(MediaRequest, regrab_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 482)))
+            .scalars()
+            .all()
+        )
+    assert row is not None
+    assert row.status is RequestStatus.evicted  # NOT restored over an incomplete tree
+    assert row.library_path == library_path  # the retry's only handle on the remains
+    assert regrab_row is not None and regrab_row.status is RequestStatus.pending
+    assert history == []  # the eviction is not finished, so nothing is recorded yet
+
+
+async def test_partial_season_tree_delete_keeps_the_claim_and_a_retry_converges(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #482 end-to-end against the REAL filesystem and the REAL purge: a
+    season directory whose parent is read-only lets ``shutil.rmtree`` remove
+    every episode and then fail on the season's own ``rmdir``. The claimed row
+    must stay ``evicted`` with its breadcrumb -- the season is unplayable, so
+    restoring it to 'available' is the bug this closes -- and the purge, retried
+    once the permissions are back, must converge to a clean ``deleted`` off the
+    kept breadcrumb."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    show_dir = tmp_path / "tv" / "Half Eaten Show"
+    season_dir = show_dir / "Season 01"
+    season_dir.mkdir(parents=True)
+    for episode_number in (1, 2):
+        (season_dir / f"Half Eaten Show - S01E0{episode_number}.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=483, title="Half Eaten Show", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_request_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        ).id
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Half Eaten Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=483,
+        size_bytes=2048,
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path / "tv")])
+    # Only the season's final rmdir needs write permission HERE; its contents do
+    # not -- so the removal genuinely eats the episodes and then fails, on every
+    # directory-entry ordering.
+    os.chmod(show_dir, 0o500)
+    try:
+        async with sessionmaker_() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=FakeLibrary(
+                    watch_states={(483, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+                ),
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+    finally:
+        os.chmod(show_dir, 0o700)
+
+    # Reported as an OUTCOME, not swallowed (Codex round-4 P2): the row is
+    # committed 'evicted' and files really did leave disk, so callers must
+    # publish/refresh on it. ``freed_bytes`` is honestly unknown and ``partial``
+    # marks the reclaimable remains.
+    assert outcome is not None
+    assert outcome.partial is True
+    assert outcome.freed_bytes is None
+    assert season_dir.is_dir()  # the top survived...
+    assert list(season_dir.iterdir()) == []  # ...but the episodes did not
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 483)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # never restored over a gutted season
+    assert season_row.library_path == str(season_dir)
+    assert history == []
+
+    retry = await purge_service.purge_library_path(fs, str(season_dir))
+
+    assert retry.outcome is PurgeOutcome.deleted
+    assert not season_dir.exists()
+
+
+async def test_a_later_sweep_finishes_a_partial_delete_instead_of_restoring_it(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #482's other half: keeping the claim is only safe if the NEXT sweep
+    honors it. ``evicted`` + breadcrumb is exactly the interrupted-eviction
+    signature the recovery pass keys on, and that pass decided "file present"
+    from a bare stat -- which a gutted directory satisfies -- so the very next
+    sweep restored the row to 'available' over media that is missing files,
+    undoing the fix during ordinary in-process retry rather than only after a
+    crash. Recovery must finish the interrupted purge off the kept breadcrumb
+    instead. Runs BELOW the pressure threshold, where the recovery pass is the
+    only thing that touches the row."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    show_dir = root / "Half Restored Show"
+    season_dir = show_dir / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Half Restored Show - S01E01.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=484, title="Half Restored Show", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_request_id = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        ).id
+
+    stale = eviction_service.EvictionCandidate(
+        request_id=season_request_id,
+        media_type="tv",
+        title="Half Restored Show",
+        season=1,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(season_dir),
+        size_percent=1.0,
+    )
+    pending = eviction_service._SeasonPending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=show_id,
+        season_request_id=season_request_id,
+        season_number=1,
+        tmdb_id=484,
+        size_bytes=1024,
+    )
+    library = FakeLibrary(
+        watch_states={(484, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(root)])
+    os.chmod(show_dir, 0o500)  # only the season's own rmdir needs write here
+    try:
+        async with sessionmaker_() as session:
+            outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=library,
+                candidate=stale,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+    finally:
+        os.chmod(show_dir, 0o700)  # the obstruction clears, as it must for a retry to converge
+    # Reported as an OUTCOME, not swallowed (Codex round-4 P2): the row is
+    # committed 'evicted' and files really did leave disk, so callers must
+    # publish/refresh on it. ``freed_bytes`` is honestly unknown and ``partial``
+    # marks the reclaimable remains.
+    assert outcome is not None
+    assert outcome.partial is True
+    assert outcome.freed_bytes is None
+    assert list(season_dir.iterdir()) == []  # gutted, but the directory survives a stat
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,  # below threshold: nothing but the recovery pass runs
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()  # the interrupted purge finished, it was not undone
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 484)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # never 'available' over a gutted season
+    assert season_row.library_path is None  # finalized, so it stops looking interrupted
+    assert len(history) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Issues #482 / #485: the incomplete-delete marker is DURABLE (a column on the
+# claim row), so every lifecycle boundary an in-process record leaks across --
+# restart, cancellation, the report-issue purge, a same-row re-import -- reads
+# and writes the same truth.
+# --------------------------------------------------------------------------- #
+
+
+async def _armed_evicted_season(
+    sm: SessionMaker, *, tmdb_id: int, title: str, season_dir: Path
+) -> tuple[int, int]:
+    """Seed the on-disk-of-record state a process leaves behind when an eviction's
+    delete started and never proved the tree intact: ``evicted`` + breadcrumb +
+    an ARMED ``partial_delete_path``. Returns ``(show_id, season_request_id)``."""
+    show_id = await _show_with_seasons(
+        sm, tmdb_id=tmdb_id, title=title, seasons={1: str(season_dir)}
+    )
+    async with sm() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.evicted
+        season_row.partial_delete_path = str(season_dir)
+        await session.commit()
+        return show_id, season_row.id
+
+
+async def test_a_restarted_process_finishes_an_incomplete_delete_from_the_persisted_marker(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #485 (and #482's restart boundary): the marker is read from the ROW,
+    so a process that never observed the interrupted delete still recovers it
+    correctly. Nothing is primed in memory here -- this sweep is the first thing
+    this module does with the path, exactly as after a restart -- and the row's
+    gutted season directory still stats fine. Recovery must FINISH the purge off
+    the kept breadcrumb rather than read the surviving directory as intact media
+    and restore it to 'available'."""
+    root = tmp_path / "tv"
+    season_dir = root / "Restarted Partial" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "leftover-S01E03.mkv").write_bytes(b"0" * 1024)  # the un-deleted remainder
+    show_id, season_request_id = await _armed_evicted_season(
+        sessionmaker_, tmdb_id=485, title="Restarted Partial", season_dir=season_dir
+    )
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()  # converged, never undone
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 485)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # never 'available' over a gutted season
+    assert season_row.library_path is None  # finalized
+    assert season_row.partial_delete_path is None  # the marker is retired with the tree
+    assert len(history) == 1
+    assert show_id  # the parent row exists; the season is what this asserts on
+
+
+async def test_a_restarted_process_keeps_the_claim_when_the_retry_still_cannot_clear_the_remains(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of #485: when the recovery retry ALSO fails, the honest
+    answer is still "not restorable" -- the row keeps its claim, its breadcrumb
+    AND its marker, so the sweep after that retries again instead of publishing a
+    season that cannot be shown to be complete. A restore here is precisely the
+    bug: the surviving directory's bare stat says nothing about its contents."""
+    root = tmp_path / "tv"
+    season_dir = root / "Stubborn Partial" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "leftover-S01E03.mkv").write_bytes(b"0" * 1024)
+    _show_id, season_request_id = await _armed_evicted_season(
+        sessionmaker_, tmdb_id=486, title="Stubborn Partial", season_dir=season_dir
+    )
+
+    async def _still_failing(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.error, 0, "PermissionError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _still_failing)
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # NOT restored to 'available'
+    assert season_row.library_path == str(season_dir)  # the retry's handle survives
+    assert season_row.partial_delete_path == str(season_dir)  # still known-incomplete
+
+
+async def test_cancelling_a_sweep_mid_delete_leaves_the_incomplete_delete_marker_persisted(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation boundary (#482 review, #485): the delete substrate lets
+    cancellation WIN over a classified result -- a worker that settles with a
+    partial delete while its caller is unwinding only gets logged, and no
+    ``PurgeOutcome.partial`` ever reaches ``_evict_one``. So the marker cannot be
+    written from the outcome; it is armed and COMMITTED with the claim, before the
+    delete. A cancelled eviction therefore still leaves the row saying its media
+    cannot be assumed complete, and the next sweep honors that."""
+    library_path = _movie_file(tmp_path, "Cancelled Mid Delete.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=487,
+        title="Cancelled Mid Delete",
+        library_path=library_path,
+    )
+
+    async def _cancelled_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _cancelled_purge)
+
+    candidate = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Cancelled Mid Delete",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=487, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        with pytest.raises(asyncio.CancelledError):
+            await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=FakeLibrary(
+                    watch_states={
+                        (487, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                    }
+                ),
+                candidate=candidate,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+
+    # A genuinely separate session: only what was COMMITTED before the delete
+    # survives a cancellation.
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted  # the claim committed
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path  # armed BEFORE the delete, so it survived
+
+
+async def test_a_same_row_re_import_retires_the_marker_so_a_later_eviction_still_restores(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destructive leak the in-process design had (#482 review): a TV re-grab
+    re-imports into the SAME row and the SAME deterministic season directory, so a
+    path-keyed marker outlived its subject. A LATER eviction of that fully
+    restored season, interrupted before its delete, would then be recovered
+    through the force-purge branch -- deleting a complete season instead of
+    reconsidering the claim. Binding the marker to the row and retiring it on
+    every placement (``set_library_path``) is what makes the restore correct
+    again."""
+    root = tmp_path / "tv"
+    season_dir = root / "Reimported Show" / "Season 01"
+    season_dir.mkdir(parents=True)
+    _show_id, season_request_id = await _armed_evicted_season(
+        sessionmaker_, tmdb_id=488, title="Reimported Show", season_dir=season_dir
+    )
+
+    # The in-window re-grab's import re-places the season into the same path.
+    async with sessionmaker_() as session:
+        await SqlSeasonRequestRepository(session).set_library_path(
+            season_request_id, str(season_dir)
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        assert season_row.partial_delete_path is None  # retired by the placement
+        # A LATER eviction claims the restored season and is interrupted before
+        # its delete: 'evicted' + breadcrumb, no marker.
+        season_row.status = RequestStatus.evicted
+        await session.commit()
+    (season_dir / "Reimported Show - S01E01.mkv").write_bytes(b"0" * 1024)
+
+    purged: list[str] = []
+
+    async def _tracking_purge(
+        _fs: object, path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:  # pragma: no cover - must never run
+        purged.append(path)
+        return PurgeResult(PurgeOutcome.deleted, 1024)
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _tracking_purge)
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert purged == []  # the restored season is NEVER force-purged
+    assert season_dir.exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.available  # restored and re-decided fresh
+
+
+async def test_a_partial_delete_rebaselines_disk_pressure_before_picking_more_victims(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482 review: a partial delete frees REAL bytes but the primitive
+    reports ``0`` (the hardlink-aware measurement necessarily precedes the delete,
+    and the delete only got part-way -- guessing would be dishonest). The sweep's
+    extra-pool loop decides "have we freed enough?" from its pre-sweep snapshot
+    plus that running total, so it used to keep deleting watched titles as though
+    the destruction freed nothing. It must re-stat the root instead."""
+    small_path = _movie_file(tmp_path, "Spared (100b).mkv", size=100)
+    big_path = _movie_file(tmp_path, "Half Eaten (200b).mkv", size=200)
+    older_stale = _STALE - timedelta(days=5)  # the stalest -- selected FIRST
+    await _movie(sessionmaker_, tmdb_id=489, title="Spared (100b)", library_path=small_path)
+    await _movie(sessionmaker_, tmdb_id=490, title="Half Eaten (200b)", library_path=big_path)
+
+    readings = iter(
+        [
+            DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=100),  # 90% used
+            # The re-baseline probe AFTER the partial delete: it really did free
+            # space, just an unmeasurable amount.
+            DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=400),  # 60% used
+        ]
+    )
+
+    def _fake_disk_usage(_path: str) -> DiskUsage:
+        return next(readings)
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _fake_disk_usage)
+
+    async def _partial_for_big(
+        _fs: object, path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        if path == big_path:
+            return PurgeResult(
+                PurgeOutcome.partial, 0, "partially deleted before failing (OSError)"
+            )
+        return PurgeResult(PurgeOutcome.deleted, 100)  # pragma: no cover - must never run
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_for_big)
+
+    library = FakeLibrary(
+        watch_states={
+            (489, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (490, "movie", None): WatchState(watched=True, last_viewed_at=older_stale),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=90.0,
+            target_pct=70.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # 90% used, target 70: the ESTIMATE says the stalest ("Half Eaten", 20%) alone
+    # reaches it, so only it is selected and "Spared" waits in the extra pool for
+    # the REAL freed total to fall short. The partial delete reports zero freed
+    # bytes, so that total stays 0 -- only the RE-STAT (60% used, already under
+    # target) can stop the loop before it eats the second, still-intact title.
+    # The partial one is REPORTED (Codex round-4 P2) but never finalized; the
+    # spared one never ran at all.
+    assert [(o.title, o.partial, o.freed_bytes) for o in outcomes] == [
+        ("Half Eaten (200b)", True, None)
+    ]
+    assert next(readings, None) is None  # both readings consumed: the re-probe happened
+    async with sessionmaker_() as session:
+        spared = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 489)))
+            .scalars()
+            .one()
+        )
+    assert spared.status is RequestStatus.available  # not evicted against a stale snapshot
+
+
+async def test_a_partial_eviction_still_refreshes_plex_for_what_it_did_remove(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: a partial delete DID remove files, and Plex goes on advertising
+    them until something rescans -- users hit playback failures on entries the
+    library still lists. Best-effort, and it must not disturb the claim or the
+    breadcrumb the retry depends on."""
+    library_path = _movie_file(tmp_path, "Scan After Partial.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=491, title="Scan After Partial", library_path=library_path
+    )
+
+    async def _partial_purge(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_purge)
+
+    candidate = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Scan After Partial",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=491, size_bytes=1024
+    )
+    library = FakeLibrary(
+        watch_states={(491, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            fs=fs,
+            library=library,
+            candidate=candidate,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    # Reported as an OUTCOME, not swallowed (Codex round-4 P2): the row is
+    # committed 'evicted' and files really did leave disk, so callers must
+    # publish/refresh on it. ``freed_bytes`` is honestly unknown and ``partial``
+    # marks the reclaimable remains.
+    assert outcome is not None
+    assert outcome.partial is True
+    assert outcome.freed_bytes is None
+    assert library.scan_calls == [(library_path, "movie")]
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path  # the scan left the retry handle alone
+    assert row.partial_delete_path == library_path
+
+
+async def test_a_cancelled_regrab_over_an_incomplete_delete_is_finished_not_stranded(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex P2: the re-armed branch assumes a re-grab is coming that will
+    re-place the missing files. When the user CANCELS that re-grab, no import
+    ever arrives -- and a ``cancelled`` + breadcrumb row is invisible to both
+    candidate assembly and the ``evicted`` resume enumeration, so the unplayable
+    remains would sit there forever. Recovery finishes the eviction instead, on
+    disk truth: purge the remains and flip ``cancelled`` -> ``evicted``."""
+    root = tmp_path / "tv"
+    season_dir = root / "Cancelled Regrab" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "leftover-S01E04.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=492, title="Cancelled Regrab", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.cancelled  # re-armed, then cancelled by the user
+        season_row.partial_delete_path = str(season_dir)
+        await session.commit()
+        season_request_id = season_row.id
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()  # the stranded remains were reclaimed
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 492)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    assert season_row.status is RequestStatus.evicted  # disk truth over the aborted intent
+    assert season_row.library_path is None
+    assert season_row.partial_delete_path is None
+    assert len(history) == 1
+
+
+async def test_an_untouched_failed_delete_disarms_the_incomplete_delete_marker(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The disarm half of the arm-before-delete protocol: a delete that provably
+    removed NOTHING (the filesystem guard refused it) leaves media that is still
+    exactly as watchable as it was, so the row is restored AND the marker armed
+    with the claim must come back off -- otherwise every later recovery of this
+    row would take the force-purge branch over intact media."""
+    outside = tmp_path / "not-a-root" / "Refused.mkv"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"0" * 1024)
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=493, title="Refused", library_path=str(outside)
+    )
+    movies_root = tmp_path / "movies"
+    movies_root.mkdir(exist_ok=True)
+
+    candidate = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Refused",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=str(outside),
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=493, size_bytes=1024
+    )
+    fs = LocalFileSystem(library_roots=[str(movies_root)])  # the path is OUTSIDE it
+    async with sessionmaker_() as session:
+        outcome = await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+            session=session,
+            fs=fs,
+            library=FakeLibrary(
+                watch_states={(493, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
+            candidate=candidate,
+            pending=pending,
+            grace_cutoff=_GRACE_CUTOFF,
+        )
+
+    assert outcome is None
+    assert outside.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.available  # restored: the tree is provably intact
+    assert row.partial_delete_path is None  # and the marker is disarmed with it
+
+
 async def test_tv_purge_registration_stays_held_until_eviction_finalizes(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5118,6 +5932,66 @@ async def test_sweep_recovers_a_rearmed_pending_season_when_its_file_still_exist
     assert show is not None and show.status is RequestStatus.available
 
 
+async def test_sweep_does_not_fold_a_rearmed_season_whose_tree_was_partly_deleted(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #482's re-armed twin: the re-request landed while the purge was
+    part-way through, so the breadcrumb's directory still stats but its episodes
+    are gone. Folding to 'available' here is doubly wrong -- it calls an
+    unplayable season watchable AND cancels the re-grab that is fetching exactly
+    the files that left.
+
+    The row keeps its re-grab -- and recovery FINISHES the interrupted purge
+    (Codex round-4 P1) rather than leaving the remains for the import to
+    overwrite, which it is not allowed to do (see the blocked-import test
+    below). The breadcrumb is released by the finalize, the marker is retired,
+    and the status is untouched so the replacement search proceeds."""
+    root = tmp_path / "tv"
+    season_dir = root / "Rearmed Partial" / "Season 01"
+    season_dir.mkdir(parents=True)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=653, title="Rearmed Partial", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.pending  # the crash-window re-arm
+        # What _evict_one arms on the row before its rmtree ate the episodes and
+        # then failed on the season directory itself -- DURABLE, on the claim row.
+        season_row.partial_delete_path = str(season_dir)
+        await session.commit()
+        season_id = season_row.id
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.pending  # the re-grab survives, never folded
+    assert not season_dir.exists()  # the remains are cleared so the replacement can land
+    assert season_row.library_path is None  # finalized: nothing left to reclaim
+    assert season_row.partial_delete_path is None  # the marker is retired with the tree
+
+
 async def test_sweep_releases_the_breadcrumb_of_a_rearmed_season_whose_file_is_gone(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
@@ -6358,3 +7232,580 @@ async def test_watch_state_absent_before_claim_fails_closed(
         row = await session.get(MediaRequest, request_id)
         assert row is not None
         assert row.status is RequestStatus.available
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-3 P2s on the recovery path: it must refresh Plex after a retry
+# that destroyed more of the tree, and it must re-check the ride-along coverage
+# claim the NORMAL path checks post-claim/pre-delete before force-purging.
+# --------------------------------------------------------------------------- #
+async def test_recovery_refreshes_plex_when_a_retry_is_still_partial(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex round-3 P2: an armed marker means a destructive delete began and was
+    never shown to have left the tree intact -- most sharply after a CRASH, where
+    the original attempt never reached any scan at all. When the recovery retry
+    removes more entries and still reports ``partial``, the claim and breadcrumb
+    are rightly kept for the next sweep, but Plex is still advertising files that
+    are now gone; without a refresh users hit playback failures on them. Same
+    best-effort posture as ``_evict_one``'s direct partial-outcome branch."""
+    library_path = _movie_file(tmp_path, "Partial Recovery Scan.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4951,
+        title="Partial Recovery Scan",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path  # armed before the interrupted delete
+        await session.commit()
+
+    async def _still_partial(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _still_partial)
+
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path / "movies"),
+            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert library.scan_calls == [(library_path, "movie")]
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    # The scan changes nothing about the retry handle: claim, breadcrumb and
+    # marker all survive for the next sweep.
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_defers_the_force_purge_while_a_pack_holds_a_coverage_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex round-3 P2: the marker is armed and COMMITTED before ``_evict_one``
+    runs its authoritative post-claim ``find_active_coverage_title`` guard. A
+    ride-along pack whose claim lands in that gap is normally rescued by that
+    guard (the claim is released, nothing is deleted) -- but if the process exits
+    right after the marker commit, the guard never runs and recovery would see the
+    armed marker and force-purge a season the pack is actively fetching.
+
+    Recovery must therefore re-check coverage too, and DEFER (never restore: the
+    tree cannot be shown complete) until the pack settles."""
+    root = tmp_path / "tv"
+    season_dir = root / "Ride Along Recovery" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Ride.Along.Recovery.S01E01.mkv").write_bytes(b"0" * 1024)
+    show_id, season_request_id = await _armed_evicted_season(
+        sessionmaker_, tmdb_id=4952, title="Ride Along Recovery", season_dir=season_dir
+    )
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="ride-along-recovery-pack",
+            status="downloading",
+            media_request_id=show_id,
+            season=5,  # the pack's own scope; season 1 is a scopeless ride-along
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert season_dir.exists(), "recovery must not delete a season a live pack is fetching"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 4952)))
+            .scalars()
+            .all()
+        )
+    assert season_row is not None
+    # Deferred, not finalized and not restored: the claim, its breadcrumb and its
+    # marker all stand, so the next sweep re-decides once the pack settles.
+    assert season_row.status is RequestStatus.evicted
+    assert season_row.library_path == str(season_dir)
+    assert season_row.partial_delete_path == str(season_dir)
+    assert history == []
+
+
+async def test_a_cancelled_regrabs_remains_are_left_alone_while_a_pack_covers_the_season(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The re-armed twin of the coverage defer above: the cancelled-re-grab branch
+    finishes an incomplete delete precisely because no import is coming -- but a
+    scopeless ride-along pack IS an import coming, and it is mid-transfer over
+    this very season. Defer to it rather than deleting under it."""
+    root = tmp_path / "tv"
+    season_dir = root / "Covered Cancelled Regrab" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "leftover-S01E04.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=4953, title="Covered Cancelled Regrab", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.cancelled
+        season_row.partial_delete_path = str(season_dir)
+        season_request_id = season_row.id
+        download = Download(
+            torrent_hash="covered-cancelled-pack",
+            status="downloading",
+            media_request_id=show_id,
+            season=5,
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=show_id,
+                season_number=1,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert season_dir.exists(), "the pack's in-flight season must not be deleted under it"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.cancelled  # untouched, re-decided next sweep
+    assert season_row.library_path == str(season_dir)
+    assert season_row.partial_delete_path == str(season_dir)
+
+
+async def test_a_cancelled_regrabs_failed_retry_keeps_the_breadcrumb_and_refreshes_plex(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-armed twin of the recovery refresh: when the cancelled-re-grab
+    retry cannot clear the remains either, the breadcrumb and marker stay for the
+    next sweep -- and Plex is refreshed best-effort, because whatever the
+    interrupted original delete DID remove is still being advertised."""
+    root = tmp_path / "tv"
+    season_dir = root / "Stubborn Cancelled Regrab" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "leftover-S01E04.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=4954,
+        title="Stubborn Cancelled Regrab",
+        seasons={1: str(season_dir)},
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.cancelled
+        season_row.partial_delete_path = str(season_dir)
+        season_request_id = season_row.id
+        await session.commit()
+
+    async def _still_failing(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.error, 0, "PermissionError")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _still_failing)
+
+    library = FakeLibrary()
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert library.scan_calls == [(str(season_dir), "tv")]
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.cancelled  # never folded to 'available'
+    assert season_row.library_path == str(season_dir)
+    assert season_row.partial_delete_path == str(season_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-4 P1: an incomplete purge's remnants BLOCK the replacement import
+# (deterministic destinations + a filesystem that refuses to overwrite), so the
+# marker's owner must finish its own purge rather than delegate it to an import
+# that is not allowed to do it.
+# --------------------------------------------------------------------------- #
+async def _rearmed_partial_season(
+    sm: SessionMaker, *, tmdb_id: int, title: str, season_dir: Path, status: RequestStatus
+) -> int:
+    """Seed the shape an incomplete purge leaves on a RE-ARMED season: ``status``
+    + breadcrumb + an ARMED marker, over a directory still holding a leftover
+    episode. Returns the season_request id."""
+    show_id = await _show_with_seasons(
+        sm, tmdb_id=tmdb_id, title=title, seasons={1: str(season_dir)}
+    )
+    async with sm() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = status
+        season_row.partial_delete_path = str(season_dir)
+        await session.commit()
+        return season_row.id
+
+
+async def test_recovery_clears_remnants_that_would_block_the_replacement_import(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Codex round-4 P1, the stuck scenario end to end. A partial purge leaves an
+    old episode file at the deterministic destination the replacement import will
+    use, and ``LocalFileSystem.hardlink_or_copy`` REFUSES to overwrite a different
+    file -- so waiting for that import to "re-place the tree" cannot work: it
+    fails, the season lands ``import_blocked``, and nothing retries the purge.
+
+    Proven in order: the placement genuinely refuses over the remains, the
+    recovery pass finishes the purge, and the same placement then succeeds."""
+    root = tmp_path / "tv"
+    season_dir = root / "Blocked By Remnants" / "Season 01"
+    season_dir.mkdir(parents=True)
+    leftover = season_dir / "Blocked.By.Remnants.S01E01.mkv"
+    leftover.write_bytes(b"old" * 512)  # the un-deleted remainder
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4961,
+        title="Blocked By Remnants",
+        season_dir=season_dir,
+        status=RequestStatus.pending,  # the crash-window re-arm, still pre-grab
+    )
+    replacement = tmp_path / "downloads" / "Blocked.By.Remnants.S01E01.mkv"
+    replacement.parent.mkdir(parents=True)
+    replacement.write_bytes(b"new" * 512)  # DIFFERENT content -- the whole point
+
+    fs = LocalFileSystem(library_roots=[str(root)])
+    with pytest.raises(FileExistsError):
+        # The premise: the import cannot clear the remains for us.
+        fs.hardlink_or_copy(replacement, leftover, root=root)
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()  # the marker's owner finished its own purge
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.pending  # the re-grab is untouched
+    assert season_row.library_path is None
+    assert season_row.partial_delete_path is None
+    # ...and the placement that could not run before now converges.
+    season_dir.mkdir(parents=True)
+    fs.hardlink_or_copy(replacement, leftover, root=root)
+    assert leftover.read_bytes() == b"new" * 512
+
+
+async def test_recovery_unblocks_a_season_whose_import_already_hit_the_remnants(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The other half of the same deadlock: if the replacement import raced ahead
+    of the sweep it is ALREADY ``import_blocked`` -- a status no enumeration
+    covered, so the purge was never retried and every operator retry hit the same
+    conflict forever (a terminal, which north star 1 forbids). A blocked season
+    whose marker is armed is now adjudicated: the remains are cleared and the row
+    keeps its surfaced, retryable status -- over a clean directory this time."""
+    root = tmp_path / "tv"
+    season_dir = root / "Already Blocked" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Already.Blocked.S01E01.mkv").write_bytes(b"0" * 1024)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4962,
+        title="Already Blocked",
+        season_dir=season_dir,
+        status=RequestStatus.import_blocked,
+    )
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    # NOT folded to 'available' and NOT flipped to 'evicted': the import is still
+    # the pending, correctable action -- it can just succeed now.
+    assert season_row.status is RequestStatus.import_blocked
+    assert season_row.library_path is None
+    assert season_row.partial_delete_path is None
+
+
+async def test_a_plain_import_blocked_season_is_never_touched_by_recovery(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The gate on that new enumeration: ``import_blocked`` with NO armed marker
+    is an ordinary import conflict of its own -- someone else's file at the
+    destination, a bad release. None of this pass's business, and emphatically not
+    a licence to delete the directory or fold the row to 'available'."""
+    root = tmp_path / "tv"
+    season_dir = root / "Ordinary Conflict" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Ordinary.Conflict.S01E01.mkv").write_bytes(b"0" * 1024)
+    show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=4963, title="Ordinary Conflict", seasons={1: str(season_dir)}
+    )
+    async with sessionmaker_() as session:
+        season_row = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        season_row.status = RequestStatus.import_blocked  # no marker armed
+        await session.commit()
+        season_request_id = season_row.id
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert season_dir.exists()  # untouched
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.import_blocked
+    assert season_row.library_path == str(season_dir)
+
+
+async def test_recovery_skips_the_purge_when_an_import_retired_the_marker_first(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The TOCTOU the new force-purge opens and must close: the enumeration reads
+    the marker armed, then a replacement import COMMITS -- re-stamping
+    ``library_path`` and retiring the marker in that same commit -- before the
+    retry runs. Purging off the stale snapshot would delete the content that
+    import just placed. The retry re-reads the row and stands down instead."""
+    root = tmp_path / "tv"
+    season_dir = root / "Imported Mid Recovery" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Imported.Mid.Recovery.S01E01.mkv").write_bytes(b"0" * 1024)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4964,
+        title="Imported Mid Recovery",
+        season_dir=season_dir,
+        status=RequestStatus.pending,
+    )
+
+    real_coverage = eviction_service._coverage_claim_active  # pyright: ignore[reportPrivateUsage]
+
+    async def _import_lands_first(session: AsyncSession, pending: object) -> bool:
+        """Stand in for the replacement import committing during the awaited
+        coverage probe -- the last await before the retry re-reads the row."""
+        async with sessionmaker_() as importer:
+            row = await importer.get(SeasonRequest, season_request_id)
+            assert row is not None
+            row.partial_delete_path = None  # what ``set_library_path`` does on placement
+            await importer.commit()
+        return await real_coverage(session, pending)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(eviction_service, "_coverage_claim_active", _import_lands_first)
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert season_dir.exists(), "the freshly imported season must not be purged"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.library_path == str(season_dir)  # the import's own breadcrumb stands
+
+
+async def test_a_partial_delete_rebaselines_before_the_next_SELECTED_victim(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex round-4 P1: the re-baseline used to run only on the way into the
+    EXTRA pool, so when the domain selected two victims up front and the first
+    one's partial delete already reached the target, the second was still deleted
+    -- a watched title lost for nothing, against a snapshot that predated the
+    destruction. The re-stat has to happen before the next selected victim too."""
+    # Sized so the ESTIMATE needs BOTH: 95% used against a 70% target is a 25pp
+    # gap, and neither 16% nor 14% closes it alone -- so ``select_evictions``
+    # takes both up front and the extra pool is empty. Only a mid-prefix re-stat
+    # can spare the second one.
+    first_path = _movie_file(tmp_path, "Half Eaten First (160b).mkv", size=160)
+    second_path = _movie_file(tmp_path, "Should Be Spared (140b).mkv", size=140)
+    older_stale = _STALE - timedelta(days=5)  # the stalest -- selected FIRST
+    await _movie(
+        sessionmaker_, tmdb_id=4971, title="Half Eaten First (160b)", library_path=first_path
+    )
+    await _movie(
+        sessionmaker_, tmdb_id=4972, title="Should Be Spared (140b)", library_path=second_path
+    )
+
+    readings = iter(
+        [
+            DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=50),  # 95% used
+            # The re-baseline probe after the FIRST victim's partial delete: it
+            # really did free space, just an unmeasurable amount.
+            DiskUsage(root=str(tmp_path), total_bytes=1000, available_bytes=500),  # 50% used
+        ]
+    )
+
+    def _fake_disk_usage(_path: str) -> DiskUsage:
+        return next(readings)
+
+    monkeypatch.setattr(eviction_service, "read_disk_usage", _fake_disk_usage)
+
+    async def _partial_for_first(
+        _fs: object, path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        if path == first_path:
+            return PurgeResult(
+                PurgeOutcome.partial, 0, "partially deleted before failing (OSError)"
+            )
+        return PurgeResult(PurgeOutcome.deleted, 140)  # pragma: no cover - must never run
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_for_first)
+
+    library = FakeLibrary(
+        watch_states={
+            (4971, "movie", None): WatchState(watched=True, last_viewed_at=older_stale),
+            (4972, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=90.0,
+            target_pct=70.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    # The first frees enough for real (95% -> 50%), and only the mid-prefix
+    # re-stat can see it -- the running freed total stays 0 for a partial delete.
+    assert [(o.title, o.partial) for o in outcomes] == [("Half Eaten First (160b)", True)]
+    assert next(readings, None) is None  # both readings consumed: the re-probe happened
+    async with sessionmaker_() as session:
+        spared = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 4972)))
+            .scalars()
+            .one()
+        )
+    assert spared.status is RequestStatus.available  # never claimed
+    assert Path(second_path).exists()  # never deleted

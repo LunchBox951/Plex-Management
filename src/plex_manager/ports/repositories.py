@@ -61,6 +61,14 @@ class RequestRecord(BaseModel):
     # ``None`` until import/availability time sets it (or for a tv rollup row,
     # where the breadcrumb lives per-season on ``SeasonRequestRecord`` instead).
     library_path: str | None = None
+    # The DURABLE incomplete-delete marker (issues #482 / #485): the path a
+    # destructive delete of this row's media was started against and has not been
+    # proven to have left intact. Non-``None`` AND equal to ``library_path`` means
+    # the media at that path must never be treated as complete/watchable — eviction
+    # recovery routes such a row through retry/converge instead of restoring it to
+    # ``available``. See ``MediaRequest.partial_delete_path``'s docstring for the
+    # arm/disarm protocol.
+    partial_delete_path: str | None = None
     # WHEN this request's import finalized (``mark_completed``) / became
     # watchable (``mark_available``) -- i.e. the instant "Finalizing" began.
     # ``None`` for a request that has never imported. The bounded-Finalizing
@@ -226,6 +234,9 @@ class SeasonRequestRecord(BaseModel):
     # The per-season mirror of ``RequestRecord.library_path`` (ADR-0012): the
     # final placed path this season's import wrote into, ``None`` until set.
     library_path: str | None = None
+    # The per-season mirror of ``RequestRecord.partial_delete_path`` (issues #482 /
+    # #485). See ``SeasonRequest.partial_delete_path``'s docstring.
+    partial_delete_path: str | None = None
     installed_quality_id: int | None = None
     installed_profile_index: int | None = None
     # Auto-grab scheduling (ADR-0013): the per-season mirror of

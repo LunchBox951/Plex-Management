@@ -33,11 +33,34 @@ a terminal):
   (the content comes back), which is why no recycle bin is needed for the beta.
 
   Ordering rationale (ADR-0014 race fix): steps (c)/(d) are IRREVERSIBLE, so the
-  slot claim (b) runs first and is committed atomically WITH them -- SQLite
-  serializes writers, so once (b)'s flush holds the slot no competitor can commit a
-  conflicting active row before this transaction's own commit, and the earlier bug
-  (the claim happening AFTER the purge, letting a concurrent re-request's collision
-  roll the DB back while the deletions stood) cannot recur.
+  slot claim (b) runs -- and COMMITS -- first, together with the durable
+  incomplete-delete marker over the breadcrumb it is about to purge (issues #482 /
+  #485). A concurrent re-request's collision therefore lands at (b) with nothing yet
+  deleted (the earlier bug: the claim happened AFTER the purge, letting the collision
+  roll the DB back while the deletions stood), and -- because the claim is durable
+  rather than merely flushed -- an INTERRUPTION during (c)/(d) can no longer roll it
+  back either, which would resurrect the pre-correction ``available`` row over files
+  a partly-finished delete had already gutted. From (b)'s commit onward this row
+  itself holds ``uq_media_requests_active``, so no competitor can take the slot while
+  the irreversible steps run and the final commit at (f) still cannot collide.
+
+  That same commit publishes an EAGER, re-searchable ``searching`` scope before
+  (c)/(d) have run, so the whole (b)->(d) stretch also holds an in-process PURGE
+  CLAIM over the breadcrumb (``purge_service.begin_purge``, taken BEFORE that
+  commit -- the row becomes visible to other connections DURING the awaited
+  commit, so a claim taken after it would leave a real published-but-unclaimed
+  window -- and released in a ``finally`` at the purge boundary). Without it the
+  auto-grab worker could grab a
+  replacement mid-stretch and -- with a same-hash attach making the import
+  near-instant -- have it PLACED into the very tree (d) is about to delete, so the
+  correction would eat its own replacement. The claim closes that with the
+  registry's existing ordering rule (``begin_placement`` refuses an import into a
+  claimed path) and keeps the scope out of auto-grab's due set for exactly that
+  window -- released for EVERY outcome, clean or partial, because the replacement
+  search is the point of the verb. Deliberately NOT keyed on the durable
+  incomplete-delete marker: that marker records a DISK fact which outlives the
+  process and stays armed after a partial delete precisely so a replacement can be
+  fetched, whereas this window ends with the coroutine that owns it.
 
   Hardlink caveat (ADR-0014): a same-filesystem import hardlinks the library file
   to the download client's seed copy, so purging the library file ALONE frees
@@ -977,102 +1000,212 @@ async def report_issue(
     # AUTHORITATIVE guard for a sibling appearing in the check->claim gap. The breadcrumb
     # is deliberately KEPT here (``clear_library_path=False``): ``purge_ok`` is not known
     # until (d), which clears it only if the file was actually removed.
+    #
+    # This block COMMITS (blocklist + re-arm + sibling rescue + the incomplete-delete
+    # marker) before returning, so the claim is durable rather than merely flushed
+    # once the irreversible steps start -- see the marker comment below for why. The
+    # commit does not weaken the collision guard: the slot is now held by a COMMITTED
+    # active row of ours, so a competitor cannot take it while (c)-(f) run, whereas
+    # before it was held only by SQLite's writer lock.
+    # HOLD a purge claim over the tree for the WHOLE destructive stretch below
+    # (Codex round-3 P1), not just around the ``purge_library_path`` call at (d)
+    # that takes one of its own. The claim at (b) publishes an EAGER ``searching``
+    # scope: the auto-grab worker selects exactly those, and a same-hash attach can
+    # make a replacement's import near-instant -- so a replacement could be
+    # grabbed, imported into this very path, and RELEASE its placement
+    # registration again before (d) runs, after which (d)'s recursive delete would
+    # eat the freshly imported replacement. The claim closes that with the
+    # registry's existing ordering rule: ``begin_placement`` refuses an import into
+    # a claimed path (honestly retried on the next import cycle), and auto-grab
+    # keeps a scope whose breadcrumb is under a claim out of its due set for the
+    # same span (see ``auto_grab_service._under_active_purge``).
+    #
+    # Taken BEFORE the commit below, not after it (Codex round-4 P1): the risky
+    # interleaving is not after the ``await`` returns, it is DURING it. The commit
+    # makes ``searching`` visible to every other connection while this coroutine is
+    # still suspended inside that await, so another task can read the published
+    # row, run a fast placement to completion and release its placement
+    # registration -- all before a post-commit ``begin_purge`` could ever run.
+    # Claiming first means the window between "published" and "claimed" does not
+    # exist at all. The ``finally`` releases it for EVERY exit, including the
+    # collision that rolls the whole claim back (so no claim is leaked over a path
+    # this verb is no longer going to touch) and every outcome of (d), clean or
+    # partial -- nothing after (d) is destructive, and holding it longer would
+    # suppress the replacement search this correction exists to run.
+    purge_claim = target.library_path
+    if purge_claim is not None:
+        purge_service.begin_purge(purge_claim)
     try:
-        if is_tv and target.season is not None:
-            await season_request_service.reset_for_research(
-                session,
-                media_request_id=request_id,
-                season_number=target.season,
-                clear_library_path=False,
-            )
-        else:
-            await request_repo.reset_for_research(request_id, clear_library_path=False)
-
-        # Rescue any sibling season(s) of a shared multi-season pack BEFORE the
-        # torrent-with-data removal at (c) below deletes their payload out from
-        # under them (issue #175) -- inside this try/except so a collision here
-        # rolls back everything (blocklist + partial re-arm + rescue) with
-        # NOTHING yet deleted, same as the target re-arm above.
-        if culprit is not None:
-            await _rescue_shared_pack_siblings(
-                session,
-                culprit,
-                reported_request_id=request_id,
-                reported_season=target.season,
-                log_extra=log_extra,
-            )
-    except IntegrityError as exc:
-        # The re-arm collided on ``uq_media_requests_active`` -- a newer active sibling
-        # grabbed the slot between the upfront check and this flush. Roll back (undoing
-        # the blocklist + partial re-arm) so NOTHING is left half-written, then surface
-        # the honest 409. Re-read the sibling for the error's id (best-effort -- it is
-        # informational; the endpoint keys only on the type).
-        await session.rollback()
-        sibling = await request_repo.find_active(request.tmdb_id, request.media_type)
-        raise ActiveDuplicateError(
-            request_id,
-            sibling.id if sibling is not None and sibling.id != request_id else request_id,
-        ) from exc
-
-    # (c) remove the culprit torrent WITH data (best-effort) -- the hardlink caveat
-    # means this must go too, not just the library file. The FIRST irreversible step,
-    # so it runs only AFTER the slot claim (b) succeeded.
-    if culprit is not None:
-        await purge_service.remove_torrent(
-            qbt,
-            culprit.torrent_hash,
-            context="a report-issue",
-            extra={"torrent_hash": culprit.torrent_hash, **log_extra},
-        )
-
-    # (d) purge the library file via the shared root-guarded primitive. ``purge_ok``
-    # tracks whether the file was ACTUALLY removed: only then is the ``library_path``
-    # breadcrumb cleared (the claim at (b) kept it). On ``error`` (a genuine delete
-    # failure -- permissions, transient I/O, a partial rmtree) or ``refused`` (out-of-
-    # root breadcrumb) the file may still be on disk, so the breadcrumb is PRESERVED --
-    # it is the only handle a later retry / eviction has to reclaim the orphan; losing
-    # it would strand the bad file with no way to purge it (honesty over silence).
-    purge_ok = True
-    if target.library_path is not None:
-        purge = await purge_service.purge_library_path(fs, target.library_path)
-        if purge.outcome is PurgeOutcome.refused:
-            purge_ok = False
-            _logger.warning(
-                "report-issue purge of %r refused by the filesystem guard (%s); "
-                "re-searching anyway but keeping the breadcrumb (a stale/misconfigured path)",
-                safe_text(request.title),
-                purge.detail,
-                extra=log_extra,
-            )
-        elif purge.outcome in {PurgeOutcome.error, PurgeOutcome.deferred}:
-            purge_ok = False
-            _logger.warning(
-                "report-issue purge of %r failed (%s); re-searching anyway but keeping "
-                "the breadcrumb so the orphaned file stays reclaimable",
-                safe_text(request.title),
-                purge.detail,
-                extra=log_extra,
-            )
-        if purge_ok:
-            # The file was actually removed, so drop the now-dangling breadcrumb the
-            # claim at (b) preserved. A targeted clear (never a second re-arm) -- the
-            # status/backoff were already set at (b), and clearing library_path is not a
-            # status transition, so it never re-touches ``uq_media_requests_active``.
+        try:
             if is_tv and target.season is not None:
-                await season_request_service.clear_library_path(
-                    session, media_request_id=request_id, season_number=target.season
+                await season_request_service.reset_for_research(
+                    session,
+                    media_request_id=request_id,
+                    season_number=target.season,
+                    clear_library_path=False,
                 )
             else:
-                await request_repo.clear_library_path(request_id)
-    else:
-        # No breadcrumb (a title recorded available straight from Plex, or one
-        # predating the library_path column): nothing of ours to delete -- honest,
-        # never a guessed path, and the re-search below still runs.
-        _logger.warning(
-            "report-issue: no stored library_path for %r; nothing to purge",
-            safe_text(request.title),
-            extra=log_extra,
-        )
+                await request_repo.reset_for_research(request_id, clear_library_path=False)
+
+            # Rescue any sibling season(s) of a shared multi-season pack BEFORE the
+            # torrent-with-data removal at (c) below deletes their payload out from
+            # under them (issue #175) -- inside this try/except so a collision here
+            # rolls back everything (blocklist + partial re-arm + rescue) with
+            # NOTHING yet deleted, same as the target re-arm above.
+            if culprit is not None:
+                await _rescue_shared_pack_siblings(
+                    session,
+                    culprit,
+                    reported_request_id=request_id,
+                    reported_season=target.season,
+                    log_extra=log_extra,
+                )
+
+            # ARM the row's durable incomplete-delete marker (issues #482 / #485) here,
+            # in the claim's OWN transaction, and COMMIT before the first irreversible
+            # step below -- exactly the protocol the eviction sweep follows.
+            #
+            # Arming it later (just before the purge at (d)) would only be a flush, and
+            # this function's first commit is at (f), AFTER the purge. An interruption
+            # in between -- the request cancelled, the worker killed, the process dead
+            # mid-``rmtree`` -- unwinds without ever reaching (f), so the whole claim
+            # AND its marker roll back while the delete that already ate into the tree
+            # does not. The row would come back as pre-correction ``available`` +
+            # breadcrumb with nothing recording the incomplete delete: eviction's
+            # re-armed-season recovery then stats the surviving directory, reads "still
+            # there" as "still complete", and republishes a season missing episodes as
+            # watchable. Committing first inverts that failure: an interruption leaves
+            # the claim standing WITH the marker armed, which is the honest default
+            # (recovery routes it through retry/converge, never restore), and the marker
+            # is retired again at (d) by any outcome that proves the tree intact-or-gone.
+            #
+            # This is also why the marker is armed for the WHOLE destructive stretch,
+            # not just around the library purge: (c) removes the culprit torrent WITH
+            # data, and a hardlinked library file shares those inodes, so an interrupted
+            # correction between (c) and (d) is a delete this row has started too.
+            if target.library_path is not None:
+                if is_tv and target.season is not None:
+                    await season_request_service.set_partial_delete_path(
+                        session,
+                        media_request_id=request_id,
+                        season_number=target.season,
+                        library_path=target.library_path,
+                    )
+                else:
+                    await request_repo.set_partial_delete_path(request_id, target.library_path)
+            await session.commit()
+        except IntegrityError as exc:
+            # The re-arm collided on ``uq_media_requests_active`` -- a newer active sibling
+            # grabbed the slot between the upfront check and this flush (or the commit that
+            # follows it, which is the same collision surfaced later). Roll back (undoing
+            # the blocklist + partial re-arm) so NOTHING is left half-written, then surface
+            # the honest 409. Re-read the sibling for the error's id (best-effort -- it is
+            # informational; the endpoint keys only on the type).
+            await session.rollback()
+            sibling = await request_repo.find_active(request.tmdb_id, request.media_type)
+            raise ActiveDuplicateError(
+                request_id,
+                sibling.id if sibling is not None and sibling.id != request_id else request_id,
+            ) from exc
+
+        # (c) remove the culprit torrent WITH data (best-effort) -- the hardlink caveat
+        # means this must go too, not just the library file. The FIRST irreversible step,
+        # so it runs only AFTER the slot claim (b) succeeded.
+        if culprit is not None:
+            await purge_service.remove_torrent(
+                qbt,
+                culprit.torrent_hash,
+                context="a report-issue",
+                extra={"torrent_hash": culprit.torrent_hash, **log_extra},
+            )
+
+        # (d) purge the library file via the shared root-guarded primitive. ``purge_ok``
+        # tracks whether the file was ACTUALLY removed: only then is the ``library_path``
+        # breadcrumb cleared (the claim at (b) kept it). On ``error`` (a genuine delete
+        # failure -- permissions, transient I/O), ``partial`` (a tree the rmtree ate into
+        # before failing, #482) or ``refused`` (out-of-root breadcrumb), files may still be
+        # on disk, so the breadcrumb is PRESERVED -- it is the only handle a later retry /
+        # eviction has to reclaim the orphan; losing it would strand the bad file with no
+        # way to purge it (honesty over silence).
+        #
+        # The row's durable incomplete-delete marker (issues #482 / #485) is ALREADY
+        # armed and committed at (b), covering this purge and the torrent removal above.
+        # Report-issue keeps its breadcrumb over a PRE-GRAB row, which is a shape
+        # eviction's crash-recovery pass enumerates and -- absent that marker -- folds
+        # back to ``available`` off a bare ``os.stat`` of the surviving directory. If
+        # this purge ate into the tree first, that fold publishes a season missing
+        # episodes as fully watchable AND cancels the replacement search that was going
+        # to restore it. The marker is cleared again below for every outcome that PROVES
+        # the tree needs no further reclaiming, so only a genuinely incomplete delete
+        # (or an interruption, which never reaches these clears at all) leaves it up.
+        purge_ok = True
+        if target.library_path is not None:
+            purge = await purge_service.purge_library_path(fs, target.library_path)
+            if purge.outcome is not PurgeOutcome.partial:
+                # Every other outcome establishes the tree's state: it is fully gone
+                # (``deleted``), or nothing left disk at all (``refused`` / ``error``
+                # with the up-front inventory intact / ``deferred``, decided before any
+                # destructive work). Retire the marker so recovery treats the row
+                # exactly as it did before this correction ran.
+                if is_tv and target.season is not None:
+                    await season_request_service.clear_partial_delete_path(
+                        session, media_request_id=request_id, season_number=target.season
+                    )
+                else:
+                    await request_repo.clear_partial_delete_path(request_id)
+            if purge.outcome is PurgeOutcome.refused:
+                purge_ok = False
+                _logger.warning(
+                    "report-issue purge of %r refused by the filesystem guard (%s); "
+                    "re-searching anyway but keeping the breadcrumb (a stale/misconfigured path)",
+                    safe_text(request.title),
+                    purge.detail,
+                    extra=log_extra,
+                )
+            elif purge.outcome is PurgeOutcome.partial:
+                purge_ok = False
+                _logger.warning(
+                    "report-issue purge of %r deleted only PART of the tree before failing "
+                    "(%s); re-searching anyway and KEEPING the breadcrumb -- it is the only "
+                    "handle a retry has on the remains -- and RECORDING the incomplete "
+                    "delete on the row so recovery cannot fold the remains back to "
+                    "'available'",
+                    safe_text(request.title),
+                    purge.detail,
+                    extra=log_extra,
+                )
+            elif purge.outcome in {PurgeOutcome.error, PurgeOutcome.deferred}:
+                purge_ok = False
+                _logger.warning(
+                    "report-issue purge of %r failed (%s); re-searching anyway but keeping "
+                    "the breadcrumb so the orphaned file stays reclaimable",
+                    safe_text(request.title),
+                    purge.detail,
+                    extra=log_extra,
+                )
+            if purge_ok:
+                # The file was actually removed, so drop the now-dangling breadcrumb the
+                # claim at (b) preserved. A targeted clear (never a second re-arm) -- the
+                # status/backoff were already set at (b), and clearing library_path is not a
+                # status transition, so it never re-touches ``uq_media_requests_active``.
+                if is_tv and target.season is not None:
+                    await season_request_service.clear_library_path(
+                        session, media_request_id=request_id, season_number=target.season
+                    )
+                else:
+                    await request_repo.clear_library_path(request_id)
+        else:
+            # No breadcrumb (a title recorded available straight from Plex, or one
+            # predating the library_path column): nothing of ours to delete -- honest,
+            # never a guessed path, and the re-search below still runs.
+            _logger.warning(
+                "report-issue: no stored library_path for %r; nothing to purge",
+                safe_text(request.title),
+                extra=log_extra,
+            )
+    finally:
+        if purge_claim is not None:
+            purge_service.end_purge(purge_claim)
 
     # (e) trigger a Plex scan so the removed item drops out of the library.
     if target.library_path is not None:
@@ -1084,11 +1217,13 @@ async def report_issue(
             extra=log_extra,
         )
 
-    # (f) audit history row + commit. The blocklist (a), slot claim (b), breadcrumb
-    # clear (d) and this audit row all commit TOGETHER: because SQLite serializes
-    # writers, once (b)'s flush holds the slot no competitor can commit a conflicting
-    # active row before this commit, so the commit cannot fail on the dedup index after
-    # the irreversible (c)/(d) already ran.
+    # (f) audit history row + commit. The blocklist (a) and slot claim (b) already
+    # committed at (b) (they have to: the destructive (c)/(d) must never be able to
+    # run with the claim still rollback-able -- see the marker comment there), so
+    # this commit carries (d)'s breadcrumb/marker clears and this audit row. It still
+    # cannot fail on the dedup index after the irreversible (c)/(d) already ran: our
+    # own row holds ``uq_media_requests_active`` in COMMITTED form from (b) onward,
+    # so no competitor can have taken the slot, and nothing here is a status change.
     session.add(
         DownloadHistory(
             tmdb_id=request.tmdb_id,

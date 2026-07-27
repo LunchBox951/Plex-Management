@@ -16,7 +16,11 @@ from typing import IO
 
 import pytest
 
-from plex_manager.adapters.filesystem import LocalFileSystem, LocalFileSystemError
+from plex_manager.adapters.filesystem import (
+    LocalFileSystem,
+    LocalFileSystemError,
+    PartialDeleteError,
+)
 from plex_manager.adapters.filesystem import local as local_fs
 from plex_manager.adapters.filesystem.local import (
     _EMPTY_LOCK_STALE_SECONDS,  # pyright: ignore[reportPrivateUsage]
@@ -2162,6 +2166,131 @@ def test_delete_traverses_execute_only_ancestors_like_pathname_unlink(
         assert not target.exists()
     finally:
         os.chmod(locked, 0o700)  # restore (owner-only) so pytest can clean tmp_path
+
+
+def test_delete_reports_a_partial_removal_when_the_tree_top_survives(tmp_path: Path) -> None:
+    """Issue #482: ``shutil.rmtree`` is NOT atomic -- it can remove children and
+    then raise, leaving a tree that still exists but is missing files. A caller
+    (eviction) reacts to that in the OPPOSITE way it reacts to a failure that
+    removed nothing, so the two must be distinguishable.
+
+    Reproduced deterministically against the real filesystem: a season directory
+    whose PARENT is read-only (``0o500`` -- listable and searchable, not
+    writable). ``rmtree`` empties the season fine and only the final ``rmdir``
+    of the season itself needs write permission on that parent, so every child
+    is really gone and the top really survives, on every entry ordering. The
+    retry afterwards proves the convergence the caller relies on: an
+    already-removed entry is an idempotent no-op, so re-purging the remains
+    succeeds once the obstruction clears."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    show = root / "Some Show"
+    season = show / "Season 01"
+    (season / "Specials").mkdir(parents=True)
+    episode = season / "Some Show - S01E01.mkv"
+    episode.write_bytes(b"x" * 100)
+    nested = season / "Specials" / "Some Show - S01E02.mkv"
+    nested.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    os.chmod(show, 0o500)  # the season's own rmdir needs write HERE; its contents do not
+    try:
+        with pytest.raises(PartialDeleteError, match="partially deleted before failing"):
+            fs.delete(os.fspath(season))
+        # The tree was genuinely eaten into: the media is no longer playable,
+        # which is exactly what the caller must not restore to 'available'.
+        assert not episode.exists()
+        assert not nested.exists()
+        assert season.is_dir()
+    finally:
+        os.chmod(show, 0o700)  # restore so the retry (and pytest's cleanup) can proceed
+
+    fs.delete(os.fspath(season))  # idempotent retry of the remains
+    assert not season.exists()
+
+
+def test_delete_propagates_an_untouched_failure_unchanged(tmp_path: Path) -> None:
+    """Issue #482's other side: a delete that failed having removed NOTHING must
+    keep raising its plain ``OSError``, never the partial signal -- the media is
+    still complete and still watchable, and the caller's restore-to-'available'
+    depends on that distinction being honest in BOTH directions.
+
+    A read-only season directory (``0o500``) is the deterministic shape: no entry
+    inside it can be unlinked, so ``rmtree`` fails on the very first one whatever
+    order it scans in, and the whole tree is provably intact afterwards."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    season = root / "Some Show" / "Season 01"
+    (season / "Specials").mkdir(parents=True)
+    episode = season / "Some Show - S01E01.mkv"
+    episode.write_bytes(b"x" * 100)
+    nested = season / "Specials" / "Some Show - S01E02.mkv"
+    nested.write_bytes(b"x" * 100)
+
+    fs = LocalFileSystem([os.fspath(root)])
+    os.chmod(season, 0o500)
+    try:
+        with pytest.raises(PermissionError) as raised:
+            fs.delete(os.fspath(season))
+        assert not isinstance(raised.value, PartialDeleteError)
+    finally:
+        os.chmod(season, 0o700)  # restore so pytest can clean tmp_path
+
+    assert episode.read_bytes() == b"x" * 100  # nothing was removed
+    assert nested.read_bytes() == b"x" * 100
+
+
+def test_delete_reports_partial_when_the_pre_inventory_walk_could_not_read_the_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An INCOMPLETE pre-removal inventory must never certify a failure as
+    "untouched": ``before <= after`` only proves nothing was removed when
+    ``before`` actually held everything the tree contained.
+
+    A nested directory unreadable at inventory time contributes only its own
+    entry (its children are never listed), so if access recovers before
+    ``shutil.rmtree`` runs -- a permission flap, or an operator fixing modes
+    mid-sweep -- the removal can unlink those children and still leave both
+    inventoried entries in place. The diff then reads as untouched over a tree
+    that really did lose files, and the caller restores it to 'available'."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    season = root / "Some Show" / "Season 01"
+    specials = season / "Specials"
+    specials.mkdir(parents=True)
+    nested = specials / "Some Show - S01E02.mkv"
+    nested.write_bytes(b"x" * 100)
+
+    real_rmtree = shutil.rmtree
+
+    class RecoveringRmtree:
+        """``shutil.rmtree`` with access to ``specials`` restored just before it
+        runs -- the flap ``delete``'s pre-inventory walk cannot see coming.
+        Carries ``avoids_symlink_attacks`` because ``delete`` gates on it."""
+
+        avoids_symlink_attacks = real_rmtree.avoids_symlink_attacks
+
+        def __call__(self, path: str, *, dir_fd: int | None = None) -> None:
+            os.chmod(specials, 0o700)
+            real_rmtree(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(shutil, "rmtree", RecoveringRmtree())
+
+    fs = LocalFileSystem([os.fspath(root)])
+    os.chmod(specials, 0o000)  # unlistable while the inventory is taken
+    os.chmod(season, 0o500)  # not writable, so removing 'Specials' itself still fails
+    try:
+        with pytest.raises(PartialDeleteError):
+            fs.delete(os.fspath(season))
+    finally:
+        os.chmod(season, 0o700)
+        os.chmod(specials, 0o700)
+
+    assert not nested.exists()  # a file really did leave, despite the equal diff
+    assert specials.is_dir()
 
 
 # --------------------------------------------------------------------------- #

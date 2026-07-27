@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
-from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSystemError
+from plex_manager.adapters.filesystem.local import (
+    LocalFileSystem,
+    LocalFileSystemError,
+    PartialDeleteError,
+)
 
-__all__ = ["LocalFileSystem", "LocalFileSystemError"]
+__all__ = ["LocalFileSystem", "LocalFileSystemError", "PartialDeleteError"]

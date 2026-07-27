@@ -1270,11 +1270,19 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
                     )
             else:
                 if evicted:
+                    # A PARTIAL eviction counts here -- the row is committed
+                    # ``evicted`` and files did leave -- but it is named
+                    # separately so the summary never implies a clean delete for
+                    # a title whose remains are still on disk awaiting the
+                    # recovery retry (issue #482, Codex round-4 P2).
+                    partial_count = sum(1 for outcome in evicted if outcome.partial)
                     _logger.info(
-                        "evicted %d %s title(s) from %s under disk pressure",
+                        "evicted %d %s title(s) from %s under disk pressure "
+                        "(%d only partially deleted; remains pending retry)",
                         len(evicted),
                         media_type,
                         root,
+                        partial_count,
                     )
                     publish_realtime(
                         app,

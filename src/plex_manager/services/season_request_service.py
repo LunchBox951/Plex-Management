@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "clear_library_path",
+    "clear_partial_delete_path",
     "ensure_seasons",
     "mark_available",
     "mark_completed",
@@ -59,6 +60,7 @@ __all__ = [
     "reset_for_research",
     "set_installed_quality",
     "set_library_path",
+    "set_partial_delete_path",
     "set_status",
     "set_status_if_in",
     "wake_waiting_for_air_date",
@@ -888,6 +890,39 @@ async def clear_library_path(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
     await season_repo.clear_library_path(row.id)
+
+
+async def set_partial_delete_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int, library_path: str
+) -> None:
+    """ARM one season's durable incomplete-delete marker (issues #482 / #485).
+
+    The ``(media_request_id, season_number)``-addressed analogue of
+    ``SqlSeasonRequestRepository.set_partial_delete_path``, for callers (report-issue)
+    that hold a season NUMBER rather than a row id. Resolves the row via the same
+    idempotent ``ensure()`` :func:`clear_library_path` uses, and is likewise NOT a
+    status transition, so it never re-touches the parent's active-dedup slot.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.set_partial_delete_path(row.id, library_path)
+
+
+async def clear_partial_delete_path(
+    session: AsyncSession, *, media_request_id: int, season_number: int
+) -> None:
+    """DISARM one season's incomplete-delete marker (issues #482 / #485) -- idempotent.
+
+    The counterpart of :func:`set_partial_delete_path`; see
+    ``SqlSeasonRequestRepository.clear_partial_delete_path``.
+    """
+    season_repo = SqlSeasonRequestRepository(session)
+    row = await season_repo.ensure(
+        media_request_id, season_number, status=RequestStatus.pending.value
+    )
+    await season_repo.clear_partial_delete_path(row.id)
 
 
 async def mark_completed(

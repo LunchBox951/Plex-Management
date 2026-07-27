@@ -837,6 +837,44 @@ async def test_double_cancellation_still_waits_for_physical_settlement(
     purge_service.end_placement(str(target))
 
 
+async def test_purge_classifies_a_partially_removed_tree_as_partial(tmp_path: Path) -> None:
+    """Issue #482: a recursive delete that removed part of a tree and THEN failed
+    is ``partial``, never ``error`` -- the path still exists but is missing
+    files, and eviction's ``error`` handling restores the row to 'available' on
+    the assumption that nothing left disk. Driven through the REAL
+    ``LocalFileSystem`` so the classification is proven against a real
+    ``shutil.rmtree``, not a fake that just raises: a read-only PARENT lets the
+    season's contents be removed and fails only its final ``rmdir``. The retry
+    then converges to ``deleted``, which is what makes keeping the eviction
+    claim (rather than restoring it) resolvable."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    root = tmp_path / "tv"
+    show = root / "Some Show"
+    season = show / "Season 01"
+    season.mkdir(parents=True)
+    episode = season / "Some Show - S01E01.mkv"
+    episode.write_bytes(b"x" * 2048)
+    fs = LocalFileSystem(library_roots=[str(root)])
+
+    os.chmod(show, 0o500)
+    try:
+        result = await purge_service.purge_library_path(fs, str(season))
+    finally:
+        os.chmod(show, 0o700)
+
+    assert result.outcome is PurgeOutcome.partial
+    assert result.freed_bytes == 0  # under-reported rather than guessed
+    assert result.detail is not None
+    assert not episode.exists()  # part of the tree really is gone
+    assert season.is_dir()  # and part of it really is left
+
+    retry = await purge_service.purge_library_path(fs, str(season))
+
+    assert retry.outcome is PurgeOutcome.deleted
+    assert not season.exists()
+
+
 async def test_purge_refuses_a_path_outside_every_configured_root(tmp_path: Path) -> None:
     # The root-guard rejection: a breadcrumb resolving OUTSIDE the configured roots
     # must be refused, never deleted -- the load-bearing safety guard.
