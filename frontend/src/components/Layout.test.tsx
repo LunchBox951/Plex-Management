@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAuthMe, useLogout, useRequests } from '../api/hooks'
 import type { AuthMeResponse, RequestListResponse, RequestResponse } from '../api/types'

@@ -674,6 +674,28 @@ class SqlDownloadRepository:
         result = cast(CursorResult[Any], await self._session.execute(stmt))
         return result.rowcount == 1
 
+    async def lock_if_terminal(self, download_id: int) -> bool:
+        """Lock a FINISHED download row through the current transaction.
+
+        The exact inverse of :meth:`lock_if_active`, for a caller whose decision is
+        only valid while the row stays terminal (``grab_service``'s orphan cleanup:
+        a terminal row is reusable, so "nothing tracks this hash" expires the moment
+        a reuse commits). Conditional ``UPDATE`` rather than a read for the same
+        reason: a reuse CAS racing the decision either wins first — this then returns
+        ``False`` — or waits, whereas a snapshot read cannot see it at all.
+        """
+        stmt = (
+            update(Download)
+            .where(
+                Download.id == download_id,
+                Download.status.in_(_TERMINAL_DOWNLOAD_STATUSES),
+            )
+            .values(status=Download.status)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        return result.rowcount == 1
+
     async def ensure_scope(
         self,
         download_id: int,

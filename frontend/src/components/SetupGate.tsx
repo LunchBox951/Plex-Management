@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Navigate, Outlet, useNavigate } from 'react-router-dom'
+import { Navigate, Outlet, useNavigate } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { AUTH_EXPIRED_EVENT, SETUP_REQUIRED_EVENT } from '../api/client'
 import { useAuthMe, useSetupStatus } from '../api/hooks'

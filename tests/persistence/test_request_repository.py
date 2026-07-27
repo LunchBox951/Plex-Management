@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plex_manager.models import MediaRequest, User
+from plex_manager.models import MediaRequest, RequestStatus, User
 from plex_manager.repositories import SqlRequestRepository
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
@@ -684,6 +684,44 @@ async def test_mark_heal_verified_present_cas(session: AsyncSession) -> None:
     )
     await repo.set_library_path(with_path.id, "/movies/z")
     assert await repo.mark_heal_verified_present(with_path.id) is False
+
+
+async def test_mark_available_cas_only_promotes_completed_or_available(
+    session: AsyncSession,
+) -> None:
+    """Issue #479: the promotion is a CAS over ``completed``/``available`` only.
+
+    A report-issue re-arm lands on ``searching``; the availability cycle's stale
+    write must lose against it rather than flipping the correction back to
+    ``available``. ``available`` stays allowed so the create-time "already in
+    Plex" stamping call still lands (and re-stamps idempotently)."""
+    repo = SqlRequestRepository(session)
+    finalizing = await repo.create(
+        tmdb_id=30, media_type="movie", title="Finalizing", status="completed"
+    )
+    assert await repo.mark_available(finalizing.id) is True
+    promoted = await session.get(MediaRequest, finalizing.id)
+    assert promoted is not None
+    assert promoted.status is RequestStatus.available
+    assert promoted.library_verified_at is not None
+    stamped_at = promoted.completed_at
+
+    # Re-stamping an already-available row is the create-time short-circuit's
+    # own call; it must still succeed, and must keep the earlier import instant.
+    assert await repo.mark_available(finalizing.id) is True
+    restamped = await session.get(MediaRequest, finalizing.id)
+    assert restamped is not None
+    assert restamped.completed_at == stamped_at
+
+    rearmed = await repo.create(
+        tmdb_id=31, media_type="movie", title="Reported", status="completed"
+    )
+    await repo.reset_for_research(rearmed.id)  # the report-issue re-arm
+    assert await repo.mark_available(rearmed.id) is False
+    untouched = await session.get(MediaRequest, rearmed.id)
+    assert untouched is not None
+    assert untouched.status is RequestStatus.searching
+    assert untouched.library_verified_at is None
 
 
 async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> None:

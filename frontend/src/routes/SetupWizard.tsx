@@ -1,5 +1,5 @@
 import { type ReactNode, type Ref, useEffect, useRef, useState } from 'react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router'
 import {
   useAuthMe,
   useCompleteSetup,
