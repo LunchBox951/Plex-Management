@@ -246,12 +246,14 @@ def is_movie_unconfirmed_tracked(request_id: int) -> bool:
 def _forget_unconfirmed(key: str) -> None:
     """Drop every trace of ``key`` from the bounded-Finalizing bookkeeping.
 
-    Called both when a row just confirmed/promoted (nothing left to warn about)
-    and, at the end of each ``run_availability_cycle`` pass, for any previously-
-    tracked key that is no longer in THIS tick's completed set at all -- an
-    operator re-armed it, a report-issue/correction moved it off ``completed``
-    some other way, or the row was deleted. Idempotent (``dict.pop`` with a
-    default): safe to call on a key that was never tracked.
+    Called when a row just confirmed/promoted (nothing left to warn about); when
+    a promotion LOST its status CAS (issue #479 -- the write itself proves the
+    row left ``completed``, so the entry describes content this row no longer
+    holds); and, at the end of each ``run_availability_cycle`` pass, for any
+    previously-tracked key that is no longer in THIS tick's completed set at all
+    -- an operator re-armed it, a report-issue/correction moved it off
+    ``completed`` some other way, or the row was deleted. Idempotent
+    (``dict.pop`` with a default): safe to call on a key that was never tracked.
     """
     _unconfirmed_warned_bucket.pop(key, None)
     _unconfirmed_since_fallback.pop(key, None)
@@ -3181,13 +3183,35 @@ async def run_availability_cycle(
             # report-issue re-arm to ``searching`` is the canonical case -- so the
             # CAS refused this now-stale answer (issue #479). An EXPECTED outcome,
             # never a fault: the concurrent writer's row carries the current
-            # intent. The bookkeeping is deliberately NOT forgotten here (this
-            # tick's snapshot still names the row); the NEXT tick's sweep drops it,
-            # once the row is genuinely absent from the completed set.
+            # intent.
+            #
+            # Drop the bounded-Finalizing bookkeeping HERE rather than leaving it
+            # to the end-of-cycle sweep. The lost CAS is DIRECT evidence of the
+            # very condition that sweep exists to detect -- this row is no longer
+            # ``completed`` -- and it is the only trustworthy evidence available:
+            # the snapshot that would otherwise keep the entry alive is precisely
+            # the stale read this branch exists to distrust.
+            #
+            # Waiting for the sweep is not merely late, it can miss entirely. The
+            # sweep only fires for a key absent from some tick's completed set,
+            # but the re-armed row can be back at ``completed`` before the next
+            # tick ever snapshots: ``run_import_cycle`` runs BEFORE this pass in
+            # the same reconcile tick and auto-drains any still-resumable download
+            # row, and ``mark_completed`` is an unconditional write that never
+            # consults the request's current status. Nothing then ever observes
+            # this key absent, and the stale entry silently becomes the
+            # REPLACEMENT's. That mis-measures it: ``reset_for_research`` clears
+            # ``completed_at``, so the replacement re-anchors from its own
+            # completion, and a duty-cycle bucket carried over from the OLD one
+            # would swallow the fresh row's first warning outright (honesty over
+            # silence). Forgetting is never the worse choice -- a row that returns
+            # to ``completed`` still re-derives its bucket from whatever anchor it
+            # then carries, and warns on schedule.
+            _forget_unconfirmed(key)
             _logger.debug(
                 "availability promotion skipped; the request left 'completed' during "
                 "this tick's Plex check",
-                extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
+                extra={"tmdb_id": safe_int(request.tmdb_id), "request_id": safe_int(request.id)},
             )
 
     # Self-heal false 'available' movie claims (request-dedup bug, see
@@ -3359,16 +3383,30 @@ async def run_availability_cycle(
                 _forget_unconfirmed(key)
             else:
                 # The season left ``completed`` during this tick's Plex check (the
-                # movie loop's own lost-CAS branch above documents the case); the
-                # parent rollup is deliberately NOT recomputed either -- see
+                # movie loop's own lost-CAS branch above documents the case, and
+                # why the bookkeeping is dropped on the spot); the parent rollup
+                # is deliberately NOT recomputed either -- see
                 # ``season_request_service.mark_available`` (issue #479).
+                #
+                # TV feels a retained entry the OTHER way round: a season has no
+                # persisted ``completed_at`` to anchor on, so its anchor IS the
+                # in-memory first-observed-miss stamp. Carrying the purged
+                # season's stamp onto its replacement would date the fresh
+                # content from the OLD completion and warn about it immediately.
+                # A season also has the shortest route back to ``completed`` of
+                # anything here: the re-arm leaves its ``SeasonEpisodeState`` rows
+                # standing, so the auto-grab worker's episode fallback finds
+                # nothing missing and completes it again -- no search, no grab, no
+                # download -- which is exactly how a stale entry would outlive a
+                # sweep that only ever fires on an absent key.
+                _forget_unconfirmed(key)
                 _logger.debug(
                     "availability promotion skipped for season %s; it left 'completed' "
                     "during this tick's Plex check",
                     season_request.season_number,
                     extra={
-                        "tmdb_id": season_request.tmdb_id,
-                        "request_id": season_request.media_request_id,
+                        "tmdb_id": safe_int(season_request.tmdb_id),
+                        "request_id": safe_int(season_request.media_request_id),
                     },
                 )
 

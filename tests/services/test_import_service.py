@@ -3433,6 +3433,65 @@ async def test_availability_promotion_never_overwrites_a_season_report_issue_rea
         await engine.dispose()
 
 
+async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #479 follow-up: a row that sat unconfirmed long enough to be WARNED
+    about carries bounded-Finalizing bookkeeping (a duty-cycle bucket). Once the
+    promotion CAS loses to a Report Issue re-arm, that bucket describes content
+    the row no longer holds, and it must not survive to mis-measure the
+    REPLACEMENT -- a retained bucket would silently swallow the fresh row's own
+    first warning.
+
+    The end-of-cycle sweep cannot be relied on to do this: it only forgets a key
+    that is ABSENT from some tick's completed set, and the re-armed row can be
+    stamped back to ``completed`` by the import pass (which runs BEFORE this one
+    in the same reconcile tick, via an unconditional ``mark_completed``) before
+    any tick ever snapshots it absent. So this asserts the drop happens while the
+    key is STILL in this very tick's completed snapshot -- i.e. the lost-CAS
+    branch dropped it, not the sweep, which by construction could not have.
+    """
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_forget.db")
+    try:
+        request_id = await _seed_movie_request(
+            sessionmaker_,
+            tmdb_id=_TMDB_ID,
+            library_path="/media/Movies/Obsession (2026)",
+            completed_at=datetime.now(UTC) - timedelta(minutes=45),
+        )
+        # Tick 1: neither the GUID batch nor the path fallback confirms the row,
+        # so it is warned about and starts carrying a duty-cycle bucket.
+        with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+            async with sessionmaker_() as session:
+                await run_availability_cycle(
+                    library=FakeLibrary(movie_file_paths=[]), session=session
+                )
+        assert any("not confirmed by Plex" in r.getMessage() for r in caplog.records)
+        assert import_service.is_movie_unconfirmed_tracked(request_id)
+
+        # Tick 2: Plex finally says yes, but Report Issue commits the re-arm
+        # inside the awaited round-trip, so the promotion CAS loses.
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await SqlRequestRepository(session).reset_for_research(
+                request_id, clear_library_path=False
+            )
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        assert not import_service.is_movie_unconfirmed_tracked(request_id)
+    finally:
+        await engine.dispose()
+
+
 # --------------------------------------------------------------------------- #
 # run_availability_cycle — batched checks, not one Plex call per row (issue #136)
 # --------------------------------------------------------------------------- #
