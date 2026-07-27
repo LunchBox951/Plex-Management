@@ -1664,9 +1664,11 @@ async def _reread_scopes_for_finalize(
     (and so a new snapshot) that includes its commit, while one that has not started
     yet is held off until this transaction's terminal swap commits and turns it away.
     The swap's ``require_no_unimported_scope_outside`` predicate cannot substitute for
-    this ordering: on PostgreSQL a blocked ``UPDATE`` re-checks its WHERE against the
-    updated target tuple but evaluates the subquery on its ORIGINAL snapshot, so a
-    scope committed while it waited on the row lock stays invisible to it.
+    this ordering: under READ COMMITTED a blocked ``UPDATE`` is expected (but
+    unverified here) to re-check its WHERE against the updated target tuple while
+    evaluating the subquery on its ORIGINAL command snapshot, so a scope committed
+    while it waits on the row lock stays invisible to it. No PostgreSQL-backed test
+    exercises this expectation.
 
     A lock refused (the row already terminal) needs no branch here: the finalize swap
     is gated on ``Importing`` and loses to that row either way.
@@ -3302,7 +3304,10 @@ async def run_availability_cycle(
             await session.rollback()
             _logger.warning(
                 "availability promotion failed; will retry next cycle",
-                extra={"tmdb_id": request.tmdb_id, "request_id": request.id},
+                extra={
+                    "tmdb_id": safe_int(request.tmdb_id),
+                    "request_id": safe_int(request.id),
+                },
             )
             continue
         if did_promote:
@@ -3501,10 +3506,10 @@ async def run_availability_cycle(
                 await session.rollback()
                 _logger.warning(
                     "availability promotion failed for season %s; will retry next cycle",
-                    season_request.season_number,
+                    safe_int(season_request.season_number),
                     extra={
-                        "tmdb_id": season_request.tmdb_id,
-                        "request_id": season_request.media_request_id,
+                        "tmdb_id": safe_int(season_request.tmdb_id),
+                        "request_id": safe_int(season_request.media_request_id),
                     },
                 )
                 continue

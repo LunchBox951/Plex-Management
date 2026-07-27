@@ -1697,10 +1697,16 @@ async def mark_completed(session: AsyncSession, request_id: int) -> None:
     await session.commit()
 
 
-async def mark_available(session: AsyncSession, request_id: int) -> None:
-    """Phase 2 of honest availability: Plex has confirmed the title is in the library."""
-    await SqlRequestRepository(session).mark_available(request_id)
+async def mark_available(session: AsyncSession, request_id: int) -> bool:
+    """Phase 2 of honest availability: Plex has confirmed the title is in the library.
+
+    Returns whether the row was actually promoted; ``False`` is a benign stale
+    result (the CAS lost to a concurrent correction re-arm), and the caller must
+    not count it as a promotion.
+    """
+    promoted = await SqlRequestRepository(session).mark_available(request_id)
     await session.commit()
+    return promoted
 
 
 async def set_keep_forever(

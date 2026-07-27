@@ -3406,13 +3406,14 @@ async def test_import_tv_finalize_reread_locks_the_download_row_first(
 
     Without the lock the re-read and the terminal swap only serialize through the swap's
     own ``NOT EXISTS`` predicate, and that predicate cannot close the window on
-    PostgreSQL: under READ COMMITTED a blocked ``UPDATE`` re-checks its WHERE against the
-    updated target tuple but still evaluates the subquery on the older command snapshot,
-    so a ``download_scopes`` row the attach committed while the swap waited on the row
-    lock stays invisible, the swap matches, and the late scope is terminalized over.
-    SQLite's single-writer behaviour cannot express that anomaly, so this pins the lock
-    ORDER -- which is what makes the read observe the attach's commit -- rather than
-    trying to reproduce the interleaving.
+    PostgreSQL: under READ COMMITTED, a blocked ``UPDATE`` is expected (but unverified
+    here) to re-check its WHERE against the updated target tuple while still evaluating
+    the subquery on the older command snapshot, so a ``download_scopes`` row the attach
+    committed while the swap waited on the row lock stays invisible, the swap matches,
+    and the late scope is terminalized over. No PostgreSQL-backed test exercises this
+    expectation. SQLite's single-writer behaviour cannot express that anomaly, so this
+    pins the lock ORDER -- which is what makes the read observe the attach's commit --
+    rather than trying to reproduce the interleaving.
     """
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
@@ -4206,6 +4207,82 @@ async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
         assert not import_service.is_movie_unconfirmed_tracked(request_id)
     finally:
         await engine.dispose()
+
+
+async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: a failed movie promotion routes both log extras through
+    ``safe_int`` before emitting the warning."""
+    tmdb_id = 811
+    request_id = await _seed_movie_request(sessionmaker_, tmdb_id=tmdb_id)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(SqlRequestRepository, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(library=FakeLibrary(available={tmdb_id}), session=session)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "availability promotion failed; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [tmdb_id, request_id]
+
+
+async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #490: the season promotion warning sanitizes its request-derived
+    extras independently of the movie loop."""
+    tmdb_id = 812
+    request_id = await _seed_show_request(sessionmaker_, tmdb_id=tmdb_id)
+    await _seed_season(sessionmaker_, media_request_id=request_id, season_number=1)
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def promotion_fails(
+        _session: AsyncSession, *, media_request_id: int, season_number: int
+    ) -> bool:
+        raise PlexLibraryError("Plex write failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(season_request_service, "mark_available", promotion_fails)
+
+    with caplog.at_level(logging.WARNING, logger=_IMPORT_SERVICE_LOGGER):
+        async with sessionmaker_() as session:
+            await run_availability_cycle(
+                library=FakeLibrary(available_tv_seasons={tmdb_id: frozenset({1})}), session=session
+            )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "availability promotion failed for season 1000001; will retry next cycle"
+    )
+    assert record.__dict__["tmdb_id"] == tmdb_id + 1_000_000
+    assert record.__dict__["request_id"] == request_id + 1_000_000
+    assert sanitized == [1, tmdb_id, request_id]
 
 
 # --------------------------------------------------------------------------- #
