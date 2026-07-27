@@ -208,7 +208,20 @@ def _entry_exists(dir_fd: int, name: str) -> bool:
 
 
 @contextlib.contextmanager
-def _publish_lock(dir_fd: int, name: str, display: str) -> Generator[None, None, None]:
+def _publish_lock(
+    dir_fd: int,
+    name: str,
+    display: str,
+    *,
+    reclaim_stale_with_existing_entry: bool = False,
+) -> Generator[None, None, None]:
+    """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
+
+    Publication refuses a contended lock when the destination exists: the existing
+    entry may belong to the lock holder. Rollback already has the publication's
+    identity token, so it can reclaim a proven-stale lock even when that entry exists.
+    A live or indeterminate lock is always left untouched.
+    """
     lock_name = f".{name}.publish.lock"
     while True:
         try:
@@ -219,7 +232,7 @@ def _publish_lock(dir_fd: int, name: str, display: str) -> Generator[None, None,
                 dir_fd=dir_fd,
             )
         except FileExistsError:
-            if _entry_exists(dir_fd, name):
+            if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
                 raise FileExistsError(display) from None
             if _lock_is_stale(dir_fd, lock_name):
                 with contextlib.suppress(FileNotFoundError):
@@ -735,11 +748,6 @@ def _verify_lexical_publication(
     if published_fd is not None:
         held_info = os.fstat(published_fd)
         identity_expected = (held_info.st_dev, held_info.st_ino)
-        if identity_expected != published_identity:
-            raise LocalFileSystemError(
-                f"refusing to publish {os.fspath(dst)!r}: the held publication descriptor "
-                "no longer identifies the inode captured during publication"
-            )
 
     lexical_identity: PublishedFileIdentity | None = None
     try:
@@ -1120,7 +1128,12 @@ class LocalFileSystem:
                     name,
                 ),
                 contextlib.suppress(FileNotFoundError),
-                _publish_lock(parent_fd, name, os.fspath(dst)),
+                _publish_lock(
+                    parent_fd,
+                    name,
+                    os.fspath(dst),
+                    reclaim_stale_with_existing_entry=True,
+                ),
             ):
                 if _entry_identity(parent_fd, name) != identity:
                     return

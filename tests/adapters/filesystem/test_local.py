@@ -2481,6 +2481,25 @@ def test_remove_published_unlinks_the_file_it_placed(tmp_path: Path) -> None:
     assert dst.parent.is_dir()  # only the file goes, never the season directory
 
 
+def test_remove_published_reclaims_a_stale_publish_lock(tmp_path: Path) -> None:
+    """A crash after placement can leave the rollback's lock behind. Its dead PID
+    proves it is stale, so rollback may reclaim it and remove the file it owns."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert not dst.exists()
+    assert not lock.exists()
+
+
 def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
     """Rollback ownership is the inode captured at publication, not just the path.
 
