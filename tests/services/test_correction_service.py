@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.filesystem.local import LocalFileSystem, PartialDeleteError
@@ -4817,3 +4818,105 @@ async def test_a_partially_purged_correction_is_still_due_for_auto_grab(
     assert request_id in await _due_request_ids(
         sessionmaker_, now=datetime.now(UTC) + timedelta(days=1)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-4 P1: the risky interleaving is DURING the awaited (b) commit, not
+# after it -- the row becomes visible to every other connection while report_issue
+# is still suspended inside that await. The purge claim must already be held then.
+# --------------------------------------------------------------------------- #
+async def test_the_purge_claim_is_already_held_when_the_re_arm_becomes_visible(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Hook the (b) commit itself and look at the world from the instant the
+    committed ``searching`` row is readable by anyone else. At that moment a fast
+    replacement placement must ALREADY be refused and the scope must ALREADY be
+    out of auto-grab's due set -- otherwise a task scheduled during this very
+    await could place a replacement, release its placement registration, and have
+    the purge at (d) delete it."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 1024)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    observations: list[tuple[bool, bool, list[int]]] = []
+
+    async with sessionmaker_() as session:
+        real_commit = session.commit
+
+        async def _observing_commit() -> None:
+            await real_commit()
+            # The row is committed and visible NOW, while report_issue is still
+            # inside this await -- exactly where a competing task would look.
+            placement_allowed = purge_service.begin_placement(str(movie_file))
+            if placement_allowed:  # pragma: no cover - the regression, not the fix
+                purge_service.end_placement(str(movie_file))
+            observations.append(
+                (
+                    purge_service.purge_in_progress(str(movie_file)),
+                    placement_allowed,
+                    await _due_request_ids(sessionmaker_, now=datetime.now(UTC)),
+                )
+            )
+
+        session.commit = _observing_commit  # pyright: ignore[reportAttributeAccessIssue]
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            LocalFileSystem(library_roots=[str(root)]),
+            FakeLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="user_reported",
+            season=None,
+            roots=LibraryRoots(movies=str(root)),
+        )
+
+    assert observations, "the (b) commit never ran"
+    claim_held, placement_allowed, due_ids = observations[0]
+    assert claim_held is True  # claimed BEFORE the row was published
+    assert placement_allowed is False  # a racing import cannot land in the tree
+    assert request_id not in due_ids  # nor can auto-grab grab one
+    # Nothing leaks past the verb.
+    assert not purge_service.purge_in_progress(str(movie_file))
+
+
+async def test_a_commit_collision_releases_the_purge_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Claiming before the commit means the claim can outlive a FAILED commit, so
+    the release has to cover that path too: a collision surfaces the honest 409
+    with nothing deleted, and must leave no claim behind blocking placements into
+    a path this verb is no longer going to touch."""
+    root = tmp_path / "movies"
+    root.mkdir()
+    movie_file = root / "Some Movie (2020).mkv"
+    movie_file.write_bytes(b"x" * 1024)
+    request_id = await _seed_available_movie(sessionmaker_, library_path=str(movie_file))
+
+    async with sessionmaker_() as session:
+
+        async def _colliding_commit() -> None:
+            raise IntegrityError("INSERT", {}, Exception("uq_media_requests_active"))
+
+        session.commit = _colliding_commit  # pyright: ignore[reportAttributeAccessIssue]
+        with pytest.raises(correction_service.ActiveDuplicateError):
+            await correction_service.report_issue(
+                session,
+                FakeQbittorrent(),
+                LocalFileSystem(library_roots=[str(root)]),
+                FakeLibrary(),
+                FakeProwlarr([]),
+                GuessitParser(),
+                default_profile(),
+                request_id=request_id,
+                reason="user_reported",
+                season=None,
+                roots=LibraryRoots(movies=str(root)),
+            )
+
+    assert not purge_service.purge_in_progress(str(movie_file))
+    assert movie_file.exists()  # nothing was deleted on the collision path

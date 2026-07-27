@@ -20,6 +20,7 @@ from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.library import WatchState
 from plex_manager.services import eviction_service
+from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
 from plex_manager.web.deps import SettingsStore
 from plex_manager.web.events import get_event_hub
 from tests.web.fakes import FakeLibrary, override_adapters
@@ -461,3 +462,52 @@ async def test_evict_one_roots_db_failure_is_rolled_back_so_the_next_root_runs(
     assert body["errors"] == [{"root": "movies_root", "detail": "sweep failed (OperationalError)"}]
     # ...and the tv root still ran on the rolled-back, clean session.
     assert swept == [str(tv_root)]
+
+
+async def test_evict_reports_and_publishes_a_partial_delete(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round-4 P2: a delete that removed part of a title and then failed
+    still commits the row ``evicted`` and really did take files off disk. Swallowing
+    it (returning no outcome) made this button answer an empty list with no error
+    AND skipped the realtime invalidation, so every connected client kept showing
+    the title as watchable. The destructive state change must be surfaced."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+
+    async def _partial(
+        _fs: object, _path: str, *, hold_purge_registration: bool = False
+    ) -> PurgeResult:
+        return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
+
+    monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial)
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+    subscription = get_event_hub(app).subscribe()
+    _ = await subscription.get()
+
+    response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["evicted"]) == 1
+    outcome = body["evicted"][0]
+    assert outcome["request_id"] == request_id
+    assert outcome["freed_bytes"] is None  # unknowable, never a fabricated number
+    event = await subscription.get()  # clients ARE told to refresh
+    assert event.reason == "eviction"
+    subscription.close()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == str(movie_file)  # the retry handle survives
