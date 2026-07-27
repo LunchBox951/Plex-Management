@@ -724,6 +724,57 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
     assert dst.stat().st_ino == src.stat().st_ino
 
 
+def test_hardlink_publication_keeps_source_fd_open_through_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The linked inode cannot be freed and reused before lexical verification."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "linked.mkv"
+    real_open_source = local_fs._open_regular_source  # pyright: ignore[reportPrivateUsage]
+    real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
+    source_fds: list[int] = []
+
+    def _record_source_fd(source: Path, display: str) -> int:
+        source_fd = real_open_source(source, display)
+        source_fds.append(source_fd)
+        return source_fd
+
+    def _verify_while_source_is_held(
+        verify_root: Path,
+        verify_dst: Path,
+        parent_fd: int,
+        name: str,
+        published_identity: tuple[int, int],
+        *,
+        published_fd: int | None,
+        placed: bool,
+    ) -> None:
+        assert len(source_fds) == 1
+        held = os.fstat(source_fds[0])
+        assert (held.st_dev, held.st_ino) == published_identity
+        real_verify(
+            verify_root,
+            verify_dst,
+            parent_fd,
+            name,
+            published_identity,
+            published_fd=published_fd,
+            placed=placed,
+        )
+
+    monkeypatch.setattr(local_fs, "_open_regular_source", _record_source_fd)
+    monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_while_source_is_held)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=root)
+
+    assert len(source_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(source_fds[0])
+
+
 def test_copy_publication_keeps_written_inode_fd_open_through_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

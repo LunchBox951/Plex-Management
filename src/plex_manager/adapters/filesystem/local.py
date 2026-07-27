@@ -626,10 +626,11 @@ def _verify_lexical_publication(
     opened root descriptor by the same no-follow component walk (creating nothing --
     verification must never build the tree it is checking) and the entry found there
     is compared by ``(st_dev, st_ino)`` against the inode behind the held publication
-    descriptor on copy/idempotent-digest paths, or against ``published_identity`` on the
-    hardlink path (where the still-existing source name pins that inode). Holding the
-    descriptor prevents the published inode number from being freed and reused by an
-    unlink/recreate before verification. It is NOT a fresh re-stat of ``name`` taken here:
+    descriptor on copy/idempotent-digest paths, or against ``published_identity`` while
+    the held source descriptor pins the linked inode on the hardlink path. Holding the
+    applicable descriptor prevents the published inode number from being freed and reused
+    by an unlink/recreate before verification. It is NOT a fresh re-stat of ``name`` taken
+    here:
     a writer who replaces the destination between the placement helper returning and this
     verifier running would have BOTH a fresh re-stat AND the lexical resolution describe
     the replacement, so they would compare equal and the caller would record and scan the
@@ -1001,14 +1002,11 @@ class LocalFileSystem:
                         placed = True
                 else:
                     placed = True
-            finally:
-                os.close(source_fd)
-            try:
-                # Copy and digest-match paths keep the published inode open until this
-                # check completes. The descriptor pins the inode against unlink/reuse, and
-                # fstat below verifies the held object rather than re-deriving its identity
-                # from a path. The hardlink path needs no extra descriptor: ``src`` remains
-                # a link to that inode and structurally pins it through verification.
+                # Every publication path keeps a descriptor pinning the published inode
+                # until this check completes. Copy and digest-match paths return that
+                # descriptor explicitly; the hardlink path keeps ``source_fd`` itself open.
+                # Verification therefore cannot accept an attacker recreation that merely
+                # reuses the freed inode number captured during publication.
                 _verify_lexical_publication(
                     root,
                     dst,
@@ -1021,6 +1019,7 @@ class LocalFileSystem:
             finally:
                 if published_fd is not None:
                     os.close(published_fd)
+                os.close(source_fd)
             return FilePublication(placed, published_identity)
 
     def remove_published(self, dst: Path, *, root: Path, identity: PublishedFileIdentity) -> None:
