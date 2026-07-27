@@ -1147,7 +1147,7 @@ class SqlDownloadRepository:
         timeout_at: datetime | None = None,
         clear_timeout_at: bool = False,
         retry_count: int | None = None,
-        require_failed_reason: str | None | _NoReasonPredicate = NO_REASON_PREDICATE,
+        require_failed_reason: str | _NoReasonPredicate | None = NO_REASON_PREDICATE,
         require_no_unimported_scope_outside: frozenset[int] | None = None,
     ) -> bool:
         """Compare-and-swap the status: move to ``status`` only if the row's CURRENT
