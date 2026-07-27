@@ -346,13 +346,13 @@ out of sync.
 
 ## Developing
 
-Requires Python 3.12+, Node.js **22.13+ on the 22 line, or Node.js 24+** (Node
-24 LTS recommended) with npm, and `ffprobe` (provided by the FFmpeg package)
-for completed-video validation. The published Docker image already includes
-it. The floor is set by the locked frontend toolchain (ESLint 10.6, jsdom
-29.1, the Vite 8.1 React plugin) — plain Node 22.0–22.12 will fail to install
-or run it; see `frontend/package.json`'s `engines` field, which enforces this
-range.
+Requires Python 3.12+, Node.js **22.22.2+ on the 22 line, 24.15+ on the 24
+line, or Node.js 26+** (Node 26 LTS recommended) with npm, and `ffprobe`
+(provided by the FFmpeg package) for completed-video validation. The published
+Docker image already includes it. The floor is set by the locked frontend
+toolchain (jsdom 30, ESLint 10.8, the Vite 8.1 React plugin) — older Node
+lines will fail to install or run it; see `frontend/package.json`'s `engines`
+field, which enforces this range.
 
 ```bash
 make install   # editable install + dev tools + pre-commit
