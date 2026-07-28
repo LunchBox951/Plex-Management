@@ -484,8 +484,14 @@ async def test_evict_reports_and_publishes_a_partial_delete(
     request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
 
     async def _partial(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
+        assert before_delete is not None
+        await before_delete()
         return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial)
