@@ -702,7 +702,6 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
         calls.append((placed, published_identity))
@@ -712,7 +711,6 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
@@ -753,7 +751,6 @@ def test_hardlink_publication_keeps_source_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
         assert len(source_fds) == 1
@@ -765,7 +762,6 @@ def test_hardlink_publication_keeps_source_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
@@ -789,6 +785,9 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
     src.write_text("payload")
     dst = root / "copied.mkv"
     real_link = os.link
+    real_copy_no_overwrite = (
+        LocalFileSystem._copy_no_overwrite  # pyright: ignore[reportPrivateUsage]
+    )
     real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
     verified_fds: list[int] = []
 
@@ -803,6 +802,20 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
             raise OSError(errno.EXDEV, "simulated cross-device link")
         real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
+    def _record_copy_no_overwrite(
+        fs: LocalFileSystem,
+        copy_src: Path,
+        copy_dst: Path,
+        source_fd: int,
+        parent_fd: int,
+        name: str,
+    ) -> tuple[tuple[int, int], int]:
+        published_identity, published_fd = real_copy_no_overwrite(
+            fs, copy_src, copy_dst, source_fd, parent_fd, name
+        )
+        verified_fds.append(published_fd)
+        return published_identity, published_fd
+
     def _verify_with_held_fd(
         verify_root: Path,
         verify_dst: Path,
@@ -810,12 +823,10 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
-        assert published_fd is not None
-        held = os.fstat(published_fd)
-        verified_fds.append(published_fd)
+        assert len(verified_fds) == 1
+        held = os.fstat(verified_fds[0])
         assert (held.st_dev, held.st_ino) == published_identity
         real_verify(
             verify_root,
@@ -823,11 +834,11 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
     monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(LocalFileSystem, "_copy_no_overwrite", _record_copy_no_overwrite)
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
 
     LocalFileSystem().hardlink_or_copy(src, dst, root=root)
@@ -847,8 +858,18 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
     src.write_text("payload")
     dst = root / "copied.mkv"
     dst.write_text("payload")  # same bytes, distinct inode: forces digest matching
+    real_idempotent_or_conflict = local_fs._idempotent_or_conflict  # pyright: ignore[reportPrivateUsage]
     real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
     verified_fds: list[int] = []
+
+    def _record_idempotent_or_conflict(
+        source_fd: int, parent_fd: int, name: str, display: str
+    ) -> tuple[tuple[int, int], int]:
+        published_identity, published_fd = real_idempotent_or_conflict(
+            source_fd, parent_fd, name, display
+        )
+        verified_fds.append(published_fd)
+        return published_identity, published_fd
 
     def _verify_with_held_fd(
         verify_root: Path,
@@ -857,12 +878,10 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
-        assert published_fd is not None
-        held = os.fstat(published_fd)
-        verified_fds.append(published_fd)
+        assert len(verified_fds) == 1
+        held = os.fstat(verified_fds[0])
         assert (held.st_dev, held.st_ino) == published_identity
         real_verify(
             verify_root,
@@ -870,10 +889,10 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
+    monkeypatch.setattr(local_fs, "_idempotent_or_conflict", _record_idempotent_or_conflict)
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
 
     result = LocalFileSystem().hardlink_or_copy(src, dst, root=root)

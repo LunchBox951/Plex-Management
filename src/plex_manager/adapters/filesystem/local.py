@@ -686,7 +686,6 @@ def _verify_lexical_publication(
     name: str,
     published_identity: PublishedFileIdentity,
     *,
-    published_fd: int | None,
     placed: bool,
 ) -> None:
     """Prove the LEXICAL ``dst`` names the very inode just published, or fail closed.
@@ -709,12 +708,15 @@ def _verify_lexical_publication(
     descriptor stays open to prevent the published inode number from being freed and
     reused by an unlink/recreate before verification. It is NOT a fresh re-stat of
     ``name`` taken here: a writer who replaces the destination between the placement
-    helper returning and this verifier running would have BOTH a fresh re-stat AND the
-    wrong file with ``placed=True``. Equal is the only success: the breadcrumb the caller
-    is about to persist provably names this inode, inside the root. Anything else -- a
-    different inode, vanished path, or symlinked/missing ancestor -- means the tree moved
-    (or was swapped) mid-publication, and the whole publish is refused as the same visible,
-    retryable :class:`LocalFileSystemError` the ancestor-symlink refusal raises.
+    helper returning and this verifier running would have both a fresh re-stat and the
+    lexical resolution describe the replacement, so they would compare equal and the
+    caller would record and scan the wrong file with ``placed=True``. Capturing identity
+    once at publication and threading it here, rather than re-deriving it, detects that
+    replacement. Equal is the only success: the breadcrumb the caller is about to persist
+    provably names this inode, inside the root. Anything else -- a different inode,
+    vanished path, or symlinked/missing ancestor -- means the tree moved (or was swapped)
+    mid-publication, and the whole publish is refused as the same visible, retryable
+    :class:`LocalFileSystemError` the ancestor-symlink refusal raises.
 
     On that refusal a file THIS call created is rolled back through the held descriptor
     -- but ONLY when the entry still at ``name`` is provably the one we published
@@ -740,8 +742,6 @@ def _verify_lexical_publication(
     What this function guarantees is the property the reconciler needs to start from:
     a breadcrumb is never born already pointing outside the root.
     """
-    identity_expected = published_identity
-
     lexical_identity: PublishedFileIdentity | None = None
     try:
         with _anchored_publication(root, dst, create_missing=False) as (verify_fd, verify_name):
@@ -750,7 +750,7 @@ def _verify_lexical_publication(
         # A missing/symlinked/non-directory ancestor on the way back down is
         # itself the escape being detected -- not a separate error to surface.
         lexical_identity = None
-    if lexical_identity == identity_expected:
+    if lexical_identity == published_identity:
         return
     # Refusing. Roll back ONLY a file we created AND can still prove we own: a swap of
     # ``name`` after the comparison above must not turn this into a third-party delete.
@@ -1081,7 +1081,6 @@ class LocalFileSystem:
                     parent_fd,
                     name,
                     published_identity,
-                    published_fd=published_fd,
                     placed=placed,
                 )
             finally:
