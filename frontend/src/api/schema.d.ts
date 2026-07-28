@@ -2250,6 +2250,11 @@ export interface components {
         /**
          * EvictionOutcomeItem
          * @description One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.
+         *
+         *     ``partial=True`` means the delete did not fully complete: some content remains on
+         *     disk pending retry, so ``freed_bytes`` is unknowable (``null``). Recovery is not
+         *     guaranteed to be automatic -- with eviction disabled, only another manual sweep
+         *     retries the removal.
          */
         EvictionOutcomeItem: {
             /** Freed Bytes */
@@ -2261,6 +2266,11 @@ export interface components {
              * @enum {string}
              */
             media_type: "movie" | "tv";
+            /**
+             * Partial
+             * @default false
+             */
+            partial: boolean;
             /** Request Id */
             request_id: number;
             /** Season */
