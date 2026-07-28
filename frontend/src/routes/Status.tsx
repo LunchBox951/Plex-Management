@@ -775,18 +775,24 @@ export function Status() {
       const partialEvictions = result.evicted.filter((outcome) => outcome.partial)
       const completeEvictions = result.evicted.filter((outcome) => !outcome.partial)
       toast({
+        // Only fully removed titles count as "freed": a partial delete left
+        // content on disk, so counting it would overstate the outcome.
         title:
-          result.evicted.length > 0
-            ? `Freed ${result.evicted.length} title${result.evicted.length === 1 ? '' : 's'}`
-            : 'Nothing to free',
+          completeEvictions.length > 0
+            ? `Freed ${completeEvictions.length} title${completeEvictions.length === 1 ? '' : 's'}`
+            : partialEvictions.length > 0
+              ? 'Partial removal'
+              : 'Nothing to free',
         // Partials are grouped into their own clause so a mixed sweep never reads
-        // as if every title were partially removed (or none were).
+        // as if every title were partially removed (or none were). "Pending retry"
+        // deliberately promises no automatic recovery: the manual endpoint stays
+        // available while eviction is disabled, and then no background sweep runs.
         description:
           result.evicted.length > 0
             ? [
                 completeEvictions.map((outcome) => outcome.title).join(', '),
                 partialEvictions.length > 0
-                  ? `Partially removed — content remains on disk pending recovery: ${partialEvictions
+                  ? `Partially removed — content remains on disk pending retry: ${partialEvictions
                       .map((outcome) => outcome.title)
                       .join(', ')}`
                   : '',

@@ -1176,7 +1176,7 @@
         "type": "object"
       },
       "EvictionOutcomeItem": {
-        "description": "One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.\n\n``partial=True`` means the delete did not fully complete: some content remains on\ndisk pending automatic recovery, so ``freed_bytes`` is unknowable (``null``).",
+        "description": "One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.\n\n``partial=True`` means the delete did not fully complete: some content remains on\ndisk pending retry, so ``freed_bytes`` is unknowable (``null``). Recovery is not\nguaranteed to be automatic -- with eviction disabled, only another manual sweep\nretries the removal.",
         "properties": {
           "freed_bytes": {
             "anyOf": [

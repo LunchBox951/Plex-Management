@@ -865,8 +865,9 @@ describe('Status', () => {
     await waitFor(() =>
       expect(toastMock).toHaveBeenCalledWith(
         expect.objectContaining({
+          title: 'Partial removal',
           description:
-            'Partially removed — content remains on disk pending recovery: Partially Removed Movie',
+            'Partially removed — content remains on disk pending retry: Partially Removed Movie',
           intent: 'warning',
         }),
       ),
@@ -916,8 +917,9 @@ describe('Status', () => {
     await waitFor(() =>
       expect(toastMock).toHaveBeenCalledWith(
         expect.objectContaining({
+          title: 'Freed 2 titles',
           description:
-            'Fully Removed Movie, Another Removed Movie. Partially removed — content remains on disk pending recovery: Partially Removed Movie',
+            'Fully Removed Movie, Another Removed Movie. Partially removed — content remains on disk pending retry: Partially Removed Movie',
           intent: 'warning',
         }),
       ),

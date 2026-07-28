@@ -2252,7 +2252,9 @@ export interface components {
          * @description One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.
          *
          *     ``partial=True`` means the delete did not fully complete: some content remains on
-         *     disk pending automatic recovery, so ``freed_bytes`` is unknowable (``null``).
+         *     disk pending retry, so ``freed_bytes`` is unknowable (``null``). Recovery is not
+         *     guaranteed to be automatic -- with eviction disabled, only another manual sweep
+         *     retries the removal.
          */
         EvictionOutcomeItem: {
             /** Freed Bytes */
