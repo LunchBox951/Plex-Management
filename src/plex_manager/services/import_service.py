@@ -204,12 +204,12 @@ _IN_LIBRARY_STATUSES: Final = frozenset({"available", "completed"})
 # however many rows are ACTUALLY stuck completed right now.
 _unconfirmed_warned_bucket: dict[str, int] = {}
 # First-observed-miss timestamp -- the substitute anchor for "elapsed since
-# completed" for any row with no first-completion stamp to anchor on. In
-# practice this means every TV season: ``SeasonRequest.completed_at`` exists
-# (issue #494) but is a completion GENERATION for the promotion CAS, not this
-# warning's anchor -- it is ``NULL`` for every pre-migration row, so switching
-# the anchor onto it would silently change how existing seasons are measured;
-# that is a separate behavior change, deliberately not made with the CAS fix. A
+# completed" for any row with no first-completion stamp to anchor on. TV's
+# ``SeasonRequest.completed_at`` is time metadata, while
+# ``completion_generation`` is the promotion CAS identity; neither is this
+# warning's anchor. A pre-migration season has no persisted completion timestamp,
+# so switching anchors would change its measurement; that is a separate behavior
+# change, deliberately not made with the CAS fix. A
 # movie instead anchors on its real, persisted ``RequestRecord.completed_at``
 # (which never moves) and only falls through to this dict in the defensive
 # (should-not-happen) case that stamp is somehow unset -- see
@@ -3493,11 +3493,10 @@ async def run_availability_cycle(
                     title = await _title_for(season_request.media_request_id)
                     _check_bounded_finalizing(
                         key,
-                        # The anchor stays the in-memory first-observed-miss
-                        # timestamp for TV: ``SeasonRequest.completed_at`` is
-                        # the promotion CAS's completion generation (issue
-                        # #494), NULL on every pre-migration row, not this
-                        # warning's anchor -- see the module dict's docstring.
+                        # TV's anchor stays the in-memory first-observed-miss
+                        # timestamp. ``SeasonRequest.completed_at`` is time
+                        # metadata; ``completion_generation`` is the promotion
+                        # CAS identity. Neither is this warning's anchor.
                         _unconfirmed_anchor(key, None, now=effective_now),
                         f"{title} season {season_request.season_number}",
                         now=effective_now,
@@ -3535,9 +3534,8 @@ async def run_availability_cycle(
                 # is deliberately NOT recomputed either -- see
                 # ``season_request_service.mark_available`` (issue #479).
                 #
-                # TV feels a retained entry the OTHER way round: a season has no
-                # persisted ``completed_at`` to anchor on, so its anchor IS the
-                # in-memory first-observed-miss stamp. Carrying the purged
+                # TV's anchor is the in-memory first-observed-miss stamp, not
+                # the season's persisted time metadata. Carrying the purged
                 # season's stamp onto its replacement would date the fresh
                 # content from the OLD completion and warn about it immediately.
                 # A season also has the shortest route back to ``completed`` of

@@ -4245,18 +4245,16 @@ async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_mo
         await engine.dispose()
 
 
-async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_season(
+async def test_availability_promotion_refuses_a_stale_answer_after_episode_fallback_recompletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #494, season twin: same replacement-completion window, per season.
+    """Issue #494: episode fallback's CAS re-completion invalidates stale evidence.
 
-    TV has the shortest route back to ``completed`` of anything here (the
-    episode fallback can re-complete a re-armed season with no search, grab or
-    download at all), so the season CAS needs the same completion binding --
-    and the parent rollup must not be pushed to ``available`` off a promotion
-    that did not happen. Clock frozen for the same reason as the movie twin
-    above: the two completions share a ``completed_at``, so only the monotonic
-    generation can tell them apart.
+    The cycle snapshots a ``completed`` season and blocks on Plex. Report Issue
+    re-arms it to ``searching`` inside that window; then the real episode-fallback
+    completion path moves it back through ``mark_completed_if_in``. The generation
+    bump in ``set_status_if_in`` makes the stale promotion CAS lose even though the
+    frozen clock gives both completions the same ``completed_at``.
     """
     _freeze_repository_clocks(monkeypatch)
     sessionmaker_, engine = await _file_backed_sessionmaker(
@@ -4290,9 +4288,13 @@ async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_se
             await season_request_service.reset_for_research(
                 session, media_request_id=request_id, season_number=1
             )
-            await season_request_service.mark_completed(
-                session, media_request_id=request_id, season_number=1
+            completed = await season_request_service.mark_completed_if_in(
+                session,
+                media_request_id=request_id,
+                season_number=1,
+                allowed_from=frozenset({RequestStatus.searching.value}),
             )
+            assert completed
             await session.commit()
         library.resume_check.set()
         assert await asyncio.wait_for(task, timeout=5) == 0

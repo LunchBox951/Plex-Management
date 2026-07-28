@@ -75,12 +75,10 @@ class RequestRecord(BaseModel):
     # warning (issue #158, ``import_service.run_availability_cycle``) reads this
     # as the anchor for "elapsed time since completed" -- persisted and exact
     # (survives a restart), unlike the in-memory fallback anchor a TV
-    # ``SeasonRequestRecord`` still uses for that warning. The season record now
-    # carries a ``completed_at`` of its own (issue #494), but it is a completion
-    # GENERATION with different semantics -- re-stamped on every re-completion,
-    # ``NULL`` for every pre-migration row -- read ONLY by the promotion CAS;
-    # re-anchoring the warning on it is a separate behavior change and was NOT
-    # made here. This column keeps its own "never moves" first-completion rule
+    # ``SeasonRequestRecord`` still uses for that warning. The season record's
+    # ``completed_at`` is time metadata; ``completion_generation`` is the
+    # promotion CAS identity. Do not re-anchor the warning on either value. This
+    # column keeps its own "never moves" first-completion rule
     # (see ``SqlRequestRepository.heal_completed_at``).
     completed_at: datetime | None = None
     # How many times this row has entered ``completed`` -- the completion
