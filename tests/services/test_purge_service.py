@@ -1587,7 +1587,12 @@ async def test_internal_probe_deadline_labels_a_late_worker_failure_honestly(
             assert await asyncio.to_thread(started.wait, 2.0)
             release.set()
             assert await asyncio.to_thread(finished.wait, 2.0)
-            await asyncio.sleep(0)
+            deadline = time.monotonic() + 2.0
+            while (
+                "failed (OSError) after detaching on an internal probe deadline" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
     finally:
         release.set()
 
