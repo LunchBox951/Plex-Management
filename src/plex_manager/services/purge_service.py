@@ -649,6 +649,7 @@ async def _run_abandonable_probe[T](
     *,
     operation_name: str,
     gate: _AbandonableThreadGate,
+    deadline_expired: asyncio.Event | None = None,
 ) -> T:
     """Run one blocking read-only probe on ``gate``'s substrate; detach on cancellation.
 
@@ -687,8 +688,24 @@ async def _run_abandonable_probe[T](
     such as ``OSError``; this substrate adds no retries, fallback values, or broad
     exception conversion. ``path`` and ``operation_name`` exist only to make a
     wedged-probe detach honest and diagnosable without logging probe results.
+    ``deadline_expired`` marks cancellation initiated by an internal probe bound,
+    so the detached-worker log distinguishes it from caller cancellation.
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
+
+    def _detach_cause_for_failure() -> str:
+        return (
+            "on an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "on caller cancellation"
+        )
+
+    def _detach_cause() -> str:
+        return (
+            "after an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "on caller cancellation"
+        )
 
     def _retrieve_worker_outcome(done: asyncio.Future[Any]) -> None:
         # ``asyncio.wait`` removed its completion callback when this caller's await
@@ -704,12 +721,12 @@ async def _run_abandonable_probe[T](
         error = done.exception()
         if error is not None:
             _logger.warning(
-                "%s of %r failed (%s) after detaching on caller cancellation; the "
-                "daemon worker ran to completion unobserved and its failure is "
-                "recorded here only",
+                "%s of %r failed (%s) after detaching %s; the daemon worker ran to "
+                "completion unobserved and its failure is recorded here only",
                 operation_name,
                 safe_text(path),
                 type(error).__name__,
+                _detach_cause_for_failure(),
             )
 
     try:
@@ -731,10 +748,11 @@ async def _run_abandonable_probe[T](
             # visible (honesty over silence) rather than a silent detach, and
             # retrieve (and log any failure of) its eventual outcome when it settles.
             _logger.warning(
-                "%s of %r detached on caller cancellation; its daemon worker will "
-                "run to completion unobserved and then release its permit",
+                "%s of %r detached %s; its daemon worker will run to completion unobserved "
+                "and then release its permit",
                 operation_name,
                 safe_text(path),
+                _detach_cause(),
             )
             worker.add_done_callback(_retrieve_worker_outcome)
         raise
@@ -1298,12 +1316,14 @@ async def _probe_within_bound[T](
         # An exhausted budget could only ever end in this raise, so never spend a
         # permit or start a physical worker to prove it.
         raise _ProbeBoundExceeded
+    deadline_expired = asyncio.Event()
     probe = asyncio.ensure_future(
         _run_abandonable_probe(
             operation,
             path,
             operation_name=operation_name,
             gate=_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE,
+            deadline_expired=deadline_expired,
         )
     )
     try:
@@ -1312,6 +1332,7 @@ async def _probe_within_bound[T](
         probe.cancel()
         raise
     if not done:
+        deadline_expired.set()
         probe.cancel()
         raise _ProbeBoundExceeded
     return probe.result()

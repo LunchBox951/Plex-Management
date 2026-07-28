@@ -82,6 +82,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
 from plex_manager.ports.library import WatchStateQuery
@@ -174,8 +175,11 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 )
 
 # The statuses the recovery pass's re-armed (breadcrumb-keyed) enumeration
-# scans: the pre-grab set PLUS ``cancelled``. A crash-window re-arm can be
-# CANCELLED before recovery runs (re-arm -> the same-release re-grab resurrects
+# scans. Pre-grab/cancelled rows are inherently tied to the crash-window re-arm;
+# ``downloading``/``failed`` are included only when the durable marker gates them,
+# because the replacement can advance before the next sweep. A genuinely active
+# scoped download still defers the destructive retry below. A crash-window re-arm
+# can be CANCELLED before recovery runs (re-arm -> the same-release re-grab resurrects
 # the old imported download row, unblocking cancel's imported-row probe -> user
 # cancels -> crash before the finalize), leaving ``cancelled`` + a stale
 # breadcrumb -- a shape BOTH enumerations would otherwise miss and that
@@ -187,7 +191,12 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # the one movie shape that CAN carry it -- report-issue's failed-purge re-arm
 # later cancelled -- is a deliberately settled correction whose kept breadcrumb
 # is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
-_REARMED_RECOVERY_STATUSES: frozenset[str] = _PRE_GRAB_STATUSES | {RequestStatus.cancelled.value}
+_MARKER_OWNED_ADVANCED_STATUSES: frozenset[str] = frozenset(
+    {RequestStatus.downloading.value, RequestStatus.failed.value}
+)
+_REARMED_RECOVERY_STATUSES: frozenset[str] = (
+    _PRE_GRAB_STATUSES | _MARKER_OWNED_ADVANCED_STATUSES | {RequestStatus.cancelled.value}
+)
 
 # The MARKER-GATED extension of the enumeration above (Codex round-4 P1): a
 # season whose replacement import was BLOCKED by the very remnants an incomplete
@@ -1129,22 +1138,19 @@ async def _resume_interrupted_evictions(
                     pending,
                 )
             )
-        # The re-armed shape: PRE-GRAB-or-CANCELLED + breadcrumb (see the
-        # docstring) -- the crash-window re-request already rewrote the status,
-        # so the 'evicted' enumeration above cannot see it; auto-grab can have
-        # promoted the re-arm past 'pending' (searching, or parked
-        # no_acceptable_release) before this sweep ran; and the user can have
-        # CANCELLED the re-arm outright (see _REARMED_RECOVERY_STATUSES). The
-        # status each row was READ at travels with it: the fold CAS compares
-        # against exactly that status, never the whole set.
+        # The re-armed shape: breadcrumb-bearing recovery statuses (see the
+        # docstring). Pre-grab/cancelled rows are lifecycle-specific; advanced
+        # downloading/failed and import-blocked rows are marker-gated below.
         for pre_grab_status in [*sorted(_REARMED_RECOVERY_STATUSES), _BLOCKED_BY_REMNANTS_STATUS]:
             for season in await season_repo.list_by_status(pre_grab_status):
                 if season.library_path is None or not _owned_by_root(
                     season.library_path, root_path, all_roots
                 ):
                     continue
-                if pre_grab_status == _BLOCKED_BY_REMNANTS_STATUS and not (
-                    _partial_delete_outstanding(season.partial_delete_path, season.library_path)
+                if pre_grab_status in (
+                    _MARKER_OWNED_ADVANCED_STATUSES | {_BLOCKED_BY_REMNANTS_STATUS}
+                ) and not _partial_delete_outstanding(
+                    season.partial_delete_path, season.library_path
                 ):
                     # A plain import conflict of its own, with no interrupted purge
                     # behind it -- none of this pass's business (see
@@ -1381,6 +1387,27 @@ async def _recover_rearmed_season(
             #     below observes -- and because the placement registration is held
             #     until that commit is done, the two windows have no gap between
             #     them.
+            if observed_status == RequestStatus.downloading.value:
+                active_download = await SqlDownloadRepository(session).find_active_for_request(
+                    pending.media_request_id, season=pending.season_number
+                )
+                if active_download is not None and active_download.status in {
+                    DownloadState.Downloading.value,
+                    DownloadState.MetadataFetching.value,
+                    DownloadState.FailedPending.value,
+                    DownloadState.ClientMissing.value,
+                }:
+                    _logger.info(
+                        "deferring the incomplete-delete retry of %r season %s: its "
+                        "replacement download is still active",
+                        _safe_title(title),
+                        safe_int(pending.season_number),
+                        extra={
+                            "request_id": safe_int(pending.media_request_id),
+                            "tmdb_id": safe_int(pending.tmdb_id),
+                        },
+                    )
+                    return False
             if await _coverage_claim_active(session, pending):
                 # A scopeless ride-along pack can be mid-transfer over this season
                 # (Codex round-3 P2), and this is a force-purge with no post-claim

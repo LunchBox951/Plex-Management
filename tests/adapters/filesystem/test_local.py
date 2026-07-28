@@ -702,7 +702,6 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
         calls.append((placed, published_identity))
@@ -712,7 +711,6 @@ def test_hardlink_or_copy_verifies_the_lexical_path_on_the_success_path(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
@@ -753,7 +751,6 @@ def test_hardlink_publication_keeps_source_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
         assert len(source_fds) == 1
@@ -765,7 +762,6 @@ def test_hardlink_publication_keeps_source_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
@@ -789,6 +785,9 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
     src.write_text("payload")
     dst = root / "copied.mkv"
     real_link = os.link
+    real_copy_no_overwrite = (
+        LocalFileSystem._copy_no_overwrite  # pyright: ignore[reportPrivateUsage]
+    )
     real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
     verified_fds: list[int] = []
 
@@ -803,6 +802,20 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
             raise OSError(errno.EXDEV, "simulated cross-device link")
         real_link(link_src, link_dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
+    def _record_copy_no_overwrite(
+        fs: LocalFileSystem,
+        copy_src: Path,
+        copy_dst: Path,
+        source_fd: int,
+        parent_fd: int,
+        name: str,
+    ) -> tuple[tuple[int, int], int]:
+        published_identity, published_fd = real_copy_no_overwrite(
+            fs, copy_src, copy_dst, source_fd, parent_fd, name
+        )
+        verified_fds.append(published_fd)
+        return published_identity, published_fd
+
     def _verify_with_held_fd(
         verify_root: Path,
         verify_dst: Path,
@@ -810,12 +823,10 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
-        assert published_fd is not None
-        held = os.fstat(published_fd)
-        verified_fds.append(published_fd)
+        assert len(verified_fds) == 1
+        held = os.fstat(verified_fds[0])
         assert (held.st_dev, held.st_ino) == published_identity
         real_verify(
             verify_root,
@@ -823,11 +834,11 @@ def test_copy_publication_keeps_written_inode_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
     monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(LocalFileSystem, "_copy_no_overwrite", _record_copy_no_overwrite)
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
 
     LocalFileSystem().hardlink_or_copy(src, dst, root=root)
@@ -847,8 +858,18 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
     src.write_text("payload")
     dst = root / "copied.mkv"
     dst.write_text("payload")  # same bytes, distinct inode: forces digest matching
+    real_idempotent_or_conflict = local_fs._idempotent_or_conflict  # pyright: ignore[reportPrivateUsage]
     real_verify = local_fs._verify_lexical_publication  # pyright: ignore[reportPrivateUsage]
     verified_fds: list[int] = []
+
+    def _record_idempotent_or_conflict(
+        source_fd: int, parent_fd: int, name: str, display: str
+    ) -> tuple[tuple[int, int], int]:
+        published_identity, published_fd = real_idempotent_or_conflict(
+            source_fd, parent_fd, name, display
+        )
+        verified_fds.append(published_fd)
+        return published_identity, published_fd
 
     def _verify_with_held_fd(
         verify_root: Path,
@@ -857,12 +878,10 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
         name: str,
         published_identity: tuple[int, int],
         *,
-        published_fd: int | None,
         placed: bool,
     ) -> None:
-        assert published_fd is not None
-        held = os.fstat(published_fd)
-        verified_fds.append(published_fd)
+        assert len(verified_fds) == 1
+        held = os.fstat(verified_fds[0])
         assert (held.st_dev, held.st_ino) == published_identity
         real_verify(
             verify_root,
@@ -870,10 +889,10 @@ def test_idempotent_digest_keeps_matched_entry_fd_open_through_verification(
             parent_fd,
             name,
             published_identity,
-            published_fd=published_fd,
             placed=placed,
         )
 
+    monkeypatch.setattr(local_fs, "_idempotent_or_conflict", _record_idempotent_or_conflict)
     monkeypatch.setattr(local_fs, "_verify_lexical_publication", _verify_with_held_fd)
 
     result = LocalFileSystem().hardlink_or_copy(src, dst, root=root)
@@ -2479,6 +2498,210 @@ def test_remove_published_unlinks_the_file_it_placed(tmp_path: Path) -> None:
 
     assert not dst.exists()
     assert dst.parent.is_dir()  # only the file goes, never the season directory
+
+
+def test_remove_published_reclaims_a_stale_publish_lock(tmp_path: Path) -> None:
+    """A crash after placement can leave the rollback's lock behind. Its dead PID
+    proves it is stale, so rollback may reclaim it and remove the file it owns."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert not dst.exists()
+    assert not lock.exists()
+
+
+def test_remove_published_refuses_an_expired_fifo_publish_lock_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """Rollback lock inspection must not block on or reclaim a non-regular lock entry."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    os.mkfifo(lock)
+    expired = time.time() - _EMPTY_LOCK_STALE_SECONDS - 1.0
+    os.utime(lock, (expired, expired))
+
+    started = time.monotonic()
+    with (
+        _bounded(1.0, "remove_published with a FIFO publish lock"),
+        pytest.raises(FileExistsError),
+    ):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    # Load-bearing hang detector: _bounded's SIGALRM raises TimeoutError, an OSError
+    # the adapter's inspection paths swallow into the expected FileExistsError — only
+    # this elapsed bound distinguishes a blocking open from a fast refusal.
+    assert time.monotonic() - started < 0.5
+    assert dst.exists()
+    assert stat.S_ISFIFO(lock.lstat().st_mode)
+
+
+def test_remove_published_refuses_fifo_replacing_an_inspected_stale_lock_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity re-check must not block when a FIFO wins the stale-lock race."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    inspected = lock.stat()
+
+    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+        lock.unlink()
+        os.mkfifo(lock)
+        return (inspected.st_dev, inspected.st_ino)
+
+    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+
+    started = time.monotonic()
+    with (
+        _bounded(1.0, "remove_published with a FIFO stale-lock replacement"),
+        pytest.raises(FileExistsError),
+    ):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    # Load-bearing hang detector: _bounded's SIGALRM raises TimeoutError, an OSError
+    # the adapter's inspection paths swallow into the expected FileExistsError — only
+    # this elapsed bound distinguishes a blocking open from a fast refusal.
+    assert time.monotonic() - started < 0.5
+    assert dst.exists()
+    assert stat.S_ISFIFO(lock.lstat().st_mode)
+
+
+def test_remove_published_refuses_a_live_publish_lock(tmp_path: Path) -> None:
+    """Rollback cannot break a lock owned by a process still running, even when it
+    owns the destination's inode; that process may be changing the entry."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text(str(os.getpid()))
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
+def test_remove_published_refuses_a_fresh_indeterminate_publish_lock(tmp_path: Path) -> None:
+    """An empty fresh lock can be a concurrent publisher between lock creation and
+    PID write, so rollback must preserve both it and the destination."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("")
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.exists()
+
+
+@pytest.mark.parametrize("lock_contents", ["0", "-1"])
+def test_remove_published_refuses_a_nonpositive_pid_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_contents: str
+) -> None:
+    """A nonpositive PID must be indeterminate, never a process-group probe."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text(lock_contents)
+
+    def _must_not_probe(_pid: int, _signal: int) -> None:
+        raise AssertionError("nonpositive lock PID must not be process-probed")
+
+    monkeypatch.setattr(os, "kill", _must_not_probe)
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == lock_contents
+
+
+def test_remove_published_refuses_an_overflow_pid_publish_lock(tmp_path: Path) -> None:
+    """An integer that overflows this platform's pid_t is indeterminate, not stale."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("2147483648")
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == "2147483648"
+
+
+def test_remove_published_refuses_when_stale_lock_is_replaced_before_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclaim must target the stale lock that was inspected, not a live replacement
+    another rollback installed at the same name before the unlink."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    inspected = lock.stat()
+
+    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+        replacement = tmp_path / "replacement.lock"
+        replacement.write_text(str(os.getpid()))
+        os.replace(replacement, lock)
+        return (inspected.st_dev, inspected.st_ino)
+
+    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == str(os.getpid())
 
 
 def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
