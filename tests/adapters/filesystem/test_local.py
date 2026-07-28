@@ -2500,6 +2500,46 @@ def test_remove_published_reclaims_a_stale_publish_lock(tmp_path: Path) -> None:
     assert not lock.exists()
 
 
+def test_remove_published_refuses_a_live_publish_lock(tmp_path: Path) -> None:
+    """Rollback cannot break a lock owned by a process still running, even when it
+    owns the destination's inode; that process may be changing the entry."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text(str(os.getpid()))
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
+def test_remove_published_refuses_a_fresh_indeterminate_publish_lock(tmp_path: Path) -> None:
+    """An empty fresh lock can be a concurrent publisher between lock creation and
+    PID write, so rollback must preserve both it and the destination."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("")
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.exists()
+
+
 def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
     """Rollback ownership is the inode captured at publication, not just the path.
 

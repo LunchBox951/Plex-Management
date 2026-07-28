@@ -705,15 +705,11 @@ def _verify_lexical_publication(
     So once the entry is fully placed, the lexical path is re-resolved from a FRESHLY
     opened root descriptor by the same no-follow component walk (creating nothing --
     verification must never build the tree it is checking) and the entry found there
-    is compared by ``(st_dev, st_ino)`` against the inode behind the held publication
-    descriptor on copy/idempotent-digest paths, or against ``published_identity`` while
-    the held source descriptor pins the linked inode on the hardlink path. Holding the
-    applicable descriptor prevents the published inode number from being freed and reused
-    by an unlink/recreate before verification. It is NOT a fresh re-stat of ``name`` taken
-    here:
-    a writer who replaces the destination between the placement helper returning and this
-    verifier running would have BOTH a fresh re-stat AND the lexical resolution describe
-    the replacement, so they would compare equal and the caller would record and scan the
+    is compared by ``(st_dev, st_ino)`` against ``published_identity``. The applicable
+    descriptor stays open to prevent the published inode number from being freed and
+    reused by an unlink/recreate before verification. It is NOT a fresh re-stat of
+    ``name`` taken here: a writer who replaces the destination between the placement
+    helper returning and this verifier running would have BOTH a fresh re-stat AND the
     wrong file with ``placed=True``. Equal is the only success: the breadcrumb the caller
     is about to persist provably names this inode, inside the root. Anything else -- a
     different inode, vanished path, or symlinked/missing ancestor -- means the tree moved
@@ -745,9 +741,6 @@ def _verify_lexical_publication(
     a breadcrumb is never born already pointing outside the root.
     """
     identity_expected = published_identity
-    if published_fd is not None:
-        held_info = os.fstat(published_fd)
-        identity_expected = (held_info.st_dev, held_info.st_ino)
 
     lexical_identity: PublishedFileIdentity | None = None
     try:
