@@ -2559,6 +2559,83 @@ def test_remove_published_refuses_a_fresh_indeterminate_publish_lock(tmp_path: P
     assert lock.exists()
 
 
+@pytest.mark.parametrize("lock_contents", ["0", "-1"])
+def test_remove_published_refuses_a_nonpositive_pid_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_contents: str
+) -> None:
+    """A nonpositive PID must be indeterminate, never a process-group probe."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text(lock_contents)
+
+    def _must_not_probe(_pid: int, _signal: int) -> None:
+        raise AssertionError("nonpositive lock PID must not be process-probed")
+
+    monkeypatch.setattr(os, "kill", _must_not_probe)
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == lock_contents
+
+
+def test_remove_published_refuses_an_overflow_pid_publish_lock(tmp_path: Path) -> None:
+    """An integer that overflows this platform's pid_t is indeterminate, not stale."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("2147483648")
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == "2147483648"
+
+
+def test_remove_published_refuses_when_stale_lock_is_replaced_before_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclaim must target the stale lock that was inspected, not a live replacement
+    another rollback installed at the same name before the unlink."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    inspected = lock.stat()
+
+    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+        replacement = tmp_path / "replacement.lock"
+        replacement.write_text(str(os.getpid()))
+        os.replace(replacement, lock)
+        return (inspected.st_dev, inspected.st_ino)
+
+    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
 def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
     """Rollback ownership is the inode captured at publication, not just the path.
 

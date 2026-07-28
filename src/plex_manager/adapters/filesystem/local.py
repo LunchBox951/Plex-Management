@@ -136,13 +136,21 @@ def _tree_entries(leaf: str, parent_fd: int) -> tuple[frozenset[str], bool]:
     return frozenset(entries), complete
 
 
-def _pid_is_running(pid: int) -> bool:
+def _pid_is_running(pid: int) -> bool | None:
+    """Whether a positive PID is running, or ``None`` when it is not probeable."""
+    if pid <= 0:
+        # kill(0, 0) and kill(-n, 0) probe process groups, never an individual owner.
+        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except (OverflowError, ValueError):
+        # A parsed integer outside the platform's pid_t range is not evidence that
+        # its lock is stale; refusal is safer than reclaiming an unknown owner.
+        return None
     return True
 
 
@@ -162,34 +170,68 @@ def _lock_is_expired(dir_fd: int, lock_name: str) -> bool:
     return time.time() - mtime > _EMPTY_LOCK_STALE_SECONDS
 
 
-def _lock_is_stale(dir_fd: int, lock_name: str) -> bool:
-    """Whether a publish lock can be reclaimed.
+def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
+    """Return the identity of a lock safe to reclaim, otherwise ``None``.
 
-    A parseable pid is authoritative: the lock is stale iff that process is gone.
-    An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
-    creates the lock file and writes its pid in two separate steps, so a crash in
-    between leaves a zero-byte lock ``int('')`` can never parse. Rather than block
-    the destination FOREVER (a terminal-only dead end -- violates north-star #1),
-    reclaim such a lock once it is older than a short threshold; a younger empty
-    lock is presumed to be a concurrent creator mid-write and is left untouched.
+    A parseable positive PID is authoritative only when it can be probed: the lock is
+    stale iff that process is gone. Invalid/unprobeable PIDs are indeterminate and left
+    untouched. An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
+    creates the lock file and writes its pid in two separate steps, so a crash in between
+    leaves a zero-byte lock ``int('')`` can never parse. Rather than block the destination
+    FOREVER (a terminal-only dead end -- violates north-star #1), reclaim such a lock once
+    it is older than a short threshold; a younger empty lock is presumed to be a concurrent
+    creator mid-write and is left untouched.
+
+    The returned identity belongs to the descriptor that was read. Reclaim verifies that
+    identity again before unlinking, but POSIX offers no conditional unlink: a replacement
+    can still land between that verification and unlink, so any uncertainty refuses.
     """
+    try:
+        lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        lock_info = os.fstat(lock_fd)
+        lock_identity = (lock_info.st_dev, lock_info.st_ino)
+        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(lock_fd)
+    if not raw:
+        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+    running = _pid_is_running(pid)
+    return lock_identity if running is False else None
+
+
+def _reclaim_lock_if_unchanged(
+    dir_fd: int, lock_name: str, expected_identity: PublishedFileIdentity
+) -> bool:
+    """Unlink the lock only when its currently opened inode is the inspected stale one."""
     try:
         lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
         return False
     try:
-        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+        lock_info = os.fstat(lock_fd)
+        if (lock_info.st_dev, lock_info.st_ino) != expected_identity:
+            return False
     except OSError:
         return False
     finally:
         os.close(lock_fd)
-    if not raw:
-        return _lock_is_expired(dir_fd, lock_name)
+    # This remains a check-then-unlink race because POSIX has no conditional unlink:
+    # a replacement can land after the identity check and before unlink. The identity
+    # re-check narrows this to the same residual window documented for entry deletion.
     try:
-        pid = int(raw)
-    except ValueError:
-        return _lock_is_expired(dir_fd, lock_name)
-    return not _pid_is_running(pid)
+        os.unlink(lock_name, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return True
 
 
 def _entry_exists(dir_fd: int, name: str) -> bool:
@@ -234,9 +276,10 @@ def _publish_lock(
         except FileExistsError:
             if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
                 raise FileExistsError(display) from None
-            if _lock_is_stale(dir_fd, lock_name):
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(lock_name, dir_fd=dir_fd)
+            stale_lock_identity = _lock_is_stale(dir_fd, lock_name)
+            if stale_lock_identity is not None and _reclaim_lock_if_unchanged(
+                dir_fd, lock_name, stale_lock_identity
+            ):
                 continue
             raise
         break
