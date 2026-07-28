@@ -185,13 +185,23 @@ def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
     The returned identity belongs to the descriptor that was read. Reclaim verifies that
     identity again before unlinking, but POSIX offers no conditional unlink: a replacement
     can still land between that verification and unlink, so any uncertainty refuses.
+
+    A non-regular entry is never a lock this module created (``_publish_lock`` only
+    creates regular files), so inspection refuses it; ``O_NONBLOCK`` keeps a planted
+    writer-less FIFO from wedging the open.
     """
     try:
-        lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
     except OSError:
         return None
     try:
         lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            return None
         lock_identity = (lock_info.st_dev, lock_info.st_ino)
         raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
     except OSError:
@@ -211,13 +221,25 @@ def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
 def _reclaim_lock_if_unchanged(
     dir_fd: int, lock_name: str, expected_identity: PublishedFileIdentity
 ) -> bool:
-    """Unlink the lock only when its currently opened inode is the inspected stale one."""
+    """Unlink the lock only when its currently opened inode is the inspected stale one.
+
+    The ``S_ISREG`` re-check runs on the freshly opened descriptor because
+    unlink-then-``mkfifo`` can reuse the inode number: identity alone cannot prove the
+    entry is still the regular file that was inspected, and ``O_NONBLOCK`` keeps such a
+    FIFO from blocking the open.
+    """
     try:
-        lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
     except OSError:
         return False
     try:
         lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            return False
         if (lock_info.st_dev, lock_info.st_ino) != expected_identity:
             return False
     except OSError:

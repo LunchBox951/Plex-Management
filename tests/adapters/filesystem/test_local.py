@@ -2519,6 +2519,74 @@ def test_remove_published_reclaims_a_stale_publish_lock(tmp_path: Path) -> None:
     assert not lock.exists()
 
 
+def test_remove_published_refuses_an_expired_fifo_publish_lock_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """Rollback lock inspection must not block on or reclaim a non-regular lock entry."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    os.mkfifo(lock)
+    expired = time.time() - _EMPTY_LOCK_STALE_SECONDS - 1.0
+    os.utime(lock, (expired, expired))
+
+    started = time.monotonic()
+    with (
+        _bounded(1.0, "remove_published with a FIFO publish lock"),
+        pytest.raises(FileExistsError),
+    ):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    # Load-bearing hang detector: _bounded's SIGALRM raises TimeoutError, an OSError
+    # the adapter's inspection paths swallow into the expected FileExistsError — only
+    # this elapsed bound distinguishes a blocking open from a fast refusal.
+    assert time.monotonic() - started < 0.5
+    assert dst.exists()
+    assert stat.S_ISFIFO(lock.lstat().st_mode)
+
+
+def test_remove_published_refuses_fifo_replacing_an_inspected_stale_lock_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity re-check must not block when a FIFO wins the stale-lock race."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    inspected = lock.stat()
+
+    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+        lock.unlink()
+        os.mkfifo(lock)
+        return (inspected.st_dev, inspected.st_ino)
+
+    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+
+    started = time.monotonic()
+    with (
+        _bounded(1.0, "remove_published with a FIFO stale-lock replacement"),
+        pytest.raises(FileExistsError),
+    ):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    # Load-bearing hang detector: _bounded's SIGALRM raises TimeoutError, an OSError
+    # the adapter's inspection paths swallow into the expected FileExistsError — only
+    # this elapsed bound distinguishes a blocking open from a fast refusal.
+    assert time.monotonic() - started < 0.5
+    assert dst.exists()
+    assert stat.S_ISFIFO(lock.lstat().st_mode)
+
+
 def test_remove_published_refuses_a_live_publish_lock(tmp_path: Path) -> None:
     """Rollback cannot break a lock owned by a process still running, even when it
     owns the destination's inode; that process may be changing the entry."""
