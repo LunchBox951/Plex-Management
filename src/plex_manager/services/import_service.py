@@ -2688,7 +2688,7 @@ async def run_import_cycle(
                 await session.rollback()
                 _logger.exception(
                     "import of download failed; will retry next cycle",
-                    extra={"download_id": row.id},
+                    extra={"download_id": safe_int(row.id)},
                 )
     return changed
 
