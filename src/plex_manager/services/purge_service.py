@@ -127,6 +127,18 @@ the same hard daemon-thread ceiling. Because a cancelled probe DETACHES rather t
 shields (issue #445), a wedged probe still holds its permit until its own worker
 physically finishes, so this cap is what bounds concurrent wedged probes.
 """
+_ABANDONABLE_CORRECTION_PROBE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous correction-path probe workers on the abandonable substrate.
+
+A SEPARATE budget from both the public :data:`_ABANDONABLE_PROBE_THREAD_LIMIT`
+and destructive :data:`_ABANDONABLE_DELETE_THREAD_LIMIT` (issue #496): bounded
+``remove_torrent`` content reads must proceed even if public health, telemetry,
+or disk probes wedge and saturate their own budget, while those best-effort reads
+must never consume destructive-correction permits. Four mirrors the other two
+budgets, yielding a process-wide ceiling of twelve abandonable daemon workers
+across the three gates. A detached, wedged worker holds its correction permit
+until physical completion, so this cap bounds concurrent wedged content probes.
+"""
 _ABANDONABLE_THREAD_GATE_POLL_SECONDS: Final = 0.01
 
 
@@ -180,6 +192,12 @@ class _AbandonableThreadPermit:
 
 _ABANDONABLE_DELETE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_DELETE_THREAD_LIMIT)
 _ABANDONABLE_PROBE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_PROBE_THREAD_LIMIT)
+# Correction-path content probes are bounded, best-effort reads that must not be
+# starved by public dashboard/telemetry probes (issue #496). They also remain
+# isolated from destructive corrections, which use the DELETE budget above.
+_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE = _AbandonableThreadGate(
+    _ABANDONABLE_CORRECTION_PROBE_THREAD_LIMIT
+)
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -514,10 +532,12 @@ async def _run_on_abandonable_thread[T](
     accounting, the final ``shutil.rmtree`` -- must run on this abandonable
     substrate instead.
 
-    ``gate`` selects the permit budget (issue #447): genuinely-unrelated read-only
-    probes draw the shared PROBE budget, while the destructive delete AND the
-    purge's OWN mandatory read-only preflight probes draw the DELETE budget, so a
-    burst of unrelated probes can never starve an operator correction.
+    ``gate`` selects the permit budget: genuinely-unrelated read-only probes draw
+    the shared PROBE budget; bounded ``remove_torrent`` content reads draw the
+    correction-only PROBE budget; and the destructive delete plus a purge's OWN
+    mandatory read-only preflight probes draw the DELETE budget. The partitions
+    prevent public probes from starving a correction and correction-path reads from
+    consuming destructive-correction permits (issues #447 / #496).
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
@@ -632,11 +652,12 @@ async def _run_abandonable_probe[T](
 ) -> T:
     """Run one blocking read-only probe on ``gate``'s substrate; detach on cancellation.
 
-    Shared core of :func:`run_abandonable_probe` (public, shared PROBE budget) and
-    :func:`purge_library_path`'s mandatory guard/reclaim preflight, which passes the
-    DELETE budget so an operator correction never depends on the shared probe budget
-    unrelated reads can exhaust (issue #447). Detach-on-cancellation is identical on
-    either budget.
+    Shared core of :func:`run_abandonable_probe` (public, shared PROBE budget),
+    :func:`purge_library_path`'s mandatory guard/reclaim preflight (DELETE budget),
+    and bounded ``remove_torrent`` content probes (correction-only PROBE budget).
+    The partitions ensure public probes cannot starve corrections, while
+    correction-path reads cannot consume destructive-correction permits. Detach-on-
+    cancellation is identical on all three budgets.
 
     Unlike a delete, a read has no partial disk mutation to protect, so this does
     NOT shield the caller through physical settlement (issue #445). On ORDINARY
@@ -1252,7 +1273,11 @@ class _ProbeBoundExceeded(Exception):
 async def _probe_within_bound[T](
     operation: Callable[[], T], path: str, *, operation_name: str, bound: float
 ) -> T:
-    """Run one abandonable PROBE-budget read of ``path`` under a ``bound``-second cap.
+    """Run one correction-path probe under a ``bound``-second cap.
+
+    Correction-path probes use their own permit budget so wedged public health,
+    telemetry, and disk probes cannot starve a ``remove_torrent`` correction
+    (issue #496). The deadline behavior otherwise matches the shared substrate.
 
     Raises :class:`_ProbeBoundExceeded` — and ONLY then — when the bound elapses with
     the probe still unanswered. ``operation``'s own result and exceptions are
@@ -1275,7 +1300,10 @@ async def _probe_within_bound[T](
         raise _ProbeBoundExceeded
     probe = asyncio.ensure_future(
         _run_abandonable_probe(
-            operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+            operation,
+            path,
+            operation_name=operation_name,
+            gate=_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE,
         )
     )
     try:
@@ -1304,8 +1332,8 @@ async def _bounded_content_probe[T](
     DISTINCTLY — an unanswered mount and a read that failed fast are different
     operator facts (:class:`_ProbeBoundExceeded`).
 
-    The worker runs on the shared read-only PROBE budget
-    (:data:`_ABANDONABLE_PROBE_THREAD_LIMIT`) rather than via
+    The worker runs on the correction-only read-only probe budget
+    (:data:`_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE`) rather than via
     ``asyncio.to_thread``: these are ordinary best-effort reads, not a destructive
     correction's preflight, and a default-executor worker wedged on a dead mount is
     rejoined at interpreter teardown, defeating the web lifespan's bounded shutdown
@@ -1382,7 +1410,7 @@ async def _visible_content_path(
     rather than checking the wrong path — when there is no live ``save_path``
     anchor, when ``list_files`` itself fails (a client hiccup here must not
     block the removal that's about to happen regardless), or when the remap
-    proves no candidate, fails, or exhausts the shared bound below.
+    proves no candidate, fails, or exhausts the correction-only bound below.
 
     Every filesystem read here is mount-sensitive and runs BEFORE ``qbt.remove``, so
     together they draw ONE ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` budget
@@ -1443,8 +1471,8 @@ async def _wait_for_content_path_gone(
     finishes, so a same-hash re-grab landing right after the ACK can start writing
     fresh data at ``content_path`` while the OLD deletion is still tearing it down
     — the tail of that deletion can then clobber the new data. Polls
-    ``os.path.exists`` on the abandonable read-only PROBE substrate (never
-    ``asyncio.to_thread``: a default-executor worker wedged on a dead mount is
+    ``os.path.exists`` on the correction-only abandonable read-only PROBE substrate
+    (never ``asyncio.to_thread``: a default-executor worker wedged on a dead mount is
     rejoined at interpreter teardown), bounded by
     ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` so this best-effort check can never
     hang a caller indefinitely (it runs inline in operator-facing correction
