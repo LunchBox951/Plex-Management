@@ -136,13 +136,21 @@ def _tree_entries(leaf: str, parent_fd: int) -> tuple[frozenset[str], bool]:
     return frozenset(entries), complete
 
 
-def _pid_is_running(pid: int) -> bool:
+def _pid_is_running(pid: int) -> bool | None:
+    """Whether a positive PID is running, or ``None`` when it is not probeable."""
+    if pid <= 0:
+        # kill(0, 0) and kill(-n, 0) probe process groups, never an individual owner.
+        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except (OverflowError, ValueError):
+        # A parsed integer outside the platform's pid_t range is not evidence that
+        # its lock is stale; refusal is safer than reclaiming an unknown owner.
+        return None
     return True
 
 
@@ -162,34 +170,90 @@ def _lock_is_expired(dir_fd: int, lock_name: str) -> bool:
     return time.time() - mtime > _EMPTY_LOCK_STALE_SECONDS
 
 
-def _lock_is_stale(dir_fd: int, lock_name: str) -> bool:
-    """Whether a publish lock can be reclaimed.
+def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
+    """Return the identity of a lock safe to reclaim, otherwise ``None``.
 
-    A parseable pid is authoritative: the lock is stale iff that process is gone.
-    An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
-    creates the lock file and writes its pid in two separate steps, so a crash in
-    between leaves a zero-byte lock ``int('')`` can never parse. Rather than block
-    the destination FOREVER (a terminal-only dead end -- violates north-star #1),
-    reclaim such a lock once it is older than a short threshold; a younger empty
-    lock is presumed to be a concurrent creator mid-write and is left untouched.
+    A parseable positive PID is authoritative only when it can be probed: the lock is
+    stale iff that process is gone. Invalid/unprobeable PIDs are indeterminate and left
+    untouched. An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
+    creates the lock file and writes its pid in two separate steps, so a crash in between
+    leaves a zero-byte lock ``int('')`` can never parse. Rather than block the destination
+    FOREVER (a terminal-only dead end -- violates north-star #1), reclaim such a lock once
+    it is older than a short threshold; a younger empty lock is presumed to be a concurrent
+    creator mid-write and is left untouched.
+
+    The returned identity belongs to the descriptor that was read. Reclaim verifies that
+    identity again before unlinking, but POSIX offers no conditional unlink: a replacement
+    can still land between that verification and unlink, so any uncertainty refuses.
+
+    A non-regular entry is never a lock this module created (``_publish_lock`` only
+    creates regular files), so inspection refuses it; ``O_NONBLOCK`` keeps a planted
+    writer-less FIFO from wedging the open.
     """
     try:
-        lock_fd = os.open(lock_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return None
+    try:
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            return None
+        lock_identity = (lock_info.st_dev, lock_info.st_ino)
+        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(lock_fd)
+    if not raw:
+        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+    running = _pid_is_running(pid)
+    return lock_identity if running is False else None
+
+
+def _reclaim_lock_if_unchanged(
+    dir_fd: int, lock_name: str, expected_identity: PublishedFileIdentity
+) -> bool:
+    """Unlink the lock only when its currently opened inode is the inspected stale one.
+
+    The ``S_ISREG`` re-check runs on the freshly opened descriptor because
+    unlink-then-``mkfifo`` can reuse the inode number: identity alone cannot prove the
+    entry is still the regular file that was inspected, and ``O_NONBLOCK`` keeps such a
+    FIFO from blocking the open.
+    """
+    try:
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
     except OSError:
         return False
     try:
-        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            return False
+        if (lock_info.st_dev, lock_info.st_ino) != expected_identity:
+            return False
     except OSError:
         return False
     finally:
         os.close(lock_fd)
-    if not raw:
-        return _lock_is_expired(dir_fd, lock_name)
+    # This remains a check-then-unlink race because POSIX has no conditional unlink:
+    # a replacement can land after the identity check and before unlink. The identity
+    # re-check narrows this to the same residual window documented for entry deletion.
     try:
-        pid = int(raw)
-    except ValueError:
-        return _lock_is_expired(dir_fd, lock_name)
-    return not _pid_is_running(pid)
+        os.unlink(lock_name, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return True
 
 
 def _entry_exists(dir_fd: int, name: str) -> bool:
@@ -208,7 +272,20 @@ def _entry_exists(dir_fd: int, name: str) -> bool:
 
 
 @contextlib.contextmanager
-def _publish_lock(dir_fd: int, name: str, display: str) -> Generator[None, None, None]:
+def _publish_lock(
+    dir_fd: int,
+    name: str,
+    display: str,
+    *,
+    reclaim_stale_with_existing_entry: bool = False,
+) -> Generator[None, None, None]:
+    """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
+
+    Publication refuses a contended lock when the destination exists: the existing
+    entry may belong to the lock holder. Rollback already has the publication's
+    identity token, so it can reclaim a proven-stale lock even when that entry exists.
+    A live or indeterminate lock is always left untouched.
+    """
     lock_name = f".{name}.publish.lock"
     while True:
         try:
@@ -219,11 +296,12 @@ def _publish_lock(dir_fd: int, name: str, display: str) -> Generator[None, None,
                 dir_fd=dir_fd,
             )
         except FileExistsError:
-            if _entry_exists(dir_fd, name):
+            if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
                 raise FileExistsError(display) from None
-            if _lock_is_stale(dir_fd, lock_name):
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(lock_name, dir_fd=dir_fd)
+            stale_lock_identity = _lock_is_stale(dir_fd, lock_name)
+            if stale_lock_identity is not None and _reclaim_lock_if_unchanged(
+                dir_fd, lock_name, stale_lock_identity
+            ):
                 continue
             raise
         break
@@ -673,7 +751,6 @@ def _verify_lexical_publication(
     name: str,
     published_identity: PublishedFileIdentity,
     *,
-    published_fd: int | None,
     placed: bool,
 ) -> None:
     """Prove the LEXICAL ``dst`` names the very inode just published, or fail closed.
@@ -692,20 +769,19 @@ def _verify_lexical_publication(
     So once the entry is fully placed, the lexical path is re-resolved from a FRESHLY
     opened root descriptor by the same no-follow component walk (creating nothing --
     verification must never build the tree it is checking) and the entry found there
-    is compared by ``(st_dev, st_ino)`` against the inode behind the held publication
-    descriptor on copy/idempotent-digest paths, or against ``published_identity`` while
-    the held source descriptor pins the linked inode on the hardlink path. Holding the
-    applicable descriptor prevents the published inode number from being freed and reused
-    by an unlink/recreate before verification. It is NOT a fresh re-stat of ``name`` taken
-    here:
-    a writer who replaces the destination between the placement helper returning and this
-    verifier running would have BOTH a fresh re-stat AND the lexical resolution describe
-    the replacement, so they would compare equal and the caller would record and scan the
-    wrong file with ``placed=True``. Equal is the only success: the breadcrumb the caller
-    is about to persist provably names this inode, inside the root. Anything else -- a
-    different inode, vanished path, or symlinked/missing ancestor -- means the tree moved
-    (or was swapped) mid-publication, and the whole publish is refused as the same visible,
-    retryable :class:`LocalFileSystemError` the ancestor-symlink refusal raises.
+    is compared by ``(st_dev, st_ino)`` against ``published_identity``. The applicable
+    descriptor stays open to prevent the published inode number from being freed and
+    reused by an unlink/recreate before verification. It is NOT a fresh re-stat of
+    ``name`` taken here: a writer who replaces the destination between the placement
+    helper returning and this verifier running would have both a fresh re-stat and the
+    lexical resolution describe the replacement, so they would compare equal and the
+    caller would record and scan the wrong file with ``placed=True``. Capturing identity
+    once at publication and threading it here, rather than re-deriving it, detects that
+    replacement. Equal is the only success: the breadcrumb the caller is about to persist
+    provably names this inode, inside the root. Anything else -- a different inode,
+    vanished path, or symlinked/missing ancestor -- means the tree moved (or was swapped)
+    mid-publication, and the whole publish is refused as the same visible, retryable
+    :class:`LocalFileSystemError` the ancestor-symlink refusal raises.
 
     On that refusal a file THIS call created is rolled back through the held descriptor
     -- but ONLY when the entry still at ``name`` is provably the one we published
@@ -731,16 +807,6 @@ def _verify_lexical_publication(
     What this function guarantees is the property the reconciler needs to start from:
     a breadcrumb is never born already pointing outside the root.
     """
-    identity_expected = published_identity
-    if published_fd is not None:
-        held_info = os.fstat(published_fd)
-        identity_expected = (held_info.st_dev, held_info.st_ino)
-        if identity_expected != published_identity:
-            raise LocalFileSystemError(
-                f"refusing to publish {os.fspath(dst)!r}: the held publication descriptor "
-                "no longer identifies the inode captured during publication"
-            )
-
     lexical_identity: PublishedFileIdentity | None = None
     try:
         with _anchored_publication(root, dst, create_missing=False) as (verify_fd, verify_name):
@@ -749,7 +815,7 @@ def _verify_lexical_publication(
         # A missing/symlinked/non-directory ancestor on the way back down is
         # itself the escape being detected -- not a separate error to surface.
         lexical_identity = None
-    if lexical_identity == identity_expected:
+    if lexical_identity == published_identity:
         return
     # Refusing. Roll back ONLY a file we created AND can still prove we own: a swap of
     # ``name`` after the comparison above must not turn this into a third-party delete.
@@ -1080,7 +1146,6 @@ class LocalFileSystem:
                     parent_fd,
                     name,
                     published_identity,
-                    published_fd=published_fd,
                     placed=placed,
                 )
             finally:
@@ -1120,7 +1185,12 @@ class LocalFileSystem:
                     name,
                 ),
                 contextlib.suppress(FileNotFoundError),
-                _publish_lock(parent_fd, name, os.fspath(dst)),
+                _publish_lock(
+                    parent_fd,
+                    name,
+                    os.fspath(dst),
+                    reclaim_stale_with_existing_entry=True,
+                ),
             ):
                 if _entry_identity(parent_fd, name) != identity:
                     return
