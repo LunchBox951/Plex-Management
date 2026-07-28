@@ -720,11 +720,16 @@ async def test_hold_registration_released_when_cancel_lands_after_worker_settles
 
 
 class _BlockDeleteAcquireGate:
-    """A real DELETE gate that parks the delete's ``acquire`` on a never-resolving
+    """A real DELETE gate that parks the FIRST ``acquire`` on a never-resolving
     (but cancellable) await -- so a caller can be cancelled while queued for a
-    delete permit with NO worker yet. The guard/reclaim probes use the SEPARATE
-    probe gate (issue #447), so this delete gate sees only the delete's single
-    ``acquire``."""
+    delete-budget permit with NO worker yet.
+
+    That first acquire is the delete-GUARD probe, not the delete: a purge's own
+    read-only preflight probes deliberately draw this same DELETE budget (issue
+    #447) so unrelated wedged probes cannot starve a destructive correction. Which
+    of the three acquires is parked does not matter for what this test asserts
+    (cancel-while-queued releases the registration), but it does for the
+    boundary-hook ordering below -- see :class:`_BlockOnlyTheDeletePermit`."""
 
     def __init__(self) -> None:
         self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
@@ -766,6 +771,122 @@ async def test_cancel_while_queued_for_delete_permit_releases_registration(
     assert purge_service.begin_placement(str(target)) is True
     purge_service.end_placement(str(target))
     assert target.exists()  # nothing was deleted -- no worker ever ran
+
+
+class _BlockOnlyTheDeletePermit:
+    """A real DELETE gate that serves the two read-only preflight probes normally
+    and then parks the DELETE's own ``acquire`` on a never-resolving (but
+    cancellable) await.
+
+    Distinct from :class:`_BlockDeleteAcquireGate` above, which parks the FIRST
+    acquire -- and the guard/reclaim preflight probes draw this same DELETE budget
+    (issue #447), so that is the guard probe, not the delete. Pinning the delete's
+    own acquire is what makes the permit-exhaustion window addressable: it is the
+    only point where a purge can be cancelled with both probes already done and no
+    worker created."""
+
+    def __init__(self) -> None:
+        self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
+        self._acquires = 0
+        self.delete_acquire_reached = asyncio.Event()
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        self._acquires += 1
+        if self._acquires <= 2:  # delete-guard probe, then reclaimable-bytes probe
+            return await self._inner.acquire()
+        self.delete_acquire_reached.set()
+        await asyncio.get_running_loop().create_future()  # blocks until cancelled
+        raise AssertionError("unreachable: the await above never resolves")
+
+    def release_permit(self) -> None:
+        self._inner.release_permit()
+
+
+async def test_cancel_while_queued_for_a_permit_never_runs_the_delete_boundary_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #515: the durable delete-boundary hook must not fire for a delete
+    that never starts.
+
+    The hook's whole promise to eviction is "a delete of this path is STARTING",
+    which is what lets recovery tell an armed marker apart from a merely
+    authorized claim. Running it before the gate wait broke that promise at the
+    one boundary the wait makes long: the delete budget is shared by every
+    destructive correction AND every purge's own preflight probes, so a purge can
+    sit queued behind wedged mounts indefinitely, and a cancellation landing
+    there used to unwind having already armed the marker -- an armed marker over
+    a provably intact tree, which is exactly the ambiguity #515 exists to remove,
+    recreated one layer down.
+
+    The gate below parks the delete's ``acquire`` forever (cancellably), so the
+    caller is cancelled with the permit never granted and no worker created."""
+    target = tmp_path / "movies" / "Never Started.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+    gate = _BlockOnlyTheDeletePermit()
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", gate)
+    boundary_calls = 0
+
+    async def _mark_delete_started() -> None:
+        nonlocal boundary_calls
+        boundary_calls += 1
+
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(
+            fs, str(target), hold_purge_registration=True, before_delete=_mark_delete_started
+        )
+    )
+    assert await asyncio.wait_for(gate.delete_acquire_reached.wait(), timeout=2.0)
+    # Parked on the DELETE's own permit wait: both read-only preflight probes have
+    # already run (they draw this same DELETE budget) and the hook has NOT.
+    assert boundary_calls == 0
+
+    purge_task.cancel()
+    await assert_task_raises(purge_task, asyncio.CancelledError)
+
+    assert boundary_calls == 0, "no delete started, so nothing may record that one did"
+    assert target.exists()
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+async def test_a_refusing_delete_boundary_hook_starts_no_delete_and_propagates(
+    tmp_path: Path,
+) -> None:
+    """The companion contract eviction's recovery leans on (issue #515): a hook
+    that REFUSES at the boundary must abort the purge without a byte moving, and
+    its exception must reach the caller unchanged -- never flattened into a
+    ``PurgeOutcome``, which would read as "a delete was attempted and failed".
+
+    The permit and the path registration are both returned, so the very next
+    purge of the same path behaves normally (proved by deleting it afterwards)."""
+    target = tmp_path / "movies" / "Revoked Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+
+    class _Revoked(Exception):
+        pass
+
+    async def _refuse() -> None:
+        raise _Revoked
+
+    with pytest.raises(_Revoked):
+        await purge_service.purge_library_path(
+            fs, str(target), hold_purge_registration=True, before_delete=_refuse
+        )
+
+    assert target.exists()
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+    # The permit really came back: a plain purge of the same path still works.
+    result = await purge_service.purge_library_path(fs, str(target))
+    assert result.outcome is PurgeOutcome.deleted
+    assert not target.exists()
 
 
 async def test_delete_thread_start_failure_releases_permit_and_registration(

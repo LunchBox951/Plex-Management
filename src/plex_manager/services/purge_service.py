@@ -901,8 +901,30 @@ def _forget_probe_task(
     _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
 
 
+class _DeleteBoundaryHookError(Exception):
+    """Internal carrier for a caller's ``before_delete`` hook failure.
+
+    The hook runs INSIDE :func:`_delete_to_settlement` (issue #515), so without
+    this wrapper its exception would fall into :func:`purge_library_path`'s
+    delete-outcome classification and a hook that happened to raise an
+    ``OSError`` would be reported as ``PurgeOutcome.error`` -- "the delete
+    failed" for a delete that never started. Unwrapped and re-raised unchanged at
+    that boundary, so callers still see exactly what their hook raised.
+    ``CancelledError`` is deliberately never wrapped: cancellation must keep
+    propagating as cancellation.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+
 async def _delete_to_settlement(
-    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool
+    fs: FileSystemPort,
+    library_path: str,
+    *,
+    hold_purge_registration: bool,
+    before_delete: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Run delete to real settlement (except process-shutdown abandonment) and own
     the ``_ACTIVE_PURGE_PATHS`` release decision from this coroutine's OWN outcome.
@@ -941,14 +963,41 @@ async def _delete_to_settlement(
     path an abandoned delete is still tearing down. A worker still running when
     its originating loop closes is process-exit territory (issue #128 crash
     recovery), not an in-process lifecycle event.
+
+    ``before_delete`` -- the caller's DURABLE delete-boundary hook -- is invoked
+    HERE, after the permit is held and immediately before the worker start, not
+    before the gate wait (issue #515). That wait is unbounded: the budget is
+    :data:`_ABANDONABLE_DELETE_THREAD_LIMIT` permits shared by every destructive
+    correction AND every purge's own preflight probes, so a purge can sit queued
+    behind wedged mounts for the whole life of a sweep, and a cancellation landing
+    in that queue used to unwind having ALREADY run the hook. For eviction that
+    meant a durable "a delete started" marker armed over a delete that never
+    began -- exactly the authorized-vs-started ambiguity issue #515 exists to
+    remove, recreated one layer down. Running the hook under the permit makes its
+    promise true: once it returns, the only thing between it and the first
+    unlinked byte is a synchronous thread start with no cancellation point in it.
+    A hook that raises or is cancelled returns the permit and starts no delete;
+    the registration is then resolved by this coroutine's own ``finally``,
+    exactly as for any other pre-worker failure.
     """
     worker: asyncio.Future[None] | None = None
     succeeded = False
     try:
         permit = await _ABANDONABLE_DELETE_THREAD_GATE.acquire()
-        # No ``await`` between the permit acquisition above and storing ``worker``
-        # below: the synchronous starter creates the daemon thread and hands back
-        # its future atomically, so cancellation can never strand a live worker.
+        if before_delete is not None:
+            try:
+                await before_delete()
+            except asyncio.CancelledError:
+                permit.release()
+                raise
+            except Exception as exc:
+                permit.release()
+                raise _DeleteBoundaryHookError(exc) from exc
+        # No ``await`` between the boundary hook returning above and storing
+        # ``worker`` below: the synchronous starter creates the daemon thread and
+        # hands back its future atomically, so cancellation can never strand a
+        # live worker. Until the starter takes it, the permit belongs to this
+        # coroutine, which is why both hook-failure paths hand it back explicitly.
         worker = _start_on_abandonable_thread(
             lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
         )
@@ -995,10 +1044,17 @@ async def purge_library_path(
     this path as free while a delete for it is still physically running.
 
     ``before_delete`` is an optional durable-boundary hook invoked after both
-    read-only preflight probes succeed and immediately before the destructive
-    worker is started. Eviction uses it to distinguish a delete that was merely
-    authorized from one whose destructive phase is starting; an exception or
-    cancellation from the hook starts no delete and is propagated unchanged.
+    read-only preflight probes succeed, AFTER one of the four delete-worker
+    permits is held, and immediately before the destructive worker is started
+    (issue #515 -- see :func:`_delete_to_settlement` for why the permit must come
+    first). Eviction uses it two ways: to distinguish a delete that was merely
+    authorized from one whose destructive phase is starting, and to re-read the
+    safety facts (an operator pin, a competing transfer) at the last cancellable
+    point before bytes leave. An exception or cancellation from the hook starts no
+    delete, releases the permit and the registration, and is propagated unchanged
+    -- deliberately NOT classified as a ``PurgeOutcome``, because no delete was
+    attempted and a caller must be able to tell "I revoked this" from "the
+    filesystem refused".
 
     CLOSED (issue #431): that invariant now holds THROUGH process-shutdown
     abandonment too. :func:`abandon_active_settlements` (PR #406) can force
@@ -1083,9 +1139,6 @@ async def purge_library_path(
         except OSError:
             freed_bytes = 0
 
-        if before_delete is not None:
-            await before_delete()
-
         # HANDOFF (issue #431): from here :func:`_delete_to_settlement` owns
         # EVERY terminal path of this ``_ACTIVE_PURGE_PATHS`` registration --
         # success (held or released), a guard/OS delete failure, ordinary
@@ -1100,8 +1153,18 @@ async def purge_library_path(
         registration_handed_off = True
         try:
             await _delete_to_settlement(
-                fs, library_path, hold_purge_registration=hold_purge_registration
+                fs,
+                library_path,
+                hold_purge_registration=hold_purge_registration,
+                before_delete=before_delete,
             )
+        except _DeleteBoundaryHookError as boundary:
+            # The caller's own hook refused (or failed) at the delete boundary --
+            # no delete started, and the registration is already resolved by the
+            # helper's ``finally``. Re-raise the ORIGINAL exception so the caller
+            # sees exactly what it raised, never a purge outcome that would claim
+            # a delete was attempted.
+            raise boundary.error from None
         except LocalFileSystemError as exc:
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
         except PartialDeleteError as exc:
