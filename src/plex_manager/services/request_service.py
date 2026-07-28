@@ -835,11 +835,12 @@ async def create_request_result(
                 seasons=seasons,
                 episodes=episodes,
             )
-            # #358 round 2: the media lock was released above (the subscribe
+            # #358 round 2 / #367: the media lock was released above (the subscribe
             # helpers' commit, or the API-key rollback), so the join target can be
-            # settled by a concurrent sole-participant withdrawal / cancel before
-            # the season writes land. Grow the tracked set under a RE-VERIFIED
-            # lock; a settled target aborts the join with nothing written and
+            # settled by a concurrent withdrawal or admin/owner cancel before the
+            # season writes land. Every cancellation path participates in this same
+            # lock, so grow the tracked set only after a RE-VERIFIED acquisition;
+            # a settled target aborts the join with nothing written and then
             # falls back to the bounded fresh-create retry (the same outcome a
             # create arriving after the settle would get).
             grown = await _grow_tv_dedup_join(
