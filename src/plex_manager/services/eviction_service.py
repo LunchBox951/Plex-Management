@@ -1307,6 +1307,19 @@ async def _recover_rearmed_season(
     Returns whether this recovery destroyed data the sweep's pressure ledger has
     not accounted for (see :func:`_resume_one`).
     """
+    if purge_service.purge_in_progress(library_path):
+        _logger.info(
+            "deferring recovery of %r season %s: an operator correction holds an "
+            "active purge claim over its path",
+            _safe_title(title),
+            safe_int(pending.season_number),
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2864,6 +2877,44 @@ async def _run_sweep(
         all_roots=scope,
     ):
         disk = await _reprobe_disk(root_path, fallback=disk)
+
+    # A multi-step operator correction can be between its DB publish and physical
+    # purge while recovery runs. Its delete may satisfy this root's pressure, so a
+    # non-proactive sweep must not select other victims from the snapshot taken
+    # before that purge. The next periodic/manual sweep re-reads pressure after the
+    # correction releases its claim.
+    #
+    # Two deliberate bounds, both pinned by tests:
+    #   * ROOT-SCOPED. ``_ACTIVE_PURGE_PATHS`` is process-global; ownership is
+    #     decided the same way candidate assembly decides it, so a correction on the
+    #     anime root cannot stall reclamation on a genuinely full tv root -- pressure
+    #     nothing in flight is going to relieve.
+    #   * NON-PROACTIVE ONLY. The whole reason to defer is stale pressure ARITHMETIC.
+    #     A proactive sweep has no pressure gate and no target to overshoot, so there
+    #     is no snapshot to go stale and nothing here to suppress. The correction's
+    #     OWN path is still protected in both modes, by the per-path defer in
+    #     ``_recover_rearmed_season`` / ``_resume_one``, which runs above this.
+    #
+    # HONEST RESIDUAL (issue #526): this is a check, not a barrier. It sees only
+    # corrections that had already claimed their path by the time the sweep reached
+    # this line. A correction that starts AFTER it -- while candidate assembly is
+    # awaiting Plex, or while an earlier victim's delete runs -- is invisible to this
+    # sweep, which then evicts from a snapshot the correction is about to change.
+    # Those victims were each independently eligible (watched, past grace, un-pinned),
+    # so the cost is bounded to over-reclaiming, never to touching the correction's
+    # own path; it is NOT the same thing as serializing corrections against sweeps,
+    # and nothing here should be read as claiming that.
+    if not proactive and any(
+        _owned_by_root(active_path, root_path, scope)
+        for active_path in purge_service.active_purge_paths()
+    ):
+        _logger.info(
+            "eviction sweep deferred for %s root %s: an operator correction purge "
+            "is active under this root; pressure will be re-read after it settles",
+            media_type,
+            safe_text(root_path),
+        )
+        return []
 
     disk_used_pct = used_percent(disk)
     if not proactive and disk_used_pct < threshold_pct:
