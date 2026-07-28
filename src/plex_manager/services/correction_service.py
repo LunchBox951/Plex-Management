@@ -1029,9 +1029,31 @@ async def report_issue(
     # Claiming first means the window between "published" and "claimed" does not
     # exist at all. The ``finally`` releases it for EVERY exit, including the
     # collision that rolls the whole claim back (so no claim is leaked over a path
-    # this verb is no longer going to touch) and every outcome of (d), clean or
-    # partial -- nothing after (d) is destructive, and holding it longer would
-    # suppress the replacement search this correction exists to run.
+    # this verb is no longer going to touch).
+    #
+    # Held through (e) AND (f), not released after (d) (issue #516). The claim used
+    # to end the moment the purge returned, which reopened the very window it exists
+    # to close -- just one step later. Between (d) and (f)'s commit this row is
+    # PUBLISHED as ``searching`` + breadcrumb + incomplete-delete marker while its
+    # file is already (fully or partly) gone, and that triple is EXACTLY the shape
+    # eviction's crash-recovery pass enumerates (``_recover_rearmed_season`` /
+    # ``_resume_one``). A sweep landing in that window reads a correction in progress
+    # as an eviction someone interrupted: it finishes the delete itself and writes an
+    # ``evicted`` history row against an operator correction that is still running --
+    # a misclassification the operator then sees in the title's history. For a fully
+    # successful purge SQLite's single-writer lock (ADR-0007) already shut that out;
+    # the PARTIAL path is the real hole, because it leaves both the breadcrumb and the
+    # marker standing for recovery to act on. Extending the claim to cover (e)'s Plex
+    # await and (f)'s commit makes the whole destructive-to-durable stretch one
+    # correction-owned span, which recovery declines to touch by path.
+    #
+    # HONEST RESIDUAL (issue #526): this serializes recovery against the correction's
+    # OWN path only. A pressure sweep that already probed disk and assembled its
+    # candidate set BEFORE this claim was taken can still evict OTHER titles that were
+    # genuinely eligible at that moment -- the claim cannot retroactively un-take a
+    # snapshot. That is bounded (those victims were evictable on their own merits) and
+    # tracked separately; nothing here claims correction and eviction are fully
+    # serialized against each other.
     purge_claim = target.library_path
     if purge_claim is not None:
         purge_service.begin_purge(purge_claim)
@@ -1203,40 +1225,53 @@ async def report_issue(
                 safe_text(request.title),
                 extra=log_extra,
             )
+
+        # (e) trigger a Plex scan so the removed item drops out of the library. Inside
+        # the purge claim (issue #516): this is an await on a REMOTE server, so it is
+        # the longest suspension in the whole verb and the one most likely to have a
+        # sweep land in it -- with the file already gone and the row still published as
+        # ``searching`` + breadcrumb + marker.
+        if target.library_path is not None:
+            await purge_service.trigger_library_scan(
+                library,
+                library_path=target.library_path,
+                media_type=media_type,
+                context="report-issue",
+                extra=log_extra,
+            )
+
+        # (f) audit history row + commit. The blocklist (a) and slot claim (b) already
+        # committed at (b) (they have to: the destructive (c)/(d) must never be able to
+        # run with the claim still rollback-able -- see the marker comment there), so
+        # this commit carries (d)'s breadcrumb/marker clears and this audit row. It still
+        # cannot fail on the dedup index after the irreversible (c)/(d) already ran: our
+        # own row holds ``uq_media_requests_active`` in COMMITTED form from (b) onward,
+        # so no competitor can have taken the slot, and nothing here is a status change.
+        session.add(
+            DownloadHistory(
+                tmdb_id=request.tmdb_id,
+                torrent_hash=culprit.torrent_hash if culprit is not None else None,
+                event_type=DownloadHistoryEvent.reported,
+                source_title=request.title,
+                message=(
+                    f"reported ({reason}){season_note}: blocklisted the release, "
+                    f"purged the file, re-searching"
+                ),
+            )
+        )
+        await session.commit()
+
     finally:
+        # The LAST thing the destructive stretch does, and the only release point:
+        # exactly one ``end_purge`` for the one ``begin_purge`` above, on every exit --
+        # the (b) collision that raises ``ActiveDuplicateError``, any failure in
+        # (c)-(f), and the success path. Released only AFTER (f) committed (issue
+        # #516), so the row is never simultaneously "file gone" and "unclaimed" while
+        # still carrying its breadcrumb/marker. Released BEFORE (g), deliberately: the
+        # re-search is the non-destructive half of this verb, and holding the claim
+        # across it would keep the replacement's own import out of this very path.
         if purge_claim is not None:
             purge_service.end_purge(purge_claim)
-
-    # (e) trigger a Plex scan so the removed item drops out of the library.
-    if target.library_path is not None:
-        await purge_service.trigger_library_scan(
-            library,
-            library_path=target.library_path,
-            media_type=media_type,
-            context="report-issue",
-            extra=log_extra,
-        )
-
-    # (f) audit history row + commit. The blocklist (a) and slot claim (b) already
-    # committed at (b) (they have to: the destructive (c)/(d) must never be able to
-    # run with the claim still rollback-able -- see the marker comment there), so
-    # this commit carries (d)'s breadcrumb/marker clears and this audit row. It still
-    # cannot fail on the dedup index after the irreversible (c)/(d) already ran: our
-    # own row holds ``uq_media_requests_active`` in COMMITTED form from (b) onward,
-    # so no competitor can have taken the slot, and nothing here is a status change.
-    session.add(
-        DownloadHistory(
-            tmdb_id=request.tmdb_id,
-            torrent_hash=culprit.torrent_hash if culprit is not None else None,
-            event_type=DownloadHistoryEvent.reported,
-            source_title=request.title,
-            message=(
-                f"reported ({reason}){season_note}: blocklisted the release, "
-                f"purged the file, re-searching"
-            ),
-        )
-    )
-    await session.commit()
 
     # (g) synchronous re-search: the SAME decision-engine -> grab path the grab
     # endpoint uses. The blocklist row above now excludes the culprit, so a
