@@ -82,6 +82,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
 from plex_manager.ports.library import WatchStateQuery
@@ -1377,7 +1378,12 @@ async def _recover_rearmed_season(
                 active_download = await SqlDownloadRepository(session).find_active_for_request(
                     pending.media_request_id, season=pending.season_number
                 )
-                if active_download is not None:
+                if active_download is not None and active_download.status in {
+                    DownloadState.Downloading.value,
+                    DownloadState.MetadataFetching.value,
+                    DownloadState.FailedPending.value,
+                    DownloadState.ClientMissing.value,
+                }:
                     _logger.info(
                         "deferring the incomplete-delete retry of %r season %s: its "
                         "replacement download is still active",

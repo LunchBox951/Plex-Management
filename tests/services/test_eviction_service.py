@@ -7721,6 +7721,59 @@ async def test_recovery_defers_downloading_marker_owner_while_download_is_active
     assert season_row.partial_delete_path == str(season_dir)
 
 
+async def test_recovery_purges_downloading_marker_owner_once_transfer_is_import_pending(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #514 review: import-side states mean transfer bytes are settled; the
+    marker owner must clear remnants before auto-import reaches the deterministic
+    destination rather than deferring into import_blocked."""
+    root = tmp_path / "tv"
+    season_dir = root / "Import Pending Advanced Regrab" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Import.Pending.Advanced.Regrab.S01E01.mkv").write_bytes(b"0" * 1024)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4974,
+        title="Import Pending Advanced Regrab",
+        season_dir=season_dir,
+        status=RequestStatus.downloading,
+    )
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        session.add(
+            Download(
+                torrent_hash="import-pending-advanced-regrab",
+                status="import_pending",
+                media_request_id=season_row.media_request_id,
+                season=1,
+                media_type=MediaType.tv,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.status is RequestStatus.downloading
+    assert season_row.library_path is None
+    assert season_row.partial_delete_path is None
+
+
 async def test_a_plain_import_blocked_season_is_never_touched_by_recovery(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
