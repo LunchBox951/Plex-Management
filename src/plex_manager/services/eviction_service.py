@@ -602,31 +602,55 @@ def _recovery_delete_boundary(
     unlinked byte. A revocation raises, the primitive starts no delete, and the
     claim/breadcrumb/marker survive intact for the next sweep to re-decide.
 
-    ORDER INSIDE THE HOOK IS LOAD-BEARING (review round 2). Re-reading a fact and
-    then awaiting three more queries re-opens the very window this hook exists to
-    close, one layer in: a pin committed while the hook awaits its LATER queries
-    would be read-then-ignored exactly as the caller's early read was. So:
+    ORDER INSIDE THE HOOK IS LOAD-BEARING, and the shape is WRITE-FIRST (review
+    round 3, which found the previous read-then-restamp version unsound):
 
-    1. the ordinary awaited queries first -- ownership (a competing transfer, a
-       ride-along pack) and the path fact (another live row claiming it). These
-       are the facts whose actors are this process's own pipeline, which the
-       sweep latch and the placement registry already serialize against;
-    2. then a single WRITE transaction that re-reads operator INTENT (pin +
-       watchlist) and the marker, and -- only if all of them still permit it --
-       re-stamps the marker and commits. Under SQLite's single-writer
-       serialization (ADR-0007, the same property ADR-0022 step 7 leans on) that
-       commit is the serialization point against ``POST /requests/{id}/keep-
-       forever``: a pin that commits BEFORE this transaction's write is visible
-       to the re-reads inside it, and one that commits AFTER has queued behind a
-       marker that is already armed with the delete underway -- the same
-       irreducible micro-window every other post-claim/pre-delete guard in this
-       module accepts, rather than a wide awaited gap.
+    1. The ordinary awaited queries first -- ownership (a competing transfer, a
+       ride-along pack) and the path fact (another live row claiming it). Their
+       actors are this process's own pipeline, which the sweep latch and the
+       placement registry already serialize against, so a plain read is honest
+       for them.
+    2. Then ONE atomic conditional ``UPDATE`` (:meth:`SqlRequestRepository.
+       confirm_partial_delete_marker` and its season twin) as the FIRST statement
+       of a fresh transaction: re-stamp the marker WHERE the breadcrumb and the
+       marker still hold this exact path AND the row (or, for a season, its
+       parent) is NOT ``keep_forever``-pinned. ``rowcount == 0`` is the database
+       itself refusing -- a pin landed, or the marker was retired -- and revokes.
+    3. Only THEN, inside that same transaction and under the writer lock the
+       statement above took, the intent facts that cannot be folded into that
+       ``WHERE``: the watchlist row, and a final fresh pin re-read (see below).
+       Revocation rolls the whole transaction back, leaving the row exactly as
+       found -- the re-stamp was value-identical anyway.
+    4. Commit. Only after that does the primitive start the delete worker.
 
-    The marker re-stamp is value-identical (recovery's marker is already armed
-    over this path; that is what selected the row). It exists to give the hook a
-    real write to serialize on, and it is rolled back with the rest of the
-    transaction when a re-read revokes -- so a revocation leaves the row byte-for-
-    byte as it found it.
+    WHY WRITE-FIRST, precisely:
+
+    * A value-identical ORM attribute assignment emits NO SQL at all. The unit of
+      work sees no attribute change, so ``session.commit()`` sends nothing --
+      verified, not assumed: the transaction contained only the two SELECTs. A
+      "re-stamp" written that way is not a write, takes no lock, and serializes
+      against nothing. It must be a query-level ``update()``.
+    * The same real ``UPDATE`` placed AFTER the reads would still not help. In WAL
+      the transaction's read snapshot is fixed at its FIRST statement, so reads
+      taken before the write see a snapshot that predates the lock; worse, the
+      read-to-write upgrade can fail outright with ``SQLITE_BUSY_SNAPSHOT`` when
+      another writer committed in between. Taking the lock with the transaction's
+      first statement makes the snapshot postdate every previously committed pin
+      and makes every racing pin queue behind this transaction.
+
+    This leans on SQLite's single-writer model (ADR-0007) exactly as ADR-0022
+    step 7 does, and inherits the same engine dependence: a future multi-writer
+    database needs ``SELECT … FOR UPDATE`` or a serializable transaction here,
+    not this statement's implicit lock.
+
+    Step 3's pin re-read is deliberately redundant WITH the CAS on an engine that
+    really does exclude concurrent writers -- there, a pin committing after the
+    CAS has queued behind it and lands only once the delete is already underway,
+    which is the same irreducible micro-window every other post-claim/pre-delete
+    guard in this module accepts. It is kept because it costs one SELECT and is
+    the only guard left on any deployment where that exclusion does not hold
+    (a shared connection, a future engine). It is read LAST, with no awaited query
+    after it, for the same reason the whole hook exists.
     """
 
     async def _revoke_if_no_longer_safe() -> None:
@@ -635,29 +659,63 @@ def _recovery_delete_boundary(
             reason = "another live row now claims its path"
         if reason is not None:
             raise _RecoveryPurgeRevoked(reason)
-        # End the read transaction the checks above opened so the block below is
-        # one self-contained write transaction rather than a tail of this one.
+        # End whatever transaction the reads above opened, so the CAS below is the
+        # FIRST statement of the final one and its writer lock is what fixes that
+        # transaction's snapshot.
         await session.rollback()
         try:
-            reason = await _recovery_intent_blocked_reason(session, pending)
-            if reason is None and not await _partial_delete_still_armed(
-                session, pending, library_path
-            ):
-                reason = (
-                    "its incomplete-delete marker was retired (a replacement import owns the path)"
+            if not await _confirm_delete_marker_cas(session, pending, library_path):
+                raise _RecoveryPurgeRevoked(
+                    "the database refused the delete-boundary re-stamp: the title was "
+                    "pinned, or its breadcrumb/incomplete-delete marker was retired"
                 )
+            reason = await _post_cas_intent_blocked_reason(session, pending)
             if reason is not None:
                 raise _RecoveryPurgeRevoked(reason)
-            await _arm_partial_delete(session, pending, library_path)
             await session.commit()
         except BaseException:
-            # Includes the revocation above: nothing this hook staged may survive
+            # Includes the revocations above: nothing this hook staged may survive
             # a boundary that decided not to delete (nor a cancellation landing
-            # mid-transaction).
+            # mid-transaction). The re-stamp is value-identical, so the rollback
+            # leaves the row byte-for-byte as it was found either way.
             await session.rollback()
             raise
 
     return _revoke_if_no_longer_safe
+
+
+async def _confirm_delete_marker_cas(
+    session: AsyncSession, pending: _Pending, library_path: str
+) -> bool:
+    """The delete boundary's atomic conditional re-stamp -- see
+    :func:`_recovery_delete_boundary` step 2. ``False`` means the DATABASE refused.
+    """
+    if isinstance(pending, _SeasonPending):
+        return await SqlSeasonRequestRepository(session).confirm_partial_delete_marker(
+            pending.season_request_id, expected_path=library_path
+        )
+    return await SqlRequestRepository(session).confirm_partial_delete_marker(
+        pending.media_request_id, expected_path=library_path
+    )
+
+
+async def _post_cas_intent_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
+    """The intent facts read AFTER the boundary's CAS, under its writer lock.
+
+    The watchlist row cannot be folded into the CAS's ``WHERE`` (a different table
+    on a different key), and the pin re-read is the defence-in-depth step 3 of
+    :func:`_recovery_delete_boundary` explains. The pin is read LAST so no awaited
+    query follows the most safety-critical fact.
+    """
+    media_type: Literal["movie", "tv"] = "tv" if isinstance(pending, _SeasonPending) else "movie"
+    if await watchlist_service.is_watchlisted(session, pending.tmdb_id, media_type):
+        return "the title is on an active watchlist"
+    parent = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
+    if parent is None:
+        return "its request row vanished"
+    if parent.keep_forever:
+        return "the operator pinned the title (keep_forever)"
+    return None
 
 
 def _size_bytes(path: str) -> int | None:

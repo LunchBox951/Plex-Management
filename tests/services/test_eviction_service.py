@@ -7635,8 +7635,11 @@ async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundar
     force-purge has no CAS to fold into.
 
     The gate above commits the pin from a SEPARATE session precisely inside that
-    window. Post-fix the boundary hook re-reads it and revokes: nothing deleted,
-    claim + breadcrumb + marker all intact. Pre-fix the file is gone."""
+    window -- BEFORE the boundary's conditional re-stamp runs, so this is the
+    ROWCOUNT-0 path: the database itself refuses the ``UPDATE ... WHERE ... AND
+    keep_forever = 0``. Nothing deleted, claim + breadcrumb + marker all intact.
+    Pre-fix the file is gone. (The sibling test below covers the other schedule,
+    where the pin lands after that statement.)"""
     library_path = _movie_file(tmp_path, "Pinned Mid Purge.mkv")
     request_id = await _movie(
         sessionmaker_,
@@ -7688,32 +7691,38 @@ async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundar
     assert row.partial_delete_path == library_path
 
 
-async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safety_read(
+async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_marker_cas(
     sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review round 2: closing the caller-to-boundary window is not enough if the
-    boundary's OWN reads are a sequence of awaits.
+    """Review round 3: the OTHER schedule, where the pin lands after the delete
+    boundary's conditional re-stamp has already matched.
 
-    A hook that re-read the pin and then awaited three more queries had simply
-    moved the read-then-ignore window one layer in. This schedules the pin
-    precisely there -- committed during the boundary hook's FIRST safety read, so
-    it lands after any pin read that preceded that read and before the marker
-    commit that ends the hook.
+    The pin is committed from inside the FIRST intent-fact read that runs after
+    the CAS -- ``watchlist_service.is_watchlisted`` -- so it is strictly later
+    than any pin read a pre-fix hook would have taken, and strictly later than
+    the transaction's first statement. The purge must still be revoked, here by
+    the post-CAS pin re-read that runs last with no awaited query after it.
 
-    Pre-fix (pin re-read first, ownership queries after) the hook reads a clean
-    pin, then the wrapper commits it, and the delete proceeds: the test fails on
-    ``Path(library_path).exists()``. Post-fix intent is read LAST, inside the
-    write transaction that stamps the marker, so the pin is seen and the purge is
-    revoked with the row byte-for-byte unchanged.
+    Pre-fix (this branch's round-2 hook: intent read FIRST, then ownership, then
+    a value-identical attribute re-stamp that emitted no SQL at all) the hook
+    reads a clean pin, the wrapper then commits the pin, and the delete proceeds
+    -- the test fails on ``Path(library_path).exists()``.
 
-    Deterministic: the wrapper fires on the SECOND call (the boundary hook's --
-    the first is the caller's cheap pre-check), and everything runs as ordinary
-    coroutines on the one event loop. No sleeps."""
-    library_path = _movie_file(tmp_path, "Pinned Mid Boundary.mkv")
+    HONEST SCOPE. The test harness binds every session to ONE SQLite connection
+    (``StaticPool`` in-memory, see ``tests/services/conftest.py``), so the
+    "concurrent" pin here is not excluded by the CAS's writer lock the way a real
+    second connection would be. That is exactly the deployment shape the post-CAS
+    re-read exists for, and it is what this test pins. On a real connection the
+    pin would instead queue behind the CAS and land after the delete began --
+    the accepted micro-window, not a regression.
+
+    Deterministic: the wrapper fires on the SECOND call (the first is the
+    caller's cheap pre-check), all on the one event loop. No sleeps."""
+    library_path = _movie_file(tmp_path, "Pinned Post CAS.mkv")
     request_id = await _movie(
         sessionmaker_,
         tmdb_id=4959,
-        title="Pinned Mid Boundary",
+        title="Pinned Post CAS",
         library_path=library_path,
         status=RequestStatus.evicted,
     )
@@ -7723,14 +7732,16 @@ async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safet
         row.partial_delete_path = library_path
         await session.commit()
 
-    real_competing_transfer = eviction_service._competing_active_transfer  # pyright: ignore[reportPrivateUsage]
+    real_is_watchlisted = eviction_service.watchlist_service.is_watchlisted
     calls = 0
 
-    async def _pin_during_the_boundarys_first_read(session: AsyncSession, pending: object) -> bool:
+    async def _pin_during_the_first_post_cas_read(
+        session: AsyncSession, tmdb_id: int, media_type: str
+    ) -> bool:
         nonlocal calls
         calls += 1
-        result = await real_competing_transfer(session, cast(Any, pending))
-        if calls == 2:  # the boundary hook's read, not the caller's pre-check
+        result = await real_is_watchlisted(session, tmdb_id, cast(Any, media_type))
+        if calls == 2:  # the boundary hook's post-CAS read, not the pre-check
             async with sessionmaker_() as pinning_session:
                 pinned = await pinning_session.get(MediaRequest, request_id)
                 assert pinned is not None
@@ -7739,7 +7750,7 @@ async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safet
         return result
 
     monkeypatch.setattr(
-        eviction_service, "_competing_active_transfer", _pin_during_the_boundarys_first_read
+        eviction_service.watchlist_service, "is_watchlisted", _pin_during_the_first_post_cas_read
     )
 
     async with sessionmaker_() as session:
@@ -7758,7 +7769,7 @@ async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safet
             grace_days=_GRACE_DAYS,
         )
 
-    assert calls >= 2, "the boundary hook must have run its own safety reads"
+    assert calls >= 2, "the boundary hook must have reached its post-CAS intent reads"
     assert outcomes == []
     assert Path(library_path).exists(), "a pinned title is NEVER deleted"
     assert purge_service.active_purge_paths() == ()
@@ -7768,6 +7779,128 @@ async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safet
     assert row.status is RequestStatus.evicted
     assert row.library_path == library_path
     assert row.partial_delete_path == library_path
+
+
+async def test_the_delete_boundary_emits_a_real_conditional_update_before_its_reads(
+    engine: AsyncEngine, sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Review round 3's core finding, pinned as an assertion on the EMITTED SQL.
+
+    The previous shape "re-stamped" the marker by assigning the value it already
+    held. SQLAlchemy's unit of work sees no attribute change and emits nothing --
+    so there was no statement, no writer lock, and no serialization against the
+    keep-forever endpoint whatsoever; the transaction contained only SELECTs.
+
+    What must be true instead: a query-level ``UPDATE`` carrying the pin in its
+    ``WHERE``, emitted as the FIRST statement of the boundary's final transaction,
+    with the intent reads that cannot be folded into it coming AFTER."""
+    library_path = _movie_file(tmp_path, "Emitted SQL.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4988,
+        title="Emitted SQL",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    statements: list[str] = []
+
+    def _capture(
+        _conn: Any, _cursor: Any, statement: str, _params: Any, _ctx: Any, _many: bool
+    ) -> None:
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(
+                    watch_states={
+                        (4988, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                    }
+                ),
+                fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert outcomes == []  # recovery converged; the sweep itself selected nothing
+    assert not Path(library_path).exists()
+
+    cas_indexes = [
+        i
+        for i, statement in enumerate(statements)
+        if statement.startswith("UPDATE media_requests SET partial_delete_path")
+        and "keep_forever" in statement
+    ]
+    assert cas_indexes, (
+        "the delete boundary must emit a real conditional UPDATE; a value-identical "
+        f"attribute assignment emits nothing. Statements: {statements}"
+    )
+    cas_at = cas_indexes[0]
+    # ...and the intent read that cannot be folded into that WHERE comes AFTER it,
+    # so it runs under the writer lock the statement above just took.
+    watchlist_after = [i for i, s in enumerate(statements) if "watchlist_items" in s and i > cas_at]
+    assert watchlist_after, f"the watchlist read must follow the CAS. Statements: {statements}"
+
+
+async def test_the_boundary_cas_reports_rowcount_zero_for_a_pinned_row(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The CAS's own contract, asserted directly: it matches an armed, un-pinned
+    row and refuses a pinned one -- the ``rowcount == 0`` the boundary revokes on."""
+    library_path = _movie_file(tmp_path, "Cas Contract.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4989,
+        title="Cas Contract",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert (
+            await SqlRequestRepository(session).confirm_partial_delete_marker(
+                request_id, expected_path=library_path
+            )
+        ) is True
+        # A path that is not the armed one is refused (a replacement import owns it).
+        assert (
+            await SqlRequestRepository(session).confirm_partial_delete_marker(
+                request_id, expected_path=library_path + ".other"
+            )
+        ) is False
+        await session.rollback()
+
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.keep_forever = True
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        assert (
+            await SqlRequestRepository(session).confirm_partial_delete_marker(
+                request_id, expected_path=library_path
+            )
+        ) is False
+        await session.rollback()
 
 
 async def test_recovery_finishes_a_marker_owned_purge_despite_a_fresh_rewatch(
