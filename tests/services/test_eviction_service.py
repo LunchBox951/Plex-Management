@@ -3091,7 +3091,11 @@ async def test_claim_refuses_to_delete_a_movie_pinned_before_the_claim(
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
     async def _forbidden_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         raise AssertionError("purge must never run once the claim has lost")
 
@@ -3174,7 +3178,11 @@ async def test_claim_refuses_to_delete_a_season_whose_parent_pinned_before_the_c
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
     async def _forbidden_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         raise AssertionError("purge must never run once the parent-pin claim has lost")
 
@@ -3243,7 +3251,11 @@ async def test_claim_loser_on_a_concurrent_status_change_never_deletes(
     monkeypatch.setattr(eviction_service, "_still_evictable", _always_evictable)
 
     async def _forbidden_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         raise AssertionError("purge must never run for a claim loser")
 
@@ -3306,7 +3318,11 @@ async def test_failed_delete_restores_the_claimed_row_to_available(
     )
 
     async def _erroring_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         # The claim already flipped the row to 'evicted' and committed; the delete
         # itself now fails (e.g. EACCES / EIO) with nothing removed.
@@ -3372,7 +3388,11 @@ async def test_deferred_purge_does_not_restore_while_replacement_import_owns_pat
     )
 
     async def _deferred_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         assert hold_purge_registration is True
         return PurgeResult(
@@ -3456,7 +3476,11 @@ async def test_partial_purge_never_restores_the_claimed_row_to_available(
         regrab_id = regrab.id
 
     async def _partial_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(
             PurgeOutcome.partial, 0, "partially deleted before failing (PermissionError)"
@@ -3699,7 +3723,7 @@ async def test_a_later_sweep_finishes_a_partial_delete_instead_of_restoring_it(
             fs=fs,
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,  # below threshold: nothing but the recovery pass runs
+            threshold_pct=0.0,  # pressure remains: recovery re-checks before retrying
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -3774,11 +3798,13 @@ async def test_a_restarted_process_finishes_an_incomplete_delete_from_the_persis
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
-            library=FakeLibrary(),
+            library=FakeLibrary(
+                watch_states={(485, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
             fs=fs,
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -3817,7 +3843,11 @@ async def test_a_restarted_process_keeps_the_claim_when_the_retry_still_cannot_c
     )
 
     async def _still_failing(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "PermissionError")
 
@@ -3864,8 +3894,14 @@ async def test_cancelling_a_sweep_mid_delete_leaves_the_incomplete_delete_marker
     )
 
     async def _cancelled_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
+        assert before_delete is not None
+        await before_delete()
         raise asyncio.CancelledError
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _cancelled_purge)
@@ -3949,7 +3985,11 @@ async def test_a_same_row_re_import_retires_the_marker_so_a_later_eviction_still
     purged: list[str] = []
 
     async def _tracking_purge(
-        _fs: object, path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:  # pragma: no cover - must never run
         purged.append(path)
         return PurgeResult(PurgeOutcome.deleted, 1024)
@@ -4007,7 +4047,11 @@ async def test_a_partial_delete_rebaselines_disk_pressure_before_picking_more_vi
     monkeypatch.setattr(eviction_service, "read_disk_usage", _fake_disk_usage)
 
     async def _partial_for_big(
-        _fs: object, path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         if path == big_path:
             return PurgeResult(
@@ -4069,8 +4113,14 @@ async def test_a_partial_eviction_still_refreshes_plex_for_what_it_did_remove(
     )
 
     async def _partial_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
+        assert before_delete is not None
+        await before_delete()
         return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial_purge)
@@ -4156,11 +4206,13 @@ async def test_a_cancelled_regrab_over_an_incomplete_delete_is_finished_not_stra
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
-            library=FakeLibrary(),
+            library=FakeLibrary(
+                watch_states={(492, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
             fs=fs,
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -4355,7 +4407,11 @@ async def test_failed_season_delete_restores_the_claimed_season_to_available(
         season_request_id = season_row.id
 
     async def _erroring_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
@@ -4435,7 +4491,11 @@ async def test_failed_season_delete_after_rearm_keeps_the_breadcrumb(
         ).id
 
     async def _rearm_then_error(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         # The concurrent re-request lands DURING the purge window: it re-arms the
         # just-committed 'evicted' claim back to 'pending' (ensure_seasons, the
@@ -4522,7 +4582,11 @@ async def test_successful_season_delete_after_rearm_clears_the_breadcrumb_once(
         ).id
 
     async def _rearm_then_delete(
-        _fs: object, path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         async with sessionmaker_() as other:
             await season_request_service.ensure_seasons(
@@ -4966,7 +5030,11 @@ async def test_failed_delete_restore_cancels_the_in_window_movie_regrab(
         regrab_id = regrab.id
 
     async def _erroring_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
@@ -5048,7 +5116,11 @@ async def test_failed_delete_restore_never_cancels_an_operator_forced_reacquire(
         reacquire_id = reacquire.id
 
     async def _erroring_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
@@ -5123,7 +5195,11 @@ async def test_failed_delete_restore_leaves_a_regrab_that_already_grabbed(
         regrab_id = regrab.id
 
     async def _erroring_purge(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "OSError")
 
@@ -5973,11 +6049,13 @@ async def test_sweep_does_not_fold_a_rearmed_season_whose_tree_was_partly_delete
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
-            library=FakeLibrary(),
+            library=FakeLibrary(
+                watch_states={(653, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
             fs=fs,
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -6576,8 +6654,14 @@ async def test_finalize_flips_a_cancelled_rearm_to_evicted_and_the_guard_holds(
         # The purge fake deletes "successfully" while the re-arm + user cancel
         # land on the row -- compressed to the end state the finalize then sees.
         async def _cancelling_purge(
-            _fs: object, _path: str, *, hold_purge_registration: bool = False
+            _fs: object,
+            _path: str,
+            *,
+            hold_purge_registration: bool = False,
+            before_delete: Callable[[], Awaitable[None]] | None = None,
         ) -> PurgeResult:
+            assert before_delete is not None
+            await before_delete()
             row = await session.get(SeasonRequest, season_id)
             assert row is not None
             row.status = RequestStatus.cancelled
@@ -7264,13 +7348,19 @@ async def test_recovery_refreshes_plex_when_a_retry_is_still_partial(
         await session.commit()
 
     async def _still_partial(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _still_partial)
 
-    library = FakeLibrary()
+    library = FakeLibrary(
+        watch_states={(4951, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
@@ -7278,7 +7368,7 @@ async def test_recovery_refreshes_plex_when_a_retry_is_still_partial(
             fs=LocalFileSystem(library_roots=[str(tmp_path)]),
             media_type="movie",
             root_path=str(tmp_path / "movies"),
-            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -7363,6 +7453,137 @@ async def test_recovery_defers_the_force_purge_while_a_pack_holds_a_coverage_cla
     assert season_row.library_path == str(season_dir)
     assert season_row.partial_delete_path == str(season_dir)
     assert history == []
+
+
+async def test_recovery_defers_marker_purge_when_operator_pins_title(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #515: a pin landing after the eviction claim must still protect an
+    armed recovery retry, just as it protects the normal claim-to-delete path."""
+    library_path = _movie_file(tmp_path, "Pinned During Outage.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4955,
+        title="Pinned During Outage",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.keep_forever = True
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(4955, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_defers_marker_purge_when_title_was_rewatched(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #515: recovery must not widen the normal rewatch race across the
+    whole outage; a fresh Plex verdict can revoke deletion eligibility."""
+    library_path = _movie_file(tmp_path, "Rewatched During Outage.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4956,
+        title="Rewatched During Outage",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(4956, "movie", None): WatchState(watched=False, last_viewed_at=None)}
+    )
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_defers_marker_purge_after_disk_pressure_clears(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #515: an armed recovery retry is not a licence to delete after the
+    pressure that authorized the original eviction has disappeared."""
+    library_path = _movie_file(tmp_path, "Pressure Cleared.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4957,
+        title="Pressure Cleared",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(4957, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert Path(library_path).exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
 
 
 async def test_a_cancelled_regrabs_remains_are_left_alone_while_a_pack_covers_the_season(
@@ -7466,13 +7687,19 @@ async def test_a_cancelled_regrabs_failed_retry_keeps_the_breadcrumb_and_refresh
         await session.commit()
 
     async def _still_failing(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         return PurgeResult(PurgeOutcome.error, 0, "PermissionError")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _still_failing)
 
-    library = FakeLibrary()
+    library = FakeLibrary(
+        watch_states={(4954, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
@@ -7480,7 +7707,7 @@ async def test_a_cancelled_regrabs_failed_retry_keeps_the_breadcrumb_and_refresh
             fs=LocalFileSystem(library_roots=[str(root)]),
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -7561,11 +7788,13 @@ async def test_recovery_clears_remnants_that_would_block_the_replacement_import(
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
-            library=FakeLibrary(),
+            library=FakeLibrary(
+                watch_states={(4961, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
             fs=fs,
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,  # below threshold: only the recovery pass runs
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -7608,11 +7837,13 @@ async def test_recovery_unblocks_a_season_whose_import_already_hit_the_remnants(
     async with sessionmaker_() as session:
         outcomes = await eviction_service.run_eviction_sweep(
             session=session,
-            library=FakeLibrary(),
+            library=FakeLibrary(
+                watch_states={(4962, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+            ),
             fs=LocalFileSystem(library_roots=[str(root)]),
             media_type="tv",
             root_path=str(root),
-            threshold_pct=101.0,
+            threshold_pct=0.0,
             target_pct=0.0,
             grace_days=_GRACE_DAYS,
         )
@@ -7769,7 +8000,11 @@ async def test_a_partial_delete_rebaselines_before_the_next_SELECTED_victim(
     monkeypatch.setattr(eviction_service, "read_disk_usage", _fake_disk_usage)
 
     async def _partial_for_first(
-        _fs: object, path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
         if path == first_path:
             return PurgeResult(

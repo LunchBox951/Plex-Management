@@ -44,7 +44,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -926,7 +926,11 @@ async def _delete_to_settlement(
 
 
 async def purge_library_path(
-    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool = False
+    fs: FileSystemPort,
+    library_path: str,
+    *,
+    hold_purge_registration: bool = False,
+    before_delete: Callable[[], Awaitable[None]] | None = None,
 ) -> PurgeResult:
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
@@ -950,6 +954,12 @@ async def purge_library_path(
     ``finally``, tied to the delete worker's PHYSICAL completion — so a
     concurrent ``begin_placement`` / a later sweep's crash-recovery can never see
     this path as free while a delete for it is still physically running.
+
+    ``before_delete`` is an optional durable-boundary hook invoked after both
+    read-only preflight probes succeed and immediately before the destructive
+    worker is started. Eviction uses it to distinguish a delete that was merely
+    authorized from one whose destructive phase is starting; an exception or
+    cancellation from the hook starts no delete and is propagated unchanged.
 
     CLOSED (issue #431): that invariant now holds THROUGH process-shutdown
     abandonment too. :func:`abandon_active_settlements` (PR #406) can force
@@ -1033,6 +1043,9 @@ async def purge_library_path(
             )
         except OSError:
             freed_bytes = 0
+
+        if before_delete is not None:
+            await before_delete()
 
         # HANDOFF (issue #431): from here :func:`_delete_to_settlement` owns
         # EVERY terminal path of this ``_ACTIVE_PURGE_PATHS`` registration --
