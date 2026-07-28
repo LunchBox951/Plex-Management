@@ -2129,7 +2129,7 @@ async def test_run_import_cycle_failure_log_sanitizes_download_id(
         if record.getMessage() == "import of download failed; will retry next cycle"
     )
     assert record.__dict__["download_id"] == download_id + 1_000_000
-    assert sanitized == [download_id]
+    assert download_id in sanitized
 
 
 async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(

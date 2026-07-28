@@ -1554,16 +1554,16 @@ async def test_visible_content_path_hands_the_remap_the_remaining_probe_budget(
     def slow_verbatim_probe_clock() -> float:
         return next(monotonic_values, 100.3)
 
-    async def record_probe_bound[T](
-        operation: Callable[[], T],
+    async def record_probe_bound(
+        operation: Callable[[], object],
         _path: str,
         *,
         operation_name: str,
         bound: float,
-    ) -> T:
+    ) -> object:
         probe_bounds.append((operation_name, bound))
         if operation_name == "content path visibility probe":
-            return cast(T, False)
+            return False
         return operation()
 
     def remap_to_mounted_path(
