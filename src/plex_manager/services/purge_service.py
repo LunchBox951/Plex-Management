@@ -532,10 +532,12 @@ async def _run_on_abandonable_thread[T](
     accounting, the final ``shutil.rmtree`` -- must run on this abandonable
     substrate instead.
 
-    ``gate`` selects the permit budget (issue #447): genuinely-unrelated read-only
-    probes draw the shared PROBE budget, while the destructive delete AND the
-    purge's OWN mandatory read-only preflight probes draw the DELETE budget, so a
-    burst of unrelated probes can never starve an operator correction.
+    ``gate`` selects the permit budget: genuinely-unrelated read-only probes draw
+    the shared PROBE budget; bounded ``remove_torrent`` content reads draw the
+    correction-only PROBE budget; and the destructive delete plus a purge's OWN
+    mandatory read-only preflight probes draw the DELETE budget. The partitions
+    prevent public probes from starving a correction and correction-path reads from
+    consuming destructive-correction permits (issues #447 / #496).
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
