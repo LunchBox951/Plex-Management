@@ -2851,6 +2851,23 @@ async def _run_sweep(
     ):
         disk = await _reprobe_disk(root_path, fallback=disk)
 
+    # A multi-step operator correction can be between its DB publish and physical
+    # purge while recovery runs. Its delete may satisfy this root's pressure, so a
+    # non-proactive sweep must not select other victims from the snapshot taken
+    # before that purge. The next periodic/manual sweep re-reads pressure after the
+    # correction releases its claim.
+    if not proactive and any(
+        _owned_by_root(active_path, root_path, scope)
+        for active_path in purge_service.active_purge_paths()
+    ):
+        _logger.info(
+            "eviction sweep deferred for %s root %s: an operator correction purge "
+            "is active under this root; pressure will be re-read after it settles",
+            media_type,
+            safe_text(root_path),
+        )
+        return []
+
     disk_used_pct = used_percent(disk)
     if not proactive and disk_used_pct < threshold_pct:
         # Cheap pre-check, BEFORE assembling candidates: select_evictions applies

@@ -7415,6 +7415,68 @@ async def test_recovery_defers_rearmed_purge_during_report_issue_active_purge(
     assert history == []
 
 
+async def test_active_correction_purge_defers_pressure_evictions_on_the_same_root(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #516 follow-up: the correction can free enough space to satisfy the
+    root, so a sweep must not select other victims from its pre-correction disk
+    snapshot while that purge still owns the path."""
+    root = tmp_path / "tv"
+    correction_dir = root / "Correction In Progress" / "Season 01"
+    correction_dir.mkdir(parents=True)
+    (correction_dir / "Correction.In.Progress.S01E01.mkv").write_bytes(b"0" * 1024)
+    await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4956,
+        title="Correction In Progress",
+        season_dir=correction_dir,
+        status=RequestStatus.searching,
+    )
+    victim_dir = root / "Otherwise Evictable" / "Season 01"
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "Otherwise.Evictable.S01E01.mkv").write_bytes(b"0" * 1024)
+    victim_show_id = await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=4957,
+        title="Otherwise Evictable",
+        seasons={1: str(victim_dir)},
+    )
+
+    purge_service.begin_purge(str(correction_dir))
+    try:
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(
+                    watch_states={(4957, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+                ),
+                fs=LocalFileSystem(library_roots=[str(root)]),
+                media_type="tv",
+                root_path=str(root),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+    finally:
+        purge_service.end_purge(str(correction_dir))
+
+    assert outcomes == []
+    assert correction_dir.exists()
+    assert victim_dir.exists(), "the in-flight correction may satisfy pressure by itself"
+    async with sessionmaker_() as session:
+        victim = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == victim_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+    assert victim.status is RequestStatus.available
+    assert victim.library_path == str(victim_dir)
+
+
 async def test_a_cancelled_regrabs_remains_are_left_alone_while_a_pack_covers_the_season(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
