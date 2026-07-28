@@ -3780,6 +3780,95 @@ async def _armed_evicted_season(
         return show_id, season_row.id
 
 
+async def test_a_delete_worker_that_never_starts_leaves_no_armed_marker(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 2, FINDING 1: the marker must not survive a delete that never
+    began.
+
+    The boundary hook commits "a delete of this path is STARTING" and the only
+    step left after it is ``threading.Thread.start()`` -- which can fail for real
+    (thread exhaustion). Nothing is unlinked, but the row is left claiming an
+    outstanding delete over an intact tree, and issue #515's own policy has
+    recovery CONVERGE such a row (no pressure or watch-state gate) rather than
+    restore it. So the tractable half is compensated: the primitive raises the
+    distinct ``DeleteWorkerStartError`` and the marker is disarmed in a follow-up
+    commit.
+
+    Pre-fix this test fails on ``partial_delete_path is None``: the marker stays
+    armed over a file that was never touched.
+
+    Also pinned here: the failure is SURFACED (not swallowed into a skip), the
+    file is intact, and the gate permit came back -- proved by a second, ordinary
+    purge of the same path succeeding afterwards."""
+    library_path = _movie_file(tmp_path, "Unstartable Delete.mkv")
+    request_id = await _movie(
+        sessionmaker_, tmdb_id=4986, title="Unstartable Delete", library_path=library_path
+    )
+    candidate = eviction_service.EvictionCandidate(
+        request_id=request_id,
+        media_type="movie",
+        title="Unstartable Delete",
+        season=None,
+        status="available",
+        watched=True,
+        last_viewed_at=_STALE,
+        keep_forever=False,
+        in_flight=False,
+        library_path=library_path,
+        size_percent=1.0,
+    )
+    pending = eviction_service._MoviePending(  # pyright: ignore[reportPrivateUsage]
+        media_request_id=request_id, tmdb_id=4986, size_bytes=1024
+    )
+    library = FakeLibrary(
+        watch_states={(4986, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    class _StartFails:
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    original_thread = threading.Thread
+
+    def _make_thread(*, target: Callable[[], None], name: str, daemon: bool) -> threading.Thread:
+        if name == "purge-delete":
+            return cast(threading.Thread, _StartFails())
+        return original_thread(target=target, name=name, daemon=daemon)
+
+    monkeypatch.setattr(purge_service.threading, "Thread", _make_thread)
+
+    async with sessionmaker_() as session:
+        with pytest.raises(purge_service.DeleteWorkerStartError, match="can't start new thread"):
+            await eviction_service._evict_one(  # pyright: ignore[reportPrivateUsage]
+                session=session,
+                fs=fs,
+                library=library,
+                candidate=candidate,
+                pending=pending,
+                grace_cutoff=_GRACE_CUTOFF,
+            )
+
+    assert Path(library_path).exists()  # no worker ran, so nothing was unlinked
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.partial_delete_path is None, "an unstarted delete may not leave a marker armed"
+    # The claim itself stands (the row is 'evicted' with its breadcrumb): recovery
+    # sees no marker, so it RESTORES and re-decides -- the pre-#515 shape, which is
+    # correct precisely because the tree is provably intact.
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+
+    # The permit and the registration came back: an ordinary purge still works.
+    monkeypatch.setattr(purge_service.threading, "Thread", original_thread)
+    assert purge_service.active_purge_paths() == ()
+    result = await purge_service.purge_library_path(fs, library_path)
+    assert result.outcome is PurgeOutcome.deleted
+    assert not Path(library_path).exists()
+
+
 async def test_a_restarted_process_finishes_an_incomplete_delete_from_the_persisted_marker(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
@@ -7591,6 +7680,88 @@ async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundar
     assert outcomes == []
     assert Path(library_path).exists(), "a pinned title is NEVER deleted"
     assert purge_service.active_purge_paths() == ()  # the revoked purge left no claim
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_revokes_when_a_pin_lands_after_the_boundarys_first_safety_read(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 2: closing the caller-to-boundary window is not enough if the
+    boundary's OWN reads are a sequence of awaits.
+
+    A hook that re-read the pin and then awaited three more queries had simply
+    moved the read-then-ignore window one layer in. This schedules the pin
+    precisely there -- committed during the boundary hook's FIRST safety read, so
+    it lands after any pin read that preceded that read and before the marker
+    commit that ends the hook.
+
+    Pre-fix (pin re-read first, ownership queries after) the hook reads a clean
+    pin, then the wrapper commits it, and the delete proceeds: the test fails on
+    ``Path(library_path).exists()``. Post-fix intent is read LAST, inside the
+    write transaction that stamps the marker, so the pin is seen and the purge is
+    revoked with the row byte-for-byte unchanged.
+
+    Deterministic: the wrapper fires on the SECOND call (the boundary hook's --
+    the first is the caller's cheap pre-check), and everything runs as ordinary
+    coroutines on the one event loop. No sleeps."""
+    library_path = _movie_file(tmp_path, "Pinned Mid Boundary.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4959,
+        title="Pinned Mid Boundary",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    real_competing_transfer = eviction_service._competing_active_transfer  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    async def _pin_during_the_boundarys_first_read(session: AsyncSession, pending: object) -> bool:
+        nonlocal calls
+        calls += 1
+        result = await real_competing_transfer(session, cast(Any, pending))
+        if calls == 2:  # the boundary hook's read, not the caller's pre-check
+            async with sessionmaker_() as pinning_session:
+                pinned = await pinning_session.get(MediaRequest, request_id)
+                assert pinned is not None
+                pinned.keep_forever = True
+                await pinning_session.commit()
+        return result
+
+    monkeypatch.setattr(
+        eviction_service, "_competing_active_transfer", _pin_during_the_boundarys_first_read
+    )
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(
+                watch_states={
+                    (4959, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                }
+            ),
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert calls >= 2, "the boundary hook must have run its own safety reads"
+    assert outcomes == []
+    assert Path(library_path).exists(), "a pinned title is NEVER deleted"
+    assert purge_service.active_purge_paths() == ()
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
     assert row is not None

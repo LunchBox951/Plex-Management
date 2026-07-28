@@ -901,6 +901,26 @@ def _forget_probe_task(
     _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
 
 
+class DeleteWorkerStartError(RuntimeError):
+    """The destructive delete worker could not be STARTED at all.
+
+    Distinct from every ``PurgeOutcome``: those classify what a delete DID, and
+    here no delete ran -- ``threading.Thread.start()`` itself failed (the
+    realistic cause being ``RuntimeError: can't start new thread`` under thread
+    exhaustion). The permit is already back and the path registration already
+    released by the time this is raised.
+
+    It is a distinct type because a caller whose ``before_delete`` hook committed
+    durable "a delete is starting" state needs to COMPENSATE that state, and must
+    be able to tell this case from a cancellation -- which can arrive after the
+    worker really did start and really did unlink bytes, where the same
+    compensation would be a lie (issue #515, review round 2). Subclasses
+    ``RuntimeError`` so callers that only wanted the old propagate-and-log
+    behaviour keep it unchanged, and the original failure's message is preserved
+    verbatim.
+    """
+
+
 class _DeleteBoundaryHookError(Exception):
     """Internal carrier for a caller's ``before_delete`` hook failure.
 
@@ -998,9 +1018,20 @@ async def _delete_to_settlement(
         # hands back its future atomically, so cancellation can never strand a
         # live worker. Until the starter takes it, the permit belongs to this
         # coroutine, which is why both hook-failure paths hand it back explicitly.
-        worker = _start_on_abandonable_thread(
-            lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
-        )
+        #
+        # The one way this step can still fail is ``Thread.start()`` itself (the
+        # starter returns the permit and re-raises). That leaves a caller whose
+        # hook committed durable "a delete is starting" state holding a lie, so it
+        # is re-raised as the DISTINCT :class:`DeleteWorkerStartError` -- the
+        # signal that no delete ran and the state may safely be compensated. A
+        # cancellation is deliberately NOT given that signal: it can arrive after
+        # the worker started and bytes left.
+        try:
+            worker = _start_on_abandonable_thread(
+                lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
+            )
+        except Exception as exc:
+            raise DeleteWorkerStartError(str(exc)) from exc
         await _await_worker_settlement(worker, library_path, operation="delete")
         succeeded = True
     finally:

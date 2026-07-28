@@ -471,15 +471,19 @@ class _RecoveryPurgeRevoked(Exception):
 #
 # Every one of those is re-read at the delete boundary itself, not merely before
 # the awaited preflight -- see :func:`_recovery_delete_boundary`.
-async def _recovery_purge_blocked_reason(
-    session: AsyncSession, pending: _Pending, library_path: str
-) -> str | None:
-    """The reason a marker-owned recovery purge must NOT run, or ``None``.
+async def _recovery_intent_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
+    """The operator-INTENT half: a ``keep_forever`` pin or an active watchlist entry.
 
-    A static, log-safe phrase rather than a bare bool so every deferral log says
-    which safety fact revoked it (honesty over silence). Reads only committed
-    state through ``get_fresh``'s ``populate_existing=True``, so a pin or a
-    download committed by another session since this sweep began is visible.
+    Split out of the ownership half so the delete boundary can read it LAST, in
+    the same write transaction that stamps the marker -- see
+    :func:`_recovery_delete_boundary`. Intent is the fact most likely to change
+    under a human's hand mid-sweep and the one whose violation is least
+    recoverable (the pinned bytes are simply gone), so it is the one that must
+    have no awaited query after it.
+
+    Reads through ``get_fresh``'s ``populate_existing=True``, so a pin committed
+    by another session since this sweep began is visible rather than served from
+    this session's identity map.
     """
     if isinstance(pending, _SeasonPending):
         parent = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
@@ -498,11 +502,74 @@ async def _recovery_purge_blocked_reason(
         media_type = "movie"
     if await watchlist_service.is_watchlisted(session, pending.tmdb_id, media_type):
         return "the title is on an active watchlist"
+    return None
+
+
+async def _recovery_ownership_blocked_reason(
+    session: AsyncSession, pending: _Pending
+) -> str | None:
+    """The OWNERSHIP half: another actor is actively working this scope's bytes."""
     if await _competing_active_transfer(session, pending):
         return "a replacement download is still transferring into this scope"
     if await _coverage_claim_active(session, pending):
         return "a live pack holds an active ride-along coverage claim over it"
     return None
+
+
+async def _recovery_purge_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
+    """The reason a marker-owned recovery purge must NOT run, or ``None``.
+
+    The CHEAP composite, used before the purge primitive is entered at all so an
+    already-revoked row never pays for the preflight probes and gets an honest
+    log. It is deliberately NOT the authority -- the boundary hook is (see
+    :func:`_recovery_delete_boundary`), exactly as ``_still_evictable`` is the
+    cheap filter and the claim CAS the authority in :func:`_evict_one`.
+
+    A static, log-safe phrase rather than a bare bool so every deferral log says
+    which safety fact revoked it (honesty over silence).
+    """
+    return await _recovery_intent_blocked_reason(
+        session, pending
+    ) or await _recovery_ownership_blocked_reason(session, pending)
+
+
+async def _disarm_unstarted_delete(
+    session: AsyncSession, pending: _Pending, title: str | None, season_note: str
+) -> None:
+    """COMPENSATE an incomplete-delete marker whose delete never started.
+
+    The marker is armed in the purge primitive's delete-boundary hook, and the
+    only step left after that hook is ``threading.Thread.start()`` -- which can
+    still fail (thread exhaustion). Nothing was unlinked, so leaving the marker
+    armed would tell the next sweep's recovery that a destructive delete began on
+    an intact tree, and recovery deliberately CONVERGES such a row rather than
+    restoring it (issue #515's policy). Take the marker back off in its own
+    follow-up commit.
+
+    Best-effort by construction: this runs while a failure is already propagating,
+    so a compensation that itself fails must not replace the original exception.
+    It is logged in full instead of swallowed -- the row is then left in the state
+    the ambiguous-commit sliver documented at the arm site describes, which
+    recovery's boundary re-checks contain.
+    """
+    try:
+        await session.rollback()
+        await _disarm_partial_delete(session, pending)
+        await session.commit()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        _logger.exception(
+            "could not disarm the incomplete-delete marker of %r%s after its delete "
+            "worker failed to start; the row will read as an outstanding delete over "
+            "a tree nothing touched until a later sweep's recovery adjudicates it",
+            _safe_title(title),
+            season_note,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
 
 
 async def _competing_active_transfer(session: AsyncSession, pending: _Pending) -> bool:
@@ -530,24 +597,65 @@ def _recovery_delete_boundary(
     happens before ``purge_library_path``'s two awaited preflight probes and
     before the wait for one of the four delete-worker permits -- a window an
     operator pin, a fresh grab or a coverage claim can easily land inside. Every
-    check below is therefore re-run HERE: after the permit is held, with nothing
-    but a synchronous worker start left between this hook returning and the first
+    check is therefore re-run HERE: after the permit is held, with nothing but a
+    synchronous worker start left between this hook returning and the first
     unlinked byte. A revocation raises, the primitive starts no delete, and the
     claim/breadcrumb/marker survive intact for the next sweep to re-decide.
 
-    Additions over :func:`_recovery_purge_blocked_reason`'s intent/ownership set
-    are the two PATH facts, which only make sense against the concrete path being
-    deleted: another live row claiming it, and the marker still covering it.
+    ORDER INSIDE THE HOOK IS LOAD-BEARING (review round 2). Re-reading a fact and
+    then awaiting three more queries re-opens the very window this hook exists to
+    close, one layer in: a pin committed while the hook awaits its LATER queries
+    would be read-then-ignored exactly as the caller's early read was. So:
+
+    1. the ordinary awaited queries first -- ownership (a competing transfer, a
+       ride-along pack) and the path fact (another live row claiming it). These
+       are the facts whose actors are this process's own pipeline, which the
+       sweep latch and the placement registry already serialize against;
+    2. then a single WRITE transaction that re-reads operator INTENT (pin +
+       watchlist) and the marker, and -- only if all of them still permit it --
+       re-stamps the marker and commits. Under SQLite's single-writer
+       serialization (ADR-0007, the same property ADR-0022 step 7 leans on) that
+       commit is the serialization point against ``POST /requests/{id}/keep-
+       forever``: a pin that commits BEFORE this transaction's write is visible
+       to the re-reads inside it, and one that commits AFTER has queued behind a
+       marker that is already armed with the delete underway -- the same
+       irreducible micro-window every other post-claim/pre-delete guard in this
+       module accepts, rather than a wide awaited gap.
+
+    The marker re-stamp is value-identical (recovery's marker is already armed
+    over this path; that is what selected the row). It exists to give the hook a
+    real write to serialize on, and it is rolled back with the rest of the
+    transaction when a re-read revokes -- so a revocation leaves the row byte-for-
+    byte as it found it.
     """
 
     async def _revoke_if_no_longer_safe() -> None:
-        reason = await _recovery_purge_blocked_reason(session, pending, library_path)
+        reason = await _recovery_ownership_blocked_reason(session, pending)
         if reason is None and await _path_claimed_by_another_row(session, library_path, pending):
             reason = "another live row now claims its path"
-        if reason is None and not await _partial_delete_still_armed(session, pending, library_path):
-            reason = "its incomplete-delete marker was retired (a replacement import owns the path)"
         if reason is not None:
             raise _RecoveryPurgeRevoked(reason)
+        # End the read transaction the checks above opened so the block below is
+        # one self-contained write transaction rather than a tail of this one.
+        await session.rollback()
+        try:
+            reason = await _recovery_intent_blocked_reason(session, pending)
+            if reason is None and not await _partial_delete_still_armed(
+                session, pending, library_path
+            ):
+                reason = (
+                    "its incomplete-delete marker was retired (a replacement import owns the path)"
+                )
+            if reason is not None:
+                raise _RecoveryPurgeRevoked(reason)
+            await _arm_partial_delete(session, pending, library_path)
+            await session.commit()
+        except BaseException:
+            # Includes the revocation above: nothing this hook staged may survive
+            # a boundary that decided not to delete (nor a cancellation landing
+            # mid-transaction).
+            await session.rollback()
+            raise
 
     return _revoke_if_no_longer_safe
 
@@ -1565,7 +1673,7 @@ async def _recover_rearmed_season(
             # claim) are read cheaply here for an honest early log, and re-read
             # authoritatively inside the delete-boundary hook below, which runs
             # under the held delete permit (issue #515).
-            blocked = await _recovery_purge_blocked_reason(session, pending, library_path)
+            blocked = await _recovery_purge_blocked_reason(session, pending)
             if blocked is not None:
                 _logger.info(
                     "deferring the incomplete-delete retry of %r season %s: %s; keeping "
@@ -1838,7 +1946,7 @@ async def _resume_one(
     NOT re-check disk pressure or Plex watch state: finishing an already-started
     delete is convergence, and re-gating it on the conditions that authorized the
     original eviction only strands gutted media (see
-    :func:`_recovery_purge_blocked_reason`'s policy comment). It never restores,
+    :func:`_recovery_intent_blocked_reason`'s policy comment). It never restores,
     since the tree still cannot be shown complete. A retry that destroys more
     without clearing the remains refreshes Plex best-effort before returning: the
     interrupted original may never have scanned at all, leaving Plex advertising
@@ -1935,8 +2043,9 @@ async def _resume_one(
         #
         # The safety facts that can revoke this convergence (pin/watchlist intent,
         # a competing active transfer, a ride-along coverage claim, the path and
-        # the marker itself -- see :func:`_recovery_purge_blocked_reason` for what
-        # is deliberately NOT re-checked and why) are read TWICE: cheaply here, so
+        # the marker itself -- see the RECOVERY POLICY comment above
+        # :func:`_recovery_intent_blocked_reason` for what is deliberately NOT
+        # re-checked and why) are read TWICE: cheaply here, so
         # an already-revoked row never pays for the primitive's preflight probes
         # and gets an honest log, and again inside the delete-boundary hook, which
         # runs under the held delete permit with only a synchronous worker start
@@ -1945,7 +2054,7 @@ async def _resume_one(
         # operator pin committed while this coroutine awaits the two preflight
         # probes or queues for a permit would otherwise be read, ignored, and the
         # pinned title's remaining files deleted anyway.
-        blocked = await _recovery_purge_blocked_reason(session, pending, library_path)
+        blocked = await _recovery_purge_blocked_reason(session, pending)
         if blocked is not None:
             _logger.info(
                 "deferring the incomplete-delete retry of %r%s: %s; keeping the claim, "
@@ -2527,9 +2636,39 @@ async def _evict_one(
         )
         return None
 
+    # THE MARKER-ARM SITE (issues #482 / #485 / #515). Handed to the purge
+    # primitive as its durable delete-boundary hook, so it runs after both
+    # read-only preflight probes, after one of the delete-worker permits is HELD,
+    # and immediately before the synchronous worker start -- i.e. the marker
+    # records "a delete of this path is starting", not "a delete was authorized",
+    # which is the distinction #515 exists to draw.
+    #
+    # TWO RESIDUAL WINDOWS, stated rather than papered over:
+    #
+    # * ``Thread.start()`` can still fail AFTER this commit (thread exhaustion),
+    #   leaving an armed marker over a provably intact tree. That one is
+    #   TRACTABLE and is compensated below: the primitive raises the distinct
+    #   ``DeleteWorkerStartError`` for exactly this case and the marker is
+    #   disarmed in a follow-up commit.
+    # * A cancellation delivered DURING ``session.commit()`` here is an ambiguous
+    #   commit -- the write may or may not have landed, and no amount of ordering
+    #   makes a single-statement commit and an in-memory record of it atomic.
+    #   This is deliberately NOT chased. The containment is recovery's own
+    #   delete-boundary re-checks (:func:`_recovery_delete_boundary`): a marker
+    #   armed over an intact tree is converged, not restored, but only after the
+    #   pin/watchlist, competing-ownership, path and marker facts are all re-read
+    #   under the held delete permit -- so the failure mode of this sliver is a
+    #   too-eager cleanup of media the operator has not protected, never the
+    #   deletion of media they have. The opposite ordering (commit after the
+    #   delete) trades that for the far worse one #485 documents: gutted media
+    #   silently restored to ``available``.
+    delete_marker_committed = False
+
     async def _mark_delete_started() -> None:
+        nonlocal delete_marker_committed
         await _arm_partial_delete(session, pending, library_path)
         await session.commit()
+        delete_marker_committed = True
 
     # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
     # both done by the shared ``purge_service.purge_library_path`` primitive
@@ -2539,12 +2678,22 @@ async def _evict_one(
     # its OWN log message + logger for each outcome (the primitive classifies, the
     # caller logs).
     purge_held = False
-    purge = await purge_service.purge_library_path(
-        fs,
-        library_path,
-        hold_purge_registration=True,
-        before_delete=_mark_delete_started,
-    )
+    try:
+        purge = await purge_service.purge_library_path(
+            fs,
+            library_path,
+            hold_purge_registration=True,
+            before_delete=_mark_delete_started,
+        )
+    except purge_service.DeleteWorkerStartError:
+        # No delete ran and none ever will for this attempt, so the marker armed a
+        # moment ago is now a false statement about an intact tree. Compensate it
+        # and let the failure keep propagating (honesty over silence -- the sweep's
+        # per-candidate guard logs it and the row is re-decided next sweep, exactly
+        # as it was before this hook existed).
+        if delete_marker_committed:
+            await _disarm_unstarted_delete(session, pending, candidate.title, season_note)
+        raise
     if purge.outcome is PurgeOutcome.deleted:
         purge_held = True
     if purge.outcome is not PurgeOutcome.deleted:
