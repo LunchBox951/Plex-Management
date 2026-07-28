@@ -693,11 +693,18 @@ async def _run_abandonable_probe[T](
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
 
+    def _detach_cause_for_failure() -> str:
+        return (
+            "on an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "on caller cancellation"
+        )
+
     def _detach_cause() -> str:
         return (
-            "an internal probe deadline"
+            "after an internal probe deadline"
             if deadline_expired is not None and deadline_expired.is_set()
-            else "caller cancellation"
+            else "on caller cancellation"
         )
 
     def _retrieve_worker_outcome(done: asyncio.Future[Any]) -> None:
@@ -719,7 +726,7 @@ async def _run_abandonable_probe[T](
                 operation_name,
                 safe_text(path),
                 type(error).__name__,
-                _detach_cause(),
+                _detach_cause_for_failure(),
             )
 
     try:
@@ -741,8 +748,8 @@ async def _run_abandonable_probe[T](
             # visible (honesty over silence) rather than a silent detach, and
             # retrieve (and log any failure of) its eventual outcome when it settles.
             _logger.warning(
-                "%s of %r detached after %s; its daemon worker will run to completion "
-                "unobserved and then release its permit",
+                "%s of %r detached %s; its daemon worker will run to completion unobserved "
+                "and then release its permit",
                 operation_name,
                 safe_text(path),
                 _detach_cause(),

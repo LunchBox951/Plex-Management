@@ -1565,7 +1565,6 @@ async def test_internal_probe_deadline_labels_a_late_worker_failure_honestly(
     """Issue #497: a daemon worker that fails after an internal bound cancels its
     probe must record that deadline, not falsely attribute the failure to caller
     cancellation."""
-    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.1)
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -1592,7 +1591,7 @@ async def test_internal_probe_deadline_labels_a_late_worker_failure_honestly(
     finally:
         release.set()
 
-    assert "failed (OSError) after detaching an internal probe deadline" in caplog.text
+    assert "failed (OSError) after detaching on an internal probe deadline" in caplog.text
     assert "after detaching on caller cancellation" not in caplog.text
 
 
