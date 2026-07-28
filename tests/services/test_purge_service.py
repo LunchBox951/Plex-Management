@@ -837,15 +837,23 @@ async def test_cancel_while_queued_for_a_permit_never_runs_the_delete_boundary_h
             fs, str(target), hold_purge_registration=True, before_delete=_mark_delete_started
         )
     )
-    assert await asyncio.wait_for(gate.delete_acquire_reached.wait(), timeout=2.0)
+    await asyncio.wait_for(gate.delete_acquire_reached.wait(), timeout=2.0)
     # Parked on the DELETE's own permit wait: both read-only preflight probes have
-    # already run (they draw this same DELETE budget) and the hook has NOT.
-    assert boundary_calls == 0
+    # already run (they draw this same DELETE budget) and the hook has NOT. Snapshot
+    # the count HERE rather than re-comparing ``boundary_calls`` to 0 again after the
+    # cancel: the two assertions then say different things -- "the hook had not run
+    # while queued" and "cancelling added no call" -- and the second is a comparison
+    # between two variables, so it can genuinely fail (and is not a constant-folded
+    # always-true test, CodeQL py/redundant-comparison).
+    calls_while_queued = boundary_calls
+    assert calls_while_queued == 0, "the hook must not run before the permit is granted"
 
     purge_task.cancel()
     await assert_task_raises(purge_task, asyncio.CancelledError)
 
-    assert boundary_calls == 0, "no delete started, so nothing may record that one did"
+    assert boundary_calls == calls_while_queued, (
+        "cancelling a queued purge started no delete, so nothing may record that one did"
+    )
     assert target.exists()
     assert purge_service.active_purge_paths() == ()
     assert purge_service.begin_placement(str(target)) is True

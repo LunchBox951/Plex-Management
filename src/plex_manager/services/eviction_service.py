@@ -519,11 +519,18 @@ async def _recovery_ownership_blocked_reason(
 async def _recovery_purge_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
     """The reason a marker-owned recovery purge must NOT run, or ``None``.
 
-    The CHEAP composite, used before the purge primitive is entered at all so an
-    already-revoked row never pays for the preflight probes and gets an honest
-    log. It is deliberately NOT the authority -- the boundary hook is (see
-    :func:`_recovery_delete_boundary`), exactly as ``_still_evictable`` is the
-    cheap filter and the claim CAS the authority in :func:`_evict_one`.
+    A CHEAP EARLY-OUT ONLY -- explicitly NOT load-bearing. It runs before the
+    purge primitive is entered at all, so an already-revoked row skips the two
+    filesystem preflight probes and the delete-permit wait and gets an honest log
+    instead. But its snapshot is stale by construction: those probes and that wait
+    are an unbounded stretch of awaits, and everything this reads can change
+    inside it. Deleting this call would cost log quality and wasted probes, never
+    safety.
+
+    The AUTHORITY is :func:`_recovery_delete_boundary`, which re-reads every one
+    of these facts after its writer-locking CAS -- the same division of labour as
+    ``_still_evictable`` (cheap filter) versus the claim CAS (authority) in
+    :func:`_evict_one`.
 
     A static, log-safe phrase rather than a bare bool so every deferral log says
     which safety fact revoked it (honesty over silence).
@@ -602,25 +609,34 @@ def _recovery_delete_boundary(
     unlinked byte. A revocation raises, the primitive starts no delete, and the
     claim/breadcrumb/marker survive intact for the next sweep to re-decide.
 
-    ORDER INSIDE THE HOOK IS LOAD-BEARING, and the shape is WRITE-FIRST (review
-    round 3, which found the previous read-then-restamp version unsound):
+    ORDER INSIDE THE HOOK IS LOAD-BEARING, and the shape is WRITE-FIRST with
+    EVERY safety read after the write (rounds 3 and 4 of review, which found the
+    read-then-restamp and then the reads-straddling-the-CAS versions unsound):
 
-    1. The ordinary awaited queries first -- ownership (a competing transfer, a
-       ride-along pack) and the path fact (another live row claiming it). Their
-       actors are this process's own pipeline, which the sweep latch and the
-       placement registry already serialize against, so a plain read is honest
-       for them.
+    1. ``session.rollback()`` FIRST, to end whatever read transaction the caller's
+       cheap pre-check left open. That snapshot predates ``purge_library_path``'s
+       two filesystem probes AND the wait for a delete permit -- an unbounded
+       stretch of awaits -- so anything read under it is exactly as stale as the
+       pre-check this hook exists to backstop.
     2. Then ONE atomic conditional ``UPDATE`` (:meth:`SqlRequestRepository.
        confirm_partial_delete_marker` and its season twin) as the FIRST statement
-       of a fresh transaction: re-stamp the marker WHERE the breadcrumb and the
+       of the fresh transaction: re-stamp the marker WHERE the breadcrumb and the
        marker still hold this exact path AND the row (or, for a season, its
        parent) is NOT ``keep_forever``-pinned. ``rowcount == 0`` is the database
        itself refusing -- a pin landed, or the marker was retired -- and revokes.
     3. Only THEN, inside that same transaction and under the writer lock the
-       statement above took, the intent facts that cannot be folded into that
-       ``WHERE``: the watchlist row, and a final fresh pin re-read (see below).
-       Revocation rolls the whole transaction back, leaving the row exactly as
-       found -- the re-stamp was value-identical anyway.
+       statement above took, EVERY remaining safety read:
+       * ownership -- a competing active transfer, a ride-along coverage claim;
+       * the path fact -- another live row now claiming this exact breadcrumb;
+       * intent that cannot be folded into the CAS's ``WHERE`` -- the watchlist
+         row, then a final fresh pin re-read (see below).
+       Ownership and path belong here, not before the CAS (round-4 P1): a
+       replacement grab or a new path owner that commits during those probe/permit
+       awaits is invisible to a pre-CAS snapshot, and the CAS itself validates only
+       pin and marker -- so reading them early let a delete proceed against
+       ownership that had already changed. Revocation rolls the whole transaction
+       back, leaving the row exactly as found -- the re-stamp was value-identical
+       anyway.
     4. Commit. Only after that does the primitive start the delete worker.
 
     WHY WRITE-FIRST, precisely:
@@ -654,14 +670,9 @@ def _recovery_delete_boundary(
     """
 
     async def _revoke_if_no_longer_safe() -> None:
-        reason = await _recovery_ownership_blocked_reason(session, pending)
-        if reason is None and await _path_claimed_by_another_row(session, library_path, pending):
-            reason = "another live row now claims its path"
-        if reason is not None:
-            raise _RecoveryPurgeRevoked(reason)
-        # End whatever transaction the reads above opened, so the CAS below is the
-        # FIRST statement of the final one and its writer lock is what fixes that
-        # transaction's snapshot.
+        # End whatever read transaction the caller's cheap pre-check left open, so
+        # the CAS below is the FIRST statement of the final one and its writer lock
+        # is what fixes that transaction's snapshot. Nothing is read before this.
         await session.rollback()
         try:
             if not await _confirm_delete_marker_cas(session, pending, library_path):
@@ -669,7 +680,13 @@ def _recovery_delete_boundary(
                     "the database refused the delete-boundary re-stamp: the title was "
                     "pinned, or its breadcrumb/incomplete-delete marker was retired"
                 )
-            reason = await _post_cas_intent_blocked_reason(session, pending)
+            reason = await _recovery_ownership_blocked_reason(session, pending)
+            if reason is None and await _path_claimed_by_another_row(
+                session, library_path, pending
+            ):
+                reason = "another live row now claims its path"
+            if reason is None:
+                reason = await _post_cas_intent_blocked_reason(session, pending)
             if reason is not None:
                 raise _RecoveryPurgeRevoked(reason)
             await session.commit()

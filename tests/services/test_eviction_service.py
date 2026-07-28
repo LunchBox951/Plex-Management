@@ -7593,17 +7593,20 @@ async def test_recovery_defers_marker_purge_when_operator_pins_title(
     assert row.partial_delete_path == library_path
 
 
-class _PinAtTheDeleteBoundary:
-    """A REAL delete gate that commits an operator pin at the exact moment the
-    purge first reaches the DELETE budget -- its delete-guard preflight probe,
-    which is after recovery's own eligibility read and before the delete-boundary
-    hook runs. (The guard probe, the reclaim probe and the delete itself all draw
-    this same budget, issue #447; firing on the first is the earliest point inside
-    the window and needs no counting.)
+class _CommitAtTheFirstDeletePermitWait:
+    """A REAL delete gate that runs a caller-supplied commit at the exact moment
+    the purge first reaches the DELETE budget -- its delete-guard preflight probe,
+    which is after recovery's cheap pre-check and before the delete-boundary hook
+    runs. (The guard probe, the reclaim probe and the delete itself all draw this
+    same budget, issue #447; firing on the first is the earliest point inside the
+    window and needs no counting.)
+
+    Used for both shapes of "something changed during the probes and the permit
+    wait": an operator pin, and a replacement download taking ownership.
 
     Deterministic by construction, no sleeps: ``purge_library_path`` cannot get
-    past this ``acquire`` until the pin callback has been awaited to completion,
-    and that callback is an ordinary coroutine on the same single event loop.
+    past this ``acquire`` until the callback has been awaited to completion, and
+    that callback is an ordinary coroutine on the same single event loop.
     Fires exactly ONCE."""
 
     def __init__(self, on_first_acquire: Callable[[], Awaitable[None]]) -> None:
@@ -7661,7 +7664,7 @@ async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundar
             pinned.keep_forever = True
             await pinning_session.commit()
 
-    gate = _PinAtTheDeleteBoundary(_pin_now)
+    gate = _CommitAtTheFirstDeletePermitWait(_pin_now)
     monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", gate)
 
     library = FakeLibrary(
@@ -7683,6 +7686,154 @@ async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundar
     assert outcomes == []
     assert Path(library_path).exists(), "a pinned title is NEVER deleted"
     assert purge_service.active_purge_paths() == ()  # the revoked purge left no claim
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def _seed_competing_transfer(sm: SessionMaker, request_id: int, torrent_hash: str) -> None:
+    """Commit a replacement download that is still MOVING BYTES for this scope --
+    the ownership fact the delete boundary must honour."""
+    async with sm() as session:
+        session.add(
+            Download(
+                torrent_hash=torrent_hash,
+                status=DownloadState.Downloading.value,
+                media_request_id=request_id,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+
+
+async def test_recovery_revokes_when_a_replacement_grab_lands_during_the_permit_wait(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 4, the named schedule: ownership that changes while the purge
+    is inside ``purge_library_path`` -- past the caller's cheap pre-check, in the
+    filesystem probes and the wait for a delete permit -- must still revoke.
+
+    A replacement grab committed there owns bytes landing at the very path the
+    remnants occupy. The boundary re-reads ownership under its writer-locking CAS
+    and defers; the claim, breadcrumb and marker all stand for the next sweep.
+
+    NOT a discriminating regression, stated plainly: the previous hook read
+    ownership too, merely on a staler snapshot, and this harness (one shared
+    SQLite connection, ``StaticPool``) gives that snapshot no isolation to be
+    stale under -- so this schedule passes pre-fix as well. It is here because it
+    is the contract the reviewer named. The schedule that DOES discriminate is the
+    sibling below, which lands the same commit at the CAS boundary itself."""
+    library_path = _movie_file(tmp_path, "Regrabbed Mid Permit.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4992,
+        title="Regrabbed Mid Permit",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    async def _grab_now() -> None:
+        await _seed_competing_transfer(sessionmaker_, request_id, "regrabbed-mid-permit")
+
+    gate = _CommitAtTheFirstDeletePermitWait(_grab_now)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", gate)
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(
+                watch_states={
+                    (4992, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                }
+            ),
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert gate.fired, "the purge must actually have reached the delete budget"
+    assert outcomes == []
+    assert Path(library_path).exists(), "a live replacement transfer owns this path"
+    assert purge_service.active_purge_paths() == ()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_revokes_when_a_replacement_grab_lands_at_the_marker_cas(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 4's P1, scheduled so it actually discriminates.
+
+    The grab is committed from inside the CAS call itself, which is the ONE point
+    whose position differs between the two hook shapes:
+
+    * pre-fix the CAS ran AFTER the ownership and path reads, so those reads saw a
+      clean scope, the CAS validated only pin and marker, and nothing looked at
+      ownership again -- the delete proceeded over a live replacement transfer;
+    * post-fix the CAS is the transaction's FIRST statement and every safety read
+      follows it, so the same commit is seen and the purge is revoked.
+
+    Pre-fix this fails on ``Path(library_path).exists()``."""
+    library_path = _movie_file(tmp_path, "Regrabbed At Cas.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4993,
+        title="Regrabbed At Cas",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    real_cas = eviction_service._confirm_delete_marker_cas  # pyright: ignore[reportPrivateUsage]
+    cas_calls = 0
+
+    async def _grab_at_the_cas(session: AsyncSession, pending: object, path: str) -> bool:
+        nonlocal cas_calls
+        cas_calls += 1
+        await _seed_competing_transfer(sessionmaker_, request_id, "regrabbed-at-cas")
+        return await real_cas(session, cast(Any, pending), path)
+
+    monkeypatch.setattr(eviction_service, "_confirm_delete_marker_cas", _grab_at_the_cas)
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(
+                watch_states={
+                    (4993, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)
+                }
+            ),
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert cas_calls == 1, "the boundary must have reached its marker CAS exactly once"
+    assert outcomes == []
+    assert Path(library_path).exists(), "ownership taken at the CAS must still revoke"
+    assert purge_service.active_purge_paths() == ()
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
     assert row is not None
@@ -7793,7 +7944,11 @@ async def test_the_delete_boundary_emits_a_real_conditional_update_before_its_re
 
     What must be true instead: a query-level ``UPDATE`` carrying the pin in its
     ``WHERE``, emitted as the FIRST statement of the boundary's final transaction,
-    with the intent reads that cannot be folded into it coming AFTER."""
+    with EVERY remaining safety read coming AFTER it -- ownership (the downloads
+    query), the path fact, and the intent facts alike (review round 4). A read
+    taken before that statement runs on a snapshot fixed before the primitive's
+    filesystem probes and its permit wait, which is exactly the staleness this
+    hook exists to eliminate."""
     library_path = _movie_file(tmp_path, "Emitted SQL.mkv")
     request_id = await _movie(
         sessionmaker_,
@@ -7849,10 +8004,20 @@ async def test_the_delete_boundary_emits_a_real_conditional_update_before_its_re
         f"attribute assignment emits nothing. Statements: {statements}"
     )
     cas_at = cas_indexes[0]
-    # ...and the intent read that cannot be folded into that WHERE comes AFTER it,
-    # so it runs under the writer lock the statement above just took.
-    watchlist_after = [i for i, s in enumerate(statements) if "watchlist_items" in s and i > cas_at]
-    assert watchlist_after, f"the watchlist read must follow the CAS. Statements: {statements}"
+    # ...and EVERY safety read the hook takes comes AFTER it, so each runs under
+    # the writer lock the statement above just took rather than on a snapshot fixed
+    # before the primitive's probes and permit wait.
+    for description, needle in (
+        ("the ownership (competing-transfer) read", "FROM downloads"),
+        (
+            "the path-claimed-by-another-row read",
+            "FROM media_requests WHERE media_requests.library_path",
+        ),
+        ("the watchlist read", "watchlist_items"),
+    ):
+        assert any(needle in s for s in statements[cas_at + 1 :]), (
+            f"{description} must follow the CAS. Statements: {statements}"
+        )
 
 
 async def test_the_boundary_cas_reports_rowcount_zero_for_a_pinned_row(
