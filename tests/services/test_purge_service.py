@@ -1547,7 +1547,7 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
         assert qbt.removed == [("a" * 40, True)]  # the correction was never held up
         assert elapsed < 2.0
         assert "did not answer within the 0.2s pre-removal mount-read bound" in caplog.text
-        assert "detached after internal probe deadline" in caplog.text
+        assert "detached after an internal probe deadline" in caplog.text
         assert "detached on caller cancellation" not in caplog.text
         # The wedged read is still parked -- on a DAEMON thread the interpreter
         # never rejoins, so it cannot hang the web lifespan's shutdown wait.
@@ -1557,6 +1557,43 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
     finally:
         wedged.release.set()
         assert await asyncio.to_thread(wedged.finished.wait, 2.0)
+
+
+async def test_internal_probe_deadline_labels_a_late_worker_failure_honestly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #497: a daemon worker that fails after an internal bound cancels its
+    probe must record that deadline, not falsely attribute the failure to caller
+    cancellation."""
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 0.1)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _wedged_then_failing_probe() -> bool:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+        raise OSError("mount recovered with an error")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+            result = await purge_service._bounded_content_probe(  # pyright: ignore[reportPrivateUsage]
+                _wedged_then_failing_probe,
+                "/downloads/clip.mkv",
+                operation_name="content path visibility probe",
+                timeout=0.1,
+            )
+            assert result is None
+            assert await asyncio.to_thread(started.wait, 2.0)
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 2.0)
+            await asyncio.sleep(0)
+    finally:
+        release.set()
+
+    assert "failed (OSError) after detaching an internal probe deadline" in caplog.text
+    assert "after detaching on caller cancellation" not in caplog.text
 
 
 async def test_bounded_content_probe_logs_the_per_probe_bound(

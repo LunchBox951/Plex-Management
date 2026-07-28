@@ -693,6 +693,13 @@ async def _run_abandonable_probe[T](
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
 
+    def _detach_cause() -> str:
+        return (
+            "an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "caller cancellation"
+        )
+
     def _retrieve_worker_outcome(done: asyncio.Future[Any]) -> None:
         # ``asyncio.wait`` removed its completion callback when this caller's await
         # was cancelled, leaving the detached worker future unobserved. Read its
@@ -707,12 +714,12 @@ async def _run_abandonable_probe[T](
         error = done.exception()
         if error is not None:
             _logger.warning(
-                "%s of %r failed (%s) after detaching on caller cancellation; the "
-                "daemon worker ran to completion unobserved and its failure is "
-                "recorded here only",
+                "%s of %r failed (%s) after detaching %s; the daemon worker ran to "
+                "completion unobserved and its failure is recorded here only",
                 operation_name,
                 safe_text(path),
                 type(error).__name__,
+                _detach_cause(),
             )
 
     try:
@@ -733,20 +740,13 @@ async def _run_abandonable_probe[T](
             # when it physically finishes. Log so an abandoned probe worker is
             # visible (honesty over silence) rather than a silent detach, and
             # retrieve (and log any failure of) its eventual outcome when it settles.
-            if deadline_expired is not None and deadline_expired.is_set():
-                _logger.warning(
-                    "%s of %r detached after internal probe deadline; its daemon worker will "
-                    "run to completion unobserved and then release its permit",
-                    operation_name,
-                    safe_text(path),
-                )
-            else:
-                _logger.warning(
-                    "%s of %r detached on caller cancellation; its daemon worker will "
-                    "run to completion unobserved and then release its permit",
-                    operation_name,
-                    safe_text(path),
-                )
+            _logger.warning(
+                "%s of %r detached after %s; its daemon worker will run to completion "
+                "unobserved and then release its permit",
+                operation_name,
+                safe_text(path),
+                _detach_cause(),
+            )
             worker.add_done_callback(_retrieve_worker_outcome)
         raise
 
