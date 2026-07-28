@@ -37,11 +37,14 @@ from plex_manager.adapters.filesystem.local import LocalFileSystem
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.disk_usage import DiskUsage
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Download,
     DownloadCoverageClaim,
     DownloadHistory,
     DownloadHistoryEvent,
+    DownloadScope,
+    DownloadScopeStatus,
     MediaRequest,
     MediaType,
     RequestStatus,
@@ -53,6 +56,7 @@ from plex_manager.ports.filesystem import FilePublication, PublishedFileIdentity
 from plex_manager.ports.library import WatchState
 from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.ports.repositories import SeasonRequestRecord
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
@@ -7500,11 +7504,114 @@ async def test_recovery_defers_marker_purge_when_operator_pins_title(
     assert row.partial_delete_path == library_path
 
 
-async def test_recovery_defers_marker_purge_when_title_was_rewatched(
+class _PinAtTheDeleteBoundary:
+    """A REAL delete gate that commits an operator pin at the exact moment the
+    purge first reaches the DELETE budget -- its delete-guard preflight probe,
+    which is after recovery's own eligibility read and before the delete-boundary
+    hook runs. (The guard probe, the reclaim probe and the delete itself all draw
+    this same budget, issue #447; firing on the first is the earliest point inside
+    the window and needs no counting.)
+
+    Deterministic by construction, no sleeps: ``purge_library_path`` cannot get
+    past this ``acquire`` until the pin callback has been awaited to completion,
+    and that callback is an ordinary coroutine on the same single event loop.
+    Fires exactly ONCE."""
+
+    def __init__(self, on_first_acquire: Callable[[], Awaitable[None]]) -> None:
+        self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
+        self._on_first_acquire = on_first_acquire
+        self.fired = False
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        if not self.fired:
+            self.fired = True
+            await self._on_first_acquire()
+        return await self._inner.acquire()
+
+    def release_permit(self) -> None:
+        self._inner.release_permit()
+
+
+async def test_recovery_revokes_its_purge_when_a_pin_lands_at_the_delete_boundary(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #515's delete-boundary RACE (distinct from the pre-seeded pin above).
+
+    Recovery read ``keep_forever`` once, then awaited the purge primitive's two
+    preflight probes and the wait for one of four delete-worker permits before any
+    byte moved. A pin committed anywhere in that window was simply not looked at
+    again, and the pinned title's remaining files were deleted -- breaking the
+    module-wide contract that a pinned title is NEVER deleted, which the normal
+    claim path enforces by folding the pin into its CAS but which a marker-owned
+    force-purge has no CAS to fold into.
+
+    The gate above commits the pin from a SEPARATE session precisely inside that
+    window. Post-fix the boundary hook re-reads it and revokes: nothing deleted,
+    claim + breadcrumb + marker all intact. Pre-fix the file is gone."""
+    library_path = _movie_file(tmp_path, "Pinned Mid Purge.mkv")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=4958,
+        title="Pinned Mid Purge",
+        library_path=library_path,
+        status=RequestStatus.evicted,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = library_path
+        await session.commit()
+
+    async def _pin_now() -> None:
+        async with sessionmaker_() as pinning_session:
+            pinned = await pinning_session.get(MediaRequest, request_id)
+            assert pinned is not None
+            pinned.keep_forever = True
+            await pinning_session.commit()
+
+    gate = _PinAtTheDeleteBoundary(_pin_now)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", gate)
+
+    library = FakeLibrary(
+        watch_states={(4958, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=library,
+            fs=LocalFileSystem(library_roots=[str(tmp_path)]),
+            media_type="movie",
+            root_path=str(tmp_path),
+            threshold_pct=0.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert gate.fired, "the purge must actually have reached the delete budget"
+    assert outcomes == []
+    assert Path(library_path).exists(), "a pinned title is NEVER deleted"
+    assert purge_service.active_purge_paths() == ()  # the revoked purge left no claim
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path == library_path
+    assert row.partial_delete_path == library_path
+
+
+async def test_recovery_finishes_a_marker_owned_purge_despite_a_fresh_rewatch(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
-    """Issue #515: recovery must not widen the normal rewatch race across the
-    whole outage; a fresh Plex verdict can revoke deletion eligibility."""
+    """Issue #515, the POLICY correction (this branch's first attempt had it
+    backwards and deferred here).
+
+    The marker says a destructive delete of exactly this path already began and
+    nothing showed the tree survived it, so a "watched=False / just viewed" verdict
+    from Plex is a reading over media that cannot play. Deferring on it cannot give
+    the title back -- it only strands the gutted remains forever, because an
+    ``evicted`` row is invisible to candidate assembly and no other pass retries it.
+    Convergence is the only honest end state; the operator's PIN is the fact that
+    still stops it (the test above)."""
     library_path = _movie_file(tmp_path, "Rewatched During Outage.mkv")
     request_id = await _movie(
         sessionmaker_,
@@ -7535,19 +7642,32 @@ async def test_recovery_defers_marker_purge_when_title_was_rewatched(
         )
 
     assert outcomes == []
-    assert Path(library_path).exists()
+    assert not Path(library_path).exists()
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
+        history = (
+            (await session.execute(select(DownloadHistory).where(DownloadHistory.tmdb_id == 4956)))
+            .scalars()
+            .all()
+        )
     assert row is not None
-    assert row.library_path == library_path
-    assert row.partial_delete_path == library_path
+    assert row.status is RequestStatus.evicted
+    assert row.library_path is None
+    assert row.partial_delete_path is None
+    assert [h.event_type for h in history] == [DownloadHistoryEvent.evicted]
 
 
-async def test_recovery_defers_marker_purge_after_disk_pressure_clears(
+async def test_recovery_finishes_a_marker_owned_purge_after_disk_pressure_clears(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
-    """Issue #515: an armed recovery retry is not a licence to delete after the
-    pressure that authorized the original eviction has disappeared."""
+    """The other half of the same policy correction (issue #515).
+
+    Pressure is what AUTHORIZES an eviction, not what makes an already-started
+    delete safe to finish -- and the interrupted delete itself is one of the things
+    that can have relieved the pressure. Gating convergence on it would mean the
+    more successful the partial delete was, the less likely its remains ever get
+    cleaned. ``threshold_pct=101.0`` is unreachable, so only the recovery pass can
+    act here at all."""
     library_path = _movie_file(tmp_path, "Pressure Cleared.mkv")
     request_id = await _movie(
         sessionmaker_,
@@ -7578,12 +7698,13 @@ async def test_recovery_defers_marker_purge_after_disk_pressure_clears(
         )
 
     assert outcomes == []
-    assert Path(library_path).exists()
+    assert not Path(library_path).exists()
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
     assert row is not None
-    assert row.library_path == library_path
-    assert row.partial_delete_path == library_path
+    assert row.status is RequestStatus.evicted
+    assert row.library_path is None
+    assert row.partial_delete_path is None
 
 
 async def test_recovery_defers_rearmed_purge_during_report_issue_active_purge(
@@ -8007,6 +8128,163 @@ async def _rearmed_partial_season(
         season_row.partial_delete_path = str(season_dir)
         await session.commit()
         return season_row.id
+
+
+async def _block_the_replacement_import(sm: SessionMaker, season_request_id: int) -> int:
+    """Seed the REST of a blocked import's lifecycle for ``season_request_id``:
+    the physical ``Download`` row AND its ``DownloadScope``, both
+    ``import_blocked``, as ``import_service._block`` actually persists them.
+
+    Seeding only the season's STATUS (what ``_rearmed_partial_season`` does) is
+    not the real shape and silently hides issue #515's deadlock: the eligibility
+    predicate consults ``find_active_for_request``, whose
+    ``_ACTIVE_SCOPE_STATUSES`` counts an ``import_blocked`` SCOPE as active. Only
+    a test that materializes the scope can observe recovery rejecting the exact
+    row its own enumeration selected. Returns the download id.
+    """
+    async with sm() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        assert season_row is not None
+        download = Download(
+            torrent_hash=f"blocked-import-{season_request_id}",
+            status=DownloadState.ImportBlocked.value,
+            media_request_id=season_row.media_request_id,
+            season=season_row.season_number,
+            media_type=MediaType.tv,
+            failed_reason="destination exists with different content",
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadScope(
+                download_id=download.id,
+                media_request_id=season_row.media_request_id,
+                season_request_id=season_row.id,
+                season_number=season_row.season_number,
+                scope_key=f"season:{season_row.season_number}|episodes:*",
+                status=DownloadScopeStatus.import_blocked.value,
+            )
+        )
+        await session.commit()
+        return download.id
+
+
+async def test_recovery_unblocks_a_season_whose_blocked_import_row_still_owns_the_scope(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #515, the DETERMINISTIC deadlock (not a race).
+
+    The recovery enumeration selects ``import_blocked`` + armed marker precisely
+    so the marker's owner can clear the remains its own interrupted purge left.
+    But the eligibility predicate asked ``find_active_for_request(...) is not
+    None``, and ``repositories/downloads.py`` deliberately treats an
+    ``import_blocked`` SCOPE as active -- so the predicate rejected the exact row
+    the enumeration had just selected, every sweep, forever: remains on disk, the
+    replacement import permanently blocked at the deterministic destination, and
+    every operator retry hitting the same ``FileExistsError``. A terminal, which
+    north star 1 forbids.
+
+    The fix distinguishes the marker owner's OWN blocked import (bytes settled,
+    waiting on the placement the remnants block) from a genuinely COMPETING
+    transfer. Pre-fix this test fails on ``season_dir.exists()``: nothing is ever
+    purged."""
+    root = tmp_path / "tv"
+    season_dir = root / "Deadlocked Import" / "Season 01"
+    season_dir.mkdir(parents=True)
+    leftover = season_dir / "Deadlocked.Import.S01E01.mkv"
+    leftover.write_bytes(b"old" * 512)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4978,
+        title="Deadlocked Import",
+        season_dir=season_dir,
+        status=RequestStatus.import_blocked,
+    )
+    download_id = await _block_the_replacement_import(sessionmaker_, season_request_id)
+
+    async with sessionmaker_() as session:
+        # The premise, asserted rather than assumed: the scope really does read as
+        # an active owner of this scope.
+        assert (
+            await SqlDownloadRepository(session).find_active_for_request(
+                (await session.get(SeasonRequest, season_request_id)).media_request_id,  # pyright: ignore[reportOptionalMemberAccess]
+                season=1,
+            )
+        ) is not None
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not season_dir.exists(), "the marker's owner must finish its own purge"
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+        download = await session.get(Download, download_id)
+    assert season_row is not None
+    # The surfaced, retryable status is deliberately LEFT alone -- the import is
+    # still the pending operator-correctable action, it can just succeed now.
+    assert season_row.status is RequestStatus.import_blocked
+    assert season_row.library_path is None
+    assert season_row.partial_delete_path is None
+    assert download is not None
+    assert download.status == DownloadState.ImportBlocked.value  # untouched by recovery
+
+
+async def test_recovery_still_defers_to_a_genuinely_competing_transfer(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The BOUND on the fix above: only the blocked-on-PLACEMENT shape is exempt.
+
+    Same seeded lifecycle, one field different -- the physical download is still
+    ``downloading``, so its bytes are landing at the very destination the purge
+    would clear. That is a real competing owner and recovery must defer, keeping
+    the breadcrumb and marker for the next sweep."""
+    root = tmp_path / "tv"
+    season_dir = root / "Still Transferring" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Still.Transferring.S01E01.mkv").write_bytes(b"old" * 512)
+    season_request_id = await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4979,
+        title="Still Transferring",
+        season_dir=season_dir,
+        status=RequestStatus.import_blocked,
+    )
+    download_id = await _block_the_replacement_import(sessionmaker_, season_request_id)
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.status = DownloadState.Downloading.value
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="tv",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert season_dir.exists()
+    async with sessionmaker_() as session:
+        season_row = await session.get(SeasonRequest, season_request_id)
+    assert season_row is not None
+    assert season_row.library_path == str(season_dir)
+    assert season_row.partial_delete_path == str(season_dir)
 
 
 async def test_recovery_clears_remnants_that_would_block_the_replacement_import(
