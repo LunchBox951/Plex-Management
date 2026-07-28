@@ -1192,23 +1192,25 @@ async def grab(
 
     if existing is not None:
         try:
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                existing.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
+            while True:
+                record, claimed_reuse = await _reuse_terminal_row(
+                    session,
+                    download_repo,
+                    existing.id,
+                    torrent_hash,
+                    request_id,
+                    source=source,
+                    tmdb_id=tmdb_id,
+                    year=year,
+                    season=season,
+                    episodes=episodes,
+                    media_type=request_media_type,
+                    release_title=candidate.title,
+                    qbt=qbt,
+                    actually_added=actually_added,
+                )
+                if claimed_reuse:
+                    break
                 if record.status not in _TERMINAL_STATUS_VALUES:
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
@@ -1236,8 +1238,10 @@ async def grab(
                         )
                         if attached is not None:
                             return attached
-                    else:
-                        return record
+                        # The row terminalized during attachment; retry the guarded
+                        # terminal CAS rather than rejecting this same-hash grab.
+                        continue
+                    return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
         except IntegrityError:
             await session.rollback()
@@ -1334,23 +1338,25 @@ async def grab(
                         return attached
                 else:
                     return winner
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                winner.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
+            while True:
+                record, claimed_reuse = await _reuse_terminal_row(
+                    session,
+                    download_repo,
+                    winner.id,
+                    torrent_hash,
+                    request_id,
+                    source=source,
+                    tmdb_id=tmdb_id,
+                    year=year,
+                    season=season,
+                    episodes=episodes,
+                    media_type=request_media_type,
+                    release_title=candidate.title,
+                    qbt=qbt,
+                    actually_added=actually_added,
+                )
+                if claimed_reuse:
+                    break
                 if record.status not in _TERMINAL_STATUS_VALUES:
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(
@@ -1377,8 +1383,10 @@ async def grab(
                         )
                         if attached is not None:
                             return attached
-                    else:
-                        return record
+                        # The row terminalized during attachment; retry the guarded
+                        # terminal CAS rather than rejecting this same-hash grab.
+                        continue
+                    return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(
