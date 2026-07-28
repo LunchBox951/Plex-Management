@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from sqlalchemy import select, text
@@ -56,6 +56,7 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import (
     auto_grab_service,
     correction_service,
+    eviction_service,
     grab_service,
     purge_service,
     queue_service,
@@ -4776,6 +4777,215 @@ async def test_report_issue_keeps_the_re_armed_scope_out_of_auto_grabs_due_set(
     assert request_id in await _due_request_ids(
         sessionmaker_, now=datetime.now(UTC) + timedelta(days=1)
     )
+
+
+async def test_report_issue_holds_purge_claim_through_scan_and_final_commit(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #516, the claim's LIFETIME, observed at each step boundary: the claim
+    that guards the destructive stretch must still be held at (e)'s Plex scan and at
+    (f)'s final commit -- the span in which the row is published as ``searching`` +
+    breadcrumb + marker over a file that is already gone -- and must be released
+    before (g)'s re-search, whose replacement import needs this very path."""
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Claim Through Finalize" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Claim.Through.Finalize.S01E01.mkv").write_bytes(b"x" * 1024)
+    async with sessionmaker_() as seed:
+        show = MediaRequest(
+            tmdb_id=1400,
+            media_type=MediaType.tv,
+            title="Claim Through Finalize",
+            status=RequestStatus.available,
+        )
+        seed.add(show)
+        await seed.flush()
+        seed.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_dir),
+            )
+        )
+        seed.add(
+            Download(
+                torrent_hash="claim-through-finalize",
+                status="imported",
+                media_request_id=show.id,
+                tmdb_id=1400,
+                season=1,
+            )
+        )
+        await seed.commit()
+        request_id = show.id
+
+    claim_at_scan: list[bool] = []
+
+    class _ClaimObservingLibrary(FakeLibrary):
+        """Samples the claim registry at step (e), the remote Plex await."""
+
+        async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+            claim_at_scan.append(purge_service.purge_in_progress(str(season_dir)))
+            await super().trigger_scan(path, media_type)
+
+    # Sampling every commit is what pins the RELEASE POINT rather than merely "the
+    # claim was held somewhere": the verb commits at (b), again at (f), and again in
+    # the (g) re-search, so the expected reading is held / held / released.
+    claim_at_commits: list[bool] = []
+    async with sessionmaker_() as session:
+        real_commit = session.commit
+
+        async def _observing_commit() -> None:
+            claim_at_commits.append(purge_service.purge_in_progress(str(season_dir)))
+            await real_commit()
+
+        session.commit = _observing_commit  # pyright: ignore[reportAttributeAccessIssue]
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            LocalFileSystem(library_roots=[str(tv_root)]),
+            _ClaimObservingLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert claim_at_scan == [True]  # (e) runs INSIDE the claim
+    assert len(claim_at_commits) >= 2
+    assert claim_at_commits[:2] == [True, True]  # (b) and the final (f) commit
+    assert not any(claim_at_commits[2:]), "(g)'s re-search must run with the claim gone"
+    assert not purge_service.purge_in_progress(str(season_dir))
+
+
+async def test_a_partially_purged_correction_is_not_finished_and_logged_as_an_eviction(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #516, the END-TO-END regression: a real eviction sweep, run at the exact
+    instant report-issue is suspended in (e)'s Plex scan, must not mistake the
+    correction for an interrupted eviction.
+
+    The PARTIAL purge is the shape that actually bites. A clean purge clears the
+    breadcrumb and retires the marker in (f)'s commit, and SQLite's single writer
+    (ADR-0007) keeps a sweep from committing over it; a partial purge KEEPS both --
+    on purpose, they are the retry's only handle -- so the row sits published as
+    ``searching`` + breadcrumb + marker over a tree the correction already ate into.
+    That is precisely what ``_recover_rearmed_season`` enumerates, and before this fix
+    the claim was released before (e): recovery finished the delete with its own retry
+    and wrote an ``evicted`` history row against a correction that was still running.
+
+    The race is driven, not waited on: ``trigger_scan`` IS the (d) -> (f) window, so
+    running the sweep inside it hits the window every time, with no sleeps and no
+    ordering left to the scheduler. The filesystem is shared with the sweep and its
+    SECOND delete succeeds, so the counterfactual really does complete the purge --
+    the assertions below therefore prove deferral, not a delete that could not have
+    happened anyway.
+    """
+    tv_root = tmp_path / "tv"
+    season_dir = tv_root / "Reported Mid Sweep" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "Reported.Mid.Sweep.S01E01.mkv").write_bytes(b"x" * 1024)
+    async with sessionmaker_() as seed:
+        show = MediaRequest(
+            tmdb_id=1401,
+            media_type=MediaType.tv,
+            title="Reported Mid Sweep",
+            status=RequestStatus.available,
+        )
+        seed.add(show)
+        await seed.flush()
+        seed.add(
+            SeasonRequest(
+                media_request_id=show.id,
+                season_number=1,
+                status=RequestStatus.available,
+                library_path=str(season_dir),
+            )
+        )
+        await seed.commit()
+        request_id = show.id
+
+    deleted_paths: list[str] = []
+
+    class _PartialThenCompleteFileSystem(LocalFileSystem):
+        """Reports a PARTIAL removal once (issue #482), then really deletes.
+
+        The first call is the correction's own purge at (d); any second call is the
+        recovery retry, which must never happen while the claim is held.
+        """
+
+        def delete(self, path: str) -> None:
+            deleted_paths.append(path)
+            if len(deleted_paths) == 1:
+                raise PartialDeleteError("partially deleted before failing (PermissionError)")
+            super().delete(path)
+
+    fs = _PartialThenCompleteFileSystem(library_roots=[str(tv_root)])
+    sweep_outcomes: list[list[eviction_service.EvictionOutcome]] = []
+
+    class _SweepDuringScanLibrary(FakeLibrary):
+        """Runs a full eviction sweep from inside report-issue's (e) Plex await."""
+
+        async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
+            async with sessionmaker_() as sweep_session:
+                sweep_outcomes.append(
+                    await eviction_service.run_eviction_sweep(
+                        session=sweep_session,
+                        library=FakeLibrary(),
+                        fs=fs,
+                        media_type="tv",
+                        root_path=str(tv_root),
+                        # No pressure: the crash-recovery pass runs unconditionally,
+                        # ahead of the pressure gate, which is the pass under test.
+                        threshold_pct=101.0,
+                        target_pct=0.0,
+                        grace_days=30,
+                    )
+                )
+            await super().trigger_scan(path, media_type)
+
+    async with sessionmaker_() as session:
+        await correction_service.report_issue(
+            session,
+            FakeQbittorrent(),
+            fs,
+            _SweepDuringScanLibrary(),
+            FakeProwlarr([]),
+            GuessitParser(),
+            default_profile(),
+            request_id=request_id,
+            reason="wrong_media",
+            season=1,
+            roots=LibraryRoots(tv=str(tv_root)),
+        )
+
+    assert sweep_outcomes == [[]], "the sweep ran and evicted nothing"
+    assert deleted_paths == [str(season_dir)], "recovery must not retry the correction's purge"
+    assert season_dir.exists()  # the remains stay the correction's to reclaim
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+            )
+        ).scalar_one()
+        events = (
+            (
+                await session.execute(
+                    select(DownloadHistory.event_type).where(DownloadHistory.tmdb_id == 1401)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert DownloadHistoryEvent.evicted not in events, "the correction is not an eviction"
+    assert DownloadHistoryEvent.reported in events
+    assert season.library_path == str(season_dir)  # recovery did not release the handle
+    assert season.partial_delete_path == str(season_dir)  # nor retire the marker
+    assert not purge_service.purge_in_progress(str(season_dir))
 
 
 async def test_a_partially_purged_correction_is_still_due_for_auto_grab(
