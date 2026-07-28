@@ -248,8 +248,10 @@ _ABANDONED_SETTLEMENTS: set[asyncio.Future[None]] = set()
 # detaches ONLY that awaiter -- the shared worker and every other awaiter are
 # untouched, and the entry lives until the physical worker completes even if every
 # awaiter has cancelled (mirroring the DELETE path's ``_ACTIVE_PURGE_PATHS``
-# dedup). The loop is single-threaded, so get/create/pop is atomic without a lock.
-# Only the public PROBE gate coalesces; a purge's OWN preflight probes draw the
+# dedup). The sole exception is a queued probe with no awaiters: it is cancelled
+# before permit acquisition, and a later caller must create a fresh task instead
+# of attaching to its cancellation-requested entry. The loop is single-threaded,
+# so get/create/pop is atomic without a lock. Only the public PROBE gate coalesces;
 # separate DELETE budget and are deliberately NOT registered here.
 _ACTIVE_PROBE_TASKS: dict[str, asyncio.Task[Any]] = {}
 
@@ -258,11 +260,12 @@ _ACTIVE_PROBE_TASKS: dict[str, asyncio.Task[Any]] = {}
 class _SharedProbeState:
     """Per-probe bookkeeping that keeps a COALESCED probe's late failure honest.
 
-    The shared probe task is caller-independent (``asyncio.ensure_future``), so
-    awaiters cancelling never cancel it: it runs its happy path and settles with the
-    worker's outcome, which :func:`_run_abandonable_probe`'s own cancellation-path
-    late-failure log therefore never sees. This tracks how many awaiters are still
-    attached (``live_awaiters``), whether any awaiter actually RECEIVED the outcome
+    The normal shared task is caller-independent (``asyncio.ensure_future``), so
+    awaiters cancelling never cancel an acquired worker: it runs its happy path and
+    settles with the worker's outcome, which :func:`_run_abandonable_probe`'s own
+    cancellation-path late-failure log therefore never sees. A queued task is not
+    yet a physical worker; when its final awaiter detaches before permit acquisition,
+    it is cancelled instead. This tracks how many awaiters are still attached
     (``delivered``), and whether the fallback failure log has already fired
     (``late_failure_logged``) so that when every awaiter has detached and no one is
     left to re-raise it, the shared worker's failure is still recorded exactly once
@@ -805,7 +808,10 @@ async def run_abandonable_probe[T](
     """
     key = _normalize_guard_path(path)
     task = _ACTIVE_PROBE_TASKS.get(key)
-    if task is not None and task.get_loop().is_closed():
+    if task is not None and (task.get_loop().is_closed() or task.cancelling()):
+        # A closed-loop task cannot be awaited here. A queued task whose final
+        # awaiter detached has a cancellation request but its done callback may
+        # not have cleared the entry yet; never attach a new caller to it.
         if _ACTIVE_PROBE_TASKS.get(key) is task:
             del _ACTIVE_PROBE_TASKS[key]
             _PROBE_STATES.pop(key, None)
@@ -841,13 +847,15 @@ async def run_abandonable_probe[T](
 async def _attach_to_shared_probe(
     task: asyncio.Task[Any], state: _SharedProbeState, *, path: str, operation_name: str
 ) -> Any:
-    """Await a coalesced probe task WITHOUT ever cancelling the shared worker.
+    """Await a coalesced probe task without cancelling an acquired worker.
 
     :func:`asyncio.wait` never cancels the futures it waits on, so this awaiter can
-    unwind on its OWN cancellation (a detached poll, or shutdown) while the shared
-    probe task -- and any other awaiter attached to it -- keeps running. Results and
-    exceptions are delivered unchanged: ``task.result()`` re-raises the probe's
-    exception to every attached awaiter, and a caller that RECEIVES a failure owns it
+    unwind on its OWN cancellation (a detached poll, or shutdown) while an acquired
+    shared probe task -- and any other awaiter attached to it -- keeps running.
+    A queued task without a permit is instead cancelled when its final awaiter
+    detaches, because no physical worker has started. Results and exceptions are
+    delivered unchanged: ``task.result()`` re-raises the probe's exception to every
+    attached awaiter, and a caller that RECEIVES a failure owns it
     (marked ``delivered``), so the substrate stays silent for it.
 
     Honesty for the SHARED worker's late failure lives here and in

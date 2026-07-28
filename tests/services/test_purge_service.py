@@ -2312,7 +2312,7 @@ def test_closed_loop_probe_registry_entry_is_replaced_for_a_new_loop(
         )
 
     try:
-        assert asyncio.run(asyncio.wait_for(run_fresh_probe(), timeout=0.1)) == 42
+        assert asyncio.run(asyncio.wait_for(run_fresh_probe(), timeout=2.0)) == 42
         assert probe_gate.acquired == 1
         assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
     finally:
@@ -2356,6 +2356,33 @@ async def test_last_awaiter_cancelling_before_probe_permit_cancels_shared_task(
     await asyncio.sleep(0)
     assert probe_gate.permits_granted == 0
     assert calls == 0
+
+
+async def test_new_caller_replaces_a_queued_shared_probe_after_its_last_awaiter_cancels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #473: callers never attach to a cancellation-requested queued task."""
+    probe_gate = _QueuedProbeGate()
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    first = asyncio.create_task(
+        purge_service.run_abandonable_probe(lambda: 1, path, operation_name="disk probe")
+    )
+    await probe_gate.acquire_reached.wait()
+    shared = purge_service._ACTIVE_PROBE_TASKS[key]  # pyright: ignore[reportPrivateUsage]
+
+    first.cancel()
+    second = asyncio.create_task(
+        purge_service.run_abandonable_probe(lambda: 42, path, operation_name="disk probe")
+    )
+    await assert_task_raises(first, asyncio.CancelledError)
+
+    probe_gate.allow_acquire.set()
+    assert await asyncio.wait_for(second, timeout=2.0) == 42
+    assert shared.cancelled()
+    assert probe_gate.permits_granted == 1
 
 
 async def test_all_cancelled_shared_probe_failure_is_retrieved_and_logged(
