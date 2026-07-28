@@ -1986,7 +1986,13 @@ class DiskResponse(BaseModel):
 
 
 class EvictionOutcomeItem(BaseModel):
-    """One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted."""
+    """One candidate a manual ``POST /api/v1/ops/evict`` sweep actually evicted.
+
+    ``partial=True`` means the delete did not fully complete: some content remains on
+    disk pending retry, so ``freed_bytes`` is unknowable (``null``). Recovery is not
+    guaranteed to be automatic -- with eviction disabled, only another manual sweep
+    retries the removal.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -1996,6 +2002,7 @@ class EvictionOutcomeItem(BaseModel):
     season: int | None = None
     library_path: str
     freed_bytes: int | None = None
+    partial: bool = False
 
 
 class EvictErrorItem(BaseModel):
