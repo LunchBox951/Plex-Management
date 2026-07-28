@@ -272,6 +272,10 @@ class _SharedProbeState:
     live_awaiters: int = 0
     delivered: bool = False
     late_failure_logged: bool = False
+    # Flips immediately after the gate grants a permit, before the synchronous
+    # worker start. Acquired workers survive detachment; queued workers with no
+    # awaiters are cancelled before they can consume a permit.
+    permit_acquired: bool = False
 
 
 # Parallel to ``_ACTIVE_PROBE_TASKS`` and kept in lockstep with it (same key,
@@ -521,7 +525,11 @@ def _start_on_abandonable_thread[T](
 
 
 async def _run_on_abandonable_thread[T](
-    operation: Callable[[], T], *, thread_name: str, gate: _AbandonableThreadGate
+    operation: Callable[[], T],
+    *,
+    thread_name: str,
+    gate: _AbandonableThreadGate,
+    on_permit_acquired: Callable[[], None] | None = None,
 ) -> asyncio.Future[T]:
     """Acquire one permit from ``gate`` and start a bounded abandonable daemon worker.
 
@@ -553,6 +561,8 @@ async def _run_on_abandonable_thread[T](
     steps itself.
     """
     permit = await gate.acquire()
+    if on_permit_acquired is not None:
+        on_permit_acquired()
     return _start_on_abandonable_thread(operation, thread_name=thread_name, permit=permit)
 
 
@@ -650,6 +660,7 @@ async def _run_abandonable_probe[T](
     operation_name: str,
     gate: _AbandonableThreadGate,
     deadline_expired: asyncio.Event | None = None,
+    on_permit_acquired: Callable[[], None] | None = None,
 ) -> T:
     """Run one blocking read-only probe on ``gate``'s substrate; detach on cancellation.
 
@@ -691,7 +702,12 @@ async def _run_abandonable_probe[T](
     ``deadline_expired`` marks cancellation initiated by an internal probe bound,
     so the detached-worker log distinguishes it from caller cancellation.
     """
-    worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
+    worker = await _run_on_abandonable_thread(
+        operation,
+        thread_name="filesystem-probe",
+        gate=gate,
+        on_permit_acquired=on_permit_acquired,
+    )
 
     def _detach_cause_for_failure() -> str:
         return (
@@ -781,12 +797,19 @@ async def run_abandonable_probe[T](
     (issue #466): the first caller starts a caller-independent probe task and every
     caller (including that first one) attaches to it via :func:`_attach_to_shared_probe`,
     so a wedged root that is re-polled while its probe is still in flight can never pin
-    more than one PROBE permit and starve the shared read budget. Distinct paths keep
-    their own worker, so cross-root concurrency stays independent (still bounded by
+    more than one PROBE permit and starve the shared read budget. Acquired probes survive
+    awaiter detachment, while unstarted probes with no awaiters are cancelled, and tasks
+    owned by closed loops are never reused. Distinct paths keep their own worker, so
+    cross-root concurrency stays independent (still bounded by
     :data:`_ABANDONABLE_PROBE_THREAD_LIMIT`).
     """
     key = _normalize_guard_path(path)
     task = _ACTIVE_PROBE_TASKS.get(key)
+    if task is not None and task.get_loop().is_closed():
+        if _ACTIVE_PROBE_TASKS.get(key) is task:
+            del _ACTIVE_PROBE_TASKS[key]
+            _PROBE_STATES.pop(key, None)
+        task = None
     if task is None or task.done():
         # No in-flight probe for this path (a just-completed-but-not-yet-cleared
         # entry is treated as absent so a fresh poll never reuses a stale reading).
@@ -795,7 +818,11 @@ async def run_abandonable_probe[T](
         state = _SharedProbeState()
         task = asyncio.ensure_future(
             _run_abandonable_probe(
-                operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+                operation,
+                path,
+                operation_name=operation_name,
+                gate=_ABANDONABLE_PROBE_THREAD_GATE,
+                on_permit_acquired=lambda: setattr(state, "permit_acquired", True),
             )
         )
         _ACTIVE_PROBE_TASKS[key] = task
@@ -845,6 +872,8 @@ async def _attach_to_shared_probe(
             state.delivered = True
         else:
             _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
+            if state.live_awaiters == 0 and not task.done() and not state.permit_acquired:
+                task.cancel()
     return task.result()
 
 

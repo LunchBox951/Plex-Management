@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -2061,6 +2061,27 @@ async def test_trigger_library_scan_records_the_scan() -> None:
     assert library.scan_calls == [("/lib/movies/x", "movie")]
 
 
+class _QueuedProbeGate(purge_service._AbandonableThreadGate):  # pyright: ignore[reportPrivateUsage]
+    """Hold probe acquisition so a test can cancel the only queued awaiter."""
+
+    def __init__(self) -> None:
+        super().__init__(1)
+        self._gate = _CountingThreadGate(1)
+        self.acquire_reached = asyncio.Event()
+        self.allow_acquire = asyncio.Event()
+        self.permits_granted = 0
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        self.acquire_reached.set()
+        await self.allow_acquire.wait()
+        permit = await self._gate.acquire()
+        self.permits_granted += 1
+        return permit
+
+    def release_permit(self) -> None:
+        self._gate.release_permit()
+
+
 class _WedgedProbe:
     """A blocking read-only probe operation: it parks in its worker thread until
     the test releases it, records how many physical workers actually ran it, and
@@ -2267,6 +2288,74 @@ async def test_registry_entry_survives_every_awaiter_cancelling(
     assert await asyncio.wait_for(asyncio.shield(shared), timeout=2.0) == 5
     await asyncio.sleep(0)
     assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_closed_loop_probe_registry_entry_is_replaced_for_a_new_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #473: a detached probe task from a closed loop is never reused."""
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+    old_loop = asyncio.new_event_loop()
+    old_task = old_loop.create_task(asyncio.Event().wait())
+    old_loop.run_until_complete(asyncio.sleep(0))
+    old_loop.close()
+    cast(Any, old_task)._log_destroy_pending = False
+    probe_gate = _CountingThreadGate(1)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    purge_service._ACTIVE_PROBE_TASKS[key] = old_task  # pyright: ignore[reportPrivateUsage]
+    purge_service._PROBE_STATES[key] = purge_service._SharedProbeState()  # pyright: ignore[reportPrivateUsage]
+
+    async def run_fresh_probe() -> int:
+        return await purge_service.run_abandonable_probe(
+            lambda: 42, path, operation_name="disk probe"
+        )
+
+    try:
+        assert asyncio.run(asyncio.wait_for(run_fresh_probe(), timeout=0.1)) == 42
+        assert probe_gate.acquired == 1
+        assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if purge_service._ACTIVE_PROBE_TASKS.get(key) is old_task:  # pyright: ignore[reportPrivateUsage]
+            purge_service._ACTIVE_PROBE_TASKS.pop(key)  # pyright: ignore[reportPrivateUsage]
+            purge_service._PROBE_STATES.pop(key)  # pyright: ignore[reportPrivateUsage]
+        del old_task
+        gc.collect()
+
+
+async def test_last_awaiter_cancelling_before_probe_permit_cancels_shared_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #473: no-awaiters queued probes do not consume a later permit."""
+    probe_gate = _QueuedProbeGate()
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", probe_gate)
+    calls = 0
+    path = str(tmp_path / "root")
+    key = purge_service._normalize_guard_path(path)  # pyright: ignore[reportPrivateUsage]
+
+    def operation() -> int:
+        nonlocal calls
+        calls += 1
+        return 42
+
+    caller = asyncio.create_task(
+        purge_service.run_abandonable_probe(operation, path, operation_name="disk probe")
+    )
+    await probe_gate.acquire_reached.wait()
+    shared = purge_service._ACTIVE_PROBE_TASKS[key]  # pyright: ignore[reportPrivateUsage]
+
+    caller.cancel()
+    await assert_task_raises(caller, asyncio.CancelledError)
+    await asyncio.sleep(0)
+
+    assert shared.cancelled()
+    assert key not in purge_service._ACTIVE_PROBE_TASKS  # pyright: ignore[reportPrivateUsage]
+    assert key not in purge_service._PROBE_STATES  # pyright: ignore[reportPrivateUsage]
+
+    probe_gate.allow_acquire.set()
+    await asyncio.sleep(0)
+    assert probe_gate.permits_granted == 0
+    assert calls == 0
 
 
 async def test_all_cancelled_shared_probe_failure_is_retrieved_and_logged(
