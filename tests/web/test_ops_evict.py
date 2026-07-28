@@ -104,6 +104,7 @@ async def test_evict_frees_space_and_flips_status_to_evicted(
     assert outcome["request_id"] == request_id
     assert outcome["title"] == "Stale Movie"
     assert outcome["media_type"] == "movie"
+    assert outcome["partial"] is False
 
     # The file is actually gone and the request is honestly, re-requestably
     # marked `evicted` (never a silent delete, never a terminal dead-end).
@@ -503,6 +504,7 @@ async def test_evict_reports_and_publishes_a_partial_delete(
     outcome = body["evicted"][0]
     assert outcome["request_id"] == request_id
     assert outcome["freed_bytes"] is None  # unknowable, never a fabricated number
+    assert outcome["partial"] is True  # content remains on disk pending recovery
     event = await subscription.get()  # clients ARE told to refresh
     assert event.reason == "eviction"
     subscription.close()

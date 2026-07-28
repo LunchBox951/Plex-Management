@@ -772,16 +772,29 @@ export function Status() {
   const onFreeSpace = async () => {
     try {
       const result = await evict.mutateAsync()
+      const partialEvictions = result.evicted.filter((outcome) => outcome.partial)
+      const completeEvictions = result.evicted.filter((outcome) => !outcome.partial)
       toast({
         title:
           result.evicted.length > 0
             ? `Freed ${result.evicted.length} title${result.evicted.length === 1 ? '' : 's'}`
             : 'Nothing to free',
+        // Partials are grouped into their own clause so a mixed sweep never reads
+        // as if every title were partially removed (or none were).
         description:
           result.evicted.length > 0
-            ? result.evicted.map((o) => o.title).join(', ')
+            ? [
+                completeEvictions.map((outcome) => outcome.title).join(', '),
+                partialEvictions.length > 0
+                  ? `Partially removed — content remains on disk pending recovery: ${partialEvictions
+                      .map((outcome) => outcome.title)
+                      .join(', ')}`
+                  : '',
+              ]
+                .filter(Boolean)
+                .join('. ')
             : 'No root is under pressure, or nothing eligible was found.',
-        intent: 'success',
+        intent: partialEvictions.length > 0 ? 'warning' : 'success',
       })
       // `errors` is optional in the generated type (it has a server-side
       // default of `[]`) but always present on the wire -- guard anyway so a
