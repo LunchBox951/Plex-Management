@@ -26,7 +26,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Patch the venv's bundled pip before it installs anything
 # (CVE-2026-1703: path traversal when extracting a crafted wheel).
-RUN pip install --upgrade pip
+RUN pip install --upgrade pip==26.1.2
 
 # Copy only what the build backend needs, then install against the committed
 # runtime constraints used by CI/audit.

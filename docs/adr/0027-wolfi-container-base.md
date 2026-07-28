@@ -32,6 +32,7 @@ Install exact APK versions rather than following repository latest implicitly:
 ```text
 python-3.14=3.14.6-r4
 py3.14-pip=26.1.2-r1       # builder only
+pip==26.1.2                # exact venv installer upgrade
 ffmpeg-8.1=8.1.2-r2        # runtime; supplies ffprobe
 ```
 
@@ -43,9 +44,11 @@ boot-to-healthy path before scanning.
 
 ## Measured evidence
 
-Both images were built for `linux/amd64` from baseline commit
-`989a4131ea2bc45fbd2d0acb1b4f461d4e7798f1` with `--pull --no-cache`. The
-Debian source resolved to
+The Debian baseline was built for `linux/amd64` from `origin/main` at
+`989a4131ea2bc45fbd2d0acb1b4f461d4e7798f1`; the Wolfi candidate was built
+from the issue branch working tree that became
+`2a411eb97d1d0c4e54cb0ee4b05b7557b9f2cacf`. Both builds used
+`--pull --no-cache`. The Debian source resolved to
 `python@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6`;
 the Wolfi source is the digest above. Trivy 0.70.0 scanned both local images
 with one downloaded DB snapshot (`UpdatedAt` `2026-07-28T13:20:17.81613423Z`),
@@ -66,7 +69,10 @@ The candidate is 51.2% of the Debian image size (a 125,217,256-byte reduction).
 Its total OS findings and critical/high findings are each 0% of baseline, below
 the required 50% ceilings, and it adds no fixable critical/high occurrence.
 These are point-in-time scanner results, not a guarantee that Wolfi will remain
-finding-free; CI and the scheduled rescan remain authoritative over time.
+finding-free. CI's build scan prints the current complete image tally; the
+scheduled SARIF policy monitors fixable/actionable OS findings between builds.
+Periodic controlled comparisons using one DB snapshot and
+`--ignore-unfixed=false` are required to reproduce the full raw-count trend.
 
 ## Alternatives considered
 

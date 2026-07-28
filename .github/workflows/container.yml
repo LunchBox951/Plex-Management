@@ -25,9 +25,9 @@ on:
   schedule:
     # Daily re-scan of :edge (via the read-only `rescan` job) so the Security
     # board stays fresh BETWEEN merges: an OS CVE currently suppressed by
-    # ignore-unfixed re-surfaces the day Debian (or Trivy's DB) gains a fixed
-    # version. Without this a suppressed finding would stay invisible until some
-    # unrelated merge rebuilt and rescanned the image.
+    # ignore-unfixed re-surfaces when Wolfi publishes a fixed package and Trivy's
+    # DB records it. Without this, a suppressed finding would stay invisible until
+    # some unrelated merge rebuilt and rescanned the image.
     - cron: "17 6 * * *"
 
 # Least privilege by default; the publish/rescan jobs opt into more (below).
@@ -213,15 +213,14 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         env:
           # Trivy owns the OS layer here: scan ONLY OS packages (pkg-types=os) and
-          # drop the ones with no upstream fix (perl-base, glibc, util-linux,
-          # ncurses: Essential Debian packages this app never invokes and cannot
-          # remove). Library (pip) CVEs are deliberately NOT in scope here — they
-          # are owned by the required `dependency-audit` (pip-audit) job +
+          # keep the Security board focused on findings for which Wolfi publishes
+          # a fixed package. Library (pip) CVEs are deliberately NOT in scope here —
+          # they are owned by the required `dependency-audit` (pip-audit) job +
           # Dependabot, which surface them (fixed AND unfixed) at the source; the
           # runtime image ships only the Python venv. So ignore-unfixed can never
           # hide a library CVE. Both the modern (pkg-types) and legacy (vuln-type)
-          # env names are set so the scope holds across Trivy versions. Cutting the
-          # OS CVE surface for real (a low-CVE base) is tracked as ADR follow-up #18.
+          # env names are set so the scope holds across Trivy versions. PR builds
+          # continue to print the complete image tally before publication.
           TRIVY_PKG_TYPES: os
           TRIVY_VULN_TYPE: os
           TRIVY_IGNORE_UNFIXED: "true"
