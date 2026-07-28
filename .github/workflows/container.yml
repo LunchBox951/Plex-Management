@@ -71,6 +71,55 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Runtime contract smoke
+        run: |
+          docker run --rm --entrypoint python "${{ steps.img.outputs.name }}:pr" -c '
+          import ctypes
+          import os
+          import pathlib
+          import shutil
+          import sys
+          import cryptography, asyncpg, psycopg2, uvloop, watchfiles, pydantic_core, aiosqlite
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert os.geteuid() == 10001, os.geteuid()
+          assert ctypes.CDLL("libc.so.6").gnu_get_libc_version
+          assert pathlib.Path("/bin/sh").is_file()
+          assert shutil.which("ffprobe")
+          '
+          docker run --rm --entrypoint ffprobe "${{ steps.img.outputs.name }}:pr" -version
+
+      - name: Root updater smoke
+        run: |
+          docker run --rm --user 0:0 --entrypoint python \
+            "${{ steps.img.outputs.name }}:pr" -c '
+          import os
+          import plex_manager.updater
+          assert os.geteuid() == 0, os.geteuid()
+          '
+
+      - name: Normal boot and health smoke
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}:pr
+          NAME: plex-manager-pr-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          trap 'docker logs --tail 200 "$NAME" 2>&1 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$NAME" "$IMAGE"
+          for attempt in $(seq 1 90); do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME")
+            case "$status" in
+              healthy) exit 0 ;;
+              unhealthy) echo "::error::Container became unhealthy"; exit 1 ;;
+            esac
+            if [ "$(docker inspect --format '{{.State.Running}}' "$NAME")" != true ]; then
+              echo "::error::Container exited before becoming healthy"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::Container did not become healthy within 90 seconds"
+          exit 1
+
       - name: Scan image (Trivy — findings to the job log)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
