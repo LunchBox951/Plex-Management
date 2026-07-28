@@ -1587,6 +1587,50 @@ async def test_bounded_content_probe_logs_the_per_probe_bound(
     assert "did not answer within the 0.3s pre-removal mount-read bound" in caplog.text
 
 
+async def test_visible_content_path_hands_the_remap_the_remaining_probe_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #510: a slow verbatim probe leaves only its unspent budget for remapping."""
+    probe_bounds: list[tuple[str, float]] = []
+    monotonic_values = iter((100.0, 100.3))
+
+    def slow_verbatim_probe_clock() -> float:
+        return next(monotonic_values, 100.3)
+
+    async def record_probe_bound(
+        operation: Callable[[], object],
+        _path: str,
+        *,
+        operation_name: str,
+        bound: float,
+    ) -> object:
+        probe_bounds.append((operation_name, bound))
+        if operation_name == "content path visibility probe":
+            return False
+        return operation()
+
+    def remap_to_mounted_path(
+        _content_path: str, _save_path: str, _expected: Sequence[tuple[str, int]]
+    ) -> str:
+        return "/downloads/clip.mkv"
+
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(purge_service.time, "monotonic", slow_verbatim_probe_clock)
+    monkeypatch.setattr(purge_service, "_probe_within_bound", record_probe_bound)
+    monkeypatch.setattr(path_visibility, "remap_download_content", remap_to_mounted_path)
+    qbt = FakeQbittorrent(files={("a" * 40): [DownloadedFile(name="clip.mkv", size_bytes=512)]})
+
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/clip.mkv", "/srv/downloads"
+    )
+
+    assert result == "/downloads/clip.mkv"
+    assert probe_bounds == [
+        ("content path visibility probe", 1.0),
+        ("content path remap", pytest.approx(0.7)),
+    ]
+
+
 async def test_visible_content_path_treats_an_unreadable_path_as_not_visible(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
