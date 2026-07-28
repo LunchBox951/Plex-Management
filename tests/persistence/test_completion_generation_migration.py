@@ -1,4 +1,4 @@
-"""``season_requests.completed_at`` migration (issue #494): column, no backfill.
+"""``completion_generation`` migration (issue #494): columns, no backfill.
 
 Mirrors ``test_season_episode_states_migration.py``'s command-based
 upgrade/downgrade pattern.
@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, text
 
 from plex_manager.config import get_settings
 
-_PRE_SEASON_COMPLETED_AT_REVISION = "111b3b3c67fb"
+_PRE_COMPLETION_GENERATION_REVISION = "111b3b3c67fb"
 
 
 def _alembic_to(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -37,36 +37,38 @@ def _downgrade(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) ->
         get_settings.cache_clear()
 
 
-def _season_columns(db_path: Path) -> set[str]:
+def _columns(db_path: Path, table: str) -> set[str]:
     con = sqlite3.connect(db_path)
     try:
-        return {r[1] for r in con.execute("PRAGMA table_info(season_requests)")}
+        return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
     finally:
         con.close()
 
 
-def test_migration_adds_the_completion_generation_column(
+def test_migration_adds_the_completion_generation_columns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db_path = tmp_path / "season-completed-at.db"
+    db_path = tmp_path / "completion-generation.db"
     _alembic_to(db_path, "head", monkeypatch)
-    assert "completed_at" in _season_columns(db_path)
+    assert "completion_generation" in _columns(db_path, "media_requests")
+    assert {"completed_at", "completion_generation"} <= _columns(db_path, "season_requests")
 
-    _downgrade(db_path, _PRE_SEASON_COMPLETED_AT_REVISION, monkeypatch)
-    assert "completed_at" not in _season_columns(db_path)
+    _downgrade(db_path, _PRE_COMPLETION_GENERATION_REVISION, monkeypatch)
+    assert "completion_generation" not in _columns(db_path, "media_requests")
+    assert not {"completed_at", "completion_generation"} & _columns(db_path, "season_requests")
 
 
-def test_migration_leaves_existing_completed_seasons_unstamped(
+def test_migration_leaves_existing_completed_rows_unstamped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No backfill, by design: the completion generation of a season that
-    completed BEFORE this column existed was never recorded, and synthesizing
-    one would fabricate a completion instant (honesty over silence). ``NULL`` is
-    safe in both directions -- the availability pass snapshots that ``NULL`` and
-    the CAS matches only a row that is still ``NULL``, while any re-completion
-    after the upgrade stamps a generation that no longer matches it."""
-    db_path = tmp_path / "season-completed-at-legacy.db"
-    _alembic_to(db_path, _PRE_SEASON_COMPLETED_AT_REVISION, monkeypatch)
+    """No backfill, by design: the completion generation of a row that completed
+    BEFORE these columns existed was never recorded, and synthesizing one would
+    fabricate history (honesty over silence). ``NULL`` is safe in both
+    directions -- the availability pass snapshots that ``NULL`` and the CAS
+    matches only a row that is still ``NULL``, while the first bump after the
+    upgrade lands on 1, which no earlier snapshot can match."""
+    db_path = tmp_path / "completion-generation-legacy.db"
+    _alembic_to(db_path, _PRE_COMPLETION_GENERATION_REVISION, monkeypatch)
 
     engine = create_engine(f"sqlite:///{db_path}")
     try:
@@ -94,8 +96,12 @@ def test_migration_leaves_existing_completed_seasons_unstamped(
 
     con = sqlite3.connect(db_path)
     try:
-        rows = con.execute("SELECT status, completed_at FROM season_requests").fetchall()
+        movies = con.execute("SELECT status, completion_generation FROM media_requests").fetchall()
+        seasons = con.execute(
+            "SELECT status, completed_at, completion_generation FROM season_requests"
+        ).fetchall()
     finally:
         con.close()
 
-    assert rows == [("completed", None)]
+    assert movies == [("completed", None)]
+    assert seasons == [("completed", None, None)]

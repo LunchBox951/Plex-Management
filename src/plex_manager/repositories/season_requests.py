@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, cast
 
-from sqlalchemy import ColumnElement, CursorResult, case, or_, select, update
+from sqlalchemy import ColumnElement, CursorResult, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import (
@@ -50,19 +50,29 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value
 
 
-def _completion_stamp_values(target: RequestStatus) -> dict[str, datetime | None]:
-    """The ``completed_at`` write that accompanies a move to ``target`` (issue #494).
+def _completion_write_values(target: RequestStatus) -> dict[str, Any]:
+    """The completion bookkeeping that accompanies a move to ``target`` (issue #494).
 
-    ``SeasonRequest.completed_at`` is a completion GENERATION (see that column's
-    docstring), so it is re-stamped on every entry into ``completed``, cleared
-    when the row leaves its completion behind for anything else, and left
-    UNTOUCHED by the promotion to ``available`` -- the promoted row still stands
-    on exactly the completion it was confirmed for. Returned as values to splice
-    into the caller's own ``UPDATE`` rather than written here, so the stamp and
-    the status move are always one statement.
+    Entering ``completed`` stamps ``completed_at`` (time metadata) AND advances
+    ``completion_generation``, the counter the promotion CAS compares. The
+    generation is bumped in SQL (``COALESCE(completion_generation, 0) + 1``) so
+    two completions racing on one row cannot both read N and both write N+1 --
+    and, unlike the timestamp, it is NEVER cleared, so the next completion
+    strictly exceeds every value ever snapshotted for this row even across a
+    re-arm. Leaving ``completed`` clears the timestamp (the row no longer stands
+    on that completion); the promotion to ``available`` touches neither, since a
+    promoted row still stands on exactly the completion it was confirmed for.
+
+    Returned as values to splice into the caller's own ``UPDATE`` rather than
+    written here, so the bookkeeping and the status move are always ONE
+    statement -- no window in which a row is ``completed`` with a stale
+    generation.
     """
     if target is RequestStatus.completed:
-        return {"completed_at": datetime.now(UTC)}
+        return {
+            "completed_at": datetime.now(UTC),
+            "completion_generation": func.coalesce(SeasonRequest.completion_generation, 0) + 1,
+        }
     if target is RequestStatus.available:
         return {}
     return {"completed_at": None}
@@ -83,6 +93,7 @@ def _to_record(row: SeasonRequest, tmdb_id: int) -> SeasonRequestRecord:
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
         completed_at=_as_utc(row.completed_at),
+        completion_generation=row.completion_generation,
         # NULL (every pre-migration row) reads as ``False`` -- the safe default
         # (see ``SeasonRequest.eviction_regrab``'s docstring in ``models.py``).
         eviction_regrab=bool(row.eviction_regrab),
@@ -466,17 +477,26 @@ class SqlSeasonRequestRepository:
         return _to_record(row, await self._tmdb_id_for(media_request_id))
 
     async def set_status(self, season_request_id: int, status: str) -> None:
-        row = await self._session.get(SeasonRequest, season_request_id)
-        if row is None:
-            raise LookupError(f"season request {season_request_id} does not exist")
+        """Move a season to ``status``, keeping its completion bookkeeping in step.
+
+        A single ``UPDATE`` (not a read-modify-write) so the ``completed``
+        generation bump is evaluated by the DATABASE -- see
+        :func:`_completion_write_values`, the single source of that rule.
+        ``rowcount`` carries the same missing-row signal the previous
+        ``session.get`` did.
+        """
         target = RequestStatus(status)
-        row.status = target
-        # Keep the completion generation in step with the status (issue #494) --
-        # see ``_completion_stamp_values``, the single source of that rule.
-        stamp = _completion_stamp_values(target)
-        if "completed_at" in stamp:
-            row.completed_at = stamp["completed_at"]
-        await self._session.flush()
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(SeasonRequest)
+                .where(SeasonRequest.id == season_request_id)
+                .values(status=target, **_completion_write_values(target))
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        if result.rowcount != 1:
+            raise LookupError(f"season request {season_request_id} does not exist")
 
     async def set_status_if_in(
         self,
@@ -555,7 +575,7 @@ class SqlSeasonRequestRepository:
         stmt = (
             update(SeasonRequest)
             .where(*predicates)
-            .values(status=target, **_completion_stamp_values(target))
+            .values(status=target, **_completion_write_values(target))
             .execution_options(synchronize_session="fetch")
         )
         result = cast(CursorResult[Any], await self._session.execute(stmt))
@@ -566,7 +586,7 @@ class SqlSeasonRequestRepository:
         await self.set_status(season_request_id, RequestStatus.completed.value)
 
     async def mark_available(
-        self, season_request_id: int, *, expected_completed_at: datetime | None
+        self, season_request_id: int, *, expected_completion_generation: int | None
     ) -> bool:
         """CAS to ``available`` (Plex-confirmed: ``leafCount>0`` for this season).
 
@@ -577,15 +597,18 @@ class SqlSeasonRequestRepository:
         stale answer); see its docstring for the full rationale. Returns whether
         the season was actually promoted.
 
-        ``expected_completed_at`` binds the swap to the completion the caller's
-        Plex answer describes -- again the twin of that method's own binding
-        (issue #494), here against this season's ``completed_at`` GENERATION
-        (see the column's docstring: re-stamped on every entry into
-        ``completed``, cleared on a re-arm). TV needs this most: a re-armed
-        season keeps its ``SeasonEpisodeState`` rows, so the auto-grab worker's
-        episode fallback can re-complete it with no search, grab or download at
-        all -- the shortest route back to ``completed`` anywhere in the system,
-        and the one most likely to close inside a single Plex round-trip.
+        ``expected_completion_generation`` binds the swap to the completion the
+        caller's Plex answer describes -- again the twin of that method's own
+        binding (issue #494), here against this season's
+        ``completion_generation`` counter (advanced on every entry into
+        ``completed``, never reset, so a replacement always differs from a
+        snapshot taken before it; the ``completed_at`` beside it is time
+        metadata, too coarse to identify a completion). TV needs this most: a
+        re-armed season keeps its ``SeasonEpisodeState`` rows, so the auto-grab
+        worker's episode fallback can re-complete it with no search, grab or
+        download at all -- the shortest route back to ``completed`` anywhere in
+        the system, and the one most likely to close inside a single Plex
+        round-trip.
 
         Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2) --
         again the twin of that method's same clear. Deliberately its OWN write
@@ -601,7 +624,9 @@ class SqlSeasonRequestRepository:
                 .where(
                     SeasonRequest.id == season_request_id,
                     SeasonRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
-                    SeasonRequest.completed_at.is_not_distinct_from(expected_completed_at),
+                    SeasonRequest.completion_generation.is_not_distinct_from(
+                        expected_completion_generation
+                    ),
                 )
                 .values(status=RequestStatus.available, eviction_regrab=False)
                 .execution_options(synchronize_session="fetch")

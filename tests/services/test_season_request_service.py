@@ -69,7 +69,7 @@ async def _settle_available(
         session,
         media_request_id=media_request_id,
         season_number=season_number,
-        expected_completed_at=observed.completed_at,
+        expected_completion_generation=observed.completion_generation,
     )
 
 
@@ -455,7 +455,7 @@ async def test_mark_completed_then_mark_available_promote_the_rollup(
             session,
             media_request_id=show_id,
             season_number=1,
-            expected_completed_at=seasons[0].completed_at,
+            expected_completion_generation=seasons[0].completion_generation,
         )
         await session.commit()
     async with sessionmaker_() as session:
@@ -531,7 +531,7 @@ async def test_mark_available_clears_the_eviction_regrab_marker(
         # The row was inserted straight at ``completed``, so it carries no
         # completion generation -- the pass snapshots (and binds to) that NULL.
         await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1, expected_completed_at=None
+            session, media_request_id=show_id, season_number=1, expected_completion_generation=None
         )
         await session.commit()
 

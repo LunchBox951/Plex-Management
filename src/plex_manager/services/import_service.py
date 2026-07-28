@@ -3305,7 +3305,7 @@ async def run_availability_cycle(
             # (issue #494), and a replacement completion must not inherit a
             # positive that was never about it.
             did_promote = await request_repo.mark_available(
-                request.id, expected_completed_at=request.completed_at
+                request.id, expected_completion_generation=request.completion_generation
             )
             await session.commit()
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
@@ -3511,7 +3511,7 @@ async def run_availability_cycle(
                     # Bound to the completion THIS tick's season_presence answer
                     # describes (issue #494) -- the movie loop above documents
                     # the replacement-completion window this closes.
-                    expected_completed_at=season_request.completed_at,
+                    expected_completion_generation=season_request.completion_generation,
                 )
                 await session.commit()
             except (PlexLibraryError, PlexAuthError, NotImplementedError):

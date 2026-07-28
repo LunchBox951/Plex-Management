@@ -328,7 +328,9 @@ async def test_removed_then_reacquired_yields_a_second_available_row(
         assert finalizing is not None
         assert (
             await request_service.mark_available(
-                session, reacquired.id, expected_completed_at=finalizing.completed_at
+                session,
+                reacquired.id,
+                expected_completion_generation=finalizing.completion_generation,
             )
             is True
         )
@@ -685,7 +687,9 @@ async def test_mark_available_clears_the_eviction_regrab_marker(
         request_id = request.id
 
     async with sessionmaker_() as session:
-        await SqlRequestRepository(session).mark_available(request_id, expected_completed_at=None)
+        await SqlRequestRepository(session).mark_available(
+            request_id, expected_completion_generation=None
+        )
         await session.commit()
 
     async with sessionmaker_() as session:

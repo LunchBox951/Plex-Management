@@ -989,15 +989,15 @@ async def mark_available(
     *,
     media_request_id: int,
     season_number: int,
-    expected_completed_at: datetime | None,
+    expected_completion_generation: int | None,
 ) -> bool:
     """Phase 2 of honest per-season availability: Plex has confirmed the season is indexed.
 
     The promotion is a CAS over ``completed``/``available`` (issue #479) BOUND to
-    ``expected_completed_at`` -- the season's completion generation as the caller
-    snapshotted it alongside the Plex answer it is acting on, so a season
-    re-armed and re-completed inside that round-trip is not promoted on evidence
-    about content it no longer holds (issue #494). See
+    ``expected_completion_generation`` -- the season's completion generation as
+    the caller snapshotted it alongside the Plex answer it is acting on, so a
+    season re-armed and re-completed inside that round-trip is not promoted on
+    evidence about content it no longer holds (issue #494). See
     ``SqlSeasonRequestRepository.mark_available``. Recomputes the parent rollup
     with ``stamp_completion=True`` ONLY when the swap happened -- for the same
     reason :func:`mark_completed_if_in` does: recomputing off a promotion that
@@ -1009,7 +1009,9 @@ async def mark_available(
     row = await season_repo.ensure(
         media_request_id, season_number, status=RequestStatus.pending.value
     )
-    promoted = await season_repo.mark_available(row.id, expected_completed_at=expected_completed_at)
+    promoted = await season_repo.mark_available(
+        row.id, expected_completion_generation=expected_completion_generation
+    )
     if promoted:
         await _recompute_parent(session, media_request_id, stamp_completion=True)
     return promoted

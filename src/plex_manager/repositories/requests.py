@@ -115,6 +115,7 @@ def _to_record(row: MediaRequest) -> RequestRecord:
         library_path=row.library_path,
         partial_delete_path=row.partial_delete_path,
         completed_at=_as_utc(row.completed_at),
+        completion_generation=row.completion_generation,
         keep_forever=bool(row.keep_forever),
         search_attempts=row.search_attempts,
         next_search_at=_as_utc(row.next_search_at),
@@ -1148,21 +1149,44 @@ class SqlRequestRepository:
         return result.rowcount == 1
 
     async def mark_completed(self, request_id: int) -> None:
-        """Set ``completed`` + stamp ``completed_at`` (imported, scan triggered)."""
-        row = await self._session.get(MediaRequest, request_id)
-        if row is None:
+        """Set ``completed`` + stamp ``completed_at``, bumping the completion
+        generation (imported, scan triggered).
+
+        The movie's ONLY entry into ``completed`` (every other status writer
+        targets ``downloading``/``import_blocked``/``available``/``evicted``/...),
+        so this is the one place ``completion_generation`` needs to advance --
+        the counter ``mark_available``'s CAS compares (issue #494).
+
+        A single ``UPDATE`` rather than a read-modify-write: the bump is
+        ``COALESCE(completion_generation, 0) + 1`` evaluated BY THE DATABASE, so
+        two completions racing on the same row cannot both read N and both write
+        N+1 and hand the availability pass a generation that no longer
+        identifies one completion. ``rowcount`` carries the same missing-row
+        signal the previous ``session.get`` did.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .where(MediaRequest.id == request_id)
+                .values(
+                    status=RequestStatus.completed,
+                    completed_at=datetime.now(UTC),
+                    completion_generation=func.coalesce(MediaRequest.completion_generation, 0) + 1,
+                )
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        if result.rowcount != 1:
             raise LookupError(f"media request {request_id} does not exist")
-        row.status = RequestStatus.completed
-        row.completed_at = datetime.now(UTC)
-        await self._session.flush()
 
     async def mark_available(
-        self, request_id: int, *, expected_completed_at: datetime | None
+        self, request_id: int, *, expected_completion_generation: int | None
     ) -> bool:
         """CAS to ``available`` + stamp ``library_verified_at`` (Plex-confirmed).
 
         A single ``UPDATE ... WHERE id = ? AND status IN ('completed','available')
-        AND completed_at IS NOT DISTINCT FROM ?`` -- the DATABASE, not the
+        AND completion_generation IS NOT DISTINCT FROM ?`` -- the DATABASE, not the
         availability cycle's snapshot, decides (mirrors :meth:`set_status_if_in`'s
         discipline). ``run_availability_cycle`` reads this tick's ``completed``
         rows, awaits a Plex round-trip, and only THEN lands here; report-issue
@@ -1177,22 +1201,28 @@ class SqlRequestRepository:
         still lands. Returns whether the row was actually promoted; ``False`` is
         a benign stale result, and the caller must not count it as a promotion.
 
-        ``expected_completed_at`` is the completion the caller's Plex answer
-        actually describes -- ``RequestRecord.completed_at`` as read in the same
-        snapshot, passed back so the swap is bound to THAT completion rather
-        than to "some completion" (issue #494). Status alone cannot tell the two
-        apart: a row re-armed AND re-imported inside one Plex round-trip (the
-        retry-import endpoint drains the replacement independently of this pass)
-        is ``completed`` again by the time the CAS runs, and the stale positive
-        would promote the REPLACEMENT on evidence about the purged content.
-        ``reset_for_research`` clears ``completed_at`` and ``mark_completed``
-        re-stamps it, so the column IS the completion generation: a replacement
-        carries a different one and the predicate refuses. ``IS NOT DISTINCT
-        FROM`` (not ``=``) so a snapshotted ``NULL`` -- a row that reached
-        ``completed`` without a stamp, or the create-time ``available`` row --
-        matches its own ``NULL`` instead of silently never matching. The refusal
-        costs at most one tick: the next pass re-snapshots the replacement's own
-        ``completed_at`` and confirms the content that is actually there now.
+        ``expected_completion_generation`` names the completion the caller's Plex
+        answer actually describes -- ``RequestRecord.completion_generation`` as
+        read in the same snapshot, passed back so the swap is bound to THAT
+        completion rather than to "some completion" (issue #494). Status alone
+        cannot tell the two apart: a row re-armed AND re-imported inside one Plex
+        round-trip (the retry-import endpoint drains the replacement
+        independently of this pass) is ``completed`` again by the time the CAS
+        runs, and the stale positive would promote the REPLACEMENT on evidence
+        about the purged content. ``mark_completed`` advances the counter on
+        every entry into ``completed`` and nothing ever resets it, so a
+        replacement necessarily carries a higher generation and the predicate
+        refuses.
+
+        The counter, not ``completed_at``, is the discriminator: a timestamp can
+        repeat under a coarse-resolution, frozen, or backward-adjusted clock, and
+        two completions sharing one reading would let exactly this stale write
+        through again. ``IS NOT DISTINCT FROM`` (not ``=``) so a snapshotted
+        ``NULL`` -- a row that has never completed, or the create-time
+        ``available`` row -- matches its own ``NULL`` instead of silently never
+        matching. The refusal costs at most one tick: the next pass re-snapshots
+        the replacement's own generation and confirms the content that is
+        actually there now.
 
         Also clears ``eviction_regrab`` (issue #156 lifecycle fix, Codex round-2):
         the marker means "this row is THIS eviction's own still-in-flight regrab",
@@ -1211,7 +1241,9 @@ class SqlRequestRepository:
                 .where(
                     MediaRequest.id == request_id,
                     MediaRequest.status.in_([RequestStatus.completed, RequestStatus.available]),
-                    MediaRequest.completed_at.is_not_distinct_from(expected_completed_at),
+                    MediaRequest.completion_generation.is_not_distinct_from(
+                        expected_completion_generation
+                    ),
                 )
                 .values(
                     status=RequestStatus.available,

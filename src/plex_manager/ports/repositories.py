@@ -83,6 +83,14 @@ class RequestRecord(BaseModel):
     # made here. This column keeps its own "never moves" first-completion rule
     # (see ``SqlRequestRepository.heal_completed_at``).
     completed_at: datetime | None = None
+    # How many times this row has entered ``completed`` -- the completion
+    # GENERATION the promotion CAS compares (issue #494). Snapshotted by the
+    # availability pass alongside its Plex answer and passed back to
+    # ``RequestRepository.mark_available``. A counter rather than
+    # ``completed_at`` because two completions can share a clock reading; see
+    # ``MediaRequest.completion_generation``. ``None`` for a pre-migration row
+    # or one that has never completed.
+    completion_generation: int | None = None
     # Operator pin (ADR-0012): ``True`` means ``domain/eviction.py`` must never
     # select this title, regardless of watch state or disk pressure.
     keep_forever: bool = False
@@ -248,13 +256,17 @@ class SeasonRequestRecord(BaseModel):
     # per-season, so the backoff ladder is tracked here.
     search_attempts: int = 0
     next_search_at: datetime | None = None
-    # When this season LAST entered ``completed`` -- its completion GENERATION
-    # (issue #494), NOT the show-level first-completion stamp
-    # ``RequestRecord.completed_at`` carries. Snapshotted by the availability
-    # pass and passed back to ``SeasonRequestRepository.mark_available`` so the
-    # promotion is bound to the completion its Plex answer described. ``NULL``
-    # for a pre-migration row; see ``SeasonRequest.completed_at``'s docstring.
+    # WHEN this season last entered ``completed`` -- time metadata, NOT the
+    # show-level first-completion stamp ``RequestRecord.completed_at`` carries
+    # and NOT the promotion CAS's discriminator (issue #494). ``NULL`` for a
+    # pre-migration row; see ``SeasonRequest.completed_at``'s docstring.
     completed_at: datetime | None = None
+    # This season's completion GENERATION -- the counter the promotion CAS
+    # compares. Snapshotted by the availability pass and passed back to
+    # ``SeasonRequestRepository.mark_available`` so the promotion is bound to the
+    # completion its Plex answer described; see
+    # ``SeasonRequest.completion_generation``.
+    completion_generation: int | None = None
     # The season-level mirror of ``RequestRecord.eviction_regrab`` (issue #156):
     # ``True`` only for a season row ``season_request_service.ensure_seasons``
     # created because Plex reported it present yet its newest tracked history was
@@ -619,7 +631,7 @@ class RequestRepository(Protocol):
         raise NotImplementedError
 
     async def mark_available(
-        self, request_id: int, *, expected_completed_at: datetime | None
+        self, request_id: int, *, expected_completion_generation: int | None
     ) -> bool:
         """CAS a ``completed``/``available`` request to ``available`` + stamp
         ``library_verified_at``. Returns whether the row was actually promoted.
@@ -631,11 +643,12 @@ class RequestRepository(Protocol):
         overwritten by the stale answer (issue #479), so a ``False`` return is a
         benign "someone else moved this row", not a promotion.
 
-        ``expected_completed_at`` binds the swap to the COMPLETION the caller's
-        Plex answer describes (the ``completed_at`` it snapshotted, ``None``
-        included): a row re-armed and re-imported inside one round-trip is
-        ``completed`` again, so status alone would promote the replacement on
-        stale evidence (issue #494).
+        ``expected_completion_generation`` binds the swap to the COMPLETION the
+        caller's Plex answer describes (the ``completion_generation`` it
+        snapshotted, ``None`` included): a row re-armed and re-imported inside
+        one round-trip is ``completed`` again, so status alone would promote the
+        replacement on stale evidence (issue #494). A counter, not a timestamp --
+        two completions can share a clock reading.
         """
         raise NotImplementedError
 
@@ -985,7 +998,7 @@ class SeasonRequestRepository(Protocol):
         raise NotImplementedError
 
     async def mark_available(
-        self, season_request_id: int, *, expected_completed_at: datetime | None
+        self, season_request_id: int, *, expected_completion_generation: int | None
     ) -> bool:
         """CAS a ``completed``/``available`` season to ``available``. Returns
         whether the season was actually promoted.
@@ -995,8 +1008,9 @@ class SeasonRequestRepository(Protocol):
         actually has it. Same stale-promotion guard as
         :meth:`RequestRepository.mark_available` (issue #479), and the same
         binding to the observed completion generation (issue #494):
-        ``expected_completed_at`` is the ``SeasonRequestRecord.completed_at``
-        snapshotted with that Plex answer.
+        ``expected_completion_generation`` is the
+        ``SeasonRequestRecord.completion_generation`` snapshotted with that Plex
+        answer.
         """
         raise NotImplementedError
 
