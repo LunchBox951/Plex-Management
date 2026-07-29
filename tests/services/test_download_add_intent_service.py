@@ -129,7 +129,8 @@ class _TwoRemoveBarrierClient(_RemoveBarrierClient):
             await super().remove(info_hash, delete_files=delete_files)
             return
         self.second_entered.set()
-        await super(_RemoveBarrierClient, self).remove(info_hash, delete_files=delete_files)
+        # Second removal must skip _RemoveBarrierClient's single-use barrier.
+        await _DelayedAddClient.remove(self, info_hash, delete_files=delete_files)
 
 
 class _PremiseLossDuringCreatedAddClient(_DelayedAddClient):
