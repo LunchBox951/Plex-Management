@@ -90,6 +90,14 @@ class IntentRecoveryResult:
         return self.finalized > 0 or self.removed > 0 or self.needs_attention > 0
 
 
+@dataclass(frozen=True)
+class _SubmissionFinalization:
+    """A submission's tracked download and whether this call parked its intent."""
+
+    record: DownloadRecord | None
+    parked: bool = False
+
+
 def intent_category(intent_id: int) -> str:
     """Return the non-user-supplied qBittorrent category proving intent ownership."""
     return f"plex-manager-intent-{intent_id}"
@@ -293,13 +301,20 @@ async def _finalize_present(
     return refreshed if refreshed is not None else record
 
 
+def _owns_present_torrent(intent: DownloadAddIntentRecord, status: DownloadStatus | None) -> bool:
+    """Return whether a client torrent is proven to belong to this intent."""
+    return intent.owns_client_torrent or (
+        status is not None and status.category == intent_category(intent.id)
+    )
+
+
 async def submit_and_finalize(
     qbt: _IntentClient,
     session: AsyncSession,
     *,
     intent: DownloadAddIntentRecord,
     prepared: PreparedAdd | None = None,
-) -> DownloadRecord:
+) -> _SubmissionFinalization:
     """Submit a prepared intent then atomically exchange it for a tracked download."""
     resolved = prepared
     if resolved is None:
@@ -308,8 +323,19 @@ async def submit_and_finalize(
         resolved = await qbt.prepare_add(intent.source)
     if resolved.torrent_hash.lower() != intent.torrent_hash:
         raise ValueError("prepared hash differs from durable intent")
-    await qbt.add_prepared(resolved, intent.save_path, intent_category(intent.id))
-    return await _finalize_present(qbt, session, intent)
+    result = await qbt.add_prepared(resolved, intent.save_path, intent_category(intent.id))
+    if result.created:
+        return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
+    status = await qbt.get_status(intent.torrent_hash)
+    if _owns_present_torrent(intent, status):
+        return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
+    parked = await _park_needs_attention(
+        session,
+        SqlDownloadAddIntentRepository(session),
+        intent.id,
+        "client_hash_ownership_unproven",
+    )
+    return _SubmissionFinalization(None, parked=parked)
 
 
 async def _park_needs_attention(
@@ -346,6 +372,14 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
                 )
                 continue
             if status is not None:
+                if not _owns_present_torrent(intent, status):
+                    if await _park_needs_attention(
+                        session, intents, intent.id, "client_hash_ownership_unproven"
+                    ):
+                        result = IntentRecoveryResult(
+                            result.finalized, result.removed, result.needs_attention + 1
+                        )
+                    continue
                 await _finalize_present(qbt, session, intent)
             elif intent.source is None:
                 if await _park_needs_attention(session, intents, intent.id, "source_unavailable"):
@@ -375,7 +409,15 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
                             result.finalized, result.removed, result.needs_attention + 1
                         )
                     continue
-                await submit_and_finalize(qbt, session, intent=intent, prepared=prepared)
+                finalization = await submit_and_finalize(
+                    qbt, session, intent=intent, prepared=prepared
+                )
+                if finalization.record is None:
+                    if finalization.parked:
+                        result = IntentRecoveryResult(
+                            result.finalized, result.removed, result.needs_attention + 1
+                        )
+                    continue
             result = IntentRecoveryResult(
                 result.finalized + 1, result.removed, result.needs_attention
             )

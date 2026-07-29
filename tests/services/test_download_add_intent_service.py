@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest
 from sqlalchemy import select
@@ -21,9 +22,15 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import AddResult, DownloadStatus, PreparedAdd
+from plex_manager.ports.download_client import (
+    AddResult,
+    DownloadClientPort,
+    DownloadStatus,
+    PreparedAdd,
+)
 from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
+from plex_manager.services.correction_service import cancel_request_with_outcome
 from plex_manager.services.download_add_intent_service import (
     intent_category,
     publish_intent,
@@ -68,6 +75,37 @@ class _Client:
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         self.removes.append(info_hash)
         self.statuses.pop(info_hash, None)
+
+
+class _DuplicateAddClient(_Client):
+    def __init__(self, statuses: dict[str, DownloadStatus], *, created: bool) -> None:
+        super().__init__(statuses)
+        self.created = created
+
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        self.adds.append(category)
+        if self.created:
+            self.statuses[prepared.torrent_hash] = DownloadStatus(
+                info_hash=prepared.torrent_hash,
+                name="torrent",
+                raw_state="downloading",
+                category=category,
+            )
+        return AddResult(torrent_hash=prepared.torrent_hash, created=self.created)
+
+
+class _DuplicateForeignRecoveryClient(_DuplicateAddClient):
+    def __init__(self) -> None:
+        super().__init__({}, created=False)
+        self.status_calls = 0
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        self.status_calls += 1
+        if self.status_calls == 1:
+            return None
+        return DownloadStatus(
+            info_hash=info_hash, name="foreign", raw_state="downloading", category="other-app"
+        )
 
 
 class _SourceErrorPrepareClient(_Client):
@@ -124,15 +162,214 @@ async def test_present_intent_finalizes_once_and_normalizes_category(session: As
         }
     )
 
-    record = await submit_and_finalize(client, session, intent=intent)
+    finalization = await submit_and_finalize(client, session, intent=intent)
 
-    assert record.torrent_hash == "hash"
+    assert finalization.record is not None
+    assert finalization.record.torrent_hash == "hash"
     assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
     assert len((await session.scalars(select(DownloadHistory))).all()) == 1
     assert client.categories == [("hash", "plex-manager")]
     request_after = await session.get(MediaRequest, request.id)
     assert request_after is not None
     assert request_after.status == RequestStatus.downloading
+
+
+async def test_foreign_present_hash_parks_without_client_mutation_or_later_removal(
+    session: AsyncSession,
+) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    client = _Client(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash", name="foreign", raw_state="downloading", category="other-app"
+            )
+        }
+    )
+
+    recovered = await recover_all(client, session)
+
+    assert recovered == type(recovered)(needs_attention=1)
+    stored = await SqlDownloadAddIntentRepository(session).get(intent.id)
+    assert stored is not None
+    assert stored.state == "needs_attention"
+    assert stored.last_error == "client_hash_ownership_unproven"
+    assert client.categories == []
+    assert client.removes == []
+    assert await session.scalar(select(Download).where(Download.torrent_hash == "hash")) is None
+
+    outcome = await cancel_request_with_outcome(
+        session, cast(DownloadClientPort, client), request_id=request.id
+    )
+
+    assert outcome.record.status == RequestStatus.cancelled.value
+    assert client.removes == []
+    assert client.statuses["hash"].category == "other-app"
+
+
+async def test_explicit_adoption_finalizes_foreign_category(session: AsyncSession) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            owns_client_torrent=True,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    client = _Client(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash", name="adopted", raw_state="downloading", category="other-app"
+            )
+        }
+    )
+
+    recovered = await recover_all(client, session)
+
+    assert recovered.finalized == 1
+    assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
+    assert client.categories == [("hash", "plex-manager")]
+
+
+@pytest.mark.parametrize(
+    ("created", "category", "finalizes"),
+    [
+        (False, "other-app", False),
+        (False, "plex-manager-intent-{intent_id}", True),
+        (True, "other-app", True),
+    ],
+)
+async def test_submit_uses_add_result_ownership_proof(
+    session: AsyncSession, created: bool, category: str, finalizes: bool
+) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            source="magnet:source",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    client = _DuplicateAddClient(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash",
+                name="existing",
+                raw_state="downloading",
+                category=category.format(intent_id=intent.id),
+            )
+        },
+        created=created,
+    )
+
+    finalization = await submit_and_finalize(client, session, intent=intent)
+
+    assert (finalization.record is not None) is finalizes
+    stored = await SqlDownloadAddIntentRepository(session).get(intent.id)
+    if finalizes:
+        assert stored is None
+        assert client.categories == [("hash", "plex-manager")]
+    else:
+        assert stored is not None
+        assert stored.state == "needs_attention"
+        assert stored.last_error == "client_hash_ownership_unproven"
+        assert client.categories == []
+
+
+async def test_submit_lost_attention_cas_does_not_report_a_mutation(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            source="magnet:source",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    await session.commit()
+    client = _DuplicateForeignRecoveryClient()
+    original_mark_state = SqlDownloadAddIntentRepository.mark_state
+
+    async def lose_to_cancel(
+        self: SqlDownloadAddIntentRepository,
+        intent_id: int,
+        state: str,
+        *,
+        last_error: str | None = None,
+        expected_state: str | None = None,
+    ) -> bool:
+        if state == "needs_attention":
+            assert await original_mark_state(
+                self, intent_id, "cancel_requested", expected_state="prepared"
+            )
+            return False
+        return await original_mark_state(
+            self,
+            intent_id,
+            state,
+            last_error=last_error,
+            expected_state=expected_state,
+        )
+
+    monkeypatch.setattr(SqlDownloadAddIntentRepository, "mark_state", lose_to_cancel)
+
+    result = await recover_all(client, session)
+
+    stored = await SqlDownloadAddIntentRepository(session).get(intent.id, fresh=True)
+    assert stored is not None
+    assert stored.state == "cancel_requested"
+    assert result.needs_attention == 0
+    assert not result.changed
 
 
 async def test_recovery_does_not_delete_intent_for_terminal_same_hash_download(
