@@ -46,9 +46,11 @@ from plex_manager.models import (
     DownloadHistory,
     DownloadHistoryEvent,
     DownloadScope,
+    EpisodeState,
     MediaRequest,
     MediaType,
     RequestStatus,
+    SeasonEpisodeState,
     SeasonRequest,
     User,
 )
@@ -3202,16 +3204,29 @@ class _AttachSeasonDuringScanLibrary(FakeLibrary):
     season in a separate session — the attach landing after this pass snapshotted its
     scopes and before it finalizes."""
 
-    def __init__(self, sm: SessionMaker, *, request_id: int, season: int) -> None:
+    def __init__(
+        self,
+        sm: SessionMaker,
+        *,
+        request_id: int,
+        season: int,
+        episodes: list[int] | None = None,
+        attach_when_path_contains: str | None = None,
+    ) -> None:
         super().__init__()
         self._sm = sm
         self._request_id = request_id
         self._season = season
+        self._episodes = episodes
+        self._attach_when_path_contains = attach_when_path_contains
         self.attached = False
 
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         await super().trigger_scan(path, media_type)
-        if self.attached:
+        if self.attached or (
+            self._attach_when_path_contains is not None
+            and self._attach_when_path_contains not in path
+        ):
             return
         self.attached = True
         async with self._sm() as session:
@@ -3222,6 +3237,7 @@ class _AttachSeasonDuringScanLibrary(FakeLibrary):
                 request_id=self._request_id,
                 tmdb_id=_TMDB_ID,
                 season=self._season,
+                episodes=self._episodes,
             )
 
 
@@ -3307,6 +3323,258 @@ async def _scope_and_claim_state(
         {scope.season_number: scope.status for scope in scopes},
         {claim.season_number: claim.status for claim in claims},
     )
+
+
+async def _seed_same_season_episode_scopes(
+    sm: SessionMaker,
+    episode_scopes: tuple[tuple[int, ...], ...],
+    *,
+    target_episodes: tuple[int, ...] = (),
+) -> tuple[int, int]:
+    """Seed active episode scopes for one downloading season."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(
+            media_request_id=request.id,
+            season_number=1,
+            status=RequestStatus.downloading.value,
+        )
+        session.add(season)
+        await session.flush()
+        session.add_all(
+            [
+                SeasonEpisodeState(
+                    season_request_id=season.id,
+                    episode_number=episode,
+                    status=EpisodeState.grabbed,
+                )
+                for episode in target_episodes
+            ]
+        )
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+            episodes_json=list(episode_scopes[0]),
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=request.id,
+                season_number=1,
+                status="active",
+            )
+        )
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season.id,
+                    season_number=1,
+                    episodes_json=list(episodes),
+                    scope_key="season:1|episodes:" + ",".join(map(str, episodes)),
+                    status="active",
+                )
+                for episodes in episode_scopes
+            ]
+        )
+        await session.commit()
+        return download.id, request.id
+
+
+async def test_import_tv_same_season_late_scope_keeps_season_downloading(
+    tmp_path: Path,
+) -> None:
+    """A late same-season scope owns the season status until a fresh pass resolves it."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_attach.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(sm, ((1,),))
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=1, episodes=[2]),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.Importing.value
+        async with sm() as session:
+            season_status = await session.scalar(
+                select(SeasonRequest.status).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert season_status == RequestStatus.downloading.value
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+        ]
+
+        async with sm() as session:
+            promoted = await run_availability_cycle(
+                library=FakeLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})}),
+                session=session,
+            )
+        assert promoted == 0
+        async with sm() as session:
+            assert (
+                await session.scalar(
+                    select(SeasonRequest.status).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+                == RequestStatus.downloading.value
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_same_season_late_scope_skips_incomplete_success_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    """A late scope prevents a stale incomplete import from re-arming the season."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_incomplete.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(
+            sm,
+            ((1,),),
+            target_episodes=(1, 2),
+        )
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=1, episodes=[2]),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.Importing.value
+        async with sm() as session:
+            season = await session.scalar(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+
+        assert season is not None
+        assert season.status is RequestStatus.downloading
+        assert season.search_attempts == 0
+        assert season.next_search_at is None
+        assert blocklisted == []
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+        ]
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_same_season_late_scope_skips_stale_failure_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    """A stale failure cannot overwrite a same-season scope attached during the pass."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_failure.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(sm, ((1,), (3,)))
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(
+                sm,
+                request_id=request_id,
+                season=1,
+                episodes=[2],
+                attach_when_path_contains="Season 01",
+            ),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.ImportBlocked.value
+        async with sm() as session:
+            season_status = await session.scalar(
+                select(SeasonRequest.status).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert season_status == RequestStatus.downloading.value
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+            ([3], RequestStatus.import_blocked.value),
+        ]
+    finally:
+        await engine.dispose()
 
 
 async def test_import_tv_scope_attached_mid_import_survives_and_imports_next_pass(

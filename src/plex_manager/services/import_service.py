@@ -1624,6 +1624,7 @@ async def _mark_tv_scope_blocked(
     *,
     download_id: int,
     failure: _TvImportFailure,
+    update_season: bool = True,
 ) -> None:
     await _set_download_scope_status(
         session,
@@ -1633,12 +1634,13 @@ async def _mark_tv_scope_blocked(
         season=failure.target.season,
         status=RequestStatus.import_blocked.value,
     )
-    await season_request_service.set_status(
-        session,
-        media_request_id=failure.target.request.id,
-        season_number=failure.target.season,
-        status=RequestStatus.import_blocked.value,
-    )
+    if update_season:
+        await season_request_service.set_status(
+            session,
+            media_request_id=failure.target.request.id,
+            season_number=failure.target.season,
+            status=RequestStatus.import_blocked.value,
+        )
 
 
 class _LateScopeReadout(NamedTuple):
@@ -2023,40 +2025,41 @@ async def _import_tv_targets_locked(
                 download_id=download_id,
                 target=plan_target,
             )
-            if plan_complete:
-                await season_request_service.mark_completed(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                )
-            else:
-                # Same recycle terminator as the single-season path: a
-                # multi-season pack is a PACK for every season it carries, so
-                # an incompletely-covered season must block this release's
-                # identity before re-arming (P1 x P2 composition: the re-arm
-                # alone would let Pass 1 re-accept the same pack). One entry
-                # per download is enough -- the identity is per-release, not
-                # per-season.
-                if not pack_blocklisted:
-                    pack_blocklisted = True
-                    await _blocklist_incomplete_pack(
+            if plan.target.season not in readout.late_seasons:
+                if plan_complete:
+                    await season_request_service.mark_completed(
                         session,
-                        tmdb_id=plan.target.request.tmdb_id,
-                        torrent_hash=torrent_hash,
-                        request_id=plan.target.request.id,
-                        season=plan.target.season,
-                        target=plan_target,
-                        covered=plan_episodes,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
                     )
-                await season_request_service.set_status(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    status=RequestStatus.searching.value,
-                )
-                await SqlSeasonRequestRepository(session).schedule_search(
-                    plan_season_row.id, search_attempts=0, next_search_at=None
-                )
+                else:
+                    # Same recycle terminator as the single-season path: a
+                    # multi-season pack is a PACK for every season it carries, so
+                    # an incompletely-covered season must block this release's
+                    # identity before re-arming (P1 x P2 composition: the re-arm
+                    # alone would let Pass 1 re-accept the same pack). One entry
+                    # per download is enough -- the identity is per-release, not
+                    # per-season.
+                    if not pack_blocklisted:
+                        pack_blocklisted = True
+                        await _blocklist_incomplete_pack(
+                            session,
+                            tmdb_id=plan.target.request.tmdb_id,
+                            torrent_hash=torrent_hash,
+                            request_id=plan.target.request.id,
+                            season=plan.target.season,
+                            target=plan_target,
+                            covered=plan_episodes,
+                        )
+                    await season_request_service.set_status(
+                        session,
+                        media_request_id=plan.target.request.id,
+                        season_number=plan.target.season,
+                        status=RequestStatus.searching.value,
+                    )
+                    await SqlSeasonRequestRepository(session).schedule_search(
+                        plan_season_row.id, search_attempts=0, next_search_at=None
+                    )
             await _set_download_scope_status(
                 session,
                 download_id=download_id,
@@ -2068,7 +2071,12 @@ async def _import_tv_targets_locked(
             )
 
         for failure in failures:
-            await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
+            await _mark_tv_scope_blocked(
+                session,
+                download_id=download_id,
+                failure=failure,
+                update_season=failure.target.season not in readout.late_seasons,
+            )
 
         if failures or readout.late_seasons:
             await download_repo.align_scalar_scope_with_active(download_id)
