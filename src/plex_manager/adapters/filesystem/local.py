@@ -70,6 +70,10 @@ class LocalFileSystemError(RuntimeError):
     """
 
 
+class PublishLockReclaimGuardError(FileExistsError):
+    """A crashed identity-only reclaimer left a visible recovery guard artifact."""
+
+
 class PartialDeleteError(OSError):
     """Raised when :meth:`LocalFileSystem.delete` removed PART of a directory tree
     and only THEN failed (issue #482).
@@ -208,12 +212,25 @@ def _existing_lock_is_reclaimable(lock_fd: int) -> bool:
     return _pid_is_running(pid) is False
 
 
+def _existing_lock_is_empty(lock_fd: int) -> bool:
+    """Whether the held existing inode has no diagnostic PID metadata."""
+    try:
+        return not os.pread(lock_fd, 1, 0)
+    except OSError:
+        return False
+
+
 def _lock_fd_owns_name(dir_fd: int, lock_name: str, lock_fd: int) -> bool:
-    """Whether the held regular descriptor is still the canonical lock entry."""
+    """Whether the held regular descriptor is still the canonical lock entry.
+
+    A missing name is an already-released lock. Any other failed probe is
+    indeterminate and must surface: treating it as a mismatch can strand a live
+    PID-bearing lock forever.
+    """
     try:
         held = os.fstat(lock_fd)
         current = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False)
-    except OSError:
+    except FileNotFoundError:
         return False
     return (
         stat.S_ISREG(held.st_mode)
@@ -243,7 +260,7 @@ def _unlink_created_publish_lock_if_unowned(dir_fd: int, lock_name: str, lock_fd
 
 
 def _write_lock_pid(lock_fd: int) -> None:
-    """Publish this process's PID to the held lock descriptor."""
+    """Publish this process's PID to a private, held lock descriptor."""
     payload = str(os.getpid()).encode("ascii")
     os.ftruncate(lock_fd, 0)
     os.lseek(lock_fd, 0, os.SEEK_SET)
@@ -255,8 +272,182 @@ def _write_lock_pid(lock_fd: int) -> None:
         written += count
 
 
-def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
-    """Claim the canonical lock inode, preserving conservative legacy semantics."""
+def _private_publish_lock_name(lock_name: str, attempt: int) -> str:
+    """Return a same-directory private name for a prepared replacement lock."""
+    return f"{lock_name}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
+
+
+def _prepare_replacement_publish_lock(
+    dir_fd: int, lock_name: str, *, advisory_locking: bool
+) -> tuple[int, str]:
+    """Create, flock, and populate an unexposed replacement lock inode."""
+    flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    for attempt in range(10):
+        temporary_name = _private_publish_lock_name(lock_name, attempt)
+        try:
+            lock_fd = os.open(
+                temporary_name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise OSError(errno.EIO, "new publish lock is not a regular file")
+            if advisory_locking:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _write_lock_pid(lock_fd)
+        except BaseException:
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=dir_fd)
+            finally:
+                os.close(lock_fd)
+            raise
+        return lock_fd, temporary_name
+    raise OSError(errno.EEXIST, "could not allocate a private publish lock")
+
+
+def _replace_held_publish_lock(
+    dir_fd: int,
+    lock_name: str,
+    old_lock_fd: int,
+    display: str,
+    *,
+    advisory_locking: bool,
+) -> int:
+    """Atomically replace a reclaimable canonical inode with a prepared lock."""
+    replacement_fd, temporary_name = _prepare_replacement_publish_lock(
+        dir_fd, lock_name, advisory_locking=advisory_locking
+    )
+    renamed = False
+    try:
+        try:
+            if not _lock_fd_owns_name(dir_fd, lock_name, old_lock_fd):
+                raise FileExistsError(display)
+            os.rename(
+                temporary_name,
+                lock_name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            renamed = True
+            if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+                raise FileExistsError(display)
+        except BaseException:
+            try:
+                if renamed and _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+                    os.unlink(lock_name, dir_fd=dir_fd)
+            finally:
+                os.close(replacement_fd)
+            raise
+    finally:
+        if not renamed:
+            # This name is private to this claimant and was never exposed.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=dir_fd)
+    os.close(old_lock_fd)
+    return replacement_fd
+
+
+def _reclaim_guard_name(lock_name: str) -> str:
+    """Return the canonical guard name for identity-only stale-lock recovery."""
+    return f"{lock_name}.reclaim"
+
+
+def _reclaim_guard_error(display: str, guard_name: str) -> PublishLockReclaimGuardError:
+    """Describe the visible recovery block an operator must correct."""
+    guard_path = os.path.join(os.path.dirname(display), guard_name)
+    return PublishLockReclaimGuardError(
+        f"publish-lock recovery blocked by {guard_path}: a crashed reclaimer left its "
+        "guard artifact; clear it before retrying"
+    )
+
+
+def _acquire_identity_only_reclaim_guard(
+    dir_fd: int, lock_name: str, display: str
+) -> tuple[int, str]:
+    """Atomically acquire the exclusive identity-only stale-reclamation guard."""
+    guard_name = _reclaim_guard_name(lock_name)
+    flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        guard_fd = os.open(guard_name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+    except FileExistsError:
+        # No check-then-act guard takeover: an extant guard is a visible, honest
+        # recovery block, not an opportunity to risk stealing a live reclaimer.
+        raise _reclaim_guard_error(display, guard_name) from None
+    try:
+        _write_lock_pid(guard_fd)
+        if not _lock_fd_owns_name(dir_fd, guard_name, guard_fd):
+            raise FileExistsError(display)
+    except BaseException:
+        try:
+            if _lock_fd_owns_name(dir_fd, guard_name, guard_fd):
+                os.unlink(guard_name, dir_fd=dir_fd)
+        finally:
+            os.close(guard_fd)
+        raise
+    return guard_fd, guard_name
+
+
+def _reclaim_identity_only_publish_lock(
+    dir_fd: int, lock_name: str, old_lock_fd: int, display: str
+) -> int:
+    """Reclaim a stale lock under a guard where advisory ownership is unavailable.
+
+    Destructive canonical operations happen only under the O_EXCL-only reclaim
+    guard, so cooperating reclaimers have one atomic winner. Residual risks on a
+    no-flock filesystem are noncooperating pathname mutation and a crashed guard
+    visibly wedging this destination until corrected, rather than silent overlap.
+    """
+    guard_fd, guard_name = _acquire_identity_only_reclaim_guard(dir_fd, lock_name, display)
+    replacement_fd: int | None = None
+    try:
+        if not _lock_fd_owns_name(dir_fd, lock_name, old_lock_fd):
+            raise FileExistsError(display)
+        try:
+            os.unlink(lock_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise FileExistsError(display) from None
+
+        flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            replacement_fd = os.open(
+                lock_name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except FileExistsError:
+            raise FileExistsError(display) from None
+        if not stat.S_ISREG(os.fstat(replacement_fd).st_mode):
+            raise FileExistsError(display)
+        _write_lock_pid(replacement_fd)
+        if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+            raise FileExistsError(display)
+        result_fd = replacement_fd
+        replacement_fd = None
+        return result_fd
+    finally:
+        try:
+            if replacement_fd is not None:
+                try:
+                    if _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+                        os.unlink(lock_name, dir_fd=dir_fd)
+                finally:
+                    os.close(replacement_fd)
+            if _lock_fd_owns_name(dir_fd, guard_name, guard_fd):
+                os.unlink(guard_name, dir_fd=dir_fd)
+        finally:
+            os.close(guard_fd)
+
+
+def _acquire_publish_lock(
+    dir_fd: int, lock_name: str, display: str, *, reclaim_stale_with_existing_entry: bool
+) -> int:
+    """Claim the canonical lock inode without ever rewriting an existing inode."""
     lock_fd, created = _open_publish_lock(dir_fd, lock_name, display)
     claimed = False
     try:
@@ -264,16 +455,58 @@ def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise FileExistsError(display) from None
+        except OSError as error:
+            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            advisory_locking = False
+        else:
+            advisory_locking = True
 
-        if not created and not _existing_lock_is_reclaimable(lock_fd):
-            raise FileExistsError(display)
         if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
             raise FileExistsError(display)
+
+        if created:
+            # Flock, when available, claims before PID publication. On identity-only
+            # mounts the brief empty inode is intentionally governed by the existing
+            # 60-second fresh-empty rule, so a crashed creator remains recoverable.
+            _write_lock_pid(lock_fd)
+            if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+                raise FileExistsError(display)
+            claimed = True
+            return lock_fd
+
+        held = os.fstat(lock_fd)
+        reclaimable = _existing_lock_is_reclaimable(lock_fd)
+        # With advisory locks, flock ownership is authoritative: a fresh empty
+        # inode with no holder is claimable immediately. Without flock, the legacy
+        # age-based predicate is the conservative authority.
+        claim_empty = (
+            advisory_locking
+            and not reclaim_stale_with_existing_entry
+            and _existing_lock_is_empty(lock_fd)
+        )
+        # Immediate empty-lock recovery requires a standalone artifact. A stale
+        # aliased inode may still be safely replaced without changing its contents.
+        if claim_empty and held.st_nlink != 1:
+            raise FileExistsError(display)
+        if not (reclaimable or claim_empty):
+            raise FileExistsError(display)
+
+        if advisory_locking:
+            lock_fd = _replace_held_publish_lock(
+                dir_fd,
+                lock_name,
+                lock_fd,
+                display,
+                advisory_locking=True,
+            )
+        else:
+            replacement_fd = _reclaim_identity_only_publish_lock(
+                dir_fd, lock_name, lock_fd, display
+            )
+            os.close(lock_fd)
+            lock_fd = replacement_fd
         claimed = True
-
-        _write_lock_pid(lock_fd)
-        if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
-            raise FileExistsError(display)
         return lock_fd
     except BaseException as original_error:
         if claimed:
@@ -332,14 +565,19 @@ def _publish_lock(
     """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
 
     The held flock is authoritative ownership of the exact regular lock inode.
-    Legacy PID and empty-file state remains a conservative compatibility gate for
-    pre-existing lock artifacts. Rollback may inspect/reclaim with an existing
+    Legacy PID state and empty locks without advisory support remain conservative
+    compatibility gates for pre-existing artifacts. Rollback may inspect/reclaim with an existing
     destination; ordinary publication still refuses that destination immediately.
     """
     lock_name = f".{name}.publish.lock"
     if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
         raise FileExistsError(display)
-    lock_fd = _acquire_publish_lock(dir_fd, lock_name, display)
+    lock_fd = _acquire_publish_lock(
+        dir_fd,
+        lock_name,
+        display,
+        reclaim_stale_with_existing_entry=reclaim_stale_with_existing_entry,
+    )
     try:
         yield
     finally:
@@ -1142,6 +1380,8 @@ class LocalFileSystem:
                     published_identity = _publish_link_no_overwrite(
                         src, source_fd, parent_fd, name, display
                     )
+                except PublishLockReclaimGuardError:
+                    raise
                 except FileExistsError:
                     # Something is already at dst: a prior fully-imported copy, or a
                     # concurrent import (the reconcile loop racing the operator's
@@ -1164,6 +1404,8 @@ class LocalFileSystem:
                         published_identity, published_fd = self._copy_no_overwrite(
                             src, dst, source_fd, parent_fd, name
                         )
+                    except PublishLockReclaimGuardError:
+                        raise
                     except FileExistsError:
                         published_identity, published_fd = _idempotent_or_conflict(
                             source_fd, parent_fd, name, display
