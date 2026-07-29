@@ -37,12 +37,13 @@ _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
 )
 
 
-_XATTR_ENUMERATION_TOLERATED_ERRNOS: frozenset[int] = frozenset({errno.EPERM, errno.ENOTSUP})
-_XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
-    {errno.EPERM, errno.ENOTSUP, errno.EACCES}
+# CPython ``shutil._copyxattr`` treats unsupported, absent, and invalid listings as empty.
+_XATTR_ENUMERATION_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.ENOTSUP, errno.ENODATA, errno.EINVAL}
 )
-_XATTR_MISSING_ERRNOS: frozenset[int] = frozenset(
-    {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
+# CPython tolerates per-attribute access, capability, absence, and target-rejection errors.
+_XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES}
 )
 
 #: Read size for the destination-vs-source digest comparison. Media files are large;
@@ -492,7 +493,7 @@ def _copy_xattrs(source_fd: int, target_fd: int) -> None:
         try:
             value = os.getxattr(source_fd, name)
         except OSError as exc:
-            if exc.errno in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS | _XATTR_MISSING_ERRNOS:
+            if exc.errno in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
                 continue
             raise
         try:

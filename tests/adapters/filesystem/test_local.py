@@ -251,8 +251,16 @@ def test_cross_device_copy_copies_all_xattrs_by_held_descriptors(
     assert stat.S_IMODE(dst.stat().st_mode) == stat.S_IMODE(source_stat.st_mode)
 
 
-@pytest.mark.parametrize("operation", ["listxattr", "getxattr", "setxattr"])
-@pytest.mark.parametrize("tolerated_errno", [errno.EPERM, errno.ENOTSUP])
+@pytest.mark.parametrize(
+    ("operation", "tolerated_errno"),
+    [
+        ("listxattr", errno.ENOTSUP),
+        ("getxattr", errno.EPERM),
+        ("getxattr", errno.ENOTSUP),
+        ("setxattr", errno.EPERM),
+        ("setxattr", errno.ENOTSUP),
+    ],
+)
 def test_cross_device_copy_tolerates_xattr_capability_or_permission_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -391,15 +399,15 @@ def test_cross_device_copy_propagates_eacces_from_xattr_enumeration(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_cross_device_copy_skips_an_xattr_removed_after_listing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_retrieval_errors_per_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
 ) -> None:
-    """A disappearing enumerated xattr does not abort the copy fallback."""
+    """A rejected or disappearing enumerated xattr does not abort the copy fallback."""
     src = tmp_path / "src.mkv"
     src.write_bytes(b"source payload")
     dst = tmp_path / "copied.mkv"
     attempted_second_attribute = False
-    missing_errno = getattr(errno, "ENOATTR", errno.ENODATA)
     real_link = os.link
 
     def _refuse_source_link(
@@ -417,7 +425,7 @@ def test_cross_device_copy_skips_an_xattr_removed_after_listing(
         nonlocal attempted_second_attribute
         assert isinstance(fd, int)
         if name == "user.removed":
-            raise OSError(missing_errno, "attribute disappeared")
+            raise OSError(tolerated_errno, "attribute unavailable")
         attempted_second_attribute = True
         return b"present"
 
@@ -436,14 +444,14 @@ def test_cross_device_copy_skips_an_xattr_removed_after_listing(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_cross_device_copy_propagates_missing_xattr_error_from_setxattr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_target_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
 ) -> None:
-    """A no-data error is tolerated only while retrieving an xattr."""
+    """A target rejecting one source-specific xattr does not abort publication."""
     src = tmp_path / "src.mkv"
     src.write_bytes(b"source payload")
     dst = tmp_path / "copied.mkv"
-    missing_errno = getattr(errno, "ENOATTR", errno.ENODATA)
     real_link = os.link
 
     def _refuse_source_link(
@@ -462,17 +470,77 @@ def test_cross_device_copy_propagates_missing_xattr_error_from_setxattr(
         return b"issue-500"
 
     def _setxattr(_fd: int, _name: str, _value: bytes) -> None:
-        raise OSError(missing_errno, "target attribute disappeared")
+        raise OSError(tolerated_errno, "target rejected attribute")
 
     monkeypatch.setattr(os, "link", _refuse_source_link)
     monkeypatch.setattr(os, "listxattr", _listxattr)
     monkeypatch.setattr(os, "getxattr", _getxattr)
     monkeypatch.setattr(os, "setxattr", _setxattr)
 
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_enumeration_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
+) -> None:
+    """An unsupported or empty xattr listing does not abort publication."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(tolerated_errno, "xattr listing unavailable")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("enumeration_errno", [errno.EPERM])
+def test_cross_device_copy_propagates_eperm_from_xattr_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enumeration_errno: int
+) -> None:
+    """An xattr enumeration permission denial aborts publication and cleans its temp."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(enumeration_errno, "xattr enumeration refused")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
     with pytest.raises(OSError) as raised:
         LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
-    assert raised.value.errno == missing_errno
+    assert raised.value.errno == enumeration_errno
     assert not dst.exists()
     assert not list(tmp_path.glob(".*.tmp"))
 
