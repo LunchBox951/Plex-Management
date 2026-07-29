@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol
 
 from sqlalchemy.exc import IntegrityError
 
@@ -67,6 +67,11 @@ __all__ = [
 
 _logger = logging.getLogger(__name__)
 ParkedIntentHashError = download_add_intent_service.ParkedIntentHashError
+
+
+class _RegistrationClient(Protocol):
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None: ...
+
 
 # The qBittorrent category the app tags its torrents with (lets a later import
 # pipeline filter to only app-managed downloads).
@@ -294,7 +299,7 @@ async def _reuse_terminal_row(
     episodes: list[int] | None,
     media_type: str | None,
     release_title: str | None,
-    qbt: DownloadClientPort,
+    qbt: _RegistrationClient,
     actually_added: bool,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
@@ -430,7 +435,7 @@ async def _retire_lost_add_reservation(
 
 
 async def _remove_torrent_if_added(
-    qbt: DownloadClientPort,
+    qbt: _RegistrationClient,
     torrent_hash: str,
     *,
     actually_added: bool,
@@ -641,7 +646,7 @@ async def _resolve_same_hash_owner(
     episodes: list[int] | None,
     scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
     target_seasons: tuple[int, ...],
-    qbt: DownloadClientPort | None,
+    qbt: _RegistrationClient | None,
     actually_added: bool,
 ) -> DownloadRecord:
     """Settle a lost post-add season CAS without deleting a torrent someone owns.
@@ -775,8 +780,10 @@ async def _attach_target_scopes_to_existing_download(
     target_seasons: tuple[int, ...],
     guard_seasons: tuple[int | None, ...],
     observed_season_status: str | None,
-    qbt: DownloadClientPort | None = None,
+    qbt: _RegistrationClient | None = None,
     actually_added: bool = False,
+    commit: bool = True,
+    already_locked: bool = False,
 ) -> DownloadRecord | None:
     """Attach logical TV scopes to an already-active physical torrent.
 
@@ -805,7 +812,7 @@ async def _attach_target_scopes_to_existing_download(
     if conflict is not None:
         raise AlreadyDownloadingError(request_id)
 
-    if not await download_repo.lock_if_active(existing.id):
+    if not already_locked and not await download_repo.lock_if_active(existing.id):
         await session.rollback()
         return None
 
@@ -910,11 +917,502 @@ async def _attach_target_scopes_to_existing_download(
             actually_added=actually_added,
         )
 
+    if not commit:
+        await session.flush()
+        return existing
     await session.commit()
     record = await download_repo.get_by_hash(existing.torrent_hash)
     if record is None:  # pragma: no cover - existing row was just read
         raise LookupError(f"download for hash {existing.torrent_hash} vanished mid-grab")
     return record
+
+
+async def register_submitted_download(
+    qbt: _RegistrationClient,
+    session: AsyncSession,
+    *,
+    torrent_hash: str,
+    actually_added: bool,
+    request_id: int | None,
+    source: str,
+    tmdb_id: int | None,
+    year: int | None,
+    season: int | None,
+    episodes: list[int] | None,
+    request_media_type: str | None,
+    release_title: str | None,
+    indexer: str,
+    target_seasons: tuple[int, ...],
+    active_guard_seasons: tuple[int | None, ...],
+    observed_request_status: str | None,
+    observed_season_status: str | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+    history_message: str,
+    commit: bool = True,
+    require_active_existing: bool = False,
+    bypass_premise_on_convergence: bool = False,
+    reservation_id: int | None = None,
+) -> DownloadRecord:
+    """Register one submitted torrent through the legacy race authority."""
+    download_repo = SqlDownloadRepository(session)
+    existing = await download_repo.get_by_hash(torrent_hash)
+    if (
+        require_active_existing
+        and existing is not None
+        and existing.status in _TERMINAL_STATUS_VALUES
+    ):
+        raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
+    record: DownloadRecord | None = None
+    scopes_registered = False
+    if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+        if reservation_id is not None:
+            # The submitted hash already has a durable winner. Release our claim
+            # before returning or refusing; the winner's torrent is never touched.
+            await _release_rejected_reservation(session, reservation_id)
+        if require_active_existing:
+            if not await download_repo.lock_if_active(existing.id):
+                await session.rollback()
+                refreshed = await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+                if refreshed is None or refreshed.status in _TERMINAL_STATUS_VALUES:
+                    raise TorrentAlreadyTrackedError(torrent_hash, None)
+                raise TorrentAlreadyTrackedError(torrent_hash, refreshed.media_request_id)
+            existing = await download_repo.get_by_hash(torrent_hash, populate_existing=True)
+            if (
+                existing is None
+                or existing.status in _TERMINAL_STATUS_VALUES
+                or existing.media_request_id != request_id
+                or existing.tmdb_id != tmdb_id
+                or existing.media_type != request_media_type
+            ):
+                await session.rollback()
+                raise TorrentAlreadyTrackedError(
+                    torrent_hash, existing.media_request_id if existing is not None else None
+                )
+        if request_id is not None and existing.media_request_id != request_id:
+            raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
+        # Same scope-match guard as the known-hash precheck, for the case the indexer
+        # gave no hash so this is the first time we see the real one from qbt.add.
+        # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
+        if request_id is not None and season is not None:
+            attached = await _attach_target_scopes_to_existing_download(
+                session,
+                download_repo,
+                existing,
+                request_id=request_id,
+                season=season,
+                episodes=episodes,
+                scope_episodes_by_season=scope_episodes_by_season,
+                target_seasons=target_seasons,
+                guard_seasons=active_guard_seasons,
+                observed_season_status=observed_season_status,
+                qbt=qbt,
+                actually_added=actually_added,
+                commit=commit,
+                already_locked=require_active_existing,
+            )
+            if attached is not None:
+                if not require_active_existing:
+                    return attached
+                record = attached
+                scopes_registered = True
+        else:
+            if not require_active_existing:
+                return existing
+            record = existing
+
+    if record is None and request_id is not None:
+        active = await _active_conflict_for_targets(
+            download_repo,
+            request_id=request_id,
+            target_seasons=active_guard_seasons,
+            torrent_hash=torrent_hash,
+        )
+        if active is not None:
+            orphan_removed = await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="losing a parallel grab for a planned TV scope",
+            )
+            if reservation_id is not None:
+                await _retire_lost_add_reservation(
+                    session, reservation_id, orphan_removed=orphan_removed
+                )
+            raise AlreadyDownloadingError(request_id)
+
+    if record is None and existing is not None:
+        try:
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
+                download_repo,
+                existing.id,
+                torrent_hash,
+                request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                episodes=episodes,
+                media_type=request_media_type,
+                release_title=release_title,
+                qbt=qbt,
+                actually_added=actually_added,
+            )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+                    # The reuse race was lost to THIS request's OTHER grab (two
+                    # seasons of one multi-season pack racing to resurrect the same
+                    # terminal row). The winner's row carries the winner's scope, so
+                    # returning it for a NON-covered scope would report this grab as
+                    # success while the requested season/episodes stay silently
+                    # untracked -- mirror the non-race active paths by attaching the
+                    # requested logical scopes to the physical row.
+                    if request_id is not None and season is not None:
+                        attached = await _attach_target_scopes_to_existing_download(
+                            session,
+                            download_repo,
+                            record,
+                            request_id=request_id,
+                            season=season,
+                            episodes=episodes,
+                            scope_episodes_by_season=scope_episodes_by_season,
+                            target_seasons=target_seasons,
+                            guard_seasons=active_guard_seasons,
+                            observed_season_status=observed_season_status,
+                            qbt=qbt,
+                            actually_added=actually_added,
+                        )
+                        if attached is not None:
+                            return attached
+                    else:
+                        return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
+        except IntegrityError:
+            await session.rollback()
+            if request_id is not None:
+                active = await _active_conflict_for_targets(
+                    download_repo,
+                    request_id=request_id,
+                    target_seasons=active_guard_seasons,
+                    torrent_hash=torrent_hash,
+                )
+                if active is not None:
+                    orphan_removed = await _remove_torrent_if_added(
+                        qbt,
+                        torrent_hash,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                        reason="losing a terminal-row reuse race",
+                    )
+                    if reservation_id is not None:
+                        await _retire_lost_add_reservation(
+                            session, reservation_id, orphan_removed=orphan_removed
+                        )
+                    raise AlreadyDownloadingError(request_id) from None
+            raise
+    elif record is None:
+        try:
+            record = await download_repo.create(
+                torrent_hash=torrent_hash,
+                status=DownloadState.Downloading.value,
+                media_request_id=request_id,
+                magnet_link=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                episodes=episodes,
+                media_type=request_media_type,
+                release_title=release_title,
+                timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
+            )
+        except IntegrityError:
+            # A concurrent grab won the race. It either grabbed the SAME release
+            # (``torrent_hash`` UNIQUE) or a DIFFERENT release for this request
+            # (``uq_downloads_active_request`` — the DB backstop to the TOCTOU
+            # guard above). Roll back and distinguish, so neither becomes an opaque
+            # 500: a different-release conflict is the honest ``already_downloading``.
+            await session.rollback()
+            if request_id is not None:
+                active = await _active_conflict_for_targets(
+                    download_repo,
+                    request_id=request_id,
+                    target_seasons=active_guard_seasons,
+                    torrent_hash=torrent_hash,
+                )
+                if active is not None:
+                    # The other release won the request's single active slot. A
+                    # torrent this grab genuinely created is now orphaned --
+                    # nothing tracks it, so it would seed forever consuming
+                    # bandwidth. Best-effort remove it (deleting its files)
+                    # before refusing the parallel grab -- but ONLY one this
+                    # call actually added (see _remove_torrent_if_added).
+                    orphan_removed = await _remove_torrent_if_added(
+                        qbt,
+                        torrent_hash,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                        reason="losing a parallel grab for this request",
+                    )
+                    if reservation_id is not None:
+                        await _retire_lost_add_reservation(
+                            session, reservation_id, orphan_removed=orphan_removed
+                        )
+                    raise AlreadyDownloadingError(request_id) from None
+            winner = await download_repo.get_by_hash(torrent_hash)
+            if winner is None:
+                # The collision proves another transaction owned this hash even though
+                # its row disappeared before re-read. Retain cleanup responsibility
+                # for any client state left by this submission rather than allowing a
+                # prepared reservation to re-add it.
+                if reservation_id is not None:
+                    await _retire_lost_add_reservation(
+                        session, reservation_id, orphan_removed=False
+                    )
+                raise
+            if winner.status not in _TERMINAL_STATUS_VALUES:
+                # This collision winner conclusively owns the physical torrent. Retire
+                # our reservation without touching its torrent or category.
+                if reservation_id is not None:
+                    await _release_rejected_reservation(session, reservation_id)
+                if request_id is not None and winner.media_request_id != request_id:
+                    raise TorrentAlreadyTrackedError(
+                        torrent_hash, winner.media_request_id
+                    ) from None
+                # Same scope-conflict guard as the non-race precheck: two grabs for
+                # the same hash but a DIFFERENT tv scope can race past the prechecks,
+                # the loser hitting UNIQUE(torrent_hash) here. Returning the winner's
+                # (first-scope) row as a no-op would leave the loser's season/episodes
+                # untracked, so refuse it honestly rather than silently stranding it.
+                if request_id is not None and season is not None:
+                    attached = await _attach_target_scopes_to_existing_download(
+                        session,
+                        download_repo,
+                        winner,
+                        request_id=request_id,
+                        season=season,
+                        episodes=episodes,
+                        scope_episodes_by_season=scope_episodes_by_season,
+                        target_seasons=target_seasons,
+                        guard_seasons=active_guard_seasons,
+                        observed_season_status=observed_season_status,
+                        qbt=qbt,
+                        actually_added=actually_added,
+                    )
+                    if attached is not None:
+                        return attached
+                else:
+                    return winner
+            record, claimed_reuse = await _reuse_terminal_row(
+                session,
+                download_repo,
+                winner.id,
+                torrent_hash,
+                request_id,
+                source=source,
+                tmdb_id=tmdb_id,
+                year=year,
+                season=season,
+                episodes=episodes,
+                media_type=request_media_type,
+                release_title=release_title,
+                qbt=qbt,
+                actually_added=actually_added,
+            )
+            if not claimed_reuse:
+                if record.status not in _TERMINAL_STATUS_VALUES:
+                    if request_id is not None and record.media_request_id != request_id:
+                        raise TorrentAlreadyTrackedError(
+                            torrent_hash, record.media_request_id
+                        ) from None
+                    # Mirror of the non-race branch above: a reuse race lost to THIS
+                    # request's other grab must still refuse a non-covered scope
+                    # instead of returning the winner's row as success (the requested
+                    # season/episodes would be silently untracked).
+                    if request_id is not None and season is not None:
+                        attached = await _attach_target_scopes_to_existing_download(
+                            session,
+                            download_repo,
+                            record,
+                            request_id=request_id,
+                            season=season,
+                            episodes=episodes,
+                            scope_episodes_by_season=scope_episodes_by_season,
+                            target_seasons=target_seasons,
+                            guard_seasons=active_guard_seasons,
+                            observed_season_status=observed_season_status,
+                            qbt=qbt,
+                            actually_added=actually_added,
+                        )
+                        if attached is not None:
+                            return attached
+                    else:
+                        return record
+                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
+    session.add(
+        DownloadHistory(
+            tmdb_id=tmdb_id,
+            torrent_hash=torrent_hash,
+            event_type=DownloadHistoryEvent.grabbed,
+            source_title=release_title,
+            indexer=indexer,
+            message=history_message,
+        )
+    )
+    if request_id is not None:
+        # ``season is not None`` here is exactly "this is a tv request": the guard
+        # above raises SeasonRequiredError for a tv request with no season, and
+        # coerces season back to None for a non-tv request -- so this never
+        # branches on a caller-supplied season alone, only on the media type it
+        # was already validated against.
+        #
+        # POST-ADD CAS: compare against EXACTLY the status the grab decision
+        # observed (see _GRABBABLE_*_STATUS_VALUES' comment). Any status a
+        # concurrent writer committed while qbt.add was in flight -- a cancel,
+        # or the eviction recovery's fold of a re-armed 'pending' season back to
+        # 'available' (its file never left disk; grabbing it now would download
+        # a duplicate) -- makes this move match zero rows, while a decision that
+        # itself observed 'available' (the deliberate reopen of a done season)
+        # compares 'available' and still wins.
+        moved = scopes_registered or bypass_premise_on_convergence
+        if season is not None and not scopes_registered:
+            # TV: the request's status is a COMPUTED rollup of its seasons, never a
+            # direct target -- resolve the season row (created lazily here, like
+            # the Download row) and CAS it to 'downloading';
+            # season_request_service recomputes the parent's rollup in the same
+            # transaction ONLY when the swap actually won.
+            season_row = await SqlSeasonRequestRepository(session).ensure(
+                request_id, season, status=RequestStatus.pending.value
+            )
+            moved = await season_request_service.set_status_if_in(
+                session,
+                media_request_id=request_id,
+                season_request_id=season_row.id,
+                status=RequestStatus.downloading.value,
+                allowed_from=(
+                    frozenset({observed_season_status})
+                    if observed_season_status is not None
+                    else _GRABBABLE_SEASON_STATUS_VALUES
+                ),
+            )
+            if moved and not scopes_registered:
+                try:
+                    for target_season in target_seasons:
+                        if target_season == season:
+                            continue
+                        await download_repo.ensure_scope(
+                            record.id,
+                            media_request_id=request_id,
+                            season=target_season,
+                            episodes=_target_episodes(
+                                primary_season=season,
+                                primary_episodes=episodes,
+                                target_season=target_season,
+                                scope_episodes_by_season=scope_episodes_by_season,
+                            ),
+                        )
+                        target_row = await SqlSeasonRequestRepository(session).ensure(
+                            request_id, target_season, status=RequestStatus.pending.value
+                        )
+                        target_moved = await season_request_service.set_status_if_in(
+                            session,
+                            media_request_id=request_id,
+                            season_request_id=target_row.id,
+                            status=RequestStatus.downloading.value,
+                            allowed_from=_PACK_TARGET_SEASON_STATUS_VALUES,
+                        )
+                        if not target_moved:
+                            await session.rollback()
+                            orphan_removed = await _remove_torrent_if_added(
+                                qbt,
+                                torrent_hash,
+                                actually_added=actually_added,
+                                request_id=request_id,
+                                reason="a planned TV scope moved on mid-grab",
+                            )
+                            if reservation_id is not None:
+                                await _retire_lost_add_reservation(
+                                    session, reservation_id, orphan_removed=orphan_removed
+                                )
+                            raise RequestNotActiveError(request_id)
+                    # Persist an atomic physical-coverage claim for EVERY season the
+                    # torrent fetches -- targets AND covered-but-untargeted ride-alongs
+                    # (#456). A ride-along carries no importable scope, so this claim is
+                    # the only thing that makes a concurrent grab of that season collide
+                    # (on ``uq_download_coverage_claims_active``) instead of racing the
+                    # window between this ``qbt.add`` and its download registration.
+                    await _claim_covered_seasons(
+                        download_repo,
+                        download_id=record.id,
+                        request_id=request_id,
+                        guard_seasons=active_guard_seasons,
+                    )
+                except IntegrityError:
+                    await session.rollback()
+                    active = await _active_conflict_for_targets(
+                        download_repo,
+                        request_id=request_id,
+                        target_seasons=active_guard_seasons,
+                        torrent_hash=torrent_hash,
+                    )
+                    if active is not None:
+                        orphan_removed = await _remove_torrent_if_added(
+                            qbt,
+                            torrent_hash,
+                            actually_added=actually_added,
+                            request_id=request_id,
+                            reason="losing an active TV scope or coverage-claim race",
+                        )
+                        if reservation_id is not None:
+                            await _retire_lost_add_reservation(
+                                session, reservation_id, orphan_removed=orphan_removed
+                            )
+                        raise AlreadyDownloadingError(request_id) from None
+                    raise
+        else:
+            moved = await SqlRequestRepository(session).set_status_if_in(
+                request_id,
+                RequestStatus.downloading.value,
+                (
+                    frozenset({observed_request_status})
+                    if observed_request_status is not None
+                    else _GRABBABLE_REQUEST_STATUS_VALUES
+                ),
+            )
+        if not moved:
+            # The request/season moved off its decision-time status while
+            # qbt.add was in flight (cancelled, folded back to 'available' by
+            # the eviction recovery, or otherwise advanced). The torrent is
+            # already in the client and the Download row + 'grabbed' history are
+            # pending in this transaction -- discard them, then best-effort
+            # remove the just-added torrent WITH data (the same orphan cleanup
+            # the lost-parallel-grab branches above perform; leaving it would
+            # seed forever for content nobody wants), and refuse honestly. Every
+            # caller already handles RequestNotActiveError: the endpoint as 409,
+            # auto-grab by leaving the scope as-is, report-issue via its
+            # _GRAB_ERRORS park (whose never-un-terminate guard skips a
+            # cancelled/available row).
+            await session.rollback()
+            orphan_removed = await _remove_torrent_if_added(
+                qbt,
+                torrent_hash,
+                actually_added=actually_added,
+                request_id=request_id,
+                reason="the request was cancelled or moved on mid-grab",
+            )
+            if reservation_id is not None:
+                await _retire_lost_add_reservation(
+                    session, reservation_id, orphan_removed=orphan_removed
+                )
+            raise RequestNotActiveError(request_id)
+    if not commit:
+        await session.flush()
+        return record
+    await session.commit()
+    refreshed = await download_repo.get_by_hash(torrent_hash)
+    return refreshed if refreshed is not None else record
 
 
 async def grab(
@@ -1292,415 +1790,29 @@ async def grab(
         # tracking an unmatchable row.
         raise GrabError(candidate.title)
 
-    existing = await download_repo.get_by_hash(torrent_hash)
-    if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
-        # The durable intent's add completed, but a committed Download already
-        # owns this exact hash. This is definitive: retire our reservation without
-        # touching the winner's torrent or category.
-        if intent_id is not None:
-            await _release_rejected_reservation(session, intent_id)
-        if request_id is not None and existing.media_request_id != request_id:
-            raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
-        # Same scope-match guard as the known-hash precheck, for the case the indexer
-        # gave no hash so this is the first time we see the real one from qbt.add.
-        # Re-adding the same magnet is a qBittorrent no-op, so nothing is orphaned.
-        if request_id is not None and season is not None:
-            attached = await _attach_target_scopes_to_existing_download(
-                session,
-                download_repo,
-                existing,
-                request_id=request_id,
-                season=season,
-                episodes=episodes,
-                scope_episodes_by_season=scope_episodes_by_season,
-                target_seasons=target_seasons,
-                guard_seasons=active_guard_seasons,
-                observed_season_status=observed_season_status,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if attached is not None:
-                return attached
-        else:
-            return existing
-
-    if request_id is not None:
-        active = await _active_conflict_for_targets(
-            download_repo,
-            request_id=request_id,
-            target_seasons=active_guard_seasons,
-            torrent_hash=torrent_hash,
-        )
-        if active is not None:
-            orphan_removed = await _remove_torrent_if_added(
-                qbt,
-                torrent_hash,
-                actually_added=actually_added,
-                request_id=request_id,
-                reason="losing a parallel grab for a planned TV scope",
-            )
-            if intent_id is not None:
-                await _retire_lost_add_reservation(
-                    session, intent_id, orphan_removed=orphan_removed
-                )
-            raise AlreadyDownloadingError(request_id)
-
-    if existing is not None:
-        try:
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                existing.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
-                if record.status not in _TERMINAL_STATUS_VALUES:
-                    if request_id is not None and record.media_request_id != request_id:
-                        raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
-                    # The reuse race was lost to THIS request's OTHER grab (two
-                    # seasons of one multi-season pack racing to resurrect the same
-                    # terminal row). The winner's row carries the winner's scope, so
-                    # returning it for a NON-covered scope would report this grab as
-                    # success while the requested season/episodes stay silently
-                    # untracked -- mirror the non-race active paths by attaching the
-                    # requested logical scopes to the physical row.
-                    if request_id is not None and season is not None:
-                        attached = await _attach_target_scopes_to_existing_download(
-                            session,
-                            download_repo,
-                            record,
-                            request_id=request_id,
-                            season=season,
-                            episodes=episodes,
-                            scope_episodes_by_season=scope_episodes_by_season,
-                            target_seasons=target_seasons,
-                            guard_seasons=active_guard_seasons,
-                            observed_season_status=observed_season_status,
-                            qbt=qbt,
-                            actually_added=actually_added,
-                        )
-                        if attached is not None:
-                            return attached
-                    else:
-                        return record
-                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
-        except IntegrityError:
-            await session.rollback()
-            if request_id is not None:
-                active = await _active_conflict_for_targets(
-                    download_repo,
-                    request_id=request_id,
-                    target_seasons=active_guard_seasons,
-                    torrent_hash=torrent_hash,
-                )
-                if active is not None:
-                    orphan_removed = await _remove_torrent_if_added(
-                        qbt,
-                        torrent_hash,
-                        actually_added=actually_added,
-                        request_id=request_id,
-                        reason="losing a terminal-row reuse race",
-                    )
-                    if intent_id is not None:
-                        await _retire_lost_add_reservation(
-                            session, intent_id, orphan_removed=orphan_removed
-                        )
-                    raise AlreadyDownloadingError(request_id) from None
-            raise
-    else:
-        try:
-            record = await download_repo.create(
-                torrent_hash=torrent_hash,
-                status=DownloadState.Downloading.value,
-                media_request_id=request_id,
-                magnet_link=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
-            )
-        except IntegrityError:
-            # A concurrent grab won the race. It either grabbed the SAME release
-            # (``torrent_hash`` UNIQUE) or a DIFFERENT release for this request
-            # (``uq_downloads_active_request`` — the DB backstop to the TOCTOU
-            # guard above). Roll back and distinguish, so neither becomes an opaque
-            # 500: a different-release conflict is the honest ``already_downloading``.
-            await session.rollback()
-            if request_id is not None:
-                active = await _active_conflict_for_targets(
-                    download_repo,
-                    request_id=request_id,
-                    target_seasons=active_guard_seasons,
-                    torrent_hash=torrent_hash,
-                )
-                if active is not None:
-                    # The other release won the request's single active slot. A
-                    # torrent this grab genuinely created is now orphaned --
-                    # nothing tracks it, so it would seed forever consuming
-                    # bandwidth. Best-effort remove it (deleting its files)
-                    # before refusing the parallel grab -- but ONLY one this
-                    # call actually added (see _remove_torrent_if_added).
-                    orphan_removed = await _remove_torrent_if_added(
-                        qbt,
-                        torrent_hash,
-                        actually_added=actually_added,
-                        request_id=request_id,
-                        reason="losing a parallel grab for this request",
-                    )
-                    if intent_id is not None:
-                        await _retire_lost_add_reservation(
-                            session, intent_id, orphan_removed=orphan_removed
-                        )
-                    raise AlreadyDownloadingError(request_id) from None
-            winner = await download_repo.get_by_hash(torrent_hash)
-            if winner is None:
-                # The uniqueness collision proves another transaction owned this
-                # hash, even though its row disappeared before our re-read. Keep
-                # cleanup responsibility durable for any client state left by this
-                # add; never re-raise while a prepared reservation can re-add it.
-                if intent_id is not None:
-                    await _retire_lost_add_reservation(session, intent_id, orphan_removed=False)
-                raise
-            if winner.status not in _TERMINAL_STATUS_VALUES:
-                # This collision winner was not visible to the earlier same-hash
-                # lookup, but it conclusively owns the physical torrent now. Retire
-                # the reservation without touching the winner's torrent or category.
-                if intent_id is not None:
-                    await _release_rejected_reservation(session, intent_id)
-                if request_id is not None and winner.media_request_id != request_id:
-                    raise TorrentAlreadyTrackedError(
-                        torrent_hash, winner.media_request_id
-                    ) from None
-                # Same scope-conflict guard as the non-race precheck: two grabs for
-                # the same hash but a DIFFERENT tv scope can race past the prechecks,
-                # the loser hitting UNIQUE(torrent_hash) here. Returning the winner's
-                # (first-scope) row as a no-op would leave the loser's season/episodes
-                # untracked, so refuse it honestly rather than silently stranding it.
-                if request_id is not None and season is not None:
-                    attached = await _attach_target_scopes_to_existing_download(
-                        session,
-                        download_repo,
-                        winner,
-                        request_id=request_id,
-                        season=season,
-                        episodes=episodes,
-                        scope_episodes_by_season=scope_episodes_by_season,
-                        target_seasons=target_seasons,
-                        guard_seasons=active_guard_seasons,
-                        observed_season_status=observed_season_status,
-                        qbt=qbt,
-                        actually_added=actually_added,
-                    )
-                    if attached is not None:
-                        return attached
-                else:
-                    return winner
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                winner.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
-                if record.status not in _TERMINAL_STATUS_VALUES:
-                    if request_id is not None and record.media_request_id != request_id:
-                        raise TorrentAlreadyTrackedError(
-                            torrent_hash, record.media_request_id
-                        ) from None
-                    # Mirror of the non-race branch above: a reuse race lost to THIS
-                    # request's other grab must still refuse a non-covered scope
-                    # instead of returning the winner's row as success (the requested
-                    # season/episodes would be silently untracked).
-                    if request_id is not None and season is not None:
-                        attached = await _attach_target_scopes_to_existing_download(
-                            session,
-                            download_repo,
-                            record,
-                            request_id=request_id,
-                            season=season,
-                            episodes=episodes,
-                            scope_episodes_by_season=scope_episodes_by_season,
-                            target_seasons=target_seasons,
-                            guard_seasons=active_guard_seasons,
-                            observed_season_status=observed_season_status,
-                            qbt=qbt,
-                            actually_added=actually_added,
-                        )
-                        if attached is not None:
-                            return attached
-                    else:
-                        return record
-                raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
-    session.add(
-        DownloadHistory(
-            tmdb_id=tmdb_id,
-            torrent_hash=torrent_hash,
-            event_type=DownloadHistoryEvent.grabbed,
-            source_title=candidate.title,
-            indexer=candidate.indexer_name,
-            message=f"grabbed {scored.quality.name} from {candidate.indexer_name}",
-        )
+    record = await register_submitted_download(
+        qbt,
+        session,
+        torrent_hash=torrent_hash,
+        actually_added=actually_added,
+        request_id=request_id,
+        source=source,
+        tmdb_id=tmdb_id,
+        year=year,
+        season=season,
+        episodes=episodes,
+        request_media_type=request_media_type,
+        release_title=candidate.title,
+        indexer=candidate.indexer_name,
+        target_seasons=target_seasons,
+        active_guard_seasons=active_guard_seasons,
+        observed_request_status=observed_request_status,
+        observed_season_status=observed_season_status,
+        scope_episodes_by_season=scope_episodes_by_season,
+        history_message=f"grabbed {scored.quality.name} from {candidate.indexer_name}",
+        commit=False,
+        reservation_id=intent_id,
     )
-    if request_id is not None:
-        # ``season is not None`` here is exactly "this is a tv request": the guard
-        # above raises SeasonRequiredError for a tv request with no season, and
-        # coerces season back to None for a non-tv request -- so this never
-        # branches on a caller-supplied season alone, only on the media type it
-        # was already validated against.
-        #
-        # POST-ADD CAS: compare against EXACTLY the status the grab decision
-        # observed (see _GRABBABLE_*_STATUS_VALUES' comment). Any status a
-        # concurrent writer committed while qbt.add was in flight -- a cancel,
-        # or the eviction recovery's fold of a re-armed 'pending' season back to
-        # 'available' (its file never left disk; grabbing it now would download
-        # a duplicate) -- makes this move match zero rows, while a decision that
-        # itself observed 'available' (the deliberate reopen of a done season)
-        # compares 'available' and still wins.
-        if season is not None:
-            # TV: the request's status is a COMPUTED rollup of its seasons, never a
-            # direct target -- resolve the season row (created lazily here, like
-            # the Download row) and CAS it to 'downloading';
-            # season_request_service recomputes the parent's rollup in the same
-            # transaction ONLY when the swap actually won.
-            season_row = await SqlSeasonRequestRepository(session).ensure(
-                request_id, season, status=RequestStatus.pending.value
-            )
-            moved = await season_request_service.set_status_if_in(
-                session,
-                media_request_id=request_id,
-                season_request_id=season_row.id,
-                status=RequestStatus.downloading.value,
-                allowed_from=(
-                    frozenset({observed_season_status})
-                    if observed_season_status is not None
-                    else _GRABBABLE_SEASON_STATUS_VALUES
-                ),
-            )
-            if moved:
-                try:
-                    for target_season in target_seasons:
-                        if target_season == season:
-                            continue
-                        await download_repo.ensure_scope(
-                            record.id,
-                            media_request_id=request_id,
-                            season=target_season,
-                            episodes=_target_episodes(
-                                primary_season=season,
-                                primary_episodes=episodes,
-                                target_season=target_season,
-                                scope_episodes_by_season=scope_episodes_by_season,
-                            ),
-                        )
-                        target_row = await SqlSeasonRequestRepository(session).ensure(
-                            request_id, target_season, status=RequestStatus.pending.value
-                        )
-                        target_moved = await season_request_service.set_status_if_in(
-                            session,
-                            media_request_id=request_id,
-                            season_request_id=target_row.id,
-                            status=RequestStatus.downloading.value,
-                            allowed_from=_PACK_TARGET_SEASON_STATUS_VALUES,
-                        )
-                        if not target_moved:
-                            await session.rollback()
-                            await _remove_torrent_if_added(
-                                qbt,
-                                torrent_hash,
-                                actually_added=actually_added,
-                                request_id=request_id,
-                                reason="a planned TV scope moved on mid-grab",
-                            )
-                            raise RequestNotActiveError(request_id)
-                    # Persist an atomic physical-coverage claim for EVERY season the
-                    # torrent fetches -- targets AND covered-but-untargeted ride-alongs
-                    # (#456). A ride-along carries no importable scope, so this claim is
-                    # the only thing that makes a concurrent grab of that season collide
-                    # (on ``uq_download_coverage_claims_active``) instead of racing the
-                    # window between this ``qbt.add`` and its download registration.
-                    await _claim_covered_seasons(
-                        download_repo,
-                        download_id=record.id,
-                        request_id=request_id,
-                        guard_seasons=active_guard_seasons,
-                    )
-                except IntegrityError:
-                    await session.rollback()
-                    active = await _active_conflict_for_targets(
-                        download_repo,
-                        request_id=request_id,
-                        target_seasons=active_guard_seasons,
-                        torrent_hash=torrent_hash,
-                    )
-                    if active is not None:
-                        await _remove_torrent_if_added(
-                            qbt,
-                            torrent_hash,
-                            actually_added=actually_added,
-                            request_id=request_id,
-                            reason="losing an active TV scope or coverage-claim race",
-                        )
-                        raise AlreadyDownloadingError(request_id) from None
-                    raise
-        else:
-            moved = await SqlRequestRepository(session).set_status_if_in(
-                request_id,
-                RequestStatus.downloading.value,
-                (
-                    frozenset({observed_request_status})
-                    if observed_request_status is not None
-                    else _GRABBABLE_REQUEST_STATUS_VALUES
-                ),
-            )
-        if not moved:
-            # The request/season moved off its decision-time status while
-            # qbt.add was in flight (cancelled, folded back to 'available' by
-            # the eviction recovery, or otherwise advanced). The torrent is
-            # already in the client and the Download row + 'grabbed' history are
-            # pending in this transaction -- discard them, then best-effort
-            # remove the just-added torrent WITH data (the same orphan cleanup
-            # the lost-parallel-grab branches above perform; leaving it would
-            # seed forever for content nobody wants), and refuse honestly. Every
-            # caller already handles RequestNotActiveError: the endpoint as 409,
-            # auto-grab by leaving the scope as-is, report-issue via its
-            # _GRAB_ERRORS park (whose never-un-terminate guard skips a
-            # cancelled/available row).
-            await session.rollback()
-            orphan_removed = await _remove_torrent_if_added(
-                qbt,
-                torrent_hash,
-                actually_added=actually_added,
-                request_id=request_id,
-                reason="the request was cancelled or moved on mid-grab",
-            )
-            if intent_id is not None:
-                await _retire_lost_add_reservation(
-                    session, intent_id, orphan_removed=orphan_removed
-                )
-            raise RequestNotActiveError(request_id)
     if intent_id is not None:
         await SqlDownloadAddIntentRepository(session).delete(intent_id)
     await session.commit()

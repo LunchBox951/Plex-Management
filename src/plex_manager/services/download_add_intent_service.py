@@ -7,7 +7,6 @@ import logging
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import IntegrityError
@@ -15,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.state_machine import DownloadState
-from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
+from plex_manager.models import RequestStatus
 from plex_manager.ports.download_client import AddResult, DownloadStatus, PreparedAdd
 from plex_manager.ports.repositories import (
     CreateDownloadAddIntent,
@@ -25,9 +24,6 @@ from plex_manager.ports.repositories import (
 )
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
-from plex_manager.repositories.requests import SqlRequestRepository
-from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
     from plex_manager.domain.release import ScoredRelease
@@ -283,180 +279,110 @@ async def _finalize_present(
     session: AsyncSession,
     intent: DownloadAddIntentRecord,
     *,
+    actually_added: bool = False,
     owned_client_torrent: bool = False,
 ) -> DownloadRecord:
+    """Exchange a proven owned intent for a tracked download atomically."""
     intents = SqlDownloadAddIntentRepository(session)
-    downloads = SqlDownloadRepository(session)
     current = await intents.get(intent.id, fresh=True)
     if current is None:
-        record = await downloads.get_by_hash(intent.torrent_hash)
+        record = await SqlDownloadRepository(session).get_by_hash(intent.torrent_hash)
         if record is None:
             raise LookupError("durable intent disappeared before finalization")
         return record
     if current.media_request_id is None:
-        raise IntentRecoveryConflictError("intent request no longer exists")
-    converged = False
-    while True:
-        existing = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
-        if existing is None:
-            record = await downloads.create(
-                torrent_hash=current.torrent_hash,
-                status=DownloadState.Downloading.value,
-                media_request_id=current.media_request_id,
-                magnet_link=current.source,
-                tmdb_id=current.tmdb_id,
-                year=current.year,
-                season=next(
-                    (scope.season_number for scope in current.scopes if scope.is_target), None
-                ),
-                episodes=next(
-                    (
-                        list(scope.episodes)
-                        for scope in current.scopes
-                        if scope.is_target and scope.episodes
-                    ),
-                    None,
-                ),
-                media_type=current.media_type,
-                release_title=current.release_title,
-                timeout_at=datetime.now(UTC),
-            )
-            break
-        if existing.status in _TERMINAL_DOWNLOAD_STATES:
-            # The live client category proves this intent owns the hash, so a terminal
-            # historical row is safe to resurrect exactly as a fresh grab would.
-            now = datetime.now(UTC)
-            claimed = await downloads.update_status_if_in(
-                existing.id,
-                DownloadState.Downloading.value,
-                _TERMINAL_DOWNLOAD_STATES,
-                progress=0.0,
-                seed_ratio=0.0,
-                clear_failed_reason=True,
-                clear_first_seen_at=True,
-                clear_download_path=True,
-                media_request_id=current.media_request_id,
-                replace_grab_metadata=True,
-                magnet_link=current.source,
-                tmdb_id=current.tmdb_id,
-                year=current.year,
-                season=next(
-                    (scope.season_number for scope in current.scopes if scope.is_target), None
-                ),
-                episodes=next(
-                    (
-                        list(scope.episodes)
-                        for scope in current.scopes
-                        if scope.is_target and scope.episodes
-                    ),
-                    None,
-                ),
-                media_type=current.media_type,
-                release_title=current.release_title,
-                added_at=now,
-                timeout_at=now,
-                retry_count=0,
-            )
-            if not claimed:
-                await session.rollback()
-                continue
-            refreshed = await downloads.get_by_hash(current.torrent_hash)
-            if refreshed is None:  # pragma: no cover - the row was just updated
-                raise LookupError("same-hash download disappeared during finalization")
-            record = refreshed
-            break
-        # A same-request/hash convergence still needs the active-row lock before it
-        # may attach new scopes. Otherwise an import can finish after the snapshot.
-        if not await downloads.lock_if_active(existing.id):
-            await session.rollback()
-            continue
-        refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
-        if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
-            await session.rollback()
-            continue
-        if (
-            refreshed.media_request_id != current.media_request_id
-            or refreshed.tmdb_id != current.tmdb_id
-            or refreshed.media_type != current.media_type
-        ):
-            await session.rollback()
-            raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
-        record = refreshed
-        converged = refreshed.media_request_id == current.media_request_id
-        break
-    for scope in current.scopes:
-        if scope.is_target and scope.season_number is not None:
-            await downloads.ensure_scope(
-                record.id,
-                media_request_id=current.media_request_id,
-                season=scope.season_number,
-                episodes=list(scope.episodes) if scope.episodes else None,
-            )
-        if scope.season_number is not None:
-            await downloads.ensure_coverage_claim(
-                record.id, media_request_id=current.media_request_id, season=scope.season_number
-            )
-    if current.media_type == "tv":
-        moved = True
-        for target in (scope for scope in current.scopes if scope.is_target):
-            if target.season_number is None:
-                continue
-            season_row = await SqlSeasonRequestRepository(session).ensure(
-                current.media_request_id,
-                target.season_number,
-                status=RequestStatus.pending.value,
-            )
-            allowed_from = (
-                frozenset({current.observed_season_status or season_row.status})
-                if target.season_number
-                == next(
-                    (
-                        scope.season_number
-                        for scope in current.scopes
-                        if scope.is_target and scope.season_number is not None
-                    ),
-                    None,
-                )
-                else _PACK_TARGET_SEASON_STATUS_VALUES
-            )
-            moved = await season_request_service.set_status_if_in(
-                session,
-                media_request_id=current.media_request_id,
-                season_request_id=season_row.id,
-                status=RequestStatus.downloading.value,
-                allowed_from=allowed_from,
-            )
-            if not moved:
-                break
-    else:
-        moved = converged or await SqlRequestRepository(session).set_status_if_in(
-            current.media_request_id,
-            RequestStatus.downloading.value,
-            frozenset({current.observed_request_status or RequestStatus.pending.value}),
+        raise IntentRecoveryConflictError(
+            "intent request no longer exists", owned_client_torrent=owned_client_torrent
         )
-    if not moved:
-        await session.rollback()
+
+    target_scopes = tuple(scope for scope in current.scopes if scope.is_target)
+    primary = target_scopes[0] if target_scopes else None
+    season = primary.season_number if primary is not None else None
+    episodes = list(primary.episodes) if primary is not None and primary.episodes else None
+    target_seasons = tuple(
+        scope.season_number for scope in target_scopes if scope.season_number is not None
+    )
+    active_guard_seasons = tuple(
+        scope.season_number for scope in current.scopes if scope.season_number is not None
+    ) or (season,)
+    scope_episodes_by_season = {
+        scope.season_number: scope.episodes
+        for scope in target_scopes
+        if scope.season_number is not None
+    }
+    existing = await SqlDownloadRepository(session).get_by_hash(current.torrent_hash)
+    # Any active same-request hash must enter the authority's locked convergence
+    # path. It re-reads and validates the full immutable media identity before
+    # attachment; treating a mismatched row as an ordinary duplicate would accept
+    # it via the movie early return and delete this intent.
+    require_active_existing = (
+        existing is not None
+        and existing.status not in _TERMINAL_DOWNLOAD_STATES
+        and existing.media_request_id == current.media_request_id
+    )
+    from plex_manager.services.grab_service import (
+        RequestNotActiveError,
+        TorrentAlreadyTrackedError,
+        register_submitted_download,
+    )
+
+    try:
+        record = await register_submitted_download(
+            qbt,
+            session,
+            torrent_hash=current.torrent_hash,
+            actually_added=actually_added,
+            request_id=current.media_request_id,
+            source=current.source or "",
+            tmdb_id=current.tmdb_id,
+            year=current.year,
+            season=season,
+            episodes=episodes,
+            request_media_type=current.media_type,
+            release_title=current.release_title,
+            indexer=current.indexer or "unknown",
+            target_seasons=target_seasons,
+            active_guard_seasons=active_guard_seasons,
+            observed_request_status=current.observed_request_status,
+            observed_season_status=current.observed_season_status,
+            scope_episodes_by_season=scope_episodes_by_season,
+            history_message="recovered durable torrent add",
+            commit=False,
+            require_active_existing=require_active_existing,
+            bypass_premise_on_convergence=require_active_existing,
+        )
+    except RequestNotActiveError as exc:
         raise IntentRecoveryConflictError(
             "intent_premise_no_longer_active", owned_client_torrent=owned_client_torrent
+        ) from exc
+    except TorrentAlreadyTrackedError as exc:
+        # The active row may finish importing after the snapshot but before its
+        # convergence lock. Re-read and delegate terminal reuse back to authority.
+        refreshed = await SqlDownloadRepository(session).get_by_hash(
+            current.torrent_hash, populate_existing=True
         )
-    session.add(
-        DownloadHistory(
-            tmdb_id=current.tmdb_id,
-            torrent_hash=current.torrent_hash,
-            event_type=DownloadHistoryEvent.grabbed,
-            source_title=current.release_title,
-            indexer=current.indexer,
-            message="recovered durable torrent add",
-        )
-    )
+        if (
+            require_active_existing
+            and refreshed is not None
+            and refreshed.status in _TERMINAL_DOWNLOAD_STATES
+        ):
+            return await _finalize_present(
+                qbt,
+                session,
+                current,
+                actually_added=actually_added,
+                owned_client_torrent=owned_client_torrent,
+            )
+        raise IntentRecoveryConflictError(
+            type(exc).__name__, owned_client_torrent=owned_client_torrent
+        ) from exc
     await intents.delete(current.id)
     await session.commit()
     try:
         await qbt.set_category(current.torrent_hash, DEFAULT_CATEGORY)
     except Exception as exc:
         _logger.warning("durable intent category normalization deferred (%s)", type(exc).__name__)
-    refreshed = await downloads.get_by_hash(current.torrent_hash)
-    return refreshed if refreshed is not None else record
+    return record
 
 
 def _client_hash(intent: DownloadAddIntentRecord) -> str:
@@ -746,12 +672,24 @@ async def submit_and_finalize(
         return _SubmissionFinalization(None)
     if result.created:
         return _SubmissionFinalization(
-            await _finalize_present(qbt, session, current, owned_client_torrent=True)
+            await _finalize_present(
+                qbt,
+                session,
+                current,
+                actually_added=True,
+                owned_client_torrent=True,
+            )
         )
     status = await qbt.get_status(intent.torrent_hash)
     if _owns_present_torrent(intent, status):
         return _SubmissionFinalization(
-            await _finalize_present(qbt, session, intent, owned_client_torrent=True)
+            await _finalize_present(
+                qbt,
+                session,
+                intent,
+                actually_added=False,
+                owned_client_torrent=True,
+            )
         )
     if status is None:
         # A duplicate only proves the hash exists. If its status cannot be read,
@@ -846,7 +784,11 @@ async def _recover(
                         )
                     continue
                 await _finalize_present(
-                    qbt, session, intent, owned_client_torrent=_owns_present_torrent(intent, status)
+                    qbt,
+                    session,
+                    intent,
+                    actually_added=False,
+                    owned_client_torrent=_owns_present_torrent(intent, status),
                 )
             elif intent.source is None:
                 if await _park_needs_attention(session, intents, intent.id, "source_unavailable"):

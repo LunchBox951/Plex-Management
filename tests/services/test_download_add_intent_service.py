@@ -1236,6 +1236,63 @@ async def test_recovery_resurrects_terminal_same_hash_download_when_client_owned
     assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
+async def test_recovery_parks_same_request_hash_with_mismatched_media_identity(
+    session: AsyncSession,
+) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Target", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    request_id = request.id
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(
+                    tmdb_id=1, media_type="movie", scope_key="movie", is_target=True
+                ),
+            ),
+        )
+    )
+    mismatched = Download(
+        torrent_hash="hash",
+        status="downloading",
+        media_request_id=request.id,
+        tmdb_id=2,
+        media_type=MediaType.movie,
+    )
+    session.add(mismatched)
+    await session.commit()
+
+    client = _Client(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash",
+                name="torrent",
+                raw_state="downloading",
+                category=intent_category(intent.id),
+            )
+        }
+    )
+    result = await recover_all(client, session)
+
+    assert result.finalized == 0
+    assert result.needs_attention == 1
+    remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+    assert remaining is not None
+    assert remaining.state == "needs_attention"
+    assert client.categories == []
+    request_after = await session.get(MediaRequest, request_id)
+    assert request_after is not None
+    assert request_after.status == RequestStatus.pending
+
+
 async def test_recovery_never_reowns_same_hash_foreign_download(session: AsyncSession) -> None:
     foreign_request = MediaRequest(
         tmdb_id=2, media_type=MediaType.tv, title="Foreign", status=RequestStatus.pending
