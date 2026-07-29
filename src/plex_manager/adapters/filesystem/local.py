@@ -186,6 +186,10 @@ def _pid_is_running(pid: int) -> bool | None:
 # large enough to never race a healthy publisher that has the fd open.
 _EMPTY_LOCK_STALE_SECONDS = 60.0
 
+# A transient release failure must not leave this process's PID lock wedged. Keep
+# attempts bounded so a persistent filesystem failure still surfaces promptly.
+_PUBLISH_LOCK_RELEASE_UNLINK_RETRIES = 2
+
 
 def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool, bool]:
     """Open the canonical regular lock entry without following it.
@@ -292,7 +296,7 @@ def _unlink_created_publish_lock_if_unowned(dir_fd: int, lock_name: str, lock_fd
         # distinguish it from this creator's abandoned entry.
         return
     except OSError as error:
-        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOLCK):
             raise
         # Unsupported advisory locking proves no contender can hold this inode's
         # flock. A contender still between open and flock is fenced by its later
@@ -581,19 +585,16 @@ def _acquire_publish_lock(
             return lock_fd
 
         old_lock_fd = lock_fd
-        held = os.fstat(old_lock_fd)
         reclaimable = _existing_lock_is_reclaimable(lock_fd)
-        # With advisory locks, flock ownership is authoritative: a fresh empty
-        # inode with no holder is claimable immediately. Without flock, the legacy
-        # age-based predicate is the conservative authority.
+        # A flock winner may not displace a live identity-only owner after an
+        # ENOLCK-to-flock recovery. Metadata therefore remains the safety gate:
+        # only dead/stale records, or a standalone fresh empty inode, are replaceable.
         claim_empty = (
             advisory_locking
             and not reclaim_stale_with_existing_entry
             and _existing_lock_is_empty(lock_fd)
         )
-        # Immediate empty-lock recovery requires a standalone artifact. A stale
-        # aliased inode may still be safely replaced without changing its contents.
-        if claim_empty and held.st_nlink != 1:
+        if claim_empty and os.fstat(old_lock_fd).st_nlink != 1:
             raise FileExistsError(display)
         if not (reclaimable or claim_empty):
             raise FileExistsError(display)
@@ -705,6 +706,14 @@ def _publish_lock(
         try:
             _unlink_owned_publish_lock(dir_fd, lock_name, lock_fd)
         except BaseException as release_error:
+            last_release_error = release_error
+            for _ in range(_PUBLISH_LOCK_RELEASE_UNLINK_RETRIES):
+                try:
+                    _unlink_owned_publish_lock(dir_fd, lock_name, lock_fd)
+                except BaseException as retry_error:
+                    last_release_error = retry_error
+                else:
+                    break
             publication = publication_supplier() if publication_supplier is not None else None
             if rollback_placed is None or publication is None:
                 raise
@@ -714,6 +723,8 @@ def _publish_lock(
                 raise PublicationReleaseError(
                     publication, release_error, cleanup_error
                 ) from release_error
+            if last_release_error is not release_error:
+                raise release_error from last_release_error
             raise
         finally:
             os.close(lock_fd)
