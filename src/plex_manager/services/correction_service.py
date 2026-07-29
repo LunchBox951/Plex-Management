@@ -1667,7 +1667,9 @@ async def cancel_request_with_outcome(
                 from plex_manager.services.download_add_intent_service import recover_for_request
 
                 try:
-                    await recover_for_request(qbt, session, request_id=request_id)
+                    cleanup_result = await recover_for_request(qbt, session, request_id=request_id)
+                    if cleanup_result.needs_attention:
+                        cleanup_deferred = True
                 except QbittorrentError as exc:
                     # The durable operator-relevant state is the ``cancel_requested``
                     # intent itself: reconciliation keeps retrying it until client

@@ -668,6 +668,35 @@ def test_parked_intent_scope_migration_downgrade_deletes_released_claim_rows(
         con.close()
 
 
+def test_cleanup_lease_downgrade_drops_populated_lease_columns(tmp_path: Path) -> None:
+    """Downgrading the lease revision never leaves lease-only schema behind."""
+    db_path = tmp_path / "cleanup-lease-downgrade.db"
+    assert _alembic(db_path, "upgrade", "head").returncode == 0
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO download_add_intents "
+            "(torrent_hash, state, tmdb_id, media_type, save_path, cleanup_lease_token, "
+            "cleanup_lease_acquired_at) VALUES (?, 'cancel_requested', 1, 'movie', '', ?, ?) ",
+            ("c" * 40, "worker-token", "2026-07-29 12:00:00"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert _alembic(db_path, "downgrade", "bfa867fe6d6f").returncode == 0
+    con = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(download_add_intents)")}
+        assert "cleanup_lease_token" not in columns
+        assert "cleanup_lease_acquired_at" not in columns
+        assert con.execute("SELECT torrent_hash FROM download_add_intents").fetchall() == [
+            ("c" * 40,)
+        ]
+    finally:
+        con.close()
+
+
 def test_synthetic_late_cleanup_downgrade_deletes_only_synthetic_rows(tmp_path: Path) -> None:
     """Downgrading preserves real reservations while retiring unrecoverable cleanup rows."""
     db_path = tmp_path / "synthetic-cleanup-downgrade.db"

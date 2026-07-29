@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import DownloadAddIntent, DownloadAddIntentScope
@@ -19,6 +20,24 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["SqlDownloadAddIntentRepository"]
+
+_CLEANUP_LEASE_TIMEOUT_SECONDS = 300
+
+
+def _cleanup_lease_is_stale() -> Any:
+    """Compare a lease against the database clock, never a worker clock."""
+    return func.julianday(DownloadAddIntent.cleanup_lease_acquired_at) < (
+        func.julianday(func.current_timestamp()) - (_CLEANUP_LEASE_TIMEOUT_SECONDS / 86400)
+    )
+
+
+def _cleanup_lease_available() -> Any:
+    """Return the SQL predicate for an unheld or database-stale cleanup lease."""
+    return (
+        DownloadAddIntent.cleanup_lease_token.is_(None)
+        | DownloadAddIntent.cleanup_lease_acquired_at.is_(None)
+        | _cleanup_lease_is_stale()
+    )
 
 
 def _episodes(value: list[Any] | None) -> tuple[int, ...] | None:
@@ -63,6 +82,8 @@ def _record(
         owns_client_torrent=row.owns_client_torrent,
         cleanup_torrent_hash=row.cleanup_torrent_hash,
         cleanup_category=row.cleanup_category,
+        cleanup_lease_token=row.cleanup_lease_token,
+        cleanup_lease_acquired_at=row.cleanup_lease_acquired_at,
         last_error=row.last_error,
         scopes=tuple(_scope_record(scope) for scope in scopes),
     )
@@ -137,6 +158,8 @@ class SqlDownloadAddIntentRepository:
             owns_client_torrent=command.owns_client_torrent,
             cleanup_torrent_hash=command.cleanup_torrent_hash,
             cleanup_category=command.cleanup_category,
+            cleanup_lease_token=command.cleanup_lease_token,
+            cleanup_lease_acquired_at=command.cleanup_lease_acquired_at,
         )
         try:
             async with self._session.begin_nested():
@@ -181,7 +204,10 @@ class SqlDownloadAddIntentRepository:
             (
                 await self._session.scalars(
                     select(DownloadAddIntent)
-                    .where(DownloadAddIntent.state.in_(("prepared", "cancel_requested")))
+                    .where(
+                        DownloadAddIntent.state.in_(("prepared", "cancel_requested")),
+                        _cleanup_lease_available(),
+                    )
                     # Cleanup must run before a competing prepared reservation for the
                     # same physical hash. A synthetic cleanup records that hash in its
                     # identity fields, so its primary key intentionally differs.
@@ -191,13 +217,18 @@ class SqlDownloadAddIntentRepository:
         )
         return [await self._to_record(row) for row in rows]
 
-    async def list_for_request(self, request_id: int) -> list[DownloadAddIntentRecord]:
+    async def list_for_request(
+        self, request_id: int, *, recoverable_only: bool = False
+    ) -> list[DownloadAddIntentRecord]:
+        predicates = [DownloadAddIntent.media_request_id == request_id]
+        if recoverable_only:
+            predicates.append(
+                (DownloadAddIntent.state != "cancel_requested") | _cleanup_lease_available()
+            )
         rows = list(
             (
                 await self._session.scalars(
-                    select(DownloadAddIntent)
-                    .where(DownloadAddIntent.media_request_id == request_id)
-                    .order_by(DownloadAddIntent.id)
+                    select(DownloadAddIntent).where(*predicates).order_by(DownloadAddIntent.id)
                 )
             ).all()
         )
@@ -223,6 +254,73 @@ class SqlDownloadAddIntentRepository:
             )
             is not None
         )
+
+    async def acquire_cleanup_lease(self, intent_id: int) -> str | None:
+        """Claim cancellation cleanup exclusively, reclaiming only database-stale workers."""
+        token = str(uuid4())
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(DownloadAddIntent)
+                .where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.state == "cancel_requested",
+                    _cleanup_lease_available(),
+                )
+                .values(
+                    cleanup_lease_token=token,
+                    cleanup_lease_acquired_at=func.current_timestamp(),
+                )
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return token if result.rowcount == 1 else None
+
+    async def has_cleanup_lease(self, intent_id: int, token: str) -> bool:
+        """Return whether this worker still owns the cancellation cleanup lease."""
+        return (
+            await self._session.scalar(
+                select(DownloadAddIntent.id).where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.state == "cancel_requested",
+                    DownloadAddIntent.cleanup_lease_token == token,
+                )
+            )
+            is not None
+        )
+
+    async def renew_cleanup_lease(self, intent_id: int, token: str) -> bool:
+        """Heartbeat a lease without ever resurrecting a lease reclaimed by another worker."""
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(DownloadAddIntent)
+                .where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.state == "cancel_requested",
+                    DownloadAddIntent.cleanup_lease_token == token,
+                )
+                .values(cleanup_lease_acquired_at=func.current_timestamp())
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def release_cleanup_lease(self, intent_id: int, token: str) -> bool:
+        """Release a failed cleanup attempt without clearing another worker's lease."""
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(DownloadAddIntent)
+                .where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.cleanup_lease_token == token,
+                )
+                .values(cleanup_lease_token=None, cleanup_lease_acquired_at=None)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
 
     async def mark_state(
         self,
@@ -254,6 +352,37 @@ class SqlDownloadAddIntentRepository:
                 .execution_options(synchronize_session="fetch")
             )
         return True
+
+    async def set_cleanup_error(self, intent_id: int, token: str, error: str) -> bool:
+        """Record an owned cleanup's probe result only while its lease is still fenced."""
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(DownloadAddIntent)
+                .where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.state == "cancel_requested",
+                    DownloadAddIntent.cleanup_lease_token == token,
+                )
+                .values(last_error=error)
+                .execution_options(synchronize_session="fetch")
+            ),
+        )
+        return result.rowcount == 1
+
+    async def delete_with_cleanup_lease(self, intent_id: int, token: str) -> bool:
+        """Atomically delete only while this worker still owns its cleanup lease."""
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                delete(DownloadAddIntent).where(
+                    DownloadAddIntent.id == intent_id,
+                    DownloadAddIntent.state == "cancel_requested",
+                    DownloadAddIntent.cleanup_lease_token == token,
+                )
+            ),
+        )
+        return result.rowcount == 1
 
     async def delete(self, intent_id: int) -> bool:
         row = await self._session.get(DownloadAddIntent, intent_id)

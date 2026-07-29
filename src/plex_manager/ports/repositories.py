@@ -178,6 +178,8 @@ class CreateDownloadAddIntent(BaseModel):
     owns_client_torrent: bool = False
     cleanup_torrent_hash: str | None = None
     cleanup_category: str | None = None
+    cleanup_lease_token: str | None = None
+    cleanup_lease_acquired_at: datetime | None = None
     scopes: tuple[DownloadAddIntentScopeCreate, ...] = ()
 
 
@@ -203,6 +205,8 @@ class DownloadAddIntentRecord(BaseModel):
     owns_client_torrent: bool = False
     cleanup_torrent_hash: str | None = None
     cleanup_category: str | None = None
+    cleanup_lease_token: str | None = None
+    cleanup_lease_acquired_at: datetime | None = None
     last_error: str | None = None
     scopes: tuple[DownloadAddIntentScopeRecord, ...] = ()
 

@@ -1689,13 +1689,17 @@ async def grab(
             # _GRAB_ERRORS park (whose never-un-terminate guard skips a
             # cancelled/available row).
             await session.rollback()
-            await _remove_torrent_if_added(
+            orphan_removed = await _remove_torrent_if_added(
                 qbt,
                 torrent_hash,
                 actually_added=actually_added,
                 request_id=request_id,
                 reason="the request was cancelled or moved on mid-grab",
             )
+            if intent_id is not None:
+                await _retire_lost_add_reservation(
+                    session, intent_id, orphan_removed=orphan_removed
+                )
             raise RequestNotActiveError(request_id)
     if intent_id is not None:
         await SqlDownloadAddIntentRepository(session).delete(intent_id)

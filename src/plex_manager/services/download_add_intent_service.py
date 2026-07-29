@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.state_machine import DownloadState
@@ -27,21 +30,21 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import season_request_service
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
-
     from plex_manager.domain.release import ScoredRelease
 
 DEFAULT_CATEGORY = "plex-manager"
 _logger = logging.getLogger(__name__)
 _MAX_ERROR_LENGTH = 180
+_CLEANUP_LEASE_RENEWAL_SECONDS = 60
 
 
 class IntentRecoveryConflictError(RuntimeError):
     """An intent cannot safely become a tracked download without operator correction."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, owned_client_torrent: bool = False) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.owned_client_torrent = owned_client_torrent
 
 
 class ParkedIntentHashError(RuntimeError):
@@ -276,7 +279,11 @@ async def publish_intent(
 
 
 async def _finalize_present(
-    qbt: _IntentClient, session: AsyncSession, intent: DownloadAddIntentRecord
+    qbt: _IntentClient,
+    session: AsyncSession,
+    intent: DownloadAddIntentRecord,
+    *,
+    owned_client_torrent: bool = False,
 ) -> DownloadRecord:
     intents = SqlDownloadAddIntentRepository(session)
     downloads = SqlDownloadRepository(session)
@@ -429,7 +436,9 @@ async def _finalize_present(
         )
     if not moved:
         await session.rollback()
-        raise IntentRecoveryConflictError("intent_premise_no_longer_active")
+        raise IntentRecoveryConflictError(
+            "intent_premise_no_longer_active", owned_client_torrent=owned_client_torrent
+        )
     session.add(
         DownloadHistory(
             tmdb_id=current.tmdb_id,
@@ -531,6 +540,161 @@ async def create_late_cleanup(
     return refreshed
 
 
+async def _renew_cleanup_lease_until_done(
+    session: AsyncSession, intent_id: int, token: str
+) -> None:
+    """Keep a live cleanup lease fresh; a reclaimed token stops this worker."""
+    async with AsyncSession(bind=session.bind) as renewal_session:
+        intents = SqlDownloadAddIntentRepository(renewal_session)
+        while True:
+            await asyncio.sleep(_CLEANUP_LEASE_RENEWAL_SECONDS)
+            if not await intents.renew_cleanup_lease(intent_id, token):
+                await renewal_session.rollback()
+                return
+            await renewal_session.commit()
+
+
+async def _await_client_removal(
+    qbt: _IntentClient,
+    session: AsyncSession,
+    *,
+    client_hash: str,
+    intent_id: int,
+    token: str,
+) -> bool:
+    """Fence and heartbeat the lease through a potentially slow client removal."""
+    intents = SqlDownloadAddIntentRepository(session)
+    if not await intents.renew_cleanup_lease(intent_id, token):
+        await session.rollback()
+        return False
+    await session.commit()
+    heartbeat = asyncio.create_task(_renew_cleanup_lease_until_done(session, intent_id, token))
+    try:
+        await qbt.remove(client_hash, delete_files=True)
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
+    return await intents.has_cleanup_lease(intent_id, token)
+
+
+@dataclass(frozen=True)
+class _CleanupRecovery:
+    """The lease-guarded result of processing one cancellation cleanup record."""
+
+    settled: bool = False
+    needs_attention: bool = False
+
+
+async def _retire_or_remove_late_cleanup(
+    qbt: _IntentClient,
+    session: AsyncSession,
+    cleanup: DownloadAddIntentRecord,
+) -> _CleanupRecovery:
+    """Settle cancellation cleanup while holding its durable, fenced worker lease."""
+    client_hash = _client_hash(cleanup)
+    intents = SqlDownloadAddIntentRepository(session)
+    # Every cancellation disposition, including synthetic-to-real conversion,
+    # begins with a token claim on the current durable cleanup row.
+    lease = await intents.acquire_cleanup_lease(cleanup.id)
+    if lease is None:
+        await session.rollback()
+        return _CleanupRecovery()
+    await session.commit()
+
+    target = cleanup
+    cleanup_lease = lease
+    try:
+        if cleanup.torrent_hash != client_hash:
+            temporary_claim = await intents.try_create(
+                CreateDownloadAddIntent(
+                    torrent_hash=client_hash,
+                    media_request_id=cleanup.media_request_id,
+                    tmdb_id=cleanup.tmdb_id,
+                    media_type=cleanup.media_type,
+                    save_path=cleanup.save_path,
+                    owns_client_torrent=True,
+                )
+            )
+            if temporary_claim is None:
+                # ``try_create`` also returns None for non-uniqueness failures. Only
+                # a re-read real-hash owner proves a successor may own this torrent.
+                owner = await intents.get_by_hash(client_hash)
+                if owner is None:
+                    raise RuntimeError("late cleanup claim insertion did not produce a hash owner")
+                if not await intents.delete_with_cleanup_lease(cleanup.id, lease):
+                    await session.rollback()
+                    return _CleanupRecovery()
+                await session.commit()
+                return _CleanupRecovery(settled=True)
+            if not await intents.mark_state(
+                temporary_claim.id, "cancel_requested", expected_state="prepared"
+            ):
+                raise IntentRecoveryConflictError("late cleanup claim changed before removal")
+            # Swap synthetic identity while still fenced by its original row. The
+            # temporary real-hash claim must itself acquire a fresh lease before I/O.
+            if not await intents.delete_with_cleanup_lease(cleanup.id, lease):
+                await session.rollback()
+                return _CleanupRecovery()
+            await session.commit()
+            target = temporary_claim
+            lease = await intents.acquire_cleanup_lease(target.id)
+            if lease is None:
+                await session.rollback()
+                return _CleanupRecovery()
+            cleanup_lease = lease
+            await session.commit()
+
+        # Probe after the lease claim: an absence/convergence result can settle
+        # only the record whose token we still own below.
+        status = await qbt.get_status(client_hash)
+        active = await SqlDownloadRepository(session).get_by_hash(client_hash)
+        if status is None or (
+            active is not None and active.status not in _TERMINAL_DOWNLOAD_STATES
+        ):
+            if not await intents.delete_with_cleanup_lease(target.id, lease):
+                await session.rollback()
+                return _CleanupRecovery()
+            await session.commit()
+            return _CleanupRecovery(settled=True)
+
+        if not _owns_present_torrent(target, status):
+            if not await intents.set_cleanup_error(
+                target.id, lease, "client_hash_ownership_unproven"
+            ):
+                await session.rollback()
+                return _CleanupRecovery()
+            # The error update proves our fence before this non-destructive
+            # disposition; release is token-matched so a reclaimer is untouched.
+            if not await intents.release_cleanup_lease(target.id, lease):
+                await session.rollback()
+                return _CleanupRecovery()
+            await session.commit()
+            return _CleanupRecovery(needs_attention=True)
+
+        if not await _await_client_removal(
+            qbt,
+            session,
+            client_hash=client_hash,
+            intent_id=target.id,
+            token=lease,
+        ):
+            await session.rollback()
+            return _CleanupRecovery()
+        if not await intents.delete_with_cleanup_lease(target.id, lease):
+            await session.rollback()
+            return _CleanupRecovery()
+        await session.commit()
+        return _CleanupRecovery(settled=True)
+    except Exception:
+        # This covers ambiguous client errors AND a database failure after a
+        # confirmed removal. Token-matched release cannot clear a newer lease.
+        await session.rollback()
+        await intents.release_cleanup_lease(target.id, cleanup_lease)
+        await session.commit()
+        raise
+
+
 async def submit_and_finalize(
     qbt: _IntentClient,
     session: AsyncSession,
@@ -562,9 +726,7 @@ async def submit_and_finalize(
         # visible to the normal retry sweep instead of orphaning the torrent.
         if result.created:
             cleanup = await create_late_cleanup(session, intent)
-            await qbt.remove(intent.torrent_hash, delete_files=True)
-            await intents.delete(cleanup.id)
-            await session.commit()
+            await _retire_or_remove_late_cleanup(qbt, session, cleanup)
         else:
             status = await qbt.get_status(intent.torrent_hash)
             if _owns_present_torrent(intent, status):
@@ -575,17 +737,22 @@ async def submit_and_finalize(
         # proves this intent owns the just-added torrent, so remove it immediately;
         # if removal fails, leave cancel_requested for normal cleanup recovery.
         if result.created:
-            await qbt.remove(intent.torrent_hash, delete_files=True)
-            await intents.delete(intent.id)
-            await session.commit()
+            # The still-cancelled reservation uses the same lease-fenced cleanup
+            # path as background recovery; a concurrent sweeper cannot retire it
+            # while this late add is being removed.
+            await _retire_or_remove_late_cleanup(qbt, session, current)
         return _SubmissionFinalization(None)
     if current.state != "prepared":
         return _SubmissionFinalization(None)
     if result.created:
-        return _SubmissionFinalization(await _finalize_present(qbt, session, current))
+        return _SubmissionFinalization(
+            await _finalize_present(qbt, session, current, owned_client_torrent=True)
+        )
     status = await qbt.get_status(intent.torrent_hash)
     if _owns_present_torrent(intent, status):
-        return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
+        return _SubmissionFinalization(
+            await _finalize_present(qbt, session, intent, owned_client_torrent=True)
+        )
     if status is None:
         # A duplicate only proves the hash exists. If its status cannot be read,
         # retain the prepared reservation so a later sweep can re-probe safely.
@@ -637,7 +804,7 @@ async def recover_for_request(
         session,
         [
             intent
-            for intent in await intents.list_for_request(request_id)
+            for intent in await intents.list_for_request(request_id, recoverable_only=True)
             if intent.state in {"prepared", "cancel_requested"}
         ],
     )
@@ -656,27 +823,17 @@ async def _recover(
         status = await qbt.get_status(client_hash)
         try:
             if intent.state == "cancel_requested":
-                # Confirmed absence retires the cleanup record. A live active Download
-                # means a newer workflow has converged on this physical torrent, so
-                # retain its data and retire only the obsolete cleanup record. An
-                # owned, untracked torrent is removed; an unproven live torrent stays
-                # durable for a later probe rather than being silently forgotten.
-                active = await SqlDownloadRepository(session).get_by_hash(client_hash)
-                if status is None or (
-                    active is not None and active.status not in _TERMINAL_DOWNLOAD_STATES
-                ):
-                    await intents.delete(intent.id)
-                    await session.commit()
+                # Every disposition (absence, active-download convergence, unproven
+                # ownership, and removal) is serialized by the cleanup helper's
+                # token-conditional lease. A live holder always wins unchanged.
+                cleanup = await _retire_or_remove_late_cleanup(qbt, session, intent)
+                if cleanup.settled:
                     result = IntentRecoveryResult(
                         result.finalized, result.removed + 1, result.needs_attention
                     )
-                    continue
-                if _owns_present_torrent(intent, status):
-                    await qbt.remove(client_hash, delete_files=True)
-                    await intents.delete(intent.id)
-                    await session.commit()
+                elif cleanup.needs_attention:
                     result = IntentRecoveryResult(
-                        result.finalized, result.removed + 1, result.needs_attention
+                        result.finalized, result.removed, result.needs_attention + 1
                     )
                 continue
             if status is not None:
@@ -688,7 +845,9 @@ async def _recover(
                             result.finalized, result.removed, result.needs_attention + 1
                         )
                     continue
-                await _finalize_present(qbt, session, intent)
+                await _finalize_present(
+                    qbt, session, intent, owned_client_torrent=_owns_present_torrent(intent, status)
+                )
             elif intent.source is None:
                 if await _park_needs_attention(session, intents, intent.id, "source_unavailable"):
                     result = IntentRecoveryResult(
@@ -732,9 +891,8 @@ async def _recover(
         except IntentRecoveryConflictError as exc:
             await session.rollback()
             if (
-                _owns_present_torrent(intent, status)
-                and exc.reason == "intent_premise_no_longer_active"
-            ):
+                exc.owned_client_torrent or _owns_present_torrent(intent, status)
+            ) and exc.reason == "intent_premise_no_longer_active":
                 # The live intent category proves this torrent is ours, but the
                 # decision premise is gone. Keep it in the existing machine-cleanup
                 # lifecycle rather than parking an invisible seeding torrent.

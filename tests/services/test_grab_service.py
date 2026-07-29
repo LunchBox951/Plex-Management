@@ -2718,10 +2718,12 @@ async def test_grab_refuses_a_movie_cancelled_while_qbt_add_was_in_flight(
                 .scalars()
                 .all()
             )
-        assert row is not None
-        assert row.status is RequestStatus.cancelled  # the user's stop STANDS
-        assert downloads == []  # no tracked download for cancelled content
-        assert history == []  # no 'grabbed' record for a refused grab
+            intent = await SqlDownloadAddIntentRepository(session).get_by_hash(_HASH)
+            assert row is not None
+            assert row.status is RequestStatus.cancelled  # the user's stop STANDS
+            assert downloads == []  # no tracked download for cancelled content
+            assert history == []  # no 'grabbed' record for a refused grab
+            assert intent is None  # successful orphan removal retires the reservation
     finally:
         await engine.dispose()
 

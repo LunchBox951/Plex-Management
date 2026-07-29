@@ -1528,6 +1528,60 @@ async def test_cancel_marks_future_intent_then_recovers_its_owned_torrent(
         assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
+async def test_cancel_defers_cleanup_when_intent_category_drift_removes_ownership_proof(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as setup:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.pending,
+        )
+        setup.add(request)
+        await setup.flush()
+        intent = await SqlDownloadAddIntentRepository(setup).create(
+            CreateDownloadAddIntent(
+                torrent_hash="recategorized-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        request_id = request.id
+        await setup.commit()
+
+    qbt = FakeQbittorrent(
+        [
+            DownloadStatus(
+                info_hash="recategorized-intent",
+                name="recategorized",
+                raw_state="downloading",
+                category="external-category",
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        outcome = await correction_service.cancel_request_with_outcome(
+            session, qbt, request_id=request_id
+        )
+
+    assert outcome.record.status == RequestStatus.cancelled.value
+    assert outcome.cleanup_deferred is True
+    assert qbt.removed == []
+    async with sessionmaker_() as check:
+        remaining = await SqlDownloadAddIntentRepository(check).get(intent.id, fresh=True)
+        assert remaining is not None
+        assert remaining.state == "cancel_requested"
+        assert remaining.last_error == "client_hash_ownership_unproven"
+
+
 async def test_cancel_preserves_committed_settle_when_intent_cleanup_client_is_unavailable(
     sessionmaker_: SessionMaker,
 ) -> None:

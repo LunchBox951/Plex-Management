@@ -780,6 +780,10 @@ class DownloadAddIntent(Base):
     # key stores its client identity separately, with a synthetic ``torrent_hash``.
     cleanup_torrent_hash: Mapped[str | None] = mapped_column(String)
     cleanup_category: Mapped[str | None] = mapped_column(String)
+    # A lease makes cancellation cleanup single-worker across every client-removal
+    # await. A stale lease is safely reclaimable after its bounded timeout.
+    cleanup_lease_token: Mapped[str | None] = mapped_column(String)
+    cleanup_lease_acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
