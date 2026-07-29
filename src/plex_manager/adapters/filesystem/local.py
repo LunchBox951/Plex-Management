@@ -277,7 +277,10 @@ def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
         return lock_fd
     except BaseException as original_error:
         if claimed:
-            _release_publish_lock(dir_fd, lock_name, lock_fd)
+            try:
+                _unlink_owned_publish_lock(dir_fd, lock_name, lock_fd)
+            finally:
+                os.close(lock_fd)
         else:
             # Failure before ``claimed`` can happen at flock or either ownership
             # check. A created entry is removable only after no owner holds it.
@@ -293,19 +296,14 @@ def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
         raise
 
 
-def _release_publish_lock(dir_fd: int, lock_name: str, lock_fd: int) -> None:
-    """Release a claimed lock without intentionally removing a replacement.
+def _unlink_owned_publish_lock(dir_fd: int, lock_name: str, lock_fd: int) -> None:
+    """Remove the claimed lock only when ``lock_fd`` still names it.
 
     POSIX cannot make the final identity check and unlink conditional against a
     non-cooperating pathname mutator; the held flock fences cooperating claimants.
     """
-    try:
-        if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
-            os.unlink(lock_name, dir_fd=dir_fd)
-    finally:
-        # Closing is the ownership handoff: it releases flock without an
-        # unlocked-but-still-open interval in this process.
-        os.close(lock_fd)
+    if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+        os.unlink(lock_name, dir_fd=dir_fd)
 
 
 def _entry_exists(dir_fd: int, name: str) -> bool:
@@ -345,7 +343,13 @@ def _publish_lock(
     try:
         yield
     finally:
-        _release_publish_lock(dir_fd, lock_name, lock_fd)
+        # Keep the guarded unlink and descriptor close adjacent: this makes the
+        # publish-lock context's ownership transfer explicit without introducing
+        # an unlocked-but-still-open interval.
+        try:
+            _unlink_owned_publish_lock(dir_fd, lock_name, lock_fd)
+        finally:
+            os.close(lock_fd)
 
 
 def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: str) -> None:

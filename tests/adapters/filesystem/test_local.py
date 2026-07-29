@@ -470,26 +470,26 @@ def test_open_publish_lock_fstat_failure_removes_created_lock(
     assert not (tmp_path / lock_name).exists()
 
 
-def test_release_publish_lock_surfaces_unlink_failure(
+def test_publish_lock_context_surfaces_unlink_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Release must report a lock that it could not remove, rather than claiming success."""
     dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     lock_name = ".dst.mkv.publish.lock"
-    lock_fd = local_fs._acquire_publish_lock(  # pyright: ignore[reportPrivateUsage]
-        dir_fd, lock_name, os.fspath(tmp_path / "dst.mkv")
-    )
-
-    def _fail_canonical_lock_unlink(path: str, *, dir_fd: int | None = None) -> None:
-        if path == lock_name:
-            raise OSError(errno.EIO, "simulated unlink failure")
-
-    monkeypatch.setattr(os, "unlink", _fail_canonical_lock_unlink)
     try:
-        with pytest.raises(OSError, match="simulated unlink failure"):
-            local_fs._release_publish_lock(  # pyright: ignore[reportPrivateUsage]
-                dir_fd, lock_name, lock_fd
-            )
+
+        def _fail_canonical_lock_unlink(path: str, *, dir_fd: int | None = None) -> None:
+            if path == lock_name:
+                raise OSError(errno.EIO, "simulated unlink failure")
+
+        monkeypatch.setattr(os, "unlink", _fail_canonical_lock_unlink)
+        with (
+            pytest.raises(OSError, match="simulated unlink failure"),
+            local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", os.fspath(tmp_path / "dst.mkv")
+            ),
+        ):
+            pass
     finally:
         os.close(dir_fd)
 
@@ -531,7 +531,7 @@ def test_publish_lock_fences_creator_suspended_after_empty_create(
     def _pause_creator_after_create(
         path: str,
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
