@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
 from plex_manager.ports.download_client import AddResult, DownloadStatus, PreparedAdd
@@ -47,6 +48,14 @@ _TERMINAL_DOWNLOAD_STATES = frozenset(
         DownloadState.Imported.value,
         DownloadState.Failed.value,
         DownloadState.NoAcceptableRelease.value,
+    }
+)
+_PACK_TARGET_SEASON_STATUS_VALUES = frozenset(
+    {
+        RequestStatus.pending.value,
+        RequestStatus.searching.value,
+        RequestStatus.no_acceptable_release.value,
+        RequestStatus.failed.value,
     }
 )
 
@@ -116,17 +125,26 @@ async def publish_intent(
             )
         )
     else:
-        for covered_season, covered_episodes in (
-            scope_episodes_by_season or {season: episodes}
-        ).items():
+        targets = tuple(dict.fromkeys((season, *scored.target_seasons)))
+        coverage = tuple(dict.fromkeys((*targets, *scored.covered_seasons)))
+        for covered_season in coverage:
+            target_episodes = (
+                episodes
+                if covered_season == season
+                else (
+                    scope_episodes_by_season.get(covered_season)
+                    if scope_episodes_by_season is not None and covered_season in targets
+                    else None
+                )
+            )
             scopes.append(
                 DownloadAddIntentScopeCreate(
                     tmdb_id=tmdb_id,
                     media_type=media_type,
                     scope_key=f"season:{covered_season}",
                     season_number=covered_season,
-                    episodes=tuple(covered_episodes) if covered_episodes is not None else None,
-                    is_target=covered_season == season,
+                    episodes=tuple(target_episodes) if target_episodes is not None else None,
+                    is_target=covered_season in targets,
                 )
             )
     candidate = scored.candidate
@@ -185,14 +203,23 @@ async def _finalize_present(
             timeout_at=datetime.now(UTC),
         )
     else:
+        if not await downloads.lock_if_active(existing.id):
+            await session.rollback()
+            refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
+            if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
+                raise IntentRecoveryConflictError("same-hash download became terminal")
+            raise IntentRecoveryConflictError("same-hash download changed before scope attachment")
+        refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
         if (
-            existing.status in _TERMINAL_DOWNLOAD_STATES
-            or existing.media_request_id != current.media_request_id
-            or existing.tmdb_id != current.tmdb_id
-            or existing.media_type != current.media_type
+            refreshed is None
+            or refreshed.status in _TERMINAL_DOWNLOAD_STATES
+            or refreshed.media_request_id != current.media_request_id
+            or refreshed.tmdb_id != current.tmdb_id
+            or refreshed.media_type != current.media_type
         ):
+            await session.rollback()
             raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
-        record = existing
+        record = refreshed
     for scope in current.scopes:
         if scope.is_target and scope.season_number is not None:
             await downloads.ensure_scope(
@@ -206,22 +233,37 @@ async def _finalize_present(
                 record.id, media_request_id=current.media_request_id, season=scope.season_number
             )
     if current.media_type == "tv":
-        target = next((scope for scope in current.scopes if scope.is_target), None)
-        if target is not None and target.season_number is not None:
+        moved = True
+        for target in (scope for scope in current.scopes if scope.is_target):
+            if target.season_number is None:
+                continue
             season_row = await SqlSeasonRequestRepository(session).ensure(
                 current.media_request_id,
                 target.season_number,
                 status=RequestStatus.pending.value,
+            )
+            allowed_from = (
+                frozenset({current.observed_season_status or season_row.status})
+                if target.season_number
+                == next(
+                    (
+                        scope.season_number
+                        for scope in current.scopes
+                        if scope.is_target and scope.season_number is not None
+                    ),
+                    None,
+                )
+                else _PACK_TARGET_SEASON_STATUS_VALUES
             )
             moved = await season_request_service.set_status_if_in(
                 session,
                 media_request_id=current.media_request_id,
                 season_request_id=season_row.id,
                 status=RequestStatus.downloading.value,
-                allowed_from=frozenset({current.observed_season_status or season_row.status}),
+                allowed_from=allowed_from,
             )
-        else:
-            moved = False
+            if not moved:
+                break
     else:
         moved = await SqlRequestRepository(session).set_status_if_in(
             current.media_request_id,
@@ -270,6 +312,21 @@ async def submit_and_finalize(
     return await _finalize_present(qbt, session, intent)
 
 
+async def _park_needs_attention(
+    session: AsyncSession,
+    intents: SqlDownloadAddIntentRepository,
+    intent_id: int,
+    error: str,
+) -> bool:
+    """Park a still-prepared intent once; a concurrent transition wins silently."""
+    marked = await intents.mark_state(
+        intent_id, "needs_attention", last_error=error, expected_state="prepared"
+    )
+    if marked:
+        await session.commit()
+    return marked
+
+
 async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecoveryResult:
     """Recover every committed intent in stable order without recreating cancellations."""
     intents = SqlDownloadAddIntentRepository(session)
@@ -291,24 +348,32 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
             if status is not None:
                 await _finalize_present(qbt, session, intent)
             elif intent.source is None:
-                await intents.mark_state(
-                    intent.id, "needs_attention", last_error="source_unavailable"
-                )
-                await session.commit()
-                result = IntentRecoveryResult(
-                    result.finalized, result.removed, result.needs_attention + 1
-                )
-                continue
-            else:
-                prepared = await qbt.prepare_add(intent.source)
-                if prepared.torrent_hash.lower() != intent.torrent_hash:
-                    await intents.mark_state(
-                        intent.id, "needs_attention", last_error="prepared_hash_mismatch"
-                    )
-                    await session.commit()
+                if await _park_needs_attention(session, intents, intent.id, "source_unavailable"):
                     result = IntentRecoveryResult(
                         result.finalized, result.removed, result.needs_attention + 1
                     )
+                continue
+            else:
+                try:
+                    prepared = await qbt.prepare_add(intent.source)
+                except QbittorrentSourceError as exc:
+                    if await _park_needs_attention(
+                        session, intents, intent.id, f"source_error:{_safe_error(exc)}"
+                    ):
+                        _logger.warning(
+                            "durable intent %s needs operator attention (%s)", intent.id, exc
+                        )
+                        result = IntentRecoveryResult(
+                            result.finalized, result.removed, result.needs_attention + 1
+                        )
+                    continue
+                if prepared.torrent_hash.lower() != intent.torrent_hash:
+                    if await _park_needs_attention(
+                        session, intents, intent.id, "prepared_hash_mismatch"
+                    ):
+                        result = IntentRecoveryResult(
+                            result.finalized, result.removed, result.needs_attention + 1
+                        )
                     continue
                 await submit_and_finalize(qbt, session, intent=intent, prepared=prepared)
             result = IntentRecoveryResult(
@@ -316,12 +381,11 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
             )
         except IntentRecoveryConflictError as exc:
             await session.rollback()
-            await intents.mark_state(intent.id, "needs_attention", last_error=_safe_error(exc))
-            await session.commit()
-            _logger.warning("durable intent %s needs operator attention (%s)", intent.id, exc)
-            result = IntentRecoveryResult(
-                result.finalized, result.removed, result.needs_attention + 1
-            )
+            if await _park_needs_attention(session, intents, intent.id, _safe_error(exc)):
+                _logger.warning("durable intent %s needs operator attention (%s)", intent.id, exc)
+                result = IntentRecoveryResult(
+                    result.finalized, result.removed, result.needs_attention + 1
+                )
         except Exception as exc:
             await session.rollback()
             _logger.warning(

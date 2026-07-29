@@ -40,6 +40,7 @@ __all__ = [
     "AuthUser",
     "BlocklistEntry",
     "BlocklistResponse",
+    "CancelRequestResponse",
     "CompactStateField",
     "CompactStateRequest",
     "CompactStateResponse",
@@ -1451,6 +1452,14 @@ class RequestResponse(BaseModel):
     is_owner: bool = False
     can_withdraw: bool = False
     has_other_participants: bool = False
+
+
+class CancelRequestResponse(RequestResponse):
+    """Cancellation outcome with its one-shot client-cleanup status."""
+
+    # ``True`` only when the durable ``cancel_requested`` intent still awaits
+    # client removal. The request is cancelled and reconciliation retries it.
+    cleanup_deferred: bool = False
 
 
 class RequestListResponse(BaseModel):

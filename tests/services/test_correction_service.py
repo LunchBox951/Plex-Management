@@ -141,6 +141,11 @@ class _AddFailsQbittorrent(FakeQbittorrent):
         raise QbittorrentError("qBittorrent is unreachable")
 
 
+class _RecoverFailsQbittorrent(FakeQbittorrent):
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        raise QbittorrentError("qBittorrent is unreachable")
+
+
 class _EmptyHashQbittorrent(FakeQbittorrent):
     """A :class:`FakeQbittorrent` whose ``add`` ACCEPTS the torrent but returns no
     derivable info-hash -- models the real client accepting an opaque source from which
@@ -1528,6 +1533,117 @@ async def test_cancel_marks_future_intent_then_recovers_its_owned_torrent(
     assert ("future-intent", True) in qbt.removed
     async with sessionmaker_() as session:
         assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
+
+
+async def test_cancel_preserves_committed_settle_when_intent_cleanup_client_is_unavailable(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="future-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        outcome = await correction_service.cancel_request_with_outcome(
+            session, _RecoverFailsQbittorrent(), request_id=request_id
+        )
+
+    assert outcome.record.status == RequestStatus.cancelled.value
+    assert outcome.cleanup_deferred is True
+    async with sessionmaker_() as session:
+        remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+        history = (
+            await session.scalars(
+                select(DownloadHistory)
+                .where(DownloadHistory.tmdb_id == _TMDB)
+                .order_by(DownloadHistory.id)
+            )
+        ).all()
+    assert remaining is not None
+    assert remaining.state == "cancel_requested"
+    messages = [row.message or "" for row in history]
+    assert (
+        "cancelled by operator: client removal deferred; reconciliation will retry automatically"
+        in messages
+    )
+    assert all("removed any active torrent" not in message for message in messages)
+
+
+async def test_cancel_refuses_retryable_conflict_when_intent_is_replaced_during_claim(
+    sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.pending,
+        )
+        session.add(request)
+        await session.flush()
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="future-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    original_delete = SqlDownloadAddIntentRepository.delete
+
+    async def replace_intent_claim(
+        self: SqlDownloadAddIntentRepository,
+        intent_id: int,
+        state: str,
+        *,
+        last_error: str | None = None,
+        expected_state: str | None = None,
+    ) -> bool:
+        await original_delete(self, intent_id)
+        return False
+
+    monkeypatch.setattr(SqlDownloadAddIntentRepository, "mark_state", replace_intent_claim)
+    async with sessionmaker_() as session:
+        with pytest.raises(correction_service.CancellationRaceError):
+            await correction_service.cancel_request(
+                session, FakeQbittorrent(), request_id=request_id
+            )
+
+    async with sessionmaker_() as session:
+        request_after = await session.get(MediaRequest, request_id)
+    assert request_after is not None
+    assert request_after.status == RequestStatus.pending
+    assert intent.id > 0
 
 
 async def test_cancel_claims_needs_attention_intent_for_removal(

@@ -981,6 +981,11 @@ export interface paths {
          *     install with qBittorrent unconfigured. When there ARE active torrents to remove but
          *     the client is unconfigured, the service refuses up front (409
          *     ``service_not_configured``) rather than silently leaking a seeding torrent.
+         *
+         *     ``cleanup_deferred`` is ``true`` only after the request was committed as
+         *     ``cancelled`` but qBittorrent client removal remains pending. The durable
+         *     ``cancel_requested`` intent guarantees that normal reconciliation retries
+         *     that removal automatically.
          */
         post: operations["cancel_request_endpoint_api_v1_requests__request_id__cancel_post"];
         delete?: never;
@@ -1932,6 +1937,74 @@ export interface components {
         BlocklistResponse: {
             /** Entries */
             entries: components["schemas"]["BlocklistEntry"][];
+        };
+        /**
+         * CancelRequestResponse
+         * @description Cancellation outcome with its one-shot client-cleanup status.
+         */
+        CancelRequestResponse: {
+            /** Backdrop Url */
+            backdrop_url?: string | null;
+            /**
+             * Can Mutate
+             * @default false
+             */
+            can_mutate: boolean;
+            /**
+             * Can Withdraw
+             * @default false
+             */
+            can_withdraw: boolean;
+            /**
+             * Cleanup Deferred
+             * @default false
+             */
+            cleanup_deferred: boolean;
+            /** Download Progress */
+            download_progress?: number | null;
+            /**
+             * Has Other Participants
+             * @default false
+             */
+            has_other_participants: boolean;
+            /** Id */
+            id: number;
+            /**
+             * Is Anime
+             * @default false
+             */
+            is_anime: boolean;
+            /**
+             * Is Owner
+             * @default false
+             */
+            is_owner: boolean;
+            /**
+             * Keep Forever
+             * @default false
+             */
+            keep_forever: boolean;
+            /** Media Type */
+            media_type: string;
+            /** Poster Url */
+            poster_url?: string | null;
+            /** Requested Episodes */
+            requested_episodes?: {
+                [key: string]: number[];
+            } | null;
+            /** Requested Seasons */
+            requested_seasons?: number[] | null;
+            /** Seasons */
+            seasons?: components["schemas"]["SeasonStatus"][] | null;
+            status: components["schemas"]["RequestStatus"];
+            /** Title */
+            title: string;
+            /** Tmdb Id */
+            tmdb_id: number;
+            /** Tv Request Mode */
+            tv_request_mode?: string | null;
+            /** Year */
+            year?: number | null;
         };
         /**
          * CompactStateField
@@ -4778,7 +4851,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RequestResponse"];
+                    "application/json": components["schemas"]["CancelRequestResponse"];
                 };
             };
             /** @description Request not found */

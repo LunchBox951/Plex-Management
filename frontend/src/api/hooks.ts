@@ -13,6 +13,7 @@ import type {
   AppApiKeyStatusResponse,
   AuthMeResponse,
   BlocklistResponse,
+  CancelRequestResponse,
   CompactStateResponse,
   CreateRequestBody,
   DiscoverHomeResponse,
@@ -800,7 +801,7 @@ export function useReportIssue() {
 export function useCancelRequest() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (requestId: number): Promise<RequestResponse> =>
+    mutationFn: async (requestId: number): Promise<CancelRequestResponse> =>
       unwrap(
         await client.POST('/api/v1/requests/{request_id}/cancel', {
           params: { path: { request_id: requestId } },

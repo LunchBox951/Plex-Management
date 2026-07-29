@@ -158,6 +158,8 @@ __all__ = [
     "CANCELLABLE_REQUEST_STATUS_VALUES",
     "REPORTABLE_STATUS_VALUES",
     "ActiveDuplicateError",
+    "CancelOutcome",
+    "CancellationRaceError",
     "DownloadClientRequiredError",
     "DownloadNotFoundError",
     "DownloadsRootUnavailableError",
@@ -175,6 +177,8 @@ __all__ = [
     "WithdrawalBlockedActiveError",
     "cancel_request",
     "cancel_request_as_owner",
+    "cancel_request_as_owner_with_outcome",
+    "cancel_request_with_outcome",
     "relocate_stranded_download",
     "report_issue",
     "withdraw_participant",
@@ -692,6 +696,24 @@ class ImportInProgressError(Exception):
         self.request_id = request_id
         super().__init__(
             f"request {request_id} has a download finalizing its import; retry shortly"
+        )
+
+
+@dataclass(frozen=True)
+class CancelOutcome:
+    """The committed cancellation record and whether client cleanup is pending."""
+
+    record: RequestRecord
+    cleanup_deferred: bool = False
+
+
+class CancellationRaceError(Exception):
+    """Cancellation's durable intent changed into a download; retry from a fresh snapshot."""
+
+    def __init__(self, request_id: int) -> None:
+        self.request_id = request_id
+        super().__init__(
+            f"request {request_id} changed while cancellation was claimed; retry shortly"
         )
 
 
@@ -1458,13 +1480,13 @@ async def _park_no_acceptable(
         await session.rollback()
 
 
-async def cancel_request(
+async def cancel_request_with_outcome(
     session: AsyncSession,
     qbt: DownloadClientPort | None,
     *,
     request_id: int,
-) -> RequestRecord:
-    """Cancel a not-yet-imported request: drop active torrent(s) + settle ``cancelled``.
+) -> CancelOutcome:
+    """Cancel a request and report whether durable client cleanup remains pending.
 
     Removes every active torrent this request still owns WITH its data (best-effort,
     closing the seeding leak), marks each of those download rows terminal, and flips
@@ -1543,6 +1565,7 @@ async def cancel_request(
     # blocklist/re-search (cancel must never re-grab).
     hashes_to_remove: list[str] = []
     removal_ids: list[int] = []
+    cleanup_deferred = False
     try:
         for intent in intents:
             if intent.state == "cancel_requested":
@@ -1552,9 +1575,12 @@ async def cancel_request(
             )
             if not marked:
                 refreshed = await intent_repo.get(intent.id, fresh=True)
-                if refreshed is not None and refreshed.state != "cancel_requested":
+                if refreshed is None:
                     await session.rollback()
-                    raise RuntimeError("durable intent changed while cancellation was claimed")
+                    raise CancellationRaceError(request_id)
+                if refreshed.state != "cancel_requested":
+                    await session.rollback()
+                    raise CancellationRaceError(request_id)
         for row in active:
             moved = await download_repo.update_status_if_in(
                 row.id,
@@ -1606,7 +1632,10 @@ async def cancel_request(
                 torrent_hash=None,
                 event_type=DownloadHistoryEvent.cancelled,
                 source_title=request.title,
-                message="cancelled by operator: removed any active torrent, settled cancelled",
+                message=(
+                    "cancelled by operator: client removal requested; "
+                    "reconciliation confirms cleanup"
+                ),
             )
         )
         await session.commit()
@@ -1631,7 +1660,30 @@ async def cancel_request(
             if intents:
                 from plex_manager.services.download_add_intent_service import recover_all
 
-                await recover_all(qbt, session)
+                try:
+                    await recover_all(qbt, session)
+                except QbittorrentError as exc:
+                    # The durable operator-relevant state is the ``cancel_requested``
+                    # intent itself: reconciliation keeps retrying it until client
+                    # removal succeeds. This outcome flag tells the acting operator;
+                    # persistent client failure remains visible via qBittorrent health.
+                    cleanup_deferred = True
+                    _logger.warning(
+                        "durable intent cancellation cleanup deferred (%s)", type(exc).__name__
+                    )
+                    session.add(
+                        DownloadHistory(
+                            tmdb_id=request.tmdb_id,
+                            torrent_hash=None,
+                            event_type=DownloadHistoryEvent.cancelled,
+                            source_title=request.title,
+                            message=(
+                                "cancelled by operator: client removal deferred; "
+                                "reconciliation will retry automatically"
+                            ),
+                        )
+                    )
+                    await session.commit()
     finally:
         # Removal has settled (or the cancel aborted): the row is either gone from the
         # client (a later grab creates a fresh torrent) or, on a removal failure, its
@@ -1643,16 +1695,26 @@ async def cancel_request(
     updated = await request_repo.get(request_id)
     if updated is None:  # pragma: no cover - just operated on this row
         raise RequestNotFoundError(request_id)
-    return updated
+    return CancelOutcome(record=updated, cleanup_deferred=cleanup_deferred)
 
 
-async def cancel_request_as_owner(
+async def cancel_request(
+    session: AsyncSession,
+    qbt: DownloadClientPort | None,
+    *,
+    request_id: int,
+) -> RequestRecord:
+    """Cancel a request while preserving the legacy record-only service contract."""
+    return (await cancel_request_with_outcome(session, qbt, request_id=request_id)).record
+
+
+async def cancel_request_as_owner_with_outcome(
     session: AsyncSession,
     qbt: DownloadClientPort | None,
     *,
     request_id: int,
     user_id: int,
-) -> RequestRecord:
+) -> CancelOutcome:
     """``POST /cancel`` for a non-admin owner (issue #314).
 
     ``POST /cancel``'s contract is unchanged for a SOLE participant: cancel the
@@ -1692,7 +1754,22 @@ async def cancel_request_as_owner(
     subscribers = await request_repo.list_subscribers(request_id)
     if any(uid != user_id for uid in subscribers):
         raise HasOtherParticipantsError(request_id)
-    return await cancel_request(session, qbt, request_id=request_id)
+    return await cancel_request_with_outcome(session, qbt, request_id=request_id)
+
+
+async def cancel_request_as_owner(
+    session: AsyncSession,
+    qbt: DownloadClientPort | None,
+    *,
+    request_id: int,
+    user_id: int,
+) -> RequestRecord:
+    """Cancel as a sole owner while preserving the record-only service contract."""
+    return (
+        await cancel_request_as_owner_with_outcome(
+            session, qbt, request_id=request_id, user_id=user_id
+        )
+    ).record
 
 
 @dataclass(frozen=True)

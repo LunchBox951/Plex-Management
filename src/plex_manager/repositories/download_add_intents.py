@@ -161,11 +161,7 @@ class SqlDownloadAddIntentRepository:
             (
                 await self._session.scalars(
                     select(DownloadAddIntent)
-                    .where(
-                        DownloadAddIntent.state.in_(
-                            ("prepared", "needs_attention", "cancel_requested")
-                        )
-                    )
+                    .where(DownloadAddIntent.state.in_(("prepared", "cancel_requested")))
                     .order_by(DownloadAddIntent.id)
                 )
             ).all()

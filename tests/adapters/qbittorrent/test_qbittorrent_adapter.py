@@ -2111,6 +2111,15 @@ async def test_add_hex_btih_magnet_is_lowercased_as_is() -> None:
     assert info_hash == MAGNET_HASH
 
 
+async def test_add_v2_only_btmh_magnet_returns_sha256_digest() -> None:
+    digest = "a" * 64
+    magnet = f"magnet:?xt=urn:btmh:1220{digest.upper()}&dn=V2"
+
+    result = await _client().add(magnet, "/downloads/movies", "plex-manager")
+
+    assert result.torrent_hash == digest
+
+
 async def test_add_invalid_base32_btih_magnet_raises_source_error() -> None:
     """Issue #90: a 32-char ``btih`` that is NOT valid base32 (``0``/``1``/``8``/``9``
     are outside the base32 alphabet) is a MALFORMED source, not a hash. It must raise

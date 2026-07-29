@@ -14,6 +14,7 @@ export type DiscoverHomeRow = Schemas['DiscoverHomeRow']
 export type DiscoverListResponse = Schemas['DiscoverListResponse']
 
 export type RequestResponse = Schemas['RequestResponse']
+export type CancelRequestResponse = Schemas['CancelRequestResponse']
 export type RequestListResponse = Schemas['RequestListResponse']
 export type WithdrawSubscriptionResponse = Schemas['WithdrawSubscriptionResponse']
 export type CreateRequestBody = Schemas['CreateRequestBody']

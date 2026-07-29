@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
 from plex_manager.models import (
     AuthSession,
     Blocklist,
@@ -29,6 +30,9 @@ from plex_manager.models import (
     Setting,
     User,
 )
+from plex_manager.ports.download_client import DownloadStatus
+from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.web.deps import get_downloads_host_root, hash_session_token
 from tests.web.fakes import FakeLibrary, FakeProwlarr, FakeQbittorrent, candidate, override_adapters
 
@@ -40,6 +44,11 @@ _HEADERS = {"X-Api-Key": _API_KEY}
 _TMDB = 603
 _CULPRIT = "3" * 40
 _ALT = "a" * 40
+
+
+class _RecoveryUnavailableQbittorrent(FakeQbittorrent):
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        raise QbittorrentError("qBittorrent is unreachable")
 
 
 async def _creator_session(app: FastAPI, *, tag: str) -> tuple[int, dict[str, str], dict[str, str]]:
@@ -361,8 +370,52 @@ async def test_cancel_endpoint_settles_cancelled(
     )
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
+    assert response.json()["cleanup_deferred"] is False
     assert response.json()["can_mutate"] is True
     assert (_CULPRIT, True) in qbt.removed
+
+
+async def test_cancel_endpoint_surfaces_deferred_intent_cleanup(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    user_id, cookies, headers = await _creator_session(app, tag="cancel-deferred")
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+            user_id=user_id,
+        )
+        session.add(request)
+        await session.flush()
+
+        await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="future-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    override_adapters(app, qbt=_RecoveryUnavailableQbittorrent())
+    response = await client.post(
+        f"/api/v1/requests/{request_id}/cancel", cookies=cookies, headers=headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["cleanup_deferred"] is True
 
 
 async def test_cancel_endpoint_409_for_imported_request(

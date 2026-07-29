@@ -498,6 +498,7 @@ class SqlSeasonRequestRepository:
             active_download = (
                 select(Download.id)
                 .where(
+                    MediaRequest.id == SeasonRequest.media_request_id,
                     Download.tmdb_id == MediaRequest.tmdb_id,
                     Download.media_type == MediaType.tv,
                     Download.season == SeasonRequest.season_number,

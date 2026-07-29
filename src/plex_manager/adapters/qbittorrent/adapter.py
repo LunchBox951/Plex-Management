@@ -275,6 +275,7 @@ def _info_hash_from_torrent(data: bytes) -> str | None:
 
 
 _HEX_BTIH_PATTERN: Final = re.compile(r"[0-9A-Fa-f]{40}")
+_HEX_BTMH_PATTERN: Final = re.compile(r"[0-9A-Fa-f]{64}")
 
 
 def _normalize_btih(value: str) -> str:
@@ -319,6 +320,14 @@ def _normalize_btih(value: str) -> str:
     raise QbittorrentSourceError("btih is not a valid 40-char hex or 32-char base32 info-hash")
 
 
+def _normalize_btmh(value: str) -> str:
+    """Return the SHA-256 digest from a BitTorrent-v2 ``1220`` multihash."""
+    digest = value.removeprefix("1220")
+    if not value.startswith("1220") or len(digest) != 64 or not _HEX_BTMH_PATTERN.fullmatch(digest):
+        raise QbittorrentSourceError("btmh is not a valid 1220 SHA-256 multihash")
+    return digest.lower()
+
+
 def _info_hash_from_magnet(magnet: str) -> str | None:
     """Extract the info-hash from a magnet URI's ``xt=urn:btih:`` parameter(s).
 
@@ -356,15 +365,25 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
         for xt in parse_qs(parsed.query).get("xt", [])
         if xt.startswith("urn:btih:")
     ]
-    if not hashes:
+    if hashes:
+        unique_hashes = set(hashes)
+        if len(unique_hashes) > 1:
+            raise QbittorrentSourceError(
+                "magnet names conflicting btih values; qBittorrent may track a "
+                "different one than any single value picked here"
+            )
+        return next(iter(unique_hashes))
+    btmh_hashes = [
+        _normalize_btmh(xt[len("urn:btmh:") :])
+        for xt in parse_qs(parsed.query).get("xt", [])
+        if xt.startswith("urn:btmh:")
+    ]
+    if not btmh_hashes:
         return None
-    unique_hashes = set(hashes)
-    if len(unique_hashes) > 1:
-        raise QbittorrentSourceError(
-            "magnet names conflicting btih values; qBittorrent may track a "
-            "different one than any single value picked here"
-        )
-    return next(iter(unique_hashes))
+    unique_btmh_hashes = set(btmh_hashes)
+    if len(unique_btmh_hashes) > 1:
+        raise QbittorrentSourceError("magnet names conflicting btmh values")
+    return next(iter(unique_btmh_hashes))
 
 
 def _is_add_success(response: httpx.Response) -> bool:

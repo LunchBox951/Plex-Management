@@ -1146,7 +1146,9 @@ describe('TitleDetailModal — keep-forever pin + evicted status (ADR-0012)', ()
 })
 
 describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)', () => {
-  function movieRequest(overrides: Partial<RequestResponse> = {}): RequestResponse {
+  function movieRequest(
+    overrides: Partial<RequestResponse> & { cleanup_deferred?: boolean } = {},
+  ): RequestResponse {
     return {
       id: 7,
       tmdb_id: 42,
@@ -1211,6 +1213,30 @@ describe('TitleDetailModal — correction verbs report-issue + cancel (ADR-0014)
     fireEvent.click(confirms[confirms.length - 1]!)
 
     await waitFor(() => expect(cancelMock.mutateAsync).toHaveBeenCalledWith(7))
+  })
+
+  it('warns when cancellation leaves torrent removal pending for reconciliation', async () => {
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({ authoritative: true,
+      data: { requests: [movieRequest({ status: 'searching' })] },
+    })
+    const cancelMock = mutation({
+      ...movieRequest({ status: 'cancelled' }),
+      cleanup_deferred: true,
+    })
+    ;(useCancelRequest as unknown as Mock).mockReturnValue(cancelMock)
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /cancel request/i }))
+    const confirms = screen.getAllByRole('button', { name: /cancel request/i })
+    fireEvent.click(confirms[confirms.length - 1]!)
+
+    await waitFor(() =>
+      expect(toastState.toast).toHaveBeenCalledWith({
+        title: 'Request cancelled',
+        description: 'Torrent removal is pending and will retry automatically.',
+        intent: 'warning',
+      }),
+    )
   })
 
   it('offers Cancel for a TV request waiting for its air date', async () => {

@@ -56,6 +56,7 @@ from plex_manager.web.deps import (
 from plex_manager.web.errors import AppError
 from plex_manager.web.events import publish_realtime
 from plex_manager.web.schemas import (
+    CancelRequestResponse,
     CompactStateField,
     CompactStateRequest,
     CompactStateResponse,
@@ -388,6 +389,13 @@ async def _to_response(
         can_withdraw=can_withdraw,
         has_other_participants=has_other_participants,
     )
+
+
+def _to_cancel_response(
+    response: RequestResponse, *, cleanup_deferred: bool
+) -> CancelRequestResponse:
+    """Add cancellation-only cleanup status without polluting ordinary request reads."""
+    return CancelRequestResponse(**response.model_dump(), cleanup_deferred=cleanup_deferred)
 
 
 @router.post(
@@ -933,7 +941,7 @@ async def cancel_request_endpoint(
     auth: Annotated[AuthContext, Depends(_require_request_mutator)],
     session: Annotated[AsyncSession, Depends(get_session)],
     qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
-) -> RequestResponse:
+) -> CancelRequestResponse:
     """Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.
 
     Removes any active torrent(s) WITH data (best-effort) and flips the request
@@ -956,10 +964,18 @@ async def cancel_request_endpoint(
     install with qBittorrent unconfigured. When there ARE active torrents to remove but
     the client is unconfigured, the service refuses up front (409
     ``service_not_configured``) rather than silently leaking a seeding torrent.
+
+    ``cleanup_deferred`` is ``true`` only after the request was committed as
+    ``cancelled`` but qBittorrent client removal remains pending. The durable
+    ``cancel_requested`` intent guarantees that normal reconciliation retries
+    that removal automatically.
     """
     try:
         if auth.is_admin:
-            updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+            outcome = await correction_service.cancel_request_with_outcome(
+                session, qbt, request_id=request_id
+            )
+            updated = outcome.record
         else:
             if auth.user_id is None:  # pragma: no cover - defensive; the mutator dependency
                 # already required a user-owned row match, which is impossible without a
@@ -967,9 +983,10 @@ async def cancel_request_endpoint(
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
                 )
-            updated = await correction_service.cancel_request_as_owner(
+            outcome = await correction_service.cancel_request_as_owner_with_outcome(
                 session, qbt, request_id=request_id, user_id=auth.user_id
             )
+            updated = outcome.record
     except correction_service.RequestNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="request_not_found"
@@ -987,19 +1004,26 @@ async def cancel_request_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="import_in_progress"
         ) from exc
+    except correction_service.CancellationRaceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="cancellation_conflict"
+        ) from exc
     except DownloadClientRequiredError as exc:
         # Active torrent(s) to remove, but qBittorrent is unconfigured. Surface the same
         # honest 409 ``service_not_configured`` the mark-failed endpoint uses -- refused
         # before any state change, so nothing was settled or removed.
         raise ServiceNotConfiguredError("qbittorrent") from exc
     can_withdraw, has_other_participants = await _subscriber_flags(session, updated, auth)
-    response_body = await _to_response(
-        session,
-        updated,
-        can_mutate=True,
-        is_owner=_is_owner(auth, updated),
-        can_withdraw=can_withdraw,
-        has_other_participants=has_other_participants,
+    response_body = _to_cancel_response(
+        await _to_response(
+            session,
+            updated,
+            can_mutate=True,
+            is_owner=_is_owner(auth, updated),
+            can_withdraw=can_withdraw,
+            has_other_participants=has_other_participants,
+        ),
+        cleanup_deferred=outcome.cleanup_deferred,
     )
     publish_realtime(
         http_request.app,

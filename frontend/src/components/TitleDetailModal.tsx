@@ -1080,8 +1080,16 @@ export function TitleDetailModal({
   const runCancel = useCallback(async () => {
     if (!cancelFor) return
     try {
-      await cancelRequest.mutateAsync(cancelFor.requestId)
-      toast({ title: 'Request cancelled', intent: 'success' })
+      const outcome = await cancelRequest.mutateAsync(cancelFor.requestId)
+      toast(
+        outcome.cleanup_deferred
+          ? {
+              title: 'Request cancelled',
+              description: 'Torrent removal is pending and will retry automatically.',
+              intent: 'warning',
+            }
+          : { title: 'Request cancelled', intent: 'success' },
+      )
       setCancelFor(null)
     } catch (error) {
       toast({ title: 'Cancel failed', description: asApiError(error).message, intent: 'error' })

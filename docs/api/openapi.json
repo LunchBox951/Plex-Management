@@ -504,6 +504,174 @@
         "title": "BlocklistResponse",
         "type": "object"
       },
+      "CancelRequestResponse": {
+        "description": "Cancellation outcome with its one-shot client-cleanup status.",
+        "properties": {
+          "backdrop_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backdrop Url"
+          },
+          "can_mutate": {
+            "default": false,
+            "title": "Can Mutate",
+            "type": "boolean"
+          },
+          "can_withdraw": {
+            "default": false,
+            "title": "Can Withdraw",
+            "type": "boolean"
+          },
+          "cleanup_deferred": {
+            "default": false,
+            "title": "Cleanup Deferred",
+            "type": "boolean"
+          },
+          "download_progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Progress"
+          },
+          "has_other_participants": {
+            "default": false,
+            "title": "Has Other Participants",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_anime": {
+            "default": false,
+            "title": "Is Anime",
+            "type": "boolean"
+          },
+          "is_owner": {
+            "default": false,
+            "title": "Is Owner",
+            "type": "boolean"
+          },
+          "keep_forever": {
+            "default": false,
+            "title": "Keep Forever",
+            "type": "boolean"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "poster_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Poster Url"
+          },
+          "requested_episodes": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Episodes"
+          },
+          "requested_seasons": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Seasons"
+          },
+          "seasons": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SeasonStatus"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seasons"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RequestStatus"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          },
+          "tv_request_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tv Request Mode"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
+          }
+        },
+        "required": [
+          "id",
+          "tmdb_id",
+          "media_type",
+          "title",
+          "status"
+        ],
+        "title": "CancelRequestResponse",
+        "type": "object"
+      },
       "CompactStateField": {
         "description": "One tile's folded live-state (issue #370) -- see ``CompactRequestState``.\n\n``status``/``request_id`` are the representative row's (active-else-newest);\n``has_history`` is always ``True`` for every key present in the response\nmap (a title with no visible request rows is simply absent) -- included\nexplicitly rather than relying on callers to infer it from key presence,\nsince the tv quick-request gate reads it directly.\n``has_coexisting_available`` is the movie presence-contradiction bit: a\nNON-representative row is a settled ``available`` alongside the chosen\nrepresentative. Always ``False`` for tv.",
         "properties": {
@@ -6712,7 +6880,7 @@
     },
     "/api/v1/requests/{request_id}/cancel": {
       "post": {
-        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\n``POST /cancel`` is a HARD cancel of the whole request -- it never silently\nremoves just the caller. An admin may always hard-cancel. A non-admin owner\nmay too, but ONLY when they are the request's sole participant; with other\nsubscribers still attached, this refuses 409 ``has_other_participants``\n(issue #314) -- the collaborative correction path for that case is\n``DELETE /subscription`` (Withdraw), which hands ownership off instead of\ncancelling co-participants' shared request out from under them.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.",
+        "description": "Cancel a not-yet-imported request (ADR-0014): drop active torrent(s), settle.\n\nRemoves any active torrent(s) WITH data (best-effort) and flips the request\n(and every tracked season, for tv) to the settled ``cancelled`` status; the\nrow is kept for history and nothing is re-grabbed. A request past the\nnot-yet-imported stage is refused (409 ``not_cancellable``) -- use report-issue\nto redo an imported title instead.\n\n``POST /cancel`` is a HARD cancel of the whole request -- it never silently\nremoves just the caller. An admin may always hard-cancel. A non-admin owner\nmay too, but ONLY when they are the request's sole participant; with other\nsubscribers still attached, this refuses 409 ``has_other_participants``\n(issue #314) -- the collaborative correction path for that case is\n``DELETE /subscription`` (Withdraw), which hands ownership off instead of\ncancelling co-participants' shared request out from under them.\n\nqBittorrent is resolved OPTIONALLY (``get_qbittorrent_optional``): a cancel for a\n``pending``/``searching``/``no_acceptable_release`` request with NO active download\nrows is a pure DB settle that never touches the client, so it still works on an\ninstall with qBittorrent unconfigured. When there ARE active torrents to remove but\nthe client is unconfigured, the service refuses up front (409\n``service_not_configured``) rather than silently leaking a seeding torrent.\n\n``cleanup_deferred`` is ``true`` only after the request was committed as\n``cancelled`` but qBittorrent client removal remains pending. The durable\n``cancel_requested`` intent guarantees that normal reconciliation retries\nthat removal automatically.",
         "operationId": "cancel_request_endpoint_api_v1_requests__request_id__cancel_post",
         "parameters": [
           {
@@ -6730,7 +6898,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RequestResponse"
+                  "$ref": "#/components/schemas/CancelRequestResponse"
                 }
               }
             },

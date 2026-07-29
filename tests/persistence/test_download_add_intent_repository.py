@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
+from plex_manager.models import Download, MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -97,6 +97,61 @@ async def test_state_cas_and_delete_cascades_scopes(session: AsyncSession) -> No
     assert not await repo.mark_state(intent.id, "needs_attention", expected_state="prepared")
     deleted = await repo.delete(intent.id)
     assert deleted
+
+
+async def test_needs_attention_intent_is_parked_outside_recovery_queue(
+    session: AsyncSession,
+) -> None:
+    repo = SqlDownloadAddIntentRepository(session)
+    intent = await repo.create(
+        CreateDownloadAddIntent(
+            torrent_hash="parked",
+            tmdb_id=7,
+            media_type="movie",
+            save_path="",
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=7, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    assert await repo.mark_state(intent.id, "needs_attention", expected_state="prepared")
+
+    assert await repo.list_recoverable() == []
+
+
+async def test_season_cas_ignores_active_download_for_other_show_same_season(
+    session: AsyncSession,
+) -> None:
+    first = MediaRequest(
+        tmdb_id=70, media_type=MediaType.tv, title="First", status=RequestStatus.pending
+    )
+    second = MediaRequest(
+        tmdb_id=71, media_type=MediaType.tv, title="Second", status=RequestStatus.pending
+    )
+    session.add_all((first, second))
+    await session.flush()
+    season = SeasonRequest(
+        media_request_id=second.id, season_number=2, status=RequestStatus.pending
+    )
+    session.add(season)
+    session.add(
+        Download(
+            torrent_hash="first-active",
+            status="downloading",
+            media_request_id=first.id,
+            tmdb_id=first.tmdb_id,
+            media_type=MediaType.tv,
+            season=2,
+        )
+    )
+    await session.flush()
+
+    assert await SqlSeasonRequestRepository(session).set_status_if_in(
+        season.id,
+        RequestStatus.no_acceptable_release.value,
+        frozenset({RequestStatus.pending.value}),
+        require_no_active_download_or_intent=True,
+    )
 
 
 async def test_movie_and_season_cas_refuse_matching_future_intent(session: AsyncSession) -> None:
