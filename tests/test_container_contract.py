@@ -156,6 +156,7 @@ def test_dockerfile_preserves_runtime_contract_without_debian_tools() -> None:
 def test_runtime_installs_timezone_data_and_limits_application_ownership() -> None:
     instructions = _dockerfile_instructions()
     copy_lines = [line for line in instructions if line.startswith("COPY ")]
+    add_lines = [line for line in instructions if line.startswith("ADD ")]
     chown_commands = [
         command
         for line in instructions
@@ -170,6 +171,10 @@ def test_runtime_installs_timezone_data_and_limits_application_ownership() -> No
     assert TZDATA_PACKAGE in "\n".join(instructions)
     assert chown_commands == ["chown 10001:10001 /app/data"], (
         "only the writable data directory may be chowned"
+    )
+    assert not add_lines, (
+        "ADD is forbidden: its URL, auto-extract, and --chown semantics are unnecessary; "
+        "use COPY for image assets"
     )
     assert protected_copy_lines, "expected COPY instructions for migration assets"
     assert all("--chown" not in line for line in protected_copy_lines), (
