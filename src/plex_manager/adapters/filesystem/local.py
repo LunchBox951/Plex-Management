@@ -37,7 +37,10 @@ _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
 )
 
 
-_XATTR_COPY_TOLERATED_ERRNOS: frozenset[int] = frozenset({errno.EPERM, errno.ENOTSUP})
+_XATTR_ENUMERATION_TOLERATED_ERRNOS: frozenset[int] = frozenset({errno.EPERM, errno.ENOTSUP})
+_XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.EACCES}
+)
 _XATTR_MISSING_ERRNOS: frozenset[int] = frozenset(
     {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
 )
@@ -481,7 +484,7 @@ def _copy_xattrs(source_fd: int, target_fd: int) -> None:
     try:
         names = os.listxattr(source_fd)
     except OSError as exc:
-        if exc.errno in _XATTR_COPY_TOLERATED_ERRNOS:
+        if exc.errno in _XATTR_ENUMERATION_TOLERATED_ERRNOS:
             return
         raise
 
@@ -489,13 +492,13 @@ def _copy_xattrs(source_fd: int, target_fd: int) -> None:
         try:
             value = os.getxattr(source_fd, name)
         except OSError as exc:
-            if exc.errno in _XATTR_COPY_TOLERATED_ERRNOS | _XATTR_MISSING_ERRNOS:
+            if exc.errno in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS | _XATTR_MISSING_ERRNOS:
                 continue
             raise
         try:
             os.setxattr(target_fd, name, value)
         except OSError as exc:
-            if exc.errno not in _XATTR_COPY_TOLERATED_ERRNOS:
+            if exc.errno not in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
                 raise
 
 

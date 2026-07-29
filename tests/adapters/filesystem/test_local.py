@@ -313,6 +313,84 @@ def test_cross_device_copy_tolerates_xattr_capability_or_permission_errors(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+@pytest.mark.parametrize("operation", ["getxattr", "setxattr"])
+def test_cross_device_copy_tolerates_eacces_for_each_xattr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """A denied xattr is skipped while readable attributes still copy."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    copied_names: list[str] = []
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["security.denied", "user.allowed"]
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        assert isinstance(fd, int)
+        if operation == "getxattr" and name == "security.denied":
+            raise OSError(errno.EACCES, "xattr access refused")
+        return name.encode()
+
+    def _setxattr(fd: int, name: str, value: bytes) -> None:
+        assert isinstance(fd, int)
+        if operation == "setxattr" and name == "security.denied":
+            raise OSError(errno.EACCES, "xattr access refused")
+        assert value == name.encode()
+        copied_names.append(name)
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert copied_names == ["user.allowed"]
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_cross_device_copy_propagates_eacces_from_xattr_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An xattr enumeration denial aborts publication rather than skipping every xattr."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(errno.EACCES, "xattr enumeration refused")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == errno.EACCES
+    assert not dst.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 def test_cross_device_copy_skips_an_xattr_removed_after_listing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
