@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
+from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import DownloadAddIntent, DownloadAddIntentScope
 from plex_manager.ports.repositories import (
@@ -84,6 +85,22 @@ class SqlDownloadAddIntentRepository:
     async def _to_record(self, row: DownloadAddIntent) -> DownloadAddIntentRecord:
         return _record(row, await self._scopes(row.id))
 
+    async def _find_owner(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord | None:
+        by_hash = await self.get_by_hash(command.torrent_hash)
+        if by_hash is not None:
+            return by_hash
+        for scope in command.scopes:
+            owner_id = await self._session.scalar(
+                select(DownloadAddIntentScope.intent_id).where(
+                    DownloadAddIntentScope.tmdb_id == scope.tmdb_id,
+                    DownloadAddIntentScope.media_type == scope.media_type,
+                    DownloadAddIntentScope.scope_key == scope.scope_key,
+                )
+            )
+            if owner_id is not None:
+                return await self.get(owner_id)
+        return None
+
     async def create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord:
         torrent_hash = command.torrent_hash.lower()
         existing = await self.get_by_hash(torrent_hash)
@@ -104,22 +121,29 @@ class SqlDownloadAddIntentRepository:
             observed_season_status=command.observed_season_status,
             owns_client_torrent=command.owns_client_torrent,
         )
-        self._session.add(row)
-        await self._session.flush()
-        for scope in command.scopes:
-            self._session.add(
-                DownloadAddIntentScope(
-                    intent_id=row.id,
-                    media_request_id=scope.media_request_id or command.media_request_id,
-                    tmdb_id=scope.tmdb_id,
-                    media_type=scope.media_type,
-                    scope_key=scope.scope_key,
-                    season_number=scope.season_number,
-                    episodes_json=list(_episodes(list(scope.episodes or ())) or ()) or None,
-                    is_target=scope.is_target,
-                )
-            )
-        await self._session.flush()
+        try:
+            async with self._session.begin_nested():
+                self._session.add(row)
+                await self._session.flush()
+                for scope in command.scopes:
+                    self._session.add(
+                        DownloadAddIntentScope(
+                            intent_id=row.id,
+                            media_request_id=scope.media_request_id or command.media_request_id,
+                            tmdb_id=scope.tmdb_id,
+                            media_type=scope.media_type,
+                            scope_key=scope.scope_key,
+                            season_number=scope.season_number,
+                            episodes_json=list(_episodes(list(scope.episodes or ())) or ()) or None,
+                            is_target=scope.is_target,
+                        )
+                    )
+                await self._session.flush()
+        except IntegrityError:
+            owner = await self._find_owner(command)
+            if owner is None:
+                raise
+            return owner
         return await self._to_record(row)
 
     async def get(self, intent_id: int, *, fresh: bool = False) -> DownloadAddIntentRecord | None:

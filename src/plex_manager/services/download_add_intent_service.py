@@ -38,6 +38,19 @@ _logger = logging.getLogger(__name__)
 _MAX_ERROR_LENGTH = 180
 
 
+class IntentRecoveryConflictError(RuntimeError):
+    """An intent cannot safely become a tracked download without operator correction."""
+
+
+_TERMINAL_DOWNLOAD_STATES = frozenset(
+    {
+        DownloadState.Imported.value,
+        DownloadState.Failed.value,
+        DownloadState.NoAcceptableRelease.value,
+    }
+)
+
+
 class _IntentClient(Protocol):
     async def prepare_add(self, magnet_or_url: str) -> PreparedAdd: ...
 
@@ -144,6 +157,8 @@ async def _finalize_present(
         if record is None:
             raise LookupError("durable intent disappeared before finalization")
         return record
+    if current.media_request_id is None:
+        raise IntentRecoveryConflictError("intent request no longer exists")
     existing = await downloads.get_by_hash(current.torrent_hash)
     if existing is None:
         record = await downloads.create(
@@ -167,6 +182,13 @@ async def _finalize_present(
             timeout_at=datetime.now(UTC),
         )
     else:
+        if (
+            existing.status in _TERMINAL_DOWNLOAD_STATES
+            or existing.media_request_id != current.media_request_id
+            or existing.tmdb_id != current.tmdb_id
+            or existing.media_type != current.media_type
+        ):
+            raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
         record = existing
     for scope in current.scopes:
         if scope.is_target and scope.season_number is not None:
@@ -176,37 +198,36 @@ async def _finalize_present(
                 season=scope.season_number,
                 episodes=list(scope.episodes) if scope.episodes else None,
             )
-        if current.media_request_id is not None and scope.season_number is not None:
+        if scope.season_number is not None:
             await downloads.ensure_coverage_claim(
                 record.id, media_request_id=current.media_request_id, season=scope.season_number
             )
-    if current.media_request_id is not None:
-        if current.media_type == "tv":
-            target = next((scope for scope in current.scopes if scope.is_target), None)
-            if target is not None and target.season_number is not None:
-                season_row = await SqlSeasonRequestRepository(session).ensure(
-                    current.media_request_id,
-                    target.season_number,
-                    status=RequestStatus.pending.value,
-                )
-                moved = await season_request_service.set_status_if_in(
-                    session,
-                    media_request_id=current.media_request_id,
-                    season_request_id=season_row.id,
-                    status=RequestStatus.downloading.value,
-                    allowed_from=frozenset({current.observed_season_status or season_row.status}),
-                )
-            else:
-                moved = False
-        else:
-            moved = await SqlRequestRepository(session).set_status_if_in(
+    if current.media_type == "tv":
+        target = next((scope for scope in current.scopes if scope.is_target), None)
+        if target is not None and target.season_number is not None:
+            season_row = await SqlSeasonRequestRepository(session).ensure(
                 current.media_request_id,
-                RequestStatus.downloading.value,
-                frozenset({current.observed_request_status or RequestStatus.pending.value}),
+                target.season_number,
+                status=RequestStatus.pending.value,
             )
-        if not moved:
-            await session.rollback()
-            raise RuntimeError("intent premise no longer active")
+            moved = await season_request_service.set_status_if_in(
+                session,
+                media_request_id=current.media_request_id,
+                season_request_id=season_row.id,
+                status=RequestStatus.downloading.value,
+                allowed_from=frozenset({current.observed_season_status or season_row.status}),
+            )
+        else:
+            moved = False
+    else:
+        moved = await SqlRequestRepository(session).set_status_if_in(
+            current.media_request_id,
+            RequestStatus.downloading.value,
+            frozenset({current.observed_request_status or RequestStatus.pending.value}),
+        )
+    if not moved:
+        await session.rollback()
+        raise RuntimeError("intent premise no longer active")
     session.add(
         DownloadHistory(
             tmdb_id=current.tmdb_id,
@@ -290,11 +311,18 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
             result = IntentRecoveryResult(
                 result.finalized + 1, result.removed, result.needs_attention
             )
-        except Exception as exc:
+        except IntentRecoveryConflictError as exc:
             await session.rollback()
             await intents.mark_state(intent.id, "needs_attention", last_error=_safe_error(exc))
             await session.commit()
+            _logger.warning("durable intent %s needs operator attention (%s)", intent.id, exc)
             result = IntentRecoveryResult(
                 result.finalized, result.removed, result.needs_attention + 1
             )
+        except Exception as exc:
+            await session.rollback()
+            _logger.warning(
+                "durable intent %s recovery deferred by %s", intent.id, type(exc).__name__
+            )
+            raise
     return result

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
@@ -67,18 +65,19 @@ async def test_same_hash_is_idempotent_but_title_scope_collision_is_not(
     first = await repo.create(command)
     assert (await repo.create(command)).id == first.id
 
-    with pytest.raises(IntegrityError):
-        await repo.create(
-            CreateDownloadAddIntent(
-                torrent_hash="two",
-                tmdb_id=7,
-                media_type="movie",
-                save_path="",
-                scopes=(
-                    DownloadAddIntentScopeCreate(tmdb_id=7, media_type="movie", scope_key="movie"),
-                ),
-            )
+    owner = await repo.create(
+        CreateDownloadAddIntent(
+            torrent_hash="two",
+            tmdb_id=7,
+            media_type="movie",
+            save_path="",
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=7, media_type="movie", scope_key="movie"),
+            ),
         )
+    )
+    assert owner.id == first.id
+    assert owner.torrent_hash == first.torrent_hash
 
 
 async def test_state_cas_and_delete_cascades_scopes(session: AsyncSession) -> None:

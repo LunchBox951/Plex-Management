@@ -1545,7 +1545,16 @@ async def cancel_request(
     removal_ids: list[int] = []
     try:
         for intent in intents:
-            await intent_repo.mark_state(intent.id, "cancel_requested", expected_state="prepared")
+            if intent.state == "cancel_requested":
+                continue
+            marked = await intent_repo.mark_state(
+                intent.id, "cancel_requested", expected_state=intent.state
+            )
+            if not marked:
+                refreshed = await intent_repo.get(intent.id, fresh=True)
+                if refreshed is not None and refreshed.state != "cancel_requested":
+                    await session.rollback()
+                    raise RuntimeError("durable intent changed while cancellation was claimed")
         for row in active:
             moved = await download_repo.update_status_if_in(
                 row.id,

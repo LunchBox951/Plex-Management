@@ -158,6 +158,21 @@ async def test_prepare_add_does_not_post() -> None:
     assert calls == []
 
 
+async def test_prepare_add_does_not_retain_credential_bearing_http_source() -> None:
+    source = "http://username:password@93.184.216.34/file.torrent?apikey=credential"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == source:
+            return httpx.Response(200, content=_TORRENT_BYTES)
+        return httpx.Response(404, text="unhandled")
+
+    prepared = await _client(handler).prepare_add(source)
+
+    assert prepared.torrent_hash == _TORRENT_HASH
+    assert prepared.submission_url is None
+    assert prepared.torrent_bytes == _TORRENT_BYTES
+
+
 async def test_add_prepared_posts_once_and_rejects_invalid_payload_shape() -> None:
     calls: list[str] = []
 

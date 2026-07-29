@@ -1530,6 +1530,44 @@ async def test_cancel_marks_future_intent_then_recovers_its_owned_torrent(
         assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
+async def test_cancel_claims_needs_attention_intent_for_removal(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="attention-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await SqlDownloadAddIntentRepository(session).mark_state(intent.id, "needs_attention")
+        await session.commit()
+        request_id = request.id
+
+    async with sessionmaker_() as session:
+        await correction_service.cancel_request(session, None, request_id=request_id)
+        remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+
+    assert remaining is not None
+    assert remaining.state == "cancel_requested"
+
+
 async def test_cancel_already_gone_torrent_is_a_no_op_success(
     sessionmaker_: SessionMaker,
 ) -> None:
