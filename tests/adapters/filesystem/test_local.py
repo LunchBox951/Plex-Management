@@ -146,6 +146,39 @@ def test_hardlink_or_copy_creates_linked_copy(tmp_path: Path) -> None:
     assert src.stat().st_ino == dst.stat().st_ino
 
 
+def test_hardlink_release_failure_rolls_back_placement_and_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock-release failure leaves neither an untracked destination nor stale ownership."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock_name = ".dst.mkv.publish.lock"
+    real_unlink = os.unlink
+    fail_once = True
+
+    def _fail_lock_release_once(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal fail_once
+        if path == lock_name and fail_once:
+            fail_once = False
+            raise OSError(errno.EIO, "simulated release failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _fail_lock_release_once)
+
+    with pytest.raises(OSError, match="simulated release failure"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert not dst.exists()
+    assert (tmp_path / lock_name).exists()
+    (tmp_path / lock_name).unlink()
+
+    publication = LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert publication.placed is True
+    assert dst.read_text() == "payload"
+
+
 def test_hardlink_or_copy_hardlink_path_preserves_active_publish_lock(tmp_path: Path) -> None:
     src = tmp_path / "src.mkv"
     src.write_text("payload")
@@ -818,7 +851,7 @@ def test_publish_lock_release_surfaces_identity_probe_failure(
     finally:
         os.close(dir_fd)
 
-    assert (tmp_path / lock_name).read_text() == str(os.getpid())
+    assert (tmp_path / lock_name).read_text() == f"v1:{os.getpid()}\n"
 
 
 def test_publish_lock_context_surfaces_unlink_failure(
@@ -845,7 +878,7 @@ def test_publish_lock_context_surfaces_unlink_failure(
         os.close(dir_fd)
 
     # The failed unlink intentionally leaves the PID-bearing lock visible for recovery.
-    assert (tmp_path / lock_name).read_text() == str(os.getpid())
+    assert (tmp_path / lock_name).read_text() == f"v1:{os.getpid()}\n"
 
 
 def test_replace_held_publish_lock_cleans_private_temp_after_identity_loss(
@@ -970,6 +1003,92 @@ def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
 
     assert dst.read_text() == "payload"
     assert not lock.exists()
+
+
+def test_publish_lock_incomplete_v1_pid_is_age_gated(tmp_path: Path) -> None:
+    """A short v1 PID write cannot authorize immediate identity-only reclaim."""
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    lock.write_text("v1:999999999")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_fd = os.open(lock.name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        assert not local_fs._existing_lock_is_reclaimable(lock_fd)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(lock_fd)
+        os.close(dir_fd)
+
+
+def test_publish_lock_reclaims_complete_v1_dead_pid(tmp_path: Path) -> None:
+    """A complete v1 PID retains immediate dead-owner recovery semantics."""
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    lock.write_text("v1:999999999\n")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_fd = os.open(lock.name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        assert local_fs._existing_lock_is_reclaimable(lock_fd)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(lock_fd)
+        os.close(dir_fd)
+
+
+def test_identity_only_contender_is_age_gated_during_partial_v1_pid_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An identity-only contender cannot reclaim a creator's incomplete v1 record."""
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    display = os.fspath(tmp_path / "dst.mkv")
+    partial_written = threading.Event()
+    resume_creator = threading.Event()
+    creator_inside = threading.Event()
+    contender_inside = threading.Event()
+    real_write = os.write
+
+    def _unsupported_flock(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOTSUP, "advisory locking unsupported")
+
+    def _pause_after_v1_prefix(fd: int, payload: bytes) -> int:
+        if threading.current_thread().name == "partial-v1-creator" and not partial_written.is_set():
+            count = real_write(fd, payload[:2])
+            partial_written.set()
+            assert resume_creator.wait(2)
+            return count
+        return real_write(fd, payload)
+
+    def _creator() -> None:
+        with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd, "dst.mkv", display
+        ):
+            creator_inside.set()
+
+    def _contender() -> None:
+        try:
+            with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", display
+            ):
+                contender_inside.set()
+        except FileExistsError:
+            pass
+
+    monkeypatch.setattr(fcntl, "flock", _unsupported_flock)
+    monkeypatch.setattr(os, "write", _pause_after_v1_prefix)
+    creator = threading.Thread(target=_creator, name="partial-v1-creator")
+    contender = threading.Thread(target=_contender, name="partial-v1-contender")
+    try:
+        creator.start()
+        assert partial_written.wait(2)
+        contender.start()
+        contender.join(2)
+        assert not contender.is_alive()
+        assert not contender_inside.is_set()
+        resume_creator.set()
+        creator.join(2)
+        assert not creator.is_alive()
+        assert creator_inside.is_set()
+    finally:
+        resume_creator.set()
+        creator.join(2)
+        contender.join(2)
+        os.close(dir_fd)
 
 
 def test_publish_lock_fences_creator_suspended_after_empty_create(

@@ -20,7 +20,7 @@ import os
 import shutil
 import stat
 import time
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
@@ -72,6 +72,27 @@ class LocalFileSystemError(RuntimeError):
 
 class PublishLockReclaimGuardError(FileExistsError):
     """A crashed identity-only reclaimer left a visible recovery guard artifact."""
+
+
+class PublicationReleaseError(OSError):
+    """A post-placement lock-release failure whose rollback could not be verified."""
+
+    publication: FilePublication
+    release_error: BaseException
+    cleanup_error: BaseException
+
+    def __init__(
+        self,
+        publication: FilePublication,
+        release_error: BaseException,
+        cleanup_error: BaseException,
+    ) -> None:
+        super().__init__(
+            "publication lock release failed after placement cleanup could not complete"
+        )
+        self.publication = publication
+        self.release_error = release_error
+        self.cleanup_error = cleanup_error
 
 
 class PartialDeleteError(OSError):
@@ -221,16 +242,18 @@ def _existing_lock_is_reclaimable(lock_fd: int) -> bool:
     """Whether the held descriptor contains a legacy lock proven safe to recover."""
     try:
         lock_info = os.fstat(lock_fd)
-        raw = os.pread(lock_fd, 64, 0).decode("utf-8", errors="replace").strip()
+        raw = os.pread(lock_fd, 64, 0).decode("utf-8", errors="replace")
     except OSError:
         return False
-    if not raw:
-        return time.time() - lock_info.st_mtime > _EMPTY_LOCK_STALE_SECONDS
-    try:
-        pid = int(raw)
-    except ValueError:
-        return time.time() - lock_info.st_mtime > _EMPTY_LOCK_STALE_SECONDS
-    return _pid_is_running(pid) is False
+    if raw.startswith("v1:"):
+        payload = raw.removeprefix("v1:")
+        if payload.endswith("\n") and payload[:-1].isdigit():
+            pid = int(payload[:-1])
+            return _pid_is_running(pid) is False
+    elif raw.isdigit():
+        # Old writers published bare decimal PIDs; retain their recovery semantics.
+        return _pid_is_running(int(raw)) is False
+    return time.time() - lock_info.st_mtime > _EMPTY_LOCK_STALE_SECONDS
 
 
 def _existing_lock_is_empty(lock_fd: int) -> bool:
@@ -282,7 +305,7 @@ def _unlink_created_publish_lock_if_unowned(dir_fd: int, lock_name: str, lock_fd
 
 def _write_lock_pid(lock_fd: int) -> None:
     """Publish this process's PID to a private, held lock descriptor."""
-    payload = str(os.getpid()).encode("ascii")
+    payload = f"v1:{os.getpid()}\n".encode("ascii")
     os.ftruncate(lock_fd, 0)
     os.lseek(lock_fd, 0, os.SEEK_SET)
     written = 0
@@ -654,6 +677,8 @@ def _publish_lock(
     display: str,
     *,
     reclaim_stale_with_existing_entry: bool = False,
+    rollback_placed: Callable[[], None] | None = None,
+    publication_supplier: Callable[[], FilePublication | None] | None = None,
 ) -> Generator[None, None, None]:
     """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
 
@@ -674,16 +699,33 @@ def _publish_lock(
     try:
         yield
     finally:
-        # Keep the guarded unlink and descriptor close adjacent: this makes the
-        # publish-lock context's ownership transfer explicit without introducing
-        # an unlocked-but-still-open interval.
+        # A release error after a proven placement must not make success look like
+        # failure while leaving an untracked destination behind. The publisher supplies
+        # identity-verified rollback before this context re-raises the release error.
         try:
             _unlink_owned_publish_lock(dir_fd, lock_name, lock_fd)
+        except BaseException as release_error:
+            publication = publication_supplier() if publication_supplier is not None else None
+            if rollback_placed is None or publication is None:
+                raise
+            try:
+                rollback_placed()
+            except BaseException as cleanup_error:
+                raise PublicationReleaseError(
+                    publication, release_error, cleanup_error
+                ) from release_error
+            raise
         finally:
             os.close(lock_fd)
 
 
-def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: str) -> None:
+def _publish_temp_no_overwrite(
+    dir_fd: int,
+    tmp_name: str,
+    name: str,
+    display: str,
+    published_identity: PublishedFileIdentity,
+) -> None:
     """Publish a complete temp copy under a per-destination lock.
 
     Every operation is resolved relative to ``dir_fd`` -- the verified destination
@@ -704,7 +746,20 @@ def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: s
     ``_entry_exists`` check made under it — every publisher in this module takes
     that same lock before touching the destination entry.
     """
-    with _publish_lock(dir_fd, name, display):
+    placed = False
+
+    def _rollback_placed() -> None:
+        if _entry_identity(dir_fd, name) != published_identity:
+            raise OSError(errno.ESTALE, "published destination changed before release rollback")
+        os.unlink(name, dir_fd=dir_fd)
+
+    with _publish_lock(
+        dir_fd,
+        name,
+        display,
+        rollback_placed=_rollback_placed,
+        publication_supplier=lambda: FilePublication(True, published_identity) if placed else None,
+    ):
         # lexists, not exists: on a hardlink-refusing filesystem the copy fallback
         # below is os.rename, which WOULD silently replace a dangling symlink's
         # entry (exists() reads a dangling link as absent) -- GHSA-8fj8. This is
@@ -719,7 +774,10 @@ def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: s
                 raise
             # The rename consumes the temp — nothing left to unlink.
             os.rename(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            placed = True
             return
+        else:
+            placed = True
         with contextlib.suppress(OSError):
             os.unlink(tmp_name, dir_fd=dir_fd)
 
@@ -808,8 +866,22 @@ def _publish_link_no_overwrite(
     """
     source_info = os.fstat(source_fd)
     source_identity = (source_info.st_dev, source_info.st_ino)
-    with _publish_lock(dir_fd, name, display):
+    placed = False
+
+    def _rollback_placed() -> None:
+        if _entry_identity(dir_fd, name) != source_identity:
+            raise OSError(errno.ESTALE, "published destination changed before release rollback")
+        os.unlink(name, dir_fd=dir_fd)
+
+    with _publish_lock(
+        dir_fd,
+        name,
+        display,
+        rollback_placed=_rollback_placed,
+        publication_supplier=lambda: FilePublication(True, source_identity) if placed else None,
+    ):
         os.link(os.fspath(src), name, dst_dir_fd=dir_fd)
+        placed = True
         if _entry_identity(dir_fd, name) == source_identity:
             # The entry we linked IS the proven-regular source inode -- that identity,
             # captured here at publication time, is what the lexical verifier must find
@@ -1618,7 +1690,9 @@ class LocalFileSystem:
                     f"copy of {src.name} is incomplete: expected {src_size} bytes, "
                     f"wrote {copied_size}; partial destination removed"
                 )
-            _publish_temp_no_overwrite(parent_fd, tmp_name, name, os.fspath(dst))
+            _publish_temp_no_overwrite(
+                parent_fd, tmp_name, name, os.fspath(dst), published_identity
+            )
             published = True
             descriptor_returned = True
             return published_identity, tmp_fd
