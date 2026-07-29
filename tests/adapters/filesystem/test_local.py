@@ -358,6 +358,47 @@ def test_cross_device_copy_skips_an_xattr_removed_after_listing(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+def test_cross_device_copy_propagates_missing_xattr_error_from_setxattr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-data error is tolerated only while retrieving an xattr."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    missing_errno = getattr(errno, "ENOATTR", errno.ENODATA)
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["user.plex_manager.issue500"]
+
+    def _getxattr(fd: int, _name: str) -> bytes:
+        assert isinstance(fd, int)
+        return b"issue-500"
+
+    def _setxattr(_fd: int, _name: str, _value: bytes) -> None:
+        raise OSError(missing_errno, "target attribute disappeared")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == missing_errno
+    assert not dst.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 @pytest.mark.parametrize("operation", ["listxattr", "getxattr", "setxattr"])
 def test_cross_device_copy_propagates_unexpected_xattr_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
