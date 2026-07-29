@@ -230,6 +230,12 @@ def _unlink_created_publish_lock_if_unowned(dir_fd: int, lock_name: str, lock_fd
         # The descriptor may name an active contender's inode; identity alone cannot
         # distinguish it from this creator's abandoned entry.
         return
+    except OSError as error:
+        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+        # Unsupported advisory locking proves no contender can hold this inode's
+        # flock. A contender still between open and flock is fenced by its later
+        # identity check, so this creator may safely remove its own entry.
     if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
         # The entry can disappear after the identity check, leaving no stranded lock.
         with contextlib.suppress(FileNotFoundError):

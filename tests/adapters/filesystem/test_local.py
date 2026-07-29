@@ -426,6 +426,7 @@ def test_publish_lock_surfaces_unsupported_advisory_locking(
     src = tmp_path / "src.mkv"
     src.write_text("payload")
     dst = tmp_path / "dst.mkv"
+    lock = tmp_path / ".dst.mkv.publish.lock"
 
     def _unsupported_flock(_fd: int, _operation: int) -> None:
         raise OSError(errno.ENOTSUP, "advisory locking unsupported")
@@ -437,6 +438,7 @@ def test_publish_lock_surfaces_unsupported_advisory_locking(
 
     assert raised.value.errno == errno.ENOTSUP
     assert not dst.exists()
+    assert not lock.exists()
 
 
 def test_open_publish_lock_fstat_failure_removes_created_lock(
