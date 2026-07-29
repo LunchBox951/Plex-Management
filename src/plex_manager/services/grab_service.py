@@ -1457,9 +1457,20 @@ async def grab(
                         )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
-            if winner is None:  # pragma: no cover - the conflicting row must exist
+            if winner is None:
+                # The uniqueness collision proves another transaction owned this
+                # hash, even though its row disappeared before our re-read. Keep
+                # cleanup responsibility durable for any client state left by this
+                # add; never re-raise while a prepared reservation can re-add it.
+                if intent_id is not None:
+                    await _retire_lost_add_reservation(session, intent_id, orphan_removed=False)
                 raise
             if winner.status not in _TERMINAL_STATUS_VALUES:
+                # This collision winner was not visible to the earlier same-hash
+                # lookup, but it conclusively owns the physical torrent now. Retire
+                # the reservation without touching the winner's torrent or category.
+                if intent_id is not None:
+                    await _release_rejected_reservation(session, intent_id)
                 if request_id is not None and winner.media_request_id != request_id:
                     raise TorrentAlreadyTrackedError(
                         torrent_hash, winner.media_request_id

@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -36,6 +37,7 @@ from plex_manager.ports.repositories import (
     DownloadAddIntentScopeCreate,
 )
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
+from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import correction_service, grab_service
@@ -423,3 +425,152 @@ async def test_same_hash_same_request_winner_retires_loser_reservation(
 
         assert record.torrent_hash == torrent_hash
         assert await session.scalar(select(DownloadAddIntent)) is None
+
+
+async def _exercise_late_same_hash_winner(
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    foreign: bool,
+) -> None:
+    torrent_hash = "8" * 40
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        owner = MediaRequest(
+            tmdb_id=70,
+            media_type=MediaType.movie,
+            title="Owner",
+            status=RequestStatus.downloading,
+        )
+        contender = MediaRequest(
+            tmdb_id=71,
+            media_type=MediaType.movie,
+            title="Contender",
+            status=RequestStatus.searching,
+        )
+        session.add_all((owner, contender))
+        await session.flush()
+        request = contender if foreign else owner
+        session.add(
+            Download(
+                torrent_hash=torrent_hash,
+                status="downloading",
+                media_request_id=owner.id,
+                tmdb_id=owner.tmdb_id,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+
+        original_get_by_hash = SqlDownloadRepository.get_by_hash
+        calls = 0
+
+        async def hide_winner_until_create_collision(
+            repository: SqlDownloadRepository,
+            value: str,
+            *,
+            populate_existing: bool = False,
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return None
+            return await original_get_by_hash(
+                repository, value, populate_existing=populate_existing
+            )
+
+        monkeypatch.setattr(
+            SqlDownloadRepository, "get_by_hash", hide_winner_until_create_collision
+        )
+        qbt = FakeQbittorrent()
+        if foreign:
+            with pytest.raises(grab_service.TorrentAlreadyTrackedError):
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored(torrent_hash),
+                    request_id=request.id,
+                    tmdb_id=request.tmdb_id,
+                )
+        else:
+            record = await grab_service.grab(
+                qbt,
+                session,
+                scored=scored(torrent_hash),
+                request_id=request.id,
+                tmdb_id=request.tmdb_id,
+            )
+            assert record.torrent_hash == torrent_hash
+
+        assert await session.scalar(select(DownloadAddIntent)) is None
+
+
+async def test_late_foreign_same_hash_collision_retires_reservation(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _exercise_late_same_hash_winner(engine, monkeypatch, foreign=True)
+
+
+async def test_late_same_request_same_hash_collision_retires_reservation(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _exercise_late_same_hash_winner(engine, monkeypatch, foreign=False)
+
+
+async def test_late_collision_winner_vanishes_retires_reservation(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torrent_hash = "9" * 40
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        owner = MediaRequest(
+            tmdb_id=80,
+            media_type=MediaType.movie,
+            title="Owner",
+            status=RequestStatus.downloading,
+        )
+        contender = MediaRequest(
+            tmdb_id=81,
+            media_type=MediaType.movie,
+            title="Contender",
+            status=RequestStatus.searching,
+        )
+        session.add_all((owner, contender))
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash=torrent_hash,
+                status="downloading",
+                media_request_id=owner.id,
+                tmdb_id=owner.tmdb_id,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+
+        calls = 0
+
+        async def hide_then_delete_winner(
+            repository: SqlDownloadRepository,
+            value: str,
+            *,
+            populate_existing: bool = False,
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return None
+            await session.execute(delete(Download).where(Download.torrent_hash == torrent_hash))
+            await session.commit()
+            return None
+
+        monkeypatch.setattr(SqlDownloadRepository, "get_by_hash", hide_then_delete_winner)
+        with pytest.raises(IntegrityError):
+            await grab_service.grab(
+                FakeQbittorrent(),
+                session,
+                scored=scored(torrent_hash),
+                request_id=contender.id,
+                tmdb_id=contender.tmdb_id,
+            )
+
+        intent = await session.scalar(select(DownloadAddIntent))
+        assert intent is not None and intent.state == "cancel_requested"
