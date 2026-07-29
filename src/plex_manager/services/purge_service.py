@@ -44,7 +44,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -127,6 +127,18 @@ the same hard daemon-thread ceiling. Because a cancelled probe DETACHES rather t
 shields (issue #445), a wedged probe still holds its permit until its own worker
 physically finishes, so this cap is what bounds concurrent wedged probes.
 """
+_ABANDONABLE_CORRECTION_PROBE_THREAD_LIMIT: Final = 4
+"""Maximum simultaneous correction-path probe workers on the abandonable substrate.
+
+A SEPARATE budget from both the public :data:`_ABANDONABLE_PROBE_THREAD_LIMIT`
+and destructive :data:`_ABANDONABLE_DELETE_THREAD_LIMIT` (issue #496): bounded
+``remove_torrent`` content reads must proceed even if public health, telemetry,
+or disk probes wedge and saturate their own budget, while those best-effort reads
+must never consume destructive-correction permits. Four mirrors the other two
+budgets, yielding a process-wide ceiling of twelve abandonable daemon workers
+across the three gates. A detached, wedged worker holds its correction permit
+until physical completion, so this cap bounds concurrent wedged content probes.
+"""
 _ABANDONABLE_THREAD_GATE_POLL_SECONDS: Final = 0.01
 
 
@@ -180,6 +192,12 @@ class _AbandonableThreadPermit:
 
 _ABANDONABLE_DELETE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_DELETE_THREAD_LIMIT)
 _ABANDONABLE_PROBE_THREAD_GATE = _AbandonableThreadGate(_ABANDONABLE_PROBE_THREAD_LIMIT)
+# Correction-path content probes are bounded, best-effort reads that must not be
+# starved by public dashboard/telemetry probes (issue #496). They also remain
+# isolated from destructive corrections, which use the DELETE budget above.
+_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE = _AbandonableThreadGate(
+    _ABANDONABLE_CORRECTION_PROBE_THREAD_LIMIT
+)
 
 # --------------------------------------------------------------------------- #
 # In-process purge-vs-import path serialization (PR #117 round 9).
@@ -514,10 +532,12 @@ async def _run_on_abandonable_thread[T](
     accounting, the final ``shutil.rmtree`` -- must run on this abandonable
     substrate instead.
 
-    ``gate`` selects the permit budget (issue #447): genuinely-unrelated read-only
-    probes draw the shared PROBE budget, while the destructive delete AND the
-    purge's OWN mandatory read-only preflight probes draw the DELETE budget, so a
-    burst of unrelated probes can never starve an operator correction.
+    ``gate`` selects the permit budget: genuinely-unrelated read-only probes draw
+    the shared PROBE budget; bounded ``remove_torrent`` content reads draw the
+    correction-only PROBE budget; and the destructive delete plus a purge's OWN
+    mandatory read-only preflight probes draw the DELETE budget. The partitions
+    prevent public probes from starving a correction and correction-path reads from
+    consuming destructive-correction permits (issues #447 / #496).
 
     The gate wait stays a plain cancellable await so a queued caller can unwind
     during shutdown without ever creating a physical worker. Once acquired, its
@@ -629,14 +649,16 @@ async def _run_abandonable_probe[T](
     *,
     operation_name: str,
     gate: _AbandonableThreadGate,
+    deadline_expired: asyncio.Event | None = None,
 ) -> T:
     """Run one blocking read-only probe on ``gate``'s substrate; detach on cancellation.
 
-    Shared core of :func:`run_abandonable_probe` (public, shared PROBE budget) and
-    :func:`purge_library_path`'s mandatory guard/reclaim preflight, which passes the
-    DELETE budget so an operator correction never depends on the shared probe budget
-    unrelated reads can exhaust (issue #447). Detach-on-cancellation is identical on
-    either budget.
+    Shared core of :func:`run_abandonable_probe` (public, shared PROBE budget),
+    :func:`purge_library_path`'s mandatory guard/reclaim preflight (DELETE budget),
+    and bounded ``remove_torrent`` content probes (correction-only PROBE budget).
+    The partitions ensure public probes cannot starve corrections, while
+    correction-path reads cannot consume destructive-correction permits. Detach-on-
+    cancellation is identical on all three budgets.
 
     Unlike a delete, a read has no partial disk mutation to protect, so this does
     NOT shield the caller through physical settlement (issue #445). On ORDINARY
@@ -666,8 +688,24 @@ async def _run_abandonable_probe[T](
     such as ``OSError``; this substrate adds no retries, fallback values, or broad
     exception conversion. ``path`` and ``operation_name`` exist only to make a
     wedged-probe detach honest and diagnosable without logging probe results.
+    ``deadline_expired`` marks cancellation initiated by an internal probe bound,
+    so the detached-worker log distinguishes it from caller cancellation.
     """
     worker = await _run_on_abandonable_thread(operation, thread_name="filesystem-probe", gate=gate)
+
+    def _detach_cause_for_failure() -> str:
+        return (
+            "on an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "on caller cancellation"
+        )
+
+    def _detach_cause() -> str:
+        return (
+            "after an internal probe deadline"
+            if deadline_expired is not None and deadline_expired.is_set()
+            else "on caller cancellation"
+        )
 
     def _retrieve_worker_outcome(done: asyncio.Future[Any]) -> None:
         # ``asyncio.wait`` removed its completion callback when this caller's await
@@ -683,12 +721,12 @@ async def _run_abandonable_probe[T](
         error = done.exception()
         if error is not None:
             _logger.warning(
-                "%s of %r failed (%s) after detaching on caller cancellation; the "
-                "daemon worker ran to completion unobserved and its failure is "
-                "recorded here only",
+                "%s of %r failed (%s) after detaching %s; the daemon worker ran to "
+                "completion unobserved and its failure is recorded here only",
                 operation_name,
                 safe_text(path),
                 type(error).__name__,
+                _detach_cause_for_failure(),
             )
 
     try:
@@ -710,10 +748,11 @@ async def _run_abandonable_probe[T](
             # visible (honesty over silence) rather than a silent detach, and
             # retrieve (and log any failure of) its eventual outcome when it settles.
             _logger.warning(
-                "%s of %r detached on caller cancellation; its daemon worker will "
-                "run to completion unobserved and then release its permit",
+                "%s of %r detached %s; its daemon worker will run to completion unobserved "
+                "and then release its permit",
                 operation_name,
                 safe_text(path),
+                _detach_cause(),
             )
             worker.add_done_callback(_retrieve_worker_outcome)
         raise
@@ -862,8 +901,50 @@ def _forget_probe_task(
     _log_orphaned_probe_failure(state, task, path=path, operation_name=operation_name)
 
 
+class DeleteWorkerStartError(RuntimeError):
+    """The destructive delete worker could not be STARTED at all.
+
+    Distinct from every ``PurgeOutcome``: those classify what a delete DID, and
+    here no delete ran -- ``threading.Thread.start()`` itself failed (the
+    realistic cause being ``RuntimeError: can't start new thread`` under thread
+    exhaustion). The permit is already back and the path registration already
+    released by the time this is raised.
+
+    It is a distinct type because a caller whose ``before_delete`` hook committed
+    durable "a delete is starting" state needs to COMPENSATE that state, and must
+    be able to tell this case from a cancellation -- which can arrive after the
+    worker really did start and really did unlink bytes, where the same
+    compensation would be a lie (issue #515, review round 2). Subclasses
+    ``RuntimeError`` so callers that only wanted the old propagate-and-log
+    behaviour keep it unchanged, and the original failure's message is preserved
+    verbatim.
+    """
+
+
+class _DeleteBoundaryHookError(Exception):
+    """Internal carrier for a caller's ``before_delete`` hook failure.
+
+    The hook runs INSIDE :func:`_delete_to_settlement` (issue #515), so without
+    this wrapper its exception would fall into :func:`purge_library_path`'s
+    delete-outcome classification and a hook that happened to raise an
+    ``OSError`` would be reported as ``PurgeOutcome.error`` -- "the delete
+    failed" for a delete that never started. Unwrapped and re-raised unchanged at
+    that boundary, so callers still see exactly what their hook raised.
+    ``CancelledError`` is deliberately never wrapped: cancellation must keep
+    propagating as cancellation.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+
 async def _delete_to_settlement(
-    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool
+    fs: FileSystemPort,
+    library_path: str,
+    *,
+    hold_purge_registration: bool,
+    before_delete: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Run delete to real settlement (except process-shutdown abandonment) and own
     the ``_ACTIVE_PURGE_PATHS`` release decision from this coroutine's OWN outcome.
@@ -902,17 +983,55 @@ async def _delete_to_settlement(
     path an abandoned delete is still tearing down. A worker still running when
     its originating loop closes is process-exit territory (issue #128 crash
     recovery), not an in-process lifecycle event.
+
+    ``before_delete`` -- the caller's DURABLE delete-boundary hook -- is invoked
+    HERE, after the permit is held and immediately before the worker start, not
+    before the gate wait (issue #515). That wait is unbounded: the budget is
+    :data:`_ABANDONABLE_DELETE_THREAD_LIMIT` permits shared by every destructive
+    correction AND every purge's own preflight probes, so a purge can sit queued
+    behind wedged mounts for the whole life of a sweep, and a cancellation landing
+    in that queue used to unwind having ALREADY run the hook. For eviction that
+    meant a durable "a delete started" marker armed over a delete that never
+    began -- exactly the authorized-vs-started ambiguity issue #515 exists to
+    remove, recreated one layer down. Running the hook under the permit makes its
+    promise true: once it returns, the only thing between it and the first
+    unlinked byte is a synchronous thread start with no cancellation point in it.
+    A hook that raises or is cancelled returns the permit and starts no delete;
+    the registration is then resolved by this coroutine's own ``finally``,
+    exactly as for any other pre-worker failure.
     """
     worker: asyncio.Future[None] | None = None
     succeeded = False
     try:
         permit = await _ABANDONABLE_DELETE_THREAD_GATE.acquire()
-        # No ``await`` between the permit acquisition above and storing ``worker``
-        # below: the synchronous starter creates the daemon thread and hands back
-        # its future atomically, so cancellation can never strand a live worker.
-        worker = _start_on_abandonable_thread(
-            lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
-        )
+        if before_delete is not None:
+            try:
+                await before_delete()
+            except asyncio.CancelledError:
+                permit.release()
+                raise
+            except Exception as exc:
+                permit.release()
+                raise _DeleteBoundaryHookError(exc) from exc
+        # No ``await`` between the boundary hook returning above and storing
+        # ``worker`` below: the synchronous starter creates the daemon thread and
+        # hands back its future atomically, so cancellation can never strand a
+        # live worker. Until the starter takes it, the permit belongs to this
+        # coroutine, which is why both hook-failure paths hand it back explicitly.
+        #
+        # The one way this step can still fail is ``Thread.start()`` itself (the
+        # starter returns the permit and re-raises). That leaves a caller whose
+        # hook committed durable "a delete is starting" state holding a lie, so it
+        # is re-raised as the DISTINCT :class:`DeleteWorkerStartError` -- the
+        # signal that no delete ran and the state may safely be compensated. A
+        # cancellation is deliberately NOT given that signal: it can arrive after
+        # the worker started and bytes left.
+        try:
+            worker = _start_on_abandonable_thread(
+                lambda: fs.delete(library_path), thread_name="purge-delete", permit=permit
+            )
+        except Exception as exc:
+            raise DeleteWorkerStartError(str(exc)) from exc
         await _await_worker_settlement(worker, library_path, operation="delete")
         succeeded = True
     finally:
@@ -926,7 +1045,11 @@ async def _delete_to_settlement(
 
 
 async def purge_library_path(
-    fs: FileSystemPort, library_path: str, *, hold_purge_registration: bool = False
+    fs: FileSystemPort,
+    library_path: str,
+    *,
+    hold_purge_registration: bool = False,
+    before_delete: Callable[[], Awaitable[None]] | None = None,
 ) -> PurgeResult:
     """Root-guarded delete of ``library_path`` + hardlink-aware freed-bytes accounting.
 
@@ -950,6 +1073,19 @@ async def purge_library_path(
     ``finally``, tied to the delete worker's PHYSICAL completion — so a
     concurrent ``begin_placement`` / a later sweep's crash-recovery can never see
     this path as free while a delete for it is still physically running.
+
+    ``before_delete`` is an optional durable-boundary hook invoked after both
+    read-only preflight probes succeed, AFTER one of the four delete-worker
+    permits is held, and immediately before the destructive worker is started
+    (issue #515 -- see :func:`_delete_to_settlement` for why the permit must come
+    first). Eviction uses it two ways: to distinguish a delete that was merely
+    authorized from one whose destructive phase is starting, and to re-read the
+    safety facts (an operator pin, a competing transfer) at the last cancellable
+    point before bytes leave. An exception or cancellation from the hook starts no
+    delete, releases the permit and the registration, and is propagated unchanged
+    -- deliberately NOT classified as a ``PurgeOutcome``, because no delete was
+    attempted and a caller must be able to tell "I revoked this" from "the
+    filesystem refused".
 
     CLOSED (issue #431): that invariant now holds THROUGH process-shutdown
     abandonment too. :func:`abandon_active_settlements` (PR #406) can force
@@ -1048,8 +1184,18 @@ async def purge_library_path(
         registration_handed_off = True
         try:
             await _delete_to_settlement(
-                fs, library_path, hold_purge_registration=hold_purge_registration
+                fs,
+                library_path,
+                hold_purge_registration=hold_purge_registration,
+                before_delete=before_delete,
             )
+        except _DeleteBoundaryHookError as boundary:
+            # The caller's own hook refused (or failed) at the delete boundary --
+            # no delete started, and the registration is already resolved by the
+            # helper's ``finally``. Re-raise the ORIGINAL exception so the caller
+            # sees exactly what it raised, never a purge outcome that would claim
+            # a delete was attempted.
+            raise boundary.error from None
         except LocalFileSystemError as exc:
             return PurgeResult(PurgeOutcome.refused, 0, str(exc))
         except PartialDeleteError as exc:
@@ -1252,7 +1398,11 @@ class _ProbeBoundExceeded(Exception):
 async def _probe_within_bound[T](
     operation: Callable[[], T], path: str, *, operation_name: str, bound: float
 ) -> T:
-    """Run one abandonable PROBE-budget read of ``path`` under a ``bound``-second cap.
+    """Run one correction-path probe under a ``bound``-second cap.
+
+    Correction-path probes use their own permit budget so wedged public health,
+    telemetry, and disk probes cannot starve a ``remove_torrent`` correction
+    (issue #496). The deadline behavior otherwise matches the shared substrate.
 
     Raises :class:`_ProbeBoundExceeded` — and ONLY then — when the bound elapses with
     the probe still unanswered. ``operation``'s own result and exceptions are
@@ -1273,9 +1423,14 @@ async def _probe_within_bound[T](
         # An exhausted budget could only ever end in this raise, so never spend a
         # permit or start a physical worker to prove it.
         raise _ProbeBoundExceeded
+    deadline_expired = asyncio.Event()
     probe = asyncio.ensure_future(
         _run_abandonable_probe(
-            operation, path, operation_name=operation_name, gate=_ABANDONABLE_PROBE_THREAD_GATE
+            operation,
+            path,
+            operation_name=operation_name,
+            gate=_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE,
+            deadline_expired=deadline_expired,
         )
     )
     try:
@@ -1284,6 +1439,7 @@ async def _probe_within_bound[T](
         probe.cancel()
         raise
     if not done:
+        deadline_expired.set()
         probe.cancel()
         raise _ProbeBoundExceeded
     return probe.result()
@@ -1304,8 +1460,8 @@ async def _bounded_content_probe[T](
     DISTINCTLY — an unanswered mount and a read that failed fast are different
     operator facts (:class:`_ProbeBoundExceeded`).
 
-    The worker runs on the shared read-only PROBE budget
-    (:data:`_ABANDONABLE_PROBE_THREAD_LIMIT`) rather than via
+    The worker runs on the correction-only read-only probe budget
+    (:data:`_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE`) rather than via
     ``asyncio.to_thread``: these are ordinary best-effort reads, not a destructive
     correction's preflight, and a default-executor worker wedged on a dead mount is
     rejoined at interpreter teardown, defeating the web lifespan's bounded shutdown
@@ -1382,7 +1538,7 @@ async def _visible_content_path(
     rather than checking the wrong path — when there is no live ``save_path``
     anchor, when ``list_files`` itself fails (a client hiccup here must not
     block the removal that's about to happen regardless), or when the remap
-    proves no candidate, fails, or exhausts the shared bound below.
+    proves no candidate, fails, or exhausts the correction-only bound below.
 
     Every filesystem read here is mount-sensitive and runs BEFORE ``qbt.remove``, so
     together they draw ONE ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` budget
@@ -1443,8 +1599,8 @@ async def _wait_for_content_path_gone(
     finishes, so a same-hash re-grab landing right after the ACK can start writing
     fresh data at ``content_path`` while the OLD deletion is still tearing it down
     — the tail of that deletion can then clobber the new data. Polls
-    ``os.path.exists`` on the abandonable read-only PROBE substrate (never
-    ``asyncio.to_thread``: a default-executor worker wedged on a dead mount is
+    ``os.path.exists`` on the correction-only abandonable read-only PROBE substrate
+    (never ``asyncio.to_thread``: a default-executor worker wedged on a dead mount is
     rejoined at interpreter teardown), bounded by
     ``_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS`` so this best-effort check can never
     hang a caller indefinitely (it runs inline in operator-facing correction

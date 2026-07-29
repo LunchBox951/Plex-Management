@@ -814,6 +814,7 @@ describe('Status', () => {
           season: null,
           library_path: '/library/movies/Old Watched Movie',
           freed_bytes: 1024,
+          partial: false,
         },
       ],
       errors: [{ root: 'tv_root', detail: 'sweep failed (PlexLibraryError)' }],
@@ -833,6 +834,92 @@ describe('Status', () => {
       expect(toastMock).toHaveBeenCalledWith(
         expect.objectContaining({
           title: expect.stringContaining('tv_root'),
+          intent: 'warning',
+        }),
+      ),
+    )
+  })
+
+  it('labels a partial removal as pending recovery', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    const partial: EvictResponse = {
+      evicted: [
+        {
+          request_id: 1,
+          media_type: 'movie',
+          title: 'Partially Removed Movie',
+          season: null,
+          library_path: '/library/movies/Partially Removed Movie',
+          freed_bytes: null,
+          partial: true,
+        },
+      ],
+    }
+    const mutateAsync = vi.fn().mockResolvedValue(partial)
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Partial removal',
+          description:
+            'Partially removed — content remains on disk pending retry: Partially Removed Movie',
+          intent: 'warning',
+        }),
+      ),
+    )
+  })
+
+  it('separates complete and partial removals in a mixed sweep toast', async () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    const mixed: EvictResponse = {
+      evicted: [
+        {
+          request_id: 1,
+          media_type: 'movie',
+          title: 'Fully Removed Movie',
+          season: null,
+          library_path: '/library/movies/Fully Removed Movie',
+          freed_bytes: 1024,
+          partial: false,
+        },
+        {
+          request_id: 2,
+          media_type: 'movie',
+          title: 'Partially Removed Movie',
+          season: null,
+          library_path: '/library/movies/Partially Removed Movie',
+          freed_bytes: null,
+          partial: true,
+        },
+        {
+          request_id: 3,
+          media_type: 'movie',
+          title: 'Another Removed Movie',
+          season: null,
+          library_path: '/library/movies/Another Removed Movie',
+          freed_bytes: 2048,
+          partial: false,
+        },
+      ],
+    }
+    const mutateAsync = vi.fn().mockResolvedValue(mixed)
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Freed 2 titles',
+          description:
+            'Fully Removed Movie, Another Removed Movie. Partially removed — content remains on disk pending retry: Partially Removed Movie',
           intent: 'warning',
         }),
       ),

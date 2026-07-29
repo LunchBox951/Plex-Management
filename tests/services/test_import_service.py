@@ -2090,6 +2090,50 @@ async def test_run_import_cycle_drains_pending_download_to_completed(
         assert request is not None and request.status == RequestStatus.completed
 
 
+async def test_run_import_cycle_failure_log_sanitizes_download_id(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #510: an import-cycle failure routes its structured ID through ``safe_int``."""
+    download_id, _request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    sanitized: list[int] = []
+
+    def test_safe_int(value: int) -> int:
+        sanitized.append(value)
+        return value + 1_000_000
+
+    async def import_fails(**_kwargs: object) -> DownloadRecord | None:
+        raise RuntimeError("import failed")
+
+    monkeypatch.setattr(import_service, "safe_int", test_safe_int)
+    monkeypatch.setattr(import_service, "import_download", import_fails)
+
+    with caplog.at_level(logging.ERROR, logger="plex_manager.services.import_service"):
+        async with sessionmaker_() as session:
+            await run_import_cycle(
+                fs=LocalFileSystem(),
+                media_probe=FakeMediaProbe(),
+                library=FakeLibrary(),
+                qbt=FakeQbittorrent(),
+                parser=GuessitParser(),
+                profile=default_profile(),
+                session=session,
+            )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "import of download failed; will retry next cycle"
+    )
+    assert record.__dict__["download_id"] == download_id + 1_000_000
+    assert download_id in sanitized
+
+
 async def test_run_import_cycle_blocks_ownerless_row_instead_of_skipping_it(
     tmp_path: Path, sessionmaker_: SessionMaker
 ) -> None:

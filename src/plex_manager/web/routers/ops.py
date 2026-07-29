@@ -834,6 +834,7 @@ async def evict_endpoint(
                 season=o.season,
                 library_path=o.library_path,
                 freed_bytes=o.freed_bytes,
+                partial=o.partial,
             )
             for o in outcomes
         ],

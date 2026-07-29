@@ -286,6 +286,7 @@ describe('useEvict', () => {
           season: null,
           library_path: '/library/movies/Old Movie',
           freed_bytes: 1024,
+          partial: false,
         },
       ],
       errors: [{ root: 'tv_root', detail: 'sweep failed (PlexLibraryError)' }],

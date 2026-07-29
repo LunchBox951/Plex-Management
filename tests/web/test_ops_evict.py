@@ -104,6 +104,7 @@ async def test_evict_frees_space_and_flips_status_to_evicted(
     assert outcome["request_id"] == request_id
     assert outcome["title"] == "Stale Movie"
     assert outcome["media_type"] == "movie"
+    assert outcome["partial"] is False
 
     # The file is actually gone and the request is honestly, re-requestably
     # marked `evicted` (never a silent delete, never a terminal dead-end).
@@ -483,8 +484,14 @@ async def test_evict_reports_and_publishes_a_partial_delete(
     request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
 
     async def _partial(
-        _fs: object, _path: str, *, hold_purge_registration: bool = False
+        _fs: object,
+        _path: str,
+        *,
+        hold_purge_registration: bool = False,
+        before_delete: Callable[[], Awaitable[None]] | None = None,
     ) -> PurgeResult:
+        assert before_delete is not None
+        await before_delete()
         return PurgeResult(PurgeOutcome.partial, 0, "partially deleted before failing (OSError)")
 
     monkeypatch.setattr(eviction_service.purge_service, "purge_library_path", _partial)
@@ -503,6 +510,7 @@ async def test_evict_reports_and_publishes_a_partial_delete(
     outcome = body["evicted"][0]
     assert outcome["request_id"] == request_id
     assert outcome["freed_bytes"] is None  # unknowable, never a fabricated number
+    assert outcome["partial"] is True  # content remains on disk pending recovery
     event = await subscription.get()  # clients ARE told to refresh
     assert event.reason == "eviction"
     subscription.close()

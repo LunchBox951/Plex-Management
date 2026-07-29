@@ -319,6 +319,49 @@ async def test_saturated_probe_budget_does_not_block_a_full_purge_correction(
         release.set()
 
 
+async def test_saturated_shared_probe_budget_does_not_block_a_correction_path_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #496: the bounded probes on ``remove_torrent``'s correction path
+    must draw a correction-only budget, so unrelated wedged public probes cannot
+    prevent the correction from reading its content path and proceeding."""
+    shared_probe_gate = _CountingThreadGate(1)
+    correction_probe_gate = _CountingThreadGate(1)
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_PROBE_THREAD_GATE", shared_probe_gate)
+    monkeypatch.setattr(
+        purge_service,
+        "_ABANDONABLE_CORRECTION_PROBE_THREAD_GATE",
+        correction_probe_gate,
+        raising=False,
+    )
+    wedged = _WedgedProbe(value=0)
+    shared_probe = asyncio.create_task(
+        purge_service.run_abandonable_probe(
+            wedged, str(tmp_path / "wedged"), operation_name="health poll"
+        )
+    )
+    try:
+        assert await asyncio.to_thread(wedged.started.wait, 2.0)
+        shared_probe.cancel()
+        await assert_task_raises(shared_probe, asyncio.CancelledError)
+
+        result = await asyncio.wait_for(
+            purge_service._bounded_content_probe(  # pyright: ignore[reportPrivateUsage]
+                lambda: True,
+                str(tmp_path / "correction-content"),
+                operation_name="content path visibility probe",
+                timeout=0.2,
+            ),
+            timeout=1.0,
+        )
+
+        assert result is True
+        assert shared_probe_gate.acquired == 1
+        assert correction_probe_gate.acquired == 1
+    finally:
+        wedged.release.set()
+
+
 async def test_detached_probe_worker_failure_is_retrieved_and_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -677,11 +720,16 @@ async def test_hold_registration_released_when_cancel_lands_after_worker_settles
 
 
 class _BlockDeleteAcquireGate:
-    """A real DELETE gate that parks the delete's ``acquire`` on a never-resolving
+    """A real DELETE gate that parks the FIRST ``acquire`` on a never-resolving
     (but cancellable) await -- so a caller can be cancelled while queued for a
-    delete permit with NO worker yet. The guard/reclaim probes use the SEPARATE
-    probe gate (issue #447), so this delete gate sees only the delete's single
-    ``acquire``."""
+    delete-budget permit with NO worker yet.
+
+    That first acquire is the delete-GUARD probe, not the delete: a purge's own
+    read-only preflight probes deliberately draw this same DELETE budget (issue
+    #447) so unrelated wedged probes cannot starve a destructive correction. Which
+    of the three acquires is parked does not matter for what this test asserts
+    (cancel-while-queued releases the registration), but it does for the
+    boundary-hook ordering below -- see :class:`_BlockOnlyTheDeletePermit`."""
 
     def __init__(self) -> None:
         self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
@@ -723,6 +771,130 @@ async def test_cancel_while_queued_for_delete_permit_releases_registration(
     assert purge_service.begin_placement(str(target)) is True
     purge_service.end_placement(str(target))
     assert target.exists()  # nothing was deleted -- no worker ever ran
+
+
+class _BlockOnlyTheDeletePermit:
+    """A real DELETE gate that serves the two read-only preflight probes normally
+    and then parks the DELETE's own ``acquire`` on a never-resolving (but
+    cancellable) await.
+
+    Distinct from :class:`_BlockDeleteAcquireGate` above, which parks the FIRST
+    acquire -- and the guard/reclaim preflight probes draw this same DELETE budget
+    (issue #447), so that is the guard probe, not the delete. Pinning the delete's
+    own acquire is what makes the permit-exhaustion window addressable: it is the
+    only point where a purge can be cancelled with both probes already done and no
+    worker created."""
+
+    def __init__(self) -> None:
+        self._inner = purge_service._AbandonableThreadGate(4)  # pyright: ignore[reportPrivateUsage]
+        self._acquires = 0
+        self.delete_acquire_reached = asyncio.Event()
+
+    async def acquire(self) -> purge_service._AbandonableThreadPermit:  # pyright: ignore[reportPrivateUsage]
+        self._acquires += 1
+        if self._acquires <= 2:  # delete-guard probe, then reclaimable-bytes probe
+            return await self._inner.acquire()
+        self.delete_acquire_reached.set()
+        await asyncio.get_running_loop().create_future()  # blocks until cancelled
+        raise AssertionError("unreachable: the await above never resolves")
+
+    def release_permit(self) -> None:
+        self._inner.release_permit()
+
+
+async def test_cancel_while_queued_for_a_permit_never_runs_the_delete_boundary_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #515: the durable delete-boundary hook must not fire for a delete
+    that never starts.
+
+    The hook's whole promise to eviction is "a delete of this path is STARTING",
+    which is what lets recovery tell an armed marker apart from a merely
+    authorized claim. Running it before the gate wait broke that promise at the
+    one boundary the wait makes long: the delete budget is shared by every
+    destructive correction AND every purge's own preflight probes, so a purge can
+    sit queued behind wedged mounts indefinitely, and a cancellation landing
+    there used to unwind having already armed the marker -- an armed marker over
+    a provably intact tree, which is exactly the ambiguity #515 exists to remove,
+    recreated one layer down.
+
+    The gate below parks the delete's ``acquire`` forever (cancellably), so the
+    caller is cancelled with the permit never granted and no worker created."""
+    target = tmp_path / "movies" / "Never Started.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+    gate = _BlockOnlyTheDeletePermit()
+    monkeypatch.setattr(purge_service, "_ABANDONABLE_DELETE_THREAD_GATE", gate)
+    boundary_calls = 0
+
+    async def _mark_delete_started() -> None:
+        nonlocal boundary_calls
+        boundary_calls += 1
+
+    purge_task = asyncio.create_task(
+        purge_service.purge_library_path(
+            fs, str(target), hold_purge_registration=True, before_delete=_mark_delete_started
+        )
+    )
+    await asyncio.wait_for(gate.delete_acquire_reached.wait(), timeout=2.0)
+    # Parked on the DELETE's own permit wait: both read-only preflight probes have
+    # already run (they draw this same DELETE budget) and the hook has NOT. Snapshot
+    # the count HERE rather than re-comparing ``boundary_calls`` to 0 again after the
+    # cancel: the two assertions then say different things -- "the hook had not run
+    # while queued" and "cancelling added no call" -- and the second is a comparison
+    # between two variables, so it can genuinely fail (and is not a constant-folded
+    # always-true test, CodeQL py/redundant-comparison).
+    calls_while_queued = boundary_calls
+    assert calls_while_queued == 0, "the hook must not run before the permit is granted"
+
+    purge_task.cancel()
+    await assert_task_raises(purge_task, asyncio.CancelledError)
+
+    assert boundary_calls == calls_while_queued, (
+        "cancelling a queued purge started no delete, so nothing may record that one did"
+    )
+    assert target.exists()
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+
+async def test_a_refusing_delete_boundary_hook_starts_no_delete_and_propagates(
+    tmp_path: Path,
+) -> None:
+    """The companion contract eviction's recovery leans on (issue #515): a hook
+    that REFUSES at the boundary must abort the purge without a byte moving, and
+    its exception must reach the caller unchanged -- never flattened into a
+    ``PurgeOutcome``, which would read as "a delete was attempted and failed".
+
+    The permit and the path registration are both returned, so the very next
+    purge of the same path behaves normally (proved by deleting it afterwards)."""
+    target = tmp_path / "movies" / "Revoked Movie.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    fs = LocalFileSystem([str(target.parent)])
+
+    class _Revoked(Exception):
+        pass
+
+    async def _refuse() -> None:
+        raise _Revoked
+
+    with pytest.raises(_Revoked):
+        await purge_service.purge_library_path(
+            fs, str(target), hold_purge_registration=True, before_delete=_refuse
+        )
+
+    assert target.exists()
+    assert purge_service.active_purge_paths() == ()
+    assert purge_service.begin_placement(str(target)) is True
+    purge_service.end_placement(str(target))
+
+    # The permit really came back: a plain purge of the same path still works.
+    result = await purge_service.purge_library_path(fs, str(target))
+    assert result.outcome is PurgeOutcome.deleted
+    assert not target.exists()
 
 
 async def test_delete_thread_start_failure_releases_permit_and_registration(
@@ -1498,11 +1670,14 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
                 purge_service.remove_torrent(qbt, "a" * 40, context="a test"), timeout=5.0
             )
         elapsed = time.monotonic() - started
+        await asyncio.sleep(0)  # let the cancelled probe record its detach cause
 
         assert ok is True
         assert qbt.removed == [("a" * 40, True)]  # the correction was never held up
         assert elapsed < 2.0
         assert "did not answer within the 0.2s pre-removal mount-read bound" in caplog.text
+        assert "detached after an internal probe deadline" in caplog.text
+        assert "detached on caller cancellation" not in caplog.text
         # The wedged read is still parked -- on a DAEMON thread the interpreter
         # never rejoins, so it cannot hang the web lifespan's shutdown wait.
         assert wedged.thread_name == "filesystem-probe"
@@ -1511,6 +1686,47 @@ async def test_remove_torrent_is_bounded_when_the_pre_removal_read_wedges(
     finally:
         wedged.release.set()
         assert await asyncio.to_thread(wedged.finished.wait, 2.0)
+
+
+async def test_internal_probe_deadline_labels_a_late_worker_failure_honestly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #497: a daemon worker that fails after an internal bound cancels its
+    probe must record that deadline, not falsely attribute the failure to caller
+    cancellation."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _wedged_then_failing_probe() -> bool:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+        raise OSError("mount recovered with an error")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="plex_manager.services.purge_service"):
+            result = await purge_service._bounded_content_probe(  # pyright: ignore[reportPrivateUsage]
+                _wedged_then_failing_probe,
+                "/downloads/clip.mkv",
+                operation_name="content path visibility probe",
+                timeout=0.1,
+            )
+            assert result is None
+            assert await asyncio.to_thread(started.wait, 2.0)
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 2.0)
+            deadline = time.monotonic() + 2.0
+            while (
+                "failed (OSError) after detaching on an internal probe deadline" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+    finally:
+        release.set()
+
+    assert "failed (OSError) after detaching on an internal probe deadline" in caplog.text
+    assert "after detaching on caller cancellation" not in caplog.text
 
 
 async def test_bounded_content_probe_logs_the_per_probe_bound(
@@ -1542,6 +1758,50 @@ async def test_bounded_content_probe_logs_the_per_probe_bound(
 
     assert result is None
     assert "did not answer within the 0.3s pre-removal mount-read bound" in caplog.text
+
+
+async def test_visible_content_path_hands_the_remap_the_remaining_probe_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #510: a slow verbatim probe leaves only its unspent budget for remapping."""
+    probe_bounds: list[tuple[str, float]] = []
+    monotonic_values = iter((100.0, 100.3))
+
+    def slow_verbatim_probe_clock() -> float:
+        return next(monotonic_values, 100.3)
+
+    async def record_probe_bound(
+        operation: Callable[[], object],
+        _path: str,
+        *,
+        operation_name: str,
+        bound: float,
+    ) -> object:
+        probe_bounds.append((operation_name, bound))
+        if operation_name == "content path visibility probe":
+            return False
+        return operation()
+
+    def remap_to_mounted_path(
+        _content_path: str, _save_path: str, _expected: Sequence[tuple[str, int]]
+    ) -> str:
+        return "/downloads/clip.mkv"
+
+    monkeypatch.setattr(purge_service, "_CONTENT_PATH_GONE_POLL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(purge_service.time, "monotonic", slow_verbatim_probe_clock)
+    monkeypatch.setattr(purge_service, "_probe_within_bound", record_probe_bound)
+    monkeypatch.setattr(path_visibility, "remap_download_content", remap_to_mounted_path)
+    qbt = FakeQbittorrent(files={("a" * 40): [DownloadedFile(name="clip.mkv", size_bytes=512)]})
+
+    result = await purge_service._visible_content_path(  # pyright: ignore[reportPrivateUsage]
+        qbt, "a" * 40, "/srv/downloads/clip.mkv", "/srv/downloads"
+    )
+
+    assert result == "/downloads/clip.mkv"
+    assert probe_bounds == [
+        ("content path visibility probe", 1.0),
+        ("content path remap", pytest.approx(0.7)),
+    ]
 
 
 async def test_visible_content_path_treats_an_unreadable_path_as_not_visible(

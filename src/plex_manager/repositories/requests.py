@@ -653,6 +653,51 @@ class SqlRequestRepository:
         )
         return result.rowcount == 1
 
+    async def confirm_partial_delete_marker(self, request_id: int, *, expected_path: str) -> bool:
+        """CAS-CONFIRM the incomplete-delete marker at a recovery purge's delete
+        boundary: re-stamp it to ``expected_path`` ONLY if the row still carries
+        exactly that breadcrumb AND marker AND is not ``keep_forever``-pinned.
+        Returns whether a row was actually matched (issue #515).
+
+        The value written is the value already there, so this looks like a no-op
+        -- and that is precisely why it must be a query-level ``update()`` rather
+        than an ORM attribute assignment. Assigning ``row.partial_delete_path =
+        <the same string>`` leaves the instance unchanged, so the unit of work
+        emits NOTHING at flush: no statement, no writer lock, no serialization.
+        Verified rather than assumed -- the transaction contained only SELECTs.
+
+        Emitting a real ``UPDATE`` as the FIRST statement of the boundary's final
+        transaction is the whole point: under SQLite it takes the writer lock
+        there and then (ADR-0007's single-writer model, the same dependency
+        ADR-0022 step 7 documents), so the statement's own snapshot postdates
+        every previously committed pin, and any pin racing us queues behind this
+        transaction until it commits. Placing the same UPDATE AFTER a read would
+        not do: in WAL the transaction's read snapshot is fixed at its first
+        statement, and the read-to-write upgrade can fail ``SQLITE_BUSY_SNAPSHOT``
+        outright.
+
+        ``rowcount == 0`` therefore means "a pin landed, or the marker/breadcrumb
+        was retired" -- decided by the DATABASE, not by a read the caller took
+        earlier -- and the caller must revoke its purge. ``synchronize_session=
+        False`` deliberately: any ORM-side sync would emit its own SELECT and cost
+        this statement its place as the transaction's first.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(MediaRequest)
+                .values(partial_delete_path=expected_path)
+                .where(
+                    MediaRequest.id == request_id,
+                    MediaRequest.library_path == expected_path,
+                    MediaRequest.partial_delete_path == expected_path,
+                    MediaRequest.keep_forever.is_(False),
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        return result.rowcount == 1
+
     async def other_row_claims_path(
         self, library_path: str, *, exclude_request_id: int | None = None
     ) -> bool:

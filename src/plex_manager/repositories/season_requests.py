@@ -675,6 +675,44 @@ class SqlSeasonRequestRepository:
         row.partial_delete_path = None
         await self._session.flush()
 
+    async def confirm_partial_delete_marker(
+        self, season_request_id: int, *, expected_path: str
+    ) -> bool:
+        """The season mirror of ``SqlRequestRepository.confirm_partial_delete_
+        marker`` -- see there for why this MUST be a query-level ``update()``
+        rather than a value-identical attribute assignment (issue #515).
+
+        One difference: the pin lives on the PARENT ``MediaRequest``, never on the
+        season row, so the un-pinned condition is the same correlated ``EXISTS``
+        subquery :meth:`set_status_if_in`'s ``require_parent_unpinned`` uses. It is
+        still ONE statement, so it is still one atomic writer-lock acquisition --
+        a parent pin committed before it is refused by the database rather than by
+        a read the caller took earlier.
+        """
+        parent_pinned = (
+            select(MediaRequest.id)
+            .where(
+                MediaRequest.id == SeasonRequest.media_request_id,
+                MediaRequest.keep_forever.is_(True),
+            )
+            .exists()
+        )
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(SeasonRequest)
+                .values(partial_delete_path=expected_path)
+                .where(
+                    SeasonRequest.id == season_request_id,
+                    SeasonRequest.library_path == expected_path,
+                    SeasonRequest.partial_delete_path == expected_path,
+                    ~parent_pinned,
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        return result.rowcount == 1
+
     async def set_installed_quality(
         self, season_request_id: int, *, quality_id: int, profile_index: int | None
     ) -> None:

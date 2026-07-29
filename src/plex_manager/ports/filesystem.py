@@ -135,7 +135,10 @@ class FileSystemPort(Protocol):
         CWE-59) while leaving the published file behind.
 
         A ``dst`` (or an ancestor) that no longer exists is a no-op, not an error --
-        rollback runs on failure paths that may already have been partly applied.
+        rollback runs on failure paths that may already have been partly applied. An
+        implementation MUST refuse rather than break a publish lock it cannot prove stale
+        (a recycled PID can read as live); callers MUST treat that as a logged best-effort
+        failure, never silently disregard it.
         """
         raise NotImplementedError
 
