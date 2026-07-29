@@ -95,7 +95,8 @@ async def test_state_cas_and_delete_cascades_scopes(session: AsyncSession) -> No
     )
     assert await repo.mark_state(intent.id, "cancel_requested", expected_state="prepared")
     assert not await repo.mark_state(intent.id, "needs_attention", expected_state="prepared")
-    assert await repo.delete(intent.id)
+    deleted = await repo.delete(intent.id)
+    assert deleted
 
 
 async def test_movie_and_season_cas_refuse_matching_future_intent(session: AsyncSession) -> None:

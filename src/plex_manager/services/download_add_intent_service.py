@@ -52,17 +52,20 @@ _TERMINAL_DOWNLOAD_STATES = frozenset(
 
 
 class _IntentClient(Protocol):
-    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd: ...
+    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd:
+        raise NotImplementedError
 
-    async def add_prepared(
-        self, prepared: PreparedAdd, save_path: str, category: str
-    ) -> AddResult: ...
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        raise NotImplementedError
 
-    async def get_status(self, info_hash: str) -> DownloadStatus | None: ...
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        raise NotImplementedError
 
-    async def set_category(self, info_hash: str, category: str) -> None: ...
+    async def set_category(self, info_hash: str, category: str) -> None:
+        raise NotImplementedError
 
-    async def remove(self, info_hash: str, *, delete_files: bool) -> None: ...
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
