@@ -168,13 +168,21 @@ _EMPTY_LOCK_STALE_SECONDS = 60.0
 
 def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool]:
     """Open the canonical regular lock entry without following it."""
-    flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    common_flags = os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        lock_fd = os.open(lock_name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDWR | common_flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=dir_fd,
+        )
         created = True
     except FileExistsError:
         try:
-            lock_fd = os.open(lock_name, flags, dir_fd=dir_fd)
+            # Existing locks are only inspected, flocked, and replaced or unlinked;
+            # reclaiming them never writes their inode. O_RDONLY also permits recovery
+            # of a dead owner's mode-0400 lock.
+            lock_fd = os.open(lock_name, os.O_RDONLY | common_flags, dir_fd=dir_fd)
         except OSError:
             raise FileExistsError(display) from None
         created = False
@@ -272,9 +280,21 @@ def _write_lock_pid(lock_fd: int) -> None:
         written += count
 
 
-def _private_publish_lock_name(lock_name: str, attempt: int) -> str:
-    """Return a same-directory private name for a prepared replacement lock."""
-    return f"{lock_name}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
+def _private_publish_lock_name(dir_fd: int, lock_name: str, attempt: int) -> str:
+    """Return a bounded same-directory private name for a replacement lock."""
+    name_max = 255
+    with contextlib.suppress(OSError):
+        configured_name_max = os.fpathconf(dir_fd, "PC_NAME_MAX")
+        if configured_name_max > 0:
+            name_max = configured_name_max
+    digest = hashlib.sha256(lock_name.encode("utf-8")).hexdigest()[:24]
+    nonce = f"{os.getpid():x}.{time.time_ns():x}.{attempt:x}"
+    prefix = ".publish-lock-replace-"
+    suffix = ".tmp"
+    available = name_max - len(prefix) - len(nonce) - len(suffix) - 1
+    if available < 1:
+        raise OSError(errno.ENAMETOOLONG, "filesystem name limit is too small for publish lock")
+    return f"{prefix}{digest[:available]}.{nonce}{suffix}"
 
 
 def _prepare_replacement_publish_lock(
@@ -283,7 +303,7 @@ def _prepare_replacement_publish_lock(
     """Create, flock, and populate an unexposed replacement lock inode."""
     flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     for attempt in range(10):
-        temporary_name = _private_publish_lock_name(lock_name, attempt)
+        temporary_name = _private_publish_lock_name(dir_fd, lock_name, attempt)
         try:
             lock_fd = os.open(
                 temporary_name,
@@ -348,7 +368,20 @@ def _replace_held_publish_lock(
             # This name is private to this claimant and was never exposed.
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=dir_fd)
-    os.close(old_lock_fd)
+    try:
+        os.close(old_lock_fd)
+    except BaseException as original_error:
+        # The replacement is now canonical but cannot be returned if retiring the old
+        # descriptor fails. Remove it while its flock is still held so it is never
+        # stranded without an owner.
+        try:
+            try:
+                _unlink_owned_publish_lock(dir_fd, lock_name, replacement_fd)
+            finally:
+                os.close(replacement_fd)
+        except BaseException as cleanup_error:
+            raise original_error from cleanup_error
+        raise
     return replacement_fd
 
 
@@ -472,10 +505,10 @@ def _acquire_publish_lock(
             _write_lock_pid(lock_fd)
             if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
                 raise FileExistsError(display)
-            claimed = True
             return lock_fd
 
-        held = os.fstat(lock_fd)
+        old_lock_fd = lock_fd
+        held = os.fstat(old_lock_fd)
         reclaimable = _existing_lock_is_reclaimable(lock_fd)
         # With advisory locks, flock ownership is authoritative: a fresh empty
         # inode with no holder is claimable immediately. Without flock, the legacy
@@ -493,20 +526,23 @@ def _acquire_publish_lock(
             raise FileExistsError(display)
 
         if advisory_locking:
-            lock_fd = _replace_held_publish_lock(
+            return _replace_held_publish_lock(
                 dir_fd,
                 lock_name,
-                lock_fd,
+                old_lock_fd,
                 display,
                 advisory_locking=True,
             )
-        else:
-            replacement_fd = _reclaim_identity_only_publish_lock(
-                dir_fd, lock_name, lock_fd, display
-            )
-            os.close(lock_fd)
-            lock_fd = replacement_fd
+
+        replacement_fd = _reclaim_identity_only_publish_lock(
+            dir_fd, lock_name, old_lock_fd, display
+        )
+        # Ownership transfers before the old descriptor is closed. If that close
+        # fails, the exception cleanup below removes and closes this replacement
+        # rather than stranding an owned lock with no caller to release it.
+        lock_fd = replacement_fd
         claimed = True
+        os.close(old_lock_fd)
         return lock_fd
     except BaseException as original_error:
         if claimed:

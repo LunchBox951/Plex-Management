@@ -439,6 +439,112 @@ def test_publish_lock_uses_identity_only_cleanup_when_advisory_locking_is_unsupp
     assert not lock.exists()
 
 
+def test_identity_only_reclaim_close_failure_cleans_replacement_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed old-fd close must not strand the newly claimed replacement lock."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    real_close = os.close
+    old_fd: int | None = None
+    replacement_fd: int | None = None
+    closed_fds: set[int] = set()
+
+    def _unsupported_flock(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOTSUP, "advisory locking unsupported")
+
+    def _fail_old_fd_close_once(fd: int) -> None:
+        nonlocal old_fd
+        if fd == old_fd:
+            old_fd = None
+            real_close(fd)
+            closed_fds.add(fd)
+            raise OSError(errno.EIO, "simulated old lock close failure")
+        real_close(fd)
+        closed_fds.add(fd)
+
+    monkeypatch.setattr(fcntl, "flock", _unsupported_flock)
+    monkeypatch.setattr(os, "close", _fail_old_fd_close_once)
+    real_open = os.open
+
+    def _record_existing_lock_fd(
+        path: str,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal old_fd, replacement_fd
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == lock_name:
+            if flags & os.O_CREAT:
+                replacement_fd = fd
+            else:
+                old_fd = fd
+        return fd
+
+    monkeypatch.setattr(os, "open", _record_existing_lock_fd)
+
+    with pytest.raises(OSError, match="simulated old lock close failure"):
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert old_fd is None
+    assert replacement_fd in closed_fds
+    assert not lock.exists()
+    assert not dst.exists()
+
+
+def test_publish_lock_reclaims_mode_0400_dead_owner_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inspecting and replacing a stale lock must not require write access to it."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    lock.chmod(0o400)
+    real_open = os.open
+
+    def _reject_existing_write_open(
+        path: str,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == lock_name and not flags & os.O_CREAT:
+            assert flags & os.O_ACCMODE == os.O_RDONLY
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _reject_existing_write_open)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_publish_lock_reclaims_max_length_canonical_name(tmp_path: Path) -> None:
+    """Replacement temp names stay below NAME_MAX when the canonical lock is full-sized."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / ("d" * 241)
+    lock = tmp_path / f".{dst.name}.publish.lock"
+    assert len(lock.name) == os.pathconf(tmp_path, "PC_NAME_MAX")
+    lock.write_text("999999999")
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
 def test_open_publish_lock_fstat_failure_removes_created_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -536,63 +642,85 @@ def test_publish_lock_context_surfaces_unlink_failure(
 def test_replace_held_publish_lock_cleans_private_temp_after_identity_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     lock_name = ".dst.mkv.publish.lock"
     lock = tmp_path / lock_name
     lock.write_text("999999999")
-    old_fd = os.open(lock_name, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
-    real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
-
-    def _lose_only_old_identity(_dir_fd: int, _name: str, fd: int) -> bool:
-        if fd == old_fd:
-            return False
-        return real_owns_name(_dir_fd, _name, fd)
-
-    monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _lose_only_old_identity)
+    dir_fd: int | None = None
+    old_fd: int | None = None
+    replacement_fd: int | None = None
     try:
-        with pytest.raises(FileExistsError):
-            local_fs._replace_held_publish_lock(  # pyright: ignore[reportPrivateUsage]
+        dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        old_fd = os.open(lock_name, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
+
+        def _lose_only_old_identity(_dir_fd: int, _name: str, fd: int) -> bool:
+            if fd == old_fd:
+                return False
+            return real_owns_name(_dir_fd, _name, fd)
+
+        monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _lose_only_old_identity)
+        try:
+            replacement_fd = local_fs._replace_held_publish_lock(  # pyright: ignore[reportPrivateUsage]
                 dir_fd, lock_name, old_fd, os.fspath(tmp_path / "dst.mkv"), advisory_locking=True
             )
+        except FileExistsError:
+            pass
+        else:
+            os.close(replacement_fd)
+            old_fd = None
+            pytest.fail("replacement unexpectedly succeeded")
     finally:
-        os.close(old_fd)
-        os.close(dir_fd)
+        if old_fd is not None:
+            os.close(old_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
-    assert not list(tmp_path.glob(f"{lock_name}.*.tmp"))
+    assert not list(tmp_path.glob(".publish-lock-replace-*.tmp"))
 
 
 def test_replace_held_publish_lock_cleans_private_temp_after_rename_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     lock_name = ".dst.mkv.publish.lock"
     lock = tmp_path / lock_name
     lock.write_text("999999999")
-    old_fd = os.open(lock_name, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
-    real_rename = os.rename
-
-    def _fail_private_lock_rename(
-        src: str,
-        dst: str,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        if src.endswith(".tmp") and dst == lock_name:
-            raise OSError(errno.EIO, "simulated rename failure")
-        real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-
-    monkeypatch.setattr(os, "rename", _fail_private_lock_rename)
+    dir_fd: int | None = None
+    old_fd: int | None = None
+    replacement_fd: int | None = None
     try:
-        with pytest.raises(OSError, match="simulated rename failure"):
-            local_fs._replace_held_publish_lock(  # pyright: ignore[reportPrivateUsage]
+        dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        old_fd = os.open(lock_name, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        real_rename = os.rename
+
+        def _fail_private_lock_rename(
+            src: str,
+            dst: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            if src.endswith(".tmp") and dst == lock_name:
+                raise OSError(errno.EIO, "simulated rename failure")
+            real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr(os, "rename", _fail_private_lock_rename)
+        try:
+            replacement_fd = local_fs._replace_held_publish_lock(  # pyright: ignore[reportPrivateUsage]
                 dir_fd, lock_name, old_fd, os.fspath(tmp_path / "dst.mkv"), advisory_locking=True
             )
+        except OSError as error:
+            assert "simulated rename failure" in str(error)
+        else:
+            os.close(replacement_fd)
+            old_fd = None
+            pytest.fail("replacement unexpectedly succeeded")
     finally:
-        os.close(old_fd)
-        os.close(dir_fd)
+        if old_fd is not None:
+            os.close(old_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
-    assert not list(tmp_path.glob(f"{lock_name}.*.tmp"))
+    assert not list(tmp_path.glob(".publish-lock-replace-*.tmp"))
 
 
 def test_publish_lock_hardlinked_stale_entry_preserves_linked_source(tmp_path: Path) -> None:
