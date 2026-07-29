@@ -68,14 +68,15 @@ WORKDIR /app
 RUN apk add --no-cache \
         python-3.14=3.14.6-r4 \
         ffmpeg-8.1=8.1.2-r2 \
-    && mkdir -p /app/data
+        tzdata=2026c-r0 \
+    && mkdir -p /app/data \
+    && chown 10001:10001 /app/data
 
 COPY --from=builder /opt/venv /opt/venv
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && chown -R 10001:10001 /app
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER 10001:10001
 EXPOSE 8000

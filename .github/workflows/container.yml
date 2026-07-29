@@ -79,12 +79,21 @@ jobs:
           import pathlib
           import shutil
           import sys
+          from zoneinfo import ZoneInfo
           import cryptography, asyncpg, psycopg2, uvloop, watchfiles, pydantic_core, aiosqlite
           assert sys.version_info[:2] == (3, 14), sys.version
           assert os.geteuid() == 10001, os.geteuid()
           assert ctypes.CDLL("libc.so.6").gnu_get_libc_version
           assert pathlib.Path("/bin/sh").is_file()
           assert shutil.which("ffprobe")
+          assert ZoneInfo("UTC").key == "UTC"
+          assert ZoneInfo("America/New_York").key == "America/New_York"
+          assert pathlib.Path("/app/alembic.ini").stat().st_uid == 0
+          assert pathlib.Path("/app/migrations").stat().st_uid == 0
+          assert pathlib.Path("/app/data").stat().st_uid == 10001
+          probe = pathlib.Path("/app/data/.write-probe")
+          probe.write_text("ok", encoding="utf-8")
+          probe.unlink()
           '
           docker run --rm --entrypoint ffprobe "${{ steps.img.outputs.name }}:pr" -version
 
@@ -190,13 +199,13 @@ jobs:
             type=raw,value=edge
             type=sha,prefix=edge-,format=short
 
-      - name: Build and push
-        id: build
+      - name: Build candidate (load locally, no push)
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          push: false
+          load: true
+          tags: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
           # metadata-action already derives an org.opencontainers.image.version
           # label from the primary tag (would be the literal string "edge" here,
           # which is meaningless as a version) — ours is listed last so it wins
@@ -208,6 +217,89 @@ jobs:
             PLEX_MANAGER_BUILD_ID=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Runtime contract smoke
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c '
+          import ctypes
+          import os
+          import pathlib
+          import shutil
+          import sys
+          from zoneinfo import ZoneInfo
+          import cryptography, asyncpg, psycopg2, uvloop, watchfiles, pydantic_core, aiosqlite
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert os.geteuid() == 10001, os.geteuid()
+          assert ctypes.CDLL("libc.so.6").gnu_get_libc_version
+          assert pathlib.Path("/bin/sh").is_file()
+          assert shutil.which("ffprobe")
+          assert ZoneInfo("UTC").key == "UTC"
+          assert ZoneInfo("America/New_York").key == "America/New_York"
+          assert pathlib.Path("/app/alembic.ini").stat().st_uid == 0
+          assert pathlib.Path("/app/migrations").stat().st_uid == 0
+          assert pathlib.Path("/app/data").stat().st_uid == 10001
+          probe = pathlib.Path("/app/data/.write-probe")
+          probe.write_text("ok", encoding="utf-8")
+          probe.unlink()
+          '
+          docker run --rm --entrypoint ffprobe "$IMAGE" -version
+
+      - name: Root updater smoke
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
+        run: |
+          docker run --rm --user 0:0 --entrypoint python "$IMAGE" -c '
+          import os
+          import plex_manager.updater
+          assert os.geteuid() == 0, os.geteuid()
+          '
+
+      - name: Normal boot and health smoke
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
+          NAME: plex-manager-publish-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          trap 'docker logs --tail 200 "$NAME" 2>&1 || true; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$NAME" "$IMAGE"
+          for attempt in $(seq 1 90); do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$NAME")
+            case "$status" in
+              healthy) exit 0 ;;
+              unhealthy) echo "::error::Container became unhealthy"; exit 1 ;;
+            esac
+            if [ "$(docker inspect --format '{{.State.Running}}' "$NAME")" != true ]; then
+              echo "::error::Container exited before becoming healthy"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::Container did not become healthy within 90 seconds"
+          exit 1
+
+      - name: Publish verified image tags
+        id: publish
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          CANDIDATE: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          immutable="$IMAGE:edge-$short_sha"
+          moving="$IMAGE:edge"
+          candidate_id=$(docker image inspect --format '{{.Id}}' "$CANDIDATE")
+          docker tag "$CANDIDATE" "$immutable"
+          docker tag "$CANDIDATE" "$moving"
+          test "$(docker image inspect --format '{{.Id}}' "$immutable")" = "$candidate_id"
+          test "$(docker image inspect --format '{{.Id}}' "$moving")" = "$candidate_id"
+          docker push "$immutable"
+          docker push "$moving"
+          digest=$(docker buildx imagetools inspect "$immutable" --format '{{.Manifest.Digest}}')
+          moving_digest=$(docker buildx imagetools inspect "$moving" --format '{{.Manifest.Digest}}')
+          test "$moving_digest" = "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Scan the published image (Trivy — SARIF to the Security tab)
         uses: aquasecurity/trivy-action@v0.36.0
@@ -226,7 +318,7 @@ jobs:
           TRIVY_IGNORE_UNFIXED: "true"
         with:
           # Scan the exact bytes just published (by digest).
-          image-ref: ${{ format('{0}@{1}', steps.img.outputs.name, steps.build.outputs.digest) }}
+          image-ref: ${{ format('{0}@{1}', steps.img.outputs.name, steps.publish.outputs.digest) }}
           format: sarif
           output: trivy-results.sarif
           severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
