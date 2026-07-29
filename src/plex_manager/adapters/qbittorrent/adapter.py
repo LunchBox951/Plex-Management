@@ -74,6 +74,7 @@ from plex_manager.ports.download_client import (
     DownloadStatus,
     FailureDetail,
     FailureDetailSource,
+    PreparedAdd,
 )
 
 __all__ = [
@@ -999,6 +1000,7 @@ def _torrent_to_status(torrent: dict[str, object]) -> DownloadStatus:
     eta = _i(torrent.get("eta"))
     return DownloadStatus(
         info_hash=_s(torrent.get("hash")).lower(),
+        category=_s(torrent.get("category")),
         name=_s(torrent.get("name")),
         raw_state=_s(torrent.get("state")),
         progress=_f(torrent.get("progress")),
@@ -1435,95 +1437,68 @@ class QbittorrentClient:
                 client, url, precheck_resolves_dns=False, transport=transport
             )
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
-        """Add a torrent; return its lowercased info-hash + whether it was created.
-
-        A 409 (already present) resolves to the computed hash rather than
-        erroring, reported honestly as ``created=False``: qBittorrent's 409 is
-        the one signal that the torrent PREDATES this call, and the caller's
-        lost-grab cleanup must never destroy (``delete_files=True``) a torrent
-        it merely reused -- its data can back a live library file via hardlink
-        (see :class:`~plex_manager.ports.download_client.AddResult`).
-
-        When ``save_path`` is non-empty (a directed path -- issues #133/#157),
-        the request ALSO carries ``autoTMM: "false"``: an install with global
-        Automatic Torrent Management enabled otherwise ignores the per-add
-        ``savepath`` field entirely and lets category/auto rules place the
-        torrent, silently defeating the whole save-path direction. Sending the
-        flag pins this ONE torrent to manual management so ``savepath`` is
-        actually honoured, without touching the client's global AutoTMM
-        setting or any other torrent. When ``save_path`` is empty (nothing to
-        direct), ``autoTMM`` is omitted entirely -- the client's own
-        auto-managed/manual mode for this torrent is left untouched, exactly
-        the prior behaviour.
-        """
-        urls_value: str | None = None
-        torrent_bytes: bytes | None = None
-        info_hash: str | None = None
-
+    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd:
+        """Resolve a source without mutating qBittorrent."""
         try:
             scheme = urlparse(magnet_or_url).scheme.casefold()
         except ValueError as exc:
-            # An indexer-supplied source that urlparse itself refuses (bad IPv6
-            # literal) is a release problem -> the SourceError subtype, never a
-            # raw ValueError escaping the taxonomy.
             raise QbittorrentSourceError("unsupported torrent source URL") from exc
         if scheme == "magnet":
-            urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
-        elif scheme in ("http", "https"):
+            if info_hash is None:
+                raise QbittorrentSourceError("could not determine torrent hash for magnet source")
+            return PreparedAdd(torrent_hash=info_hash.lower(), submission_url=magnet_or_url)
+        if scheme in ("http", "https"):
             magnet, body = await self._resolve_http_source(magnet_or_url)
             if magnet is not None:
-                urls_value = magnet
                 info_hash = _info_hash_from_magnet(magnet)
-            elif body is not None:
+                if info_hash is None:
+                    raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
+                return PreparedAdd(torrent_hash=info_hash.lower(), submission_url=magnet)
+            if body is not None:
                 info_hash = _info_hash_from_torrent(body)
                 if info_hash is None:
                     raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
-                torrent_bytes = body
-            else:
-                # Could not resolve to a magnet or locally hashable .torrent. Do
-                # not ask qBittorrent to add an untrackable opaque URL.
-                raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
-        elif scheme:
-            # An unsupported scheme (ftp:// etc.) is a source veto -- nothing was
-            # (or will be) handed to qBittorrent -> the SourceError subtype.
+                return PreparedAdd(torrent_hash=info_hash.lower(), torrent_bytes=body)
+            raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
+        if scheme:
             raise QbittorrentSourceError("unsupported torrent source URL")
-        else:
-            urls_value = magnet_or_url
-            info_hash = _info_hash_from_magnet(magnet_or_url)
+        info_hash = _info_hash_from_magnet(magnet_or_url)
+        if info_hash is None:
+            raise QbittorrentSourceError("could not determine torrent hash for magnet source")
+        return PreparedAdd(torrent_hash=info_hash.lower(), submission_url=magnet_or_url)
 
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        """Submit a previously prepared torrent exactly once."""
+        has_url = prepared.submission_url is not None
+        has_bytes = prepared.torrent_bytes is not None
+        if has_url == has_bytes:
+            raise ValueError("prepared add must contain exactly one submission payload")
         form: dict[str, str] = {"savepath": save_path, "category": category}
         if save_path:
-            # A directed save path only takes effect when this torrent is NOT
-            # auto-managed -- otherwise a global AutoTMM install silently
-            # relocates it per category/auto rules, ignoring ``savepath``
-            # entirely. Manual-manage just THIS add; omitted (below) when
-            # there is no directed path, leaving the client's own mode alone.
             form["autoTMM"] = "false"
         files: dict[str, tuple[str, bytes, str]] | None = None
-        if urls_value is not None:
-            form["urls"] = urls_value
-        if torrent_bytes is not None:
+        if prepared.submission_url is not None:
+            form["urls"] = prepared.submission_url
+        else:
+            torrent_bytes = prepared.torrent_bytes
+            if torrent_bytes is None:  # pragma: no cover - guarded by has_bytes
+                raise ValueError("prepared torrent bytes are missing")
             files = {"torrents": ("file.torrent", torrent_bytes, "application/x-bittorrent")}
-
         response = await self._request("POST", "/torrents/add", data=form, files=files)
         if not _is_add_success(response):
-            # Surfaced, retryable failure — never an opaque 500. No url/secret leak.
             raise QbittorrentError(
                 f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )
-        # The 409 branch of _is_add_success is "already present, resolved to the
-        # existing torrent" -- the honest created=False signal (every other
-        # success shape means the client actually accepted a new add).
-        created = response.status_code != _HTTP_CONFLICT
+        return AddResult(
+            torrent_hash=prepared.torrent_hash.lower(),
+            created=response.status_code != _HTTP_CONFLICT,
+        )
 
-        if info_hash is not None:
-            return AddResult(torrent_hash=info_hash.lower(), created=created)
-        # No locally-derivable hash (rare: opaque .torrent URL qBit fetched). Best
-        # effort: the caller can reconcile by category on the next poll.
-        _logger.warning("added torrent but could not derive its info-hash locally")
-        return AddResult(torrent_hash="", created=created)
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        """Prepare then submit a torrent for compatibility callers."""
+        prepared = await self.prepare_add(magnet_or_url)
+        return await self.add_prepared(prepared, save_path, category)
 
     # ---- status --------------------------------------------------------- #
     async def get_status(self, info_hash: str) -> DownloadStatus | None:

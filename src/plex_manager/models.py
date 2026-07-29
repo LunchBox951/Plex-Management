@@ -43,7 +43,12 @@ __all__ = [
     "AuthSession",
     "Blocklist",
     "BlocklistReason",
+    "ClientOnlyTorrent",
+    "ClientOnlyTorrentState",
     "Download",
+    "DownloadAddIntent",
+    "DownloadAddIntentScope",
+    "DownloadAddIntentState",
     "DownloadCoverageClaim",
     "DownloadHistory",
     "DownloadHistoryEvent",
@@ -154,6 +159,21 @@ class DownloadScopeStatus(StrEnum):
     # carrying such a scope — a legitimately persisted state, not corrupt data
     # (Codex review on PR #269). Scope-terminal, like ``imported``/``failed``.
     cancelled = "cancelled"
+
+
+class DownloadAddIntentState(StrEnum):
+    """Durable workflow state between preparing and tracking a torrent add."""
+
+    prepared = "prepared"
+    needs_attention = "needs_attention"
+    cancel_requested = "cancel_requested"
+
+
+class ClientOnlyTorrentState(StrEnum):
+    """Correction state for an app-category torrent lacking application ownership."""
+
+    pending = "pending"
+    removing = "removing"
 
 
 class DownloadCoverageClaimStatus(StrEnum):
@@ -727,6 +747,93 @@ class SeasonEpisodeState(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DownloadAddIntent(Base):
+    """Committed hash-keyed proof that a client add may be retried or recovered."""
+
+    __tablename__ = "download_add_intents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    torrent_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    source: Mapped[str | None] = mapped_column(EncryptedStr)
+    state: Mapped[str] = mapped_column(
+        String, default="prepared", server_default=sa.text("'prepared'")
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL")
+    )
+    tmdb_id: Mapped[int | None] = mapped_column()
+    media_type: Mapped[str | None] = mapped_column(String)
+    year: Mapped[int | None] = mapped_column()
+    release_title: Mapped[str | None] = mapped_column(String)
+    indexer: Mapped[str | None] = mapped_column(String)
+    quality_name: Mapped[str | None] = mapped_column(String)
+    save_path: Mapped[str] = mapped_column(String, default="", server_default=sa.text("''"))
+    observed_request_status: Mapped[str | None] = mapped_column(String)
+    observed_season_status: Mapped[str | None] = mapped_column(String)
+    owns_client_torrent: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    last_error: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DownloadAddIntentScope(Base):
+    """One physical title scope held before its successor download exists."""
+
+    __tablename__ = "download_add_intent_scopes"
+    __table_args__ = (
+        Index("uq_download_add_intent_scopes_intent_scope", "intent_id", "scope_key", unique=True),
+        Index(
+            "uq_download_add_intent_scopes_title_scope",
+            "tmdb_id",
+            "media_type",
+            "scope_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    intent_id: Mapped[int] = mapped_column(
+        ForeignKey("download_add_intents.id", ondelete="CASCADE"), index=True
+    )
+    media_request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_requests.id", ondelete="SET NULL")
+    )
+    tmdb_id: Mapped[int | None] = mapped_column()
+    media_type: Mapped[str | None] = mapped_column(String)
+    scope_key: Mapped[str] = mapped_column(String)
+    season_number: Mapped[int | None] = mapped_column()
+    episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
+    is_target: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClientOnlyTorrent(Base):
+    """A bounded correction observation for an untracked app-category torrent."""
+
+    __tablename__ = "client_only_torrents"
+
+    torrent_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    raw_state: Mapped[str] = mapped_column(String)
+    progress: Mapped[float] = mapped_column(default=0.0, server_default=sa.text("0"))
+    save_path: Mapped[str] = mapped_column(String, default="", server_default=sa.text("''"))
+    category: Mapped[str] = mapped_column(
+        String, default="plex-manager", server_default=sa.text("'plex-manager'")
+    )
+    state: Mapped[str] = mapped_column(
+        String, default="pending", server_default=sa.text("'pending'")
+    )
+    last_error: Mapped[str | None] = mapped_column(String)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 

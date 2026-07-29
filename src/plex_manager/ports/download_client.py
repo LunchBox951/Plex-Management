@@ -24,6 +24,7 @@ __all__ = [
     "DownloadedFile",
     "FailureDetail",
     "FailureDetailSource",
+    "PreparedAdd",
 ]
 
 
@@ -48,6 +49,16 @@ class AddResult(BaseModel):
     created: bool
 
 
+class PreparedAdd(BaseModel):
+    """A hash-resolved add payload that has not reached the download client."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    torrent_hash: str
+    submission_url: str | None = None
+    torrent_bytes: bytes | None = None
+
+
 class DownloadStatus(BaseModel):
     """A point-in-time snapshot of one torrent in the download client.
 
@@ -60,6 +71,7 @@ class DownloadStatus(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     info_hash: str
+    category: str = ""
     name: str
     raw_state: str
     progress: float = 0.0
@@ -128,6 +140,14 @@ class DownloadedFile(BaseModel):
 @runtime_checkable
 class DownloadClientPort(Protocol):
     """Add, monitor, and control torrents in the download client."""
+
+    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd:
+        """Resolve a source and derive its stable hash without client mutation."""
+        raise NotImplementedError
+
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        """Submit one already-prepared, hash-resolved torrent to the client."""
+        raise NotImplementedError
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         """Add a torrent; return its lowercased info-hash + whether it was created.

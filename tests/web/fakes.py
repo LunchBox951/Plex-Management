@@ -24,6 +24,7 @@ from plex_manager.ports.download_client import (
     DownloadedFile,
     DownloadStatus,
     FailureDetail,
+    PreparedAdd,
 )
 from plex_manager.ports.indexer import IndexerPort
 from plex_manager.ports.library import (
@@ -332,6 +333,22 @@ class FakeQbittorrent:
         # call was scoped to -- lets a test assert reconcile requested exactly
         # its tracked hashes (issue #216), never the whole inventory.
         self.status_queries: list[list[str]] = []
+
+    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd:
+        if magnet_or_url in self.source_errors:
+            raise QbittorrentSourceError("could not determine torrent hash for HTTP source")
+        marker = "urn:btih:"
+        torrent_hash = ""
+        if marker in magnet_or_url:
+            torrent_hash = magnet_or_url.split(marker, 1)[1].split("&", 1)[0].lower()
+        return PreparedAdd(torrent_hash=torrent_hash, submission_url=magnet_or_url)
+
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        self.added.append((prepared.submission_url or "<torrent-bytes>", save_path, category))
+        return AddResult(
+            torrent_hash=prepared.torrent_hash,
+            created=prepared.torrent_hash not in self.pre_existing,
+        )
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         if magnet_or_url in self.source_errors:

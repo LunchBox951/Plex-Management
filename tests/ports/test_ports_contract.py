@@ -26,6 +26,7 @@ from plex_manager.ports.download_client import (
     DownloadedFile,
     DownloadStatus,
     FailureDetail,
+    PreparedAdd,
 )
 from plex_manager.ports.filesystem import FileSystemPort
 from plex_manager.ports.indexer import IndexerPort
@@ -159,6 +160,12 @@ class _FakeIndexer:
 
 
 class _FakeDownloadClient:
+    async def prepare_add(self, magnet_or_url: str) -> PreparedAdd:
+        return PreparedAdd(torrent_hash="hash", submission_url=magnet_or_url)
+
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        return AddResult(torrent_hash=prepared.torrent_hash, created=True)
+
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         return AddResult(torrent_hash="hash", created=True)
 
