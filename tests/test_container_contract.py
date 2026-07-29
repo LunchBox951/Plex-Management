@@ -76,19 +76,52 @@ def _build_actions(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _docker_command_pushes(command: list[str]) -> bool:
+    """Identify a Docker command, not a word merely passed to another command."""
+    leading_shell_tokens = {"!", "do", "if", "then"}
+    docker_index = next((index for index, part in enumerate(command) if part == "docker"), None)
+    if docker_index is None:
+        return False
+
+    prefix = command[:docker_index]
+    if any(token not in leading_shell_tokens and "=" not in token for token in prefix):
+        return False
+    return any(
+        argument == "push" or argument.startswith("--push")
+        for argument in command[docker_index + 1 :]
+    )
+
+
 def _is_push_effecting_step(step: dict[str, Any]) -> bool:
-    """Whether a step can publish an image to a registry."""
+    """Whether a step can publish an image to a registry.
+
+    Treat every Docker CLI invocation with a ``push`` token (for example,
+    ``docker image push``) or a ``--push`` option as push-effecting. Shell
+    tokenization excludes comments and quoted strings passed to commands such as
+    ``echo`` instead of matching their text as if it were a Docker invocation.
+    """
     if step in _build_actions([step]):
         with_values = cast(dict[str, Any], step.get("with", {}))
         return with_values.get("push") is True
 
-    run = str(step.get("run", ""))
-    for command in re.findall(r"(?m)^\s*(?:docker\s+)?(?:buildx\s+)?[^\n]+", run):
+    # Join escaped newlines so a multi-line Docker command remains one command.
+    run = str(step.get("run", "")).replace("\\\n", " ")
+    for line in run.splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        command: list[str] = []
         try:
-            argv = shlex.split(command)
+            tokens = list(lexer)
         except ValueError:
             continue
-        if argv[:2] == ["docker", "push"] or "--push" in argv:
+        for token in tokens:
+            if token in {";", "&&", "|", "||"}:
+                if _docker_command_pushes(command):
+                    return True
+                command = []
+            else:
+                command.append(token)
+        if _docker_command_pushes(command):
             return True
     return False
 
@@ -124,18 +157,24 @@ def test_runtime_installs_timezone_data_and_limits_application_ownership() -> No
     instructions = _dockerfile_instructions()
     copy_lines = [line for line in instructions if line.startswith("COPY ")]
     chown_commands = [
-        match.group(0)
+        command
         for line in instructions
-        if (match := re.search(r"\bchown\s+[^;&|]+", line)) is not None
+        for command in re.findall(r"(?:^|&&|;|\|\|)\s*(chown\s+[^;&|]+)", line)
+    ]
+    protected_copy_lines = [
+        line
+        for line in copy_lines
+        if any(path in line.split() for path in ("alembic.ini", "migrations"))
     ]
 
     assert TZDATA_PACKAGE in "\n".join(instructions)
     assert chown_commands == ["chown 10001:10001 /app/data"], (
         "only the writable data directory may be chowned"
     )
-    for copied_path in ("alembic.ini", "migrations"):
-        copy = next(line for line in copy_lines if copied_path in line)
-        assert "--chown" not in copy, f"{copied_path} must remain root-owned"
+    assert protected_copy_lines, "expected COPY instructions for migration assets"
+    assert all("--chown" not in line for line in protected_copy_lines), (
+        "migration assets must remain root-owned"
+    )
 
 
 def test_publish_smokes_the_exact_candidate_before_publishing_tags() -> None:
