@@ -1546,13 +1546,11 @@ async def cancel_request_with_outcome(
     if any(row.status == DownloadState.Importing.value for row in active):
         raise ImportInProgressError(request_id)
 
-    # A cancel with active rows genuinely needs qBittorrent to remove their torrents;
-    # discover them FIRST (above) so a pure-DB settle with NO active rows still works
-    # unconfigured, and only require the client when there is actually something to
-    # remove. Raised BEFORE any state change (nothing settled, no torrent touched) so
-    # the endpoint surfaces the honest 409 ``service_not_configured`` -- never a silent
-    # skip that leaks a seeding torrent (see DownloadClientRequiredError).
-    if active and qbt is None:
+    # A cancel with active rows or durable intents genuinely needs qBittorrent to
+    # remove owned torrents; discover both FIRST (above) so a pure-DB settle with
+    # neither still works unconfigured. Refuse before any state change rather than
+    # report success while a cancel_requested intent can keep a torrent seeding.
+    if (active or intents) and qbt is None:
         raise DownloadClientRequiredError(request_id)
 
     # Move every active row out of the active set (so the reconciler stops tracking it

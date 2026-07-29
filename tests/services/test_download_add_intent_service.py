@@ -631,7 +631,7 @@ async def test_transient_cancel_remove_failure_preserves_retryable_state(
     assert remaining.state == "cancel_requested"
 
 
-async def test_cancelled_intent_database_failure_after_remove_stays_non_readdable(
+async def test_cancelled_intent_status_outage_after_remove_stays_recoverable(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     intent = await SqlDownloadAddIntentRepository(session).create(
@@ -675,9 +675,10 @@ async def test_cancelled_intent_database_failure_after_remove_stays_non_readdabl
     assert client.statuses == {}
 
     result = await recover_all(client, session)
-    assert result.removed == 1
+    assert not result.changed
     assert client.adds == []
-    assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
+    retained = await SqlDownloadAddIntentRepository(session).get(intent.id)
+    assert retained is not None and retained.state == "cancel_requested"
 
 
 async def test_client_wide_prepare_failure_is_reraised(session: AsyncSession) -> None:
@@ -996,7 +997,9 @@ async def test_source_error_parks_intent_and_recovers_later_intents(session: Asy
     assert await SqlDownloadAddIntentRepository(session).get(second.id) is None
 
 
-async def test_stale_premise_parks_and_recovers_later_intents(session: AsyncSession) -> None:
+async def test_stale_owned_premise_enters_cleanup_and_recovers_later_intents(
+    session: AsyncSession,
+) -> None:
     first_request = MediaRequest(
         tmdb_id=1, media_type=MediaType.movie, title="First", status=RequestStatus.pending
     )
@@ -1062,11 +1065,10 @@ async def test_stale_premise_parks_and_recovers_later_intents(session: AsyncSess
         session,
     )
 
-    assert result == type(result)(finalized=1, needs_attention=1)
+    assert result == type(result)(finalized=1)
     stale_after = await intents.get(stale.id, fresh=True)
     assert stale_after is not None
-    assert stale_after.state == "needs_attention"
-    assert stale_after.last_error == "intent_premise_no_longer_active"
+    assert stale_after.state == "cancel_requested"
     assert await intents.get(later.id, fresh=True) is None
 
 
@@ -1113,7 +1115,9 @@ async def test_cancel_recovers_only_cancelled_request_intents(session: AsyncSess
 
     assert outcome.record.status == RequestStatus.cancelled.value
     assert not outcome.cleanup_deferred
-    assert await intents.get(target.id, fresh=True) is None
+    target_after = await intents.get(target.id, fresh=True)
+    assert target_after is not None
+    assert target_after.state == "cancel_requested"
     unrelated_after = await intents.get(other.id, fresh=True)
     assert unrelated_after is not None
     assert unrelated_after.state == "prepared"

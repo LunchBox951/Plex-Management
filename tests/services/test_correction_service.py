@@ -1639,7 +1639,7 @@ async def test_cancel_refuses_retryable_conflict_when_intent_is_replaced_during_
     assert intent.id > 0
 
 
-async def test_cancel_claims_needs_attention_intent_for_removal(
+async def test_cancel_with_needs_attention_intent_requires_configured_client(
     sessionmaker_: SessionMaker,
 ) -> None:
     async with sessionmaker_() as session:
@@ -1670,11 +1670,15 @@ async def test_cancel_claims_needs_attention_intent_for_removal(
         request_id = request.id
 
     async with sessionmaker_() as session:
-        await correction_service.cancel_request(session, None, request_id=request_id)
+        with pytest.raises(correction_service.DownloadClientRequiredError):
+            await correction_service.cancel_request(session, None, request_id=request_id)
         remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+        request_after = await session.get(MediaRequest, request_id)
 
     assert remaining is not None
-    assert remaining.state == "cancel_requested"
+    assert remaining.state == "needs_attention"
+    assert request_after is not None
+    assert request_after.status == RequestStatus.downloading
 
 
 async def test_cancel_already_gone_torrent_is_a_no_op_success(

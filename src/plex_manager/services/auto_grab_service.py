@@ -1232,7 +1232,7 @@ async def run_grab_cycle(
                 _logger.warning(
                     "auto-grab: active scope refused (%s)",
                     type(exc).__name__,
-                    extra={"request_id": scope.request_id},
+                    extra={"request_id": safe_int(scope.request_id)},
                 )
                 break
             except (

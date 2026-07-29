@@ -513,6 +513,7 @@ class SqlSeasonRequestRepository:
                     DownloadAddIntentScope.tmdb_id == MediaRequest.tmdb_id,
                     DownloadAddIntentScope.media_type == MediaType.tv.value,
                     DownloadAddIntentScope.season_number == SeasonRequest.season_number,
+                    DownloadAddIntentScope.active_scope_key.is_not(None),
                 )
                 .exists()
             )

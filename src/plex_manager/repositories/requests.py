@@ -1185,6 +1185,7 @@ class SqlRequestRepository:
                     DownloadAddIntentScope.tmdb_id == MediaRequest.tmdb_id,
                     DownloadAddIntentScope.media_type == MediaRequest.media_type,
                     DownloadAddIntentScope.scope_key == "movie",
+                    DownloadAddIntentScope.active_scope_key.is_not(None),
                 )
                 .exists()
             )

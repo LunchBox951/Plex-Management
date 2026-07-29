@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
+from sqlalchemy.exc import IntegrityError
+
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import DownloadHistory, DownloadHistoryEvent, RequestStatus
@@ -534,9 +536,11 @@ async def _recover(
         status = await qbt.get_status(intent.torrent_hash)
         try:
             if intent.state == "cancel_requested":
-                if status is not None and (
-                    status.category == intent_category(intent.id) or intent.owns_client_torrent
-                ):
+                # A missing status is an ambiguous client outage, not proof this
+                # intent-owned torrent is gone. Retain cleanup state to re-probe.
+                if status is None:
+                    continue
+                if status.category == intent_category(intent.id) or intent.owns_client_torrent:
                     await qbt.remove(intent.torrent_hash, delete_files=True)
                 await intents.delete(intent.id)
                 await session.commit()
@@ -596,11 +600,32 @@ async def _recover(
             )
         except IntentRecoveryConflictError as exc:
             await session.rollback()
+            if (
+                _owns_present_torrent(intent, status)
+                and exc.reason == "intent_premise_no_longer_active"
+            ):
+                # The live intent category proves this torrent is ours, but the
+                # decision premise is gone. Keep it in the existing machine-cleanup
+                # lifecycle rather than parking an invisible seeding torrent.
+                if await intents.mark_state(
+                    intent.id, "cancel_requested", expected_state="prepared"
+                ):
+                    await session.commit()
+                continue
             if await _park_needs_attention(session, intents, intent.id, exc.reason):
                 _logger.warning("durable intent %s needs operator attention (%s)", intent.id, exc)
                 result = IntentRecoveryResult(
                     result.finalized, result.removed, result.needs_attention + 1
                 )
+        except IntegrityError:
+            await session.rollback()
+            # This recovery invocation submitted under this intent's category, so a
+            # persistence collision after that submit leaves a client torrent owned by
+            # the intent. Retire it into the cancellation cleanup lifecycle rather
+            # than retrying the same collision and starving later intents.
+            if await intents.mark_state(intent.id, "cancel_requested", expected_state="prepared"):
+                await session.commit()
+            continue
         except Exception as exc:
             await session.rollback()
             _logger.warning(

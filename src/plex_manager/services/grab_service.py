@@ -412,6 +412,18 @@ async def _release_rejected_reservation(session: AsyncSession, intent_id: int) -
     await session.commit()
 
 
+async def _retire_lost_add_reservation(
+    session: AsyncSession, intent_id: int, *, orphan_removed: bool
+) -> None:
+    """Retire an intent after its add lost a definitive post-add race."""
+    intents = SqlDownloadAddIntentRepository(session)
+    if orphan_removed:
+        await intents.delete(intent_id)
+    else:
+        await intents.mark_state(intent_id, "cancel_requested", expected_state="prepared")
+    await session.commit()
+
+
 async def _remove_torrent_if_added(
     qbt: DownloadClientPort,
     torrent_hash: str,
@@ -419,7 +431,7 @@ async def _remove_torrent_if_added(
     actually_added: bool,
     request_id: int | None,
     reason: str,
-) -> None:
+) -> bool:
     """Best-effort cleanup (WITH data) of the torrent THIS grab genuinely
     created, after the grab lost a race/CAS and nothing tracks it.
 
@@ -447,7 +459,7 @@ async def _remove_torrent_if_added(
             reason,
             extra=log_extra,
         )
-        return
+        return False
     try:
         await qbt.remove(torrent_hash, delete_files=True)
     except Exception:
@@ -458,6 +470,8 @@ async def _remove_torrent_if_added(
             exc_info=True,
             extra=log_extra,
         )
+        return False
+    return True
 
 
 def _planned_target_seasons(scored: ScoredRelease, season: int | None) -> tuple[int, ...]:
@@ -1075,10 +1089,6 @@ async def grab(
     target_seasons = _planned_target_seasons(scored, season)
     active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
 
-    # Resolve the stable hash before reserving the shared durable scope. This
-    # does no client mutation; a committed reservation survives a worker crash
-    # and is recovered through the normal intent loop.
-    prepared = await qbt.prepare_add(source)
     intent_id: int | None = None
     intent_owns_client_torrent = False
 
@@ -1152,6 +1162,16 @@ async def grab(
         )
         if active is not None:
             raise AlreadyDownloadingError(request_id)
+
+    # Resolve a prepared payload only after candidate-hash prechecks can reject
+    # idempotent/recovery cases without waiting on a mutable or expired source.
+    prepared = await qbt.prepare_add(source)
+    if (
+        known_hash is not None
+        and prepared.torrent_hash
+        and prepared.torrent_hash.lower() != known_hash
+    ):
+        raise GrabError(candidate.title)
 
     # A hashless indexer candidate can still have a stable hash after preparation.
     # Preserve same-request idempotency before taking a second reservation: this is
@@ -1265,6 +1285,11 @@ async def grab(
 
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+        # The durable intent's add completed, but a committed Download already
+        # owns this exact hash. This is definitive: retire our reservation without
+        # touching the winner's torrent or category.
+        if intent_id is not None:
+            await _release_rejected_reservation(session, intent_id)
         if request_id is not None and existing.media_request_id != request_id:
             raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
         # Same scope-match guard as the known-hash precheck, for the case the indexer
@@ -1298,13 +1323,17 @@ async def grab(
             torrent_hash=torrent_hash,
         )
         if active is not None:
-            await _remove_torrent_if_added(
+            orphan_removed = await _remove_torrent_if_added(
                 qbt,
                 torrent_hash,
                 actually_added=actually_added,
                 request_id=request_id,
                 reason="losing a parallel grab for a planned TV scope",
             )
+            if intent_id is not None:
+                await _retire_lost_add_reservation(
+                    session, intent_id, orphan_removed=orphan_removed
+                )
             raise AlreadyDownloadingError(request_id)
 
     if existing is not None:
@@ -1366,13 +1395,17 @@ async def grab(
                     torrent_hash=torrent_hash,
                 )
                 if active is not None:
-                    await _remove_torrent_if_added(
+                    orphan_removed = await _remove_torrent_if_added(
                         qbt,
                         torrent_hash,
                         actually_added=actually_added,
                         request_id=request_id,
                         reason="losing a terminal-row reuse race",
                     )
+                    if intent_id is not None:
+                        await _retire_lost_add_reservation(
+                            session, intent_id, orphan_removed=orphan_removed
+                        )
                     raise AlreadyDownloadingError(request_id) from None
             raise
     else:
@@ -1411,13 +1444,17 @@ async def grab(
                     # bandwidth. Best-effort remove it (deleting its files)
                     # before refusing the parallel grab -- but ONLY one this
                     # call actually added (see _remove_torrent_if_added).
-                    await _remove_torrent_if_added(
+                    orphan_removed = await _remove_torrent_if_added(
                         qbt,
                         torrent_hash,
                         actually_added=actually_added,
                         request_id=request_id,
                         reason="losing a parallel grab for this request",
                     )
+                    if intent_id is not None:
+                        await _retire_lost_add_reservation(
+                            session, intent_id, orphan_removed=orphan_removed
+                        )
                     raise AlreadyDownloadingError(request_id) from None
             winner = await download_repo.get_by_hash(torrent_hash)
             if winner is None:  # pragma: no cover - the conflicting row must exist
