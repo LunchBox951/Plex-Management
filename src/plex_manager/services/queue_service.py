@@ -1316,6 +1316,16 @@ async def reconcile_and_list(
         # run since ``list_active()`` above that could have raced in a new row.
         return rows
     statuses = await qbt.get_statuses_for_hashes([row.torrent_hash for row in rows])
+    for status in statuses:
+        if status.category.startswith("plex-manager-intent-"):
+            try:
+                await qbt.set_category(status.info_hash, "plex-manager")
+            except Exception as exc:
+                _logger.warning(
+                    "download %s: deferred intent-category normalization (%s)",
+                    status.info_hash,
+                    type(exc).__name__,
+                )
     now = _utcnow()
 
     transitions = reconcile(rows, statuses, now=now)

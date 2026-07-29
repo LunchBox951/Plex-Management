@@ -311,6 +311,7 @@ class FakeQbittorrent:
         self.files = files or {}
         self.added: list[tuple[str, str, str]] = []
         self.removed: list[tuple[str, bool]] = []
+        self.categories: list[tuple[str, str]] = []
         # The client's canned GLOBAL default save path (``get_default_save_path``)
         # and a recorder of every ``set_location`` call (lowercased hash, target).
         self.default_save_path = default_save_path
@@ -386,7 +387,7 @@ class FakeQbittorrent:
         self.removed.append((info_hash.lower(), delete_files))
 
     async def set_category(self, info_hash: str, category: str) -> None:
-        return None
+        self.categories.append((info_hash.lower(), category))
 
     async def get_save_path(self, info_hash: str) -> str | None:
         return None

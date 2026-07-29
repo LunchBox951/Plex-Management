@@ -128,6 +128,81 @@ class CompactRequestState(BaseModel):
     has_coexisting_available: bool
 
 
+class DownloadAddIntentScopeRecord(BaseModel):
+    """One normalized physical scope reserved by a durable add intent."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    intent_id: int
+    media_request_id: int | None = None
+    tmdb_id: int
+    media_type: str
+    scope_key: str
+    season_number: int | None = None
+    episodes: tuple[int, ...] | None = None
+    is_target: bool = False
+
+
+class DownloadAddIntentScopeCreate(BaseModel):
+    """A physical scope to reserve while an add is pending."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tmdb_id: int
+    media_type: str
+    scope_key: str
+    season_number: int | None = None
+    episodes: tuple[int, ...] | None = None
+    media_request_id: int | None = None
+    is_target: bool = False
+
+
+class CreateDownloadAddIntent(BaseModel):
+    """The internal command used to persist an add before client mutation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    torrent_hash: str
+    source: str | None = None
+    media_request_id: int | None = None
+    tmdb_id: int
+    media_type: str
+    year: int | None = None
+    release_title: str | None = None
+    indexer: str | None = None
+    quality_name: str | None = None
+    save_path: str
+    observed_request_status: str | None = None
+    observed_season_status: str | None = None
+    owns_client_torrent: bool = False
+    scopes: tuple[DownloadAddIntentScopeCreate, ...] = ()
+
+
+class DownloadAddIntentRecord(BaseModel):
+    """Internal, recoverable durable add state. Never expose ``source`` to the web."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    torrent_hash: str
+    source: str | None = None
+    state: str
+    media_request_id: int | None = None
+    tmdb_id: int
+    media_type: str
+    year: int | None = None
+    release_title: str | None = None
+    indexer: str | None = None
+    quality_name: str | None = None
+    save_path: str
+    observed_request_status: str | None = None
+    observed_season_status: str | None = None
+    owns_client_torrent: bool = False
+    last_error: str | None = None
+    scopes: tuple[DownloadAddIntentScopeRecord, ...] = ()
+
+
 class DownloadRecord(BaseModel):
     """A tracked download as the domain reads it."""
 
@@ -587,6 +662,7 @@ class RequestRepository(Protocol):
         *,
         require_unpinned: bool = False,
         require_not_watchlisted: bool = False,
+        require_no_active_download_or_intent: bool = False,
     ) -> bool:
         """Compare-and-swap: move to ``status`` only if currently in ``allowed_from``
         (and, with ``require_unpinned``, only if not ``keep_forever``-pinned).
@@ -668,6 +744,39 @@ class RequestRepository(Protocol):
         their own ``user_id`` to confine the title-wide sweep to their rows;
         ``None`` (the default) leaves it unrestricted for admin/operator use.
         """
+        raise NotImplementedError
+
+
+@runtime_checkable
+class DownloadAddIntentRepository(Protocol):
+    """Persistence for the durable pre-client-mutation add workflow."""
+
+    async def create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord:
+        raise NotImplementedError
+
+    async def get(self, intent_id: int, *, fresh: bool = False) -> DownloadAddIntentRecord | None:
+        raise NotImplementedError
+
+    async def get_by_hash(self, torrent_hash: str) -> DownloadAddIntentRecord | None:
+        raise NotImplementedError
+
+    async def list_recoverable(self) -> list[DownloadAddIntentRecord]:
+        raise NotImplementedError
+
+    async def list_for_request(self, request_id: int) -> list[DownloadAddIntentRecord]:
+        raise NotImplementedError
+
+    async def mark_state(
+        self,
+        intent_id: int,
+        state: str,
+        *,
+        last_error: str | None = None,
+        expected_state: str | None = None,
+    ) -> bool:
+        raise NotImplementedError
+
+    async def delete(self, intent_id: int) -> bool:
         raise NotImplementedError
 
 
@@ -943,6 +1052,8 @@ class SeasonRequestRepository(Protocol):
         status: str,
         allowed_from: frozenset[str],
         *,
+        require_no_active_coverage: bool = False,
+        require_no_active_download_or_intent: bool = False,
         require_parent_unpinned: bool = False,
         require_not_watchlisted: bool = False,
     ) -> bool:

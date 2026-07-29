@@ -11,6 +11,7 @@ work.
 from __future__ import annotations
 
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.repositories.requests import SqlRequestRepository
@@ -20,6 +21,7 @@ from plex_manager.repositories.update_coordination import SqlUpdateCoordinationR
 
 __all__ = [
     "SqlBlocklistRepository",
+    "SqlDownloadAddIntentRepository",
     "SqlDownloadRepository",
     "SqlLogEventRepository",
     "SqlRequestRepository",

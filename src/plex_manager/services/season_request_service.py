@@ -775,6 +775,7 @@ async def set_status_if_in(
     status: str,
     allowed_from: frozenset[str],
     require_no_active_coverage: bool = False,
+    require_no_active_download_or_intent: bool = False,
     require_parent_unpinned: bool = False,
     require_not_watchlisted: bool = False,
     tolerate_active_conflict: bool = False,
@@ -812,6 +813,7 @@ async def set_status_if_in(
         status,
         allowed_from,
         require_no_active_coverage=require_no_active_coverage,
+        require_no_active_download_or_intent=require_no_active_download_or_intent,
         require_parent_unpinned=require_parent_unpinned,
         require_not_watchlisted=require_not_watchlisted,
     )
@@ -1090,6 +1092,7 @@ async def mark_no_acceptable_release(
     media_request_id: int,
     season_number: int,
     require_no_active_coverage: bool = False,
+    require_no_active_download_or_intent: bool = False,
 ) -> bool:
     """Persist ``no_acceptable_release`` on one season when a grab finds nothing.
 
@@ -1130,4 +1133,5 @@ async def mark_no_acceptable_release(
         status=RequestStatus.no_acceptable_release.value,
         allowed_from=_PARKABLE_SEASON_STATUS_VALUES,
         require_no_active_coverage=require_no_active_coverage,
+        require_no_active_download_or_intent=require_no_active_download_or_intent,
     )

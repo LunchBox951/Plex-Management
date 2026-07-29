@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 from plex_manager.models import (
     Download,
+    DownloadAddIntentScope,
     DownloadCoverageClaim,
     MediaRequest,
     MediaType,
@@ -460,6 +461,7 @@ class SqlSeasonRequestRepository:
         allowed_from: frozenset[str],
         *,
         require_no_active_coverage: bool = False,
+        require_no_active_download_or_intent: bool = False,
         require_parent_unpinned: bool = False,
         require_not_watchlisted: bool = False,
     ) -> bool:
@@ -492,6 +494,28 @@ class SqlSeasonRequestRepository:
             SeasonRequest.id == season_request_id,
             SeasonRequest.status.in_([RequestStatus(s) for s in allowed_from]),
         ]
+        if require_no_active_download_or_intent:
+            active_download = (
+                select(Download.id)
+                .where(
+                    Download.tmdb_id == MediaRequest.tmdb_id,
+                    Download.media_type == MediaType.tv,
+                    Download.season == SeasonRequest.season_number,
+                    Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                )
+                .exists()
+            )
+            active_intent = (
+                select(DownloadAddIntentScope.id)
+                .join(MediaRequest, MediaRequest.id == SeasonRequest.media_request_id)
+                .where(
+                    DownloadAddIntentScope.tmdb_id == MediaRequest.tmdb_id,
+                    DownloadAddIntentScope.media_type == MediaType.tv.value,
+                    DownloadAddIntentScope.season_number == SeasonRequest.season_number,
+                )
+                .exists()
+            )
+            predicates.extend((~active_download, ~active_intent))
         if require_no_active_coverage:
             active_coverage_claim = (
                 select(DownloadCoverageClaim.id)

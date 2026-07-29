@@ -755,9 +755,10 @@ class DownloadAddIntent(Base):
     """Committed hash-keyed proof that a client add may be retried or recovered."""
 
     __tablename__ = "download_add_intents"
+    __table_args__ = (Index("ix_download_add_intents_state", "state"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    torrent_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    torrent_hash: Mapped[str] = mapped_column(String, unique=True)
     source: Mapped[str | None] = mapped_column(EncryptedStr)
     state: Mapped[str] = mapped_column(
         String, default="prepared", server_default=sa.text("'prepared'")
@@ -787,25 +788,27 @@ class DownloadAddIntentScope(Base):
 
     __tablename__ = "download_add_intent_scopes"
     __table_args__ = (
-        Index("uq_download_add_intent_scopes_intent_scope", "intent_id", "scope_key", unique=True),
-        Index(
-            "uq_download_add_intent_scopes_title_scope",
+        sa.UniqueConstraint(
+            "intent_id", "scope_key", name="uq_download_add_intent_scopes_intent_scope"
+        ),
+        sa.UniqueConstraint(
             "tmdb_id",
             "media_type",
             "scope_key",
-            unique=True,
+            name="uq_download_add_intent_scopes_title_scope",
         ),
+        Index("ix_download_add_intent_scopes_intent_id", "intent_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     intent_id: Mapped[int] = mapped_column(
-        ForeignKey("download_add_intents.id", ondelete="CASCADE"), index=True
+        ForeignKey("download_add_intents.id", ondelete="CASCADE")
     )
     media_request_id: Mapped[int | None] = mapped_column(
         ForeignKey("media_requests.id", ondelete="SET NULL")
     )
-    tmdb_id: Mapped[int | None] = mapped_column()
-    media_type: Mapped[str | None] = mapped_column(String)
+    tmdb_id: Mapped[int] = mapped_column()
+    media_type: Mapped[str] = mapped_column(String)
     scope_key: Mapped[str] = mapped_column(String)
     season_number: Mapped[int | None] = mapped_column()
     episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
@@ -817,6 +820,7 @@ class ClientOnlyTorrent(Base):
     """A bounded correction observation for an untracked app-category torrent."""
 
     __tablename__ = "client_only_torrents"
+    __table_args__ = (Index("ix_client_only_torrents_state", "state"),)
 
     torrent_hash: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String)

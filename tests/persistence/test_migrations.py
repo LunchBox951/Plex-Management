@@ -495,6 +495,112 @@ def test_download_scope_waiting_status_downgrade_remaps_before_constraint(
     assert season_status == ("pending",)
 
 
+def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "intent-contract.db"
+    _upgrade(db_path, "head", monkeypatch)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        assert {
+            "download_add_intents",
+            "download_add_intent_scopes",
+            "client_only_torrents",
+        } <= set(inspector.get_table_names())
+        scope_columns = {
+            column["name"]: column for column in inspector.get_columns("download_add_intent_scopes")
+        }
+        assert scope_columns["tmdb_id"]["nullable"] is False
+        assert scope_columns["media_type"]["nullable"] is False
+        assert inspector.get_indexes("download_add_intent_scopes") == [
+            {
+                "name": "ix_download_add_intent_scopes_intent_id",
+                "column_names": ["intent_id"],
+                "unique": 0,
+                "dialect_options": {},
+            }
+        ]
+        unique_constraints = {
+            constraint["name"]: constraint["column_names"]
+            for constraint in inspector.get_unique_constraints("download_add_intent_scopes")
+        }
+        assert unique_constraints == {
+            "uq_download_add_intent_scopes_intent_scope": ["intent_id", "scope_key"],
+            "uq_download_add_intent_scopes_title_scope": ["tmdb_id", "media_type", "scope_key"],
+        }
+        foreign_keys = {
+            foreign_key["constrained_columns"][0]: foreign_key.get("options", {}).get("ondelete")
+            for foreign_key in inspector.get_foreign_keys("download_add_intent_scopes")
+        }
+        assert foreign_keys == {"intent_id": "CASCADE", "media_request_id": "SET NULL"}
+        with engine.connect() as conn:
+            conn.execute(text("PRAGMA foreign_keys = ON"))
+            conn.commit()
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO media_requests (id, tmdb_id, media_type, title, status) "
+                    "VALUES (1, 42, 'movie', 'Preserved', 'pending')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO download_add_intents "
+                    "(id, torrent_hash, tmdb_id, media_type, save_path) "
+                    "VALUES (1, 'intent-one', 42, 'movie', '')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO download_add_intent_scopes "
+                    "(intent_id, media_request_id, tmdb_id, media_type, scope_key) "
+                    "VALUES (1, 1, 42, 'movie', 'movie')"
+                )
+            )
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO download_add_intents "
+                        "(id, torrent_hash, tmdb_id, media_type, save_path) "
+                        "VALUES (2, 'intent-null', 42, 'movie', '')"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO download_add_intent_scopes "
+                        "(intent_id, tmdb_id, media_type, scope_key) "
+                        "VALUES (2, NULL, NULL, 'movie')"
+                    )
+                )
+            conn.execute(text("DELETE FROM download_add_intents WHERE id = 1"))
+            assert (
+                conn.execute(text("SELECT count(*) FROM download_add_intent_scopes")).scalar_one()
+                == 0
+            )
+    finally:
+        engine.dispose()
+
+    _downgrade(db_path, "111b3b3c67fb", monkeypatch)
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        assert not {
+            "download_add_intents",
+            "download_add_intent_scopes",
+            "client_only_torrents",
+        } & set(inspector.get_table_names())
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT title FROM media_requests WHERE id = 1")).scalar_one()
+                == "Preserved"
+            )
+    finally:
+        engine.dispose()
+
+
 def test_release_title_migration_backfills_from_download_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

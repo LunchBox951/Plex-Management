@@ -907,6 +907,7 @@ async def _park(
             media_request_id=scope.request_id,
             season_number=scope.season,
             require_no_active_coverage=True,
+            require_no_active_download_or_intent=True,
         )
         if not parked:
             await session.rollback()
@@ -923,7 +924,9 @@ async def _park(
         )
         # Flush-only; this function owns the commit boundary.
     else:  # movie
-        parked = await request_service.mark_no_acceptable_release(session, scope.request_id)
+        parked = await request_service.mark_no_acceptable_release(
+            session, scope.request_id, require_no_active_download_or_intent=True
+        )
         if not parked:
             await session.rollback()
             _logger.info(

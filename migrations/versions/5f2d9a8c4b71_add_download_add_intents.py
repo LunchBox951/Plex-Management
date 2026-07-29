@@ -23,7 +23,7 @@ def upgrade() -> None:
         "download_add_intents",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("torrent_hash", sa.String(), nullable=False, unique=True),
-        sa.Column("source", sa.Text(), nullable=True),
+        sa.Column("source", sa.String(), nullable=True),
         sa.Column("state", sa.String(), nullable=False, server_default="prepared"),
         sa.Column(
             "media_request_id",
@@ -65,8 +65,8 @@ def upgrade() -> None:
             sa.ForeignKey("media_requests.id", ondelete="SET NULL"),
             nullable=True,
         ),
-        sa.Column("tmdb_id", sa.Integer(), nullable=True),
-        sa.Column("media_type", sa.String(), nullable=True),
+        sa.Column("tmdb_id", sa.Integer(), nullable=False),
+        sa.Column("media_type", sa.String(), nullable=False),
         sa.Column("scope_key", sa.String(), nullable=False),
         sa.Column("season_number", sa.Integer(), nullable=True),
         sa.Column("episodes_json", sa.JSON(), nullable=True),
@@ -78,11 +78,14 @@ def upgrade() -> None:
             "intent_id", "scope_key", name="uq_download_add_intent_scopes_intent_scope"
         ),
         sa.UniqueConstraint(
-            "tmdb_id", "media_type", "scope_key", name="uq_download_add_intent_scopes_title_scope"
+            "tmdb_id",
+            "media_type",
+            "scope_key",
+            name="uq_download_add_intent_scopes_title_scope",
         ),
     )
     op.create_index(
-        "ix_download_add_intent_scopes_intent", "download_add_intent_scopes", ["intent_id"]
+        "ix_download_add_intent_scopes_intent_id", "download_add_intent_scopes", ["intent_id"]
     )
     op.create_table(
         "client_only_torrents",
@@ -110,7 +113,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_client_only_torrents_state", table_name="client_only_torrents")
     op.drop_table("client_only_torrents")
-    op.drop_index("ix_download_add_intent_scopes_intent", table_name="download_add_intent_scopes")
+    op.drop_index(
+        "ix_download_add_intent_scopes_intent_id", table_name="download_add_intent_scopes"
+    )
     op.drop_table("download_add_intent_scopes")
     op.drop_index("ix_download_add_intents_state", table_name="download_add_intents")
     op.drop_table("download_add_intents")

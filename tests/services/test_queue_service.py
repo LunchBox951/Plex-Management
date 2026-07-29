@@ -595,6 +595,29 @@ async def test_reconcile_and_list_requests_exactly_the_tracked_hashes(
     assert set(qbt.status_queries[0]) == {_HASH, other_hash}
 
 
+async def test_reconcile_normalizes_a_tracked_intent_category(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        session.add(Download(torrent_hash=_HASH, status="downloading", tmdb_id=603))
+        await session.commit()
+
+    qbt = FakeQbittorrent(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name="a",
+                raw_state="downloading",
+                category="plex-manager-intent-42",
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+
+    assert qbt.categories == [(_HASH, "plex-manager")]
+
+
 async def test_reconcile_and_list_tracked_hash_missing_from_scoped_response_goes_client_missing(
     sessionmaker_: SessionMaker,
 ) -> None:

@@ -1644,7 +1644,9 @@ async def get_request(session: AsyncSession, request_id: int) -> RequestRecord |
     return await SqlRequestRepository(session).get(request_id)
 
 
-async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> bool:
+async def mark_no_acceptable_release(
+    session: AsyncSession, request_id: int, *, require_no_active_download_or_intent: bool = False
+) -> bool:
     """Persist ``no_acceptable_release`` on the request when a grab finds nothing.
 
     Honesty over silence: a live grab that finds no acceptable candidate returns
@@ -1683,6 +1685,7 @@ async def mark_no_acceptable_release(session: AsyncSession, request_id: int) -> 
         request_id,
         RequestStatus.no_acceptable_release.value,
         _PARKABLE_REQUEST_STATUS_VALUES,
+        require_no_active_download_or_intent=require_no_active_download_or_intent,
     )
 
 

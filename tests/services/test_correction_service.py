@@ -48,8 +48,10 @@ from plex_manager.models import (
     SeasonRequest,
     User,
 )
-from plex_manager.ports.download_client import AddResult
+from plex_manager.ports.download_client import AddResult, DownloadStatus
 from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -1478,6 +1480,54 @@ async def test_cancel_movie_removes_torrent_and_settles_cancelled(
     assert download.status == "failed"
     assert download.failed_reason == "cancelled by operator"
     assert len(history) == 1
+
+
+async def test_cancel_marks_future_intent_then_recovers_its_owned_torrent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="future-intent",
+                media_request_id=request.id,
+                tmdb_id=_TMDB,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=_TMDB, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        request_id = request.id
+
+    qbt = FakeQbittorrent(
+        [
+            DownloadStatus(
+                info_hash="future-intent",
+                name="intent torrent",
+                raw_state="downloading",
+                category=f"plex-manager-intent-{intent.id}",
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        updated = await correction_service.cancel_request(session, qbt, request_id=request_id)
+
+    assert updated.status == RequestStatus.cancelled.value
+    assert ("future-intent", True) in qbt.removed
+    async with sessionmaker_() as session:
+        assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
 async def test_cancel_already_gone_torrent_is_a_no_op_success(

@@ -35,7 +35,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     _assert_safe_fetch_url_shape,  # pyright: ignore[reportPrivateUsage]
 )
 from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
-from plex_manager.ports.download_client import FailureDetailSource
+from plex_manager.ports.download_client import FailureDetailSource, PreparedAdd
 
 BASE_URL = "http://qbit.local:8080"
 USERNAME = "admin"
@@ -58,6 +58,7 @@ INFO_ROWS: list[dict[str, Any]] = [
         "seeding_time_limit": -2,
         "inactive_seeding_time_limit": -2,
         "last_activity": 1700000000,
+        "category": "plex-manager",
     },
     {
         "hash": "abcabcabcabcabcabcabcabcabcabcabcabcabca",
@@ -141,6 +142,50 @@ async def test_add_magnet_returns_derived_hash() -> None:
     assert result.created is True  # a genuine new add -- the grab owns it
 
 
+async def test_prepare_add_does_not_post() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        return httpx.Response(404, text="unhandled")
+
+    source = f"{MAGNET}&token=credential"
+    prepared = await _client(handler).prepare_add(source)
+
+    assert prepared.torrent_hash == MAGNET_HASH
+    assert calls == []
+
+
+async def test_add_prepared_posts_once_and_rejects_invalid_payload_shape() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404, text="unhandled")
+
+    client = _client(handler)
+    result = await client.add_prepared(
+        PreparedAdd(torrent_hash=MAGNET_HASH, submission_url=MAGNET), "", "intent-category"
+    )
+    assert result.torrent_hash == MAGNET_HASH
+    assert calls == ["/api/v2/auth/login", "/api/v2/torrents/add"]
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await client.add_prepared(PreparedAdd(torrent_hash=MAGNET_HASH), "", "intent-category")
+    with pytest.raises(ValueError, match="exactly one"):
+        await client.add_prepared(
+            PreparedAdd(torrent_hash=MAGNET_HASH, submission_url=MAGNET, torrent_bytes=b"x"),
+            "",
+            "intent-category",
+        )
+
+
 async def test_add_with_directed_save_path_disables_autotmm() -> None:
     """A non-empty ``save_path`` (issues #133/#157) must ALSO pin the torrent to
     manual management -- otherwise a global-AutoTMM install ignores ``savepath``
@@ -164,6 +209,12 @@ async def test_add_with_directed_save_path_disables_autotmm() -> None:
             "urls": MAGNET,
         }
     ]
+
+
+async def test_download_status_maps_qbittorrent_category() -> None:
+    status = await _client().get_status(MAGNET_HASH)
+    assert status is not None
+    assert status.category == "plex-manager"
 
 
 async def test_add_with_no_save_path_omits_autotmm() -> None:

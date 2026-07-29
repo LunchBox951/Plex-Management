@@ -123,6 +123,7 @@ from plex_manager.models import (
     RequestStatus,
 )
 from plex_manager.repositories.blocklist import SqlBlocklistRepository
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -1487,6 +1488,8 @@ async def cancel_request(
         raise NotCancellableError(request_id, request.status)
 
     download_repo = SqlDownloadRepository(session)
+    intent_repo = SqlDownloadAddIntentRepository(session)
+    intents = await intent_repo.list_for_request(request_id)
 
     seasons: list[SeasonRequestRecord] = []
     if request.media_type == "tv":
@@ -1541,6 +1544,8 @@ async def cancel_request(
     hashes_to_remove: list[str] = []
     removal_ids: list[int] = []
     try:
+        for intent in intents:
+            await intent_repo.mark_state(intent.id, "cancel_requested", expected_state="prepared")
         for row in active:
             moved = await download_repo.update_status_if_in(
                 row.id,
@@ -1614,6 +1619,10 @@ async def cancel_request(
                     context="a cancel",
                     extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
                 )
+            if intents:
+                from plex_manager.services.download_add_intent_service import recover_all
+
+                await recover_all(qbt, session)
     finally:
         # Removal has settled (or the cancel aborted): the row is either gone from the
         # client (a later grab creates a fresh torrent) or, on a removal failure, its

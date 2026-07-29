@@ -2589,6 +2589,7 @@ async def _evict_one(
             allowed_from=frozenset({RequestStatus.available.value}),
             require_parent_unpinned=True,
             require_not_watchlisted=True,
+            require_no_active_download_or_intent=True,
             tolerate_active_conflict=True,
         )
     else:
@@ -2598,6 +2599,7 @@ async def _evict_one(
             frozenset({RequestStatus.available.value}),
             require_unpinned=True,
             require_not_watchlisted=True,
+            require_no_active_download_or_intent=True,
         )
 
     if not claimed:

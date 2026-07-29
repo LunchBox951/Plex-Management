@@ -737,6 +737,12 @@ async def _reconcile_once_leased(app: FastAPI) -> None:
             # availability commit, then fall through — no request stuck in "Finalizing"
             # while qBittorrent is down.
             try:
+                from plex_manager.services.download_add_intent_service import recover_all
+
+                recovered = await recover_all(qbt, session)
+                if recovered.changed:
+                    changes.queue = True
+                    changes.requests = True
                 await queue_service.reconcile_and_list(qbt, session, changes=changes)
                 if library is not None:
                     movies_root = await get_movies_root_optional(session)
