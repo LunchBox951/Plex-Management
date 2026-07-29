@@ -13,12 +13,14 @@ classic seedbox/library cross-mount case.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import hashlib
 import os
 import shutil
 import stat
+import threading
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
@@ -75,23 +77,154 @@ class PublishLockReclaimGuardError(FileExistsError):
 
 
 class PublicationReleaseError(OSError):
-    """A post-placement lock-release failure whose rollback could not be verified."""
+    """A post-placement lock-release failure, with any rollback failure attached."""
 
     publication: FilePublication
     release_error: BaseException
-    cleanup_error: BaseException
+    cleanup_error: BaseException | None
 
     def __init__(
         self,
         publication: FilePublication,
         release_error: BaseException,
-        cleanup_error: BaseException,
+        cleanup_error: BaseException | None = None,
     ) -> None:
-        super().__init__(
-            "publication lock release failed after placement cleanup could not complete"
-        )
+        super().__init__("publication lock release failed after placement")
         self.publication = publication
         self.release_error = release_error
+        self.cleanup_error = cleanup_error
+
+
+type _PublishLockRegistryKey = tuple[int, int, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _StrandedPublishLockReplacement:
+    """The adapter's still-live ownership of a canonical replacement lock."""
+
+    lock_name: str
+    display: str
+    replacement_fd: int
+
+
+class _RetainedPublishLockReplacementError(BaseException):
+    """Internal transfer of a live replacement fd to its adapter registry."""
+
+    replacement_fd: int
+    original_error: BaseException
+    cleanup_error: BaseException
+
+    def __init__(
+        self, replacement_fd: int, original_error: BaseException, cleanup_error: BaseException
+    ) -> None:
+        super().__init__("publish lock replacement cleanup could not be verified")
+        self.replacement_fd = replacement_fd
+        self.original_error = original_error
+        self.cleanup_error = cleanup_error
+
+
+def _publish_lock_registry_key(dir_fd: int, lock_name: str) -> _PublishLockRegistryKey:
+    """The anchored directory identity and canonical lock name for registry ownership."""
+    directory = os.fstat(dir_fd)
+    return directory.st_dev, directory.st_ino, lock_name
+
+
+class _PublishLockReplacementRegistry:
+    """Per-directory-lock ownership and recovery of unresolved replacements."""
+
+    def __init__(self) -> None:
+        self._entries: dict[_PublishLockRegistryKey, _StrandedPublishLockReplacement] = {}
+        # Fixed stripes bound mutex growth. A collision only serializes unrelated
+        # destinations; every key still has one exclusive recovery/retain path.
+        self._locks: tuple[threading.Lock, ...] = tuple(threading.Lock() for _ in range(64))
+
+    def _lock_for(self, key: _PublishLockRegistryKey) -> threading.Lock:
+        return self._locks[hash(key) % len(self._locks)]
+
+    def recover(self, key: _PublishLockRegistryKey, dir_fd: int) -> None:
+        """Retry a retained lock, disposing it only after an observed inode mismatch."""
+        with self._lock_for(key):
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            try:
+                held = os.fstat(entry.replacement_fd)
+                current = os.stat(entry.lock_name, dir_fd=dir_fd, follow_symlinks=False)
+            except BaseException as cleanup_error:
+                # ENOENT (notably transient NFS visibility loss) is indeterminate:
+                # retain the fd/flock until the canonical inode is actually observed.
+                raise PublishLockReplacementError(
+                    entry.display, entry.lock_name, cleanup_error
+                ) from cleanup_error
+            held_identity = held.st_dev, held.st_ino
+            current_identity = current.st_dev, current.st_ino
+            if stat.S_ISREG(current.st_mode) and current_identity != held_identity:
+                # An observed regular inode proves a foreign replacement. Our fd is
+                # now unlinked and cannot authorize any canonical destructive action.
+                self._entries.pop(key)
+                try:
+                    os.close(entry.replacement_fd)
+                except BaseException as close_error:
+                    raise PublishLockReplacementError(
+                        entry.display, entry.lock_name, close_error
+                    ) from close_error
+                return
+            if not (stat.S_ISREG(held.st_mode) and stat.S_ISREG(current.st_mode)):
+                cleanup_error = OSError(errno.EIO, "publish lock identity is not regular")
+                raise PublishLockReplacementError(
+                    entry.display, entry.lock_name, cleanup_error
+                ) from cleanup_error
+            try:
+                os.unlink(entry.lock_name, dir_fd=dir_fd)
+            except BaseException as cleanup_error:
+                raise PublishLockReplacementError(
+                    entry.display, entry.lock_name, cleanup_error
+                ) from cleanup_error
+            self._entries.pop(key)
+            try:
+                os.close(entry.replacement_fd)
+            except BaseException as close_error:
+                raise PublishLockReplacementError(
+                    entry.display, entry.lock_name, close_error
+                ) from close_error
+
+    def retain(
+        self,
+        key: _PublishLockRegistryKey,
+        lock_name: str,
+        display: str,
+        error: _RetainedPublishLockReplacementError,
+    ) -> None:
+        """Take sole responsibility for a replacement or consume a collision fd."""
+        with self._lock_for(key):
+            if key not in self._entries:
+                self._entries[key] = _StrandedPublishLockReplacement(
+                    lock_name, display, error.replacement_fd
+                )
+                return
+            try:
+                os.close(error.replacement_fd)
+            except BaseException as close_error:
+                raise PublishLockReplacementError(
+                    display, lock_name, close_error
+                ) from error.original_error
+            raise PublishLockReplacementError(
+                display, lock_name, error.cleanup_error
+            ) from error.original_error
+
+
+class PublishLockReplacementError(OSError):
+    """A post-rename replacement lock needs adapter-managed recovery."""
+
+    destination: str
+    lock_name: str
+    cleanup_error: BaseException
+
+    def __init__(self, destination: str, lock_name: str, cleanup_error: BaseException) -> None:
+        message = f"publish lock replacement cleanup could not be verified for {destination}"
+        super().__init__(f"{message} ({lock_name})")
+        self.destination = destination
+        self.lock_name = lock_name
         self.cleanup_error = cleanup_error
 
 
@@ -189,6 +322,8 @@ _EMPTY_LOCK_STALE_SECONDS = 60.0
 # A transient release failure must not leave this process's PID lock wedged. Keep
 # attempts bounded so a persistent filesystem failure still surfaces promptly.
 _PUBLISH_LOCK_RELEASE_UNLINK_RETRIES = 2
+_REPLACEMENT_CLEANUP_RETRIES = 2
+_PUBLISH_LOCK_REPLACEMENTS = _PublishLockReplacementRegistry()
 
 
 def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool, bool]:
@@ -370,6 +505,25 @@ def _prepare_replacement_publish_lock(
     raise OSError(errno.EEXIST, "could not allocate a private publish lock")
 
 
+def _cleanup_renamed_replacement_lock(
+    dir_fd: int, lock_name: str, replacement_fd: int, display: str
+) -> BaseException | None:
+    """Boundedly unlink a renamed replacement while its fd still owns its flock."""
+    cleanup_error: BaseException | None = None
+    for _ in range(_REPLACEMENT_CLEANUP_RETRIES + 1):
+        try:
+            if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+                raise FileExistsError(display)
+            os.unlink(lock_name, dir_fd=dir_fd)
+        except BaseException as error:
+            cleanup_error = error
+        else:
+            return None
+    if cleanup_error is None:
+        raise RuntimeError("replacement cleanup retry loop ended without an outcome")
+    return cleanup_error
+
+
 def _replace_held_publish_lock(
     dir_fd: int,
     lock_name: str,
@@ -384,30 +538,38 @@ def _replace_held_publish_lock(
     )
     renamed = False
     try:
-        try:
-            if not _lock_fd_owns_name(dir_fd, lock_name, old_lock_fd):
-                raise FileExistsError(display)
-            os.rename(
-                temporary_name,
-                lock_name,
-                src_dir_fd=dir_fd,
-                dst_dir_fd=dir_fd,
+        if not _lock_fd_owns_name(dir_fd, lock_name, old_lock_fd):
+            raise FileExistsError(display)
+        os.rename(
+            temporary_name,
+            lock_name,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+        )
+        renamed = True
+        if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+            raise FileExistsError(display)
+    except BaseException as original_error:
+        if renamed:
+            cleanup_error = _cleanup_renamed_replacement_lock(
+                dir_fd, lock_name, replacement_fd, display
             )
-            renamed = True
-            if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
-                raise FileExistsError(display)
-        except BaseException:
+            if cleanup_error is not None:
+                raise _RetainedPublishLockReplacementError(
+                    replacement_fd, original_error, cleanup_error
+                ) from original_error
             try:
-                if renamed and _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
-                    os.unlink(lock_name, dir_fd=dir_fd)
-            finally:
                 os.close(replacement_fd)
+            except BaseException as close_error:
+                raise original_error from close_error
             raise
-    finally:
-        if not renamed:
+        try:
+            os.close(replacement_fd)
+        finally:
             # This name is private to this claimant and was never exposed.
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=dir_fd)
+        raise
     # The caller owns old_lock_fd and transfers replacement ownership only after
     # publishing it as the claimed descriptor; this helper never closes the old fd.
     return replacement_fd
@@ -625,6 +787,14 @@ def _acquire_publish_lock(
         claimed = True
         os.close(old_lock_fd)
         return lock_fd
+    except _RetainedPublishLockReplacementError as replacement_error:
+        # The registry owns the renamed replacement fd; this acquisition frame only
+        # retires the superseded descriptor and must not close the retained fd.
+        try:
+            os.close(lock_fd)
+        except BaseException as close_error:
+            raise replacement_error from close_error
+        raise
     except BaseException as original_error:
         if claimed:
             try:
@@ -680,6 +850,7 @@ def _publish_lock(
     reclaim_stale_with_existing_entry: bool = False,
     rollback_placed: Callable[[], None] | None = None,
     publication_supplier: Callable[[], FilePublication | None] | None = None,
+    replacement_registry: _PublishLockReplacementRegistry = _PUBLISH_LOCK_REPLACEMENTS,
 ) -> Generator[None, None, None]:
     """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
 
@@ -689,14 +860,22 @@ def _publish_lock(
     destination; ordinary publication still refuses that destination immediately.
     """
     lock_name = f".{name}.publish.lock"
+    registry_key = _publish_lock_registry_key(dir_fd, lock_name)
+    replacement_registry.recover(registry_key, dir_fd)
     if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
         raise FileExistsError(display)
-    lock_fd = _acquire_publish_lock(
-        dir_fd,
-        lock_name,
-        display,
-        reclaim_stale_with_existing_entry=reclaim_stale_with_existing_entry,
-    )
+    try:
+        lock_fd = _acquire_publish_lock(
+            dir_fd,
+            lock_name,
+            display,
+            reclaim_stale_with_existing_entry=reclaim_stale_with_existing_entry,
+        )
+    except _RetainedPublishLockReplacementError as retained_error:
+        replacement_registry.retain(registry_key, lock_name, display, retained_error)
+        raise PublishLockReplacementError(
+            display, lock_name, retained_error.cleanup_error
+        ) from retained_error.original_error
     try:
         yield
     finally:
@@ -724,8 +903,8 @@ def _publish_lock(
                     publication, release_error, cleanup_error
                 ) from release_error
             if last_release_error is not release_error:
-                raise release_error from last_release_error
-            raise
+                raise PublicationReleaseError(publication, release_error) from last_release_error
+            raise PublicationReleaseError(publication, release_error) from release_error
         finally:
             os.close(lock_fd)
 
@@ -1557,6 +1736,8 @@ class LocalFileSystem:
                         src, source_fd, parent_fd, name, display
                     )
                 except PublishLockReclaimGuardError:
+                    raise
+                except PublicationReleaseError:
                     raise
                 except FileExistsError:
                     # Something is already at dst: a prior fully-imported copy, or a

@@ -166,9 +166,12 @@ def test_hardlink_release_failure_rolls_back_placement_and_retry_succeeds(
 
     monkeypatch.setattr(os, "unlink", _fail_lock_release_once)
 
-    with pytest.raises(OSError, match="simulated release failure"):
+    with pytest.raises(local_fs.PublicationReleaseError) as raised:
         LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
+    assert isinstance(raised.value.release_error, OSError)
+    assert "simulated release failure" in str(raised.value.release_error)
+    assert raised.value.cleanup_error is None
     assert not dst.exists()
     assert not (tmp_path / lock_name).exists()
 
@@ -176,6 +179,40 @@ def test_hardlink_release_failure_rolls_back_placement_and_retry_succeeds(
 
     assert publication.placed is True
     assert dst.read_text() == "payload"
+
+
+def test_hardlink_release_error_is_not_misrouted_to_copy_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Post-placement release errors are typed before errno-based hardlink fallback."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock_name = ".dst.mkv.publish.lock"
+    real_unlink = os.unlink
+    real_link = os.link
+    link_calls = 0
+
+    def _release_eprem(path: str, *, dir_fd: int | None = None) -> None:
+        if path == lock_name:
+            raise OSError(errno.EPERM, "simulated release EPERM")
+        real_unlink(path, dir_fd=dir_fd)
+
+    def _record_link(*args: object, **kwargs: object) -> None:
+        nonlocal link_calls
+        link_calls += 1
+        real_link(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", _release_eprem)
+    monkeypatch.setattr(os, "link", _record_link)
+
+    with pytest.raises(local_fs.PublicationReleaseError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert isinstance(raised.value.release_error, OSError)
+    assert raised.value.release_error.errno == errno.EPERM
+    assert link_calls == 1
+    assert not dst.exists()
 
 
 def test_hardlink_or_copy_hardlink_path_preserves_active_publish_lock(tmp_path: Path) -> None:
@@ -856,7 +893,6 @@ def test_created_lock_cleanup_unlinks_written_lock_when_flock_returns_enolck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A post-write identity failure with ENOLCK removes the created canonical lock."""
-    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     lock_name = ".dst.mkv.publish.lock"
     real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
     identity_checks = 0
@@ -874,16 +910,28 @@ def test_created_lock_cleanup_unlinks_written_lock_when_flock_returns_enolck(
 
     monkeypatch.setattr(fcntl, "flock", _no_locks)
     monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _lose_post_write_identity)
+    claimed_fd: int | None = None
+    dir_fd: int | None = None
     try:
-        with pytest.raises(FileExistsError):
-            local_fs._acquire_publish_lock(  # pyright: ignore[reportPrivateUsage]
+        dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            claimed_fd = local_fs._acquire_publish_lock(  # pyright: ignore[reportPrivateUsage]
                 dir_fd,
                 lock_name,
                 os.fspath(tmp_path / "dst.mkv"),
                 reclaim_stale_with_existing_entry=False,
             )
+        except FileExistsError:
+            pass
+        else:
+            os.close(claimed_fd)
+            claimed_fd = None
+            pytest.fail("publish lock acquisition unexpectedly succeeded")
     finally:
-        os.close(dir_fd)
+        if claimed_fd is not None:
+            os.close(claimed_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
     assert identity_checks >= 2
     assert not (tmp_path / lock_name).exists()
@@ -1038,6 +1086,289 @@ def test_replace_held_publish_lock_cleans_private_temp_after_rename_failure(
     assert not list(tmp_path.glob(".publish-lock-replace-*.tmp"))
 
 
+def test_replace_held_publish_lock_retains_fd_when_post_rename_cleanup_is_unprovable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-rename identity error cannot close and strand our canonical replacement."""
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    old_fd = os.open(lock_name, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
+    replacement_fd: int | None = None
+    replacement_checks = 0
+
+    def _fail_replacement_identity(_dir_fd: int, name: str, fd: int) -> bool:
+        nonlocal replacement_fd, replacement_checks
+        if name == lock_name and fd != old_fd:
+            replacement_fd = fd
+            replacement_checks += 1
+            raise OSError(errno.EIO, "simulated replacement identity failure")
+        return real_owns_name(_dir_fd, name, fd)
+
+    monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _fail_replacement_identity)
+    try:
+        with pytest.raises(local_fs._RetainedPublishLockReplacementError) as raised:  # pyright: ignore[reportPrivateUsage]
+            local_fs._replace_held_publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, lock_name, old_fd, os.fspath(tmp_path / "dst.mkv"), advisory_locking=True
+            )
+        assert replacement_fd is not None
+        assert raised.value.replacement_fd == replacement_fd
+        assert replacement_checks == 1 + local_fs._REPLACEMENT_CLEANUP_RETRIES + 1  # pyright: ignore[reportPrivateUsage]
+        assert lock.exists()
+        monkeypatch.setattr(local_fs, "_lock_fd_owns_name", real_owns_name)
+        local_fs._unlink_owned_publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd, lock_name, raised.value.replacement_fd
+        )
+        os.close(raised.value.replacement_fd)
+        replacement_fd = None
+    finally:
+        if replacement_fd is not None:
+            os.close(replacement_fd)
+        os.close(old_fd)
+        os.close(dir_fd)
+
+
+def test_publish_lock_finishes_retained_replacement_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The context owner removes a replacement after its helper retries exhaust."""
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    identity_checks = 0
+    real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
+
+    def _fail_then_recover_identity(_dir_fd: int, name: str, fd: int) -> bool:
+        nonlocal identity_checks
+        if name == lock_name:
+            identity_checks += 1
+            # The first two checks validate the existing canonical inode before
+            # replacement; fail the post-rename probe and every helper cleanup
+            # probe, then let the context manager's outer cleanup prove ownership.
+            if identity_checks in range(3, 3 + local_fs._REPLACEMENT_CLEANUP_RETRIES + 2):  # pyright: ignore[reportPrivateUsage]
+                raise OSError(errno.EIO, "simulated replacement identity failure")
+        return real_owns_name(_dir_fd, name, fd)
+
+    monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _fail_then_recover_identity)
+    registry = local_fs._PublishLockReplacementRegistry()  # pyright: ignore[reportPrivateUsage]
+    try:
+        with (
+            pytest.raises(local_fs.PublishLockReplacementError),
+            local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd,
+                "dst.mkv",
+                os.fspath(tmp_path / "dst.mkv"),
+                replacement_registry=registry,
+            ),
+        ):
+            pytest.fail("lock acquisition unexpectedly entered")
+        assert lock.exists()
+        with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd,
+            "dst.mkv",
+            os.fspath(tmp_path / "dst.mkv"),
+            replacement_registry=registry,
+        ):
+            pass
+    finally:
+        os.close(dir_fd)
+
+    assert identity_checks == local_fs._REPLACEMENT_CLEANUP_RETRIES + 7  # pyright: ignore[reportPrivateUsage]
+    assert not lock.exists()
+
+
+def test_hardlink_retry_recovers_adapter_owned_replacement_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discarded public errors retain no caller-owned fd and heal on retry."""
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    checks = 0
+    real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
+
+    def _fail_both_cleanup_layers(_dir_fd: int, name: str, fd: int) -> bool:
+        nonlocal checks
+        if name == lock_name:
+            checks += 1
+            # Existing-lock identity, old-fd pre-rename identity, then fail the
+            # post-rename probe and all bounded helper cleanup probes. The next
+            # public call's registry retry can prove ownership and release it.
+            if checks in range(3, 3 + local_fs._REPLACEMENT_CLEANUP_RETRIES + 2):  # pyright: ignore[reportPrivateUsage]
+                raise OSError(errno.EIO, "simulated replacement metadata outage")
+        return real_owns_name(_dir_fd, name, fd)
+
+    monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _fail_both_cleanup_layers)
+    filesystem = LocalFileSystem()
+    try:
+        filesystem.hardlink_or_copy(src, dst, root=tmp_path)
+    except OSError:
+        pass  # Matches the broad import-service handler; it owns no descriptor.
+    else:
+        pytest.fail("replacement cleanup unexpectedly succeeded")
+
+    assert lock.exists()
+    publication = filesystem.hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert publication.placed is True
+    assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_publish_lock_registry_retains_fd_across_transient_enoent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unobserved canonical name cannot dispose the adapter's held replacement."""
+    lock_name = ".dst.mkv.publish.lock"
+    display = os.fspath(tmp_path / "dst.mkv")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    retained_fd = os.open(
+        lock_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+    )
+    os.write(retained_fd, f"v1:{os.getpid()}\n".encode("ascii"))
+    registry = local_fs._PublishLockReplacementRegistry()  # pyright: ignore[reportPrivateUsage]
+    key = local_fs._publish_lock_registry_key(dir_fd, lock_name)  # pyright: ignore[reportPrivateUsage]
+    registry.retain(
+        key,
+        lock_name,
+        display,
+        local_fs._RetainedPublishLockReplacementError(  # pyright: ignore[reportPrivateUsage]
+            retained_fd,
+            OSError(errno.EIO, "original failure"),
+            OSError(errno.EIO, "cleanup failure"),
+        ),
+    )
+    real_stat = os.stat
+    injected = False
+
+    def _transient_enoent(
+        path: str | bytes | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal injected
+        if path == lock_name and not injected:
+            injected = True
+            raise FileNotFoundError(errno.ENOENT, "transient NFS lookup miss", path)
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", _transient_enoent)
+    try:
+        with pytest.raises(local_fs.PublishLockReplacementError):
+            registry.recover(key, dir_fd)
+        assert key in registry._entries  # pyright: ignore[reportPrivateUsage]
+        assert os.fstat(retained_fd).st_ino > 0
+        monkeypatch.setattr(os, "stat", real_stat)
+        with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd, "dst.mkv", display, replacement_registry=registry
+        ):
+            pass
+        assert key not in registry._entries  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(retained_fd)
+    finally:
+        os.close(dir_fd)
+
+    assert not (tmp_path / lock_name).exists()
+
+
+def test_publish_lock_registry_discards_retained_fd_after_foreign_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conclusive foreign inode mismatch disposes ours and resumes acquisition."""
+    lock_name = ".dst.mkv.publish.lock"
+    lock = tmp_path / lock_name
+    lock.write_text("999999999")
+    display = os.fspath(tmp_path / "dst.mkv")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    registry = local_fs._PublishLockReplacementRegistry()  # pyright: ignore[reportPrivateUsage]
+    real_owns_name = local_fs._lock_fd_owns_name  # pyright: ignore[reportPrivateUsage]
+    checks = 0
+
+    def _retain_replacement_fd(_dir_fd: int, name: str, fd: int) -> bool:
+        nonlocal checks
+        if name == lock_name:
+            checks += 1
+            if checks in range(3, 3 + local_fs._REPLACEMENT_CLEANUP_RETRIES + 2):  # pyright: ignore[reportPrivateUsage]
+                raise OSError(errno.EIO, "simulated replacement metadata outage")
+        return real_owns_name(_dir_fd, name, fd)
+
+    monkeypatch.setattr(local_fs, "_lock_fd_owns_name", _retain_replacement_fd)
+    try:
+        with (
+            pytest.raises(local_fs.PublishLockReplacementError),
+            local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", display, replacement_registry=registry
+            ),
+        ):
+            pytest.fail("replacement cleanup unexpectedly succeeded")
+        key = local_fs._publish_lock_registry_key(dir_fd, lock_name)  # pyright: ignore[reportPrivateUsage]
+        retained_fd = registry._entries[key].replacement_fd  # pyright: ignore[reportPrivateUsage]
+        foreign_name = ".foreign.lock"
+        (tmp_path / foreign_name).write_text(f"v1:{os.getpid()}\n")
+        os.replace(foreign_name, lock_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        monkeypatch.setattr(local_fs, "_lock_fd_owns_name", real_owns_name)
+
+        with (
+            pytest.raises(FileExistsError),
+            local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", display, replacement_registry=registry
+            ),
+        ):
+            pytest.fail("foreign live lock unexpectedly entered")
+
+        assert key not in registry._entries  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(retained_fd)
+    finally:
+        os.close(dir_fd)
+
+    assert lock.exists()
+    assert lock.read_text() == f"v1:{os.getpid()}\n"
+
+
+def test_publish_lock_registry_collision_closes_incoming_fd(tmp_path: Path) -> None:
+    """A duplicate retain consumes its incoming descriptor before surfacing failure."""
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_name = ".dst.mkv.publish.lock"
+    display = os.fspath(tmp_path / "dst.mkv")
+    key = local_fs._publish_lock_registry_key(dir_fd, lock_name)  # pyright: ignore[reportPrivateUsage]
+    registry = local_fs._PublishLockReplacementRegistry()  # pyright: ignore[reportPrivateUsage]
+    first_fd = os.open(
+        ".first.lock", os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+    )
+    incoming_fd = os.open(
+        ".incoming.lock", os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+    )
+    try:
+        first_error = local_fs._RetainedPublishLockReplacementError(  # pyright: ignore[reportPrivateUsage]
+            first_fd, OSError("first"), OSError("first cleanup")
+        )
+        registry.retain(key, lock_name, display, first_error)
+        incoming_error = local_fs._RetainedPublishLockReplacementError(  # pyright: ignore[reportPrivateUsage]
+            incoming_fd, OSError("incoming"), OSError("incoming cleanup")
+        )
+        with pytest.raises(local_fs.PublishLockReplacementError) as raised:
+            registry.retain(key, lock_name, display, incoming_error)
+        assert raised.value.destination == display
+        assert raised.value.lock_name == lock_name
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(incoming_fd)
+        assert os.fstat(first_fd).st_ino > 0
+    finally:
+        entry = registry._entries.pop(key, None)  # pyright: ignore[reportPrivateUsage]
+        if entry is not None:
+            os.close(entry.replacement_fd)
+        os.close(dir_fd)
+
+
 def test_publish_lock_hardlinked_stale_entry_preserves_linked_source(tmp_path: Path) -> None:
     src = tmp_path / "source.mkv"
     original = b"old-media-payload-not-a-lock"
@@ -1143,7 +1474,7 @@ def test_identity_only_contender_is_age_gated_during_partial_v1_pid_write(
                 outcomes.put("entered")
         except FileExistsError as error:
             outcomes.put(error)
-        except BaseException as error:
+        except Exception as error:
             outcomes.put(error)
 
     monkeypatch.setattr(fcntl, "flock", _unsupported_flock)
@@ -1196,7 +1527,7 @@ def test_flock_winner_refuses_live_identity_only_owner(
                 creator_ready.set()
                 assert allow_creator_release.wait(2)
                 outcomes.put("creator-entered")
-        except BaseException as error:
+        except Exception as error:
             outcomes.put(error)
 
     def _contender() -> None:
@@ -1207,7 +1538,7 @@ def test_flock_winner_refuses_live_identity_only_owner(
                 outcomes.put("contender-entered")
         except FileExistsError as error:
             outcomes.put(error)
-        except BaseException as error:
+        except Exception as error:
             outcomes.put(error)
 
     monkeypatch.setattr(fcntl, "flock", _creator_enolck)
