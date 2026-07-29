@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, select, update
@@ -94,7 +95,7 @@ class SqlDownloadAddIntentRepository:
                 select(DownloadAddIntentScope.intent_id).where(
                     DownloadAddIntentScope.tmdb_id == scope.tmdb_id,
                     DownloadAddIntentScope.media_type == scope.media_type,
-                    DownloadAddIntentScope.scope_key == scope.scope_key,
+                    DownloadAddIntentScope.active_scope_key == scope.scope_key,
                 )
             )
             if owner_id is not None:
@@ -102,10 +103,22 @@ class SqlDownloadAddIntentRepository:
         return None
 
     async def create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord:
+        record = await self._create(command, return_owner=True)
+        if record is None:  # pragma: no cover - return_owner guarantees a record
+            raise RuntimeError("durable intent creation returned no owner")
+        return record
+
+    async def try_create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord | None:
+        """Create only when no hash or scope owner exists; never return a rival owner."""
+        return await self._create(command, return_owner=False)
+
+    async def _create(
+        self, command: CreateDownloadAddIntent, *, return_owner: bool
+    ) -> DownloadAddIntentRecord | None:
         torrent_hash = command.torrent_hash.lower()
         existing = await self.get_by_hash(torrent_hash)
         if existing is not None:
-            return existing
+            return existing if return_owner else None
         row = DownloadAddIntent(
             torrent_hash=torrent_hash,
             source=command.source,
@@ -133,6 +146,7 @@ class SqlDownloadAddIntentRepository:
                             tmdb_id=scope.tmdb_id,
                             media_type=scope.media_type,
                             scope_key=scope.scope_key,
+                            active_scope_key=scope.scope_key,
                             season_number=scope.season_number,
                             episodes_json=list(_episodes(list(scope.episodes or ())) or ()) or None,
                             is_target=scope.is_target,
@@ -140,6 +154,8 @@ class SqlDownloadAddIntentRepository:
                     )
                 await self._session.flush()
         except IntegrityError:
+            if not return_owner:
+                return None
             owner = await self._find_owner(command)
             if owner is None:
                 raise
@@ -180,6 +196,27 @@ class SqlDownloadAddIntentRepository:
         )
         return [await self._to_record(row) for row in rows]
 
+    async def has_active_scope(
+        self, *, tmdb_id: int, media_type: str, scope_keys: Sequence[str]
+    ) -> bool:
+        """Return whether an unfinished intent owns any candidate physical scope."""
+        if not scope_keys:
+            return False
+        return (
+            await self._session.scalar(
+                select(DownloadAddIntentScope.id)
+                .join(DownloadAddIntent)
+                .where(
+                    DownloadAddIntentScope.tmdb_id == tmdb_id,
+                    DownloadAddIntentScope.media_type == media_type,
+                    DownloadAddIntentScope.scope_key.in_(scope_keys),
+                    DownloadAddIntent.state.in_(("prepared", "cancel_requested")),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
     async def mark_state(
         self,
         intent_id: int,
@@ -200,7 +237,16 @@ class SqlDownloadAddIntentRepository:
                 .execution_options(synchronize_session="fetch")
             ),
         )
-        return result.rowcount == 1
+        if result.rowcount != 1:
+            return False
+        if state == "needs_attention":
+            await self._session.execute(
+                update(DownloadAddIntentScope)
+                .where(DownloadAddIntentScope.intent_id == intent_id)
+                .values(active_scope_key=None)
+                .execution_options(synchronize_session="fetch")
+            )
+        return True
 
     async def delete(self, intent_id: int) -> bool:
         row = await self._session.get(DownloadAddIntent, intent_id)

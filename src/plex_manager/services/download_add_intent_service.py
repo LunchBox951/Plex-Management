@@ -1,9 +1,4 @@
-"""Recovery for durable pre-add torrent intents.
-
-This module deliberately has no grab-service call site yet: PR 1 is the N-1
-reader/recovery substrate; direct grab keeps its legacy client-add path until
-activation.
-"""
+"""Recovery and reservation lifecycle for durable pre-add torrent intents."""
 
 from __future__ import annotations
 
@@ -41,6 +36,10 @@ _MAX_ERROR_LENGTH = 180
 
 class IntentRecoveryConflictError(RuntimeError):
     """An intent cannot safely become a tracked download without operator correction."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 _TERMINAL_DOWNLOAD_STATES = frozenset(
@@ -107,23 +106,15 @@ def _safe_error(exc: Exception) -> str:
     return type(exc).__name__[:_MAX_ERROR_LENGTH]
 
 
-async def publish_intent(
-    session: AsyncSession,
+def _intent_scopes(
     *,
     scored: ScoredRelease,
-    prepared: PreparedAdd,
-    request_id: int | None,
     tmdb_id: int,
-    year: int | None,
     season: int | None,
     episodes: list[int] | None,
-    save_path: str,
-    observed_request_status: str | None,
-    observed_season_status: str | None,
     scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
-) -> DownloadAddIntentRecord:
-    """Publish a hash-keyed intent; activation wires this before client submission."""
-
+) -> tuple[DownloadAddIntentScopeCreate, ...]:
+    """Build the physical title footprint that an intent owns until finalization."""
     media_type = "tv" if season is not None else "movie"
     scopes: list[DownloadAddIntentScopeCreate] = []
     if season is None:
@@ -155,22 +146,120 @@ async def publish_intent(
                     is_target=covered_season in targets,
                 )
             )
+    return tuple(scopes)
+
+
+def _intent_command(
+    *,
+    scored: ScoredRelease,
+    prepared: PreparedAdd,
+    request_id: int | None,
+    tmdb_id: int,
+    year: int | None,
+    season: int | None,
+    episodes: list[int] | None,
+    save_path: str,
+    observed_request_status: str | None,
+    observed_season_status: str | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+) -> CreateDownloadAddIntent:
+    media_type = "tv" if season is not None else "movie"
     candidate = scored.candidate
-    return await SqlDownloadAddIntentRepository(session).create(
-        CreateDownloadAddIntent(
-            torrent_hash=prepared.torrent_hash,
-            source=candidate.magnet_url or candidate.download_url,
-            media_request_id=request_id,
+    return CreateDownloadAddIntent(
+        torrent_hash=prepared.torrent_hash,
+        source=candidate.magnet_url or candidate.download_url,
+        media_request_id=request_id,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        year=year,
+        release_title=candidate.title,
+        indexer=candidate.indexer_name,
+        quality_name=scored.quality.name,
+        save_path=save_path,
+        observed_request_status=observed_request_status,
+        observed_season_status=observed_season_status,
+        scopes=_intent_scopes(
+            scored=scored,
             tmdb_id=tmdb_id,
-            media_type=media_type,
+            season=season,
+            episodes=episodes,
+            scope_episodes_by_season=scope_episodes_by_season,
+        ),
+    )
+
+
+async def reserve_intent(
+    session: AsyncSession,
+    *,
+    scored: ScoredRelease,
+    prepared: PreparedAdd,
+    request_id: int | None,
+    tmdb_id: int,
+    year: int | None,
+    season: int | None,
+    episodes: list[int] | None,
+    save_path: str,
+    observed_request_status: str | None,
+    observed_season_status: str | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+) -> DownloadAddIntentRecord | None:
+    """Atomically reserve a candidate footprint before its client submission.
+
+    A committed reservation uses the same unique scope domain as every other
+    durable add. A competing publisher returns ``None`` without client mutation;
+    a crash leaves the prepared intent for normal recovery rather than wedging a
+    scope behind an in-process lock.
+    """
+    intent = await SqlDownloadAddIntentRepository(session).try_create(
+        _intent_command(
+            scored=scored,
+            prepared=prepared,
+            request_id=request_id,
+            tmdb_id=tmdb_id,
             year=year,
-            release_title=candidate.title,
-            indexer=candidate.indexer_name,
-            quality_name=scored.quality.name,
+            season=season,
+            episodes=episodes,
             save_path=save_path,
             observed_request_status=observed_request_status,
             observed_season_status=observed_season_status,
-            scopes=tuple(scopes),
+            scope_episodes_by_season=scope_episodes_by_season,
+        )
+    )
+    if intent is not None:
+        await session.commit()
+    return intent
+
+
+async def publish_intent(
+    session: AsyncSession,
+    *,
+    scored: ScoredRelease,
+    prepared: PreparedAdd,
+    request_id: int | None,
+    tmdb_id: int,
+    year: int | None,
+    season: int | None,
+    episodes: list[int] | None,
+    save_path: str,
+    observed_request_status: str | None,
+    observed_season_status: str | None,
+    scope_episodes_by_season: Mapping[int, Sequence[int] | None] | None,
+) -> DownloadAddIntentRecord:
+    """Publish a hash-keyed intent; activation wires this before client submission."""
+
+    return await SqlDownloadAddIntentRepository(session).create(
+        _intent_command(
+            scored=scored,
+            prepared=prepared,
+            request_id=request_id,
+            tmdb_id=tmdb_id,
+            year=year,
+            season=season,
+            episodes=episodes,
+            save_path=save_path,
+            observed_request_status=observed_request_status,
+            observed_season_status=observed_season_status,
+            scope_episodes_by_season=scope_episodes_by_season,
         )
     )
 
@@ -211,23 +300,70 @@ async def _finalize_present(
             timeout_at=datetime.now(UTC),
         )
     else:
-        if not await downloads.lock_if_active(existing.id):
-            await session.rollback()
-            refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
-            if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
+        if existing.status in _TERMINAL_DOWNLOAD_STATES:
+            # The live client category proves this intent owns the hash, so a terminal
+            # historical row is safe to resurrect exactly as a fresh grab would.
+            now = datetime.now(UTC)
+            claimed = await downloads.update_status_if_in(
+                existing.id,
+                DownloadState.Downloading.value,
+                _TERMINAL_DOWNLOAD_STATES,
+                progress=0.0,
+                seed_ratio=0.0,
+                clear_failed_reason=True,
+                clear_first_seen_at=True,
+                clear_download_path=True,
+                media_request_id=current.media_request_id,
+                replace_grab_metadata=True,
+                magnet_link=current.source,
+                tmdb_id=current.tmdb_id,
+                year=current.year,
+                season=next(
+                    (scope.season_number for scope in current.scopes if scope.is_target), None
+                ),
+                episodes=next(
+                    (
+                        list(scope.episodes)
+                        for scope in current.scopes
+                        if scope.is_target and scope.episodes
+                    ),
+                    None,
+                ),
+                media_type=current.media_type,
+                release_title=current.release_title,
+                added_at=now,
+                timeout_at=now,
+                retry_count=0,
+            )
+            if not claimed:
+                await session.rollback()
                 raise IntentRecoveryConflictError("same-hash download became terminal")
-            raise IntentRecoveryConflictError("same-hash download changed before scope attachment")
-        refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
-        if (
-            refreshed is None
-            or refreshed.status in _TERMINAL_DOWNLOAD_STATES
-            or refreshed.media_request_id != current.media_request_id
-            or refreshed.tmdb_id != current.tmdb_id
-            or refreshed.media_type != current.media_type
-        ):
-            await session.rollback()
-            raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
-        record = refreshed
+            refreshed = await downloads.get_by_hash(current.torrent_hash)
+            if refreshed is None:  # pragma: no cover - the row was just updated
+                raise LookupError("same-hash download disappeared during finalization")
+            record = refreshed
+        else:
+            if not await downloads.lock_if_active(existing.id):
+                await session.rollback()
+                refreshed = await downloads.get_by_hash(
+                    current.torrent_hash, populate_existing=True
+                )
+                if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
+                    raise IntentRecoveryConflictError("same-hash download became terminal")
+                raise IntentRecoveryConflictError(
+                    "same-hash download changed before scope attachment"
+                )
+            refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
+            if (
+                refreshed is None
+                or refreshed.status in _TERMINAL_DOWNLOAD_STATES
+                or refreshed.media_request_id != current.media_request_id
+                or refreshed.tmdb_id != current.tmdb_id
+                or refreshed.media_type != current.media_type
+            ):
+                await session.rollback()
+                raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
+            record = refreshed
     for scope in current.scopes:
         if scope.is_target and scope.season_number is not None:
             await downloads.ensure_scope(
@@ -280,7 +416,7 @@ async def _finalize_present(
         )
     if not moved:
         await session.rollback()
-        raise RuntimeError("intent premise no longer active")
+        raise IntentRecoveryConflictError("intent_premise_no_longer_active")
     session.add(
         DownloadHistory(
             tmdb_id=current.tmdb_id,
@@ -329,6 +465,10 @@ async def submit_and_finalize(
     status = await qbt.get_status(intent.torrent_hash)
     if _owns_present_torrent(intent, status):
         return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
+    if status is None:
+        # A duplicate only proves the hash exists. If its status cannot be read,
+        # retain the prepared reservation so a later sweep can re-probe safely.
+        return _SubmissionFinalization(None)
     parked = await _park_needs_attention(
         session,
         SqlDownloadAddIntentRepository(session),
@@ -336,6 +476,13 @@ async def submit_and_finalize(
         "client_hash_ownership_unproven",
     )
     return _SubmissionFinalization(None, parked=parked)
+
+
+async def park_intent(session: AsyncSession, intent_id: int, error: str) -> bool:
+    """Park a prepared intent and release its scope claim for a fresh retry."""
+    return await _park_needs_attention(
+        session, SqlDownloadAddIntentRepository(session), intent_id, error
+    )
 
 
 async def _park_needs_attention(
@@ -356,8 +503,34 @@ async def _park_needs_attention(
 async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecoveryResult:
     """Recover every committed intent in stable order without recreating cancellations."""
     intents = SqlDownloadAddIntentRepository(session)
+    return await _recover(qbt, session, await intents.list_recoverable())
+
+
+async def recover_for_request(
+    qbt: _IntentClient, session: AsyncSession, *, request_id: int
+) -> IntentRecoveryResult:
+    """Recover only one request's durable intents after its cancellation commits."""
+    intents = SqlDownloadAddIntentRepository(session)
+    return await _recover(
+        qbt,
+        session,
+        [
+            intent
+            for intent in await intents.list_for_request(request_id)
+            if intent.state in {"prepared", "cancel_requested"}
+        ],
+    )
+
+
+async def _recover(
+    qbt: _IntentClient,
+    session: AsyncSession,
+    recoverable: Sequence[DownloadAddIntentRecord],
+) -> IntentRecoveryResult:
+    """Recover the supplied durable intents without widening a caller's scope."""
+    intents = SqlDownloadAddIntentRepository(session)
     result = IntentRecoveryResult()
-    for intent in await intents.list_recoverable():
+    for intent in recoverable:
         status = await qbt.get_status(intent.torrent_hash)
         try:
             if intent.state == "cancel_requested":
@@ -423,7 +596,7 @@ async def recover_all(qbt: _IntentClient, session: AsyncSession) -> IntentRecove
             )
         except IntentRecoveryConflictError as exc:
             await session.rollback()
-            if await _park_needs_attention(session, intents, intent.id, _safe_error(exc)):
+            if await _park_needs_attention(session, intents, intent.id, exc.reason):
                 _logger.warning("durable intent %s needs operator attention (%s)", intent.id, exc)
                 result = IntentRecoveryResult(
                     result.finalized, result.removed, result.needs_attention + 1

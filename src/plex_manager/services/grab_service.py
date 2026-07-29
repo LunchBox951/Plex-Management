@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentAddRejectedError
 from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
@@ -32,10 +33,11 @@ from plex_manager.models import (
     DownloadHistoryEvent,
     RequestStatus,
 )
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
-from plex_manager.services import queue_service, season_request_service
+from plex_manager.services import download_add_intent_service, queue_service, season_request_service
 from plex_manager.services.request_service import TERMINAL_REQUEST_STATUS_VALUES
 
 if TYPE_CHECKING:
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_CATEGORY",
     "AlreadyDownloadingError",
+    "ClientHashOwnershipUnprovenError",
     "GrabError",
     "NoGrabSourceError",
     "RequestNotActiveError",
@@ -184,6 +187,14 @@ class AlreadyDownloadingError(Exception):
     def __init__(self, request_id: int) -> None:
         self.request_id = request_id
         super().__init__(f"request {request_id} already has an active download")
+
+
+class ClientHashOwnershipUnprovenError(Exception):
+    """A duplicate client hash cannot be safely adopted without an ownership proof."""
+
+    def __init__(self, torrent_hash: str) -> None:
+        self.torrent_hash = torrent_hash
+        super().__init__(f"client ownership of torrent {torrent_hash} is unproven")
 
 
 class GrabError(Exception):
@@ -393,6 +404,12 @@ async def _reuse_terminal_row(
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
     return record, True
+
+
+async def _release_rejected_reservation(session: AsyncSession, intent_id: int) -> None:
+    """Release a reservation only after qBittorrent definitively rejected its add."""
+    await SqlDownloadAddIntentRepository(session).delete(intent_id)
+    await session.commit()
 
 
 async def _remove_torrent_if_added(
@@ -1058,6 +1075,13 @@ async def grab(
     target_seasons = _planned_target_seasons(scored, season)
     active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
 
+    # Resolve the stable hash before reserving the shared durable scope. This
+    # does no client mutation; a committed reservation survives a worker crash
+    # and is recovered through the normal intent loop.
+    prepared = await qbt.prepare_add(source)
+    intent_id: int | None = None
+    intent_owns_client_torrent = False
+
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
     known_hash = candidate.info_hash.lower() if candidate.info_hash else None
@@ -1129,7 +1153,100 @@ async def grab(
         if active is not None:
             raise AlreadyDownloadingError(request_id)
 
-    add_result = await qbt.add(source, save_path, category)
+    # A hashless indexer candidate can still have a stable hash after preparation.
+    # Preserve same-request idempotency before taking a second reservation: this is
+    # not a cross-worker ownership claim (the later unique reservation is), merely
+    # convergence on the Download row this request already durably owns.
+    if request_id is not None and known_hash is None and prepared.torrent_hash:
+        prepared_existing = await download_repo.get_by_hash(prepared.torrent_hash)
+        if (
+            prepared_existing is not None
+            and prepared_existing.status not in _TERMINAL_STATUS_VALUES
+            and prepared_existing.media_request_id == request_id
+        ):
+            if season is not None:
+                attached = await _attach_target_scopes_to_existing_download(
+                    session,
+                    download_repo,
+                    prepared_existing,
+                    request_id=request_id,
+                    season=season,
+                    episodes=episodes,
+                    scope_episodes_by_season=scope_episodes_by_season,
+                    target_seasons=target_seasons,
+                    guard_seasons=active_guard_seasons,
+                    observed_season_status=observed_season_status,
+                )
+                if attached is not None:
+                    return attached
+            else:
+                return prepared_existing
+
+    # Claim the same durable scope domain that intent publication uses BEFORE
+    # qBittorrent mutation. The database uniqueness constraint makes this a
+    # cross-worker atomic exclusion, and a committed claim is recoverable if this
+    # process dies while submitting.
+    if request_id is not None and tmdb_id is not None and prepared.torrent_hash:
+        intent = await download_add_intent_service.reserve_intent(
+            session,
+            scored=scored,
+            prepared=prepared,
+            request_id=request_id,
+            tmdb_id=tmdb_id,
+            year=year,
+            season=season,
+            episodes=episodes,
+            save_path=save_path,
+            observed_request_status=observed_request_status,
+            observed_season_status=observed_season_status,
+            scope_episodes_by_season=scope_episodes_by_season,
+        )
+        if intent is None:
+            raise AlreadyDownloadingError(request_id)
+        intent_id = intent.id
+
+    if intent_id is not None:
+        # Submit exactly the bytes/URL whose hash the durable claim names. Re-preparing
+        # a mutable HTTP source here could add a different torrent under this intent's
+        # category and leave recovery unable to prove or clean it up after a crash.
+        submission_category = download_add_intent_service.intent_category(intent_id)
+    else:
+        submission_category = category
+    try:
+        add_result = await qbt.add_prepared(prepared, save_path, submission_category)
+    except QbittorrentAddRejectedError:
+        if intent_id is not None:
+            # A completed rejection proves no client mutation occurred, so delete the
+            # reservation and let an immediate retry use the shared scope. Transport
+            # failures remain deliberately ambiguous and retain the recoverable intent.
+            await _release_rejected_reservation(session, intent_id)
+        raise
+    if not add_result.created:
+        status = await qbt.get_status(prepared.torrent_hash)
+        intent_owns_client_torrent = (
+            intent_id is not None
+            and status is not None
+            and (status.category == download_add_intent_service.intent_category(intent_id))
+        )
+        if not intent_owns_client_torrent:
+            if intent_id is None:
+                # An unreserved caller has no durable client-ownership proof. Never
+                # adopt the duplicate; make the refusal explicit to its caller.
+                raise ClientHashOwnershipUnprovenError(prepared.torrent_hash)
+            if status is None:
+                # A duplicate with an unavailable status is ambiguous, not definitively
+                # foreign. Keep its prepared reservation for recovery to re-probe.
+                if request_id is None:  # pragma: no cover - reservations require a request
+                    raise RuntimeError("reserved intent has no request")
+                raise AlreadyDownloadingError(request_id)
+            # A visible foreign category is definitive: retain correction metadata but
+            # release the scope claim and never adopt, recategorize, or delete its data.
+            await download_add_intent_service.park_intent(
+                session, intent_id, "client_hash_ownership_unproven"
+            )
+            if request_id is None:  # pragma: no cover - reservations require a request
+                raise RuntimeError("reserved intent has no request")
+            raise AlreadyDownloadingError(request_id)
     torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
     # Whether THIS call genuinely created the torrent. False = the client
     # reported it already present (qBittorrent's 409) and resolved to the
@@ -1523,6 +1640,15 @@ async def grab(
                 reason="the request was cancelled or moved on mid-grab",
             )
             raise RequestNotActiveError(request_id)
+    if intent_id is not None:
+        await SqlDownloadAddIntentRepository(session).delete(intent_id)
     await session.commit()
+    if intent_id is not None and (add_result.created or intent_owns_client_torrent):
+        try:
+            await qbt.set_category(torrent_hash, category)
+        except Exception as exc:
+            _logger.warning(
+                "durable intent category normalization deferred (%s)", type(exc).__name__
+            )
     refreshed = await download_repo.get_by_hash(torrent_hash)
     return refreshed if refreshed is not None else record

@@ -160,6 +160,15 @@ class QbittorrentError(RuntimeError):
     """
 
 
+class QbittorrentAddRejectedError(QbittorrentError):
+    """qBittorrent definitely rejected an add before creating a torrent.
+
+    Unlike a transport error, a completed non-success response proves that the
+    client did not accept the submission, so a caller may safely release a
+    pre-submission reservation and retry another release.
+    """
+
+
 class QbittorrentAuthError(QbittorrentError):
     """Raised when qBittorrent rejects the login (bad credentials / banned IP).
 
@@ -1506,7 +1515,7 @@ class QbittorrentClient:
             files = {"torrents": ("file.torrent", torrent_bytes, "application/x-bittorrent")}
         response = await self._request("POST", "/torrents/add", data=form, files=files)
         if not _is_add_success(response):
-            raise QbittorrentError(
+            raise QbittorrentAddRejectedError(
                 f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )
         return AddResult(

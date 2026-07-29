@@ -31,6 +31,7 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
+    ClientHashOwnershipUnprovenError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -353,9 +354,12 @@ async def grab_endpoint(
                     media_request_id=request.id,
                     season_number=body.season,
                     require_no_active_coverage=True,
+                    require_no_active_download_or_intent=True,
                 )
             else:
-                parked = await request_service.mark_no_acceptable_release(session, request.id)
+                parked = await request_service.mark_no_acceptable_release(
+                    session, request.id, require_no_active_download_or_intent=True
+                )
             if parked:
                 await session.commit()
                 publish_realtime(
@@ -402,6 +406,12 @@ async def grab_endpoint(
         # refuse the parallel grab instead of spawning a second active row.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
+        ) from exc
+    except ClientHashOwnershipUnprovenError as exc:
+        # A caller without a durable reservation cannot prove a duplicate's client
+        # ownership. Refuse rather than silently adopting a potentially foreign torrent.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="client_hash_ownership_unproven"
         ) from exc
     except TorrentAlreadyTrackedError as exc:
         # The same torrent hash is already actively owned by a different request.

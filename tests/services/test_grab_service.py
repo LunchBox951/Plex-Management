@@ -25,8 +25,14 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import AddResult
-from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
+from plex_manager.ports.download_client import AddResult, DownloadStatus
+from plex_manager.ports.repositories import (
+    CreateDownloadAddIntent,
+    DownloadAddIntentScopeCreate,
+    DownloadRecord,
+    DownloadScopeRecord,
+)
+from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import grab_service, queue_service
 from plex_manager.services.grab_service import (
@@ -53,6 +59,84 @@ def _scored(info_hash: str) -> ScoredRelease:
     return ScoredRelease(
         candidate=cand, parsed=parsed, quality=WEBDL1080P, profile_index=19, score=1.0
     )
+
+
+async def test_grab_refuses_movie_scope_owned_by_prepared_intent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+        )
+        session.add(request)
+        await session.flush()
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="intent-hash",
+                media_request_id=request.id,
+                tmdb_id=request.tmdb_id,
+                media_type="movie",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=request.tmdb_id, media_type="movie", scope_key="movie"
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        qbt = FakeQbittorrent()
+
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt,
+                session,
+                scored=_scored("second-hash"),
+                request_id=request.id,
+                tmdb_id=request.tmdb_id,
+            )
+
+        assert qbt.added == []
+        remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+        assert remaining is not None and remaining.state == "prepared"
+
+
+async def test_grab_refuses_tv_pack_coverage_owned_by_prepared_intent(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id = await _make_tv_request(sessionmaker_)
+    async with sessionmaker_() as session:
+        intent = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="intent-pack",
+                media_request_id=request_id,
+                tmdb_id=900,
+                media_type="tv",
+                save_path="",
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=900,
+                        media_type="tv",
+                        scope_key="season:2",
+                        season_number=2,
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+        qbt = FakeQbittorrent()
+        pack = _scored_tv("second-pack", "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
+            update={"target_seasons": (1,), "covered_seasons": (1, 2)}
+        )
+
+        with pytest.raises(AlreadyDownloadingError):
+            await grab_service.grab(
+                qbt, session, scored=pack, request_id=request_id, tmdb_id=900, season=1
+            )
+
+        assert qbt.added == []
+        remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
+        assert remaining is not None and remaining.state == "prepared"
 
 
 async def test_grab_reuses_terminal_row_and_reowns_to_current_request(
@@ -853,129 +937,67 @@ class _BlockDuringAddQbt(FakeQbittorrent):
         self.entered_add = asyncio.Event()
         self.resume_add = asyncio.Event()
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
         self.entered_add.set()
         await asyncio.wait_for(self.resume_add.wait(), timeout=1)
-        return await super().add(magnet_or_url, save_path, category)
+        return await super().add_prepared(prepared, save_path, category)
 
 
-async def test_pack_ride_along_claim_race_cleans_up_the_losing_pack_torrent(
+async def test_pack_reservation_refuses_ride_along_grab_before_client_add(
     tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #464: two real sessions pass their pre-add guards while both qBT adds
-    pause. The pack also clears its post-add guard before S2 commits; the dedicated
-    grab wins SQLite's one writer, so the resumed pack collides on its S2 coverage
-    claim, raises ``AlreadyDownloadingError``, and removes its created torrent."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_ride_along_race.db")
+    """A pack reserves both its target and covered seasons before qBittorrent add.
+
+    A dedicated S2 grab therefore loses in the durable scope table while the pack is
+    paused at client submission: it cannot create a second torrent and has no orphan
+    to clean up. This is the stronger replacement for the former post-add collision.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_reservation_race.db")
     try:
         request_id = await _make_tv_request(sm)
         pack_hash = "8" * 40
-        dedicated_hash = "9" * 40
         pack = _scored_tv(pack_hash, "Some.Show.S01-S02.1080p.WEB-DL.x264-GROUP").model_copy(
             update={"covered_seasons": (1, 2), "target_seasons": (1,)}
         )
         pack_qbt = _BlockDuringAddQbt()
-        dedicated_qbt = _BlockDuringAddQbt()
-        real_active_conflict = (
-            grab_service._active_conflict_for_targets  # pyright: ignore[reportPrivateUsage]
-        )
-        pack_guard_checks = 0
-        pack_post_add_guard_passed = asyncio.Event()
-        release_pack_after_guard = asyncio.Event()
-
-        async def block_pack_after_post_add_guard(
-            download_repo: SqlDownloadRepository,
-            *,
-            request_id: int | None,
-            target_seasons: tuple[int | None, ...],
-            torrent_hash: str,
-        ) -> DownloadRecord | None:
-            nonlocal pack_guard_checks
-            conflict = await real_active_conflict(
-                download_repo,
-                request_id=request_id,
-                target_seasons=target_seasons,
-                torrent_hash=torrent_hash,
-            )
-            if torrent_hash == pack_hash:
-                pack_guard_checks += 1
-                if pack_guard_checks == 2:
-                    assert conflict is None
-                    pack_post_add_guard_passed.set()
-                    await asyncio.wait_for(release_pack_after_guard.wait(), timeout=1)
-            return conflict
-
-        monkeypatch.setattr(
-            grab_service, "_active_conflict_for_targets", block_pack_after_post_add_guard
-        )
+        dedicated_qbt = FakeQbittorrent()
 
         async def grab_pack() -> DownloadRecord:
             async with sm() as session:
                 return await grab_service.grab(
-                    pack_qbt,
-                    session,
-                    scored=pack,
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=1,
-                )
-
-        async def grab_dedicated() -> DownloadRecord:
-            async with sm() as session:
-                return await grab_service.grab(
-                    dedicated_qbt,
-                    session,
-                    scored=_scored_tv(dedicated_hash, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=2,
+                    pack_qbt, session, scored=pack, request_id=request_id, tmdb_id=900, season=1
                 )
 
         pack_task = asyncio.create_task(grab_pack())
         await asyncio.wait_for(pack_qbt.entered_add.wait(), timeout=1)
-        dedicated_task = asyncio.create_task(grab_dedicated())
-        await asyncio.wait_for(dedicated_qbt.entered_add.wait(), timeout=1)
-
-        # Both pre-add read guards already returned. Let the pack pass its post-add
-        # read guard too, then let the dedicated writer commit S2 before the pack
-        # resumes its real coverage-claim INSERT and trips the database backstop.
-        pack_qbt.resume_add.set()
-        await asyncio.wait_for(pack_post_add_guard_passed.wait(), timeout=1)
-        dedicated_qbt.resume_add.set()
-        await asyncio.wait_for(dedicated_task, timeout=1)
-        release_pack_after_guard.set()
-        with pytest.raises(AlreadyDownloadingError):
-            await asyncio.wait_for(pack_task, timeout=1)
-
-        assert pack_qbt.removed == [(pack_hash, True)]
         async with sm() as session:
-            downloads = (await session.execute(select(Download))).scalars().all()
-            histories = (await session.execute(select(DownloadHistory))).scalars().all()
-            scopes = (await session.execute(select(DownloadScope))).scalars().all()
+            with pytest.raises(AlreadyDownloadingError):
+                await grab_service.grab(
+                    dedicated_qbt,
+                    session,
+                    scored=_scored_tv("9" * 40, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+        assert dedicated_qbt.added == []
+
+        pack_qbt.resume_add.set()
+        record = await asyncio.wait_for(pack_task, timeout=1)
+        assert record.torrent_hash == pack_hash
+        assert pack_qbt.removed == []
+        async with sm() as session:
             claims = (await session.execute(select(DownloadCoverageClaim))).scalars().all()
-        assert [(row.torrent_hash, row.season) for row in downloads] == [(dedicated_hash, 2)]
-        assert {scope.season_number for scope in scopes} == {2}
-        assert {(claim.download_id, claim.season_number) for claim in claims} == {
-            (downloads[0].id, 2)
-        }
-        assert [history.torrent_hash for history in histories] == [dedicated_hash]
+        assert {claim.season_number for claim in claims} == {1, 2}
     finally:
         await engine.dispose()
 
 
-async def test_pack_ride_along_same_hash_race_attaches_the_dedicated_scope(
+async def test_pack_reservation_refuses_same_hash_overlapping_scope_before_add(
     tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #464: both sessions reach the stale same-hash row-create decision.
-
-    The pack and dedicated S2 grab pass their pre-add guards, then both stop before
-    inserting. The pack wins ``UNIQUE(torrent_hash)``; the dedicated session loses,
-    rolls back, and is forced through the attach collision verification/retry path so
-    S2 is durably attached instead of silently returned as an unscoped success.
-    """
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_ride_along_same_hash_race.db")
+    """A same-hash dedicated grab also loses on the pack's whole footprint."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "pack_same_hash_reservation_race.db")
     try:
         request_id = await _make_tv_request(sm)
         torrent_hash = "a" * 40
@@ -983,87 +1005,19 @@ async def test_pack_ride_along_same_hash_race_attaches_the_dedicated_scope(
             update={"covered_seasons": (1, 2), "target_seasons": (1,)}
         )
         pack_qbt = _BlockDuringAddQbt()
-        dedicated_qbt = _BlockDuringAddQbt()
-        real_create = grab_service.SqlDownloadRepository.create
-        pack_create_entered = asyncio.Event()
-        dedicated_create_entered = asyncio.Event()
-        allow_pack_create = asyncio.Event()
-        allow_dedicated_create = asyncio.Event()
-        create_attempts = 0
-        collision_loser_repositories: set[int] = set()
-
-        async def serialize_stale_same_hash_creates(
-            self: grab_service.SqlDownloadRepository, **kwargs: Any
-        ) -> DownloadRecord:
-            nonlocal create_attempts
-            if kwargs["torrent_hash"] == torrent_hash:
-                create_attempts += 1
-                if kwargs["season"] == 1:
-                    pack_create_entered.set()
-                    await asyncio.wait_for(allow_pack_create.wait(), timeout=1)
-                else:
-                    assert kwargs["season"] == 2
-                    dedicated_create_entered.set()
-                    await asyncio.wait_for(allow_dedicated_create.wait(), timeout=1)
-            try:
-                return await real_create(self, **kwargs)
-            except IntegrityError:
-                collision_loser_repositories.add(id(self))
-                raise
-
-        real_ensure_claim = grab_service.SqlDownloadRepository.ensure_coverage_claim
-        injected_attach_collision = False
-
-        async def force_loser_attach_rollback(
-            self: grab_service.SqlDownloadRepository,
-            download_id: int,
-            *,
-            media_request_id: int,
-            season: int,
-        ) -> None:
-            nonlocal injected_attach_collision
-            if id(self) in collision_loser_repositories and not injected_attach_collision:
-                injected_attach_collision = True
-                raise IntegrityError("coverage claim collision", {}, RuntimeError("collision"))
-            await real_ensure_claim(
-                self,
-                download_id,
-                media_request_id=media_request_id,
-                season=season,
-            )
-
-        real_attached_target_scopes = (
-            grab_service._attached_target_scopes  # pyright: ignore[reportPrivateUsage]
-        )
-        attached_target_scope_checks = 0
-
-        async def count_attached_target_scopes(*args: Any, **kwargs: Any) -> bool:
-            nonlocal attached_target_scope_checks
-            attached_target_scope_checks += 1
-            return await real_attached_target_scopes(*args, **kwargs)
-
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "create", serialize_stale_same_hash_creates
-        )
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "ensure_coverage_claim", force_loser_attach_rollback
-        )
-        monkeypatch.setattr(grab_service, "_attached_target_scopes", count_attached_target_scopes)
 
         async def grab_pack() -> DownloadRecord:
             async with sm() as session:
                 return await grab_service.grab(
-                    pack_qbt,
-                    session,
-                    scored=pack,
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=1,
+                    pack_qbt, session, scored=pack, request_id=request_id, tmdb_id=900, season=1
                 )
 
-        async def grab_dedicated() -> DownloadRecord:
-            async with sm() as session:
-                return await grab_service.grab(
+        pack_task = asyncio.create_task(grab_pack())
+        await asyncio.wait_for(pack_qbt.entered_add.wait(), timeout=1)
+        dedicated_qbt = FakeQbittorrent()
+        async with sm() as session:
+            with pytest.raises(AlreadyDownloadingError):
+                await grab_service.grab(
                     dedicated_qbt,
                     session,
                     scored=_scored_tv(torrent_hash, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
@@ -1071,35 +1025,11 @@ async def test_pack_ride_along_same_hash_race_attaches_the_dedicated_scope(
                     tmdb_id=900,
                     season=2,
                 )
+        assert dedicated_qbt.added == []
 
-        pack_task = asyncio.create_task(grab_pack())
-        await asyncio.wait_for(pack_qbt.entered_add.wait(), timeout=1)
-        dedicated_task = asyncio.create_task(grab_dedicated())
-        await asyncio.wait_for(dedicated_qbt.entered_add.wait(), timeout=1)
         pack_qbt.resume_add.set()
-        await asyncio.wait_for(pack_create_entered.wait(), timeout=1)
-        dedicated_qbt.resume_add.set()
-        await asyncio.wait_for(dedicated_create_entered.wait(), timeout=1)
-        allow_pack_create.set()
-        await asyncio.wait_for(pack_task, timeout=1)
-        allow_dedicated_create.set()
-        attached = await asyncio.wait_for(dedicated_task, timeout=1)
-
-        assert create_attempts == 2
-        assert injected_attach_collision
-        assert attached_target_scope_checks == 1
-        assert attached.torrent_hash == torrent_hash
-        assert dedicated_qbt.removed == []
-        async with sm() as session:
-            downloads = (await session.execute(select(Download))).scalars().all()
-            scopes = (await session.execute(select(DownloadScope))).scalars().all()
-            claims = (await session.execute(select(DownloadCoverageClaim))).scalars().all()
-        assert [(row.torrent_hash, row.season) for row in downloads] == [(torrent_hash, 1)]
-        assert {scope.season_number for scope in scopes} == {1, 2}
-        assert {(claim.download_id, claim.season_number) for claim in claims} == {
-            (downloads[0].id, 1),
-            (downloads[0].id, 2),
-        }
+        record = await asyncio.wait_for(pack_task, timeout=1)
+        assert record.torrent_hash == torrent_hash
     finally:
         await engine.dispose()
 
@@ -1806,390 +1736,84 @@ async def test_grab_reuses_a_terminal_same_hash_after_attach_collision(
         await engine.dispose()
 
 
-class _CommitSameHashOwnerDuringAddQbt(FakeQbittorrent):
-    """``add`` lets a SECOND session commit the whole grab for the SAME hash before
-    returning -- issue #480's window, made deterministic: this caller's
-    ``created=True`` was observed BEFORE any ownership of the hash was durable."""
+class _SecondGrabDuringAddQbt(FakeQbittorrent):
+    """Attempt the same grab from a distinct session during client submission."""
 
     def __init__(self, sm: SessionMaker, scored: ScoredRelease, request_id: int) -> None:
         super().__init__()
         self._sm = sm
         self._scored = scored
         self._request_id = request_id
-        self.winner: DownloadRecord | None = None
+        self.second_refused = False
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
         async with self._sm() as session:
-            self.winner = await grab_service.grab(
-                FakeQbittorrent(),
-                session,
-                scored=self._scored,
-                request_id=self._request_id,
-                tmdb_id=900,
-                season=1,
-            )
-        return await super().add(magnet_or_url, save_path, category)
-
-
-async def test_grab_keeps_a_same_hash_torrent_a_committed_owner_holds(
-    tmp_path: Any,
-) -> None:
-    """Issue #480: this grab physically added the hash, then a concurrent session
-    committed the Download + scope for it and advanced the season -- which is
-    exactly why this grab's season CAS then loses. The winner's torrent is live
-    and tracked, so it must survive (with its files); the loser converges on the
-    winner's row instead of reporting an error over a hole it just punched."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_committed_owner.db")
-    try:
-        request_id = await _make_tv_request(sm)
-        pack_hash = "e" * 40
-        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
-        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
-        async with sm() as session:
-            record = await grab_service.grab(
-                qbt,
-                session,
-                scored=scored,
-                request_id=request_id,
-                tmdb_id=900,
-                season=1,
-            )
-
-        assert qbt.added != []  # this grab really did hand the torrent to the client
-        assert qbt.removed == []  # ... and never deleted the committed owner's copy
-        assert qbt.winner is not None
-        assert record.id == qbt.winner.id
-        async with sm() as session:
-            row = (
-                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
-            ).scalar_one()
-            season_row = (
-                await session.execute(
-                    select(SeasonRequest).where(
-                        SeasonRequest.media_request_id == request_id,
-                        SeasonRequest.season_number == 1,
-                    )
-                )
-            ).scalar_one()
-        assert row.status == "downloading"  # the winner keeps its live row
-        assert season_row.status is RequestStatus.downloading
-    finally:
-        await engine.dispose()
-
-
-async def test_grab_still_removes_its_orphan_when_no_committed_owner_remains(
-    tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The control: the same lost season CAS, but the hash's row terminalizes before
-    the ownership re-check reads it. Nothing tracks the torrent this grab created,
-    so the orphan cleanup still removes it (with its data) and refuses honestly."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_orphan_control.db")
-    try:
-        request_id = await _make_tv_request(sm)
-        pack_hash = "f" * 40
-        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
-        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
-
-        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
-        terminalized = False
-
-        async def terminalize_before_ownership_check(
-            self: grab_service.SqlDownloadRepository,
-            torrent_hash: str,
-            *,
-            populate_existing: bool = False,
-        ) -> DownloadRecord | None:
-            nonlocal terminalized
-            if populate_existing and not terminalized:
-                terminalized = True
-                async with sm() as other_session:
-                    winner = qbt.winner
-                    assert winner is not None
-                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
-                        winner.id,
-                        "failed",
-                        frozenset({"downloading"}),
-                    )
-                    assert moved
-                    await other_session.commit()
-            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
-
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
-        )
-        async with sm() as session:
-            with pytest.raises(RequestNotActiveError):
+            with pytest.raises(AlreadyDownloadingError):
                 await grab_service.grab(
-                    qbt,
-                    session,
-                    scored=scored,
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=1,
-                )
-
-        assert terminalized
-        assert (pack_hash, True) in qbt.removed
-        async with sm() as session:
-            row = (
-                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
-            ).scalar_one()
-        assert row.status == "failed"
-    finally:
-        await engine.dispose()
-
-
-class _ReuseSameHashDuringRemoveQbt(_CommitSameHashOwnerDuringAddQbt):
-    """``remove`` lets a THIRD grab re-own the hash's terminal row before the delete
-    lands -- the check-to-delete window. Terminal rows are explicitly reusable, so a
-    point-in-time "nothing tracks it" read is not a claim on the torrent."""
-
-    def __init__(self, sm: SessionMaker, scored: ScoredRelease, request_id: int) -> None:
-        super().__init__(sm, scored, request_id)
-        self.reuse_record: DownloadRecord | None = None
-        self.reuse_refused = False
-
-    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
-        async with self._sm() as session:
-            try:
-                # ``pre_existing``: this grab's own add resolves to the torrent the
-                # loser created, so its cleanups never remove it -- only the loser's
-                # delete below is under test.
-                self.reuse_record = await grab_service.grab(
-                    FakeQbittorrent(pre_existing={info_hash.lower()}),
+                    FakeQbittorrent(),
                     session,
                     scored=self._scored,
                     request_id=self._request_id,
                     tmdb_id=900,
                     season=1,
                 )
-            except TorrentRemovalInFlightError:
-                self.reuse_refused = True
-        await super().remove(info_hash, delete_files=delete_files)
+            self.second_refused = True
+        return await super().add_prepared(prepared, save_path, category)
 
 
-async def test_grab_reserves_the_hash_before_deleting_its_orphan(
+async def test_grab_reservation_refuses_same_hash_concurrent_owner_before_add(
     tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ownership re-check is a READ; terminal rows are reusable, so between it and
-    the delete a fresh grab can re-own the row and start relying on the torrent -- and
-    then have its files destroyed, recreating #480 one step later. The cleanup must
-    hold the shared removal claim across that window so reuse refuses (#206's guard)
-    instead of committing a live row over data this call is deleting."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_reuse_during_delete.db")
+    """A second worker cannot pass into qBittorrent after the first reserves a hash."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_reservation_race.db")
     try:
         request_id = await _make_tv_request(sm)
-        pack_hash = "c" * 40
-        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
-        qbt = _ReuseSameHashDuringRemoveQbt(sm, scored, request_id)
-
-        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
-        terminalized = False
-
-        async def terminalize_before_ownership_check(
-            self: grab_service.SqlDownloadRepository,
-            torrent_hash: str,
-            *,
-            populate_existing: bool = False,
-        ) -> DownloadRecord | None:
-            nonlocal terminalized
-            if populate_existing and not terminalized:
-                terminalized = True
-                async with sm() as other_session:
-                    winner = qbt.winner
-                    assert winner is not None
-                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
-                        winner.id,
-                        "failed",
-                        frozenset({"downloading"}),
-                    )
-                    assert moved
-                    await other_session.commit()
-            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
-
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
-        )
-        async with sm() as session:
-            with pytest.raises(RequestNotActiveError):
-                await grab_service.grab(
-                    qbt,
-                    session,
-                    scored=scored,
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=1,
-                )
-
-        assert terminalized
-        assert qbt.reuse_refused  # the racing grab was told to retry, not handed the row
-        assert qbt.reuse_record is None
-        async with sm() as session:
-            row = (
-                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
-            ).scalar_one()
-        # No row is left claiming a torrent this call deleted with its files.
-        assert row.status == "failed"
-        assert (pack_hash, True) in qbt.removed
-    finally:
-        await engine.dispose()
-
-
-async def test_grab_rechecks_terminality_against_an_in_flight_reuse(
-    tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reuse CAS already in flight when the ownership read ran is invisible to that
-    snapshot read, so terminality is re-decided by the conditional UPDATE that
-    serializes behind it. Modelled by committing the reuse exactly at the probe: the
-    torrent now backs a live row and must survive."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_reuse_at_probe.db")
-    try:
-        request_id = await _make_tv_request(sm)
-        pack_hash = "b" * 40
-        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
-        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
-
-        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
-        real_lock_if_terminal = grab_service.SqlDownloadRepository.lock_if_terminal
-        terminalized = False
-        reused = False
-
-        async def terminalize_before_ownership_check(
-            self: grab_service.SqlDownloadRepository,
-            torrent_hash: str,
-            *,
-            populate_existing: bool = False,
-        ) -> DownloadRecord | None:
-            nonlocal terminalized
-            if populate_existing and not terminalized:
-                terminalized = True
-                async with sm() as other_session:
-                    winner = qbt.winner
-                    assert winner is not None
-                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
-                        winner.id,
-                        "failed",
-                        frozenset({"downloading"}),
-                    )
-                    assert moved
-                    await other_session.commit()
-            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
-
-        async def reuse_commits_at_the_probe(
-            self: grab_service.SqlDownloadRepository, download_id: int
-        ) -> bool:
-            nonlocal reused
-            if not reused:
-                reused = True
-                async with sm() as other_session:
-                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
-                        download_id,
-                        "downloading",
-                        frozenset({"failed"}),
-                    )
-                    assert moved
-                    await other_session.commit()
-            return await real_lock_if_terminal(self, download_id)
-
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
-        )
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "lock_if_terminal", reuse_commits_at_the_probe
-        )
+        torrent_hash = "e" * 40
+        scored = _scored_tv(torrent_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
+        qbt = _SecondGrabDuringAddQbt(sm, scored, request_id)
         async with sm() as session:
             record = await grab_service.grab(
-                qbt,
-                session,
-                scored=scored,
-                request_id=request_id,
-                tmdb_id=900,
-                season=1,
+                qbt, session, scored=scored, request_id=request_id, tmdb_id=900, season=1
             )
 
-        assert terminalized
-        assert reused
-        assert qbt.removed == []  # the re-owned torrent keeps its data
-        assert qbt.winner is not None
-        assert record.id == qbt.winner.id
-        async with sm() as session:
-            row = (
-                await session.execute(select(Download).where(Download.torrent_hash == pack_hash))
-            ).scalar_one()
-        assert row.status == "downloading"
+        assert record.torrent_hash == torrent_hash
+        assert qbt.second_refused
+        assert len(qbt.added) == 1
     finally:
         await engine.dispose()
 
 
-async def test_grab_releases_the_removal_claim_after_its_orphan_cleanup(
+async def test_grab_reservation_releases_scope_after_success(
     tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The claim is a window, not a lease: once the delete settles the row is plainly
-    reusable again, so a later grab must succeed rather than retry forever."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "samehash_claim_released.db")
+    """Finalization exchanges the reservation for the Download, never a permanent lock."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "reservation_released_after_success.db")
     try:
         request_id = await _make_tv_request(sm)
-        pack_hash = "d" * 40
-        scored = _scored_tv(pack_hash, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
-        qbt = _CommitSameHashOwnerDuringAddQbt(sm, scored, request_id)
-
-        real_get_by_hash = grab_service.SqlDownloadRepository.get_by_hash
-        terminalized = False
-
-        async def terminalize_before_ownership_check(
-            self: grab_service.SqlDownloadRepository,
-            torrent_hash: str,
-            *,
-            populate_existing: bool = False,
-        ) -> DownloadRecord | None:
-            nonlocal terminalized
-            if populate_existing and not terminalized:
-                terminalized = True
-                async with sm() as other_session:
-                    winner = qbt.winner
-                    assert winner is not None
-                    moved = await SqlDownloadRepository(other_session).update_status_if_in(
-                        winner.id,
-                        "failed",
-                        frozenset({"downloading"}),
-                    )
-                    assert moved
-                    await other_session.commit()
-            return await real_get_by_hash(self, torrent_hash, populate_existing=populate_existing)
-
-        monkeypatch.setattr(
-            grab_service.SqlDownloadRepository, "get_by_hash", terminalize_before_ownership_check
-        )
-        async with sm() as session:
-            with pytest.raises(RequestNotActiveError):
-                await grab_service.grab(
-                    qbt,
-                    session,
-                    scored=scored,
-                    request_id=request_id,
-                    tmdb_id=900,
-                    season=1,
-                )
-        assert terminalized
-        monkeypatch.undo()
-
-        winner = qbt.winner
-        assert winner is not None
-        assert not queue_service.removal_in_flight(winner.id)
+        first = _scored_tv("c" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP")
         async with sm() as session:
             record = await grab_service.grab(
                 FakeQbittorrent(),
                 session,
-                scored=scored,
+                scored=first,
                 request_id=request_id,
                 tmdb_id=900,
                 season=1,
             )
-        assert record.id == winner.id
+            assert await SqlDownloadAddIntentRepository(session).get_by_hash("c" * 40) is None
+
+        # The permanent Download guard, rather than a stale intent, now explains the
+        # refusal and keeps correction paths free to release the scope at terminality.
+        async with sm() as session:
+            with pytest.raises(AlreadyDownloadingError):
+                await grab_service.grab(
+                    FakeQbittorrent(),
+                    session,
+                    scored=_scored_tv("d" * 40, "Some.Show.S01.1080p.WEB-DL.x264-GROUP"),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                )
         assert record.status == "downloading"
     finally:
         await engine.dispose()
@@ -2652,8 +2276,8 @@ class _HashReturningQbt(FakeQbittorrent):
         super().__init__()
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
-        self.added.append((magnet_or_url, save_path, category))
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
+        self.added.append((prepared.submission_url or "<torrent-bytes>", save_path, category))
         return AddResult(torrent_hash=self._info_hash, created=True)
 
 
@@ -2714,8 +2338,8 @@ class _CompetingActiveDuringAddQbt(FakeQbittorrent):
         self._request_id = request_id
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
-        self.added.append((magnet_or_url, save_path, category))
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
+        self.added.append((prepared.submission_url or "<torrent-bytes>", save_path, category))
         async with self._sessionmaker() as session:
             session.add(
                 Download(
@@ -2736,8 +2360,8 @@ class _CompetingHashOwnerDuringAddQbt(FakeQbittorrent):
         self._owner_request_id = owner_request_id
         self._info_hash = info_hash
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
-        self.added.append((magnet_or_url, save_path, category))
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
+        self.added.append((prepared.submission_url or "<torrent-bytes>", save_path, category))
         async with self._sessionmaker() as session:
             session.add(
                 Download(
@@ -3009,13 +2633,13 @@ class _CancelMovieDuringAddQbt(FakeQbittorrent):
         self._sm = sm
         self._request_id = request_id
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
         async with self._sm() as session:
             row = await session.get(MediaRequest, self._request_id)
             assert row is not None
             row.status = RequestStatus.cancelled
             await session.commit()
-        return await super().add(magnet_or_url, save_path, category)
+        return await super().add_prepared(prepared, save_path, category)
 
 
 class _CancelSeasonDuringAddQbt(FakeQbittorrent):
@@ -3026,13 +2650,13 @@ class _CancelSeasonDuringAddQbt(FakeQbittorrent):
         self._sm = sm
         self._season_request_id = season_request_id
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
             row.status = RequestStatus.cancelled
             await session.commit()
-        return await super().add(magnet_or_url, save_path, category)
+        return await super().add_prepared(prepared, save_path, category)
 
 
 async def _file_backed_sessionmaker(tmp_path: Any, name: str) -> tuple[SessionMaker, Any]:
@@ -3233,13 +2857,13 @@ class _FoldSeasonDuringAddQbt(FakeQbittorrent):
         self._season_request_id = season_request_id
         self._status = status
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared, save_path: str, category: str):  # type: ignore[no-untyped-def]
         async with self._sm() as session:
             row = await session.get(SeasonRequest, self._season_request_id)
             assert row is not None
             row.status = self._status
             await session.commit()
-        return await super().add(magnet_or_url, save_path, category)
+        return await super().add_prepared(prepared, save_path, category)
 
 
 async def test_grab_loses_to_a_recovery_fold_that_landed_while_qbt_add_was_in_flight(
@@ -3653,6 +3277,14 @@ async def test_grab_loss_cleanup_leaves_a_pre_existing_torrent_untouched(
 
         qbt = _CancelMovieDuringAddQbt(sm, request_id)
         qbt.pre_existing = {_HASH}  # add() reports 409-already-present
+        qbt.statuses = [
+            DownloadStatus(
+                info_hash=_HASH,
+                name="intent-owned-existing",
+                raw_state="downloading",
+                category="plex-manager-intent-1",
+            )
+        ]
         async with sm() as session:
             with pytest.raises(RequestNotActiveError):
                 await grab_service.grab(
@@ -4194,14 +3826,10 @@ async def test_reuse_refused_after_add_cleans_up_the_orphan_torrent(
     assert row.media_request_id == old_id  # NOT repointed to the new request
 
 
-async def test_reuse_refused_after_add_leaves_a_pre_existing_torrent_in_place(
+async def test_unproven_pre_existing_torrent_is_parked_without_terminal_row_reuse(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """Finding 1 counterpart: when the post-add guard fires but the torrent was
-    already PRESENT (``created=False`` -- it predates this grab, e.g. a still-seeding
-    import whose data may back a live library file), it is NOT ours to destroy. The
-    guard refuses without removing anything -- the pre-existing torrent is left
-    untouched, mirroring ``_remove_torrent_if_added``'s gate."""
+    """A transiently unavailable client status is not proven by terminal DB history."""
     h = "8" * 40
     old_id, new_id, download_id = await _seed_terminal_download(sessionmaker_, torrent_hash=h)
 
@@ -4209,7 +3837,7 @@ async def test_reuse_refused_after_add_leaves_a_pre_existing_torrent_in_place(
     queue_service.register_removal_in_flight(download_id)
     try:
         async with sessionmaker_() as session:
-            with pytest.raises(TorrentRemovalInFlightError):
+            with pytest.raises(AlreadyDownloadingError):
                 await grab_service.grab(
                     qbt,
                     session,

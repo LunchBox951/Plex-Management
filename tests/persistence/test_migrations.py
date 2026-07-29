@@ -514,6 +514,7 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
         }
         assert scope_columns["tmdb_id"]["nullable"] is False
         assert scope_columns["media_type"]["nullable"] is False
+        assert scope_columns["active_scope_key"]["nullable"] is True
         assert inspector.get_indexes("download_add_intent_scopes") == [
             {
                 "name": "ix_download_add_intent_scopes_intent_id",
@@ -528,7 +529,11 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
         }
         assert unique_constraints == {
             "uq_download_add_intent_scopes_intent_scope": ["intent_id", "scope_key"],
-            "uq_download_add_intent_scopes_title_scope": ["tmdb_id", "media_type", "scope_key"],
+            "uq_download_add_intent_scopes_active_title_scope": [
+                "tmdb_id",
+                "media_type",
+                "active_scope_key",
+            ],
         }
         foreign_keys = {
             foreign_key["constrained_columns"][0]: foreign_key.get("options", {}).get("ondelete")
@@ -556,8 +561,9 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
             conn.execute(
                 text(
                     "INSERT INTO download_add_intent_scopes "
-                    "(intent_id, media_request_id, tmdb_id, media_type, scope_key) "
-                    "VALUES (1, 1, 42, 'movie', 'movie')"
+                    "(intent_id, media_request_id, tmdb_id, media_type, scope_key, "
+                    "active_scope_key) "
+                    "VALUES (1, 1, 42, 'movie', 'movie', 'movie')"
                 )
             )
             with pytest.raises(IntegrityError):
@@ -571,8 +577,8 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
                 conn.execute(
                     text(
                         "INSERT INTO download_add_intent_scopes "
-                        "(intent_id, tmdb_id, media_type, scope_key) "
-                        "VALUES (2, NULL, NULL, 'movie')"
+                        "(intent_id, tmdb_id, media_type, scope_key, active_scope_key) "
+                        "VALUES (2, NULL, NULL, 'movie', 'movie')"
                     )
                 )
             conn.execute(text("DELETE FROM download_add_intents WHERE id = 1"))
@@ -599,6 +605,67 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
             )
     finally:
         engine.dispose()
+
+
+def test_parked_intent_scope_migration_downgrade_deletes_duplicate_parked_rows(
+    tmp_path: Path,
+) -> None:
+    """Downgrading removes parked incidents before restoring their old unique domain."""
+    db_path = tmp_path / "parked-intent-downgrade.db"
+    assert _alembic(db_path, "upgrade", "5f2d9a8c4b71").returncode == 0
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO media_requests (id, tmdb_id, media_type, title, status) "
+            "VALUES (1, 1, 'movie', 'Movie', 'pending'), "
+            "(2, 2, 'movie', 'Other Movie', 'pending')"
+        )
+        for intent_id, state, tmdb_id in ((1, "needs_attention", 1), (2, "prepared", 2)):
+            con.execute(
+                "INSERT INTO download_add_intents "
+                "(id, torrent_hash, state, media_request_id, tmdb_id, media_type, save_path) "
+                "VALUES (?, ?, ?, ?, ?, 'movie', '')",
+                (intent_id, str(intent_id) * 40, state, tmdb_id, tmdb_id),
+            )
+            con.execute(
+                "INSERT INTO download_add_intent_scopes "
+                "(intent_id, media_request_id, tmdb_id, media_type, scope_key, is_target) "
+                "VALUES (?, ?, ?, 'movie', 'movie', 1)",
+                (intent_id, tmdb_id, tmdb_id),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    assert _alembic(db_path, "upgrade", "c7967dc972e4").returncode == 0
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO download_add_intents "
+            "(id, torrent_hash, state, media_request_id, tmdb_id, media_type, save_path) "
+            "VALUES (3, ?, 'needs_attention', 1, 1, 'movie', '')",
+            ("3" * 40,),
+        )
+        con.execute(
+            "INSERT INTO download_add_intent_scopes "
+            "(intent_id, media_request_id, tmdb_id, media_type, scope_key, "
+            "active_scope_key, is_target) "
+            "VALUES (3, 1, 1, 'movie', 'movie', NULL, 1)"
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert _alembic(db_path, "downgrade", "5f2d9a8c4b71").returncode == 0
+
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute("SELECT id, state FROM download_add_intents").fetchall() == [
+            (2, "prepared")
+        ]
+        assert con.execute("SELECT intent_id FROM download_add_intent_scopes").fetchall() == [(2,)]
+    finally:
+        con.close()
 
 
 def test_release_title_migration_backfills_from_download_history(

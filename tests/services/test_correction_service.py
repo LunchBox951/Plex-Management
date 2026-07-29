@@ -48,7 +48,7 @@ from plex_manager.models import (
     SeasonRequest,
     User,
 )
-from plex_manager.ports.download_client import AddResult, DownloadStatus
+from plex_manager.ports.download_client import AddResult, DownloadStatus, PreparedAdd
 from plex_manager.ports.metadata import MovieMetadata
 from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
@@ -132,12 +132,9 @@ class _DeletePartiallyFailsFileSystem(LocalFileSystem):
 
 
 class _AddFailsQbittorrent(FakeQbittorrent):
-    """A :class:`FakeQbittorrent` whose ``add`` raises ``QbittorrentError`` -- models the
-    download client being unreachable/erroring when the inline report-issue RE-GRAB
-    hands it the replacement release. ``remove`` is inherited (the culprit torrent
-    removal earlier in the verb still succeeds)."""
+    """A client that fails while the inline correction re-grab submits its release."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
         raise QbittorrentError("qBittorrent is unreachable")
 
 
@@ -147,14 +144,10 @@ class _RecoverFailsQbittorrent(FakeQbittorrent):
 
 
 class _EmptyHashQbittorrent(FakeQbittorrent):
-    """A :class:`FakeQbittorrent` whose ``add`` ACCEPTS the torrent but returns no
-    derivable info-hash -- models the real client accepting an opaque source from which
-    no info-hash can be derived (and the indexer supplied none), the exact condition
-    ``grab_service`` surfaces as ``GrabError`` (a LIVE, untracked torrent now exists).
-    ``remove`` is inherited (the culprit torrent removal earlier still succeeds)."""
+    """A client that accepts an opaque source but cannot return its info-hash."""
 
-    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
-        self.added.append((magnet_or_url, save_path, category))
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        self.added.append((prepared.submission_url or "", save_path, category))
         return AddResult(torrent_hash="", created=True)
 
 

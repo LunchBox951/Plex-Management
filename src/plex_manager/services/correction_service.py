@@ -274,6 +274,7 @@ _GRAB_OPERATIONAL_ERRORS: Final = (grab_service.GrabError,)
 # releases exist; the grab was refused for a scope reason, not exhaustion).
 _GRAB_SCOPE_REFUSALS: Final = (
     grab_service.AlreadyDownloadingError,
+    grab_service.ClientHashOwnershipUnprovenError,
     grab_service.RequestNotActiveError,
     grab_service.SeasonRequiredError,
     grab_service.TorrentRemovalInFlightError,
@@ -1658,10 +1659,10 @@ async def cancel_request_with_outcome(
                     extra={"torrent_hash": torrent_hash, "request_id": safe_int(request_id)},
                 )
             if intents:
-                from plex_manager.services.download_add_intent_service import recover_all
+                from plex_manager.services.download_add_intent_service import recover_for_request
 
                 try:
-                    await recover_all(qbt, session)
+                    await recover_for_request(qbt, session, request_id=request_id)
                 except QbittorrentError as exc:
                     # The durable operator-relevant state is the ``cancel_requested``
                     # intent itself: reconciliation keeps retrying it until client

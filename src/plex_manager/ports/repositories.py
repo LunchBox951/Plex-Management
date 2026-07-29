@@ -754,6 +754,10 @@ class DownloadAddIntentRepository(Protocol):
     async def create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord:
         raise NotImplementedError
 
+    async def try_create(self, command: CreateDownloadAddIntent) -> DownloadAddIntentRecord | None:
+        """Create an intent only when its hash and scopes are currently unowned."""
+        raise NotImplementedError
+
     async def get(self, intent_id: int, *, fresh: bool = False) -> DownloadAddIntentRecord | None:
         raise NotImplementedError
 
@@ -764,6 +768,12 @@ class DownloadAddIntentRepository(Protocol):
         raise NotImplementedError
 
     async def list_for_request(self, request_id: int) -> list[DownloadAddIntentRecord]:
+        raise NotImplementedError
+
+    async def has_active_scope(
+        self, *, tmdb_id: int, media_type: str, scope_keys: Sequence[str]
+    ) -> bool:
+        """Whether an unfinished durable intent owns any physical scope."""
         raise NotImplementedError
 
     async def mark_state(

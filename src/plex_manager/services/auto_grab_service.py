@@ -95,6 +95,7 @@ from plex_manager.services import (
 )
 from plex_manager.services.grab_service import (
     AlreadyDownloadingError,
+    ClientHashOwnershipUnprovenError,
     GrabError,
     NoGrabSourceError,
     RequestNotActiveError,
@@ -755,6 +756,7 @@ async def _attempt_episode_fallback(
             return _EpisodeFallbackOutcome(settled=True, grabbed=True, searched=True)
         except (
             AlreadyDownloadingError,
+            ClientHashOwnershipUnprovenError,
             RequestNotActiveError,
             SeasonRequiredError,
             TorrentRemovalInFlightError,
@@ -1218,8 +1220,22 @@ async def run_grab_cycle(
                 park_scope = False
                 cooldowns.pop(scope_key, None)  # grabbed: the pipeline recovered -- clear cooldown
                 break
+            except AlreadyDownloadingError as exc:
+                # A durable pre-add intent owns this same physical scope, or a
+                # committed download won the parallel-grab race. Both are the
+                # active disposition: report it exactly once rather than silently
+                # dropping an accepted scope until the next cycle.
+                await session.rollback()
+                skipped_active += 1
+                park_scope = False
+                cooldowns.pop(scope_key, None)
+                _logger.warning(
+                    "auto-grab: active scope refused (%s)",
+                    type(exc).__name__,
+                    extra={"request_id": scope.request_id},
+                )
+                break
             except (
-                AlreadyDownloadingError,
                 RequestNotActiveError,
                 SeasonRequiredError,
                 TorrentRemovalInFlightError,

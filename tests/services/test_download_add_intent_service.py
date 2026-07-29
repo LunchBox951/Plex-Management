@@ -30,6 +30,7 @@ from plex_manager.ports.download_client import (
 )
 from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
+from plex_manager.services import request_service
 from plex_manager.services.correction_service import cancel_request_with_outcome
 from plex_manager.services.download_add_intent_service import (
     intent_category,
@@ -372,7 +373,7 @@ async def test_submit_lost_attention_cas_does_not_report_a_mutation(
     assert not result.changed
 
 
-async def test_recovery_does_not_delete_intent_for_terminal_same_hash_download(
+async def test_recovery_resurrects_terminal_same_hash_download_when_client_owned(
     session: AsyncSession,
 ) -> None:
     request = MediaRequest(
@@ -420,16 +421,14 @@ async def test_recovery_does_not_delete_intent_for_terminal_same_hash_download(
         session,
     )
 
-    assert result.needs_attention == 1
+    assert result.finalized == 1
     terminal_after = await session.get(Download, terminal_id)
     assert terminal_after is not None
-    assert terminal_after.status == "failed"
+    assert terminal_after.status == "downloading"
     request_after = await session.get(MediaRequest, request_id)
     assert request_after is not None
-    assert request_after.status == RequestStatus.pending
-    remaining = await SqlDownloadAddIntentRepository(session).get(intent.id)
-    assert remaining is not None
-    assert remaining.state == "needs_attention"
+    assert request_after.status == RequestStatus.downloading
+    assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
 async def test_recovery_never_reowns_same_hash_foreign_download(session: AsyncSession) -> None:
@@ -995,6 +994,129 @@ async def test_source_error_parks_intent_and_recovers_later_intents(session: Asy
     assert first_after is not None
     assert first_after.state == "needs_attention"
     assert await SqlDownloadAddIntentRepository(session).get(second.id) is None
+
+
+async def test_stale_premise_parks_and_recovers_later_intents(session: AsyncSession) -> None:
+    first_request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="First", status=RequestStatus.pending
+    )
+    second_request = MediaRequest(
+        tmdb_id=2, media_type=MediaType.movie, title="Second", status=RequestStatus.pending
+    )
+    session.add_all((first_request, second_request))
+    await session.flush()
+    intents = SqlDownloadAddIntentRepository(session)
+    stale = await intents.create(
+        CreateDownloadAddIntent(
+            torrent_hash="stale",
+            media_request_id=first_request.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    later = await intents.create(
+        CreateDownloadAddIntent(
+            torrent_hash="later",
+            media_request_id=second_request.id,
+            tmdb_id=2,
+            media_type="movie",
+            save_path="",
+            observed_request_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=2, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    await session.commit()
+    assert (
+        await request_service.mark_no_acceptable_release(
+            session, first_request.id, require_no_active_download_or_intent=True
+        )
+        is False
+    )
+    await request_service.mark_no_acceptable_release(session, first_request.id)
+    await session.commit()
+
+    result = await recover_all(
+        _Client(
+            {
+                "stale": DownloadStatus(
+                    info_hash="stale",
+                    name="stale",
+                    raw_state="downloading",
+                    category=intent_category(stale.id),
+                ),
+                "later": DownloadStatus(
+                    info_hash="later",
+                    name="later",
+                    raw_state="downloading",
+                    category=intent_category(later.id),
+                ),
+            }
+        ),
+        session,
+    )
+
+    assert result == type(result)(finalized=1, needs_attention=1)
+    stale_after = await intents.get(stale.id, fresh=True)
+    assert stale_after is not None
+    assert stale_after.state == "needs_attention"
+    assert stale_after.last_error == "intent_premise_no_longer_active"
+    assert await intents.get(later.id, fresh=True) is None
+
+
+async def test_cancel_recovers_only_cancelled_request_intents(session: AsyncSession) -> None:
+    cancelled = MediaRequest(
+        tmdb_id=1, media_type=MediaType.movie, title="Cancelled", status=RequestStatus.pending
+    )
+    unrelated = MediaRequest(
+        tmdb_id=2, media_type=MediaType.movie, title="Unrelated", status=RequestStatus.pending
+    )
+    session.add_all((cancelled, unrelated))
+    await session.flush()
+    intents = SqlDownloadAddIntentRepository(session)
+    target = await intents.create(
+        CreateDownloadAddIntent(
+            torrent_hash="target",
+            media_request_id=cancelled.id,
+            tmdb_id=1,
+            media_type="movie",
+            save_path="",
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=1, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    other = await intents.create(
+        CreateDownloadAddIntent(
+            torrent_hash="other",
+            source="magnet:other",
+            media_request_id=unrelated.id,
+            tmdb_id=2,
+            media_type="movie",
+            save_path="",
+            scopes=(
+                DownloadAddIntentScopeCreate(tmdb_id=2, media_type="movie", scope_key="movie"),
+            ),
+        )
+    )
+    await session.commit()
+
+    outcome = await cancel_request_with_outcome(
+        session, cast(DownloadClientPort, _FailingPrepareClient({})), request_id=cancelled.id
+    )
+
+    assert outcome.record.status == RequestStatus.cancelled.value
+    assert not outcome.cleanup_deferred
+    assert await intents.get(target.id, fresh=True) is None
+    unrelated_after = await intents.get(other.id, fresh=True)
+    assert unrelated_after is not None
+    assert unrelated_after.state == "prepared"
 
 
 async def test_cancelled_intent_removes_only_owned_category(session: AsyncSession) -> None:

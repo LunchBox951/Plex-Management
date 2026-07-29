@@ -791,11 +791,15 @@ class DownloadAddIntentScope(Base):
         sa.UniqueConstraint(
             "intent_id", "scope_key", name="uq_download_add_intent_scopes_intent_scope"
         ),
+        # Only prepared/cancel-requested intents own a physical scope. Parking
+        # ``needs_attention`` clears ``active_scope_key`` while preserving
+        # ``scope_key`` as the durable correction record, so a parked incident
+        # never wedges a legitimate retry.
         sa.UniqueConstraint(
             "tmdb_id",
             "media_type",
-            "scope_key",
-            name="uq_download_add_intent_scopes_title_scope",
+            "active_scope_key",
+            name="uq_download_add_intent_scopes_active_title_scope",
         ),
         Index("ix_download_add_intent_scopes_intent_id", "intent_id"),
     )
@@ -810,6 +814,11 @@ class DownloadAddIntentScope(Base):
     tmdb_id: Mapped[int] = mapped_column()
     media_type: Mapped[str] = mapped_column(String)
     scope_key: Mapped[str] = mapped_column(String)
+    # ``NULL`` releases the uniqueness claim without erasing scope identity from
+    # a needs-attention record. SQLite and Postgres both permit multiple NULLs in
+    # a unique constraint, while a prepared/cancel-requested claim mirrors
+    # ``scope_key`` exactly.
+    active_scope_key: Mapped[str | None] = mapped_column(String)
     season_number: Mapped[int | None] = mapped_column()
     episodes_json: Mapped[list[Any] | None] = mapped_column(sa.JSON)
     is_target: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
