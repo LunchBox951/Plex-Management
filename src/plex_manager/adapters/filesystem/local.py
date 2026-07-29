@@ -178,8 +178,16 @@ def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, 
     try:
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             raise FileExistsError(display)
-    except BaseException:
-        os.close(lock_fd)
+    except BaseException as original_error:
+        try:
+            if created:
+                _unlink_created_publish_lock_if_unowned(dir_fd, lock_name, lock_fd)
+        except BaseException as cleanup_error:
+            # Keep metadata validation's failure primary while preserving cleanup's
+            # evidence that the just-created entry may remain on disk.
+            raise original_error from cleanup_error
+        finally:
+            os.close(lock_fd)
         raise
     return lock_fd, created
 
@@ -212,6 +220,20 @@ def _lock_fd_owns_name(dir_fd: int, lock_name: str, lock_fd: int) -> bool:
         and stat.S_ISREG(current.st_mode)
         and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
     )
+
+
+def _unlink_created_publish_lock_if_unowned(dir_fd: int, lock_name: str, lock_fd: int) -> None:
+    """Remove a failed creator's entry only after proving no owner holds its flock."""
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # The descriptor may name an active contender's inode; identity alone cannot
+        # distinguish it from this creator's abandoned entry.
+        return
+    if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+        # The entry can disappear after the identity check, leaving no stranded lock.
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(lock_name, dir_fd=dir_fd)
 
 
 def _write_lock_pid(lock_fd: int) -> None:
@@ -247,16 +269,21 @@ def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
         if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
             raise FileExistsError(display)
         return lock_fd
-    except BaseException:
+    except BaseException as original_error:
         if claimed:
             _release_publish_lock(dir_fd, lock_name, lock_fd)
         else:
-            # A created entry can fail before ``claimed`` only when flock itself
-            # fails. Preserve existing or replacement entries in every other case.
-            if created and _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
-                with contextlib.suppress(OSError):
-                    os.unlink(lock_name, dir_fd=dir_fd)
-            os.close(lock_fd)
+            # Failure before ``claimed`` can happen at flock or either ownership
+            # check. A created entry is removable only after no owner holds it.
+            try:
+                if created:
+                    _unlink_created_publish_lock_if_unowned(dir_fd, lock_name, lock_fd)
+            except BaseException as cleanup_error:
+                # The acquisition failure remains primary; chain cleanup's evidence
+                # that its entry may still block future claimants.
+                raise original_error from cleanup_error
+            finally:
+                os.close(lock_fd)
         raise
 
 
@@ -268,8 +295,7 @@ def _release_publish_lock(dir_fd: int, lock_name: str, lock_fd: int) -> None:
     """
     try:
         if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
-            with contextlib.suppress(OSError):
-                os.unlink(lock_name, dir_fd=dir_fd)
+            os.unlink(lock_name, dir_fd=dir_fd)
     finally:
         # Closing is the ownership handoff: it releases flock without an
         # unlocked-but-still-open interval in this process.

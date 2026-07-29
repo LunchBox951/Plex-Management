@@ -439,6 +439,62 @@ def test_publish_lock_surfaces_unsupported_advisory_locking(
     assert not dst.exists()
 
 
+def test_open_publish_lock_fstat_failure_removes_created_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A creation-time metadata failure must not strand an empty lock entry."""
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_name = ".dst.mkv.publish.lock"
+    real_fstat = os.fstat
+    failed = False
+
+    def _fail_created_lock_fstat(fd: int) -> os.stat_result:
+        nonlocal failed
+        info = real_fstat(fd)
+        if not failed and stat.S_ISREG(info.st_mode) and info.st_size == 0:
+            failed = True
+            raise OSError(errno.EIO, "simulated fstat failure")
+        return info
+
+    monkeypatch.setattr(os, "fstat", _fail_created_lock_fstat)
+    try:
+        with pytest.raises(OSError, match="simulated fstat failure"):
+            local_fs._open_publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, lock_name, os.fspath(tmp_path / "dst.mkv")
+            )
+    finally:
+        os.close(dir_fd)
+
+    assert not (tmp_path / lock_name).exists()
+
+
+def test_release_publish_lock_surfaces_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Release must report a lock that it could not remove, rather than claiming success."""
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_name = ".dst.mkv.publish.lock"
+    lock_fd = local_fs._acquire_publish_lock(  # pyright: ignore[reportPrivateUsage]
+        dir_fd, lock_name, os.fspath(tmp_path / "dst.mkv")
+    )
+
+    def _fail_canonical_lock_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if path == lock_name:
+            raise OSError(errno.EIO, "simulated unlink failure")
+
+    monkeypatch.setattr(os, "unlink", _fail_canonical_lock_unlink)
+    try:
+        with pytest.raises(OSError, match="simulated unlink failure"):
+            local_fs._release_publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, lock_name, lock_fd
+            )
+    finally:
+        os.close(dir_fd)
+
+    # The failed unlink intentionally leaves the PID-bearing lock visible for recovery.
+    assert (tmp_path / lock_name).read_text() == str(os.getpid())
+
+
 def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     """A crash between creating the lock and writing its pid leaves a zero-byte
     lock. Once it is older than the threshold it must be reclaimed, not block the
@@ -524,6 +580,14 @@ def test_publish_lock_fences_creator_suspended_after_empty_create(
             "contender-entered",
             "creator-fenced",
         ]
+        assert lock.exists()  # the fenced creator must not unlink B's active lock
+        with (
+            pytest.raises(FileExistsError),
+            local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", os.fspath(tmp_path / "dst.mkv")
+            ),
+        ):
+            pytest.fail("third claimant entered while contender held the lock")
     finally:
         resume_creator.set()
         release_contender.set()
