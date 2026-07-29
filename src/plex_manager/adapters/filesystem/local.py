@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import os
 import shutil
@@ -161,99 +162,118 @@ def _pid_is_running(pid: int) -> bool | None:
 _EMPTY_LOCK_STALE_SECONDS = 60.0
 
 
-def _lock_is_expired(dir_fd: int, lock_name: str) -> bool:
-    """Whether an empty/unparseable lock is old enough (by mtime) to reclaim."""
+def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool]:
+    """Open the canonical regular lock entry without following it."""
+    flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        mtime = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False).st_mtime
-    except OSError:
-        return False
-    return time.time() - mtime > _EMPTY_LOCK_STALE_SECONDS
+        lock_fd = os.open(lock_name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+        created = True
+    except FileExistsError:
+        try:
+            lock_fd = os.open(lock_name, flags, dir_fd=dir_fd)
+        except OSError:
+            raise FileExistsError(display) from None
+        created = False
 
-
-def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
-    """Return the identity of a lock safe to reclaim, otherwise ``None``.
-
-    A parseable positive PID is authoritative only when it can be probed: the lock is
-    stale iff that process is gone. Invalid/unprobeable PIDs are indeterminate and left
-    untouched. An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
-    creates the lock file and writes its pid in two separate steps, so a crash in between
-    leaves a zero-byte lock ``int('')`` can never parse. Rather than block the destination
-    FOREVER (a terminal-only dead end -- violates north-star #1), reclaim such a lock once
-    it is older than a short threshold; a younger empty lock is presumed to be a concurrent
-    creator mid-write and is left untouched.
-
-    The returned identity belongs to the descriptor that was read. Reclaim verifies that
-    identity again before unlinking, but POSIX offers no conditional unlink: a replacement
-    can still land between that verification and unlink, so any uncertainty refuses.
-
-    A non-regular entry is never a lock this module created (``_publish_lock`` only
-    creates regular files), so inspection refuses it; ``O_NONBLOCK`` keeps a planted
-    writer-less FIFO from wedging the open.
-    """
     try:
-        lock_fd = os.open(
-            lock_name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=dir_fd,
-        )
-    except OSError:
-        return None
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise FileExistsError(display)
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    return lock_fd, created
+
+
+def _existing_lock_is_reclaimable(lock_fd: int) -> bool:
+    """Whether the held descriptor contains a legacy lock proven safe to recover."""
     try:
         lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode):
-            return None
-        lock_identity = (lock_info.st_dev, lock_info.st_ino)
-        raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
+        raw = os.pread(lock_fd, 64, 0).decode("utf-8", errors="replace").strip()
     except OSError:
-        return None
-    finally:
-        os.close(lock_fd)
+        return False
     if not raw:
-        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+        return time.time() - lock_info.st_mtime > _EMPTY_LOCK_STALE_SECONDS
     try:
         pid = int(raw)
     except ValueError:
-        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
-    running = _pid_is_running(pid)
-    return lock_identity if running is False else None
+        return time.time() - lock_info.st_mtime > _EMPTY_LOCK_STALE_SECONDS
+    return _pid_is_running(pid) is False
 
 
-def _reclaim_lock_if_unchanged(
-    dir_fd: int, lock_name: str, expected_identity: PublishedFileIdentity
-) -> bool:
-    """Unlink the lock only when its currently opened inode is the inspected stale one.
+def _lock_fd_owns_name(dir_fd: int, lock_name: str, lock_fd: int) -> bool:
+    """Whether the held regular descriptor is still the canonical lock entry."""
+    try:
+        held = os.fstat(lock_fd)
+        current = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(held.st_mode)
+        and stat.S_ISREG(current.st_mode)
+        and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+    )
 
-    The ``S_ISREG`` re-check runs on the freshly opened descriptor because
-    unlink-then-``mkfifo`` can reuse the inode number: identity alone cannot prove the
-    entry is still the regular file that was inspected, and ``O_NONBLOCK`` keeps such a
-    FIFO from blocking the open.
+
+def _write_lock_pid(lock_fd: int) -> None:
+    """Publish this process's PID to the held lock descriptor."""
+    payload = str(os.getpid()).encode("ascii")
+    os.ftruncate(lock_fd, 0)
+    os.lseek(lock_fd, 0, os.SEEK_SET)
+    written = 0
+    while written < len(payload):
+        count = os.write(lock_fd, payload[written:])
+        if count == 0:
+            raise OSError(errno.EIO, "publish lock PID write made no progress")
+        written += count
+
+
+def _acquire_publish_lock(dir_fd: int, lock_name: str, display: str) -> int:
+    """Claim the canonical lock inode, preserving conservative legacy semantics."""
+    lock_fd, created = _open_publish_lock(dir_fd, lock_name, display)
+    claimed = False
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise FileExistsError(display) from None
+
+        if not created and not _existing_lock_is_reclaimable(lock_fd):
+            raise FileExistsError(display)
+        if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+            raise FileExistsError(display)
+        claimed = True
+
+        _write_lock_pid(lock_fd)
+        if not _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+            raise FileExistsError(display)
+        return lock_fd
+    except BaseException:
+        if claimed:
+            _release_publish_lock(dir_fd, lock_name, lock_fd)
+        else:
+            # A created entry can fail before ``claimed`` only when flock itself
+            # fails. Preserve existing or replacement entries in every other case.
+            if created and _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+                with contextlib.suppress(OSError):
+                    os.unlink(lock_name, dir_fd=dir_fd)
+            os.close(lock_fd)
+        raise
+
+
+def _release_publish_lock(dir_fd: int, lock_name: str, lock_fd: int) -> None:
+    """Release a claimed lock without intentionally removing a replacement.
+
+    POSIX cannot make the final identity check and unlink conditional against a
+    non-cooperating pathname mutator; the held flock fences cooperating claimants.
     """
     try:
-        lock_fd = os.open(
-            lock_name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=dir_fd,
-        )
-    except OSError:
-        return False
-    try:
-        lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode):
-            return False
-        if (lock_info.st_dev, lock_info.st_ino) != expected_identity:
-            return False
-    except OSError:
-        return False
+        if _lock_fd_owns_name(dir_fd, lock_name, lock_fd):
+            with contextlib.suppress(OSError):
+                os.unlink(lock_name, dir_fd=dir_fd)
     finally:
+        # Closing is the ownership handoff: it releases flock without an
+        # unlocked-but-still-open interval in this process.
         os.close(lock_fd)
-    # This remains a check-then-unlink race because POSIX has no conditional unlink:
-    # a replacement can land after the identity check and before unlink. The identity
-    # re-check narrows this to the same residual window documented for entry deletion.
-    try:
-        os.unlink(lock_name, dir_fd=dir_fd)
-    except OSError:
-        return False
-    return True
 
 
 def _entry_exists(dir_fd: int, name: str) -> bool:
@@ -281,37 +301,19 @@ def _publish_lock(
 ) -> Generator[None, None, None]:
     """Serialize publication or rollback of ``name`` relative to ``dir_fd``.
 
-    Publication refuses a contended lock when the destination exists: the existing
-    entry may belong to the lock holder. Rollback already has the publication's
-    identity token, so it can reclaim a proven-stale lock even when that entry exists.
-    A live or indeterminate lock is always left untouched.
+    The held flock is authoritative ownership of the exact regular lock inode.
+    Legacy PID and empty-file state remains a conservative compatibility gate for
+    pre-existing lock artifacts. Rollback may inspect/reclaim with an existing
+    destination; ordinary publication still refuses that destination immediately.
     """
     lock_name = f".{name}.publish.lock"
-    while True:
-        try:
-            lock_fd = os.open(
-                lock_name,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o600,
-                dir_fd=dir_fd,
-            )
-        except FileExistsError:
-            if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
-                raise FileExistsError(display) from None
-            stale_lock_identity = _lock_is_stale(dir_fd, lock_name)
-            if stale_lock_identity is not None and _reclaim_lock_if_unchanged(
-                dir_fd, lock_name, stale_lock_identity
-            ):
-                continue
-            raise
-        break
+    if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
+        raise FileExistsError(display)
+    lock_fd = _acquire_publish_lock(dir_fd, lock_name, display)
     try:
-        os.write(lock_fd, str(os.getpid()).encode("ascii"))
         yield
     finally:
-        os.close(lock_fd)
-        with contextlib.suppress(OSError):
-            os.unlink(lock_name, dir_fd=dir_fd)
+        _release_publish_lock(dir_fd, lock_name, lock_fd)
 
 
 def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: str) -> None:

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import os
+import queue
 import shutil
 import signal
 import stat
+import threading
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -417,6 +420,25 @@ def test_cross_device_copy_recovers_stale_publish_lock(
     assert not lock.exists()
 
 
+def test_publish_lock_surfaces_unsupported_advisory_locking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = tmp_path / "dst.mkv"
+
+    def _unsupported_flock(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOTSUP, "advisory locking unsupported")
+
+    monkeypatch.setattr(fcntl, "flock", _unsupported_flock)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == errno.ENOTSUP
+    assert not dst.exists()
+
+
 def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     """A crash between creating the lock and writing its pid leaves a zero-byte
     lock. Once it is older than the threshold it must be reclaimed, not block the
@@ -432,6 +454,103 @@ def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_publish_lock_fences_creator_suspended_after_empty_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A creator that loses its empty lock may not resume into the critical section."""
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    lock_name = ".dst.mkv.publish.lock"
+    creator_opened = threading.Event()
+    resume_creator = threading.Event()
+    contender_inside = threading.Event()
+    release_contender = threading.Event()
+    outcomes: queue.Queue[str] = queue.Queue()
+    real_open = os.open
+
+    def _pause_creator_after_create(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if (
+            threading.current_thread().name == "empty-lock-creator"
+            and path == lock_name
+            and flags & os.O_EXCL
+        ):
+            creator_opened.set()
+            assert resume_creator.wait(2.0)
+        return fd
+
+    def _creator() -> None:
+        try:
+            with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+                dir_fd, "dst.mkv", os.fspath(tmp_path / "dst.mkv")
+            ):
+                outcomes.put("creator-entered")
+        except FileExistsError:
+            outcomes.put("creator-fenced")
+
+    def _contender() -> None:
+        with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd, "dst.mkv", os.fspath(tmp_path / "dst.mkv")
+        ):
+            outcomes.put("contender-entered")
+            contender_inside.set()
+            assert release_contender.wait(2.0)
+
+    monkeypatch.setattr(os, "open", _pause_creator_after_create)
+    creator = threading.Thread(target=_creator, name="empty-lock-creator")
+    contender = threading.Thread(target=_contender, name="empty-lock-contender")
+    try:
+        creator.start()
+        assert creator_opened.wait(2.0)
+        lock = tmp_path / lock_name
+        expired = time.time() - _EMPTY_LOCK_STALE_SECONDS - 1.0
+        os.utime(lock, (expired, expired))
+
+        contender.start()
+        assert contender_inside.wait(2.0)
+        resume_creator.set()
+        creator.join(2.0)
+        assert not creator.is_alive()
+
+        assert sorted([outcomes.get_nowait(), outcomes.get_nowait()]) == [
+            "contender-entered",
+            "creator-fenced",
+        ]
+    finally:
+        resume_creator.set()
+        release_contender.set()
+        creator.join(2.0)
+        contender.join(2.0)
+        os.close(dir_fd)
+
+
+def test_publish_lock_reclaims_the_inspected_stale_inode_without_replacing_it(
+    tmp_path: Path,
+) -> None:
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    lock.write_text("999999999")
+    inspected = lock.stat()
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        with local_fs._publish_lock(  # pyright: ignore[reportPrivateUsage]
+            dir_fd, "dst.mkv", os.fspath(tmp_path / "dst.mkv")
+        ):
+            claimed = os.stat(lock.name, dir_fd=dir_fd, follow_symlinks=False)
+            assert (claimed.st_dev, claimed.st_ino) == (
+                inspected.st_dev,
+                inspected.st_ino,
+            )
+    finally:
+        os.close(dir_fd)
+
     assert not lock.exists()
 
 
@@ -2563,14 +2682,15 @@ def test_remove_published_refuses_fifo_replacing_an_inspected_stale_lock_without
     publication = fs.hardlink_or_copy(src, dst, root=root)
     lock = dst.parent / f".{dst.name}.publish.lock"
     lock.write_text("999999999")
-    inspected = lock.stat()
+    inspect_existing = local_fs._existing_lock_is_reclaimable  # pyright: ignore[reportPrivateUsage]
 
-    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+    def _replace_after_inspection(lock_fd: int) -> bool:
+        reclaimable = inspect_existing(lock_fd)
         lock.unlink()
         os.mkfifo(lock)
-        return (inspected.st_dev, inspected.st_ino)
+        return reclaimable
 
-    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+    monkeypatch.setattr(local_fs, "_existing_lock_is_reclaimable", _replace_after_inspection)
 
     started = time.monotonic()
     with (
@@ -2687,15 +2807,46 @@ def test_remove_published_refuses_when_stale_lock_is_replaced_before_reclaim(
     publication = fs.hardlink_or_copy(src, dst, root=root)
     lock = dst.parent / f".{dst.name}.publish.lock"
     lock.write_text("999999999")
-    inspected = lock.stat()
+    inspect_existing = local_fs._existing_lock_is_reclaimable  # pyright: ignore[reportPrivateUsage]
 
-    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+    def _replace_after_inspection(lock_fd: int) -> bool:
+        reclaimable = inspect_existing(lock_fd)
         replacement = tmp_path / "replacement.lock"
         replacement.write_text(str(os.getpid()))
         os.replace(replacement, lock)
-        return (inspected.st_dev, inspected.st_ino)
+        return reclaimable
 
-    monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
+    monkeypatch.setattr(local_fs, "_existing_lock_is_reclaimable", _replace_after_inspection)
+
+    with pytest.raises(FileExistsError):
+        fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert dst.exists()
+    assert lock.read_text() == str(os.getpid())
+
+
+def test_remove_published_refuses_when_lock_is_replaced_after_pid_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimant that loses its name while publishing its PID must not yield."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    write_pid = local_fs._write_lock_pid  # pyright: ignore[reportPrivateUsage]
+
+    def _replace_after_pid(lock_fd: int) -> None:
+        write_pid(lock_fd)
+        replacement = tmp_path / "replacement.lock"
+        replacement.write_text(str(os.getpid()))
+        os.replace(replacement, lock)
+
+    monkeypatch.setattr(local_fs, "_write_lock_pid", _replace_after_pid)
 
     with pytest.raises(FileExistsError):
         fs.remove_published(dst, root=root, identity=publication.identity)
