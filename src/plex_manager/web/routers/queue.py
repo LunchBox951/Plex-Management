@@ -34,6 +34,7 @@ from plex_manager.services.grab_service import (
     ClientHashOwnershipUnprovenError,
     GrabError,
     NoGrabSourceError,
+    ParkedIntentHashError,
     RequestNotActiveError,
     SeasonRequiredError,
     TorrentAlreadyTrackedError,
@@ -401,9 +402,9 @@ async def grab_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="request_not_active"
         ) from exc
-    except AlreadyDownloadingError as exc:
-        # The request already has an active download for a different release;
-        # refuse the parallel grab instead of spawning a second active row.
+    except (AlreadyDownloadingError, ParkedIntentHashError) as exc:
+        # An active reservation or a parked hash blocks this exact release. Parked
+        # history is not an opaque server error; auto-grab may try lower candidates.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="already_downloading"
         ) from exc

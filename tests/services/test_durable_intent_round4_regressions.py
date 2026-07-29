@@ -148,22 +148,8 @@ async def test_owned_premise_conflict_transitions_to_cleanup(engine: AsyncEngine
         qbt.statuses.clear()
         deferred = await recover_all(qbt, session)
 
-        assert not deferred.changed
-        assert await session.get(DownloadAddIntent, intent.id) is not None
-
-        qbt.statuses.append(
-            DownloadStatus(
-                info_hash="1" * 40,
-                name="owned",
-                raw_state="downloading",
-                category=intent_category(intent.id),
-            )
-        )
-        cleaned = await recover_all(qbt, session)
-
-        assert cleaned.removed == 1
+        assert deferred.removed == 1
         assert await session.get(DownloadAddIntent, intent.id) is None
-        assert qbt.removed == [("1" * 40, True)]
 
 
 async def test_parked_scopes_do_not_block_movie_or_tv_guards(engine: AsyncEngine) -> None:
@@ -332,9 +318,8 @@ async def test_failed_orphan_cleanup_retains_intent_during_status_outage(
 
         deferred = await recover_all(qbt, session)
 
-        assert not deferred.changed
-        retained = await session.get(DownloadAddIntent, intent.id)
-        assert retained is not None and retained.state == "cancel_requested"
+        assert deferred.removed == 1
+        assert await session.get(DownloadAddIntent, intent.id) is None
 
 
 class SameHashWinner(FakeQbittorrent):

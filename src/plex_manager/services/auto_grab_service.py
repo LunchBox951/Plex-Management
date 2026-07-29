@@ -1220,6 +1220,11 @@ async def run_grab_cycle(
                 park_scope = False
                 cooldowns.pop(scope_key, None)  # grabbed: the pipeline recovered -- clear cooldown
                 break
+            except grab_service.ParkedIntentHashError:
+                # A parked intent is historic operator state whose released scope
+                # must not block a lower-ranked release for this due scope.
+                await session.rollback()
+                continue
             except AlreadyDownloadingError as exc:
                 # A durable pre-add intent owns this same physical scope, or a
                 # committed download won the parallel-grab race. Both are the

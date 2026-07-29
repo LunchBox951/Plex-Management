@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from plex_manager.adapters.qbittorrent.adapter import (
+    QbittorrentAddAmbiguousError,
+    QbittorrentAddRejectedError,
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
@@ -10,6 +12,8 @@ from plex_manager.adapters.qbittorrent.adapter import (
 )
 
 __all__ = [
+    "QbittorrentAddAmbiguousError",
+    "QbittorrentAddRejectedError",
     "QbittorrentAuthError",
     "QbittorrentClient",
     "QbittorrentError",

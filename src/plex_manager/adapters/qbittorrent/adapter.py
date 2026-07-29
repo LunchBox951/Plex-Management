@@ -161,11 +161,14 @@ class QbittorrentError(RuntimeError):
 
 
 class QbittorrentAddRejectedError(QbittorrentError):
-    """qBittorrent definitely rejected an add before creating a torrent.
+    """qBittorrent conclusively rejected an add before creating a torrent."""
 
-    Unlike a transport error, a completed non-success response proves that the
-    client did not accept the submission, so a caller may safely release a
-    pre-submission reservation and retry another release.
+
+class QbittorrentAddAmbiguousError(QbittorrentError):
+    """An add response cannot prove whether qBittorrent created the torrent.
+
+    Callers must retain their durable reservation and let recovery establish the
+    client state rather than treating this as a safe pre-mutation rejection.
     """
 
 
@@ -395,33 +398,42 @@ def _info_hash_from_magnet(magnet: str) -> str | None:
     return next(iter(unique_btmh_hashes))
 
 
-def _is_add_success(response: httpx.Response) -> bool:
-    """Normalise qBittorrent's varied ``/torrents/add`` success signals.
+def _add_response_outcome(response: httpx.Response) -> bool | None:
+    """Classify an add response as success, conclusive rejection, or ambiguous.
 
-    ``Ok.`` text, a 409 (already present), or a JSON body reporting added/pending
-    ids all count as success. Salvaged from the prototype's
-    ``_is_torrent_add_success``.
+    ``True`` is an accepted submission, ``False`` is a conclusive client-side
+    rejection, and ``None`` means the completed response cannot establish whether
+    an intermediary accepted the add before returning it.
     """
     if response.status_code == _HTTP_CONFLICT:
         return True
     if response.status_code not in (_HTTP_OK, _HTTP_NO_CONTENT):
-        return False
+        return None
     text = response.text.strip()
     if text in ("Ok.", ""):
         return True
+    if text == "Fails.":
+        return False
     if text.startswith("{"):
         try:
             data = _as_dict(response.json())
         except ValueError:
-            return False
-        if _i(data.get("success_count")) > 0:
-            return True
-        if _i(data.get("pending_count")) > 0:
+            return None
+        success_count = data.get("success_count")
+        pending_count = data.get("pending_count")
+        if _i(success_count) > 0 or _i(pending_count) > 0:
             return True
         ids = data.get("added_torrent_ids")
         if isinstance(ids, list) and ids:
             return True
-    return False
+        if (
+            isinstance(success_count, int)
+            and isinstance(pending_count, int)
+            and success_count == 0
+            and pending_count == 0
+        ):
+            return False
+    return None
 
 
 def _decode_json(response: httpx.Response, what: str) -> object:
@@ -1514,7 +1526,12 @@ class QbittorrentClient:
                 raise ValueError("prepared torrent bytes are missing")
             files = {"torrents": ("file.torrent", torrent_bytes, "application/x-bittorrent")}
         response = await self._request("POST", "/torrents/add", data=form, files=files)
-        if not _is_add_success(response):
+        outcome = _add_response_outcome(response)
+        if outcome is None:
+            raise QbittorrentAddAmbiguousError(
+                f"qBittorrent add outcome is ambiguous (HTTP {response.status_code})"
+            )
+        if not outcome:
             raise QbittorrentAddRejectedError(
                 f"qBittorrent rejected the torrent (HTTP {response.status_code})"
             )

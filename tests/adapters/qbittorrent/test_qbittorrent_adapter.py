@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from plex_manager.adapters.qbittorrent import (
+    QbittorrentAddAmbiguousError,
     QbittorrentAuthError,
     QbittorrentClient,
     QbittorrentError,
@@ -201,7 +202,20 @@ async def test_add_prepared_posts_once_and_rejects_invalid_payload_shape() -> No
         )
 
 
-async def test_add_with_directed_save_path_disables_autotmm() -> None:
+@pytest.mark.parametrize("status", [502, 504])
+async def test_add_prepared_server_error_is_ambiguous(status: int) -> None:
+    def error_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/add":
+            return httpx.Response(status, text="gateway failure")
+        return httpx.Response(404, text="unhandled")
+
+    with pytest.raises(QbittorrentAddAmbiguousError, match="ambiguous"):
+        await _client(error_handler).add_prepared(
+            PreparedAdd(torrent_hash=MAGNET_HASH, submission_url=MAGNET), "", "intent-category"
+        )
+
     """A non-empty ``save_path`` (issues #133/#157) must ALSO pin the torrent to
     manual management -- otherwise a global-AutoTMM install ignores ``savepath``
     entirely and places the torrent per its own category/auto rules."""

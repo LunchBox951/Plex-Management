@@ -36,17 +36,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # The predecessor schema cannot represent multiple parked incidents for the
-    # same physical scope. They have already released their client claim and an
-    # older build has no correction flow for them, so discard only those
-    # incompatible records before restoring its unconditional uniqueness rule.
+    # The predecessor schema cannot represent any released scope claim. Remove
+    # every NULL active key (not merely parked state): cancellation can transition
+    # a released claim to cleanup state while a replacement owns the scope.
+    op.execute("DELETE FROM download_add_intent_scopes WHERE active_scope_key IS NULL")
     op.execute(
-        "DELETE FROM download_add_intent_scopes "
-        "WHERE intent_id IN ("
-        "SELECT id FROM download_add_intents WHERE state = 'needs_attention'"
-        ")"
+        "DELETE FROM download_add_intents WHERE id NOT IN "
+        "(SELECT DISTINCT intent_id FROM download_add_intent_scopes)"
     )
-    op.execute("DELETE FROM download_add_intents WHERE state = 'needs_attention'")
     with op.batch_alter_table("download_add_intent_scopes") as batch_op:
         batch_op.drop_constraint("uq_download_add_intent_scopes_active_title_scope", type_="unique")
         batch_op.create_unique_constraint(

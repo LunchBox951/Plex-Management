@@ -607,10 +607,10 @@ def test_download_add_intent_schema_contract_and_downgrade_preserves_n_minus_one
         engine.dispose()
 
 
-def test_parked_intent_scope_migration_downgrade_deletes_duplicate_parked_rows(
+def test_parked_intent_scope_migration_downgrade_deletes_released_claim_rows(
     tmp_path: Path,
 ) -> None:
-    """Downgrading removes parked incidents before restoring their old unique domain."""
+    """Downgrading drops every released scope claim before restoring uniqueness."""
     db_path = tmp_path / "parked-intent-downgrade.db"
     assert _alembic(db_path, "upgrade", "5f2d9a8c4b71").returncode == 0
 
@@ -644,7 +644,7 @@ def test_parked_intent_scope_migration_downgrade_deletes_duplicate_parked_rows(
         con.execute(
             "INSERT INTO download_add_intents "
             "(id, torrent_hash, state, media_request_id, tmdb_id, media_type, save_path) "
-            "VALUES (3, ?, 'needs_attention', 1, 1, 'movie', '')",
+            "VALUES (3, ?, 'cancel_requested', 1, 1, 'movie', '')",
             ("3" * 40,),
         )
         con.execute(
@@ -664,6 +664,47 @@ def test_parked_intent_scope_migration_downgrade_deletes_duplicate_parked_rows(
             (2, "prepared")
         ]
         assert con.execute("SELECT intent_id FROM download_add_intent_scopes").fetchall() == [(2,)]
+    finally:
+        con.close()
+
+
+def test_synthetic_late_cleanup_downgrade_deletes_only_synthetic_rows(tmp_path: Path) -> None:
+    """Downgrading preserves real reservations while retiring unrecoverable cleanup rows."""
+    db_path = tmp_path / "synthetic-cleanup-downgrade.db"
+    assert _alembic(db_path, "upgrade", "head").returncode == 0
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO media_requests (id, tmdb_id, media_type, title, status) "
+            "VALUES (1, 1, 'movie', 'Old', 'cancelled'), "
+            "(2, 2, 'movie', 'New', 'pending')"
+        )
+        con.execute(
+            "INSERT INTO download_add_intents "
+            "(id, torrent_hash, state, media_request_id, tmdb_id, media_type, save_path) "
+            "VALUES (1, ?, 'prepared', 2, 2, 'movie', '')",
+            ("a" * 40,),
+        )
+        con.execute(
+            "INSERT INTO download_add_intents "
+            "(id, torrent_hash, state, media_request_id, tmdb_id, media_type, save_path, "
+            "owns_client_torrent, cleanup_torrent_hash, cleanup_category) "
+            "VALUES (3, ?, 'cancel_requested', 1, 1, 'movie', '', 1, ?, ?)",
+            (f"cleanup:10:{'b' * 40}", "b" * 40, "plex-manager-intent-10"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert _alembic(db_path, "downgrade", "c7967dc972e4").returncode == 0
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute("SELECT id, torrent_hash FROM download_add_intents").fetchall() == [
+            (1, "a" * 40)
+        ]
+        columns = {row[1] for row in con.execute("PRAGMA table_info(download_add_intents)")}
+        assert "cleanup_torrent_hash" not in columns
+        assert "cleanup_category" not in columns
     finally:
         con.close()
 

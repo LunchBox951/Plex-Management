@@ -1546,11 +1546,12 @@ async def cancel_request_with_outcome(
     if any(row.status == DownloadState.Importing.value for row in active):
         raise ImportInProgressError(request_id)
 
-    # A cancel with active rows or durable intents genuinely needs qBittorrent to
-    # remove owned torrents; discover both FIRST (above) so a pure-DB settle with
-    # neither still works unconfigured. Refuse before any state change rather than
-    # report success while a cancel_requested intent can keep a torrent seeding.
-    if (active or intents) and qbt is None:
+    # Only machine-active reservations can require a client operation. Parked
+    # incidents are operator history with no active claim and retire DB-only.
+    machine_intents = [
+        intent for intent in intents if intent.state in {"prepared", "cancel_requested"}
+    ]
+    if (active or machine_intents) and qbt is None:
         raise DownloadClientRequiredError(request_id)
 
     # Move every active row out of the active set (so the reconciler stops tracking it
@@ -1567,6 +1568,12 @@ async def cancel_request_with_outcome(
     cleanup_deferred = False
     try:
         for intent in intents:
+            if intent.state == "needs_attention":
+                # Parked incidents have already released their client claim and
+                # never receive automatic cleanup. Cancellation retires their
+                # historic correction record without requiring qBittorrent.
+                await intent_repo.delete(intent.id)
+                continue
             if intent.state == "cancel_requested":
                 continue
             marked = await intent_repo.mark_state(

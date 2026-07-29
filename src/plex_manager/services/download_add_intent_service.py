@@ -44,6 +44,10 @@ class IntentRecoveryConflictError(RuntimeError):
         self.reason = reason
 
 
+class ParkedIntentHashError(RuntimeError):
+    """A release hash belongs to parked operator history, not an active claim."""
+
+
 _TERMINAL_DOWNLOAD_STATES = frozenset(
     {
         DownloadState.Imported.value,
@@ -212,7 +216,8 @@ async def reserve_intent(
     a crash leaves the prepared intent for normal recovery rather than wedging a
     scope behind an in-process lock.
     """
-    intent = await SqlDownloadAddIntentRepository(session).try_create(
+    repository = SqlDownloadAddIntentRepository(session)
+    intent = await repository.try_create(
         _intent_command(
             scored=scored,
             prepared=prepared,
@@ -229,7 +234,11 @@ async def reserve_intent(
     )
     if intent is not None:
         await session.commit()
-    return intent
+        return intent
+    existing = await repository.get_by_hash(prepared.torrent_hash)
+    if existing is not None and existing.state == "needs_attention":
+        raise ParkedIntentHashError(prepared.torrent_hash)
+    return None
 
 
 async def publish_intent(
@@ -279,29 +288,33 @@ async def _finalize_present(
         return record
     if current.media_request_id is None:
         raise IntentRecoveryConflictError("intent request no longer exists")
-    existing = await downloads.get_by_hash(current.torrent_hash)
-    if existing is None:
-        record = await downloads.create(
-            torrent_hash=current.torrent_hash,
-            status=DownloadState.Downloading.value,
-            media_request_id=current.media_request_id,
-            magnet_link=current.source,
-            tmdb_id=current.tmdb_id,
-            year=current.year,
-            season=next((scope.season_number for scope in current.scopes if scope.is_target), None),
-            episodes=next(
-                (
-                    list(scope.episodes)
-                    for scope in current.scopes
-                    if scope.is_target and scope.episodes
+    converged = False
+    while True:
+        existing = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
+        if existing is None:
+            record = await downloads.create(
+                torrent_hash=current.torrent_hash,
+                status=DownloadState.Downloading.value,
+                media_request_id=current.media_request_id,
+                magnet_link=current.source,
+                tmdb_id=current.tmdb_id,
+                year=current.year,
+                season=next(
+                    (scope.season_number for scope in current.scopes if scope.is_target), None
                 ),
-                None,
-            ),
-            media_type=current.media_type,
-            release_title=current.release_title,
-            timeout_at=datetime.now(UTC),
-        )
-    else:
+                episodes=next(
+                    (
+                        list(scope.episodes)
+                        for scope in current.scopes
+                        if scope.is_target and scope.episodes
+                    ),
+                    None,
+                ),
+                media_type=current.media_type,
+                release_title=current.release_title,
+                timeout_at=datetime.now(UTC),
+            )
+            break
         if existing.status in _TERMINAL_DOWNLOAD_STATES:
             # The live client category proves this intent owns the hash, so a terminal
             # historical row is safe to resurrect exactly as a fresh grab would.
@@ -339,33 +352,31 @@ async def _finalize_present(
             )
             if not claimed:
                 await session.rollback()
-                raise IntentRecoveryConflictError("same-hash download became terminal")
+                continue
             refreshed = await downloads.get_by_hash(current.torrent_hash)
             if refreshed is None:  # pragma: no cover - the row was just updated
                 raise LookupError("same-hash download disappeared during finalization")
             record = refreshed
-        else:
-            if not await downloads.lock_if_active(existing.id):
-                await session.rollback()
-                refreshed = await downloads.get_by_hash(
-                    current.torrent_hash, populate_existing=True
-                )
-                if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
-                    raise IntentRecoveryConflictError("same-hash download became terminal")
-                raise IntentRecoveryConflictError(
-                    "same-hash download changed before scope attachment"
-                )
-            refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
-            if (
-                refreshed is None
-                or refreshed.status in _TERMINAL_DOWNLOAD_STATES
-                or refreshed.media_request_id != current.media_request_id
-                or refreshed.tmdb_id != current.tmdb_id
-                or refreshed.media_type != current.media_type
-            ):
-                await session.rollback()
-                raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
-            record = refreshed
+            break
+        # A same-request/hash convergence still needs the active-row lock before it
+        # may attach new scopes. Otherwise an import can finish after the snapshot.
+        if not await downloads.lock_if_active(existing.id):
+            await session.rollback()
+            continue
+        refreshed = await downloads.get_by_hash(current.torrent_hash, populate_existing=True)
+        if refreshed is None or refreshed.status in _TERMINAL_DOWNLOAD_STATES:
+            await session.rollback()
+            continue
+        if (
+            refreshed.media_request_id != current.media_request_id
+            or refreshed.tmdb_id != current.tmdb_id
+            or refreshed.media_type != current.media_type
+        ):
+            await session.rollback()
+            raise IntentRecoveryConflictError("same-hash download cannot be safely re-owned")
+        record = refreshed
+        converged = refreshed.media_request_id == current.media_request_id
+        break
     for scope in current.scopes:
         if scope.is_target and scope.season_number is not None:
             await downloads.ensure_scope(
@@ -411,7 +422,7 @@ async def _finalize_present(
             if not moved:
                 break
     else:
-        moved = await SqlRequestRepository(session).set_status_if_in(
+        moved = converged or await SqlRequestRepository(session).set_status_if_in(
             current.media_request_id,
             RequestStatus.downloading.value,
             frozenset({current.observed_request_status or RequestStatus.pending.value}),
@@ -439,11 +450,85 @@ async def _finalize_present(
     return refreshed if refreshed is not None else record
 
 
+def _client_hash(intent: DownloadAddIntentRecord) -> str:
+    """Return the real client hash for ordinary and synthetic cleanup intents."""
+    return intent.cleanup_torrent_hash or intent.torrent_hash
+
+
 def _owns_present_torrent(intent: DownloadAddIntentRecord, status: DownloadStatus | None) -> bool:
     """Return whether a client torrent is proven to belong to this intent."""
-    return intent.owns_client_torrent or (
-        status is not None and status.category == intent_category(intent.id)
+    if status is None:
+        return False
+    if intent.cleanup_category is not None:
+        return status.category == intent.cleanup_category
+    return intent.owns_client_torrent or status.category == intent_category(intent.id)
+
+
+def _same_intent_identity(
+    current: DownloadAddIntentRecord, original: DownloadAddIntentRecord
+) -> bool:
+    """Return whether an id re-read is still the submission's original intent."""
+    return (
+        current.torrent_hash == original.torrent_hash
+        and current.media_request_id == original.media_request_id
+        and current.tmdb_id == original.tmdb_id
+        and current.media_type == original.media_type
+        and current.source == original.source
     )
+
+
+async def create_late_cleanup(
+    session: AsyncSession, intent: DownloadAddIntentRecord
+) -> DownloadAddIntentRecord:
+    """Durably retain a cancellation sweep record for a late owned add."""
+    intents = SqlDownloadAddIntentRepository(session)
+    cleanup = await intents.try_create(
+        CreateDownloadAddIntent(
+            torrent_hash=intent.torrent_hash,
+            media_request_id=intent.media_request_id,
+            tmdb_id=intent.tmdb_id,
+            media_type=intent.media_type,
+            year=intent.year,
+            release_title=intent.release_title,
+            indexer=intent.indexer,
+            quality_name=intent.quality_name,
+            save_path=intent.save_path,
+            observed_request_status=intent.observed_request_status,
+            observed_season_status=intent.observed_season_status,
+            owns_client_torrent=True,
+        )
+    )
+    if cleanup is None:
+        # A new request now owns the real hash reservation. Retain the old add's
+        # category identity in a synthetic, claim-less cleanup row instead of ever
+        # mutating the collision owner.
+        cleanup = await intents.create(
+            CreateDownloadAddIntent(
+                torrent_hash=f"cleanup:{intent.id}:{intent.torrent_hash}",
+                media_request_id=intent.media_request_id,
+                tmdb_id=intent.tmdb_id,
+                media_type=intent.media_type,
+                year=intent.year,
+                release_title=intent.release_title,
+                indexer=intent.indexer,
+                quality_name=intent.quality_name,
+                save_path=intent.save_path,
+                observed_request_status=intent.observed_request_status,
+                observed_season_status=intent.observed_season_status,
+                owns_client_torrent=True,
+                cleanup_torrent_hash=intent.torrent_hash,
+                cleanup_category=intent_category(intent.id),
+            )
+        )
+    if cleanup.state == "prepared" and not await intents.mark_state(
+        cleanup.id, "cancel_requested", expected_state="prepared"
+    ):
+        raise IntentRecoveryConflictError("late cleanup intent changed before removal")
+    await session.commit()
+    refreshed = await intents.get(cleanup.id, fresh=True)
+    if refreshed is None:  # pragma: no cover - the cleanup row was just committed
+        raise LookupError("late cleanup intent disappeared after creation")
+    return refreshed
 
 
 async def submit_and_finalize(
@@ -461,9 +546,43 @@ async def submit_and_finalize(
         resolved = await qbt.prepare_add(intent.source)
     if resolved.torrent_hash.lower() != intent.torrent_hash:
         raise ValueError("prepared hash differs from durable intent")
+    intents = SqlDownloadAddIntentRepository(session)
+    current = await intents.get(intent.id, fresh=True)
+    if current is None or not _same_intent_identity(current, intent) or current.state != "prepared":
+        return _SubmissionFinalization(None)
     result = await qbt.add_prepared(resolved, intent.save_path, intent_category(intent.id))
+    current = await intents.get(intent.id, fresh=True)
+    if current is None or not _same_intent_identity(current, intent):
+        # The id can be reused after cancellation deletes the original row. Treat a
+        # different immutable reservation as the old intent having disappeared.
+        # Cancellation can conclusively observe absence and delete its intent while
+        # this add POST is still in flight. ``created`` is proof this submission
+        # owns the resulting torrent even without a remaining intent row. Recreate
+        # a cancellation-only intent before removal so a transport failure remains
+        # visible to the normal retry sweep instead of orphaning the torrent.
+        if result.created:
+            cleanup = await create_late_cleanup(session, intent)
+            await qbt.remove(intent.torrent_hash, delete_files=True)
+            await intents.delete(cleanup.id)
+            await session.commit()
+        else:
+            status = await qbt.get_status(intent.torrent_hash)
+            if _owns_present_torrent(intent, status):
+                await qbt.remove(intent.torrent_hash, delete_files=True)
+        return _SubmissionFinalization(None)
+    if current.state == "cancel_requested":
+        # Cancellation may win while the add request is in flight. A created result
+        # proves this intent owns the just-added torrent, so remove it immediately;
+        # if removal fails, leave cancel_requested for normal cleanup recovery.
+        if result.created:
+            await qbt.remove(intent.torrent_hash, delete_files=True)
+            await intents.delete(intent.id)
+            await session.commit()
+        return _SubmissionFinalization(None)
+    if current.state != "prepared":
+        return _SubmissionFinalization(None)
     if result.created:
-        return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
+        return _SubmissionFinalization(await _finalize_present(qbt, session, current))
     status = await qbt.get_status(intent.torrent_hash)
     if _owns_present_torrent(intent, status):
         return _SubmissionFinalization(await _finalize_present(qbt, session, intent))
@@ -533,20 +652,32 @@ async def _recover(
     intents = SqlDownloadAddIntentRepository(session)
     result = IntentRecoveryResult()
     for intent in recoverable:
-        status = await qbt.get_status(intent.torrent_hash)
+        client_hash = _client_hash(intent)
+        status = await qbt.get_status(client_hash)
         try:
             if intent.state == "cancel_requested":
-                # A missing status is an ambiguous client outage, not proof this
-                # intent-owned torrent is gone. Retain cleanup state to re-probe.
-                if status is None:
+                # Confirmed absence retires the cleanup record. A live active Download
+                # means a newer workflow has converged on this physical torrent, so
+                # retain its data and retire only the obsolete cleanup record. An
+                # owned, untracked torrent is removed; an unproven live torrent stays
+                # durable for a later probe rather than being silently forgotten.
+                active = await SqlDownloadRepository(session).get_by_hash(client_hash)
+                if status is None or (
+                    active is not None and active.status not in _TERMINAL_DOWNLOAD_STATES
+                ):
+                    await intents.delete(intent.id)
+                    await session.commit()
+                    result = IntentRecoveryResult(
+                        result.finalized, result.removed + 1, result.needs_attention
+                    )
                     continue
-                if status.category == intent_category(intent.id) or intent.owns_client_torrent:
-                    await qbt.remove(intent.torrent_hash, delete_files=True)
-                await intents.delete(intent.id)
-                await session.commit()
-                result = IntentRecoveryResult(
-                    result.finalized, result.removed + 1, result.needs_attention
-                )
+                if _owns_present_torrent(intent, status):
+                    await qbt.remove(client_hash, delete_files=True)
+                    await intents.delete(intent.id)
+                    await session.commit()
+                    result = IntentRecoveryResult(
+                        result.finalized, result.removed + 1, result.needs_attention
+                    )
                 continue
             if status is not None:
                 if not _owns_present_torrent(intent, status):

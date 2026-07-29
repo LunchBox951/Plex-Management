@@ -249,7 +249,7 @@ from plex_manager.domain.state_machine import (
     DownloadState,
     is_legal_transition,
 )
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -1323,7 +1323,7 @@ async def reconcile_and_list(
             except Exception as exc:
                 _logger.warning(
                     "download %s: deferred intent-category normalization (%s)",
-                    status.info_hash,
+                    safe_text(status.info_hash),
                     type(exc).__name__,
                 )
     now = _utcnow()
@@ -1338,8 +1338,8 @@ async def reconcile_and_list(
     for torrent_hash, raw_state in unmapped_client_states(rows, statuses):
         _logger.warning(
             "download %s: unmapped qBittorrent state %r; tracking as downloading",
-            torrent_hash,
-            raw_state,
+            safe_text(torrent_hash),
+            safe_text(raw_state),
         )
 
     # Single update path over every tracked row. A row with a transition is moved

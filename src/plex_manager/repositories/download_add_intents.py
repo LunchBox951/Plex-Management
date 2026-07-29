@@ -61,6 +61,8 @@ def _record(
         observed_request_status=row.observed_request_status,
         observed_season_status=row.observed_season_status,
         owns_client_torrent=row.owns_client_torrent,
+        cleanup_torrent_hash=row.cleanup_torrent_hash,
+        cleanup_category=row.cleanup_category,
         last_error=row.last_error,
         scopes=tuple(_scope_record(scope) for scope in scopes),
     )
@@ -133,6 +135,8 @@ class SqlDownloadAddIntentRepository:
             observed_request_status=command.observed_request_status,
             observed_season_status=command.observed_season_status,
             owns_client_torrent=command.owns_client_torrent,
+            cleanup_torrent_hash=command.cleanup_torrent_hash,
+            cleanup_category=command.cleanup_category,
         )
         try:
             async with self._session.begin_nested():
@@ -178,7 +182,10 @@ class SqlDownloadAddIntentRepository:
                 await self._session.scalars(
                     select(DownloadAddIntent)
                     .where(DownloadAddIntent.state.in_(("prepared", "cancel_requested")))
-                    .order_by(DownloadAddIntent.id)
+                    # Cleanup must run before a competing prepared reservation for the
+                    # same physical hash. A synthetic cleanup records that hash in its
+                    # identity fields, so its primary key intentionally differs.
+                    .order_by(DownloadAddIntent.state != "cancel_requested", DownloadAddIntent.id)
                 )
             ).all()
         )
@@ -209,7 +216,7 @@ class SqlDownloadAddIntentRepository:
                 .where(
                     DownloadAddIntentScope.tmdb_id == tmdb_id,
                     DownloadAddIntentScope.media_type == media_type,
-                    DownloadAddIntentScope.scope_key.in_(scope_keys),
+                    DownloadAddIntentScope.active_scope_key.in_(scope_keys),
                     DownloadAddIntent.state.in_(("prepared", "cancel_requested")),
                 )
                 .limit(1)
@@ -239,7 +246,7 @@ class SqlDownloadAddIntentRepository:
         )
         if result.rowcount != 1:
             return False
-        if state == "needs_attention":
+        if state in {"needs_attention", "cancel_requested"}:
             await self._session.execute(
                 update(DownloadAddIntentScope)
                 .where(DownloadAddIntentScope.intent_id == intent_id)

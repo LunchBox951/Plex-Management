@@ -55,6 +55,17 @@ def scored(info_hash: str) -> ScoredRelease:
     )
 
 
+class _StatusOutageQbittorrent(FakeQbittorrent):
+    def __init__(self, *, torrent_hash: str) -> None:
+        super().__init__(statuses=[], pre_existing={torrent_hash})
+        self.outage = True
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        if self.outage:
+            raise RuntimeError("status outage")
+        return await super().get_status(info_hash)
+
+
 async def test_transient_duplicate_status_can_reprobe_to_owned_intent(engine: AsyncEngine) -> None:
     torrent_hash = "f" * 40
     async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -73,9 +84,9 @@ async def test_transient_duplicate_status_can_reprobe_to_owned_intent(engine: As
             )
         )
         await session.commit()
-        qbt = FakeQbittorrent(statuses=[], pre_existing={torrent_hash})
+        qbt = _StatusOutageQbittorrent(torrent_hash=torrent_hash)
 
-        with pytest.raises(grab_service.AlreadyDownloadingError):
+        with pytest.raises(RuntimeError, match="status outage"):
             await grab_service.grab(
                 qbt, session, scored=scored(torrent_hash), request_id=request.id, tmdb_id=1
             )
@@ -83,11 +94,12 @@ async def test_transient_duplicate_status_can_reprobe_to_owned_intent(engine: As
         assert pending is not None and pending.state == "prepared"
 
         for _ in range(2):
-            deferred = await recover_all(qbt, session)
-            assert not deferred.changed
+            with pytest.raises(RuntimeError, match="status outage"):
+                await recover_all(qbt, session)
             pending = await session.scalar(select(DownloadAddIntent))
             assert pending is not None and pending.state == "prepared"
 
+        qbt.outage = False
         qbt.statuses.append(
             DownloadStatus(
                 info_hash=torrent_hash,

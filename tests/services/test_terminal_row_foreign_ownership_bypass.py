@@ -75,8 +75,9 @@ async def test_terminal_row_is_not_ownership_proof_for_foreign_duplicate(
             )
         )
         await session.commit()
-        # Duplicate add is reported, but the immediate status lookup has not yet
-        # converged. The old terminal DB row is not one of the three ownership proofs.
+        # qBittorrent's successful empty status response proves the duplicate
+        # vanished between add and probe. A terminal DB row remains no ownership
+        # proof, and the stale reservation is retired for a later retry.
         qbt = FakeQbittorrent(statuses=[], pre_existing={torrent_hash})
 
         with pytest.raises(grab_service.AlreadyDownloadingError):
@@ -85,6 +86,6 @@ async def test_terminal_row_is_not_ownership_proof_for_foreign_duplicate(
             )
 
         intent = await session.scalar(select(DownloadAddIntent))
-        assert intent is not None and intent.state == "prepared"
+        assert intent is None
         assert qbt.categories == []
         assert qbt.removed == []

@@ -24,7 +24,10 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
-from plex_manager.adapters.qbittorrent.adapter import QbittorrentAddRejectedError
+from plex_manager.adapters.qbittorrent.adapter import (
+    QbittorrentAddAmbiguousError,
+    QbittorrentAddRejectedError,
+)
 from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
@@ -53,6 +56,7 @@ __all__ = [
     "ClientHashOwnershipUnprovenError",
     "GrabError",
     "NoGrabSourceError",
+    "ParkedIntentHashError",
     "RequestNotActiveError",
     "SeasonRequiredError",
     "TorrentAlreadyTrackedError",
@@ -62,6 +66,7 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+ParkedIntentHashError = download_add_intent_service.ParkedIntentHashError
 
 # The qBittorrent category the app tags its torrents with (lets a later import
 # pipeline filter to only app-managed downloads).
@@ -1236,10 +1241,12 @@ async def grab(
         add_result = await qbt.add_prepared(prepared, save_path, submission_category)
     except QbittorrentAddRejectedError:
         if intent_id is not None:
-            # A completed rejection proves no client mutation occurred, so delete the
-            # reservation and let an immediate retry use the shared scope. Transport
-            # failures remain deliberately ambiguous and retain the recoverable intent.
+            # A conclusive rejection proves no client mutation occurred, so delete
+            # the reservation. Ambiguous completed responses and transport errors
+            # retain it for recovery to re-probe.
             await _release_rejected_reservation(session, intent_id)
+        raise
+    except QbittorrentAddAmbiguousError:
         raise
     if not add_result.created:
         status = await qbt.get_status(prepared.torrent_hash)
@@ -1254,8 +1261,10 @@ async def grab(
                 # adopt the duplicate; make the refusal explicit to its caller.
                 raise ClientHashOwnershipUnprovenError(prepared.torrent_hash)
             if status is None:
-                # A duplicate with an unavailable status is ambiguous, not definitively
-                # foreign. Keep its prepared reservation for recovery to re-probe.
+                # qBittorrent first reported a duplicate, then definitively showed
+                # no torrent. The duplicate vanished in that gap; retire this stale
+                # reservation so a subsequent grab/recovery may submit again.
+                await _release_rejected_reservation(session, intent_id)
                 if request_id is None:  # pragma: no cover - reservations require a request
                     raise RuntimeError("reserved intent has no request")
                 raise AlreadyDownloadingError(request_id)

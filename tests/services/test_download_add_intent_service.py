@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import cast
 
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.qbittorrent.adapter import QbittorrentSourceError
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.release import ParsedRelease, ScoredRelease
+from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Download,
     DownloadCoverageClaim,
@@ -30,12 +32,14 @@ from plex_manager.ports.download_client import (
 )
 from plex_manager.ports.repositories import CreateDownloadAddIntent, DownloadAddIntentScopeCreate
 from plex_manager.repositories.download_add_intents import SqlDownloadAddIntentRepository
-from plex_manager.services import request_service
+from plex_manager.repositories.downloads import SqlDownloadRepository
+from plex_manager.services import download_add_intent_service, request_service
 from plex_manager.services.correction_service import cancel_request_with_outcome
 from plex_manager.services.download_add_intent_service import (
     intent_category,
     publish_intent,
     recover_all,
+    recover_for_request,
     submit_and_finalize,
 )
 from tests.web.fakes import candidate
@@ -76,6 +80,24 @@ class _Client:
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         self.removes.append(info_hash)
         self.statuses.pop(info_hash, None)
+
+
+class _DelayedAddClient(_Client):
+    def __init__(self, statuses: dict[str, DownloadStatus]) -> None:
+        super().__init__(statuses)
+        self.add_entered = asyncio.Event()
+        self.allow_add = asyncio.Event()
+        self.fail_removes = False
+
+    async def add_prepared(self, prepared: PreparedAdd, save_path: str, category: str) -> AddResult:
+        self.add_entered.set()
+        await self.allow_add.wait()
+        return await super().add_prepared(prepared, save_path, category)
+
+    async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+        if self.fail_removes:
+            raise ConnectionError("remove unavailable")
+        await super().remove(info_hash, delete_files=delete_files)
 
 
 class _DuplicateAddClient(_Client):
@@ -313,6 +335,353 @@ async def test_submit_uses_add_result_ownership_proof(
         assert stored.state == "needs_attention"
         assert stored.last_error == "client_hash_ownership_unproven"
         assert client.categories == []
+
+
+async def test_cancel_during_submit_removes_late_created_torrent(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as setup:
+        request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+        )
+        setup.add(request)
+        await setup.flush()
+        intent = await SqlDownloadAddIntentRepository(setup).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:source",
+                media_request_id=request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+                observed_request_status=RequestStatus.pending.value,
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=1, media_type="movie", scope_key="movie", is_target=True
+                    ),
+                ),
+            )
+        )
+        request_id = request.id
+        intent_id = intent.id
+        await setup.commit()
+
+    client = _DelayedAddClient({})
+    async with sessionmaker_() as worker, sessionmaker_() as canceller:
+        recovery = asyncio.create_task(recover_all(client, worker))
+        await client.add_entered.wait()
+
+        outcome = await cancel_request_with_outcome(
+            canceller, cast(DownloadClientPort, client), request_id=request_id
+        )
+
+        assert outcome.cleanup_deferred is False
+        assert await SqlDownloadAddIntentRepository(canceller).get(intent_id, fresh=True) is None
+        client.allow_add.set()
+        await recovery
+
+    assert client.removes == ["hash"]
+    assert client.statuses == {}
+    async with sessionmaker_() as check:
+        assert await SqlDownloadAddIntentRepository(check).get(intent_id, fresh=True) is None
+        assert await check.scalar(select(Download).where(Download.torrent_hash == "hash")) is None
+
+
+async def test_late_remove_failure_retains_cancel_requested_cleanup_intent(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as setup:
+        request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Movie", status=RequestStatus.pending
+        )
+        setup.add(request)
+        await setup.flush()
+        intent = await SqlDownloadAddIntentRepository(setup).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:source",
+                media_request_id=request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+                observed_request_status=RequestStatus.pending.value,
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=1, media_type="movie", scope_key="movie", is_target=True
+                    ),
+                ),
+            )
+        )
+        request_id = request.id
+        await setup.commit()
+
+    client = _DelayedAddClient({})
+    client.fail_removes = True
+    async with sessionmaker_() as worker, sessionmaker_() as canceller:
+        recovery = asyncio.create_task(recover_all(client, worker))
+        await client.add_entered.wait()
+        outcome = await cancel_request_with_outcome(
+            canceller, cast(DownloadClientPort, client), request_id=request_id
+        )
+        assert outcome.cleanup_deferred is False
+        assert await SqlDownloadAddIntentRepository(canceller).get(intent.id, fresh=True) is None
+        client.allow_add.set()
+        with pytest.raises(ConnectionError, match="remove unavailable"):
+            await recovery
+
+    async with sessionmaker_() as check:
+        cleanup = await SqlDownloadAddIntentRepository(check).get_by_hash("hash")
+        assert cleanup is not None
+        assert cleanup.state == "cancel_requested"
+        assert cleanup.owns_client_torrent is True
+
+    client.fail_removes = False
+    async with sessionmaker_() as sweep:
+        recovered = await recover_all(client, sweep)
+
+    assert recovered.removed == 1
+    assert client.statuses == {}
+    async with sessionmaker_() as check:
+        assert await SqlDownloadAddIntentRepository(check).get_by_hash("hash") is None
+
+
+async def test_late_cleanup_collision_preserves_new_hash_reservation(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as session:
+        old_request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Old", status=RequestStatus.cancelled
+        )
+        new_request = MediaRequest(
+            tmdb_id=2, media_type=MediaType.movie, title="New", status=RequestStatus.pending
+        )
+        session.add_all((old_request, new_request))
+        await session.flush()
+        old = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                media_request_id=old_request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await SqlDownloadAddIntentRepository(session).delete(old.id)
+        replacement = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:new",
+                media_request_id=new_request.id,
+                tmdb_id=2,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await session.commit()
+
+        cleanup = await download_add_intent_service.create_late_cleanup(session, old)
+
+        replacement_after = await SqlDownloadAddIntentRepository(session).get(
+            replacement.id, fresh=True
+        )
+        assert replacement_after is not None
+        assert replacement_after.state == "prepared"
+        assert replacement_after.owns_client_torrent is False
+        assert cleanup.id != replacement.id
+        assert cleanup.state == "cancel_requested"
+        assert cleanup.cleanup_torrent_hash == "hash"
+        assert cleanup.cleanup_category == intent_category(old.id)
+
+
+async def test_synthetic_late_cleanup_retries_only_old_category_removal(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as session:
+        old_request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Old", status=RequestStatus.cancelled
+        )
+        new_request = MediaRequest(
+            tmdb_id=2, media_type=MediaType.movie, title="New", status=RequestStatus.pending
+        )
+        session.add_all((old_request, new_request))
+        await session.flush()
+        old = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                media_request_id=old_request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await SqlDownloadAddIntentRepository(session).delete(old.id)
+        replacement = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:new",
+                media_request_id=new_request.id,
+                tmdb_id=2,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await session.commit()
+        cleanup = await download_add_intent_service.create_late_cleanup(session, old)
+
+    client = _DelayedAddClient(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash",
+                name="old",
+                raw_state="downloading",
+                category=intent_category(old.id),
+            )
+        }
+    )
+    client.fail_removes = True
+    async with sessionmaker_() as sweep:
+        with pytest.raises(ConnectionError, match="remove unavailable"):
+            await recover_for_request(client, sweep, request_id=old_request.id)
+
+    async with sessionmaker_() as check:
+        replacement_after = await SqlDownloadAddIntentRepository(check).get(
+            replacement.id, fresh=True
+        )
+        cleanup_after = await SqlDownloadAddIntentRepository(check).get(cleanup.id, fresh=True)
+        assert replacement_after is not None and replacement_after.state == "prepared"
+        assert cleanup_after is not None and cleanup_after.state == "cancel_requested"
+
+    client.fail_removes = False
+    async with sessionmaker_() as sweep:
+        recovered = await recover_for_request(client, sweep, request_id=old_request.id)
+    assert recovered.removed == 1
+    assert client.removes == ["hash"]
+    async with sessionmaker_() as check:
+        assert (
+            await SqlDownloadAddIntentRepository(check).get(replacement.id, fresh=True) is not None
+        )
+        assert await SqlDownloadAddIntentRepository(check).get(cleanup.id, fresh=True) is None
+
+
+async def test_synthetic_late_cleanup_retires_when_active_download_converges(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as session:
+        old_request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Old", status=RequestStatus.cancelled
+        )
+        new_request = MediaRequest(
+            tmdb_id=2, media_type=MediaType.movie, title="New", status=RequestStatus.downloading
+        )
+        session.add_all((old_request, new_request))
+        await session.flush()
+        old = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                media_request_id=old_request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await SqlDownloadAddIntentRepository(session).delete(old.id)
+        replacement = await SqlDownloadAddIntentRepository(session).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                media_request_id=new_request.id,
+                tmdb_id=2,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        session.add(
+            Download(
+                torrent_hash="hash",
+                status=DownloadState.Downloading.value,
+                media_request_id=new_request.id,
+                tmdb_id=2,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+        cleanup = await download_add_intent_service.create_late_cleanup(session, old)
+
+    client = _Client(
+        {
+            "hash": DownloadStatus(
+                info_hash="hash",
+                name="newly tracked",
+                raw_state="downloading",
+                category=intent_category(old.id),
+            )
+        }
+    )
+    async with sessionmaker_() as sweep:
+        recovered = await recover_for_request(client, sweep, request_id=old_request.id)
+
+    assert recovered.removed == 1
+    assert client.removes == []
+    async with sessionmaker_() as check:
+        assert await SqlDownloadAddIntentRepository(check).get(cleanup.id, fresh=True) is None
+        assert (
+            await SqlDownloadAddIntentRepository(check).get(replacement.id, fresh=True) is not None
+        )
+
+
+async def test_submit_late_add_id_reuse_creates_synthetic_cleanup(
+    sessionmaker_: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessionmaker_() as setup:
+        old_request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.movie, title="Old", status=RequestStatus.cancelled
+        )
+        new_request = MediaRequest(
+            tmdb_id=2, media_type=MediaType.movie, title="New", status=RequestStatus.pending
+        )
+        setup.add_all((old_request, new_request))
+        await setup.flush()
+        old = await SqlDownloadAddIntentRepository(setup).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:old",
+                media_request_id=old_request.id,
+                tmdb_id=1,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await setup.commit()
+
+    client = _DelayedAddClient({})
+    async with sessionmaker_() as worker, sessionmaker_() as replacement_session:
+        submission = asyncio.create_task(submit_and_finalize(client, worker, intent=old))
+        await client.add_entered.wait()
+        replacement_repo = SqlDownloadAddIntentRepository(replacement_session)
+        await replacement_repo.delete(old.id)
+        replacement = await replacement_repo.create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                source="magnet:new",
+                media_request_id=new_request.id,
+                tmdb_id=2,
+                media_type="movie",
+                save_path="",
+            )
+        )
+        await replacement_session.commit()
+        assert replacement.id == old.id
+        client.allow_add.set()
+        await submission
+
+    assert client.removes == ["hash"]
+    async with sessionmaker_() as check:
+        replacement_after = await SqlDownloadAddIntentRepository(check).get(
+            replacement.id, fresh=True
+        )
+        cleanup = await SqlDownloadAddIntentRepository(check).get_by_hash(f"cleanup:{old.id}:hash")
+        assert replacement_after is not None and replacement_after.state == "prepared"
+        assert cleanup is None
+        assert await check.scalar(select(Download).where(Download.torrent_hash == "hash")) is None
 
 
 async def test_submit_lost_attention_cas_does_not_report_a_mutation(
@@ -675,10 +1044,9 @@ async def test_cancelled_intent_status_outage_after_remove_stays_recoverable(
     assert client.statuses == {}
 
     result = await recover_all(client, session)
-    assert not result.changed
+    assert result.removed == 1
     assert client.adds == []
-    retained = await SqlDownloadAddIntentRepository(session).get(intent.id)
-    assert retained is not None and retained.state == "cancel_requested"
+    assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
 
 
 async def test_client_wide_prepare_failure_is_reraised(session: AsyncSession) -> None:
@@ -710,7 +1078,7 @@ async def test_client_wide_prepare_failure_is_reraised(session: AsyncSession) ->
     assert remaining.state == "prepared"
 
 
-async def test_same_hash_convergence_locks_active_download_before_attaching_scopes(
+async def test_same_hash_convergence_locks_active_download_before_attachment(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request = MediaRequest(
@@ -767,6 +1135,161 @@ async def test_same_hash_convergence_locks_active_download_before_attaching_scop
 
     assert locked
     assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
+
+
+async def test_tv_same_hash_convergence_attaches_new_target_scope(
+    session: AsyncSession,
+) -> None:
+    request = MediaRequest(
+        tmdb_id=1, media_type=MediaType.tv, title="Show", status=RequestStatus.pending
+    )
+    session.add(request)
+    await session.flush()
+    season_one = SeasonRequest(
+        media_request_id=request.id, season_number=1, status=RequestStatus.downloading
+    )
+    season_two = SeasonRequest(
+        media_request_id=request.id, season_number=2, status=RequestStatus.pending
+    )
+    session.add_all((season_one, season_two))
+    await session.flush()
+    existing = Download(
+        torrent_hash="hash",
+        status="downloading",
+        media_request_id=request.id,
+        tmdb_id=1,
+        media_type=MediaType.tv,
+        season=1,
+    )
+    session.add(existing)
+    await session.flush()
+    intent = await SqlDownloadAddIntentRepository(session).create(
+        CreateDownloadAddIntent(
+            torrent_hash="hash",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type="tv",
+            save_path="",
+            observed_season_status=RequestStatus.pending.value,
+            scopes=(
+                DownloadAddIntentScopeCreate(
+                    tmdb_id=1,
+                    media_type="tv",
+                    scope_key="season:2",
+                    season_number=2,
+                    is_target=True,
+                ),
+            ),
+        )
+    )
+    await session.commit()
+
+    recovered = await recover_all(
+        _Client(
+            {
+                "hash": DownloadStatus(
+                    info_hash="hash",
+                    name="pack",
+                    raw_state="downloading",
+                    category=intent_category(intent.id),
+                )
+            }
+        ),
+        session,
+    )
+
+    assert recovered.finalized == 1
+    assert await SqlDownloadAddIntentRepository(session).get(intent.id) is None
+    updated_season = await session.get(SeasonRequest, season_two.id)
+    assert updated_season is not None and updated_season.status == RequestStatus.downloading
+    scopes = (await session.scalars(select(DownloadScope))).all()
+    assert [(scope.download_id, scope.season_number) for scope in scopes] == [(existing.id, 2)]
+
+
+async def test_tv_convergence_locks_before_attaching_scopes(
+    sessionmaker_: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with sessionmaker_() as setup:
+        request = MediaRequest(
+            tmdb_id=1, media_type=MediaType.tv, title="Show", status=RequestStatus.downloading
+        )
+        season = SeasonRequest(media_request_id=1, season_number=2, status=RequestStatus.pending)
+        setup.add(request)
+        await setup.flush()
+        season.media_request_id = request.id
+        setup.add(season)
+        download = Download(
+            torrent_hash="hash",
+            status="downloading",
+            media_request_id=request.id,
+            tmdb_id=1,
+            media_type=MediaType.tv,
+            season=1,
+        )
+        setup.add(download)
+        await setup.flush()
+        intent = await SqlDownloadAddIntentRepository(setup).create(
+            CreateDownloadAddIntent(
+                torrent_hash="hash",
+                media_request_id=request.id,
+                tmdb_id=1,
+                media_type="tv",
+                save_path="",
+                observed_season_status=RequestStatus.pending.value,
+                scopes=(
+                    DownloadAddIntentScopeCreate(
+                        tmdb_id=1,
+                        media_type="tv",
+                        scope_key="season:2",
+                        season_number=2,
+                        is_target=True,
+                    ),
+                ),
+            )
+        )
+        download_id = download.id
+        season_id = season.id
+        await setup.commit()
+
+    original_lock = SqlDownloadRepository.lock_if_active
+    raced = False
+
+    async def complete_before_lock(repository: SqlDownloadRepository, download_id_: int) -> bool:
+        nonlocal raced
+        if not raced:
+            raced = True
+            async with sessionmaker_() as other:
+                completed = await other.get(Download, download_id)
+                assert completed is not None
+                completed.status = DownloadState.Imported.value
+                await other.commit()
+        return await original_lock(repository, download_id_)
+
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", complete_before_lock)
+    async with sessionmaker_() as worker:
+        recovered = await recover_all(
+            _Client(
+                {
+                    "hash": DownloadStatus(
+                        info_hash="hash",
+                        name="pack",
+                        raw_state="downloading",
+                        category=intent_category(intent.id),
+                    )
+                }
+            ),
+            worker,
+        )
+
+    assert recovered.finalized == 1
+    async with sessionmaker_() as check:
+        downloaded = await check.get(Download, download_id)
+        updated_season = await check.get(SeasonRequest, season_id)
+        scopes = (await check.scalars(select(DownloadScope))).all()
+        assert downloaded is not None and downloaded.status == DownloadState.Downloading.value
+        assert updated_season is not None and updated_season.status == RequestStatus.downloading
+        assert [(scope.download_id, scope.season_number) for scope in scopes] == [(download_id, 2)]
+        assert await SqlDownloadAddIntentRepository(check).get(intent.id) is None
 
 
 async def test_tv_pack_recovery_keeps_initiating_season_as_primary_target(
@@ -1115,9 +1638,7 @@ async def test_cancel_recovers_only_cancelled_request_intents(session: AsyncSess
 
     assert outcome.record.status == RequestStatus.cancelled.value
     assert not outcome.cleanup_deferred
-    target_after = await intents.get(target.id, fresh=True)
-    assert target_after is not None
-    assert target_after.state == "cancel_requested"
+    assert await intents.get(target.id, fresh=True) is None
     unrelated_after = await intents.get(other.id, fresh=True)
     assert unrelated_after is not None
     assert unrelated_after.state == "prepared"

@@ -17,6 +17,8 @@ from plex_manager.domain.release import CandidateRelease
 from plex_manager.domain.state_machine import DownloadState
 from plex_manager.models import (
     Download,
+    DownloadAddIntent,
+    DownloadAddIntentScope,
     DownloadCoverageClaim,
     DownloadHistory,
     DownloadHistoryEvent,
@@ -978,6 +980,51 @@ async def test_grab_rejects_second_active_release_for_same_request(
         )
     assert len(rows) == 1
     assert rows[0].torrent_hash == _GOOD_HASH
+
+
+async def test_manual_grab_parked_hash_returns_typed_conflict(
+    app: FastAPI, client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    request_id = await _create_request(app, client)
+    torrent_hash = "8" * 40
+    async with sessionmaker_() as session:
+        intent = DownloadAddIntent(
+            torrent_hash=torrent_hash,
+            state="needs_attention",
+            media_request_id=request_id,
+            tmdb_id=603,
+            media_type="movie",
+            save_path="",
+        )
+        session.add(intent)
+        await session.flush()
+        session.add(
+            DownloadAddIntentScope(
+                intent_id=intent.id,
+                media_request_id=request_id,
+                tmdb_id=603,
+                media_type="movie",
+                scope_key="movie",
+                active_scope_key=None,
+                is_target=True,
+            )
+        )
+        await session.commit()
+
+    qbt = FakeQbittorrent()
+    override_adapters(
+        app,
+        prowlarr=FakeProwlarr([candidate(_GOOD, info_hash=torrent_hash, seeders=42)]),
+        qbt=qbt,
+    )
+    response = await client.post(
+        "/api/v1/queue/grab", json={"request_id": request_id}, headers=_HEADERS
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "already_downloading"
+    assert qbt.added == []
 
 
 async def test_grab_no_acceptable_release_keeps_active_download_status(

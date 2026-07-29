@@ -776,6 +776,10 @@ class DownloadAddIntent(Base):
     observed_request_status: Mapped[str | None] = mapped_column(String)
     observed_season_status: Mapped[str | None] = mapped_column(String)
     owns_client_torrent: Mapped[bool] = mapped_column(default=False, server_default=sa.false())
+    # A cancellation cleanup that cannot reuse the real hash's unique reservation
+    # key stores its client identity separately, with a synthetic ``torrent_hash``.
+    cleanup_torrent_hash: Mapped[str | None] = mapped_column(String)
+    cleanup_category: Mapped[str | None] = mapped_column(String)
     last_error: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
