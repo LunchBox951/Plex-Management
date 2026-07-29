@@ -194,6 +194,7 @@ def test_publish_smokes_the_exact_candidate_before_publishing_tags() -> None:
     build_with = cast(dict[str, Any], candidate_build["with"])
     assert build_with.get("push") is False
     assert build_with.get("load") is True
+    assert build_with.get("provenance") is False
     assert build_with.get("tags") == CANDIDATE_TAG
 
     for name in PUBLISH_SMOKES:

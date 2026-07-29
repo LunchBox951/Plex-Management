@@ -205,6 +205,10 @@ jobs:
           context: .
           push: false
           load: true
+          # The local-store load gate drops attestations anyway; pin this explicitly.
+          # We prioritize a verified candidate over provenance until a registry-backed
+          # candidate flow is available if attestations become consumed.
+          provenance: false
           tags: ${{ steps.img.outputs.name }}:candidate-${{ github.sha }}
           # metadata-action already derives an org.opencontainers.image.version
           # label from the primary tag (would be the literal string "edge" here,
