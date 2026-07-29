@@ -166,8 +166,11 @@ def _pid_is_running(pid: int) -> bool | None:
 _EMPTY_LOCK_STALE_SECONDS = 60.0
 
 
-def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool]:
-    """Open the canonical regular lock entry without following it."""
+def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, bool, bool]:
+    """Open the canonical regular lock entry without following it.
+
+    The final value reports whether an existing lock needed the read-only fallback.
+    """
     common_flags = os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         lock_fd = os.open(
@@ -177,14 +180,24 @@ def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, 
             dir_fd=dir_fd,
         )
         created = True
+        read_only_fallback = False
     except FileExistsError:
         try:
-            # Existing locks are only inspected, flocked, and replaced or unlinked;
-            # reclaiming them never writes their inode. O_RDONLY also permits recovery
-            # of a dead owner's mode-0400 lock.
-            lock_fd = os.open(lock_name, os.O_RDONLY | common_flags, dir_fd=dir_fd)
-        except OSError:
-            raise FileExistsError(display) from None
+            # NFS implements flock with whole-file fcntl locks, which require a
+            # writable descriptor for LOCK_EX. Existing locks are never rewritten,
+            # but prefer O_RDWR so flock remains authoritative where available.
+            lock_fd = os.open(lock_name, os.O_RDWR | common_flags, dir_fd=dir_fd)
+            read_only_fallback = False
+        except OSError as write_open_error:
+            if write_open_error.errno not in (errno.EACCES, errno.EROFS):
+                raise FileExistsError(display) from None
+            try:
+                # A mode-0400 stale lock is still recoverable through identity-only
+                # reclamation when its read-only descriptor cannot take LOCK_EX.
+                lock_fd = os.open(lock_name, os.O_RDONLY | common_flags, dir_fd=dir_fd)
+                read_only_fallback = True
+            except OSError:
+                raise FileExistsError(display) from None
         created = False
 
     try:
@@ -201,7 +214,7 @@ def _open_publish_lock(dir_fd: int, lock_name: str, display: str) -> tuple[int, 
         finally:
             os.close(lock_fd)
         raise
-    return lock_fd, created
+    return lock_fd, created, read_only_fallback
 
 
 def _existing_lock_is_reclaimable(lock_fd: int) -> bool:
@@ -368,26 +381,24 @@ def _replace_held_publish_lock(
             # This name is private to this claimant and was never exposed.
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=dir_fd)
-    try:
-        os.close(old_lock_fd)
-    except BaseException as original_error:
-        # The replacement is now canonical but cannot be returned if retiring the old
-        # descriptor fails. Remove it while its flock is still held so it is never
-        # stranded without an owner.
-        try:
-            try:
-                _unlink_owned_publish_lock(dir_fd, lock_name, replacement_fd)
-            finally:
-                os.close(replacement_fd)
-        except BaseException as cleanup_error:
-            raise original_error from cleanup_error
-        raise
+    # The caller owns old_lock_fd and transfers replacement ownership only after
+    # publishing it as the claimed descriptor; this helper never closes the old fd.
     return replacement_fd
 
 
-def _reclaim_guard_name(lock_name: str) -> str:
-    """Return the canonical guard name for identity-only stale-lock recovery."""
-    return f"{lock_name}.reclaim"
+def _reclaim_guard_name(dir_fd: int, lock_name: str) -> str:
+    """Return a bounded deterministic guard name for identity-only recovery."""
+    name_max = 255
+    with contextlib.suppress(OSError):
+        configured_name_max = os.fpathconf(dir_fd, "PC_NAME_MAX")
+        if configured_name_max > 0:
+            name_max = configured_name_max
+    prefix = ".publish-lock-reclaim-"
+    digest = hashlib.sha256(lock_name.encode("utf-8")).hexdigest()
+    available = name_max - len(prefix)
+    if available < 1:
+        raise OSError(errno.ENAMETOOLONG, "filesystem name limit is too small for reclaim guard")
+    return f"{prefix}{digest[:available]}"
 
 
 def _reclaim_guard_error(display: str, guard_name: str) -> PublishLockReclaimGuardError:
@@ -403,7 +414,7 @@ def _acquire_identity_only_reclaim_guard(
     dir_fd: int, lock_name: str, display: str
 ) -> tuple[int, str]:
     """Atomically acquire the exclusive identity-only stale-reclamation guard."""
-    guard_name = _reclaim_guard_name(lock_name)
+    guard_name = _reclaim_guard_name(dir_fd, lock_name)
     flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         guard_fd = os.open(guard_name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
@@ -436,6 +447,7 @@ def _reclaim_identity_only_publish_lock(
     visibly wedging this destination until corrected, rather than silent overlap.
     """
     guard_fd, guard_name = _acquire_identity_only_reclaim_guard(dir_fd, lock_name, display)
+    active_guard_fd: int | None = guard_fd
     replacement_fd: int | None = None
     try:
         if not _lock_fd_owns_name(dir_fd, lock_name, old_lock_fd):
@@ -460,6 +472,36 @@ def _reclaim_identity_only_publish_lock(
         _write_lock_pid(replacement_fd)
         if not _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
             raise FileExistsError(display)
+
+        # The canonical replacement remains this function's responsibility until
+        # guard removal succeeds. A guard-cleanup failure cannot strand it.
+        try:
+            if _lock_fd_owns_name(dir_fd, guard_name, guard_fd):
+                os.unlink(guard_name, dir_fd=dir_fd)
+        except BaseException as guard_cleanup_error:
+            # Preserve this first guard-cleanup error. The outer finally must never
+            # retry a destructive guard unlink, but this branch still closes its fd.
+            active_guard_fd = None
+            try:
+                try:
+                    try:
+                        if _lock_fd_owns_name(dir_fd, lock_name, replacement_fd):
+                            os.unlink(lock_name, dir_fd=dir_fd)
+                    finally:
+                        os.close(replacement_fd)
+                finally:
+                    os.close(guard_fd)
+            except BaseException as replacement_cleanup_error:
+                raise guard_cleanup_error from replacement_cleanup_error
+            finally:
+                replacement_fd = None
+            raise
+        else:
+            # Clear ownership before close because a close error may report after
+            # releasing the kernel descriptor; never retry this numeric fd.
+            active_guard_fd = None
+            os.close(guard_fd)
+
         result_fd = replacement_fd
         replacement_fd = None
         return result_fd
@@ -471,17 +513,20 @@ def _reclaim_identity_only_publish_lock(
                         os.unlink(lock_name, dir_fd=dir_fd)
                 finally:
                     os.close(replacement_fd)
-            if _lock_fd_owns_name(dir_fd, guard_name, guard_fd):
+            if active_guard_fd is not None and _lock_fd_owns_name(
+                dir_fd, guard_name, active_guard_fd
+            ):
                 os.unlink(guard_name, dir_fd=dir_fd)
         finally:
-            os.close(guard_fd)
+            if active_guard_fd is not None:
+                os.close(active_guard_fd)
 
 
 def _acquire_publish_lock(
     dir_fd: int, lock_name: str, display: str, *, reclaim_stale_with_existing_entry: bool
 ) -> int:
     """Claim the canonical lock inode without ever rewriting an existing inode."""
-    lock_fd, created = _open_publish_lock(dir_fd, lock_name, display)
+    lock_fd, created, read_only_fallback = _open_publish_lock(dir_fd, lock_name, display)
     claimed = False
     try:
         try:
@@ -489,9 +534,14 @@ def _acquire_publish_lock(
         except BlockingIOError:
             raise FileExistsError(display) from None
         except OSError as error:
-            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            if error.errno in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOLCK):
+                # These errors mean advisory ownership is unavailable.
+                advisory_locking = False
+            elif error.errno == errno.EBADF and not created and read_only_fallback:
+                # NFS returns EBADF when LOCK_EX reaches its read-only fallback fd.
+                advisory_locking = False
+            else:
                 raise
-            advisory_locking = False
         else:
             advisory_locking = True
 
@@ -526,13 +576,20 @@ def _acquire_publish_lock(
             raise FileExistsError(display)
 
         if advisory_locking:
-            return _replace_held_publish_lock(
+            replacement_fd = _replace_held_publish_lock(
                 dir_fd,
                 lock_name,
                 old_lock_fd,
                 display,
                 advisory_locking=True,
             )
+            # Ownership transfers before the old descriptor is closed. If that close
+            # fails, the exception cleanup below removes and closes this replacement
+            # rather than retrying the old numeric descriptor after it may be reused.
+            lock_fd = replacement_fd
+            claimed = True
+            os.close(old_lock_fd)
+            return lock_fd
 
         replacement_fd = _reclaim_identity_only_publish_lock(
             dir_fd, lock_name, old_lock_fd, display
