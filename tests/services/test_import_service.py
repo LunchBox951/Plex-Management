@@ -2967,7 +2967,7 @@ async def test_import_tv_probe_outage_keeps_crash_resumed_shared_scopes_auto_ret
 
 
 async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
-    tmp_path: Path, sessionmaker_: SessionMaker
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
@@ -3026,11 +3026,79 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
         download_id = download.id
         request_id = request.id
 
+    calls: list[str] = []
+    real_lock = SqlDownloadRepository.lock_if_active
+    real_list_scopes = SqlDownloadRepository.list_scopes
+    real_set_scope = import_service._set_download_scope_status  # pyright: ignore[reportPrivateUsage]
+    real_set_status = season_request_service.set_status
+
+    async def record_lock(self: SqlDownloadRepository, row_id: int) -> bool:
+        result = await real_lock(self, row_id)
+        if row_id == download_id:
+            calls.append("parent-lock")
+        return result
+
+    async def record_scopes(self: SqlDownloadRepository, row_id: int) -> list[DownloadScopeRecord]:
+        result = await real_list_scopes(self, row_id)
+        if row_id == download_id:
+            calls.append("scope-read")
+        return result
+
+    async def record_scope_status(
+        session: AsyncSession,
+        *,
+        download_id: int,
+        status: str,
+        request_id: int | None = None,
+        season: int | None = None,
+        scope_id: int | None = None,
+        completed: bool = False,
+    ) -> None:
+        if status == RequestStatus.import_blocked.value:
+            calls.append("scope-import-blocked")
+        await real_set_scope(
+            session,
+            download_id=download_id,
+            status=status,
+            request_id=request_id,
+            season=season,
+            scope_id=scope_id,
+            completed=completed,
+        )
+
+    async def record_season_status(
+        session: AsyncSession,
+        *,
+        media_request_id: int,
+        season_number: int,
+        status: str,
+        skip_if_terminal: bool = False,
+    ) -> None:
+        if status == RequestStatus.import_blocked.value:
+            calls.append("season-import-blocked")
+        await real_set_status(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+            status=status,
+            skip_if_terminal=skip_if_terminal,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", record_lock)
+    monkeypatch.setattr(SqlDownloadRepository, "list_scopes", record_scopes)
+    monkeypatch.setattr(import_service, "_set_download_scope_status", record_scope_status)
+    monkeypatch.setattr(season_request_service, "set_status", record_season_status)
+
     library = FakeLibrary()
     record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
+    finalize_lock = max(index for index, call in enumerate(calls) if call == "parent-lock")
+    assert calls[finalize_lock + 1] == "scope-read"
+    assert calls.index("scope-import-blocked") > finalize_lock
+    assert calls.index("season-import-blocked") > finalize_lock
+    assert calls.index("scope-read", finalize_lock) < calls.index("scope-import-blocked")
     assert record.failed_reason is not None
     assert "S02" in record.failed_reason
     assert record.season == 2
@@ -3440,6 +3508,97 @@ async def test_import_tv_releases_every_coverage_claim_when_nothing_attaches_lat
     scopes, claims = await _scope_and_claim_state(sessionmaker_, download_id)
     assert scopes == {1: "imported"}
     assert claims == {1: "released"}
+
+
+async def test_import_tv_scope_finalize_locks_and_rereads_before_success_bookkeeping(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id = await _seed_tv_pack_with_s1_scope(sessionmaker_)
+
+    calls: list[str] = []
+    real_lock = SqlDownloadRepository.lock_if_active
+    real_list_scopes = SqlDownloadRepository.list_scopes
+    real_set_scope = import_service._set_download_scope_status  # pyright: ignore[reportPrivateUsage]
+    real_set_library_path = season_request_service.set_library_path
+    real_mark_completed = season_request_service.mark_completed
+
+    async def record_lock(self: SqlDownloadRepository, row_id: int) -> bool:
+        result = await real_lock(self, row_id)
+        if row_id == download_id:
+            calls.append("parent-lock")
+        return result
+
+    async def record_scopes(self: SqlDownloadRepository, row_id: int) -> list[DownloadScopeRecord]:
+        result = await real_list_scopes(self, row_id)
+        if row_id == download_id:
+            calls.append("scope-read")
+        return result
+
+    async def record_scope_status(
+        session: AsyncSession,
+        *,
+        download_id: int,
+        status: str,
+        request_id: int | None = None,
+        season: int | None = None,
+        scope_id: int | None = None,
+        completed: bool = False,
+    ) -> None:
+        if status == "imported":
+            calls.append("scope-imported")
+        await real_set_scope(
+            session,
+            download_id=download_id,
+            status=status,
+            request_id=request_id,
+            season=season,
+            scope_id=scope_id,
+            completed=completed,
+        )
+
+    async def record_library_path(
+        session: AsyncSession, *, media_request_id: int, season_number: int, library_path: str
+    ) -> None:
+        calls.append("season-library-path")
+        await real_set_library_path(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+            library_path=library_path,
+        )
+
+    async def record_completed(
+        session: AsyncSession, *, media_request_id: int, season_number: int
+    ) -> None:
+        calls.append("season-completed")
+        await real_mark_completed(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", record_lock)
+    monkeypatch.setattr(SqlDownloadRepository, "list_scopes", record_scopes)
+    monkeypatch.setattr(import_service, "_set_download_scope_status", record_scope_status)
+    monkeypatch.setattr(season_request_service, "set_library_path", record_library_path)
+    monkeypatch.setattr(season_request_service, "mark_completed", record_completed)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    finalize_lock = max(index for index, call in enumerate(calls) if call == "parent-lock")
+    assert calls[finalize_lock + 1] == "scope-read"
+    first_bookkeeping = min(
+        calls.index(event)
+        for event in ("season-library-path", "season-completed", "scope-imported")
+    )
+    assert finalize_lock < first_bookkeeping
+    assert calls.index("scope-read", finalize_lock) < first_bookkeeping
 
 
 async def test_import_tv_finalize_reread_locks_the_download_row_first(
