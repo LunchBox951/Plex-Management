@@ -176,7 +176,7 @@ def test_cross_device_copy_copies_all_xattrs_by_held_descriptors(
     """A copy fallback must preserve xattrs from the already-held file descriptors."""
     src = tmp_path / "src.mkv"
     src.write_bytes(b"source payload")
-    os.chmod(src, 0o640)
+    os.chmod(src, 0o600)
     source_stat = src.stat()
     dst = tmp_path / "copied.mkv"
     operations: list[str] = []
@@ -262,7 +262,7 @@ def test_cross_device_copy_tolerates_xattr_capability_or_permission_errors(
     """Capability and permission refusals are best-effort, per xattr when possible."""
     src = tmp_path / "src.mkv"
     src.write_bytes(b"source payload")
-    os.chmod(src, 0o640)
+    os.chmod(src, 0o600)
     source_stat = src.stat()
     dst = tmp_path / "copied.mkv"
     attempted_second_attribute = False
@@ -310,6 +310,51 @@ def test_cross_device_copy_tolerates_xattr_capability_or_permission_errors(
     assert stat.S_IMODE(dst.stat().st_mode) == stat.S_IMODE(source_stat.st_mode)
     assert dst.stat().st_mtime_ns == source_stat.st_mtime_ns
     assert attempted_second_attribute is (operation != "listxattr")
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_cross_device_copy_skips_an_xattr_removed_after_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disappearing enumerated xattr does not abort the copy fallback."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    attempted_second_attribute = False
+    missing_errno = getattr(errno, "ENOATTR", errno.ENODATA)
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["user.removed", "user.present"]
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        nonlocal attempted_second_attribute
+        assert isinstance(fd, int)
+        if name == "user.removed":
+            raise OSError(missing_errno, "attribute disappeared")
+        attempted_second_attribute = True
+        return b"present"
+
+    def _setxattr(_fd: int, _name: str, _value: bytes) -> None:
+        return None
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert attempted_second_attribute
+    assert dst.read_bytes() == b"source payload"
     assert not list(tmp_path.glob(".*.tmp"))
 
 

@@ -38,6 +38,9 @@ _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
 
 
 _XATTR_COPY_TOLERATED_ERRNOS: frozenset[int] = frozenset({errno.EPERM, errno.ENOTSUP})
+_XATTR_MISSING_ERRNOS: frozenset[int] = frozenset(
+    {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
+)
 
 #: Read size for the destination-vs-source digest comparison. Media files are large;
 #: this is the same 1 MiB chunk the import pipeline used before the comparison moved
@@ -485,6 +488,11 @@ def _copy_xattrs(source_fd: int, target_fd: int) -> None:
     for name in names:
         try:
             value = os.getxattr(source_fd, name)
+        except OSError as exc:
+            if exc.errno in _XATTR_COPY_TOLERATED_ERRNOS | _XATTR_MISSING_ERRNOS:
+                continue
+            raise
+        try:
             os.setxattr(target_fd, name, value)
         except OSError as exc:
             if exc.errno not in _XATTR_COPY_TOLERATED_ERRNOS:
