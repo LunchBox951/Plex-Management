@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plex_manager.models import MediaRequest, RequestStatus, User
 from plex_manager.repositories import SqlRequestRepository
+from plex_manager.repositories import requests as requests_repo
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
 # ONLY to the parked ``no_acceptable_release``.
@@ -699,7 +700,7 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
     finalizing = await repo.create(
         tmdb_id=30, media_type="movie", title="Finalizing", status="completed"
     )
-    assert await repo.mark_available(finalizing.id) is True
+    assert await repo.mark_available(finalizing.id, expected_completion_generation=None) is True
     promoted = await session.get(MediaRequest, finalizing.id)
     assert promoted is not None
     assert promoted.status is RequestStatus.available
@@ -708,7 +709,9 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
 
     # Re-stamping an already-available row is the create-time short-circuit's
     # own call; it must still succeed, and must keep the earlier import instant.
-    assert await repo.mark_available(finalizing.id) is True
+    # The row never went through ``mark_completed``, so its generation is still
+    # unset and the create-time caller passes exactly that.
+    assert await repo.mark_available(finalizing.id, expected_completion_generation=None) is True
     restamped = await session.get(MediaRequest, finalizing.id)
     assert restamped is not None
     assert restamped.completed_at == stamped_at
@@ -717,11 +720,115 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
         tmdb_id=31, media_type="movie", title="Reported", status="completed"
     )
     await repo.reset_for_research(rearmed.id)  # the report-issue re-arm
-    assert await repo.mark_available(rearmed.id) is False
+    assert await repo.mark_available(rearmed.id, expected_completion_generation=None) is False
     untouched = await session.get(MediaRequest, rearmed.id)
     assert untouched is not None
     assert untouched.status is RequestStatus.searching
     assert untouched.library_verified_at is None
+
+
+async def test_mark_completed_advances_the_generation_and_stamps_the_time(
+    session: AsyncSession,
+) -> None:
+    """The counter advances on every entry into ``completed``; ``completed_at``
+    is time metadata beside it. The generation is bumped in SQL from the row's
+    current value, so it counts completions rather than restarting."""
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=33, media_type="movie", title="Counter", status="downloading")
+    fresh = await repo.get(row.id)
+    assert fresh is not None
+    assert fresh.completion_generation is None  # never completed
+
+    await repo.mark_completed(row.id)
+    first = await repo.get(row.id)
+    assert first is not None
+    assert first.completion_generation == 1
+    assert first.completed_at is not None
+
+    # A re-arm leaves the counter standing (only the availability anchors clear),
+    # so the next completion strictly exceeds every earlier snapshot.
+    await repo.reset_for_research(row.id)
+    rearmed = await repo.get(row.id)
+    assert rearmed is not None
+    assert rearmed.completion_generation == 1
+    assert rearmed.completed_at is None
+
+    await repo.mark_completed(row.id)
+    second = await repo.get(row.id)
+    assert second is not None
+    assert second.completion_generation == 2
+
+
+async def test_mark_completed_raises_for_a_missing_row(session: AsyncSession) -> None:
+    """The single-statement rewrite keeps the missing-row signal."""
+    with pytest.raises(LookupError):
+        await SqlRequestRepository(session).mark_completed(9_999)
+
+
+async def test_mark_available_cas_refuses_a_replacement_completion(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494: the CAS is bound to the completion the caller OBSERVED.
+
+    A row that is re-armed and re-imported inside one Plex round-trip is
+    ``completed`` again, so the status-only predicate could not tell the
+    replacement from the snapshotted original and would promote it on evidence
+    about the purged content.
+
+    The clock is FROZEN here, so both completions carry the identical
+    ``completed_at`` -- the collision a coarse-resolution, stopped or
+    backward-adjusted clock produces in the field. A timestamp binding would
+    match the replacement and let the stale write through; the monotonic
+    ``completion_generation`` is what actually separates them, so the stale
+    write loses while the replacement's OWN generation still promotes it."""
+    frozen = datetime(2026, 7, 27, 12, 0, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is UTC
+            return frozen
+
+    monkeypatch.setattr(requests_repo, "datetime", _FrozenDatetime)
+
+    repo = SqlRequestRepository(session)
+    row = await repo.create(tmdb_id=32, media_type="movie", title="Replaced", status="completed")
+    await repo.mark_completed(row.id)  # the ORIGINAL completion, snapshotted below
+    original = await repo.get(row.id)
+    assert original is not None
+    observed_generation = original.completion_generation
+    assert observed_generation == 1
+
+    # Report Issue purges + re-arms, then a retry-import lands the REPLACEMENT.
+    await repo.reset_for_research(row.id)
+    await repo.mark_completed(row.id)
+    replacement = await repo.get(row.id)
+    assert replacement is not None
+    # Same wall clock, so the timestamps are indistinguishable...
+    assert replacement.completed_at == original.completed_at
+    # ...but the generation is not.
+    assert replacement.completion_generation == 2
+
+    # The now-stale positive must not promote the replacement...
+    assert (
+        await repo.mark_available(row.id, expected_completion_generation=observed_generation)
+        is False
+    )
+    refused = await session.get(MediaRequest, row.id)
+    assert refused is not None
+    assert refused.status is RequestStatus.completed  # honest "Finalizing"
+    assert refused.library_verified_at is None
+
+    # ...but the next pass, which snapshots the replacement's own completion, does.
+    assert (
+        await repo.mark_available(
+            row.id, expected_completion_generation=replacement.completion_generation
+        )
+        is True
+    )
+    confirmed = await session.get(MediaRequest, row.id)
+    assert confirmed is not None
+    assert confirmed.status is RequestStatus.available
 
 
 async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> None:
@@ -730,8 +837,9 @@ async def test_rearm_false_available_to_pending_cas(session: AsyncSession) -> No
     repo = SqlRequestRepository(session)
     row = await repo.create(tmdb_id=20, media_type="movie", title="Heal", status="available")
     # Stamp library_verified_at/completed_at, as the real already-in-library
-    # short-circuit does.
-    assert await repo.mark_available(row.id) is True
+    # short-circuit does (which passes its freshly-created row's own, unset,
+    # completion generation).
+    assert await repo.mark_available(row.id, expected_completion_generation=None) is True
 
     changed = await repo.rearm_false_available_to_pending(row.id)
     assert changed is True

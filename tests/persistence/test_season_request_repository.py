@@ -8,7 +8,7 @@ uniqueness constraint itself is pinned separately in
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 from sqlalchemy import event, select
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from plex_manager.models import MediaRequest, RequestStatus, SeasonRequest
 from plex_manager.repositories import SqlSeasonRequestRepository
+from plex_manager.repositories import season_requests as season_requests_repo
 
 # The statuses the auto-grab worker scans (ADR-0013); the backoff gate applies
 # ONLY to the parked ``no_acceptable_release``.
@@ -248,11 +249,60 @@ async def test_mark_completed_and_mark_available(session: AsyncSession) -> None:
     fetched = await repo.get(created.id)
     assert fetched is not None
     assert fetched.status == "completed"
+    # Entering ``completed`` stamps the time metadata AND advances the
+    # generation the promotion CAS compares (#494).
+    assert fetched.completed_at is not None
+    assert fetched.completion_generation == 1
 
-    assert await repo.mark_available(created.id) is True
-    fetched = await repo.get(created.id)
-    assert fetched is not None
-    assert fetched.status == "available"
+    assert (
+        await repo.mark_available(
+            created.id, expected_completion_generation=fetched.completion_generation
+        )
+        is True
+    )
+    promoted = await repo.get(created.id)
+    assert promoted is not None
+    assert promoted.status == "available"
+    # The promotion leaves both alone -- the row still stands on the very
+    # completion it was confirmed for.
+    assert promoted.completed_at == fetched.completed_at
+    assert promoted.completion_generation == 1
+
+
+async def test_season_completion_bookkeeping_tracks_the_status(session: AsyncSession) -> None:
+    """``completed_at`` is time metadata (stamped on entry, cleared on leaving);
+    ``completion_generation`` is the monotonic counter and is NEVER cleared, so a
+    re-armed season's next completion outranks every earlier snapshot."""
+    show = await _make_show(session)
+    repo = SqlSeasonRequestRepository(session)
+    season = await repo.ensure(show.id, 1, status="downloading")
+    fresh = await repo.get(season.id)
+    assert fresh is not None
+    assert fresh.completed_at is None
+    assert fresh.completion_generation is None
+
+    await repo.mark_completed(season.id)
+    completed = await repo.get(season.id)
+    assert completed is not None
+    assert completed.completed_at is not None
+    assert completed.completion_generation == 1
+
+    await repo.set_status(season.id, "searching")  # the report-issue re-arm
+    rearmed = await repo.get(season.id)
+    assert rearmed is not None
+    assert rearmed.completed_at is None  # no longer standing on that completion
+    assert rearmed.completion_generation == 1  # but the counter never rewinds
+
+    await repo.mark_completed(season.id)
+    recompleted = await repo.get(season.id)
+    assert recompleted is not None
+    assert recompleted.completion_generation == 2
+
+
+async def test_set_status_raises_for_a_missing_row(session: AsyncSession) -> None:
+    """The single-statement rewrite keeps the missing-row signal."""
+    with pytest.raises(LookupError):
+        await SqlSeasonRequestRepository(session).set_status(9_999, "searching")
 
 
 async def test_mark_available_cas_only_promotes_completed_or_available(
@@ -264,16 +314,77 @@ async def test_mark_available_cas_only_promotes_completed_or_available(
     show = await _make_show(session)
     repo = SqlSeasonRequestRepository(session)
     finalizing = await repo.ensure(show.id, 1, status="completed")
-    assert await repo.mark_available(finalizing.id) is True
+    assert await repo.mark_available(finalizing.id, expected_completion_generation=None) is True
     # Re-stamping an already-available season must still succeed.
-    assert await repo.mark_available(finalizing.id) is True
+    assert await repo.mark_available(finalizing.id, expected_completion_generation=None) is True
 
     rearmed = await repo.ensure(show.id, 2, status="completed")
     await repo.set_status(rearmed.id, "searching")  # the report-issue re-arm
-    assert await repo.mark_available(rearmed.id) is False
+    assert await repo.mark_available(rearmed.id, expected_completion_generation=None) is False
     fetched = await repo.get(rearmed.id)
     assert fetched is not None
     assert fetched.status == "searching"
+
+
+async def test_mark_available_cas_refuses_a_replacement_completion(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494, season twin: bound to the completion the caller OBSERVED.
+
+    TV has the shortest route back to ``completed`` in the system (the episode
+    fallback re-completes a re-armed season with no search, grab or download),
+    so the season CAS must also refuse a positive that described the content the
+    re-arm purged.
+
+    The clock is FROZEN, so both completions carry the same ``completed_at`` --
+    the collision a coarse-resolution, stopped or backward-adjusted clock
+    produces. Only the monotonic generation separates them, so the stale write
+    loses while the replacement's own generation still promotes."""
+    frozen = datetime(2026, 7, 27, 12, 0, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is UTC
+            return frozen
+
+    monkeypatch.setattr(season_requests_repo, "datetime", _FrozenDatetime)
+
+    show = await _make_show(session)
+    repo = SqlSeasonRequestRepository(session)
+    season = await repo.ensure(show.id, 1, status="downloading")
+    await repo.mark_completed(season.id)
+    original = await repo.get(season.id)
+    assert original is not None
+    observed_generation = original.completion_generation
+    assert observed_generation == 1
+
+    await repo.set_status(season.id, "searching")  # Report Issue: purged + re-armed
+    await repo.mark_completed(season.id)  # the REPLACEMENT completes
+    replacement = await repo.get(season.id)
+    assert replacement is not None
+    # Same wall clock, so the timestamps are indistinguishable...
+    assert replacement.completed_at == original.completed_at
+    # ...but the generation is not.
+    assert replacement.completion_generation == 2
+
+    assert (
+        await repo.mark_available(season.id, expected_completion_generation=observed_generation)
+        is False
+    )
+    refused = await repo.get(season.id)
+    assert refused is not None
+    assert refused.status == "completed"
+
+    assert (
+        await repo.mark_available(
+            season.id, expected_completion_generation=replacement.completion_generation
+        )
+        is True
+    )
+    confirmed = await repo.get(season.id)
+    assert confirmed is not None
+    assert confirmed.status == "available"
 
 
 async def test_library_path_defaults_none_and_round_trips(session: AsyncSession) -> None:
