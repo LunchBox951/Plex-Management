@@ -190,8 +190,9 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # through the eviction lifecycle (its re-grab is a SEPARATE row with no
 # breadcrumb, and the claimed ``evicted`` movie row is not cancellable at all);
 # the one movie shape that CAN carry it -- report-issue's failed-purge re-arm
-# later cancelled -- is a deliberately settled correction whose kept breadcrumb
-# is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
+# later cancelled -- is marker-owned recovery ONLY while its incomplete-delete
+# marker is armed. Without that marker it is a deliberately settled correction
+# whose kept breadcrumb is the orphan-reclaim handle and is left alone (#513).
 _MARKER_OWNED_ADVANCED_STATUSES: frozenset[str] = frozenset(
     {RequestStatus.downloading.value, RequestStatus.failed.value}
 )
@@ -214,7 +215,10 @@ _REARMED_RECOVERY_STATUSES: frozenset[str] = (
 _BLOCKED_BY_REMNANTS_STATUS: str = RequestStatus.import_blocked.value
 
 # Every status the re-armed pass can adjudicate, for the breadcrumb-release CAS
-# (a subset of ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` below).
+# (a subset of ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` below). Seasons may
+# enter the pre-grab subset without a marker through eviction's same-row re-arm;
+# movies join this enumeration ONLY when their marker is armed, which identifies
+# report-issue's incomplete purge rather than an interrupted eviction (#513).
 _REARMED_OR_BLOCKED_STATUSES: frozenset[str] = _REARMED_RECOVERY_STATUSES | {
     _BLOCKED_BY_REMNANTS_STATUS
 }
@@ -244,7 +248,9 @@ _STALE_SEASON_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = _REARMED_RECOVERY_STAT
     RequestStatus.failed.value,
 }
 
-_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = frozenset({RequestStatus.evicted.value})
+_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = (
+    frozenset({RequestStatus.evicted.value}) | _REARMED_OR_BLOCKED_STATUSES
+)
 
 # In-PROCESS sweep serialization latch: :func:`run_eviction_sweep` no-ops (with
 # a log line) when another sweep is still running. Exactly two actors ever call
@@ -1394,8 +1400,9 @@ async def _resume_interrupted_evictions(
       the eviction fresh through the normal claim -> purge path). File gone ->
       finalize now (CAS-clear breadcrumb as the single-winner gate, history row,
       the Plex refresh the crash swallowed).
-    * PRE-GRAB-or-CANCELLED + breadcrumb (TV only; every status in
-      :data:`_REARMED_RECOVERY_STATUSES`) -- an in-window re-request re-armed the
+    * PRE-GRAB-or-CANCELLED + breadcrumb (TV's same-row eviction re-arm, or a
+      MARKER-GATED movie correction; every status in
+      :data:`_REARMED_RECOVERY_STATUSES`) -- an in-window TV re-request re-armed the
       claimed season row (``ensure_seasons``, ``evicted`` -> ``pending``) before
       recovery ran, so the ``evicted`` enumeration alone would MISS it and let
       the re-grab download a duplicate of a file that never left. The re-arm
@@ -1414,11 +1421,14 @@ async def _resume_interrupted_evictions(
       gone -> the disk-truth flip (``cancelled`` -> ``evicted``, so
       ``evicted_seasons`` -- rightly cancelled-blind -- keeps subtracting);
       file present -> the fold to ``available`` (the aborted re-grab left a
-      live file). Movies have no same-row re-arm (a movie re-request always
-      creates a NEW row; a movie ``searching``/``cancelled`` + breadcrumb row
-      is report-issue's failed-purge redo -- a deliberately settled correction
-      whose kept breadcrumb is the orphan-reclaim handle -- and must never be
-      touched), so this shape is season-only.
+      live file). A movie has no same-row EVICTION re-arm (a re-request creates
+      a new row), but report-issue does re-arm the same movie row. Movie rows
+      join this recovery shape ONLY with an armed marker over their breadcrumb:
+      that durable fact proves correction's delete began and was not shown to
+      finish. The pass then uses :func:`_resume_one`'s marker-owned convergence
+      without folding the correction or changing its status; an unmarked
+      ``searching``/``cancelled`` movie breadcrumb remains the deliberately
+      settled orphan-reclaim handle and is left alone (#513).
 
     Before restoring/folding ANY file-present row, :func:`_path_claimed_by_another_row`
     distinguishes interrupted from FINALIZED-BUT-SUPERSEDED: if another live row
@@ -1468,6 +1478,35 @@ async def _resume_interrupted_evictions(
                 media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
             )
             pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
+        # Movie report-issue re-arms the SAME row and preserves its breadcrumb when
+        # the purge is incomplete. Unlike TV's same-row eviction re-arm, status plus
+        # breadcrumb alone is therefore not a recovery signature: a failed but
+        # provably untouched correction deliberately keeps that orphan-reclaim
+        # handle. The durable marker is the discriminator (#513). Enumerate every
+        # status the replacement can reach, including import_blocked (the
+        # deterministic destination deadlock), but only while the marker still
+        # covers this row's own breadcrumb.
+        for recovery_status in sorted(_REARMED_OR_BLOCKED_STATUSES):
+            for row in await request_repo.list_by_status(recovery_status):
+                if (
+                    row.media_type != "movie"
+                    or row.library_path is None
+                    or not _owned_by_root(row.library_path, root_path, all_roots)
+                    or not _partial_delete_outstanding(row.partial_delete_path, row.library_path)
+                ):
+                    continue
+                pairs.append(
+                    (
+                        row.library_path,
+                        row.title,
+                        row.partial_delete_path,
+                        _MoviePending(
+                            media_request_id=row.id,
+                            tmdb_id=row.tmdb_id,
+                            size_bytes=None,
+                        ),
+                    )
+                )
     else:
         season_repo = SqlSeasonRequestRepository(session)
         request_repo = SqlRequestRepository(session)
@@ -2031,6 +2070,18 @@ async def _resume_one(
     measure, so the sweep can re-baseline its pressure accounting (its disk
     snapshot is taken before recovery runs)."""
     season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
+    if purge_service.purge_in_progress(library_path):
+        _logger.info(
+            "deferring recovery of %r%s: an operator correction holds an active "
+            "purge claim over its path",
+            _safe_title(title),
+            season_note,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2236,10 +2287,7 @@ async def _resume_one(
             # letting a re-request mint 'available' off stale Plex over the
             # just-deleted file. The file is genuinely gone; flip to 'evicted' (CAS
             # from {cancelled} only -- every other status is left exactly as the
-            # normal finalize leaves it). Movies never need this: their re-grabs are
-            # SEPARATE rows, so the original row stays 'evicted' and the
-            # newest-non-cancelled guard already holds (and an 'evicted' movie row
-            # itself is not cancellable at all).
+            # normal finalize leaves it).
             await season_request_service.set_status_if_in(
                 session,
                 media_request_id=pending.media_request_id,
@@ -2248,6 +2296,11 @@ async def _resume_one(
                 allowed_from=frozenset({RequestStatus.cancelled.value}),
                 tolerate_active_conflict=True,
             )
+        # A movie correction needs no corresponding status rewrite (#513): its
+        # available row was itself re-armed by report-issue, and movie availability
+        # has no cancelled-blind per-season set like ``evicted_seasons``. Keep the
+        # surfaced replacement/cancellation status; clearing the disk breadcrumb and
+        # marker is the honest terminal-status treatment.
         session.add(
             DownloadHistory(
                 tmdb_id=pending.tmdb_id,

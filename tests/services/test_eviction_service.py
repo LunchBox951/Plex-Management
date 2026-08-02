@@ -8569,6 +8569,268 @@ async def test_a_cancelled_regrabs_failed_retry_keeps_the_breadcrumb_and_refresh
 
 
 # --------------------------------------------------------------------------- #
+# Issue #513: movie report-issue purges use the same durable marker as seasons,
+# so their remnants need the same recovery consumer before deterministic movie
+# destinations can accept a replacement.
+# --------------------------------------------------------------------------- #
+async def _rearmed_partial_movie(
+    sm: SessionMaker,
+    *,
+    tmdb_id: int,
+    title: str,
+    movie_dir: Path,
+    status: RequestStatus,
+) -> int:
+    """Seed a movie correction whose incomplete purge left ``movie_dir``."""
+    request_id = await _movie(
+        sm,
+        tmdb_id=tmdb_id,
+        title=title,
+        library_path=str(movie_dir),
+        status=status,
+    )
+    async with sm() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.partial_delete_path = str(movie_dir)
+        await session.commit()
+    return request_id
+
+
+async def test_movie_correction_recovery_clears_remnants_blocking_replacement_import(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #513's deterministic deadlock, end to end.
+
+    A movie report-issue partial purge leaves the title directory plus its old
+    deterministic filename. The replacement cannot overwrite it, so recovery
+    must finish the marker owner's purge before that same placement can succeed.
+    """
+    root = tmp_path / "movies"
+    movie_dir = root / "Blocked By Movie Remnants (2026)"
+    movie_dir.mkdir(parents=True)
+    destination = movie_dir / "Blocked By Movie Remnants (2026).mkv"
+    destination.write_bytes(b"old" * 512)
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5131,
+        title="Blocked By Movie Remnants",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+    replacement = tmp_path / "downloads" / destination.name
+    replacement.parent.mkdir(parents=True)
+    replacement.write_bytes(b"new" * 512)
+    fs = LocalFileSystem(library_roots=[str(root)])
+
+    with pytest.raises(FileExistsError):
+        fs.hardlink_or_copy(replacement, destination, root=root)
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=fs,
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not movie_dir.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.searching
+    assert row.library_path is None
+    assert row.partial_delete_path is None
+
+    movie_dir.mkdir(parents=True)
+    fs.hardlink_or_copy(replacement, destination, root=root)
+    assert destination.read_bytes() == b"new" * 512
+
+
+async def test_movie_correction_recovery_unblocks_import_blocked_marker_owner(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A replacement already blocked by the remnants still owns its download row;
+    that settled import must not be mistaken for a competing transfer."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Already Blocked Movie (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Already Blocked Movie (2026).mkv").write_bytes(b"old" * 512)
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5132,
+        title="Already Blocked Movie",
+        movie_dir=movie_dir,
+        status=RequestStatus.import_blocked,
+    )
+    async with sessionmaker_() as session:
+        download = Download(
+            torrent_hash="blocked-movie-import",
+            status=DownloadState.ImportBlocked.value,
+            media_request_id=request_id,
+            media_type=MediaType.movie,
+            failed_reason="destination exists with different content",
+        )
+        session.add(download)
+        await session.commit()
+        download_id = download.id
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert not movie_dir.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        download = await session.get(Download, download_id)
+    assert row is not None
+    assert row.status is RequestStatus.import_blocked
+    assert row.library_path is None
+    assert row.partial_delete_path is None
+    assert download is not None
+    assert download.status == DownloadState.ImportBlocked.value
+
+
+async def test_unmarked_movie_correction_breadcrumb_is_not_a_recovery_target(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """The #513 discriminator is the durable marker, not status + breadcrumb.
+
+    A provably untouched failed report-issue purge deliberately retains its
+    breadcrumb as the orphan-reclaim handle and must remain settled.
+    """
+    root = tmp_path / "movies"
+    movie_dir = root / "Untouched Failed Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    leftover = movie_dir / "Untouched Failed Correction (2026).mkv"
+    leftover.write_bytes(b"intact")
+    request_id = await _movie(
+        sessionmaker_,
+        tmdb_id=5133,
+        title="Untouched Failed Correction",
+        library_path=str(movie_dir),
+        status=RequestStatus.cancelled,
+    )
+
+    async with sessionmaker_() as session:
+        outcomes = await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert outcomes == []
+    assert leftover.read_bytes() == b"intact"
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.cancelled
+    assert row.library_path == str(movie_dir)
+    assert row.partial_delete_path is None
+
+
+async def test_cancelled_movie_correction_recovery_preserves_cancelled_status(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Finishing a cancelled movie correction purge clears disk facts only.
+
+    Unlike TV, movies have no cancelled-blind per-season availability subtraction
+    that requires a disk-truth flip to ``evicted``; the user's settled intent stays.
+    """
+    root = tmp_path / "movies"
+    movie_dir = root / "Cancelled Movie Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Cancelled Movie Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5134,
+        title="Cancelled Movie Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.cancelled,
+    )
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert not movie_dir.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.cancelled
+    assert row.library_path is None
+    assert row.partial_delete_path is None
+
+
+async def test_movie_correction_recovery_defers_during_active_correction_purge(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Issue #519's path claim protects the newly enumerated movie shape too."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Correction Still Purging (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Correction Still Purging (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5135,
+        title="Correction Still Purging",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+
+    purge_service.begin_purge(str(movie_dir))
+    try:
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=FakeLibrary(),
+                fs=LocalFileSystem(library_roots=[str(root)]),
+                media_type="movie",
+                root_path=str(root),
+                threshold_pct=101.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+    finally:
+        purge_service.end_purge(str(movie_dir))
+
+    assert outcomes == []
+    assert movie_dir.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.library_path == str(movie_dir)
+    assert row.partial_delete_path == str(movie_dir)
+
+
+# --------------------------------------------------------------------------- #
 # Codex round-4 P1: an incomplete purge's remnants BLOCK the replacement import
 # (deterministic destinations + a filesystem that refuses to overwrite), so the
 # marker's owner must finish its own purge rather than delegate it to an import
