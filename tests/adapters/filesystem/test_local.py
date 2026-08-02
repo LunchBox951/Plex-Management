@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import os
 import shutil
 import signal
@@ -432,6 +433,45 @@ def test_publish_lock_empty_expired_lock_is_reclaimed(tmp_path: Path) -> None:
     LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
 
     assert dst.read_text() == "payload"
+    assert not lock.exists()
+
+
+def test_publish_lock_suspended_creator_cannot_be_reclaimed_after_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A creator paused after create but before its PID write keeps exclusive inode
+    ownership; aging its still-empty lock cannot admit a second publisher."""
+    first_src = tmp_path / "first.mkv"
+    first_src.write_text("first publisher")
+    second_src = tmp_path / "second.mkv"
+    second_src.write_text("second publisher")
+    dst = tmp_path / "dst.mkv"
+    lock = tmp_path / ".dst.mkv.publish.lock"
+    real_write = os.write
+    write_intercepted = False
+
+    def _suspend_before_pid_write(fd: int, data: bytes) -> int:
+        nonlocal write_intercepted
+        if not write_intercepted and data == str(os.getpid()).encode("ascii"):
+            write_intercepted = True
+            before = os.fstat(fd)
+            aged = time.time() - (_EMPTY_LOCK_STALE_SECONDS + 5)
+            os.utime(lock, (aged, aged))
+
+            with pytest.raises(FileExistsError):
+                LocalFileSystem().hardlink_or_copy(second_src, dst, root=tmp_path)
+
+            after = lock.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert after.st_size == 0
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", _suspend_before_pid_write)
+
+    LocalFileSystem().hardlink_or_copy(first_src, dst, root=tmp_path)
+
+    assert write_intercepted
+    assert dst.read_text() == "first publisher"
     assert not lock.exists()
 
 
@@ -2563,12 +2603,11 @@ def test_remove_published_refuses_fifo_replacing_an_inspected_stale_lock_without
     publication = fs.hardlink_or_copy(src, dst, root=root)
     lock = dst.parent / f".{dst.name}.publish.lock"
     lock.write_text("999999999")
-    inspected = lock.stat()
 
-    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+    def _replace_after_inspection(_lock_fd: int) -> bool:
         lock.unlink()
         os.mkfifo(lock)
-        return (inspected.st_dev, inspected.st_ino)
+        return True
 
     monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
 
@@ -2687,13 +2726,12 @@ def test_remove_published_refuses_when_stale_lock_is_replaced_before_reclaim(
     publication = fs.hardlink_or_copy(src, dst, root=root)
     lock = dst.parent / f".{dst.name}.publish.lock"
     lock.write_text("999999999")
-    inspected = lock.stat()
 
-    def _replace_after_inspection(_dir_fd: int, _lock_name: str) -> tuple[int, int]:
+    def _replace_after_inspection(_lock_fd: int) -> bool:
         replacement = tmp_path / "replacement.lock"
         replacement.write_text(str(os.getpid()))
         os.replace(replacement, lock)
-        return (inspected.st_dev, inspected.st_ino)
+        return True
 
     monkeypatch.setattr(local_fs, "_lock_is_stale", _replace_after_inspection)
 
@@ -2702,6 +2740,51 @@ def test_remove_published_refuses_when_stale_lock_is_replaced_before_reclaim(
 
     assert dst.exists()
     assert lock.read_text() == str(os.getpid())
+
+
+def test_remove_published_excludes_replacement_at_stale_lock_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publisher cannot replace a stale lock between final proof and unlink."""
+    root = tmp_path / "library"
+    root.mkdir()
+    src = tmp_path / "src.mkv"
+    src.write_text("payload")
+    dst = root / "Some Show (2020)" / "Season 01" / "Some Show - S01E01.mkv"
+    fs = LocalFileSystem()
+    publication = fs.hardlink_or_copy(src, dst, root=root)
+    lock = dst.parent / f".{dst.name}.publish.lock"
+    lock.write_text("999999999")
+    real_unlink = os.unlink
+    replacement_attempted = False
+
+    def _contend_at_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replacement_attempted
+        if path == lock.name and dir_fd is not None and not replacement_attempted:
+            replacement_attempted = True
+            contender_fd = os.open(
+                path,
+                os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dir_fd,
+            )
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(contender_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(contender_fd)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _contend_at_unlink)
+
+    fs.remove_published(dst, root=root, identity=publication.identity)
+
+    assert replacement_attempted
+    assert not dst.exists()
+    assert not lock.exists()
 
 
 def test_remove_published_refuses_to_unlink_a_replacement(tmp_path: Path) -> None:
