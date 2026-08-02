@@ -49,7 +49,7 @@ from plex_manager.models import (
     User,
 )
 from plex_manager.ports.download_client import AddResult
-from plex_manager.ports.metadata import MovieMetadata
+from plex_manager.ports.metadata import MovieMetadata, TvMetadata
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -4234,6 +4234,85 @@ async def test_admin_cancel_request_keeps_every_subscriber(
             .all()
         )
     assert set(subs) == {owner_id, other_id, third_id}
+
+
+async def test_admin_cancel_serializes_after_a_concurrent_tv_dedup_join(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admin cancellation sees TV seasons joined before the shared media lock."""
+    tmdb_id = 3670
+    tmdb = FakeTmdb(
+        shows={
+            tmdb_id: TvMetadata(
+                tmdb_id=tmdb_id,
+                title="Lock Boundary Show",
+                year=2026,
+                season_count=2,
+            )
+        }
+    )
+    async with sessionmaker_() as session:
+        request = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=tmdb_id,
+            media_type="tv",
+            seasons=[1],
+        )
+    request_id = request.id
+
+    real_acquire = SqlRequestRepository.acquire_media_lock
+    state: dict[str, bool | int | None] = {
+        "admin_lock_observed": False,
+        "inside_join": False,
+        "joined_request_id": None,
+    }
+
+    async def join_before_admin_lock(
+        self: SqlRequestRepository, lock_tmdb_id: int, media_type: str
+    ) -> None:
+        if not state["inside_join"] and not state["admin_lock_observed"]:
+            state["admin_lock_observed"] = True
+            state["inside_join"] = True
+            try:
+                async with sessionmaker_() as joining_session:
+                    joined = await request_service.create_request(
+                        joining_session,
+                        tmdb,
+                        tmdb_id=tmdb_id,
+                        media_type="tv",
+                        seasons=[2],
+                    )
+                state["joined_request_id"] = joined.id
+            finally:
+                state["inside_join"] = False
+        await real_acquire(self, lock_tmdb_id, media_type)
+
+    monkeypatch.setattr(SqlRequestRepository, "acquire_media_lock", join_before_admin_lock)
+
+    async with sessionmaker_() as session:
+        cancelled = await correction_service.cancel_request(session, None, request_id=request_id)
+
+    assert state["admin_lock_observed"] is True
+    assert state["joined_request_id"] == request_id
+    assert cancelled.status == RequestStatus.cancelled.value
+    async with sessionmaker_() as session:
+        parent = await session.get(MediaRequest, request_id)
+        seasons = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == request_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert parent is not None and parent.status is RequestStatus.cancelled
+    assert {row.season_number: row.status for row in seasons} == {
+        1: RequestStatus.cancelled,
+        2: RequestStatus.cancelled,
+    }
 
 
 async def test_withdraw_last_participant_on_import_blocked_is_refused(
