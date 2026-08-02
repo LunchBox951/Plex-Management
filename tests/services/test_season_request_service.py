@@ -61,8 +61,15 @@ async def _settle_available(
     await season_request_service.mark_completed(
         session, media_request_id=media_request_id, season_number=season_number
     )
+    # The promotion is bound to the completion just made (issue #494), exactly
+    # as the availability pass binds it to the one it snapshotted.
+    finalizing = await SqlSeasonRequestRepository(session).list_for_request(media_request_id)
+    observed = next(row for row in finalizing if row.season_number == season_number)
     assert await season_request_service.mark_available(
-        session, media_request_id=media_request_id, season_number=season_number
+        session,
+        media_request_id=media_request_id,
+        season_number=season_number,
+        expected_completion_generation=observed.completion_generation,
     )
 
 
@@ -443,8 +450,12 @@ async def test_mark_completed_then_mark_available_promote_the_rollup(
         assert show.status is RequestStatus.completed  # "Finalizing", not yet available
 
     async with sessionmaker_() as session:
+        seasons = await SqlSeasonRequestRepository(session).list_for_request(show_id)
         await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
+            session,
+            media_request_id=show_id,
+            season_number=1,
+            expected_completion_generation=seasons[0].completion_generation,
         )
         await session.commit()
     async with sessionmaker_() as session:
@@ -517,8 +528,10 @@ async def test_mark_available_clears_the_eviction_regrab_marker(
         season_id = season.id
 
     async with sessionmaker_() as session:
+        # The row was inserted straight at ``completed``, so it carries no
+        # completion generation -- the pass snapshots (and binds to) that NULL.
         await season_request_service.mark_available(
-            session, media_request_id=show_id, season_number=1
+            session, media_request_id=show_id, season_number=1, expected_completion_generation=None
         )
         await session.commit()
 
