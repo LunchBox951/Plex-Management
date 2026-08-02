@@ -835,11 +835,12 @@ async def create_request_result(
                 seasons=seasons,
                 episodes=episodes,
             )
-            # #358 round 2: the media lock was released above (the subscribe
+            # #358 round 2 / #367: the media lock was released above (the subscribe
             # helpers' commit, or the API-key rollback), so the join target can be
-            # settled by a concurrent sole-participant withdrawal / cancel before
-            # the season writes land. Grow the tracked set under a RE-VERIFIED
-            # lock; a settled target aborts the join with nothing written and
+            # settled by a concurrent withdrawal or admin/owner cancel before the
+            # season writes land. Every cancellation path participates in this same
+            # lock, so grow the tracked set only after a RE-VERIFIED acquisition;
+            # a settled target aborts the join with nothing written and then
             # falls back to the bounded fresh-create retry (the same outcome a
             # create arriving after the settle would get).
             grown = await _grow_tv_dedup_join(
@@ -1295,7 +1296,12 @@ async def create_request_result(
         )
         if initial_status == RequestStatus.available.value:
             # It IS in Plex — stamp library_verified_at so the record is honest.
-            await repo.mark_available(record.id)
+            # The row was just created in THIS transaction, so its own
+            # generation is the completion this stamp describes (issue #494's
+            # binding); nothing else can have re-completed it yet.
+            await repo.mark_available(
+                record.id, expected_completion_generation=record.completion_generation
+            )
         if media_type == "tv":
             # Always starts 'pending' above (the movie-only in-library short-circuit
             # never applies to tv); ensure_seasons' own per-season availability check
@@ -1697,14 +1703,24 @@ async def mark_completed(session: AsyncSession, request_id: int) -> None:
     await session.commit()
 
 
-async def mark_available(session: AsyncSession, request_id: int) -> bool:
+async def mark_available(
+    session: AsyncSession, request_id: int, *, expected_completion_generation: int | None
+) -> bool:
     """Phase 2 of honest availability: Plex has confirmed the title is in the library.
 
+    ``expected_completion_generation`` is the ``completion_generation`` the
+    caller snapshotted alongside the Plex answer it is acting on; the CAS is
+    bound to it so a row that was re-armed AND re-completed inside that
+    round-trip is not promoted on evidence about the content it no longer holds
+    (issue #494).
+
     Returns whether the row was actually promoted; ``False`` is a benign stale
-    result (the CAS lost to a concurrent correction re-arm), and the caller must
-    not count it as a promotion.
+    result (the CAS lost to a concurrent correction re-arm, or to a replacement
+    completion), and the caller must not count it as a promotion.
     """
-    promoted = await SqlRequestRepository(session).mark_available(request_id)
+    promoted = await SqlRequestRepository(session).mark_available(
+        request_id, expected_completion_generation=expected_completion_generation
+    )
     await session.commit()
     return promoted
 

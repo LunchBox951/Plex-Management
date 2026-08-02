@@ -438,6 +438,23 @@ class MediaRequest(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Monotonic counter of how many times this row has entered ``completed`` --
+    # its completion GENERATION (issue #494), bumped in SQL
+    # (``COALESCE(completion_generation, 0) + 1``) by
+    # ``SqlRequestRepository.mark_completed``, the movie's only entry into that
+    # status. Never reset: a re-arm leaves it standing so the next completion
+    # strictly exceeds every value ever snapshotted for this row.
+    #
+    # Its ONE reader is ``mark_available``'s CAS, which binds the promotion to
+    # the completion the availability pass actually observed. ``completed_at``
+    # deliberately does NOT serve that role: it is time METADATA, and two
+    # completions can share a timestamp under a coarse-resolution, frozen, or
+    # backward-adjusted clock -- a counter incremented by the database cannot
+    # collide however the wall clock behaves. ``NULL`` for a pre-migration row
+    # and for one that has never completed; that is safe, since a snapshotted
+    # ``NULL`` matches only a row that is still ``NULL`` and the first bump
+    # lands on 1.
+    completion_generation: Mapped[int | None] = mapped_column()
     library_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     library_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Convergence discriminator for the false-available MOVIE heal pass
@@ -656,6 +673,28 @@ class SeasonRequest(Base):
     installed_quality_id: Mapped[int | None] = mapped_column()
     installed_profile_index: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # WHEN this season LAST entered ``completed`` -- time METADATA only, the
+    # per-season counterpart of the instant "Finalizing" began (issue #494).
+    # Written by ``SqlSeasonRequestRepository.set_status`` / ``.set_status_if_in``
+    # whenever the target status is ``completed``, cleared when the row leaves
+    # ``completed``/``available`` (a re-arm), and left alone by the promotion to
+    # ``available``. Distinct from ``MediaRequest.completed_at``, which records a
+    # show's FIRST completion and never moves. Deliberately NOT the promotion
+    # CAS's discriminator -- see ``completion_generation`` below.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # This season's completion GENERATION: the monotonic counter the promotion
+    # CAS actually compares (issue #494), bumped in SQL alongside every
+    # ``completed`` stamp above and, unlike that timestamp, never cleared -- so
+    # the next completion strictly exceeds every value ever snapshotted for this
+    # row, even across a re-arm. The season twin of
+    # ``MediaRequest.completion_generation``; see that column for why a counter
+    # rather than the timestamp (two completions can share a clock reading, and
+    # a stale CAS bound to that reading would promote the replacement -- the very
+    # bug this closes). ``NULL`` for every pre-migration row (no backfill is
+    # possible -- the generation was never recorded) and for a row created
+    # straight at ``completed``: safe in both directions, since a snapshotted
+    # ``NULL`` matches only a still-``NULL`` row and the first bump lands on 1.
+    completion_generation: Mapped[int | None] = mapped_column()
     # The season-level mirror of ``MediaRequest.eviction_regrab`` (issue #156): ``True``
     # ONLY for a season row ``season_request_service.ensure_seasons`` created because
     # its newest tracked history was ``evicted`` -- the season-level eviction guard's

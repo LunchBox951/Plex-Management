@@ -16,7 +16,7 @@ import stat
 import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
 from unittest import mock
@@ -63,6 +63,8 @@ from plex_manager.ports.media_probe import (
     MediaProbeUnavailableError,
 )
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
+from plex_manager.repositories import requests as requests_repo
+from plex_manager.repositories import season_requests as season_requests_repo
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
@@ -4504,6 +4506,29 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
 # --------------------------------------------------------------------------- #
 
 
+def _freeze_repository_clocks(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Pin ``datetime.now`` inside both request repositories to ONE instant.
+
+    Issue #494: the promotion CAS must identify a completion by the monotonic
+    ``completion_generation``, never by ``completed_at`` -- a coarse-resolution,
+    stopped or backward-adjusted clock can stamp two successive completions with
+    the same reading, and a timestamp-bound CAS would then accept a stale answer
+    about the replaced content. Freezing the clock makes that collision the
+    condition under test instead of something the wall clock happens to avoid.
+    """
+    frozen = datetime(2026, 7, 27, 12, 0, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is UTC
+            return frozen
+
+    monkeypatch.setattr(requests_repo, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(season_requests_repo, "datetime", _FrozenDatetime)
+    return frozen
+
+
 class _BlockingPresenceLibrary(FakeLibrary):
     """Hold the availability pass between its completed-row snapshot and its write.
 
@@ -4621,6 +4646,143 @@ async def test_availability_promotion_never_overwrites_a_season_report_issue_rea
         await engine.dispose()
 
 
+async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_movie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494: the status-only CAS cannot see a REPLACEMENT completion.
+
+    The cycle snapshots a ``completed`` movie and blocks on Plex. Inside that
+    window the row is re-armed (Report Issue purges the file) AND completes
+    again -- the independent retry-import endpoint drains the replacement while
+    the availability pass is still awaiting its answer. Status alone is back to
+    ``completed``, so the #479 predicate would happily promote the REPLACEMENT
+    on an answer that described the now-purged content. Binding the CAS to the
+    snapshotted ``completion_generation`` refuses it: the row honestly stays
+    "Finalizing" until a later tick confirms the content actually there now.
+
+    Deterministic on BOTH axes, by construction rather than by timing:
+
+    * the re-arm + replacement completion are committed from a second real
+      session while the fake Plex adapter holds the pass inside ``present_ids``,
+      so the interleaving is injected rather than raced for; and
+    * the clock is frozen, so both completions carry the identical
+      ``completed_at``. That is the collision a coarse-resolution, stopped or
+      backward-adjusted clock produces in the field -- a timestamp binding would
+      match the replacement here and promote it. Only the monotonic generation
+      separates the two completions.
+    """
+    _freeze_repository_clocks(monkeypatch)
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_replaced.db")
+    try:
+        _download_id, request_id = await _seed(
+            sessionmaker_,
+            request_status=RequestStatus.completed,
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            # The ORIGINAL completion -- the one this tick's Plex answer describes.
+            await SqlRequestRepository(session).mark_completed(request_id)
+            await session.commit()
+            snapshotted = await session.get(MediaRequest, request_id)
+            assert snapshotted is not None
+            observed_completed_at = snapshotted.completed_at
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            repo = SqlRequestRepository(session)
+            await repo.reset_for_research(request_id)  # Report Issue: purged + re-armed
+            await repo.mark_completed(request_id)  # retry-import lands the REPLACEMENT
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.completed  # honest "Finalizing", not promoted
+        assert request.library_verified_at is None
+        # The replacement is indistinguishable from the original BY TIMESTAMP --
+        # a ``completed_at``-bound CAS would have matched and promoted it here.
+        assert request.completed_at == observed_completed_at
+        # The generation is what refused it.
+        assert request.completion_generation == 2
+    finally:
+        await engine.dispose()
+
+
+async def test_availability_promotion_refuses_a_stale_answer_after_episode_fallback_recompletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494: episode fallback's CAS re-completion invalidates stale evidence.
+
+    The cycle snapshots a ``completed`` season and blocks on Plex. Report Issue
+    re-arms it to ``searching`` inside that window; then the real episode-fallback
+    completion path moves it back through ``mark_completed_if_in``. The generation
+    bump in ``set_status_if_in`` makes the stale promotion CAS lose even though the
+    frozen clock gives both completions the same ``completed_at``.
+    """
+    _freeze_repository_clocks(monkeypatch)
+    sessionmaker_, engine = await _file_backed_sessionmaker(
+        tmp_path, "availability_replaced_season.db"
+    )
+    try:
+        _download_id, request_id, season_id = await _seed_tv(
+            sessionmaker_,
+            season=1,
+            request_status=RequestStatus.completed,
+            season_status="completed",
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            await season_request_service.mark_completed(
+                session, media_request_id=request_id, season_number=1
+            )
+            await session.commit()
+            snapshotted = await session.get(SeasonRequest, season_id)
+            assert snapshotted is not None
+            observed_completed_at = snapshotted.completed_at
+        library = _BlockingPresenceLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await season_request_service.reset_for_research(
+                session, media_request_id=request_id, season_number=1
+            )
+            completed = await season_request_service.mark_completed_if_in(
+                session,
+                media_request_id=request_id,
+                season_number=1,
+                allowed_from=frozenset({RequestStatus.searching.value}),
+            )
+            assert completed
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            season_row = await session.get(SeasonRequest, season_id)
+            request = await session.get(MediaRequest, request_id)
+        assert season_row is not None and season_row.status is RequestStatus.completed
+        assert request is not None and request.status is RequestStatus.completed
+        # Same collision as the movie twin: identical timestamp, different
+        # generation -- and the generation is what refused the stale answer.
+        assert season_row.completed_at == observed_completed_at
+        assert season_row.completion_generation == 2
+    finally:
+        await engine.dispose()
+
+
 async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -4695,7 +4857,12 @@ async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
         sanitized.append(value)
         return value + 1_000_000
 
-    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+    async def promotion_fails(
+        _self: SqlRequestRepository,
+        _request_id: int,
+        *,
+        expected_completion_generation: int | None,
+    ) -> bool:
         raise PlexLibraryError("Plex write failed")
 
     monkeypatch.setattr(import_service, "safe_int", test_safe_int)
@@ -4732,7 +4899,11 @@ async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
         return value + 1_000_000
 
     async def promotion_fails(
-        _session: AsyncSession, *, media_request_id: int, season_number: int
+        _session: AsyncSession,
+        *,
+        media_request_id: int,
+        season_number: int,
+        expected_completion_generation: int | None,
     ) -> bool:
         raise PlexLibraryError("Plex write failed")
 
