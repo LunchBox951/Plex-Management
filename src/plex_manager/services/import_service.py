@@ -204,13 +204,15 @@ _IN_LIBRARY_STATUSES: Final = frozenset({"available", "completed"})
 # however many rows are ACTUALLY stuck completed right now.
 _unconfirmed_warned_bucket: dict[str, int] = {}
 # First-observed-miss timestamp -- the substitute anchor for "elapsed since
-# completed" for any row with no PERSISTED completion stamp to anchor on. In
-# practice this means every TV season (``SeasonRequest`` carries no per-season
-# mirror of ``MediaRequest.completed_at``, deliberately deferred rather than
-# added here without its own migration -- see ``SqlRequestRepository.
-# heal_completed_at``'s docstring): a movie instead anchors on its real,
-# persisted ``RequestRecord.completed_at`` and only falls through to this dict
-# in the defensive (should-not-happen) case that stamp is somehow unset -- see
+# completed" for any row with no first-completion stamp to anchor on. TV's
+# ``SeasonRequest.completed_at`` is time metadata, while
+# ``completion_generation`` is the promotion CAS identity; neither is this
+# warning's anchor. A pre-migration season has no persisted completion timestamp,
+# so switching anchors would change its measurement; that is a separate behavior
+# change, deliberately not made with the CAS fix. A
+# movie instead anchors on its real, persisted ``RequestRecord.completed_at``
+# (which never moves) and only falls through to this dict in the defensive
+# (should-not-happen) case that stamp is somehow unset -- see
 # ``_unconfirmed_anchor``.
 _unconfirmed_since_fallback: dict[str, datetime] = {}
 
@@ -3298,7 +3300,13 @@ async def run_availability_cycle(
                 )
             continue
         try:
-            did_promote = await request_repo.mark_available(request.id)
+            # Bound to the completion THIS tick's Plex answer describes: the row
+            # may have been re-armed and re-imported inside the round-trip above
+            # (issue #494), and a replacement completion must not inherit a
+            # positive that was never about it.
+            did_promote = await request_repo.mark_available(
+                request.id, expected_completion_generation=request.completion_generation
+            )
             await session.commit()
         except (PlexLibraryError, PlexAuthError, NotImplementedError):
             await session.rollback()
@@ -3485,11 +3493,10 @@ async def run_availability_cycle(
                     title = await _title_for(season_request.media_request_id)
                     _check_bounded_finalizing(
                         key,
-                        # SeasonRequest carries no per-season ``completed_at``
-                        # mirror (deliberately deferred -- see the module
-                        # dict's docstring), so the anchor always falls back
-                        # to the in-memory first-observed-miss timestamp for
-                        # TV.
+                        # TV's anchor stays the in-memory first-observed-miss
+                        # timestamp. ``SeasonRequest.completed_at`` is time
+                        # metadata; ``completion_generation`` is the promotion
+                        # CAS identity. Neither is this warning's anchor.
                         _unconfirmed_anchor(key, None, now=effective_now),
                         f"{title} season {season_request.season_number}",
                         now=effective_now,
@@ -3500,6 +3507,10 @@ async def run_availability_cycle(
                     session,
                     media_request_id=season_request.media_request_id,
                     season_number=season_request.season_number,
+                    # Bound to the completion THIS tick's season_presence answer
+                    # describes (issue #494) -- the movie loop above documents
+                    # the replacement-completion window this closes.
+                    expected_completion_generation=season_request.completion_generation,
                 )
                 await session.commit()
             except (PlexLibraryError, PlexAuthError, NotImplementedError):
@@ -3523,9 +3534,8 @@ async def run_availability_cycle(
                 # is deliberately NOT recomputed either -- see
                 # ``season_request_service.mark_available`` (issue #479).
                 #
-                # TV feels a retained entry the OTHER way round: a season has no
-                # persisted ``completed_at`` to anchor on, so its anchor IS the
-                # in-memory first-observed-miss stamp. Carrying the purged
+                # TV's anchor is the in-memory first-observed-miss stamp, not
+                # the season's persisted time metadata. Carrying the purged
                 # season's stamp onto its replacement would date the fresh
                 # content from the OLD completion and warn about it immediately.
                 # A season also has the shortest route back to ``completed`` of

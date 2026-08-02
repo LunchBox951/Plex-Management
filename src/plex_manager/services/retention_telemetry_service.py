@@ -399,10 +399,7 @@ async def _candidate_context(
     timestamp (stamped by ``mark_completed``/``mark_available`` at import time)
     -- an exact reference.
 
-    TV: ``candidate.request_id`` is the ``SeasonRequest`` id. ``SeasonRequest``
-    carries no completion timestamp of its own (ADR-0012 never added one, and a
-    delete-nothing telemetry sweep is not the place to add a migration for it —
-    see the module docstring's "no schema change" constraint), so ``completed_at``
+    TV: ``candidate.request_id`` is the ``SeasonRequest`` id, but ``completed_at``
     here is the PARENT SHOW's ``MediaRequest.completed_at`` -- stamped by
     ``season_request_service._recompute_parent`` the first time any tracked season
     reaches ``completed``/``available`` (the per-season analogue of the movie
@@ -411,8 +408,22 @@ async def _candidate_context(
     show, an honest APPROXIMATION for a later season of a multi-season show (it
     reflects whenever the show's FIRST tracked season completed, not necessarily
     this one). This is a documented, known limitation, not a silently assumed
-    precision -- if week-1 telemetry shows this caveat matters for the analysis, a
-    follow-up can add a per-season ``completed_at`` column with its own migration.
+    precision.
+
+    ``SeasonRequest`` DOES now carry per-season completion columns -- issue #494
+    added ``completed_at`` (when the season last entered ``completed``) and the
+    ``completion_generation`` counter the availability promotion CAS compares --
+    but telemetry deliberately stays on the parent stamp, so nothing about this
+    function's runtime behavior changed. Those columns answer a different
+    question: the counter is an identity, not a time, and the season timestamp
+    records the LATEST completion (re-stamped on every re-import, cleared on a
+    re-arm) rather than the FIRST, which is the anchor a "how long was it
+    watchable before eviction" interval needs. It is also ``NULL`` on every row
+    that completed before that migration -- no backfill was possible -- so
+    switching onto it would turn exactly the historical rows this sweep measures
+    into "unknown". Any future move to per-season precision is therefore a
+    deliberate re-anchoring decision, NOT a missing column: do not add another
+    migration for one.
     A parent still carrying ``None`` (a row imported before the stamp existed)
     resolves to ``completed_at=None`` and the caller logs "unknown" -- see below.
 
