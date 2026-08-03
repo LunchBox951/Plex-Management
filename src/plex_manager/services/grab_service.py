@@ -32,6 +32,7 @@ from plex_manager.models import (
     DownloadHistoryEvent,
     RequestStatus,
 )
+from plex_manager.repositories.blocklist import SqlBlocklistRepository
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
@@ -393,6 +394,70 @@ async def _reuse_terminal_row(
     if record is None:  # pragma: no cover - just updated this row
         raise LookupError(f"download for hash {torrent_hash} vanished mid-grab")
     return record, True
+
+
+async def _restart_after_attachment_loss(
+    session: AsyncSession,
+    *,
+    scored: ScoredRelease,
+    source: str,
+    save_path: str,
+    category: str,
+    torrent_hash: str,
+    tmdb_id: int | None,
+    media_type: str | None,
+    qbt: DownloadClientPort,
+    actually_added: bool,
+    request_id: int | None,
+) -> bool:
+    """Restart client-add policy after terminalization wins an attachment race.
+
+    A normal grab decision already filtered the blocklist, but that snapshot may
+    predate an operator ``mark_failed`` which removes the torrent, blocklists the
+    release, and terminalizes the active row while this call tries to attach a TV
+    scope. Roll back the lost attachment transaction and recheck the fresh
+    blocklist before handing the release to the client again. A blocked stale
+    decision is refused so callers leave the re-armed scope for a fresh search.
+
+    If the release remains eligible, repeat ``qbt.add`` before terminal reuse. This
+    matters when the winning terminalization removed the first add's torrent: the
+    repeated add restores a real client torrent, while qBittorrent treats an
+    already-present hash as an idempotent no-op. Return whether either add created
+    the torrent so any later lost race still performs orphan cleanup.
+    """
+    await session.rollback()
+    if await SqlBlocklistRepository(session).is_blocklisted(
+        tmdb_id,
+        torrent_hash,
+        scored.candidate.title,
+        scored.candidate.indexer_name,
+        media_type=media_type,
+    ):
+        await session.rollback()
+        await _remove_torrent_if_added(
+            qbt,
+            torrent_hash,
+            actually_added=actually_added,
+            request_id=request_id,
+            reason="the release was blocklisted while attaching its TV scope",
+        )
+        if request_id is None:  # pragma: no cover - blocklist races require owned media
+            raise LookupError(f"blocklisted release {torrent_hash} has no request owner")
+        raise RequestNotActiveError(request_id)
+
+    await session.rollback()
+    restarted = await qbt.add(source, save_path, category)
+    restarted_hash = restarted.torrent_hash.lower() or torrent_hash
+    if restarted_hash != torrent_hash:  # pragma: no cover - a source's hash is stable
+        await _remove_torrent_if_added(
+            qbt,
+            restarted_hash,
+            actually_added=restarted.created,
+            request_id=request_id,
+            reason="the attachment-loss retry resolved to a different torrent",
+        )
+        raise GrabError(scored.candidate.title)
+    return actually_added or restarted.created
 
 
 async def _remove_torrent_if_added(
@@ -1057,6 +1122,11 @@ async def grab(
 
     target_seasons = _planned_target_seasons(scored, season)
     active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
+    # ``None`` means the ordinary first client add has not run yet. A known-hash
+    # attachment may terminalize before that add; in that case the attachment-loss
+    # restart performs the policy recheck + add itself, and stores whether it created
+    # the torrent so the ordinary add below is not repeated.
+    actually_added_after_pre_add_attachment_loss: bool | None = None
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -1098,6 +1168,22 @@ async def grab(
                 )
                 if attached is not None:
                     return attached
+                # Attachment lost to terminalization before the ordinary client add.
+                # Revalidate the current blocklist and add the torrent before the
+                # terminal-row reuse path below can resurrect the row.
+                actually_added_after_pre_add_attachment_loss = await _restart_after_attachment_loss(
+                    session,
+                    scored=scored,
+                    source=source,
+                    save_path=save_path,
+                    category=category,
+                    torrent_hash=known_hash,
+                    tmdb_id=tmdb_id,
+                    media_type=request_media_type,
+                    qbt=qbt,
+                    actually_added=False,
+                    request_id=request_id,
+                )
             else:
                 return pre
 
@@ -1129,15 +1215,23 @@ async def grab(
         if active is not None:
             raise AlreadyDownloadingError(request_id)
 
-    add_result = await qbt.add(source, save_path, category)
-    torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
-    # Whether THIS call genuinely created the torrent. False = the client
-    # reported it already present (qBittorrent's 409) and resolved to the
-    # pre-existing one -- which the lost-grab cleanups below must then never
-    # remove: it predates this grab (e.g. a still-seeding import whose data may
-    # back a live library file via hardlink), and the DB rollback preserves
-    # whatever row tracked it. See _remove_torrent_if_added.
-    actually_added = add_result.created
+    if actually_added_after_pre_add_attachment_loss is None:
+        add_result = await qbt.add(source, save_path, category)
+        torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
+        # Whether THIS call genuinely created the torrent. False = the client
+        # reported it already present (qBittorrent's 409) and resolved to the
+        # pre-existing one -- which the lost-grab cleanups below must then never
+        # remove: it predates this grab (e.g. a still-seeding import whose data may
+        # back a live library file via hardlink), and the DB rollback preserves
+        # whatever row tracked it. See _remove_torrent_if_added.
+        actually_added = add_result.created
+    else:
+        # The known-hash attachment terminalized and
+        # ``_restart_after_attachment_loss`` already repeated the full decision at
+        # the client boundary. Continue from that same known hash without adding a
+        # third time.
+        torrent_hash = known_hash or ""  # known by construction on this path
+        actually_added = actually_added_after_pre_add_attachment_loss
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -1146,6 +1240,7 @@ async def grab(
         # tracking an unmatchable row.
         raise GrabError(candidate.title)
 
+    post_add_attachment_lost = False
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
         if request_id is not None and existing.media_request_id != request_id:
@@ -1170,8 +1265,28 @@ async def grab(
             )
             if attached is not None:
                 return attached
+            post_add_attachment_lost = True
         else:
             return existing
+
+    if post_add_attachment_lost:
+        # The first post-add attachment attempt lost to terminalization. Re-run
+        # policy + client add before the very first terminal reuse CAS; delaying
+        # this until a CAS loss would still let that first CAS resurrect an
+        # operator-blocklisted row whose torrent was just removed.
+        actually_added = await _restart_after_attachment_loss(
+            session,
+            scored=scored,
+            source=source,
+            save_path=save_path,
+            category=category,
+            torrent_hash=torrent_hash,
+            tmdb_id=tmdb_id,
+            media_type=request_media_type,
+            qbt=qbt,
+            actually_added=actually_added,
+            request_id=request_id,
+        )
 
     if request_id is not None:
         active = await _active_conflict_for_targets(
@@ -1192,23 +1307,25 @@ async def grab(
 
     if existing is not None:
         try:
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                existing.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
+            while True:
+                record, claimed_reuse = await _reuse_terminal_row(
+                    session,
+                    download_repo,
+                    existing.id,
+                    torrent_hash,
+                    request_id,
+                    source=source,
+                    tmdb_id=tmdb_id,
+                    year=year,
+                    season=season,
+                    episodes=episodes,
+                    media_type=request_media_type,
+                    release_title=candidate.title,
+                    qbt=qbt,
+                    actually_added=actually_added,
+                )
+                if claimed_reuse:
+                    break
                 if record.status not in _TERMINAL_STATUS_VALUES:
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
@@ -1236,8 +1353,25 @@ async def grab(
                         )
                         if attached is not None:
                             return attached
-                    else:
-                        return record
+                        # Attachment lost to terminalization. The decision that chose
+                        # this release predates that terminal write; an operator may
+                        # also have removed and blocklisted it. Revalidate that policy
+                        # before any terminal-row reuse can resurrect the row.
+                        actually_added = await _restart_after_attachment_loss(
+                            session,
+                            scored=scored,
+                            source=source,
+                            save_path=save_path,
+                            category=category,
+                            torrent_hash=torrent_hash,
+                            tmdb_id=tmdb_id,
+                            media_type=request_media_type,
+                            qbt=qbt,
+                            actually_added=actually_added,
+                            request_id=request_id,
+                        )
+                        continue
+                    return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id)
         except IntegrityError:
             await session.rollback()
@@ -1332,25 +1466,67 @@ async def grab(
                     )
                     if attached is not None:
                         return attached
+                    # The create winner terminalized during this first attachment.
+                    # Revalidate before the first reuse CAS, just like the ordinary
+                    # post-add existing-row path above.
+                    actually_added = await _restart_after_attachment_loss(
+                        session,
+                        scored=scored,
+                        source=source,
+                        save_path=save_path,
+                        category=category,
+                        torrent_hash=torrent_hash,
+                        tmdb_id=tmdb_id,
+                        media_type=request_media_type,
+                        qbt=qbt,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                    )
                 else:
                     return winner
-            record, claimed_reuse = await _reuse_terminal_row(
-                session,
-                download_repo,
-                winner.id,
-                torrent_hash,
-                request_id,
-                source=source,
-                tmdb_id=tmdb_id,
-                year=year,
-                season=season,
-                episodes=episodes,
-                media_type=request_media_type,
-                release_title=candidate.title,
-                qbt=qbt,
-                actually_added=actually_added,
-            )
-            if not claimed_reuse:
+            while True:
+                try:
+                    record, claimed_reuse = await _reuse_terminal_row(
+                        session,
+                        download_repo,
+                        winner.id,
+                        torrent_hash,
+                        request_id,
+                        source=source,
+                        tmdb_id=tmdb_id,
+                        year=year,
+                        season=season,
+                        episodes=episodes,
+                        media_type=request_media_type,
+                        release_title=candidate.title,
+                        qbt=qbt,
+                        actually_added=actually_added,
+                    )
+                except IntegrityError:
+                    # This retry runs inside the create-conflict handler, so a new
+                    # unique conflict would otherwise bypass that handler and escape
+                    # as a 500. Settle it exactly like the original create conflict,
+                    # including cleanup of a torrent this call genuinely created.
+                    await session.rollback()
+                    if request_id is not None:
+                        active = await _active_conflict_for_targets(
+                            download_repo,
+                            request_id=request_id,
+                            target_seasons=active_guard_seasons,
+                            torrent_hash=torrent_hash,
+                        )
+                        if active is not None:
+                            await _remove_torrent_if_added(
+                                qbt,
+                                torrent_hash,
+                                actually_added=actually_added,
+                                request_id=request_id,
+                                reason="losing a retried terminal-row reuse race",
+                            )
+                            raise AlreadyDownloadingError(request_id) from None
+                    raise
+                if claimed_reuse:
+                    break
                 if record.status not in _TERMINAL_STATUS_VALUES:
                     if request_id is not None and record.media_request_id != request_id:
                         raise TorrentAlreadyTrackedError(
@@ -1377,8 +1553,25 @@ async def grab(
                         )
                         if attached is not None:
                             return attached
-                    else:
-                        return record
+                        # Attachment lost to terminalization. The decision that chose
+                        # this release predates that terminal write; an operator may
+                        # also have removed and blocklisted it. Revalidate that policy
+                        # before any terminal-row reuse can resurrect the row.
+                        actually_added = await _restart_after_attachment_loss(
+                            session,
+                            scored=scored,
+                            source=source,
+                            save_path=save_path,
+                            category=category,
+                            torrent_hash=torrent_hash,
+                            tmdb_id=tmdb_id,
+                            media_type=request_media_type,
+                            qbt=qbt,
+                            actually_added=actually_added,
+                            request_id=request_id,
+                        )
+                        continue
+                    return record
                 raise TorrentAlreadyTrackedError(torrent_hash, record.media_request_id) from None
     session.add(
         DownloadHistory(

@@ -2989,6 +2989,253 @@ async def test_grab_terminal_reuse_cas_lost_to_same_request_attaches_scope(
     assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "downloading"}
 
 
+async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_attach(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale same-hash grab must not undo an operator mark-failed correction.
+
+    The client add sees an active same-hash row, then the operator removes and
+    blocklists that release while attachment is acquiring its guard. The very first
+    terminal reuse CAS would succeed if reached, so the stale grab must recheck the
+    blocklist before that CAS and refuse instead of resurrecting a downloading row
+    for the now-removed torrent.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "reuse_attach_mark_failed.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        async with sm() as session:
+            seeded = Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+            )
+            session.add(seeded)
+            await session.commit()
+            download_id = seeded.id
+
+        real_update = grab_service.SqlDownloadRepository.update_status_if_in
+        reuse_attempts = 0
+
+        async def count_terminal_claims(
+            self: grab_service.SqlDownloadRepository,
+            row_id: int,
+            status: str,
+            allowed_from: frozenset[str],
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal reuse_attempts
+            if status == "downloading" and "failed" in allowed_from:
+                reuse_attempts += 1
+            return await real_update(self, row_id, status, allowed_from, **kwargs)
+
+        qbt = FakeQbittorrent(pre_existing={_HASH})
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+        operator_failed = False
+
+        async def mark_failed_before_attachment_lock(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal operator_failed
+            if not operator_failed:
+                operator_failed = True
+                async with sm() as other:
+                    await mark_failed(
+                        other,
+                        qbt,
+                        download_id=row_id,
+                        blocklist=True,
+                        remove_torrent=True,
+                    )
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "update_status_if_in",
+            count_terminal_claims,
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            mark_failed_before_attachment_lock,
+        )
+
+        with pytest.raises(RequestNotActiveError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless(
+                        "magnet:?xt=urn:btih:" + _HASH,
+                        "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                    ).model_copy(update={"target_seasons": (2,)}),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        assert reuse_attempts == 0
+        assert operator_failed
+        assert len(qbt.added) == 1
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            row = await session.get(Download, download_id)
+            season_two = (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 2,
+                    )
+                )
+            ).scalar_one()
+            blocklist = (await session.execute(select(Blocklist))).scalars().all()
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert row is not None
+        assert row.status == "failed"
+        assert row.media_request_id == request_id
+        assert season_two.status == RequestStatus.searching
+        assert len(blocklist) == 1
+        assert blocklist[0].torrent_hash == _HASH
+        assert history == []
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_create_race_second_reuse_conflict_cleans_orphan(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unique conflict from the create handler's second reuse CAS is translated.
+
+    Another release takes the season after same-hash attachment sees its row
+    terminalize. The retried reuse then conflicts with that active owner; grab must
+    roll back, remove the torrent it created, and raise AlreadyDownloadingError
+    rather than leak IntegrityError and the orphan.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "create_second_reuse_conflict.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        real_create = grab_service.SqlDownloadRepository.create
+        competing_id: int | None = None
+
+        async def lose_create_to_terminal_row(
+            self: grab_service.SqlDownloadRepository, **kwargs: Any
+        ) -> DownloadRecord:
+            nonlocal competing_id
+            async with sm() as other:
+                competing = Download(
+                    torrent_hash=_HASH,
+                    status="failed",
+                    media_request_id=request_id,
+                    tmdb_id=900,
+                    season=1,
+                    failed_reason="competing failure",
+                )
+                other.add(competing)
+                await other.commit()
+                competing_id = competing.id
+            return await real_create(self, **kwargs)
+
+        real_update = grab_service.SqlDownloadRepository.update_status_if_in
+        reuse_attempts = 0
+
+        async def lose_first_terminal_claim(
+            self: grab_service.SqlDownloadRepository,
+            row_id: int,
+            status: str,
+            allowed_from: frozenset[str],
+            **kwargs: Any,
+        ) -> bool:
+            nonlocal reuse_attempts
+            reuse_attempts += 1
+            if reuse_attempts == 1:
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "downloading"
+                    row.season = 1
+                    await other.commit()
+            return await real_update(self, row_id, status, allowed_from, **kwargs)
+
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+        winning_hash = "b" * 40
+        parallel_id: int | None = None
+
+        async def terminalize_and_claim_before_attachment_lock(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal parallel_id
+            if parallel_id is None:
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "failed"
+                    parallel = Download(
+                        torrent_hash=winning_hash,
+                        status="downloading",
+                        media_request_id=request_id,
+                        tmdb_id=900,
+                        season=2,
+                    )
+                    other.add(parallel)
+                    await other.commit()
+                    parallel_id = parallel.id
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "create",
+            lose_create_to_terminal_row,
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "update_status_if_in",
+            lose_first_terminal_claim,
+        )
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            terminalize_and_claim_before_attachment_lock,
+        )
+
+        qbt = FakeQbittorrent()
+        scored = _scored_hashless(
+            "magnet:?xt=urn:btih:" + _HASH,
+            "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+        ).model_copy(update={"target_seasons": (2,)})
+        with pytest.raises(AlreadyDownloadingError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        assert competing_id is not None
+        assert parallel_id is not None
+        assert reuse_attempts == 2
+        assert len(qbt.added) == 2
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            same_hash = await session.get(Download, competing_id)
+            winner = await session.get(Download, parallel_id)
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert same_hash is not None
+        assert same_hash.status == "failed"
+        assert winner is not None
+        assert winner.status == "downloading"
+        assert winner.torrent_hash == winning_hash
+        assert history == []
+    finally:
+        await engine.dispose()
+
+
 # --------------------------------------------------------------------------- #
 # Codex round-4 finding 2 (PR #117): a cancel committing while ``qbt.add`` is
 # in flight must never be overwritten back to 'downloading' by grab's post-add
