@@ -1399,6 +1399,7 @@ async def _resume_interrupted_evictions(
     media_type: Literal["movie", "tv"],
     root_path: str,
     all_roots: Sequence[str],
+    correction_only: bool = False,
 ) -> bool:
     """Recover every CLAIMED-BUT-NOT-FINALIZED eviction owned by this root
     (ADR-0012 #67, crash resumability). Keyed on the BREADCRUMB, not only on the
@@ -1467,6 +1468,14 @@ async def _resume_interrupted_evictions(
     Retrying is also the only retry such a row can ever get: an ``evicted`` row is
     invisible to candidate assembly.
 
+    ``correction_only`` narrows the enumeration to the shape an OPERATOR's
+    report-issue purge owns -- a movie row whose durable marker still covers its
+    own breadcrumb -- and drops everything retention claimed for itself (the
+    ``evicted`` shapes, and TV entirely; see the branches below). It is what
+    :func:`run_correction_recovery_sweep` runs while ``eviction_enabled`` is off,
+    so the switch that stops the retention bot never strands a correction the
+    operator already asked for.
+
     Returns whether recovery destroyed data the caller's disk snapshot (taken
     BEFORE this pass runs) does not reflect, so the sweep can re-baseline its
     pressure accounting rather than pick further victims against a stale reading.
@@ -1484,17 +1493,22 @@ async def _resume_interrupted_evictions(
     rearmed: list[tuple[str, str | None, str, str | None, _SeasonPending]] = []
     if media_type == "movie":
         request_repo = SqlRequestRepository(session)
-        for row in await request_repo.list_by_status(RequestStatus.evicted.value):
-            if (
-                row.media_type != "movie"
-                or row.library_path is None
-                or not _owned_by_root(row.library_path, root_path, all_roots)
-            ):
-                continue
-            pending: _Pending = _MoviePending(
-                media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
-            )
-            pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
+        # The claimed-eviction shape is RETENTION's own interrupted work, so it is
+        # the enumeration ``correction_only`` drops: that mode runs while the
+        # retention bot is switched off (see :func:`run_correction_recovery_sweep`)
+        # and must not finish a delete the operator turned the bot off to stop.
+        if not correction_only:
+            for row in await request_repo.list_by_status(RequestStatus.evicted.value):
+                if (
+                    row.media_type != "movie"
+                    or row.library_path is None
+                    or not _owned_by_root(row.library_path, root_path, all_roots)
+                ):
+                    continue
+                pending: _Pending = _MoviePending(
+                    media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
+                )
+                pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
         # Movie report-issue re-arms the SAME row and preserves its breadcrumb when
         # the purge is incomplete. Unlike TV's same-row eviction re-arm, status plus
         # breadcrumb alone is therefore not a recovery signature: a failed but
@@ -1525,7 +1539,17 @@ async def _resume_interrupted_evictions(
                         ),
                     )
                 )
-    else:
+    elif not correction_only:
+        # TV is absent from ``correction_only`` deliberately. A season's marker can
+        # sit over EITHER a correction purge or retention's own same-row eviction
+        # re-arm (``ensure_seasons`` rewrites the claimed row's status out from
+        # under it), so nothing on the row distinguishes the two -- and with the
+        # retention bot switched off, the conservative reading is the only honest
+        # one. Movies carry no such ambiguity: an eviction re-request lands on a NEW
+        # row, so a marker over a non-``evicted`` movie breadcrumb is report-issue's
+        # purge by construction (#513). A TV remnant still converges on the next
+        # enabled sweep, and the manual free-space button (which ignores the switch)
+        # reaches it at any time.
         season_repo = SqlSeasonRequestRepository(session)
         request_repo = SqlRequestRepository(session)
         for season in await season_repo.list_by_status(RequestStatus.evicted.value):
@@ -3395,6 +3419,84 @@ async def run_eviction_sweep(
             proactive=proactive,
             all_roots=all_roots,
             qbt=qbt,
+        )
+    finally:
+        _sweep_latch["busy"] = False
+
+
+async def run_correction_recovery_sweep(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
+) -> None:
+    """Converge one root's INTERRUPTED OPERATOR CORRECTIONS and nothing else.
+
+    ``eviction_enabled`` is the RETENTION bot's master switch, not a switch over
+    the operator's own corrections. A report-issue purge that crashed mid-delete
+    leaves remnants at a DETERMINISTIC destination, so the replacement import
+    fails (``import_blocked``) against them on every retry -- and with the bot off,
+    the periodic tick used to return before recovery ever ran, leaving that
+    deadlock to be broken only by re-enabling eviction or hitting an unrelated
+    manual action. That is exactly the terminal north star #1 forbids, so the tick
+    routes through here instead (``web/app.py``'s ``_eviction_tick_leased``).
+
+    This is :func:`_resume_interrupted_evictions` with ``correction_only=True`` and
+    NOTHING else: no candidate assembly, no pressure gate, no proactive pass, no
+    retention telemetry, no eviction -- hence no outcomes to return. Rows retention
+    claimed for itself are skipped (see that function), so a disabled bot never
+    finishes a delete the operator disabled it to stop.
+
+    Keeps two of the sweep's preconditions, for the same reasons:
+
+    * ``_sweep_latch``. Recovery must never run beside a sweep that could be
+      mid-purge on the same path; a skipped pass is retried next tick.
+    * The root disk stat. An unreadable root (missing mount) must never let a
+      breadcrumb's ``os.stat`` read as "gone" and be finalized -- skipped and
+      logged, never a crash. The reading itself is unused here: nothing in this
+      pass reasons about pressure.
+
+    An unconfigured qBittorrent (``qbt=None``) is honest, not fatal: recovery
+    defers any correction whose culprit torrent must be removed first and retries
+    on a later tick (see :func:`_resume_one_claimed`).
+    """
+    if _sweep_latch["busy"]:
+        _logger.info(
+            "correction recovery skipped for %s root %s: a sweep is already in "
+            "progress (it runs this same recovery pass)",
+            media_type,
+            root_path,
+        )
+        return
+    _sweep_latch["busy"] = True
+    try:
+        try:
+            await purge_service.run_abandonable_probe(
+                lambda: read_disk_usage(root_path),
+                root_path,
+                operation_name="correction recovery root probe",
+            )
+        except OSError as exc:
+            _logger.warning(
+                "correction recovery skipped for %s root %s (%s)",
+                media_type,
+                root_path,
+                type(exc).__name__,
+            )
+            return
+        await _resume_interrupted_evictions(
+            session=session,
+            library=library,
+            fs=fs,
+            qbt=qbt,
+            media_type=media_type,
+            root_path=root_path,
+            all_roots=all_roots if all_roots is not None else (root_path,),
+            correction_only=True,
         )
     finally:
         _sweep_latch["busy"] = False

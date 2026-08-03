@@ -552,13 +552,22 @@ class SqlRequestRepository:
         -- the exact race this guards. When this returns ``True`` the caller
         re-grabs (``pending``) instead of trusting Plex.
 
-        Keyed on the NEWEST row that either is non-cancelled OR carries a durable
-        ``library_removed_at`` stamp (``ORDER BY id DESC``). Ordinary cancellations
-        remain ignored because they say nothing about disk truth; a correction row
-        whose purge removed the old file remains authoritative even if its
-        replacement later settles ``cancelled`` or ``failed``. A fresh import clears
-        that stamp in :meth:`set_library_path`, so successfully replaced media does
-        not keep suppressing Plex truth.
+        Keyed on the NEWEST TRUTH-BEARING row (``ORDER BY id DESC``) -- one that
+        actually asserts something about the file on disk. Exactly three shapes
+        qualify: ``evicted`` (removal claimed), a durable ``library_removed_at``
+        stamp (removal proven, whatever status the row later settled at), and
+        ``available``/``completed`` (presence asserted, which legitimately ENDS an
+        older removal claim -- a re-download). Everything else is silent about
+        disk and is skipped rather than counted as "newest", so it can never
+        SHADOW older truth: a ``cancelled`` re-grab says nothing (evicted ->
+        pending -> cancelled must not reset this guard), and neither does a
+        SEPARATE newer re-request row that is merely ``pending``/``searching``/
+        ``failed`` -- it would otherwise mask the stamped correction row behind it
+        and let the next re-request mint ``available`` over media that is gone
+        while Plex is still stale. Reaching a presence row here is safe (the
+        caller already asked :meth:`find_in_library`, which found none) and keeps
+        the rule self-contained; a fresh import also clears the stamp in
+        :meth:`set_library_path`, so replaced media stops suppressing Plex truth.
         """
         stmt = (
             select(MediaRequest.status, MediaRequest.library_removed_at)
@@ -566,7 +575,13 @@ class SqlRequestRepository:
                 MediaRequest.tmdb_id == tmdb_id,
                 MediaRequest.media_type == MediaType(media_type),
                 or_(
-                    MediaRequest.status != RequestStatus.cancelled,
+                    MediaRequest.status.in_(
+                        [
+                            RequestStatus.evicted,
+                            RequestStatus.available,
+                            RequestStatus.completed,
+                        ]
+                    ),
                     MediaRequest.library_removed_at.is_not(None),
                 ),
             )
