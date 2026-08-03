@@ -2995,10 +2995,11 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
 ) -> None:
     """A stale same-hash grab must not undo an operator mark-failed correction.
 
-    The grab loses its first terminal reuse CAS to an active row, then the operator
-    removes and blocklists that release while attachment is acquiring its guard.
-    The stale grab must recheck the blocklist and refuse instead of resurrecting a
-    downloading row for the now-removed torrent.
+    The client add sees an active same-hash row, then the operator removes and
+    blocklists that release while attachment is acquiring its guard. The very first
+    terminal reuse CAS would succeed if reached, so the stale grab must recheck the
+    blocklist before that CAS and refuse instead of resurrecting a downloading row
+    for the now-removed torrent.
     """
     sm, engine = await _file_backed_sessionmaker(tmp_path, "reuse_attach_mark_failed.db")
     try:
@@ -3006,12 +3007,11 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
         async with sm() as session:
             seeded = Download(
                 torrent_hash=_HASH,
-                status="failed",
+                status="downloading",
                 media_request_id=request_id,
                 tmdb_id=900,
                 season=2,
                 release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
-                failed_reason="prior failure",
             )
             session.add(seeded)
             await session.commit()
@@ -3020,7 +3020,7 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
         real_update = grab_service.SqlDownloadRepository.update_status_if_in
         reuse_attempts = 0
 
-        async def lose_first_terminal_claim(
+        async def count_terminal_claims(
             self: grab_service.SqlDownloadRepository,
             row_id: int,
             status: str,
@@ -3028,13 +3028,8 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
             **kwargs: Any,
         ) -> bool:
             nonlocal reuse_attempts
-            reuse_attempts += 1
-            if reuse_attempts == 1:
-                async with sm() as other:
-                    row = await other.get(Download, row_id)
-                    assert row is not None
-                    row.status = "downloading"
-                    await other.commit()
+            if status == "downloading" and "failed" in allowed_from:
+                reuse_attempts += 1
             return await real_update(self, row_id, status, allowed_from, **kwargs)
 
         qbt = FakeQbittorrent(pre_existing={_HASH})
@@ -3060,7 +3055,7 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
         monkeypatch.setattr(
             grab_service.SqlDownloadRepository,
             "update_status_if_in",
-            lose_first_terminal_claim,
+            count_terminal_claims,
         )
         monkeypatch.setattr(
             grab_service.SqlDownloadRepository,
@@ -3073,13 +3068,16 @@ async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_a
                 await grab_service.grab(
                     qbt,
                     session,
-                    scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                    scored=_scored_hashless(
+                        "magnet:?xt=urn:btih:" + _HASH,
+                        "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                    ).model_copy(update={"target_seasons": (2,)}),
                     request_id=request_id,
                     tmdb_id=900,
                     season=2,
                 )
 
-        assert reuse_attempts >= 1
+        assert reuse_attempts == 0
         assert operator_failed
         assert len(qbt.added) == 1
         assert qbt.removed == [(_HASH, True)]

@@ -1122,6 +1122,11 @@ async def grab(
 
     target_seasons = _planned_target_seasons(scored, season)
     active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
+    # ``None`` means the ordinary first client add has not run yet. A known-hash
+    # attachment may terminalize before that add; in that case the attachment-loss
+    # restart performs the policy recheck + add itself, and stores whether it created
+    # the torrent so the ordinary add below is not repeated.
+    actually_added_after_pre_add_attachment_loss: bool | None = None
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -1163,6 +1168,22 @@ async def grab(
                 )
                 if attached is not None:
                     return attached
+                # Attachment lost to terminalization before the ordinary client add.
+                # Revalidate the current blocklist and add the torrent before the
+                # terminal-row reuse path below can resurrect the row.
+                actually_added_after_pre_add_attachment_loss = await _restart_after_attachment_loss(
+                    session,
+                    scored=scored,
+                    source=source,
+                    save_path=save_path,
+                    category=category,
+                    torrent_hash=known_hash,
+                    tmdb_id=tmdb_id,
+                    media_type=request_media_type,
+                    qbt=qbt,
+                    actually_added=False,
+                    request_id=request_id,
+                )
             else:
                 return pre
 
@@ -1194,15 +1215,23 @@ async def grab(
         if active is not None:
             raise AlreadyDownloadingError(request_id)
 
-    add_result = await qbt.add(source, save_path, category)
-    torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
-    # Whether THIS call genuinely created the torrent. False = the client
-    # reported it already present (qBittorrent's 409) and resolved to the
-    # pre-existing one -- which the lost-grab cleanups below must then never
-    # remove: it predates this grab (e.g. a still-seeding import whose data may
-    # back a live library file via hardlink), and the DB rollback preserves
-    # whatever row tracked it. See _remove_torrent_if_added.
-    actually_added = add_result.created
+    if actually_added_after_pre_add_attachment_loss is None:
+        add_result = await qbt.add(source, save_path, category)
+        torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
+        # Whether THIS call genuinely created the torrent. False = the client
+        # reported it already present (qBittorrent's 409) and resolved to the
+        # pre-existing one -- which the lost-grab cleanups below must then never
+        # remove: it predates this grab (e.g. a still-seeding import whose data may
+        # back a live library file via hardlink), and the DB rollback preserves
+        # whatever row tracked it. See _remove_torrent_if_added.
+        actually_added = add_result.created
+    else:
+        # The known-hash attachment terminalized and
+        # ``_restart_after_attachment_loss`` already repeated the full decision at
+        # the client boundary. Continue from that same known hash without adding a
+        # third time.
+        torrent_hash = known_hash or ""  # known by construction on this path
+        actually_added = actually_added_after_pre_add_attachment_loss
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -1211,6 +1240,7 @@ async def grab(
         # tracking an unmatchable row.
         raise GrabError(candidate.title)
 
+    post_add_attachment_lost = False
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
         if request_id is not None and existing.media_request_id != request_id:
@@ -1235,8 +1265,28 @@ async def grab(
             )
             if attached is not None:
                 return attached
+            post_add_attachment_lost = True
         else:
             return existing
+
+    if post_add_attachment_lost:
+        # The first post-add attachment attempt lost to terminalization. Re-run
+        # policy + client add before the very first terminal reuse CAS; delaying
+        # this until a CAS loss would still let that first CAS resurrect an
+        # operator-blocklisted row whose torrent was just removed.
+        actually_added = await _restart_after_attachment_loss(
+            session,
+            scored=scored,
+            source=source,
+            save_path=save_path,
+            category=category,
+            torrent_hash=torrent_hash,
+            tmdb_id=tmdb_id,
+            media_type=request_media_type,
+            qbt=qbt,
+            actually_added=actually_added,
+            request_id=request_id,
+        )
 
     if request_id is not None:
         active = await _active_conflict_for_targets(
@@ -1416,6 +1466,22 @@ async def grab(
                     )
                     if attached is not None:
                         return attached
+                    # The create winner terminalized during this first attachment.
+                    # Revalidate before the first reuse CAS, just like the ordinary
+                    # post-add existing-row path above.
+                    actually_added = await _restart_after_attachment_loss(
+                        session,
+                        scored=scored,
+                        source=source,
+                        save_path=save_path,
+                        category=category,
+                        torrent_hash=torrent_hash,
+                        tmdb_id=tmdb_id,
+                        media_type=request_media_type,
+                        qbt=qbt,
+                        actually_added=actually_added,
+                        request_id=request_id,
+                    )
                 else:
                     return winner
             while True:
