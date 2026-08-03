@@ -330,6 +330,13 @@ class _TvImportFailure(NamedTuple):
     reason: str
 
 
+class _TvImportSuccess(NamedTuple):
+    """One scan-confirmed scope awaiting parent-locked final bookkeeping."""
+
+    plan: _TvImportPlan
+    imported: tuple[tuple[str, PurePosixPath], ...]
+
+
 def _is_settled_for_import(status: DownloadStatus) -> bool:
     return status.progress >= 1.0 and status.raw_state in _IMPORT_READY_RAW_STATES
 
@@ -1619,6 +1626,7 @@ async def _mark_tv_scope_blocked(
     *,
     download_id: int,
     failure: _TvImportFailure,
+    update_season: bool = True,
 ) -> None:
     await _set_download_scope_status(
         session,
@@ -1628,12 +1636,13 @@ async def _mark_tv_scope_blocked(
         season=failure.target.season,
         status=RequestStatus.import_blocked.value,
     )
-    await season_request_service.set_status(
-        session,
-        media_request_id=failure.target.request.id,
-        season_number=failure.target.season,
-        status=RequestStatus.import_blocked.value,
-    )
+    if update_season:
+        await season_request_service.set_status(
+            session,
+            media_request_id=failure.target.request.id,
+            season_number=failure.target.season,
+            status=RequestStatus.import_blocked.value,
+        )
 
 
 class _LateScopeReadout(NamedTuple):
@@ -1650,7 +1659,7 @@ async def _reread_scopes_for_finalize(
     request_id: int,
     planned_scope_ids: frozenset[int],
 ) -> _LateScopeReadout:
-    """Re-read this download's scopes immediately before the finalize swap (#476).
+    """Lock/re-read this download's scopes before scoped bookkeeping and the finalize swap (#476).
 
     The scope set a pass plans from is read BEFORE its probe/copy/scan work, and the
     same-hash attach path legitimately gives a still-``importing`` row a new scope,
@@ -1898,6 +1907,7 @@ async def _import_tv_targets_locked(
         await session.commit()
 
         successful_dirs: list[Path] = []
+        successful_imports: list[_TvImportSuccess] = []
         pack_blocklisted = False
         for plan in plans:
             placed_paths: list[tuple[Path, PublishedFileIdentity]] = []
@@ -1936,62 +1946,88 @@ async def _import_tv_targets_locked(
                     )
                     continue
 
-                for basename, relative in imported:
-                    session.add(
-                        DownloadHistory(
-                            tmdb_id=plan.target.request.tmdb_id,
-                            torrent_hash=torrent_hash,
-                            event_type=DownloadHistoryEvent.imported,
-                            source_title=None,
-                            message=f"imported {basename} to {relative}",
-                        )
+                successful_imports.append(_TvImportSuccess(plan=plan, imported=tuple(imported)))
+                successful_dirs.append(plan.season_dir)
+
+        if not successful_dirs:
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                _failure_summary(failures),
+                request_id=request.id,
+                seasons=target_seasons,
+                clear_download_path=True,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+
+        readout = await _reread_scopes_for_finalize(
+            download_repo,
+            download_id=download_id,
+            request_id=request.id,
+            planned_scope_ids=frozenset(
+                target.scope_id for target in targets if target.scope_id is not None
+            ),
+        )
+        for success in successful_imports:
+            plan = success.plan
+            for basename, relative in success.imported:
+                session.add(
+                    DownloadHistory(
+                        tmdb_id=plan.target.request.tmdb_id,
+                        torrent_hash=torrent_hash,
+                        event_type=DownloadHistoryEvent.imported,
+                        source_title=None,
+                        message=f"imported {basename} to {relative}",
                     )
-                await season_request_service.set_library_path(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    library_path=str(plan.season_dir),
                 )
-                installed_quality, installed_profile_index = _lowest_profile_quality(
-                    plan.accepted, profile
-                )
-                await season_request_service.set_installed_quality(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    quality_id=installed_quality.id,
-                    profile_index=installed_profile_index,
-                )
-                # Episode-level completeness for THIS season of the multi-target
-                # plan (P2, issue #178 review round 2) -- the multi-season mirror
-                # of ``_import_tv_locked``'s conditional completion. Without it,
-                # target rows a prior fallback cycle seeded stay ``pending`` after
-                # the pack imports, and the next airing refresh sees
-                # ``target > imported`` and re-arms an already-imported season for
-                # duplicate grabs. Same degradation rule: an unseeded season
-                # (empty target) completes on import exactly as before.
-                plan_season_row = await SqlSeasonRequestRepository(session).ensure(
-                    plan.target.request.id,
-                    plan.target.season,
-                    status=RequestStatus.pending.value,
-                )
-                plan_state_repo = SqlSeasonEpisodeStateRepository(session)
-                # Exclude stale grabbed rows from the completion target (P2,
-                # round 3) -- see the single-season path's comment for the full
-                # rationale; identical semantics here.
-                plan_target = frozenset(
-                    state.episode_number
-                    for state in await plan_state_repo.list_for_season(plan_season_row.id)
-                ) - await plan_state_repo.stale_grabbed_episodes(plan_season_row.id)
-                plan_episodes = {ep for result in plan.accepted for ep in result.episodes}
-                plan_complete = await season_episode_service.apply_import(
-                    session,
-                    media_request_id=plan.target.request.id,
-                    season_number=plan.target.season,
-                    imported_episodes=plan_episodes,
-                    download_id=download_id,
-                    target=plan_target,
-                )
+            await season_request_service.set_library_path(
+                session,
+                media_request_id=plan.target.request.id,
+                season_number=plan.target.season,
+                library_path=str(plan.season_dir),
+            )
+            installed_quality, installed_profile_index = _lowest_profile_quality(
+                plan.accepted, profile
+            )
+            await season_request_service.set_installed_quality(
+                session,
+                media_request_id=plan.target.request.id,
+                season_number=plan.target.season,
+                quality_id=installed_quality.id,
+                profile_index=installed_profile_index,
+            )
+            # Episode-level completeness for THIS season of the multi-target
+            # plan (P2, issue #178 review round 2) -- the multi-season mirror
+            # of ``_import_tv_locked``'s conditional completion. Without it,
+            # target rows a prior fallback cycle seeded stay ``pending`` after
+            # the pack imports, and the next airing refresh sees
+            # ``target > imported`` and re-arms an already-imported season for
+            # duplicate grabs. Same degradation rule: an unseeded season
+            # (empty target) completes on import exactly as before.
+            plan_season_row = await SqlSeasonRequestRepository(session).ensure(
+                plan.target.request.id,
+                plan.target.season,
+                status=RequestStatus.pending.value,
+            )
+            plan_state_repo = SqlSeasonEpisodeStateRepository(session)
+            # Exclude stale grabbed rows from the completion target (P2,
+            # round 3) -- see the single-season path's comment for the full
+            # rationale; identical semantics here.
+            plan_target = frozenset(
+                state.episode_number
+                for state in await plan_state_repo.list_for_season(plan_season_row.id)
+            ) - await plan_state_repo.stale_grabbed_episodes(plan_season_row.id)
+            plan_episodes = {ep for result in plan.accepted for ep in result.episodes}
+            plan_complete = await season_episode_service.apply_import(
+                session,
+                media_request_id=plan.target.request.id,
+                season_number=plan.target.season,
+                imported_episodes=plan_episodes,
+                download_id=download_id,
+                target=plan_target,
+            )
+            if plan.target.season not in readout.late_seasons:
                 if plan_complete:
                     await season_request_service.mark_completed(
                         session,
@@ -2026,39 +2062,24 @@ async def _import_tv_targets_locked(
                     await SqlSeasonRequestRepository(session).schedule_search(
                         plan_season_row.id, search_attempts=0, next_search_at=None
                     )
-                await _set_download_scope_status(
-                    session,
-                    download_id=download_id,
-                    scope_id=plan.target.scope_id,
-                    request_id=plan.target.request.id,
-                    season=plan.target.season,
-                    status="imported",
-                    completed=True,
-                )
-                successful_dirs.append(plan.season_dir)
-
-        if not successful_dirs:
-            await _block(
+            await _set_download_scope_status(
                 session,
-                download_repo,
-                download_id,
-                _failure_summary(failures),
-                request_id=request.id,
-                seasons=target_seasons,
-                clear_download_path=True,
+                download_id=download_id,
+                scope_id=plan.target.scope_id,
+                request_id=plan.target.request.id,
+                season=plan.target.season,
+                status="imported",
+                completed=True,
             )
-            return await download_repo.get_by_hash(torrent_hash)
 
         for failure in failures:
-            await _mark_tv_scope_blocked(session, download_id=download_id, failure=failure)
-        readout = await _reread_scopes_for_finalize(
-            download_repo,
-            download_id=download_id,
-            request_id=request.id,
-            planned_scope_ids=frozenset(
-                target.scope_id for target in targets if target.scope_id is not None
-            ),
-        )
+            await _mark_tv_scope_blocked(
+                session,
+                download_id=download_id,
+                failure=failure,
+                update_season=failure.target.season not in readout.late_seasons,
+            )
+
         if failures or readout.late_seasons:
             await download_repo.align_scalar_scope_with_active(download_id)
             # Partial pack: the physical row stays non-terminal (ImportBlocked) for the
