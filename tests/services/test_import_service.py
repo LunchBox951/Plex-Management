@@ -16,7 +16,7 @@ import stat
 import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
 from unittest import mock
@@ -46,9 +46,11 @@ from plex_manager.models import (
     DownloadHistory,
     DownloadHistoryEvent,
     DownloadScope,
+    EpisodeState,
     MediaRequest,
     MediaType,
     RequestStatus,
+    SeasonEpisodeState,
     SeasonRequest,
     User,
 )
@@ -61,6 +63,8 @@ from plex_manager.ports.media_probe import (
     MediaProbeUnavailableError,
 )
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
+from plex_manager.repositories import requests as requests_repo
+from plex_manager.repositories import season_requests as season_requests_repo
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.repositories.requests import SqlRequestRepository
 from plex_manager.services import (
@@ -2967,7 +2971,7 @@ async def test_import_tv_probe_outage_keeps_crash_resumed_shared_scopes_auto_ret
 
 
 async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
-    tmp_path: Path, sessionmaker_: SessionMaker
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tv_root = tmp_path / "tv"
     tv_root.mkdir()
@@ -3026,11 +3030,79 @@ async def test_import_tv_shared_torrent_keeps_download_blocked_for_failed_scope(
         download_id = download.id
         request_id = request.id
 
+    calls: list[str] = []
+    real_lock = SqlDownloadRepository.lock_if_active
+    real_list_scopes = SqlDownloadRepository.list_scopes
+    real_set_scope = import_service._set_download_scope_status  # pyright: ignore[reportPrivateUsage]
+    real_set_status = season_request_service.set_status
+
+    async def record_lock(self: SqlDownloadRepository, row_id: int) -> bool:
+        result = await real_lock(self, row_id)
+        if row_id == download_id:
+            calls.append("parent-lock")
+        return result
+
+    async def record_scopes(self: SqlDownloadRepository, row_id: int) -> list[DownloadScopeRecord]:
+        result = await real_list_scopes(self, row_id)
+        if row_id == download_id:
+            calls.append("scope-read")
+        return result
+
+    async def record_scope_status(
+        session: AsyncSession,
+        *,
+        download_id: int,
+        status: str,
+        request_id: int | None = None,
+        season: int | None = None,
+        scope_id: int | None = None,
+        completed: bool = False,
+    ) -> None:
+        if status == RequestStatus.import_blocked.value:
+            calls.append("scope-import-blocked")
+        await real_set_scope(
+            session,
+            download_id=download_id,
+            status=status,
+            request_id=request_id,
+            season=season,
+            scope_id=scope_id,
+            completed=completed,
+        )
+
+    async def record_season_status(
+        session: AsyncSession,
+        *,
+        media_request_id: int,
+        season_number: int,
+        status: str,
+        skip_if_terminal: bool = False,
+    ) -> None:
+        if status == RequestStatus.import_blocked.value:
+            calls.append("season-import-blocked")
+        await real_set_status(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+            status=status,
+            skip_if_terminal=skip_if_terminal,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", record_lock)
+    monkeypatch.setattr(SqlDownloadRepository, "list_scopes", record_scopes)
+    monkeypatch.setattr(import_service, "_set_download_scope_status", record_scope_status)
+    monkeypatch.setattr(season_request_service, "set_status", record_season_status)
+
     library = FakeLibrary()
     record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), library)
 
     assert record is not None
     assert record.status == DownloadState.ImportBlocked.value
+    finalize_lock = max(index for index, call in enumerate(calls) if call == "parent-lock")
+    assert calls[finalize_lock + 1] == "scope-read"
+    assert calls.index("scope-import-blocked") > finalize_lock
+    assert calls.index("season-import-blocked") > finalize_lock
+    assert calls.index("scope-read", finalize_lock) < calls.index("scope-import-blocked")
     assert record.failed_reason is not None
     assert "S02" in record.failed_reason
     assert record.season == 2
@@ -3134,16 +3206,29 @@ class _AttachSeasonDuringScanLibrary(FakeLibrary):
     season in a separate session — the attach landing after this pass snapshotted its
     scopes and before it finalizes."""
 
-    def __init__(self, sm: SessionMaker, *, request_id: int, season: int) -> None:
+    def __init__(
+        self,
+        sm: SessionMaker,
+        *,
+        request_id: int,
+        season: int,
+        episodes: list[int] | None = None,
+        attach_when_path_contains: str | None = None,
+    ) -> None:
         super().__init__()
         self._sm = sm
         self._request_id = request_id
         self._season = season
+        self._episodes = episodes
+        self._attach_when_path_contains = attach_when_path_contains
         self.attached = False
 
     async def trigger_scan(self, path: str, media_type: Literal["movie", "tv"]) -> None:
         await super().trigger_scan(path, media_type)
-        if self.attached:
+        if self.attached or (
+            self._attach_when_path_contains is not None
+            and self._attach_when_path_contains not in path
+        ):
             return
         self.attached = True
         async with self._sm() as session:
@@ -3154,6 +3239,7 @@ class _AttachSeasonDuringScanLibrary(FakeLibrary):
                 request_id=self._request_id,
                 tmdb_id=_TMDB_ID,
                 season=self._season,
+                episodes=self._episodes,
             )
 
 
@@ -3239,6 +3325,258 @@ async def _scope_and_claim_state(
         {scope.season_number: scope.status for scope in scopes},
         {claim.season_number: claim.status for claim in claims},
     )
+
+
+async def _seed_same_season_episode_scopes(
+    sm: SessionMaker,
+    episode_scopes: tuple[tuple[int, ...], ...],
+    *,
+    target_episodes: tuple[int, ...] = (),
+) -> tuple[int, int]:
+    """Seed active episode scopes for one downloading season."""
+    async with sm() as session:
+        request = MediaRequest(
+            tmdb_id=_TMDB_ID,
+            media_type=MediaType.tv,
+            title="Some Show",
+            year=2020,
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        season = SeasonRequest(
+            media_request_id=request.id,
+            season_number=1,
+            status=RequestStatus.downloading.value,
+        )
+        session.add(season)
+        await session.flush()
+        session.add_all(
+            [
+                SeasonEpisodeState(
+                    season_request_id=season.id,
+                    episode_number=episode,
+                    status=EpisodeState.grabbed,
+                )
+                for episode in target_episodes
+            ]
+        )
+        download = Download(
+            torrent_hash=_HASH,
+            status=DownloadState.ImportPending.value,
+            media_request_id=request.id,
+            tmdb_id=_TMDB_ID,
+            year=2020,
+            season=1,
+            episodes_json=list(episode_scopes[0]),
+            media_type=MediaType.tv,
+        )
+        session.add(download)
+        await session.flush()
+        session.add(
+            DownloadCoverageClaim(
+                download_id=download.id,
+                media_request_id=request.id,
+                season_number=1,
+                status="active",
+            )
+        )
+        session.add_all(
+            [
+                DownloadScope(
+                    download_id=download.id,
+                    media_request_id=request.id,
+                    season_request_id=season.id,
+                    season_number=1,
+                    episodes_json=list(episodes),
+                    scope_key="season:1|episodes:" + ",".join(map(str, episodes)),
+                    status="active",
+                )
+                for episodes in episode_scopes
+            ]
+        )
+        await session.commit()
+        return download.id, request.id
+
+
+async def test_import_tv_same_season_late_scope_keeps_season_downloading(
+    tmp_path: Path,
+) -> None:
+    """A late same-season scope owns the season status until a fresh pass resolves it."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_attach.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(sm, ((1,),))
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=1, episodes=[2]),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.Importing.value
+        async with sm() as session:
+            season_status = await session.scalar(
+                select(SeasonRequest.status).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert season_status == RequestStatus.downloading.value
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+        ]
+
+        async with sm() as session:
+            promoted = await run_availability_cycle(
+                library=FakeLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})}),
+                session=session,
+            )
+        assert promoted == 0
+        async with sm() as session:
+            assert (
+                await session.scalar(
+                    select(SeasonRequest.status).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 1,
+                    )
+                )
+                == RequestStatus.downloading.value
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_same_season_late_scope_skips_incomplete_success_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    """A late scope prevents a stale incomplete import from re-arming the season."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_incomplete.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(
+            sm,
+            ((1,),),
+            target_episodes=(1, 2),
+        )
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(sm, request_id=request_id, season=1, episodes=[2]),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.Importing.value
+        async with sm() as session:
+            season = await session.scalar(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+
+        assert season is not None
+        assert season.status is RequestStatus.downloading
+        assert season.search_attempts == 0
+        assert season.next_search_at is None
+        assert blocklisted == []
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+        ]
+    finally:
+        await engine.dispose()
+
+
+async def test_import_tv_same_season_late_scope_skips_stale_failure_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    """A stale failure cannot overwrite a same-season scope attached during the pass."""
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "same_season_late_failure.db")
+    try:
+        tv_root = tmp_path / "tv"
+        tv_root.mkdir()
+        release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+        _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+        _make_video(release_dir / "Some.Show.S01E02.1080p.WEB-DL.x264-GRP.mkv")
+        download_id, request_id = await _seed_same_season_episode_scopes(sm, ((1,), (3,)))
+
+        record = await _import_tv(
+            sm,
+            download_id,
+            tv_root,
+            _qbt(release_dir),
+            _AttachSeasonDuringScanLibrary(
+                sm,
+                request_id=request_id,
+                season=1,
+                episodes=[2],
+                attach_when_path_contains="Season 01",
+            ),
+        )
+
+        assert record is not None
+        assert record.status == DownloadState.ImportBlocked.value
+        async with sm() as session:
+            season_status = await session.scalar(
+                select(SeasonRequest.status).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+            scopes = (
+                (
+                    await session.execute(
+                        select(DownloadScope).where(DownloadScope.download_id == download_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert season_status == RequestStatus.downloading.value
+        assert sorted((scope.episodes_json, scope.status) for scope in scopes) == [
+            ([1], "imported"),
+            ([2], "active"),
+            ([3], RequestStatus.import_blocked.value),
+        ]
+    finally:
+        await engine.dispose()
 
 
 async def test_import_tv_scope_attached_mid_import_survives_and_imports_next_pass(
@@ -3440,6 +3778,97 @@ async def test_import_tv_releases_every_coverage_claim_when_nothing_attaches_lat
     scopes, claims = await _scope_and_claim_state(sessionmaker_, download_id)
     assert scopes == {1: "imported"}
     assert claims == {1: "released"}
+
+
+async def test_import_tv_scope_finalize_locks_and_rereads_before_success_bookkeeping(
+    tmp_path: Path, sessionmaker_: SessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    release_dir = tmp_path / "downloads" / "Some.Show.S01.1080p.WEB-DL.x264-GRP"
+    _make_video(release_dir / "Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv")
+    download_id, _request_id = await _seed_tv_pack_with_s1_scope(sessionmaker_)
+
+    calls: list[str] = []
+    real_lock = SqlDownloadRepository.lock_if_active
+    real_list_scopes = SqlDownloadRepository.list_scopes
+    real_set_scope = import_service._set_download_scope_status  # pyright: ignore[reportPrivateUsage]
+    real_set_library_path = season_request_service.set_library_path
+    real_mark_completed = season_request_service.mark_completed
+
+    async def record_lock(self: SqlDownloadRepository, row_id: int) -> bool:
+        result = await real_lock(self, row_id)
+        if row_id == download_id:
+            calls.append("parent-lock")
+        return result
+
+    async def record_scopes(self: SqlDownloadRepository, row_id: int) -> list[DownloadScopeRecord]:
+        result = await real_list_scopes(self, row_id)
+        if row_id == download_id:
+            calls.append("scope-read")
+        return result
+
+    async def record_scope_status(
+        session: AsyncSession,
+        *,
+        download_id: int,
+        status: str,
+        request_id: int | None = None,
+        season: int | None = None,
+        scope_id: int | None = None,
+        completed: bool = False,
+    ) -> None:
+        if status == "imported":
+            calls.append("scope-imported")
+        await real_set_scope(
+            session,
+            download_id=download_id,
+            status=status,
+            request_id=request_id,
+            season=season,
+            scope_id=scope_id,
+            completed=completed,
+        )
+
+    async def record_library_path(
+        session: AsyncSession, *, media_request_id: int, season_number: int, library_path: str
+    ) -> None:
+        calls.append("season-library-path")
+        await real_set_library_path(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+            library_path=library_path,
+        )
+
+    async def record_completed(
+        session: AsyncSession, *, media_request_id: int, season_number: int
+    ) -> None:
+        calls.append("season-completed")
+        await real_mark_completed(
+            session,
+            media_request_id=media_request_id,
+            season_number=season_number,
+        )
+
+    monkeypatch.setattr(SqlDownloadRepository, "lock_if_active", record_lock)
+    monkeypatch.setattr(SqlDownloadRepository, "list_scopes", record_scopes)
+    monkeypatch.setattr(import_service, "_set_download_scope_status", record_scope_status)
+    monkeypatch.setattr(season_request_service, "set_library_path", record_library_path)
+    monkeypatch.setattr(season_request_service, "mark_completed", record_completed)
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, _qbt(release_dir), FakeLibrary())
+
+    assert record is not None
+    assert record.status == DownloadState.Imported.value
+    finalize_lock = max(index for index, call in enumerate(calls) if call == "parent-lock")
+    assert calls[finalize_lock + 1] == "scope-read"
+    first_bookkeeping = min(
+        calls.index(event)
+        for event in ("season-library-path", "season-completed", "scope-imported")
+    )
+    assert finalize_lock < first_bookkeeping
+    assert calls.index("scope-read", finalize_lock) < first_bookkeeping
 
 
 async def test_import_tv_finalize_reread_locks_the_download_row_first(
@@ -4077,6 +4506,29 @@ async def test_run_availability_cycle_leaves_a_season_completed_when_not_yet_in_
 # --------------------------------------------------------------------------- #
 
 
+def _freeze_repository_clocks(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Pin ``datetime.now`` inside both request repositories to ONE instant.
+
+    Issue #494: the promotion CAS must identify a completion by the monotonic
+    ``completion_generation``, never by ``completed_at`` -- a coarse-resolution,
+    stopped or backward-adjusted clock can stamp two successive completions with
+    the same reading, and a timestamp-bound CAS would then accept a stale answer
+    about the replaced content. Freezing the clock makes that collision the
+    condition under test instead of something the wall clock happens to avoid.
+    """
+    frozen = datetime(2026, 7, 27, 12, 0, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is UTC
+            return frozen
+
+    monkeypatch.setattr(requests_repo, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(season_requests_repo, "datetime", _FrozenDatetime)
+    return frozen
+
+
 class _BlockingPresenceLibrary(FakeLibrary):
     """Hold the availability pass between its completed-row snapshot and its write.
 
@@ -4194,6 +4646,143 @@ async def test_availability_promotion_never_overwrites_a_season_report_issue_rea
         await engine.dispose()
 
 
+async def test_availability_promotion_refuses_a_stale_answer_about_a_replaced_movie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494: the status-only CAS cannot see a REPLACEMENT completion.
+
+    The cycle snapshots a ``completed`` movie and blocks on Plex. Inside that
+    window the row is re-armed (Report Issue purges the file) AND completes
+    again -- the independent retry-import endpoint drains the replacement while
+    the availability pass is still awaiting its answer. Status alone is back to
+    ``completed``, so the #479 predicate would happily promote the REPLACEMENT
+    on an answer that described the now-purged content. Binding the CAS to the
+    snapshotted ``completion_generation`` refuses it: the row honestly stays
+    "Finalizing" until a later tick confirms the content actually there now.
+
+    Deterministic on BOTH axes, by construction rather than by timing:
+
+    * the re-arm + replacement completion are committed from a second real
+      session while the fake Plex adapter holds the pass inside ``present_ids``,
+      so the interleaving is injected rather than raced for; and
+    * the clock is frozen, so both completions carry the identical
+      ``completed_at``. That is the collision a coarse-resolution, stopped or
+      backward-adjusted clock produces in the field -- a timestamp binding would
+      match the replacement here and promote it. Only the monotonic generation
+      separates the two completions.
+    """
+    _freeze_repository_clocks(monkeypatch)
+    sessionmaker_, engine = await _file_backed_sessionmaker(tmp_path, "availability_replaced.db")
+    try:
+        _download_id, request_id = await _seed(
+            sessionmaker_,
+            request_status=RequestStatus.completed,
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            # The ORIGINAL completion -- the one this tick's Plex answer describes.
+            await SqlRequestRepository(session).mark_completed(request_id)
+            await session.commit()
+            snapshotted = await session.get(MediaRequest, request_id)
+            assert snapshotted is not None
+            observed_completed_at = snapshotted.completed_at
+        library = _BlockingPresenceLibrary(available={_TMDB_ID})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            repo = SqlRequestRepository(session)
+            await repo.reset_for_research(request_id)  # Report Issue: purged + re-armed
+            await repo.mark_completed(request_id)  # retry-import lands the REPLACEMENT
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            request = await session.get(MediaRequest, request_id)
+        assert request is not None
+        assert request.status is RequestStatus.completed  # honest "Finalizing", not promoted
+        assert request.library_verified_at is None
+        # The replacement is indistinguishable from the original BY TIMESTAMP --
+        # a ``completed_at``-bound CAS would have matched and promoted it here.
+        assert request.completed_at == observed_completed_at
+        # The generation is what refused it.
+        assert request.completion_generation == 2
+    finally:
+        await engine.dispose()
+
+
+async def test_availability_promotion_refuses_a_stale_answer_after_episode_fallback_recompletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #494: episode fallback's CAS re-completion invalidates stale evidence.
+
+    The cycle snapshots a ``completed`` season and blocks on Plex. Report Issue
+    re-arms it to ``searching`` inside that window; then the real episode-fallback
+    completion path moves it back through ``mark_completed_if_in``. The generation
+    bump in ``set_status_if_in`` makes the stale promotion CAS lose even though the
+    frozen clock gives both completions the same ``completed_at``.
+    """
+    _freeze_repository_clocks(monkeypatch)
+    sessionmaker_, engine = await _file_backed_sessionmaker(
+        tmp_path, "availability_replaced_season.db"
+    )
+    try:
+        _download_id, request_id, season_id = await _seed_tv(
+            sessionmaker_,
+            season=1,
+            request_status=RequestStatus.completed,
+            season_status="completed",
+            download_status=DownloadState.Imported.value,
+        )
+        async with sessionmaker_() as session:
+            await season_request_service.mark_completed(
+                session, media_request_id=request_id, season_number=1
+            )
+            await session.commit()
+            snapshotted = await session.get(SeasonRequest, season_id)
+            assert snapshotted is not None
+            observed_completed_at = snapshotted.completed_at
+        library = _BlockingPresenceLibrary(available_tv_seasons={_TMDB_ID: frozenset({1})})
+
+        async def cycle() -> int:
+            async with sessionmaker_() as session:
+                return await run_availability_cycle(library=library, session=session)
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(library.entered_check.wait(), timeout=5)
+        async with sessionmaker_() as session:
+            await season_request_service.reset_for_research(
+                session, media_request_id=request_id, season_number=1
+            )
+            completed = await season_request_service.mark_completed_if_in(
+                session,
+                media_request_id=request_id,
+                season_number=1,
+                allowed_from=frozenset({RequestStatus.searching.value}),
+            )
+            assert completed
+            await session.commit()
+        library.resume_check.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0
+
+        async with sessionmaker_() as session:
+            season_row = await session.get(SeasonRequest, season_id)
+            request = await session.get(MediaRequest, request_id)
+        assert season_row is not None and season_row.status is RequestStatus.completed
+        assert request is not None and request.status is RequestStatus.completed
+        # Same collision as the movie twin: identical timestamp, different
+        # generation -- and the generation is what refused the stale answer.
+        assert season_row.completed_at == observed_completed_at
+        assert season_row.completion_generation == 2
+    finally:
+        await engine.dispose()
+
+
 async def test_availability_lost_cas_drops_the_bounded_finalizing_bookkeeping(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -4268,7 +4857,12 @@ async def test_availability_promotion_failed_movie_log_sanitizes_extra_ids(
         sanitized.append(value)
         return value + 1_000_000
 
-    async def promotion_fails(_self: SqlRequestRepository, _request_id: int) -> bool:
+    async def promotion_fails(
+        _self: SqlRequestRepository,
+        _request_id: int,
+        *,
+        expected_completion_generation: int | None,
+    ) -> bool:
         raise PlexLibraryError("Plex write failed")
 
     monkeypatch.setattr(import_service, "safe_int", test_safe_int)
@@ -4305,7 +4899,11 @@ async def test_availability_promotion_failed_season_log_sanitizes_extra_ids(
         return value + 1_000_000
 
     async def promotion_fails(
-        _session: AsyncSession, *, media_request_id: int, season_number: int
+        _session: AsyncSession,
+        *,
+        media_request_id: int,
+        season_number: int,
+        expected_completion_generation: int | None,
     ) -> bool:
         raise PlexLibraryError("Plex write failed")
 
