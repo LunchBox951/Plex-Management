@@ -1125,6 +1125,10 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
             # Nothing is evictable without Plex to resolve watch state from --
             # never guess, never evict blind.
             return interval_minutes * 60.0
+        try:
+            qbt = await resolve_qbittorrent(app.state, session, client)
+        except ServiceNotConfiguredError:
+            qbt = None
 
         threshold_pct = await get_disk_pressure_threshold_percent(session)
         target_pct = await get_disk_pressure_target_percent(session)
@@ -1252,6 +1256,7 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
+                    qbt=qbt,
                 )
             except Exception:
                 _logger.exception(
@@ -1309,6 +1314,7 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
                         target_pct=target_pct,
                         grace_days=grace_days,
                         proactive=True,
+                        qbt=qbt,
                     )
                 except Exception:
                     _logger.exception(

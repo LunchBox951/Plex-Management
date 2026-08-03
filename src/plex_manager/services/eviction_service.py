@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.disk_usage import DiskUsage
+    from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
 
@@ -143,6 +144,7 @@ class _MoviePending:
     media_request_id: int
     tmdb_id: int
     size_bytes: int | None
+    correction_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -478,7 +480,7 @@ class _RecoveryPurgeRevoked(Exception):
 # Every one of those is re-read at the delete boundary itself, not merely before
 # the awaited preflight -- see :func:`_recovery_delete_boundary`.
 async def _recovery_intent_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
-    """The operator-INTENT half: a ``keep_forever`` pin or an active watchlist entry.
+    """The operator-INTENT half for retention-owned eviction recovery.
 
     Split out of the ownership half so the delete boundary can read it LAST, in
     the same write transaction that stamps the marker -- see
@@ -487,10 +489,17 @@ async def _recovery_intent_blocked_reason(session: AsyncSession, pending: _Pendi
     recoverable (the pinned bytes are simply gone), so it is the one that must
     have no awaited query after it.
 
+    A movie correction marker belongs to an operator-requested destructive redo,
+    not a disk-pressure eviction. A pin/watchlist added before or during that redo
+    must not strand the reported-bad remnants forever; correction recovery still
+    observes transfer, placement, path-owner, and marker safety below.
+
     Reads through ``get_fresh``'s ``populate_existing=True``, so a pin committed
     by another session since this sweep began is visible rather than served from
     this session's identity map.
     """
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        return None
     if isinstance(pending, _SeasonPending):
         parent = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
         season = await SqlSeasonRequestRepository(session).get_fresh(pending.season_request_id)
@@ -718,7 +727,9 @@ async def _confirm_delete_marker_cas(
             pending.season_request_id, expected_path=library_path
         )
     return await SqlRequestRepository(session).confirm_partial_delete_marker(
-        pending.media_request_id, expected_path=library_path
+        pending.media_request_id,
+        expected_path=library_path,
+        honor_keep_forever=not pending.correction_recovery,
     )
 
 
@@ -729,7 +740,12 @@ async def _post_cas_intent_blocked_reason(session: AsyncSession, pending: _Pendi
     on a different key), and the pin re-read is the defence-in-depth step 3 of
     :func:`_recovery_delete_boundary` explains. The pin is read LAST so no awaited
     query follows the most safety-critical fact.
+
+    Correction-owned movie recovery intentionally ignores retention intent; see
+    :func:`_recovery_intent_blocked_reason`.
     """
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        return None
     media_type: Literal["movie", "tv"] = "tv" if isinstance(pending, _SeasonPending) else "movie"
     if await watchlist_service.is_watchlisted(session, pending.tmdb_id, media_type):
         return "the title is on an active watchlist"
@@ -1379,6 +1395,7 @@ async def _resume_interrupted_evictions(
     session: AsyncSession,
     library: LibraryPort,
     fs: FileSystemPort,
+    qbt: DownloadClientPort | None,
     media_type: Literal["movie", "tv"],
     root_path: str,
     all_roots: Sequence[str],
@@ -1504,6 +1521,7 @@ async def _resume_interrupted_evictions(
                             media_request_id=row.id,
                             tmdb_id=row.tmdb_id,
                             size_bytes=None,
+                            correction_recovery=True,
                         ),
                     )
                 )
@@ -1578,6 +1596,7 @@ async def _resume_interrupted_evictions(
                 title=title,
                 partial_delete_path=partial_delete_path,
                 pending=pending,
+                qbt=qbt,
             )
         except Exception:
             # One interrupted eviction's recovery failing must never abort the
@@ -1617,6 +1636,44 @@ async def _resume_interrupted_evictions(
 
 
 async def _recover_rearmed_season(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    library_path: str,
+    title: str | None,
+    observed_status: str,
+    partial_delete_path: str | None,
+    pending: _SeasonPending,
+) -> bool:
+    """Acquire the path claim atomically, then recover one re-armed season."""
+    if not purge_service.begin_purge(library_path):
+        _logger.info(
+            "deferring recovery of %r season %s: another purge owns its path",
+            _safe_title(title),
+            safe_int(pending.season_number),
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+    try:
+        return await _recover_rearmed_season_claimed(
+            session=session,
+            library=library,
+            fs=fs,
+            library_path=library_path,
+            title=title,
+            observed_status=observed_status,
+            partial_delete_path=partial_delete_path,
+            pending=pending,
+        )
+    finally:
+        purge_service.end_purge(library_path)
+
+
+async def _recover_rearmed_season_claimed(
     *,
     session: AsyncSession,
     library: LibraryPort,
@@ -1700,19 +1757,6 @@ async def _recover_rearmed_season(
     Returns whether this recovery destroyed data the sweep's pressure ledger has
     not accounted for (see :func:`_resume_one`).
     """
-    if purge_service.purge_in_progress(library_path):
-        _logger.info(
-            "deferring recovery of %r season %s: an operator correction holds an "
-            "active purge claim over its path",
-            _safe_title(title),
-            safe_int(pending.season_number),
-            extra={
-                "request_id": safe_int(pending.media_request_id),
-                "tmdb_id": safe_int(pending.tmdb_id),
-            },
-        )
-        return False
-
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2040,6 +2084,48 @@ async def _resume_one(
     title: str | None,
     partial_delete_path: str | None,
     pending: _Pending,
+    qbt: DownloadClientPort | None,
+) -> bool:
+    """Acquire the path claim atomically, then resume one interrupted purge."""
+    season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
+    if not purge_service.begin_purge(library_path):
+        _logger.info(
+            "deferring recovery of %r%s: another purge owns its path",
+            _safe_title(title),
+            season_note,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+    try:
+        return await _resume_one_claimed(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type=media_type,
+            library_path=library_path,
+            title=title,
+            partial_delete_path=partial_delete_path,
+            pending=pending,
+            qbt=qbt,
+        )
+    finally:
+        purge_service.end_purge(library_path)
+
+
+async def _resume_one_claimed(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    media_type: Literal["movie", "tv"],
+    library_path: str,
+    title: str | None,
+    partial_delete_path: str | None,
+    pending: _Pending,
+    qbt: DownloadClientPort | None,
 ) -> bool:
     """Recover ONE claimed-but-not-finalized eviction — see
     :func:`_resume_interrupted_evictions` for the three-way decision.
@@ -2070,18 +2156,39 @@ async def _resume_one(
     measure, so the sweep can re-baseline its pressure accounting (its disk
     snapshot is taken before recovery runs)."""
     season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
-    if purge_service.purge_in_progress(library_path):
-        _logger.info(
-            "deferring recovery of %r%s: an operator correction holds an active "
-            "purge claim over its path",
-            _safe_title(title),
-            season_note,
-            extra={
-                "request_id": safe_int(pending.media_request_id),
-                "tmdb_id": safe_int(pending.tmdb_id),
-            },
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        if not await _partial_delete_still_armed(session, pending, library_path):
+            return False
+        culprit = await SqlDownloadRepository(session).find_latest_imported_for_request(
+            pending.media_request_id
         )
-        return False
+        if culprit is not None and qbt is None:
+            _logger.warning(
+                "deferring correction recovery of %r: qBittorrent is unconfigured, so "
+                "the culprit torrent cannot be purged safely",
+                _safe_title(title),
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            return False
+        if (
+            culprit is not None
+            and qbt is not None
+            and not await purge_service.remove_torrent(
+                qbt,
+                culprit.torrent_hash,
+                context="correction recovery",
+                extra={
+                    "torrent_hash": culprit.torrent_hash,
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+        ):
+            return False
+
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2274,6 +2381,7 @@ async def _resume_one(
                 pending.media_request_id,
                 expected_path=library_path,
                 expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
+                mark_removed=pending.correction_recovery,
             )
         if not cleared:
             # A concurrent pass finalized first, or a replacement import owns the
@@ -3190,6 +3298,7 @@ async def run_eviction_sweep(
     grace_days: int,
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
 ) -> list[EvictionOutcome]:
     """One sweep pass for ONE configured root/media-kind.
 
@@ -3285,6 +3394,7 @@ async def run_eviction_sweep(
             grace_days=grace_days,
             proactive=proactive,
             all_roots=all_roots,
+            qbt=qbt,
         )
     finally:
         _sweep_latch["busy"] = False
@@ -3337,6 +3447,7 @@ async def _run_sweep(
     grace_days: int,
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
 ) -> list[EvictionOutcome]:
     """The sweep body, entered only under :func:`run_eviction_sweep`'s
     serialization latch — see the public docstring."""
@@ -3385,6 +3496,7 @@ async def _run_sweep(
         session=session,
         library=library,
         fs=fs,
+        qbt=qbt,
         media_type=media_type,
         root_path=root_path,
         all_roots=scope,

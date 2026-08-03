@@ -1055,8 +1055,8 @@ async def report_issue(
     # tracked separately; nothing here claims correction and eviction are fully
     # serialized against each other.
     purge_claim = target.library_path
-    if purge_claim is not None:
-        purge_service.begin_purge(purge_claim)
+    if purge_claim is not None and not purge_service.begin_purge(purge_claim):
+        raise ImportInProgressError(request_id)
     try:
         try:
             if is_tv and target.season is not None:
@@ -1215,7 +1215,7 @@ async def report_issue(
                         session, media_request_id=request_id, season_number=target.season
                     )
                 else:
-                    await request_repo.clear_library_path(request_id)
+                    await request_repo.clear_library_path(request_id, mark_removed=True)
         else:
             # No breadcrumb (a title recorded available straight from Plex, or one
             # predating the library_path column): nothing of ours to delete -- honest,

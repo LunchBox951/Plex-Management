@@ -66,7 +66,7 @@ from plex_manager.services import (
     season_request_service,
 )
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
-from tests.web.fakes import FakeLibrary, FakeTmdb
+from tests.web.fakes import FakeLibrary, FakeQbittorrent, FakeTmdb
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
@@ -8893,6 +8893,167 @@ async def test_rerequest_after_cancelled_movie_correction_recovery_ignores_stale
             .all()
         )
     assert sorted(row.status.value for row in rows) == ["evicted", "pending"]
+
+
+async def test_movie_correction_recovery_preserves_removed_truth_after_later_failure(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A replacement that fails after recovery must not erase disk-removal truth."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Later Failed Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Later Failed Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5138,
+        title="Later Failed Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        assert row.library_removed_at is not None
+        row.status = RequestStatus.failed
+        await session.commit()
+        assert await SqlRequestRepository(session).latest_request_evicted(5138, "movie")
+
+
+async def test_pinned_watchlisted_movie_correction_recovery_finishes_operator_purge(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Retention intent cannot deadlock an already-requested correction purge."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Pinned Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Pinned Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5139,
+        title="Pinned Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+        assert row is not None
+        row.keep_forever = True
+        user = User(username="correction-owner")
+        session.add(user)
+        await session.flush()
+        session.add(WatchlistItem(user_id=user.id, tmdb_id=5139, media_type=MediaType.movie))
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+    assert not movie_dir.exists()
+
+
+async def test_movie_correction_recovery_removes_culprit_torrent_before_remnants(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A crash before report-issue step (c) is resumed before marker retirement."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Seeding Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Seeding Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5140,
+        title="Seeding Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+    async with sessionmaker_() as session:
+        session.add(
+            Download(
+                torrent_hash="culprit-seed",
+                status=DownloadState.Imported.value,
+                media_request_id=request_id,
+                media_type=MediaType.movie,
+            )
+        )
+        await session.commit()
+    qbt = FakeQbittorrent()
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            qbt=qbt,
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert qbt.removed == [("culprit-seed", True)]
+    assert not movie_dir.exists()
+
+
+async def test_movie_correction_recovery_claim_blocks_late_correction_claim(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery owns the path before its first await; a correction cannot nest."""
+    root = tmp_path / "movies"
+    movie_dir = root / "Atomic Recovery Claim (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Atomic Recovery Claim (2026).mkv").write_bytes(b"remnant")
+    await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5141,
+        title="Atomic Recovery Claim",
+        movie_dir=movie_dir,
+        status=RequestStatus.searching,
+    )
+    observed_claim = False
+    real_resume = eviction_service._resume_one_claimed  # pyright: ignore[reportPrivateUsage]
+
+    async def resume_after_late_claim(**kwargs: Any) -> bool:
+        nonlocal observed_claim
+        observed_claim = True
+        assert purge_service.begin_purge(str(movie_dir)) is False
+        return await real_resume(**kwargs)
+
+    monkeypatch.setattr(eviction_service, "_resume_one_claimed", resume_after_late_claim)
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert observed_claim
+    assert not movie_dir.exists()
+    assert not purge_service.purge_in_progress(str(movie_dir))
 
 
 async def test_movie_correction_recovery_defers_during_active_correction_purge(

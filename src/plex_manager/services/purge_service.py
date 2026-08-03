@@ -354,8 +354,14 @@ def end_placement(library_path: str) -> None:
     _unregister(library_path, _ACTIVE_PLACEMENT_PATHS)
 
 
-def begin_purge(library_path: str) -> None:
-    """Register a purge claim over ``library_path`` BEFORE the delete itself runs.
+def begin_purge(library_path: str) -> bool:
+    """Atomically register an exclusive purge claim over ``library_path``.
+
+    Returns ``False`` when an equal, ancestor, or descendant path is already
+    claimed.  The conflict check and registration contain no suspension point,
+    so they are one atomic operation with respect to other asyncio tasks in this
+    process.  A winning caller MUST pair this with :func:`end_purge`.
+
 
     :func:`purge_library_path` registers its own claim for the duration of its
     delete, which is enough for a single-step purge. A multi-step destructive verb
@@ -371,12 +377,14 @@ def begin_purge(library_path: str) -> None:
     ordering rule rather than a second mechanism: :func:`begin_placement` refuses
     an import into a claimed path (the import retries on its next cycle), and
     :func:`purge_in_progress` lets the auto-grab worker keep the scope out of its
-    due set for the same span. Refcounted, so the nested registration
-    :func:`purge_library_path` takes for its own delete nests cleanly inside this
-    one. The caller MUST pair this with :func:`end_purge` in a ``finally`` — a
-    leaked claim would block placements into the path for the life of the process.
+    due set for the same span. The caller MUST pair a successful claim with
+    :func:`end_purge` in a ``finally`` — a leaked claim would block placements
+    into the path for the life of the process.
     """
+    if _conflicts_with(library_path, _ACTIVE_PURGE_PATHS):
+        return False
     _register(library_path, _ACTIVE_PURGE_PATHS)
+    return True
 
 
 def purge_in_progress(library_path: str) -> bool:
