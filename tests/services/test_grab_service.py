@@ -2989,13 +2989,18 @@ async def test_grab_terminal_reuse_cas_lost_to_same_request_attaches_scope(
     assert {s.season_number: s.status for s in seasons} == {1: "pending", 2: "downloading"}
 
 
-async def test_grab_reenters_terminal_reuse_when_attach_loser_finds_terminal_row(
+async def test_grab_refuses_reuse_after_operator_mark_failed_blocklists_during_attach(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reuse loser whose active-row attachment also loses to terminalization
-    must retry the guarded terminal claim instead of rejecting the same owner."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "reuse_attach_terminal.db")
+    """A stale same-hash grab must not undo an operator mark-failed correction.
+
+    The grab loses its first terminal reuse CAS to an active row, then the operator
+    removes and blocklists that release while attachment is acquiring its guard.
+    The stale grab must recheck the blocklist and refuse instead of resurrecting a
+    downloading row for the now-removed torrent.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "reuse_attach_mark_failed.db")
     try:
         request_id = await _make_tv_request(sm)
         async with sm() as session:
@@ -3004,7 +3009,8 @@ async def test_grab_reenters_terminal_reuse_when_attach_loser_finds_terminal_row
                 status="failed",
                 media_request_id=request_id,
                 tmdb_id=900,
-                season=1,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
                 failed_reason="prior failure",
             )
             session.add(seeded)
@@ -3028,24 +3034,27 @@ async def test_grab_reenters_terminal_reuse_when_attach_loser_finds_terminal_row
                     row = await other.get(Download, row_id)
                     assert row is not None
                     row.status = "downloading"
-                    row.season = 1
                     await other.commit()
             return await real_update(self, row_id, status, allowed_from, **kwargs)
 
+        qbt = FakeQbittorrent(pre_existing={_HASH})
         real_lock = grab_service.SqlDownloadRepository.lock_if_active
-        attachment_terminalizations = 0
+        operator_failed = False
 
-        async def terminalize_before_attachment_lock(
+        async def mark_failed_before_attachment_lock(
             self: grab_service.SqlDownloadRepository, row_id: int
         ) -> bool:
-            nonlocal attachment_terminalizations
-            if attachment_terminalizations == 0:
-                attachment_terminalizations += 1
+            nonlocal operator_failed
+            if not operator_failed:
+                operator_failed = True
                 async with sm() as other:
-                    row = await other.get(Download, row_id)
-                    assert row is not None
-                    row.status = "failed"
-                    await other.commit()
+                    await mark_failed(
+                        other,
+                        qbt,
+                        download_id=row_id,
+                        blocklist=True,
+                        remove_torrent=True,
+                    )
             return await real_lock(self, row_id)
 
         monkeypatch.setattr(
@@ -3056,31 +3065,26 @@ async def test_grab_reenters_terminal_reuse_when_attach_loser_finds_terminal_row
         monkeypatch.setattr(
             grab_service.SqlDownloadRepository,
             "lock_if_active",
-            terminalize_before_attachment_lock,
+            mark_failed_before_attachment_lock,
         )
 
-        qbt = FakeQbittorrent()
-        async with sm() as session:
-            record = await grab_service.grab(
-                qbt,
-                session,
-                scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
-                request_id=request_id,
-                tmdb_id=900,
-                season=2,
-            )
+        with pytest.raises(RequestNotActiveError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP"),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
 
-        assert record.id == download_id
-        assert reuse_attempts == 2
-        assert attachment_terminalizations == 1
+        assert reuse_attempts >= 1
+        assert operator_failed
         assert len(qbt.added) == 1
-        assert qbt.removed == []
+        assert qbt.removed == [(_HASH, True)]
         async with sm() as session:
-            rows = (
-                (await session.execute(select(Download).where(Download.torrent_hash == _HASH)))
-                .scalars()
-                .all()
-            )
+            row = await session.get(Download, download_id)
             season_two = (
                 await session.execute(
                     select(SeasonRequest).where(
@@ -3089,36 +3093,40 @@ async def test_grab_reenters_terminal_reuse_when_attach_loser_finds_terminal_row
                     )
                 )
             ).scalar_one()
+            blocklist = (await session.execute(select(Blocklist))).scalars().all()
             history = (await session.execute(select(DownloadHistory))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].status == "downloading"
-        assert rows[0].media_request_id == request_id
-        assert rows[0].season == 2
-        assert season_two.status == RequestStatus.downloading
-        assert len(history) == 1
-        assert history[0].event_type == "grabbed"
+        assert row is not None
+        assert row.status == "failed"
+        assert row.media_request_id == request_id
+        assert season_two.status == RequestStatus.searching
+        assert len(blocklist) == 1
+        assert blocklist[0].torrent_hash == _HASH
+        assert history == []
     finally:
         await engine.dispose()
 
 
-async def test_grab_create_race_reenters_terminal_reuse_when_attach_loser_finds_terminal_row(
+async def test_grab_create_race_second_reuse_conflict_cleans_orphan(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A create-conflict loser must retry terminal reuse when its intervening
-    active-row attachment observes that the competing row terminalized again."""
-    sm, engine = await _file_backed_sessionmaker(tmp_path, "create_reuse_attach_terminal.db")
+    """A unique conflict from the create handler's second reuse CAS is translated.
+
+    Another release takes the season after same-hash attachment sees its row
+    terminalize. The retried reuse then conflicts with that active owner; grab must
+    roll back, remove the torrent it created, and raise AlreadyDownloadingError
+    rather than leak IntegrityError and the orphan.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "create_second_reuse_conflict.db")
     try:
         request_id = await _make_tv_request(sm)
         real_create = grab_service.SqlDownloadRepository.create
-        create_attempts = 0
         competing_id: int | None = None
 
         async def lose_create_to_terminal_row(
             self: grab_service.SqlDownloadRepository, **kwargs: Any
         ) -> DownloadRecord:
-            nonlocal create_attempts, competing_id
-            create_attempts += 1
+            nonlocal competing_id
             async with sm() as other:
                 competing = Download(
                     torrent_hash=_HASH,
@@ -3155,19 +3163,28 @@ async def test_grab_create_race_reenters_terminal_reuse_when_attach_loser_finds_
             return await real_update(self, row_id, status, allowed_from, **kwargs)
 
         real_lock = grab_service.SqlDownloadRepository.lock_if_active
-        attachment_terminalizations = 0
+        winning_hash = "b" * 40
+        parallel_id: int | None = None
 
-        async def terminalize_before_attachment_lock(
+        async def terminalize_and_claim_before_attachment_lock(
             self: grab_service.SqlDownloadRepository, row_id: int
         ) -> bool:
-            nonlocal attachment_terminalizations
-            if attachment_terminalizations == 0:
-                attachment_terminalizations += 1
+            nonlocal parallel_id
+            if parallel_id is None:
                 async with sm() as other:
                     row = await other.get(Download, row_id)
                     assert row is not None
                     row.status = "failed"
+                    parallel = Download(
+                        torrent_hash=winning_hash,
+                        status="downloading",
+                        media_request_id=request_id,
+                        tmdb_id=900,
+                        season=2,
+                    )
+                    other.add(parallel)
                     await other.commit()
+                    parallel_id = parallel.id
             return await real_lock(self, row_id)
 
         monkeypatch.setattr(
@@ -3183,7 +3200,7 @@ async def test_grab_create_race_reenters_terminal_reuse_when_attach_loser_finds_
         monkeypatch.setattr(
             grab_service.SqlDownloadRepository,
             "lock_if_active",
-            terminalize_before_attachment_lock,
+            terminalize_and_claim_before_attachment_lock,
         )
 
         qbt = FakeQbittorrent()
@@ -3191,45 +3208,32 @@ async def test_grab_create_race_reenters_terminal_reuse_when_attach_loser_finds_
             "magnet:?xt=urn:btih:" + _HASH,
             "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
         ).model_copy(update={"target_seasons": (2,)})
-        async with sm() as session:
-            record = await grab_service.grab(
-                qbt,
-                session,
-                scored=scored,
-                request_id=request_id,
-                tmdb_id=900,
-                season=2,
-            )
+        with pytest.raises(AlreadyDownloadingError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=scored,
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
 
         assert competing_id is not None
-        assert record.id == competing_id
-        assert create_attempts == 1
+        assert parallel_id is not None
         assert reuse_attempts == 2
-        assert attachment_terminalizations == 1
-        assert len(qbt.added) == 1
-        assert qbt.removed == []
+        assert len(qbt.added) == 2
+        assert qbt.removed == [(_HASH, True)]
         async with sm() as session:
-            rows = (
-                (await session.execute(select(Download).where(Download.torrent_hash == _HASH)))
-                .scalars()
-                .all()
-            )
-            season_two = (
-                await session.execute(
-                    select(SeasonRequest).where(
-                        SeasonRequest.media_request_id == request_id,
-                        SeasonRequest.season_number == 2,
-                    )
-                )
-            ).scalar_one()
+            same_hash = await session.get(Download, competing_id)
+            winner = await session.get(Download, parallel_id)
             history = (await session.execute(select(DownloadHistory))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].status == "downloading"
-        assert rows[0].media_request_id == request_id
-        assert rows[0].season == 2
-        assert season_two.status == RequestStatus.downloading
-        assert len(history) == 1
-        assert history[0].event_type == "grabbed"
+        assert same_hash is not None
+        assert same_hash.status == "failed"
+        assert winner is not None
+        assert winner.status == "downloading"
+        assert winner.torrent_hash == winning_hash
+        assert history == []
     finally:
         await engine.dispose()
 
