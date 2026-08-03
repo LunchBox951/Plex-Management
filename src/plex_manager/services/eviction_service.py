@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from plex_manager.domain.disk_usage import DiskUsage
+    from plex_manager.ports.download_client import DownloadClientPort
     from plex_manager.ports.filesystem import FileSystemPort
     from plex_manager.ports.library import LibraryPort
 
@@ -143,6 +144,7 @@ class _MoviePending:
     media_request_id: int
     tmdb_id: int
     size_bytes: int | None
+    correction_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -190,8 +192,9 @@ _PRE_GRAB_STATUSES: frozenset[str] = frozenset(
 # through the eviction lifecycle (its re-grab is a SEPARATE row with no
 # breadcrumb, and the claimed ``evicted`` movie row is not cancellable at all);
 # the one movie shape that CAN carry it -- report-issue's failed-purge re-arm
-# later cancelled -- is a deliberately settled correction whose kept breadcrumb
-# is the orphan-reclaim handle, not an interrupted eviction, and is left alone.
+# later cancelled -- is marker-owned recovery ONLY while its incomplete-delete
+# marker is armed. Without that marker it is a deliberately settled correction
+# whose kept breadcrumb is the orphan-reclaim handle and is left alone (#513).
 _MARKER_OWNED_ADVANCED_STATUSES: frozenset[str] = frozenset(
     {RequestStatus.downloading.value, RequestStatus.failed.value}
 )
@@ -214,7 +217,10 @@ _REARMED_RECOVERY_STATUSES: frozenset[str] = (
 _BLOCKED_BY_REMNANTS_STATUS: str = RequestStatus.import_blocked.value
 
 # Every status the re-armed pass can adjudicate, for the breadcrumb-release CAS
-# (a subset of ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` below).
+# (a subset of ``_STALE_SEASON_BREADCRUMB_CLEAR_STATUSES`` below). Seasons may
+# enter the pre-grab subset without a marker through eviction's same-row re-arm;
+# movies join this enumeration ONLY when their marker is armed, which identifies
+# report-issue's incomplete purge rather than an interrupted eviction (#513).
 _REARMED_OR_BLOCKED_STATUSES: frozenset[str] = _REARMED_RECOVERY_STATUSES | {
     _BLOCKED_BY_REMNANTS_STATUS
 }
@@ -244,7 +250,9 @@ _STALE_SEASON_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = _REARMED_RECOVERY_STAT
     RequestStatus.failed.value,
 }
 
-_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = frozenset({RequestStatus.evicted.value})
+_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES: frozenset[str] = (
+    frozenset({RequestStatus.evicted.value}) | _REARMED_OR_BLOCKED_STATUSES
+)
 
 # In-PROCESS sweep serialization latch: :func:`run_eviction_sweep` no-ops (with
 # a log line) when another sweep is still running. Exactly two actors ever call
@@ -472,7 +480,7 @@ class _RecoveryPurgeRevoked(Exception):
 # Every one of those is re-read at the delete boundary itself, not merely before
 # the awaited preflight -- see :func:`_recovery_delete_boundary`.
 async def _recovery_intent_blocked_reason(session: AsyncSession, pending: _Pending) -> str | None:
-    """The operator-INTENT half: a ``keep_forever`` pin or an active watchlist entry.
+    """The operator-INTENT half for retention-owned eviction recovery.
 
     Split out of the ownership half so the delete boundary can read it LAST, in
     the same write transaction that stamps the marker -- see
@@ -481,10 +489,17 @@ async def _recovery_intent_blocked_reason(session: AsyncSession, pending: _Pendi
     recoverable (the pinned bytes are simply gone), so it is the one that must
     have no awaited query after it.
 
+    A movie correction marker belongs to an operator-requested destructive redo,
+    not a disk-pressure eviction. A pin/watchlist added before or during that redo
+    must not strand the reported-bad remnants forever; correction recovery still
+    observes transfer, placement, path-owner, and marker safety below.
+
     Reads through ``get_fresh``'s ``populate_existing=True``, so a pin committed
     by another session since this sweep began is visible rather than served from
     this session's identity map.
     """
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        return None
     if isinstance(pending, _SeasonPending):
         parent = await SqlRequestRepository(session).get_fresh(pending.media_request_id)
         season = await SqlSeasonRequestRepository(session).get_fresh(pending.season_request_id)
@@ -712,7 +727,9 @@ async def _confirm_delete_marker_cas(
             pending.season_request_id, expected_path=library_path
         )
     return await SqlRequestRepository(session).confirm_partial_delete_marker(
-        pending.media_request_id, expected_path=library_path
+        pending.media_request_id,
+        expected_path=library_path,
+        honor_keep_forever=not pending.correction_recovery,
     )
 
 
@@ -723,7 +740,12 @@ async def _post_cas_intent_blocked_reason(session: AsyncSession, pending: _Pendi
     on a different key), and the pin re-read is the defence-in-depth step 3 of
     :func:`_recovery_delete_boundary` explains. The pin is read LAST so no awaited
     query follows the most safety-critical fact.
+
+    Correction-owned movie recovery intentionally ignores retention intent; see
+    :func:`_recovery_intent_blocked_reason`.
     """
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        return None
     media_type: Literal["movie", "tv"] = "tv" if isinstance(pending, _SeasonPending) else "movie"
     if await watchlist_service.is_watchlisted(session, pending.tmdb_id, media_type):
         return "the title is on an active watchlist"
@@ -1373,9 +1395,11 @@ async def _resume_interrupted_evictions(
     session: AsyncSession,
     library: LibraryPort,
     fs: FileSystemPort,
+    qbt: DownloadClientPort | None,
     media_type: Literal["movie", "tv"],
     root_path: str,
     all_roots: Sequence[str],
+    correction_only: bool = False,
 ) -> bool:
     """Recover every CLAIMED-BUT-NOT-FINALIZED eviction owned by this root
     (ADR-0012 #67, crash resumability). Keyed on the BREADCRUMB, not only on the
@@ -1394,8 +1418,9 @@ async def _resume_interrupted_evictions(
       the eviction fresh through the normal claim -> purge path). File gone ->
       finalize now (CAS-clear breadcrumb as the single-winner gate, history row,
       the Plex refresh the crash swallowed).
-    * PRE-GRAB-or-CANCELLED + breadcrumb (TV only; every status in
-      :data:`_REARMED_RECOVERY_STATUSES`) -- an in-window re-request re-armed the
+    * PRE-GRAB-or-CANCELLED + breadcrumb (TV's same-row eviction re-arm, or a
+      MARKER-GATED movie correction; every status in
+      :data:`_REARMED_RECOVERY_STATUSES`) -- an in-window TV re-request re-armed the
       claimed season row (``ensure_seasons``, ``evicted`` -> ``pending``) before
       recovery ran, so the ``evicted`` enumeration alone would MISS it and let
       the re-grab download a duplicate of a file that never left. The re-arm
@@ -1414,11 +1439,14 @@ async def _resume_interrupted_evictions(
       gone -> the disk-truth flip (``cancelled`` -> ``evicted``, so
       ``evicted_seasons`` -- rightly cancelled-blind -- keeps subtracting);
       file present -> the fold to ``available`` (the aborted re-grab left a
-      live file). Movies have no same-row re-arm (a movie re-request always
-      creates a NEW row; a movie ``searching``/``cancelled`` + breadcrumb row
-      is report-issue's failed-purge redo -- a deliberately settled correction
-      whose kept breadcrumb is the orphan-reclaim handle -- and must never be
-      touched), so this shape is season-only.
+      live file). A movie has no same-row EVICTION re-arm (a re-request creates
+      a new row), but report-issue does re-arm the same movie row. Movie rows
+      join this recovery shape ONLY with an armed marker over their breadcrumb:
+      that durable fact proves correction's delete began and was not shown to
+      finish. The pass then uses :func:`_resume_one`'s marker-owned convergence
+      without folding the correction or changing its status; an unmarked
+      ``searching``/``cancelled`` movie breadcrumb remains the deliberately
+      settled orphan-reclaim handle and is left alone (#513).
 
     Before restoring/folding ANY file-present row, :func:`_path_claimed_by_another_row`
     distinguishes interrupted from FINALIZED-BUT-SUPERSEDED: if another live row
@@ -1440,6 +1468,14 @@ async def _resume_interrupted_evictions(
     Retrying is also the only retry such a row can ever get: an ``evicted`` row is
     invisible to candidate assembly.
 
+    ``correction_only`` narrows the enumeration to the shape an OPERATOR's
+    report-issue purge owns -- a movie row whose durable marker still covers its
+    own breadcrumb -- and drops everything retention claimed for itself (the
+    ``evicted`` shapes, and TV entirely; see the branches below). It is what
+    :func:`run_correction_recovery_sweep` runs while ``eviction_enabled`` is off,
+    so the switch that stops the retention bot never strands a correction the
+    operator already asked for.
+
     Returns whether recovery destroyed data the caller's disk snapshot (taken
     BEFORE this pass runs) does not reflect, so the sweep can re-baseline its
     pressure accounting rather than pick further victims against a stale reading.
@@ -1457,18 +1493,63 @@ async def _resume_interrupted_evictions(
     rearmed: list[tuple[str, str | None, str, str | None, _SeasonPending]] = []
     if media_type == "movie":
         request_repo = SqlRequestRepository(session)
-        for row in await request_repo.list_by_status(RequestStatus.evicted.value):
-            if (
-                row.media_type != "movie"
-                or row.library_path is None
-                or not _owned_by_root(row.library_path, root_path, all_roots)
-            ):
-                continue
-            pending: _Pending = _MoviePending(
-                media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
-            )
-            pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
-    else:
+        # The claimed-eviction shape is RETENTION's own interrupted work, so it is
+        # the enumeration ``correction_only`` drops: that mode runs while the
+        # retention bot is switched off (see :func:`run_correction_recovery_sweep`)
+        # and must not finish a delete the operator turned the bot off to stop.
+        if not correction_only:
+            for row in await request_repo.list_by_status(RequestStatus.evicted.value):
+                if (
+                    row.media_type != "movie"
+                    or row.library_path is None
+                    or not _owned_by_root(row.library_path, root_path, all_roots)
+                ):
+                    continue
+                pending: _Pending = _MoviePending(
+                    media_request_id=row.id, tmdb_id=row.tmdb_id, size_bytes=None
+                )
+                pairs.append((row.library_path, row.title, row.partial_delete_path, pending))
+        # Movie report-issue re-arms the SAME row and preserves its breadcrumb when
+        # the purge is incomplete. Unlike TV's same-row eviction re-arm, status plus
+        # breadcrumb alone is therefore not a recovery signature: a failed but
+        # provably untouched correction deliberately keeps that orphan-reclaim
+        # handle. The durable marker is the discriminator (#513). Enumerate every
+        # status the replacement can reach, including import_blocked (the
+        # deterministic destination deadlock), but only while the marker still
+        # covers this row's own breadcrumb.
+        for recovery_status in sorted(_REARMED_OR_BLOCKED_STATUSES):
+            for row in await request_repo.list_by_status(recovery_status):
+                if (
+                    row.media_type != "movie"
+                    or row.library_path is None
+                    or not _owned_by_root(row.library_path, root_path, all_roots)
+                    or not _partial_delete_outstanding(row.partial_delete_path, row.library_path)
+                ):
+                    continue
+                pairs.append(
+                    (
+                        row.library_path,
+                        row.title,
+                        row.partial_delete_path,
+                        _MoviePending(
+                            media_request_id=row.id,
+                            tmdb_id=row.tmdb_id,
+                            size_bytes=None,
+                            correction_recovery=True,
+                        ),
+                    )
+                )
+    elif not correction_only:
+        # TV is absent from ``correction_only`` deliberately. A season's marker can
+        # sit over EITHER a correction purge or retention's own same-row eviction
+        # re-arm (``ensure_seasons`` rewrites the claimed row's status out from
+        # under it), so nothing on the row distinguishes the two -- and with the
+        # retention bot switched off, the conservative reading is the only honest
+        # one. Movies carry no such ambiguity: an eviction re-request lands on a NEW
+        # row, so a marker over a non-``evicted`` movie breadcrumb is report-issue's
+        # purge by construction (#513). A TV remnant still converges on the next
+        # enabled sweep, and the manual free-space button (which ignores the switch)
+        # reaches it at any time.
         season_repo = SqlSeasonRequestRepository(session)
         request_repo = SqlRequestRepository(session)
         for season in await season_repo.list_by_status(RequestStatus.evicted.value):
@@ -1539,6 +1620,7 @@ async def _resume_interrupted_evictions(
                 title=title,
                 partial_delete_path=partial_delete_path,
                 pending=pending,
+                qbt=qbt,
             )
         except Exception:
             # One interrupted eviction's recovery failing must never abort the
@@ -1578,6 +1660,44 @@ async def _resume_interrupted_evictions(
 
 
 async def _recover_rearmed_season(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    library_path: str,
+    title: str | None,
+    observed_status: str,
+    partial_delete_path: str | None,
+    pending: _SeasonPending,
+) -> bool:
+    """Acquire the path claim atomically, then recover one re-armed season."""
+    if not purge_service.begin_purge(library_path):
+        _logger.info(
+            "deferring recovery of %r season %s: another purge owns its path",
+            _safe_title(title),
+            safe_int(pending.season_number),
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+    try:
+        return await _recover_rearmed_season_claimed(
+            session=session,
+            library=library,
+            fs=fs,
+            library_path=library_path,
+            title=title,
+            observed_status=observed_status,
+            partial_delete_path=partial_delete_path,
+            pending=pending,
+        )
+    finally:
+        purge_service.end_purge(library_path)
+
+
+async def _recover_rearmed_season_claimed(
     *,
     session: AsyncSession,
     library: LibraryPort,
@@ -1661,19 +1781,6 @@ async def _recover_rearmed_season(
     Returns whether this recovery destroyed data the sweep's pressure ledger has
     not accounted for (see :func:`_resume_one`).
     """
-    if purge_service.purge_in_progress(library_path):
-        _logger.info(
-            "deferring recovery of %r season %s: an operator correction holds an "
-            "active purge claim over its path",
-            _safe_title(title),
-            safe_int(pending.season_number),
-            extra={
-                "request_id": safe_int(pending.media_request_id),
-                "tmdb_id": safe_int(pending.tmdb_id),
-            },
-        )
-        return False
-
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2001,6 +2108,48 @@ async def _resume_one(
     title: str | None,
     partial_delete_path: str | None,
     pending: _Pending,
+    qbt: DownloadClientPort | None,
+) -> bool:
+    """Acquire the path claim atomically, then resume one interrupted purge."""
+    season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
+    if not purge_service.begin_purge(library_path):
+        _logger.info(
+            "deferring recovery of %r%s: another purge owns its path",
+            _safe_title(title),
+            season_note,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return False
+    try:
+        return await _resume_one_claimed(
+            session=session,
+            library=library,
+            fs=fs,
+            media_type=media_type,
+            library_path=library_path,
+            title=title,
+            partial_delete_path=partial_delete_path,
+            pending=pending,
+            qbt=qbt,
+        )
+    finally:
+        purge_service.end_purge(library_path)
+
+
+async def _resume_one_claimed(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    media_type: Literal["movie", "tv"],
+    library_path: str,
+    title: str | None,
+    partial_delete_path: str | None,
+    pending: _Pending,
+    qbt: DownloadClientPort | None,
 ) -> bool:
     """Recover ONE claimed-but-not-finalized eviction — see
     :func:`_resume_interrupted_evictions` for the three-way decision.
@@ -2031,6 +2180,39 @@ async def _resume_one(
     measure, so the sweep can re-baseline its pressure accounting (its disk
     snapshot is taken before recovery runs)."""
     season_note = f" season {pending.season_number}" if isinstance(pending, _SeasonPending) else ""
+    if isinstance(pending, _MoviePending) and pending.correction_recovery:
+        if not await _partial_delete_still_armed(session, pending, library_path):
+            return False
+        culprit = await SqlDownloadRepository(session).find_latest_imported_for_request(
+            pending.media_request_id
+        )
+        if culprit is not None and qbt is None:
+            _logger.warning(
+                "deferring correction recovery of %r: qBittorrent is unconfigured, so "
+                "the culprit torrent cannot be purged safely",
+                _safe_title(title),
+                extra={
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+            return False
+        if (
+            culprit is not None
+            and qbt is not None
+            and not await purge_service.remove_torrent(
+                qbt,
+                culprit.torrent_hash,
+                context="correction recovery",
+                extra={
+                    "torrent_hash": culprit.torrent_hash,
+                    "request_id": safe_int(pending.media_request_id),
+                    "tmdb_id": safe_int(pending.tmdb_id),
+                },
+            )
+        ):
+            return False
+
     try:
         await asyncio.to_thread(os.stat, library_path)
         file_present = True
@@ -2223,6 +2405,7 @@ async def _resume_one(
                 pending.media_request_id,
                 expected_path=library_path,
                 expected_statuses=_STALE_MOVIE_BREADCRUMB_CLEAR_STATUSES,
+                mark_removed=pending.correction_recovery,
             )
         if not cleared:
             # A concurrent pass finalized first, or a replacement import owns the
@@ -2236,10 +2419,7 @@ async def _resume_one(
             # letting a re-request mint 'available' off stale Plex over the
             # just-deleted file. The file is genuinely gone; flip to 'evicted' (CAS
             # from {cancelled} only -- every other status is left exactly as the
-            # normal finalize leaves it). Movies never need this: their re-grabs are
-            # SEPARATE rows, so the original row stays 'evicted' and the
-            # newest-non-cancelled guard already holds (and an 'evicted' movie row
-            # itself is not cancellable at all).
+            # normal finalize leaves it).
             await season_request_service.set_status_if_in(
                 session,
                 media_request_id=pending.media_request_id,
@@ -2247,6 +2427,26 @@ async def _resume_one(
                 status=RequestStatus.evicted.value,
                 allowed_from=frozenset({RequestStatus.cancelled.value}),
                 tolerate_active_conflict=True,
+            )
+        else:
+            # DISK-TRUTH-OVER-INTENT for SETTLED movie correction rows (#513):
+            # ``cancelled`` says the replacement intent stopped and ``failed`` says
+            # it exhausted, but recovery has now proved the old file is GONE. Neither
+            # status is recognized by ``latest_request_evicted``, so preserving it
+            # would let an immediate re-request trust eventually-consistent Plex
+            # presence and mint ``available`` over no file and no download. Publish
+            # ``evicted`` as the durable stale-Plex guard for those two settled
+            # outcomes, matching the normal movie eviction finalize. Active/retryable
+            # replacement statuses stay unchanged.
+            await SqlRequestRepository(session).set_status_if_in(
+                pending.media_request_id,
+                RequestStatus.evicted.value,
+                frozenset(
+                    {
+                        RequestStatus.cancelled.value,
+                        RequestStatus.failed.value,
+                    }
+                ),
             )
         session.add(
             DownloadHistory(
@@ -3122,6 +3322,7 @@ async def run_eviction_sweep(
     grace_days: int,
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
 ) -> list[EvictionOutcome]:
     """One sweep pass for ONE configured root/media-kind.
 
@@ -3217,6 +3418,85 @@ async def run_eviction_sweep(
             grace_days=grace_days,
             proactive=proactive,
             all_roots=all_roots,
+            qbt=qbt,
+        )
+    finally:
+        _sweep_latch["busy"] = False
+
+
+async def run_correction_recovery_sweep(
+    *,
+    session: AsyncSession,
+    library: LibraryPort,
+    fs: FileSystemPort,
+    media_type: Literal["movie", "tv"],
+    root_path: str,
+    all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
+) -> None:
+    """Converge one root's INTERRUPTED OPERATOR CORRECTIONS and nothing else.
+
+    ``eviction_enabled`` is the RETENTION bot's master switch, not a switch over
+    the operator's own corrections. A report-issue purge that crashed mid-delete
+    leaves remnants at a DETERMINISTIC destination, so the replacement import
+    fails (``import_blocked``) against them on every retry -- and with the bot off,
+    the periodic tick used to return before recovery ever ran, leaving that
+    deadlock to be broken only by re-enabling eviction or hitting an unrelated
+    manual action. That is exactly the terminal north star #1 forbids, so the tick
+    routes through here instead (``web/app.py``'s ``_eviction_tick_leased``).
+
+    This is :func:`_resume_interrupted_evictions` with ``correction_only=True`` and
+    NOTHING else: no candidate assembly, no pressure gate, no proactive pass, no
+    retention telemetry, no eviction -- hence no outcomes to return. Rows retention
+    claimed for itself are skipped (see that function), so a disabled bot never
+    finishes a delete the operator disabled it to stop.
+
+    Keeps two of the sweep's preconditions, for the same reasons:
+
+    * ``_sweep_latch``. Recovery must never run beside a sweep that could be
+      mid-purge on the same path; a skipped pass is retried next tick.
+    * The root disk stat. An unreadable root (missing mount) must never let a
+      breadcrumb's ``os.stat`` read as "gone" and be finalized -- skipped and
+      logged, never a crash. The reading itself is unused here: nothing in this
+      pass reasons about pressure.
+
+    An unconfigured qBittorrent (``qbt=None``) is honest, not fatal: recovery
+    defers any correction whose culprit torrent must be removed first and retries
+    on a later tick (see :func:`_resume_one_claimed`).
+    """
+    if _sweep_latch["busy"]:
+        _logger.info(
+            "correction recovery skipped for %s root %s: a sweep is already in "
+            "progress (it runs this same recovery pass)",
+            media_type,
+            root_path,
+        )
+        return
+    _sweep_latch["busy"] = True
+    try:
+        try:
+            await purge_service.run_abandonable_probe(
+                lambda: read_disk_usage(root_path),
+                root_path,
+                operation_name="correction recovery root probe",
+            )
+        except OSError as exc:
+            _logger.warning(
+                "correction recovery skipped for %s root %s (%s)",
+                media_type,
+                root_path,
+                type(exc).__name__,
+            )
+            return
+        await _resume_interrupted_evictions(
+            session=session,
+            library=library,
+            fs=fs,
+            qbt=qbt,
+            media_type=media_type,
+            root_path=root_path,
+            all_roots=all_roots if all_roots is not None else (root_path,),
+            correction_only=True,
         )
     finally:
         _sweep_latch["busy"] = False
@@ -3269,6 +3549,7 @@ async def _run_sweep(
     grace_days: int,
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
+    qbt: DownloadClientPort | None = None,
 ) -> list[EvictionOutcome]:
     """The sweep body, entered only under :func:`run_eviction_sweep`'s
     serialization latch — see the public docstring."""
@@ -3317,6 +3598,7 @@ async def _run_sweep(
         session=session,
         library=library,
         fs=fs,
+        qbt=qbt,
         media_type=media_type,
         root_path=root_path,
         all_roots=scope,

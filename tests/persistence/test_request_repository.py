@@ -606,6 +606,38 @@ async def test_latest_request_evicted_ignores_cancelled_rows(session: AsyncSessi
     assert await repo.latest_request_evicted(702, "movie") is False
 
 
+async def test_latest_request_evicted_is_not_shadowed_by_rows_silent_about_disk(
+    session: AsyncSession,
+) -> None:
+    """A NEWER row that asserts nothing about the file must not mask older removal
+    truth. A separate re-request that settled 'failed' (not cancelled, so the old
+    non-cancelled keying counted it as "newest") says only that a download did not
+    work out -- the media is still gone. Letting it win would answer False and let
+    the next re-request mint 'available' over nothing while Plex is still stale."""
+    repo = SqlRequestRepository(session)
+
+    # The durable removal stamp: a correction whose purge really did remove the
+    # old file, on a row that later settled 'failed'.
+    corrected = await repo.create(tmdb_id=704, media_type="movie", title="Fixed", status="failed")
+    await repo.set_library_path(corrected.id, "/media/movies/Fixed (2026)")
+    await repo.clear_library_path(corrected.id, mark_removed=True)
+    assert await repo.latest_request_evicted(704, "movie") is True
+
+    # The replacement re-request, itself failed: newer, unstamped, disk-silent.
+    await repo.create(tmdb_id=704, media_type="movie", title="Fixed", status="failed")
+    assert await repo.latest_request_evicted(704, "movie") is True
+
+    # Same shadowing shape over a plain 'evicted' row (no stamp needed).
+    await repo.create(tmdb_id=705, media_type="movie", title="Gone", status="evicted")
+    await repo.create(tmdb_id=705, media_type="movie", title="Gone", status="failed")
+    assert await repo.latest_request_evicted(705, "movie") is True
+
+    # PRESENCE still wins: an available row asserts the file is back, which
+    # legitimately ends the removal claim (a genuine re-download).
+    await repo.create(tmdb_id=705, media_type="movie", title="Gone", status="available")
+    assert await repo.latest_request_evicted(705, "movie") is False
+
+
 async def test_clear_library_path_if_set_is_a_single_winner_gate(session: AsyncSession) -> None:
     """The guarded breadcrumb clear returns True exactly once -- the eviction
     finalize's single-winner gate: only the pass that actually cleared it writes

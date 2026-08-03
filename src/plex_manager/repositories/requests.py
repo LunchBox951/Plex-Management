@@ -538,7 +538,7 @@ class SqlRequestRepository:
         return _to_record(row) if row is not None else None
 
     async def latest_request_evicted(self, tmdb_id: int, media_type: str) -> bool:
-        """Whether the NEWEST request row for this media is ``evicted`` (ADR-0012).
+        """Whether the newest durable media truth says the library copy is gone.
 
         The in-library short-circuit (``request_service.create_request``) consults
         this AFTER :meth:`find_in_library` finds no ``available``/``completed`` row.
@@ -552,30 +552,46 @@ class SqlRequestRepository:
         -- the exact race this guards. When this returns ``True`` the caller
         re-grabs (``pending``) instead of trusting Plex.
 
-        Keyed on the NEWEST NON-``cancelled`` row (``ORDER BY id DESC``) so a
-        movie legitimately re-downloaded after an earlier eviction (whose newest
-        row is ``available`` / active, already resolved by ``find_in_library`` /
-        ``find_active`` before this is ever reached) is never falsely suppressed
-        -- only a media whose most recent history really is an eviction is
-        treated as stale-in-Plex. ``cancelled`` rows are IGNORED outright rather
-        than counted as "newest": a cancellation says nothing about on-disk
-        truth, so an in-window re-grab the user then cancelled (evicted ->
-        pending -> cancelled) must not reset this guard and let the NEXT
-        re-request mint ``available`` off the same stale Plex reading while the
-        sweep is still deleting the file.
+        Keyed on the NEWEST TRUTH-BEARING row (``ORDER BY id DESC``) -- one that
+        actually asserts something about the file on disk. Exactly three shapes
+        qualify: ``evicted`` (removal claimed), a durable ``library_removed_at``
+        stamp (removal proven, whatever status the row later settled at), and
+        ``available``/``completed`` (presence asserted, which legitimately ENDS an
+        older removal claim -- a re-download). Everything else is silent about
+        disk and is skipped rather than counted as "newest", so it can never
+        SHADOW older truth: a ``cancelled`` re-grab says nothing (evicted ->
+        pending -> cancelled must not reset this guard), and neither does a
+        SEPARATE newer re-request row that is merely ``pending``/``searching``/
+        ``failed`` -- it would otherwise mask the stamped correction row behind it
+        and let the next re-request mint ``available`` over media that is gone
+        while Plex is still stale. Reaching a presence row here is safe (the
+        caller already asked :meth:`find_in_library`, which found none) and keeps
+        the rule self-contained; a fresh import also clears the stamp in
+        :meth:`set_library_path`, so replaced media stops suppressing Plex truth.
         """
         stmt = (
-            select(MediaRequest.status)
+            select(MediaRequest.status, MediaRequest.library_removed_at)
             .where(
                 MediaRequest.tmdb_id == tmdb_id,
                 MediaRequest.media_type == MediaType(media_type),
-                MediaRequest.status != RequestStatus.cancelled,
+                or_(
+                    MediaRequest.status.in_(
+                        [
+                            RequestStatus.evicted,
+                            RequestStatus.available,
+                            RequestStatus.completed,
+                        ]
+                    ),
+                    MediaRequest.library_removed_at.is_not(None),
+                ),
             )
             .order_by(MediaRequest.id.desc())
             .limit(1)
         )
-        status = (await self._session.execute(stmt)).scalars().first()
-        return status == RequestStatus.evicted
+        row = (await self._session.execute(stmt)).first()
+        return row is not None and (
+            row.status == RequestStatus.evicted or row.library_removed_at is not None
+        )
 
     async def list_for_media(
         self, tmdb_id: int, media_type: str, statuses: frozenset[str]
@@ -609,6 +625,7 @@ class SqlRequestRepository:
         *,
         expected_path: str | None = None,
         expected_statuses: frozenset[str] | None = None,
+        mark_removed: bool = False,
     ) -> bool:
         """Null the eviction breadcrumb ONLY if it is currently set (and, with
         ``expected_path``, only if it still holds EXACTLY that value; with
@@ -637,6 +654,12 @@ class SqlRequestRepository:
             predicates.append(
                 MediaRequest.status.in_([RequestStatus(status) for status in expected_statuses])
             )
+        values: dict[str, object | None] = {
+            "library_path": None,
+            "partial_delete_path": None,
+        }
+        if mark_removed:
+            values["library_removed_at"] = datetime.now(UTC)
         result = cast(
             CursorResult[Any],
             await self._session.execute(
@@ -646,17 +669,26 @@ class SqlRequestRepository:
                 # reclaim, so an outstanding marker over it could only mislead a
                 # later recovery pass. Cleared in the SAME statement so no window
                 # exists where one is set without the other.
-                .values(library_path=None, partial_delete_path=None)
+                .values(**values)
                 .where(*predicates)
                 .execution_options(synchronize_session="fetch")
             ),
         )
         return result.rowcount == 1
 
-    async def confirm_partial_delete_marker(self, request_id: int, *, expected_path: str) -> bool:
+    async def confirm_partial_delete_marker(
+        self,
+        request_id: int,
+        *,
+        expected_path: str,
+        honor_keep_forever: bool = True,
+    ) -> bool:
         """CAS-CONFIRM the incomplete-delete marker at a recovery purge's delete
         boundary: re-stamp it to ``expected_path`` ONLY if the row still carries
-        exactly that breadcrumb AND marker AND is not ``keep_forever``-pinned.
+        exactly that breadcrumb AND marker. Retention-owned eviction recovery also
+        requires the row not be ``keep_forever``-pinned; operator correction
+        recovery passes ``honor_keep_forever=False`` because that pin must not
+        strand a destructive correction the operator already requested.
         Returns whether a row was actually matched (issue #515).
 
         The value written is the value already there, so this looks like a no-op
@@ -682,17 +714,19 @@ class SqlRequestRepository:
         False`` deliberately: any ORM-side sync would emit its own SELECT and cost
         this statement its place as the transaction's first.
         """
+        predicates = [
+            MediaRequest.id == request_id,
+            MediaRequest.library_path == expected_path,
+            MediaRequest.partial_delete_path == expected_path,
+        ]
+        if honor_keep_forever:
+            predicates.append(MediaRequest.keep_forever.is_(False))
         result = cast(
             CursorResult[Any],
             await self._session.execute(
                 update(MediaRequest)
                 .values(partial_delete_path=expected_path)
-                .where(
-                    MediaRequest.id == request_id,
-                    MediaRequest.library_path == expected_path,
-                    MediaRequest.partial_delete_path == expected_path,
-                    MediaRequest.keep_forever.is_(False),
-                )
+                .where(*predicates)
                 .execution_options(synchronize_session=False)
             ),
         )
@@ -1378,6 +1412,9 @@ class SqlRequestRepository:
             raise LookupError(f"media request {request_id} does not exist")
         row.library_path = library_path
         row.partial_delete_path = None
+        # Fresh placed content supersedes any earlier correction/eviction removal
+        # truth carried by this same row.
+        row.library_removed_at = None
         await self._session.flush()
 
     async def set_partial_delete_path(self, request_id: int, library_path: str) -> None:
@@ -1646,7 +1683,7 @@ class SqlRequestRepository:
             .execution_options(synchronize_session="fetch")
         )
 
-    async def clear_library_path(self, request_id: int) -> None:
+    async def clear_library_path(self, request_id: int, *, mark_removed: bool = False) -> None:
         """Drop the eviction/purge breadcrumb without any status transition (ADR-0014).
 
         The movie-level mirror of ``SqlSeasonRequestRepository.clear_library_path``:
@@ -1666,6 +1703,8 @@ class SqlRequestRepository:
         # The marker dies with the breadcrumb it describes (issues #482 / #485):
         # the caller only reaches here once the purge ACTUALLY removed the file.
         row.partial_delete_path = None
+        if mark_removed:
+            row.library_removed_at = datetime.now(UTC)
         await self._session.flush()
 
     async def set_keep_forever(self, request_id: int, keep_forever: bool) -> None:

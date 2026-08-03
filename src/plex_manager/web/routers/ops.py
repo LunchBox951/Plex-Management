@@ -57,6 +57,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
 from plex_manager.domain.disk_usage import used_percent
+from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import eviction_service, purge_service, watchlist_service
@@ -98,6 +99,7 @@ from plex_manager.web.deps import (
     get_library_optional,
     get_log_handler,
     get_movies_root_optional,
+    get_qbittorrent_optional,
     get_reconcile_status,
     get_session,
     get_tv_root_optional,
@@ -693,6 +695,7 @@ async def evict_endpoint(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     library: Annotated[LibraryPort, Depends(get_library)],
+    qbt: Annotated[DownloadClientPort | None, Depends(get_qbittorrent_optional)],
     cache: Annotated[TtlCache[DiskRootItem], Depends(_get_disk_preview_cache)],
 ) -> EvictResponse:
     """Manually trigger a pressure-triggered eviction sweep across every
@@ -777,6 +780,7 @@ async def evict_endpoint(
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
+                    qbt=qbt,
                 )
             )
         except Exception as exc:

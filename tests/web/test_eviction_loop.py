@@ -145,6 +145,89 @@ async def test_eviction_disabled_setting_is_a_master_kill_switch(
         assert row.status is RequestStatus.available
 
 
+async def test_disabled_eviction_still_recovers_an_interrupted_correction_purge(
+    sessionmaker_: SessionMaker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``eviction_enabled=False`` switches off the RETENTION bot, not the
+    operator's own corrections (issue #513).
+
+    A report-issue purge interrupted mid-delete leaves remnants at the movie's
+    DETERMINISTIC destination, so its replacement import keeps failing against
+    them (``import_blocked``). Only the marker-owned recovery pass clears that,
+    and before this the disabled tick returned before ever reaching it -- leaving
+    the operator's correction stuck until someone re-enabled an unrelated bot.
+    The disabled tick therefore still runs recovery, and STILL evicts nothing.
+    """
+    victim_file = tmp_path / "Stale Movie.mkv"
+    victim_file.write_bytes(b"0" * 1024)
+    # threshold/target 0 -- everything except the disabled switch is primed to
+    # evict this watched, past-grace movie.
+    victim_id = await _seed(
+        sessionmaker_,
+        movies_root=str(tmp_path),
+        library_path=str(victim_file),
+        eviction_enabled="false",
+    )
+
+    # The interrupted correction: breadcrumb + the durable incomplete-delete
+    # marker over the SAME path is the #513 recovery signature for a movie.
+    remnants = tmp_path / "Corrected Movie (2026)"
+    remnants.mkdir()
+    (remnants / "Corrected Movie (2026).mkv").write_bytes(b"old" * 512)
+    async with sessionmaker_() as session:
+        correction = MediaRequest(
+            tmdb_id=_TMDB_ID + 1,
+            media_type=MediaType.movie,
+            title="Corrected Movie",
+            status=RequestStatus.import_blocked,
+            library_path=str(remnants),
+            partial_delete_path=str(remnants),
+        )
+        session.add(correction)
+        await session.flush()
+        correction_id = correction.id
+        await session.commit()
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+
+    async def _library(_session: AsyncSession, _client: httpx.AsyncClient) -> LibraryPort | None:
+        return library
+
+    monkeypatch.setattr(app_module, "get_library_optional", _library)
+
+    telemetry_calls: list[str] = []
+
+    async def _fake_sweep(**kwargs: object) -> None:
+        telemetry_calls.append(kwargs["root_path"])  # type: ignore[index]
+
+    monkeypatch.setattr(retention_telemetry_service, "run_retention_telemetry_sweep", _fake_sweep)
+
+    app = _app(sessionmaker_)
+    try:
+        await app_module._eviction_tick(app)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await app.state.http_client.aclose()
+
+    # The correction converged: the remnants are gone and the row no longer
+    # points at them, so the replacement import can finally land.
+    assert not remnants.exists()
+    # Recovery only: the pressure victim is untouched, and the disabled tick
+    # still does no extra Plex watch-state polling for telemetry.
+    assert victim_file.exists()
+    assert telemetry_calls == []
+    async with sessionmaker_() as session:
+        recovered = await session.get(MediaRequest, correction_id)
+        victim = await session.get(MediaRequest, victim_id)
+    assert recovered is not None
+    assert recovered.status is RequestStatus.import_blocked  # never re-adjudicated
+    assert recovered.library_path is None
+    assert recovered.partial_delete_path is None
+    assert victim is not None
+    assert victim.status is RequestStatus.available
+
+
 # --------------------------------------------------------------------------- #
 # Retention telemetry (ADR-0012 follow-up): a DELETE-NOTHING sweep that only
 # runs when the SAME tick's pressure gate does NOT fire -- proving (a) it never
