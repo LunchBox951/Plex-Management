@@ -14,16 +14,19 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- builder: install the app into an isolated venv ----
-FROM python:3.14-slim AS builder
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e AS builder
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 
-RUN python -m venv /opt/venv
+RUN apk add --no-cache \
+        python-3.14=3.14.6-r4 \
+        py3.14-pip=26.1.2-r1 \
+    && python3.14 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Patch the venv's bundled pip before it installs anything
 # (CVE-2026-1703: path traversal when extracting a crafted wheel).
-RUN pip install --upgrade pip
+RUN pip install --upgrade pip==26.1.2
 
 # Copy only what the build backend needs, then install against the committed
 # runtime constraints used by CI/audit.
@@ -35,8 +38,8 @@ COPY src ./src
 COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
 RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
-# ---- runtime: slim image with just the venv + migration assets ----
-FROM python:3.14-slim AS runtime
+# ---- runtime: Wolfi/glibc image with just the venv + migration assets ----
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e AS runtime
 ARG PLEX_MANAGER_BUILD_ID=0.0.0
 # The app's config default is loopback (safe for bare-metal first runs); inside
 # the container the ONLY way in is the published port, so bind all interfaces
@@ -61,30 +64,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Validate downloaded candidates by their actual media container/streams before
-# they can enter a Plex library.  ffprobe ships in Debian's ffmpeg package; keep
-# it in the runtime stage only (the builder never probes media).
-# --only-upgrade liblzma5 also patches CVE-2026-34743 (xz/liblzma buffer
-# overflow decoding a Record-less Index): python:3.14-slim ships 5.8.1-1, and
-# the fixed 5.8.1-1+deb13u1 is already in the Debian repo the base image
-# points at -- the base image just hasn't picked it up. Scoped to the one
-# package rather than a blanket `apt-get upgrade` so the layer stays
-# deterministic and this line can be dropped once the base image rebases past
-# the fix.
-RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ffmpeg \
-    && apt-get install --yes --only-upgrade liblzma5 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Patch the base image's own system pip too (same CVE-2026-1703). The app runs
-# from the copied venv and never invokes this pip, but Trivy scans the whole
-# filesystem and we surface every finding, so we fix the fixable ones outright.
-# This runs before the venv is copied, so `python` is the base interpreter here.
-RUN python -m pip install --no-cache-dir --upgrade pip
-
-# Non-root user; pre-create the data dir for the mounted volume.
-RUN useradd --create-home --uid 10001 appuser \
+# they can enter a Plex library. The versioned ffmpeg package supplies ffprobe.
+RUN apk add --no-cache \
+        python-3.14=3.14.6-r4 \
+        ffmpeg-8.1=8.1.2-r2 \
+        tzdata=2026c-r0 \
     && mkdir -p /app/data \
-    && chown -R appuser:appuser /app
+    && chown 10001:10001 /app/data
 
 COPY --from=builder /opt/venv /opt/venv
 COPY alembic.ini ./
@@ -92,10 +78,10 @@ COPY migrations ./migrations
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-USER appuser
+USER 10001:10001
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os,urllib.request,sys; p=os.environ.get('PLEX_MANAGER_PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=4).status==200 else 1)"
+    CMD ["python", "-c", "import os,urllib.request,sys; p=os.environ.get('PLEX_MANAGER_PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=4).status==200 else 1)"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

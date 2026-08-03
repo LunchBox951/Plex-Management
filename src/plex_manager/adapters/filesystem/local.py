@@ -47,6 +47,16 @@ _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
     {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
 )
 
+
+# CPython ``shutil._copyxattr`` treats unsupported, absent, and invalid listings as empty.
+_XATTR_ENUMERATION_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.ENOTSUP, errno.ENODATA, errno.EINVAL}
+)
+# CPython tolerates per-attribute access, capability, absence, and target-rejection errors.
+_XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES}
+)
+
 #: Read size for the destination-vs-source digest comparison. Media files are large;
 #: this is the same 1 MiB chunk the import pipeline used before the comparison moved
 #: behind the publish walk's descriptor.
@@ -478,6 +488,28 @@ def _publish_link_no_overwrite(
     )
 
 
+def _copy_xattrs(source_fd: int, target_fd: int) -> None:
+    try:
+        names = os.listxattr(source_fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_ENUMERATION_TOLERATED_ERRNOS:
+            return
+        raise
+
+    for name in names:
+        try:
+            value = os.getxattr(source_fd, name)
+        except OSError as exc:
+            if exc.errno in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
+                continue
+            raise
+        try:
+            os.setxattr(target_fd, name, value)
+        except OSError as exc:
+            if exc.errno not in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
+                raise
+
+
 def _copy_contents(source_fd: int, target: IO[bytes]) -> None:
     """Stream the bytes behind ``source_fd`` into the already-open ``target``, preserving
     mode and timestamps -- the ``shutil.copy2`` equivalent for a destination that exists
@@ -493,6 +525,7 @@ def _copy_contents(source_fd: int, target: IO[bytes]) -> None:
         shutil.copyfileobj(source, target)
     source_stat = os.fstat(source_fd)
     target.flush()
+    _copy_xattrs(source_fd, target.fileno())
     os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
     os.utime(target.fileno(), ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
 

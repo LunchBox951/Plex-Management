@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import stat
+import sys
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -168,6 +169,461 @@ def test_hardlink_or_copy_falls_back_to_copy(
 
     assert dst.read_text() == "payload"
     assert src.stat().st_ino != dst.stat().st_ino  # a copy, not a link
+
+
+def test_cross_device_copy_copies_all_xattrs_by_held_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy fallback must preserve xattrs from the already-held file descriptors."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    os.chmod(src, 0o600)
+    source_stat = src.stat()
+    dst = tmp_path / "copied.mkv"
+    operations: list[str] = []
+    expected_names = ["user.plex_manager.issue500", "system.posix_acl_access"]
+    expected_values = {
+        "user.plex_manager.issue500": b"issue-500",
+        "system.posix_acl_access": b"acl-bytes",
+    }
+    real_link = os.link
+    real_copyfileobj = shutil.copyfileobj
+    real_fchmod = os.fchmod
+    real_utime = os.utime
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _record_copy(source: IO[bytes], target: IO[bytes]) -> None:
+        operations.append("content copy")
+        real_copyfileobj(source, target)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        operations.append("listxattr")
+        return expected_names
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        assert isinstance(fd, int)
+        operations.append(f"getxattr:{name}")
+        return expected_values[name]
+
+    def _setxattr(fd: int, name: str, value: bytes) -> None:
+        assert isinstance(fd, int)
+        assert value == expected_values[name]
+        operations.append(f"setxattr:{name}")
+
+    def _record_fchmod(fd: int, mode: int) -> None:
+        assert isinstance(fd, int)
+        operations.append("fchmod")
+        real_fchmod(fd, mode)
+
+    def _record_utime(fd: int, *, ns: tuple[int, int]) -> None:
+        assert isinstance(fd, int)
+        operations.append("utime")
+        real_utime(fd, ns=ns)
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(shutil, "copyfileobj", _record_copy)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+    monkeypatch.setattr(os, "fchmod", _record_fchmod)
+    monkeypatch.setattr(os, "utime", _record_utime)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert src.read_bytes() == dst.read_bytes() == b"source payload"
+    assert src.stat().st_ino != dst.stat().st_ino
+    assert operations == [
+        "content copy",
+        "listxattr",
+        "getxattr:user.plex_manager.issue500",
+        "setxattr:user.plex_manager.issue500",
+        "getxattr:system.posix_acl_access",
+        "setxattr:system.posix_acl_access",
+        "fchmod",
+        "utime",
+    ]
+    assert stat.S_IMODE(dst.stat().st_mode) == stat.S_IMODE(source_stat.st_mode)
+
+
+@pytest.mark.parametrize(
+    ("operation", "tolerated_errno"),
+    [
+        ("listxattr", errno.ENOTSUP),
+        ("getxattr", errno.EPERM),
+        ("getxattr", errno.ENOTSUP),
+        ("setxattr", errno.EPERM),
+        ("setxattr", errno.ENOTSUP),
+    ],
+)
+def test_cross_device_copy_tolerates_xattr_capability_or_permission_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    tolerated_errno: int,
+) -> None:
+    """Capability and permission refusals are best-effort, per xattr when possible."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    os.chmod(src, 0o600)
+    source_stat = src.stat()
+    dst = tmp_path / "copied.mkv"
+    attempted_second_attribute = False
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        if operation == "listxattr":
+            raise OSError(tolerated_errno, "xattrs refused")
+        return ["user.first", "user.second"]
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        nonlocal attempted_second_attribute
+        assert isinstance(fd, int)
+        if name == "user.second":
+            attempted_second_attribute = True
+        if operation == "getxattr" and name == "user.first":
+            raise OSError(tolerated_errno, "xattrs refused")
+        return name.encode()
+
+    def _setxattr(fd: int, name: str, value: bytes) -> None:
+        nonlocal attempted_second_attribute
+        assert isinstance(fd, int)
+        if name == "user.second":
+            attempted_second_attribute = True
+        if operation == "setxattr" and name == "user.first":
+            raise OSError(tolerated_errno, "xattrs refused")
+        assert value == name.encode()
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert stat.S_IMODE(dst.stat().st_mode) == stat.S_IMODE(source_stat.st_mode)
+    assert dst.stat().st_mtime_ns == source_stat.st_mtime_ns
+    assert attempted_second_attribute is (operation != "listxattr")
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["getxattr", "setxattr"])
+def test_cross_device_copy_tolerates_eacces_for_each_xattr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """A denied xattr is skipped while readable attributes still copy."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    copied_names: list[str] = []
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["security.denied", "user.allowed"]
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        assert isinstance(fd, int)
+        if operation == "getxattr" and name == "security.denied":
+            raise OSError(errno.EACCES, "xattr access refused")
+        return name.encode()
+
+    def _setxattr(fd: int, name: str, value: bytes) -> None:
+        assert isinstance(fd, int)
+        if operation == "setxattr" and name == "security.denied":
+            raise OSError(errno.EACCES, "xattr access refused")
+        assert value == name.encode()
+        copied_names.append(name)
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert copied_names == ["user.allowed"]
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_cross_device_copy_propagates_eacces_from_xattr_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An xattr enumeration denial aborts publication rather than skipping every xattr."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(errno.EACCES, "xattr enumeration refused")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == errno.EACCES
+    assert not dst.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_retrieval_errors_per_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
+) -> None:
+    """A rejected or disappearing enumerated xattr does not abort the copy fallback."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    attempted_second_attribute = False
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["user.removed", "user.present"]
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        nonlocal attempted_second_attribute
+        assert isinstance(fd, int)
+        if name == "user.removed":
+            raise OSError(tolerated_errno, "attribute unavailable")
+        attempted_second_attribute = True
+        return b"present"
+
+    def _setxattr(_fd: int, _name: str, _value: bytes) -> None:
+        return None
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert attempted_second_attribute
+    assert dst.read_bytes() == b"source payload"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_target_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
+) -> None:
+    """A target rejecting one source-specific xattr does not abort publication."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        return ["user.plex_manager.issue500"]
+
+    def _getxattr(fd: int, _name: str) -> bytes:
+        assert isinstance(fd, int)
+        return b"issue-500"
+
+    def _setxattr(_fd: int, _name: str, _value: bytes) -> None:
+        raise OSError(tolerated_errno, "target rejected attribute")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("tolerated_errno", [errno.ENODATA, errno.EINVAL])
+def test_cross_device_copy_tolerates_xattr_enumeration_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tolerated_errno: int
+) -> None:
+    """An unsupported or empty xattr listing does not abort publication."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(tolerated_errno, "xattr listing unavailable")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert dst.read_bytes() == b"source payload"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("enumeration_errno", [errno.EPERM])
+def test_cross_device_copy_propagates_eperm_from_xattr_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enumeration_errno: int
+) -> None:
+    """An xattr enumeration permission denial aborts publication and cleans its temp."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        raise OSError(enumeration_errno, "xattr enumeration refused")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == enumeration_errno
+    assert not dst.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["listxattr", "getxattr", "setxattr"])
+def test_cross_device_copy_propagates_unexpected_xattr_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Unexpected xattr I/O errors abort publication and remove the temporary file."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    def _listxattr(fd: int) -> list[str]:
+        assert isinstance(fd, int)
+        if operation == "listxattr":
+            raise OSError(errno.EIO, "xattr I/O failed")
+        return ["user.plex_manager.issue500"]
+
+    def _getxattr(fd: int, _name: str) -> bytes:
+        assert isinstance(fd, int)
+        if operation == "getxattr":
+            raise OSError(errno.EIO, "xattr I/O failed")
+        return b"issue-500"
+
+    def _setxattr(fd: int, _name: str, _value: bytes) -> None:
+        assert isinstance(fd, int)
+        if operation == "setxattr":
+            raise OSError(errno.EIO, "xattr I/O failed")
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+    monkeypatch.setattr(os, "listxattr", _listxattr)
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    monkeypatch.setattr(os, "setxattr", _setxattr)
+
+    with pytest.raises(OSError) as raised:
+        LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert raised.value.errno == errno.EIO
+    assert not dst.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux xattr APIs")
+def test_cross_device_copy_preserves_real_linux_user_xattr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Linux descriptor xattr path preserves a readable user attribute."""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source payload")
+    dst = tmp_path / "copied.mkv"
+    attribute = "user.plex_manager.issue500"
+    value = b"issue-500"
+    try:
+        os.setxattr(src, attribute, value)
+    except OSError as exc:
+        if exc.errno in {errno.EPERM, errno.ENOTSUP}:
+            pytest.skip(f"filesystem does not permit xattrs: {exc}")
+        raise
+    real_link = os.link
+
+    def _refuse_source_link(
+        source: str, target: str, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None
+    ) -> None:
+        if source == os.fspath(src):
+            raise OSError(errno.EXDEV, "simulated cross-device link")
+        real_link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "link", _refuse_source_link)
+
+    LocalFileSystem().hardlink_or_copy(src, dst, root=tmp_path)
+
+    assert src.stat().st_ino != dst.stat().st_ino
+    assert os.getxattr(dst, attribute) == value
 
 
 def test_cross_device_copy_refuses_destination_created_during_publish(
