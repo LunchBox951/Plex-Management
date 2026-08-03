@@ -15,7 +15,9 @@ lock's opened inode and after proving the pathname still names that inode. A
 creator writes its PID and makes the same pathname proof before entry, fencing a
 creator whose zero-byte inode was reclaimed while it was suspended. Because all
 publishers and reclaimers obey the flock, no replacement can reach the lock name
-between a reclaimer's final identity proof and unlink.
+between a reclaimer's final identity proof and unlink. Correctness requires
+working cross-process ``flock`` semantics: local Docker volumes are the supported
+target; NFS/SMB configurations that do not provide real flock are unsupported.
 """
 
 from __future__ import annotations
@@ -226,9 +228,11 @@ def _reclaim_lock_if_stale(dir_fd: int, lock_name: str) -> bool:
     """Unlink a stale lock while excluding its creator and every other reclaimer.
 
     ``flock`` is attached to the opened inode, so a suspended creator already holding
-    the same exclusive lock prevents inspection. After acquiring it, the pathname
-    identity proof and unlink are indivisible with respect to cooperating creators:
-    no replacement can be published at ``lock_name`` until this descriptor unlocks.
+    the same exclusive lock prevents inspection. The pathname identity proof and
+    unlink are indivisible with respect to cooperating creators only until unlink
+    returns. A publisher may then create and lock a new inode at ``lock_name`` before
+    this descriptor closes; that is safe because the reclaimer performs no destination
+    work afterward and its caller retries acquisition against the new pathname.
     """
     try:
         lock_fd = os.open(
