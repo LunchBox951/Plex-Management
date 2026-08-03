@@ -118,34 +118,37 @@ async def test_shared_user_requests_are_limited_to_their_own_records(
     )
     shared_cookies, shared_headers = await _shared_user_cookies(app)
 
+    client.cookies.update(shared_cookies)
     own = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=shared_cookies,
         headers=shared_headers,
     )
     assert own.status_code == 201
     assert own.json()["can_mutate"] is True
 
+    # The api-key row must be minted with NO session cookie riding along, so the
+    # ownerless/automation path is exercised on its own.
+    client.cookies.clear()
     admin = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 604, "media_type": "movie"},
         headers=_HEADERS,
     )
     assert admin.status_code == 201
+    client.cookies.update(shared_cookies)
 
-    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    listed = await client.get("/api/v1/requests")
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == [own.json()["id"]]
     assert listed.json()["requests"][0]["can_mutate"] is True
 
-    hidden = await client.get(f"/api/v1/requests/{admin.json()['id']}", cookies=shared_cookies)
+    hidden = await client.get(f"/api/v1/requests/{admin.json()['id']}")
     assert hidden.status_code == 404
 
     pin = await client.post(
         f"/api/v1/requests/{own.json()['id']}/keep-forever",
         json={"keep_forever": True},
-        cookies=shared_cookies,
         headers=shared_headers,
     )
     assert pin.status_code == 200
@@ -174,17 +177,18 @@ async def test_subscriber_cannot_mutate_another_users_request(
     subscriber_cookies, subscriber_headers = await _shared_user_cookies(
         app, tag=f"subscriber-{suffix}"
     )
+    client.cookies.update(owner_cookies)
     created = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=owner_cookies,
         headers=owner_headers,
     )
     assert created.status_code == 201
+    client.cookies.clear()
+    client.cookies.update(subscriber_cookies)
     subscribed = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=subscriber_cookies,
         headers=subscriber_headers,
     )
     assert subscribed.status_code == 200
@@ -193,7 +197,6 @@ async def test_subscriber_cannot_mutate_another_users_request(
     response = await client.post(
         f"/api/v1/requests/{created.json()['id']}/{suffix}",
         json=json_body,
-        cookies=subscriber_cookies,
         headers=subscriber_headers,
     )
     assert response.status_code == 404
@@ -259,10 +262,10 @@ async def test_keep_forever_by_non_admin_does_not_touch_another_users_row(
         await session.commit()
         settled_id, active_id = settled.id, active.id
 
+    client.cookies.update(cookies_b)
     pinned = await client.post(
         f"/api/v1/requests/{active_id}/keep-forever",
         json={"keep_forever": True},
-        cookies=cookies_b,
         headers=headers_b,
     )
     assert pinned.status_code == 200
@@ -334,18 +337,21 @@ async def test_shared_user_request_progress_is_filtered_with_their_records(
     )
     shared_cookies, shared_headers = await _shared_user_cookies(app)
 
+    client.cookies.update(shared_cookies)
     own = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=shared_cookies,
         headers=shared_headers,
     )
+    # The hidden row belongs to the api-key path alone -- no session cookie.
+    client.cookies.clear()
     hidden = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 604, "media_type": "movie"},
         headers=_HEADERS,
     )
     assert own.status_code == hidden.status_code == 201
+    client.cookies.update(shared_cookies)
 
     async with app.state.sessionmaker() as session:
         own_row = await session.get(MediaRequest, own.json()["id"])
@@ -373,7 +379,7 @@ async def test_shared_user_request_progress_is_filtered_with_their_records(
         )
         await session.commit()
 
-    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    listed = await client.get("/api/v1/requests")
     assert listed.status_code == 200
     assert listed.json()["requests"] == [
         {
@@ -398,10 +404,10 @@ async def test_shared_user_dedup_subscribes_to_unowned_request_without_claiming_
     assert admin.status_code == 201
 
     # A shared user requesting the same title dedups onto that ownerless request.
+    client.cookies.update(shared_cookies)
     shared = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=shared_cookies,
         headers=shared_headers,
     )
     assert shared.status_code == 200
@@ -410,7 +416,7 @@ async def test_shared_user_dedup_subscribes_to_unowned_request_without_claiming_
 
     # It is now adopted by the requester, so it shows up in THEIR filtered list
     # rather than succeeding yet vanishing behind the per-user filter.
-    listed = await client.get("/api/v1/requests", cookies=shared_cookies)
+    listed = await client.get("/api/v1/requests")
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == [admin.json()["id"]]
     assert listed.json()["requests"][0]["can_mutate"] is False
@@ -439,10 +445,10 @@ async def test_ownerless_automation_subscriber_cannot_mutate_request(
         headers=_HEADERS,
     )
     cookies, headers = await _shared_user_cookies(app, tag=f"ownerless-{suffix}")
+    client.cookies.update(cookies)
     subscribed = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie"},
-        cookies=cookies,
         headers=headers,
     )
     assert subscribed.status_code == 200
@@ -451,7 +457,6 @@ async def test_ownerless_automation_subscriber_cannot_mutate_request(
     response = await client.post(
         f"/api/v1/requests/{automation.json()['id']}/{suffix}",
         json=json_body,
-        cookies=cookies,
         headers=headers,
     )
     assert response.status_code == 404
@@ -530,10 +535,10 @@ async def test_create_force_reacquire_allowed_for_shared_user(
     override_adapters(app, tmdb=_tmdb(), library=FakeLibrary(available={603}))
     shared_cookies, shared_headers = await _shared_user_cookies(app)
 
+    client.cookies.update(shared_cookies)
     created = await client.post(
         "/api/v1/requests",
         json={"tmdb_id": 603, "media_type": "movie", "force": True},
-        cookies=shared_cookies,
         headers=shared_headers,
     )
     assert created.status_code == 201
@@ -1043,7 +1048,8 @@ async def test_subscriber_scoped_list_folds_cross_owner_duplicates(
         await repo.add_subscriber(newer_id, viewer_id)
         await session.commit()
 
-    listed = await client.get("/api/v1/requests", cookies=viewer_cookies)
+    client.cookies.update(viewer_cookies)
+    listed = await client.get("/api/v1/requests")
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == [newer_id]
     assert listed.json()["requests"][0]["can_mutate"] is False

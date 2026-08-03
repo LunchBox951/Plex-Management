@@ -729,7 +729,7 @@ async def revoke_user_sessions_endpoint(
     user_id = body.user_id
     if user_id is None:  # pragma: no cover - guaranteed by RevokeSessionsRequest
         raise AppError(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             code="invalid_revoke_target",
             message="A user-session revoke needs a user_id.",
         )

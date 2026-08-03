@@ -421,7 +421,8 @@ async def test_search_scopes_request_badges_to_the_shared_users_own_rows(
     )
     override_adapters(app, tmdb=tmdb, library=FakeLibrary(available={3}))
 
-    response = await client.get("/api/v1/discover/search", params={"query": "x"}, cookies=cookies)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/discover/search", params={"query": "x"})
     assert response.status_code == 200
     states = {r["tmdb_id"]: r["library_state"] for r in response.json()["results"]}
     # The neighbor's request activity does NOT leak (1 -> none); the shared user's
@@ -481,7 +482,8 @@ async def test_home_scopes_request_badges_for_shared_sessions_too(
     ]
     override_adapters(app, tmdb=FakeTmdb(trending=trending, popular=[], upcoming=[]))
 
-    response = await client.get("/api/v1/discover/home", cookies=cookies)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/discover/home")
     assert response.status_code == 200
     body = response.json()
     trending_row = next(r for r in body["rows"] if r["row_type"] == "trending")
@@ -574,9 +576,8 @@ async def test_shared_session_personalization_uses_only_own_history(
     # global-history fallback would call it and expose its title in copy.
     override_adapters(app, tmdb=tmdb, library=FakeLibrary(available={901}))
 
-    response = await client.get(
-        "/api/v1/discover/home", params={"load_id": _LOAD_ID}, cookies=cookies
-    )
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/discover/home", params={"load_id": _LOAD_ID})
 
     assert response.status_code == 200
     body = response.json()
@@ -625,10 +626,9 @@ async def test_plex_admin_personalization_is_still_scoped_to_the_admins_own_rows
     tmdb = _personalized_tmdb(201, 902)
     override_adapters(app, tmdb=tmdb)
 
-    first = await client.get("/api/v1/discover/home", params={"load_id": _LOAD_ID}, cookies=cookies)
-    second = await client.get(
-        "/api/v1/discover/home", params={"load_id": _LOAD_ID}, cookies=cookies
-    )
+    client.cookies.update(cookies)
+    first = await client.get("/api/v1/discover/home", params={"load_id": _LOAD_ID})
+    second = await client.get("/api/v1/discover/home", params={"load_id": _LOAD_ID})
 
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
@@ -661,10 +661,9 @@ async def test_home_load_id_validation_and_omitted_id_backward_compatibility(
     tmdb = _personalized_tmdb(301, 903)
     override_adapters(app, tmdb=tmdb)
 
-    invalid = await client.get(
-        "/api/v1/discover/home", params={"load_id": "not-a-uuid"}, cookies=cookies
-    )
-    omitted = await client.get("/api/v1/discover/home", cookies=cookies)
+    client.cookies.update(cookies)
+    invalid = await client.get("/api/v1/discover/home", params={"load_id": "not-a-uuid"})
+    omitted = await client.get("/api/v1/discover/home")
 
     assert invalid.status_code == 422
     assert omitted.status_code == 200
@@ -713,9 +712,8 @@ async def test_no_history_omits_personalized_placeholders_but_keeps_response_pri
     tmdb = FakeTmdb(trending=[], popular=[], upcoming=[])
     override_adapters(app, tmdb=tmdb)
 
-    response = await client.get(
-        "/api/v1/discover/home", params={"load_id": _LOAD_ID}, cookies=cookies
-    )
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/discover/home", params={"load_id": _LOAD_ID})
 
     assert response.status_code == 200
     assert len(response.json()["rows"]) == 5
