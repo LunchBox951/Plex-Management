@@ -8,12 +8,23 @@ synchronous (local disk) per the port contract.
 ``hardlink_or_copy`` prefers a hardlink (instant, zero extra space) and falls
 back to a content copy when the destination is on a different device — the
 classic seedbox/library cross-mount case.
+
+Publish locks use one invariant: an actor may enter the destination critical
+section, or unlink a stale lock, only while holding ``flock(LOCK_EX)`` on the
+lock's opened inode and after proving the pathname still names that inode. A
+creator writes its PID and makes the same pathname proof before entry, fencing a
+creator whose zero-byte inode was reclaimed while it was suspended. Because all
+publishers and reclaimers obey the flock, no replacement can reach the lock name
+between a reclaimer's final identity proof and unlink. Correctness requires
+working cross-process ``flock`` semantics: local Docker volumes are the supported
+target; NFS/SMB configurations that do not provide real flock are unsupported.
 """
 
 from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import os
 import shutil
@@ -34,6 +45,16 @@ __all__ = ["LocalFileSystem", "LocalFileSystemError", "PartialDeleteError"]
 # could overwrite a file another import just placed.
 _COPY_FALLBACK_ERRNOS: frozenset[int] = frozenset(
     {errno.EXDEV, errno.EPERM, errno.EMLINK, errno.EOPNOTSUPP, errno.EACCES}
+)
+
+
+# CPython ``shutil._copyxattr`` treats unsupported, absent, and invalid listings as empty.
+_XATTR_ENUMERATION_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.ENOTSUP, errno.ENODATA, errno.EINVAL}
+)
+# CPython tolerates per-attribute access, capability, absence, and target-rejection errors.
+_XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES}
 )
 
 #: Read size for the destination-vs-source digest comparison. Media files are large;
@@ -161,99 +182,94 @@ def _pid_is_running(pid: int) -> bool | None:
 _EMPTY_LOCK_STALE_SECONDS = 60.0
 
 
-def _lock_is_expired(dir_fd: int, lock_name: str) -> bool:
-    """Whether an empty/unparseable lock is old enough (by mtime) to reclaim."""
+def _lock_path_matches_fd(dir_fd: int, lock_name: str, lock_fd: int) -> bool:
+    """Whether ``lock_name`` still names the regular file opened as ``lock_fd``."""
     try:
-        mtime = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False).st_mtime
+        lock_info = os.fstat(lock_fd)
+        path_info = os.stat(lock_name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(lock_info.st_mode)
+        and stat.S_ISREG(path_info.st_mode)
+        and (lock_info.st_dev, lock_info.st_ino) == (path_info.st_dev, path_info.st_ino)
+    )
+
+
+def _lock_is_expired(lock_fd: int) -> bool:
+    """Whether an empty/unparseable opened lock is old enough to reclaim."""
+    try:
+        mtime = os.fstat(lock_fd).st_mtime
     except OSError:
         return False
     return time.time() - mtime > _EMPTY_LOCK_STALE_SECONDS
 
 
-def _lock_is_stale(dir_fd: int, lock_name: str) -> PublishedFileIdentity | None:
-    """Return the identity of a lock safe to reclaim, otherwise ``None``.
+def _lock_is_stale(lock_fd: int) -> bool:
+    """Whether the regular lock opened as ``lock_fd`` is safe to reclaim.
 
     A parseable positive PID is authoritative only when it can be probed: the lock is
     stale iff that process is gone. Invalid/unprobeable PIDs are indeterminate and left
-    untouched. An empty or unparseable lock is the poisoning hazard -- ``_publish_lock``
-    creates the lock file and writes its pid in two separate steps, so a crash in between
-    leaves a zero-byte lock ``int('')`` can never parse. Rather than block the destination
-    FOREVER (a terminal-only dead end -- violates north-star #1), reclaim such a lock once
-    it is older than a short threshold; a younger empty lock is presumed to be a concurrent
+    untouched. An empty or unparseable lock is the poisoning hazard -- a creator can
+    crash before writing its PID. Rather than block the destination FOREVER (a
+    terminal-only dead end -- violates north-star #1), reclaim such a lock once it is
+    older than a short threshold; a younger empty lock is presumed to be a concurrent
     creator mid-write and is left untouched.
-
-    The returned identity belongs to the descriptor that was read. Reclaim verifies that
-    identity again before unlinking, but POSIX offers no conditional unlink: a replacement
-    can still land between that verification and unlink, so any uncertainty refuses.
-
-    A non-regular entry is never a lock this module created (``_publish_lock`` only
-    creates regular files), so inspection refuses it; ``O_NONBLOCK`` keeps a planted
-    writer-less FIFO from wedging the open.
     """
-    try:
-        lock_fd = os.open(
-            lock_name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=dir_fd,
-        )
-    except OSError:
-        return None
     try:
         lock_info = os.fstat(lock_fd)
         if not stat.S_ISREG(lock_info.st_mode):
-            return None
-        lock_identity = (lock_info.st_dev, lock_info.st_ino)
+            return False
+        os.lseek(lock_fd, 0, os.SEEK_SET)
         raw = os.read(lock_fd, 64).decode("utf-8", errors="replace").strip()
     except OSError:
-        return None
-    finally:
-        os.close(lock_fd)
+        return False
     if not raw:
-        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+        return _lock_is_expired(lock_fd)
     try:
         pid = int(raw)
     except ValueError:
-        return lock_identity if _lock_is_expired(dir_fd, lock_name) else None
+        return _lock_is_expired(lock_fd)
     running = _pid_is_running(pid)
-    return lock_identity if running is False else None
+    return running is False
 
 
-def _reclaim_lock_if_unchanged(
-    dir_fd: int, lock_name: str, expected_identity: PublishedFileIdentity
-) -> bool:
-    """Unlink the lock only when its currently opened inode is the inspected stale one.
+def _reclaim_lock_if_stale(dir_fd: int, lock_name: str) -> bool:
+    """Unlink a stale lock while excluding its creator and every other reclaimer.
 
-    The ``S_ISREG`` re-check runs on the freshly opened descriptor because
-    unlink-then-``mkfifo`` can reuse the inode number: identity alone cannot prove the
-    entry is still the regular file that was inspected, and ``O_NONBLOCK`` keeps such a
-    FIFO from blocking the open.
+    ``flock`` is attached to the opened inode, so a suspended creator already holding
+    the same exclusive lock prevents inspection. The pathname identity proof and
+    unlink are indivisible with respect to cooperating creators only until unlink
+    returns. A publisher may then create and lock a new inode at ``lock_name`` before
+    this descriptor closes; that is safe because the reclaimer performs no destination
+    work afterward and its caller retries acquisition against the new pathname.
     """
     try:
         lock_fd = os.open(
             lock_name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=dir_fd,
         )
     except OSError:
         return False
     try:
-        lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode):
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
             return False
-        if (lock_info.st_dev, lock_info.st_ino) != expected_identity:
+        if not _lock_path_matches_fd(dir_fd, lock_name, lock_fd):
             return False
-    except OSError:
-        return False
+        if not _lock_is_stale(lock_fd):
+            return False
+        if not _lock_path_matches_fd(dir_fd, lock_name, lock_fd):
+            return False
+        try:
+            os.unlink(lock_name, dir_fd=dir_fd)
+        except OSError:
+            return False
+        return True
     finally:
         os.close(lock_fd)
-    # This remains a check-then-unlink race because POSIX has no conditional unlink:
-    # a replacement can land after the identity check and before unlink. The identity
-    # re-check narrows this to the same residual window documented for entry deletion.
-    try:
-        os.unlink(lock_name, dir_fd=dir_fd)
-    except OSError:
-        return False
-    return True
 
 
 def _entry_exists(dir_fd: int, name: str) -> bool:
@@ -298,20 +314,21 @@ def _publish_lock(
         except FileExistsError:
             if _entry_exists(dir_fd, name) and not reclaim_stale_with_existing_entry:
                 raise FileExistsError(display) from None
-            stale_lock_identity = _lock_is_stale(dir_fd, lock_name)
-            if stale_lock_identity is not None and _reclaim_lock_if_unchanged(
-                dir_fd, lock_name, stale_lock_identity
-            ):
+            if _reclaim_lock_if_stale(dir_fd, lock_name):
                 continue
             raise
         break
     try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        if not _lock_path_matches_fd(dir_fd, lock_name, lock_fd):
+            raise FileExistsError(display)
         yield
     finally:
+        if _lock_path_matches_fd(dir_fd, lock_name, lock_fd):
+            with contextlib.suppress(OSError):
+                os.unlink(lock_name, dir_fd=dir_fd)
         os.close(lock_fd)
-        with contextlib.suppress(OSError):
-            os.unlink(lock_name, dir_fd=dir_fd)
 
 
 def _publish_temp_no_overwrite(dir_fd: int, tmp_name: str, name: str, display: str) -> None:
@@ -471,6 +488,28 @@ def _publish_link_no_overwrite(
     )
 
 
+def _copy_xattrs(source_fd: int, target_fd: int) -> None:
+    try:
+        names = os.listxattr(source_fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_ENUMERATION_TOLERATED_ERRNOS:
+            return
+        raise
+
+    for name in names:
+        try:
+            value = os.getxattr(source_fd, name)
+        except OSError as exc:
+            if exc.errno in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
+                continue
+            raise
+        try:
+            os.setxattr(target_fd, name, value)
+        except OSError as exc:
+            if exc.errno not in _XATTR_ATTRIBUTE_TOLERATED_ERRNOS:
+                raise
+
+
 def _copy_contents(source_fd: int, target: IO[bytes]) -> None:
     """Stream the bytes behind ``source_fd`` into the already-open ``target``, preserving
     mode and timestamps -- the ``shutil.copy2`` equivalent for a destination that exists
@@ -486,6 +525,7 @@ def _copy_contents(source_fd: int, target: IO[bytes]) -> None:
         shutil.copyfileobj(source, target)
     source_stat = os.fstat(source_fd)
     target.flush()
+    _copy_xattrs(source_fd, target.fileno())
     os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
     os.utime(target.fileno(), ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
 

@@ -117,4 +117,5 @@ def test_auto_update_profile_confines_docker_authority_and_has_no_listener(
     assert updater["tmpfs"] == [_HARDENED_TMPFS]
     assert updater["healthcheck"] == {"disable": True}
     assert updater["entrypoint"] == ["python", "-m", "plex_manager.updater"]
+    assert updater["user"] == "0:0"
     assert updater["profiles"] == ["auto-update"]

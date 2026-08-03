@@ -1463,9 +1463,32 @@ async def cancel_request(
     *,
     request_id: int,
 ) -> RequestRecord:
-    """Cancel a not-yet-imported request: drop active torrent(s) + settle ``cancelled``.
+    """Cancel a request while holding its per-media serialization lock.
 
-    Removes every active torrent this request still owns WITH its data (best-effort,
+    This public entry point owns the initial media-lock acquisition. The locked
+    helper commits the database cancellation, releasing that lock before any
+    post-commit qBittorrent removal I/O.
+    """
+    request_repo = SqlRequestRepository(session)
+    request = await request_repo.get(request_id)
+    if request is None:
+        raise RequestNotFoundError(request_id)
+    # These identifiers are immutable, so the pre-lock read is sufficient only
+    # to choose the lock. Every cancellation decision uses the fresh read below.
+    await request_repo.acquire_media_lock(request.tmdb_id, request.media_type)
+    return await _cancel_request_locked(session, qbt, request_id=request_id)
+
+
+async def _cancel_request_locked(
+    session: AsyncSession,
+    qbt: DownloadClientPort | None,
+    *,
+    request_id: int,
+) -> RequestRecord:
+    """Cancel a not-yet-imported request while its media lock is held.
+
+    The caller must already hold the request's per-media lock. Removes every
+    active torrent this request still owns WITH its data (best-effort,
     closing the seeding leak), marks each of those download rows terminal, and flips
     the request -- and, for TV, every tracked season -- to the settled ``cancelled``
     status (kept only for history; nothing re-grabbed). Returns the updated record.
@@ -1480,7 +1503,7 @@ async def cancel_request(
     ``service_not_configured``), never a silent skip that would leak a seeding torrent.
     """
     request_repo = SqlRequestRepository(session)
-    request = await request_repo.get(request_id)
+    request = await request_repo.get_fresh(request_id)
     if request is None:
         raise RequestNotFoundError(request_id)
     if request.status not in CANCELLABLE_REQUEST_STATUS_VALUES:
@@ -1674,7 +1697,7 @@ async def cancel_request_as_owner(
     subscribers = await request_repo.list_subscribers(request_id)
     if any(uid != user_id for uid in subscribers):
         raise HasOtherParticipantsError(request_id)
-    return await cancel_request(session, qbt, request_id=request_id)
+    return await _cancel_request_locked(session, qbt, request_id=request_id)
 
 
 @dataclass(frozen=True)
@@ -1829,7 +1852,7 @@ async def withdraw_participant(
         # (ImportInProgressError / DownloadClientRequiredError / the TV
         # per-season NotCancellableError guard) propagate uncaught -- nothing is
         # removed below if it raises.
-        await cancel_request(session, qbt, request_id=request_id)
+        await _cancel_request_locked(session, qbt, request_id=request_id)
         # #338: ``cancel_request`` commits the settle mid-body (and then runs its
         # post-commit torrent-removal I/O), which RELEASES the media lock acquired at
         # the top of this function. Re-acquire it and re-read the row + participants so
