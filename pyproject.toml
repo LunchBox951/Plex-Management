@@ -31,7 +31,7 @@ dependencies = [
     # Release-name parser (borrowed brains, ADR-0008). Pinned exactly: the
     # parse output drives the safety-critical CAM/TS hard cutoff, so a silent
     # upgrade must never shift classification (golden tests guard it too).
-    "guessit==4.1.0",
+    "guessit==4.3.0",
     # Fernet encryption for secrets at rest (ADR-0005).
     "cryptography>=42",
 ]
@@ -53,7 +53,7 @@ dev = [
     # the pre-commit hook in sync; ``pyright`` is NOT a pre-commit hook (it
     # runs via ``make type`` / ``make check`` and CI only), so this pin only
     # keeps local and CI agreeing on it.
-    "ruff==0.16.0",
+    "ruff==0.16.1",
     "pyright==1.1.411",
     "pytest>=8.2",
     "pytest-cov>=5.0",
