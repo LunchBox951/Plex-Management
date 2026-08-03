@@ -13,8 +13,10 @@ single app — with two differences that define the project:
 > loop is built and tested for movies, TV, and anime — search, grab, reconcile,
 > import, Plex scan, Plex availability dedupe, disk-pressure eviction,
 > operability (health/logs/retention/eviction), auto-grab, and in-app correction
-> surfaces. A 7-day live beta run is set to begin gathering real-world data ahead
-> of a v1 stable promotion. Browser Plex sign-in/session auth is built; the
+> surfaces. The 7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with
+> fixes landing continuously into `:edge` through the soak; a short
+> release-blocker buffer is underway ahead of the 1.0.0 stable promotion,
+> scheduled for Aug 7, 2026. Browser Plex sign-in/session auth is built; the
 > bundled first-party container updater is available as an opt-in Compose
 > profile.
 
