@@ -4734,13 +4734,7 @@ async def test_cancel_as_owner_rereads_participants_under_lock_after_a_concurren
             # A concurrent dedup-join commits (separate transaction) just before we
             # serialize -- the row now has a co-participant.
             async with sessionmaker_() as other:
-                await other.execute(
-                    text(
-                        "INSERT INTO request_subscribers (request_id, user_id, subscribed_at) "
-                        "VALUES (:r, :u, :t)"
-                    ),
-                    {"r": request_id, "u": joiner_id, "t": datetime.now(UTC)},
-                )
+                other.add(RequestSubscriber(request_id=request_id, user_id=joiner_id))
                 await other.commit()
         await real_acquire(self, tmdb_id, media_type)
 

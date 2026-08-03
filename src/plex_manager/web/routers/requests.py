@@ -549,7 +549,7 @@ async def list_requests_endpoint(
         )
     elif cursor is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="cursor_requires_limit"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="cursor_requires_limit"
         )
     elif auth.is_admin or auth.user_id is None:
         records = await request_service.list_requests(session)
@@ -884,7 +884,7 @@ async def report_issue_endpoint(
         ) from exc
     except ReportSeasonRequiredError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="report_requires_season"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="report_requires_season"
         ) from exc
     except SeasonNotFoundError as exc:
         raise HTTPException(

@@ -142,10 +142,10 @@ async def test_report_issue_endpoint_blocklists_purges_and_regrabs(
     )
     app.dependency_overrides[get_downloads_host_root] = lambda: "/home/lunchbox/Downloads"
 
+    client.cookies.update(cookies)
     response = await client.post(
         f"/api/v1/requests/{request_id}/report-issue",
         json={"reason": "bad_quality"},
-        cookies=cookies,
         headers=headers,
     )
     assert response.status_code == 200
@@ -356,9 +356,8 @@ async def test_cancel_endpoint_settles_cancelled(
 
     qbt = FakeQbittorrent()
     override_adapters(app, qbt=qbt)
-    response = await client.post(
-        f"/api/v1/requests/{request_id}/cancel", cookies=cookies, headers=headers
-    )
+    client.cookies.update(cookies)
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=headers)
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
     assert response.json()["can_mutate"] is True
@@ -533,10 +532,10 @@ async def test_creator_media_root_error_does_not_expose_absolute_path(
     )
     override_adapters(app, library=FakeLibrary(), qbt=FakeQbittorrent(), prowlarr=FakeProwlarr([]))
 
+    client.cookies.update(cookies)
     response = await client.post(
         f"/api/v1/requests/{request_id}/report-issue",
         json={"reason": "bad_quality"},
-        cookies=cookies,
         headers=headers,
     )
     assert response.status_code == 409
