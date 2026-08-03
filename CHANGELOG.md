@@ -6,10 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_No released versions yet — no Git tags or GitHub releases exist, and package
-metadata is still `0.0.0`. The request → watchable → correct loop for movies,
-TV, and anime is feature-complete; a milestone canary/feature-freeze run
-precedes the first stable promotion (see the "Version 1.0" milestone)._
+_No released versions yet — no Git tags or GitHub releases exist. Package
+metadata is set to `1.0.0` ahead of the promotion (see
+`src/plex_manager/__init__.py`), but the tag and release itself are cut on
+promotion day per CONTRIBUTING.md's release checklist. The request →
+watchable → correct loop for movies, TV, and anime is feature-complete; the
+7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with fixes landing
+continuously into `:edge` through the soak, and 1.0.0 stable promotion is
+scheduled for Aug 7, 2026 (see the "Version 1.0" milestone)._
 
 ### Added
 - Typed React/Vite single-page app, contract-bound to the published OpenAPI
@@ -60,6 +64,11 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
   backup expectations are now documented honestly rather than implied — see
   [ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) and
   the README "Backup & recovery" section.
+- Runtime container base migrated from Debian `python:3.14-slim` to a
+  digest-pinned Wolfi/glibc base, shrinking the base-OS vulnerability surface
+  while preserving the Python 3.14, glibc-wheel, `ffprobe`, and numeric-UID
+  production contract ([ADR-0027](docs/adr/0027-wolfi-container-base.md),
+  #18).
 
 ### Fixed
 - A broad honesty/resilience pass: no unhandled 500s on parse, settings
@@ -68,6 +77,35 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
   request-row dedup healing (folds duplicates, self-heals false "available"
   claims); qBittorrent session reuse across polling cycles with stall healing;
   host/container path-visibility healing for library and download roots.
+- Canary-soak eviction/correction-order hardening: recovery now finishes
+  marker-owned movie correction purges left incomplete across replacement
+  statuses, defers recovery while a correction purge is still active, and
+  recovers advanced marker-owned purges instead of stranding them; the
+  incomplete-delete outcome is persisted on the eviction claim row itself so
+  a later sweep can't re-derive stale state (#540, #524, #519, #525, #495).
+- Purge probe-lifecycle races: correction-path probes are isolated from
+  eviction's own probes, a probe's own deadline cancellation is distinguished
+  from an external cancel, and `remove_torrent`'s mount-sensitive reads run
+  on the same abandonable probe substrate so a slow qBittorrent call can't
+  strand a purge past its deadline (#518, #522, #493).
+- Filesystem publish-lock and containment: stale publish locks are reclaimed
+  on rollback and the remaining reclaim races closed, xattrs survive the
+  cross-device copy fallback, and import publication is anchored to
+  no-follow descriptors inside the configured library root instead of
+  trusting a path string (#521, #541, #500, #499).
+- Import/availability/grab race closures: the import finalize path locks its
+  parent before scope bookkeeping and re-reads scopes before terminal
+  finalize so a late same-hash attach still imports; availability promotion
+  binds its CAS to the actually-observed completion and guards against a
+  correction re-arm mid-promotion; `mark_available`'s CAS boolean return is
+  honored instead of assumed; a same-hash torrent removal verifies scope
+  ownership before its lost-CAS cleanup; and admin cancel now serializes
+  with the per-media lock (#498, #492, #523, #489, #508, #491, #367).
+- Health/updater/logs operability: shared health-probe lifecycle gaps are
+  closed, promotion log extras are sanitized and cite the actual probe
+  bound, the import-cycle download ID is normalized in logs, and partial
+  eviction outcomes are surfaced instead of collapsing to a single
+  pass/fail (#473, #509, #520, #517, #527).
 
 ### Security
 - Header-safe credential handling, atomic and symlink-safe encryption-key
