@@ -8,8 +8,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _No released versions yet — no Git tags or GitHub releases exist. Package
 metadata is set to `1.0.0` ahead of the promotion (see
-`src/plex_manager/__init__.py`), but the tag and release itself are cut on
-promotion day per CONTRIBUTING.md's release checklist. The request →
+`src/plex_manager/__init__.py`); this section is cut to `## [1.0.0]` as the
+remaining release-checklist curation step, which must land on `main` before
+the `:edge` build selected for promotion (promotion itself only re-tags that
+already-built image — see CONTRIBUTING.md's release checklist). The request →
 watchable → correct loop for movies, TV, and anime is feature-complete; the
 7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with fixes landing
 continuously into `:edge` through the soak, and 1.0.0 stable promotion is
@@ -85,9 +87,11 @@ scheduled for Aug 7, 2026 (see the "Version 1.0" milestone)._
   a later sweep can't re-derive stale state (#540, #524, #519, #525, #495).
 - Purge probe-lifecycle races: correction-path probes are isolated from
   eviction's own probes, a probe's own deadline cancellation is distinguished
-  from an external cancel, and `remove_torrent`'s mount-sensitive reads run
-  on the same abandonable probe substrate so a slow qBittorrent call can't
-  strand a purge past its deadline (#518, #522, #493).
+  from an external cancel, and `remove_torrent`'s local mount-sensitive
+  reads run on the same abandonable probe substrate so a wedged or
+  unresponsive mount can't strand a purge past the filesystem-probe
+  deadline (qBittorrent API calls keep their own adapter timeout)
+  (#518, #522, #493).
 - Filesystem publish-lock and containment: stale publish locks are reclaimed
   on rollback and the remaining reclaim races closed, xattrs survive the
   cross-device copy fallback, and import publication is anchored to
