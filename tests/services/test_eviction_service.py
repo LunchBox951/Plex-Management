@@ -8748,13 +8748,14 @@ async def test_unmarked_movie_correction_breadcrumb_is_not_a_recovery_target(
     assert row.partial_delete_path is None
 
 
-async def test_cancelled_movie_correction_recovery_preserves_cancelled_status(
+async def test_cancelled_movie_correction_recovery_records_evicted_disk_truth(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
-    """Finishing a cancelled movie correction purge clears disk facts only.
+    """Finishing a cancelled movie correction purge records removed-media truth.
 
-    Unlike TV, movies have no cancelled-blind per-season availability subtraction
-    that requires a disk-truth flip to ``evicted``; the user's settled intent stays.
+    ``cancelled`` describes the abandoned replacement intent, not whether the old
+    file survived. Once recovery removes its remnants, ``evicted`` is the durable
+    state that keeps an immediate re-request from trusting stale Plex presence.
     """
     root = tmp_path / "movies"
     movie_dir = root / "Cancelled Movie Correction (2026)"
@@ -8784,9 +8785,114 @@ async def test_cancelled_movie_correction_recovery_preserves_cancelled_status(
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
     assert row is not None
-    assert row.status is RequestStatus.cancelled
+    assert row.status is RequestStatus.evicted
     assert row.library_path is None
     assert row.partial_delete_path is None
+
+
+async def test_failed_movie_correction_recovery_records_evicted_disk_truth(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """A settled failed replacement has the same stale-Plex hazard as cancelled.
+
+    Recovery proved the old file is gone, so the row must advertise ``evicted``
+    even though the replacement pipeline previously exhausted as ``failed``.
+    """
+    root = tmp_path / "movies"
+    movie_dir = root / "Failed Movie Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Failed Movie Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5137,
+        title="Failed Movie Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.failed,
+    )
+
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=FakeLibrary(),
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert not movie_dir.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.evicted
+    assert row.library_path is None
+    assert row.partial_delete_path is None
+
+
+async def test_rerequest_after_cancelled_movie_correction_recovery_ignores_stale_plex(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Senior-review regression: recovery removes the last remnant, but Plex's
+    eventually-consistent presence can still say the movie exists. The durable
+    ``evicted`` state must force a real pending re-grab rather than instant-complete
+    a new ``available`` row with no file or download behind it.
+    """
+    root = tmp_path / "movies"
+    movie_dir = root / "Stale Plex After Correction (2026)"
+    movie_dir.mkdir(parents=True)
+    (movie_dir / "Stale Plex After Correction (2026).mkv").write_bytes(b"remnant")
+    request_id = await _rearmed_partial_movie(
+        sessionmaker_,
+        tmdb_id=5136,
+        title="Stale Plex After Correction",
+        movie_dir=movie_dir,
+        status=RequestStatus.cancelled,
+    )
+
+    stale_library = FakeLibrary(available={5136})
+    async with sessionmaker_() as session:
+        await eviction_service.run_eviction_sweep(
+            session=session,
+            library=stale_library,
+            fs=LocalFileSystem(library_roots=[str(root)]),
+            media_type="movie",
+            root_path=str(root),
+            threshold_pct=101.0,
+            target_pct=0.0,
+            grace_days=_GRACE_DAYS,
+        )
+
+    assert not movie_dir.exists()
+    tmdb = FakeTmdb(
+        movies={
+            5136: MovieMetadata(
+                tmdb_id=5136,
+                title="Stale Plex After Correction",
+                year=2026,
+            )
+        }
+    )
+    async with sessionmaker_() as session:
+        fresh = await request_service.create_request(
+            session,
+            tmdb,
+            tmdb_id=5136,
+            media_type="movie",
+            library=stale_library,
+        )
+
+    assert fresh.id != request_id
+    assert fresh.status == RequestStatus.pending.value
+    assert fresh.eviction_regrab is True
+    async with sessionmaker_() as session:
+        rows = (
+            (await session.execute(select(MediaRequest).where(MediaRequest.tmdb_id == 5136)))
+            .scalars()
+            .all()
+        )
+    assert sorted(row.status.value for row in rows) == ["evicted", "pending"]
 
 
 async def test_movie_correction_recovery_defers_during_active_correction_purge(

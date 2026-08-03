@@ -2296,11 +2296,26 @@ async def _resume_one(
                 allowed_from=frozenset({RequestStatus.cancelled.value}),
                 tolerate_active_conflict=True,
             )
-        # A movie correction needs no corresponding status rewrite (#513): its
-        # available row was itself re-armed by report-issue, and movie availability
-        # has no cancelled-blind per-season set like ``evicted_seasons``. Keep the
-        # surfaced replacement/cancellation status; clearing the disk breadcrumb and
-        # marker is the honest terminal-status treatment.
+        else:
+            # DISK-TRUTH-OVER-INTENT for SETTLED movie correction rows (#513):
+            # ``cancelled`` says the replacement intent stopped and ``failed`` says
+            # it exhausted, but recovery has now proved the old file is GONE. Neither
+            # status is recognized by ``latest_request_evicted``, so preserving it
+            # would let an immediate re-request trust eventually-consistent Plex
+            # presence and mint ``available`` over no file and no download. Publish
+            # ``evicted`` as the durable stale-Plex guard for those two settled
+            # outcomes, matching the normal movie eviction finalize. Active/retryable
+            # replacement statuses stay unchanged.
+            await SqlRequestRepository(session).set_status_if_in(
+                pending.media_request_id,
+                RequestStatus.evicted.value,
+                frozenset(
+                    {
+                        RequestStatus.cancelled.value,
+                        RequestStatus.failed.value,
+                    }
+                ),
+            )
         session.add(
             DownloadHistory(
                 tmdb_id=pending.tmdb_id,
