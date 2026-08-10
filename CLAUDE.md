@@ -73,6 +73,6 @@ Two channels by image tag with a manual promotion gate ([ADR-0004](docs/adr/0004
 ## Reference repositories
 
 `prototype/`, `ombi/`, `overseerr/`, `radarr/`, `sonarr/`, `prowlarr/`, `jackett/`
-are read-only clones for reference (cloned by `init.sh`, gitignored). They are
+are read-only clones for reference (manually cloned, gitignored). They are
 **not** part of this project — study them, never edit them, and never treat their
 files as ours.
