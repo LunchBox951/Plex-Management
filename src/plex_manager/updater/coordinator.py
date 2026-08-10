@@ -4,29 +4,50 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Final, Literal, cast
 
 import httpx
-
-from plex_manager.logsafe import redact_secrets, safe_text
 
 Action = Literal["none", "check", "install"]
 Outcome = Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
 
 _logger = logging.getLogger(__name__)
 
-#: Cap on the ``detail``/``message`` field chars logged on a non-2xx
-#: coordinator response whose body is the app's own AppError envelope (issue
-#: #539, review round 3) -- bounds a pathological field without needing one
-#: (both are normally short operator-facing prose/codes; see
-#: :func:`_parse_app_error_envelope`).
-_MAX_LOGGED_FIELD_CHARS: Final = 500
+#: The app's own machine-code charset (issue #539 review round 4): every
+#: ``AppError``/``PlexVerifyError``/``CoordinatorError`` code raised anywhere
+#: in this codebase (``web/errors.py``, ``web/routers/updates.py``,
+#: ``web/updater_auth.py``, ``adapters/plex/oauth.py``, this module's own
+#: ``coordinator_*`` codes) is lowercase ASCII letters/digits/underscores;
+#: the longest observed (``update_recovery_generation_mismatch``) is 35
+#: chars, so 64 is a generous, still-tight bound. This is an ALLOWLIST, not a
+#: sanitizer, mirroring :func:`~plex_manager.logsafe.safe_guid`'s own
+#: plain-id passthrough: a string that fullmatches this charset cannot
+#: contain ``/ : ? & % @`` or whitespace, so it structurally cannot carry a
+#: URL, a query string, or a CR/LF -- there is no separate
+#: safe_text/redact_secrets step needed after a fullmatch, the same way
+#: ``safe_guid``'s own allowlisted ids pass through unprocessed. Round 3's
+#: ``message`` field is deliberately dropped rather than similarly
+#: constrained: free-text prose has no charset that stays both bounded and
+#: useful, and shape (parses-as-envelope) proved NOT to authenticate origin
+#: (round 4's finding -- a look-alike proxy body with string ``detail``/
+#: ``message`` fields passed the round-3 predicate). The detail CODE alone
+#: (e.g. ``coordinator_lease_store_unreachable``) remains the diagnostic
+#: payload.
+_DETAIL_CODE_RE: Final = re.compile(r"[a-z0-9_]{1,64}")
 
-#: Cap on the logged ``Content-Type`` header for a non-app-shape body. Also
-#: server-controlled input; bounded and safe_text'd for the same reason as
-#: every other value on this path even though a compliant header is short.
-_MAX_LOGGED_CONTENT_TYPE_CHARS: Final = 128
+#: RFC 6838 media-type token charset (``type/subtype``, no parameters) for
+#: the ``Content-Type`` logged on a non-app-shape body (issue #539 review
+#: round 4): a parameter such as ``application/json; source="https://host/
+#: ...secret..."`` could smuggle a secret past a naive whole-header log, so
+#: only the portion before the first ``;`` is even considered, and it is
+#: logged ONLY when it fullmatches this allowlist -- otherwise
+#: ``content_type=invalid``. Each side is capped at 127 chars (every real
+#: IANA-registered media type is far shorter; RFC 4288 itself caps a
+#: type/subtype token at 127) so a pathological-but-charset-valid header
+#: cannot flood the log either.
+_MEDIA_TYPE_RE: Final = re.compile(r"[a-zA-Z0-9!#$&^_.+-]{1,127}/[a-zA-Z0-9!#$&^_.+-]{1,127}")
 
 #: Hex digits of the SHA-256 fingerprint logged for a non-app-shape body
 #: (issue #539 review round 3) -- long enough to correlate repeated
@@ -64,7 +85,13 @@ class LeaseStatus:
 def _object(response: httpx.Response) -> dict[str, object]:
     try:
         value: object = response.json()
-    except ValueError as exc:
+    # httpx.Response.json() delegates to the stdlib json module: a malformed
+    # body raises json.JSONDecodeError (a ValueError subclass), and CPython's
+    # JSON scanner raises RecursionError -- not a ValueError -- on
+    # pathologically deep nesting (issue #539 review round 4). Catching only
+    # ValueError would let that escape uncaught here instead of the intended
+    # coordinator_invalid_json classification.
+    except (ValueError, RecursionError) as exc:
         raise CoordinatorError("coordinator_invalid_json") from exc
     if not isinstance(value, dict):
         raise CoordinatorError("coordinator_invalid_response")
@@ -79,45 +106,61 @@ def _optional_string(value: object) -> str | None:
     return value
 
 
-def _parse_app_error_envelope(response: httpx.Response) -> tuple[str, str] | None:
-    """Recognize the app's own ``AppError`` JSON envelope on a non-2xx body
-    (``web/errors.py``'s ``{"detail": <code>, "message": <text>, "hint"?:
-    ..., "diagnostics"?: ...}``, see ``_envelope``/``install_error_handlers``)
-    -- the ONLY body shape this client ever echoes any text from.
+def _extract_safe_detail_code(response: httpx.Response) -> str | None:
+    """Extract a non-2xx coordinator body's ``detail`` field, but ONLY when
+    it is a string that fullmatches :data:`_DETAIL_CODE_RE` -- the app's own
+    machine-code charset (issue #539 review round 4). ``None`` for anything
+    else: not JSON, not a dict, a missing/non-string ``detail``, or a
+    ``detail`` that IS a string but does not fullmatch the charset.
 
-    Returns ``(detail, message)`` when the parsed JSON is a dict carrying
-    both as strings; ``None`` for anything else (not JSON, not a dict,
-    missing/non-string fields) -- including a body that is valid JSON but
-    merely LOOKS similar, which is treated exactly as opaque as one that
-    isn't JSON at all (see :meth:`CoordinatorClient._log_non_2xx`).
-
-    Why only these two fields, and why this is the only recognized shape:
-    ``AppError.message``/``hint`` are operator-facing prose the APP ITSELF
-    constructs and ``diagnostics`` is explicitly documented as NON-secret
-    context (``AppError``'s own docstring) -- the envelope is safe to echo
-    BY THE APP'S OWN CONTRACT, unlike arbitrary response text. An
-    intermediary/proxy debug page, raw HTML, or any other non-envelope body
-    could carry an unlabeled token or a secret-bearing URL
-    (``https://host/download/<token>``) that neither ``safe_text`` (line-
-    boundary only) nor ``redact_secrets`` (key-name/shape-based) is
-    guaranteed to catch -- truncating that text would still leave it
-    logged, just shorter. ``hint``/``diagnostics`` are recognized as part of
-    the shape check (a genuine envelope may carry them) but deliberately NOT
-    returned/logged: the review scope for issue #539 is ``detail``/
-    ``message`` only.
+    Round 3 tried to recognize the app's ``AppError`` JSON envelope
+    (``web/errors.py``'s ``{"detail": <code>, "message": <text>, ...}``) by
+    SHAPE -- a dict with string ``detail``/``message`` fields -- and echoed
+    both. That shape does not authenticate origin: a look-alike proxy/relay
+    body with its own string ``detail``/``message`` fields (a secret-bearing
+    URL in ``message``, say) passes the identical predicate, and neither
+    ``safe_text`` (line-boundary only) nor ``redact_secrets`` (key-name/
+    shape-based) is guaranteed to catch an unlabeled secret riding free-text
+    prose. Round 4 instead authenticates by CONTENT: ``detail`` is logged
+    ONLY when it fullmatches the tight ``[a-z0-9_]{1,64}`` allowlist every
+    real machine code in this codebase uses -- a string in that charset
+    structurally cannot contain ``/ : ? & % @`` or whitespace, so it cannot
+    carry a URL or a CR/LF regardless of where the response actually came
+    from. ``message`` is no longer read or logged at all: free-text prose has
+    no charset that stays both bounded and useful the way a code does.
     """
     try:
         parsed: object = response.json()
-    except ValueError:
+    # See _object's identical comment: json.JSONDecodeError (a ValueError
+    # subclass) covers malformed JSON, but CPython's scanner raises
+    # RecursionError -- not a ValueError -- on pathologically deep nesting
+    # (issue #539 review round 4), and that must still resolve to "not the
+    # app envelope" rather than escape this method uncaught.
+    except (ValueError, RecursionError):
         return None
     if not isinstance(parsed, dict):
         return None
-    parsed_dict = cast("dict[str, object]", parsed)
-    detail = parsed_dict.get("detail")
-    message = parsed_dict.get("message")
-    if not isinstance(detail, str) or not isinstance(message, str):
+    detail = cast("dict[str, object]", parsed).get("detail")
+    if not isinstance(detail, str) or _DETAIL_CODE_RE.fullmatch(detail) is None:
         return None
-    return detail, message
+    return detail
+
+
+def _safe_media_type(content_type_header: str) -> str:
+    """Reduce a ``Content-Type`` header to a loggable media type (issue #539
+    review round 4): only the portion before the first ``;`` is even
+    considered (a parameter such as ``application/json; source="https://
+    host/...secret..."`` could otherwise smuggle a secret past the log), and
+    that portion is returned ONLY when it fullmatches :data:`_MEDIA_TYPE_RE`
+    -- the RFC 6838 ``type/subtype`` token charset. Anything else (missing,
+    empty, malformed, or carrying stray characters the charset excludes)
+    logs as the fixed string ``"invalid"`` rather than any part of the raw
+    header value.
+    """
+    media_type = content_type_header.split(";", 1)[0].strip()
+    if _MEDIA_TYPE_RE.fullmatch(media_type) is None:
+        return "invalid"
+    return media_type
 
 
 class CoordinatorClient:
@@ -165,59 +208,54 @@ class CoordinatorClient:
             # above there is real diagnostic evidence (issue #539 -- the
             # 2026-07-28 canary 500s on /eligibility left no evidence because
             # this classification was previously silent): log it, but never
-            # echo arbitrary response text (review round 3 -- see
-            # _log_non_2xx/_parse_app_error_envelope for why).
+            # echo arbitrary response text (review rounds 3-4 -- see
+            # _log_non_2xx/_extract_safe_detail_code for why).
             self._log_non_2xx(path, response)
             raise CoordinatorError("coordinator_unavailable") from exc
         return _object(response)
 
     def _log_non_2xx(self, path: str, response: httpx.Response) -> None:
         """Log a non-2xx coordinator response without ever echoing arbitrary
-        response text (issue #539 review round 3).
+        response text (issue #539 review rounds 3-4).
 
-        Truncation alone does not make an unrecognized body non-secret: an
-        intermediary/proxy debug page returned instead of the app's own
-        response could carry an unlabeled token or a secret-bearing URL
-        (``https://host/download/<token>``) that neither ``safe_text``
-        (line-boundary only) nor ``redact_secrets`` (key-name/shape-based) is
-        guaranteed to catch within the first N characters. So body TEXT is
-        only ever logged when it parses as the app's own AppError envelope
-        (:func:`_parse_app_error_envelope`) -- content the app itself
-        constructed and guarantees non-secret by contract -- and even then
-        only the recognized ``detail``/``message`` fields, bounded and run
-        through ``safe_text``/``redact_secrets``. Any other body (the actual
-        #539 recurrence case was app-origin JSON, so this is the exceptional
-        path) logs status/content-type/length plus an IRREVERSIBLE
+        Body shape does not authenticate origin: a look-alike intermediary/
+        proxy body can carry its own string ``detail``/``message`` fields, so
+        parsing-as-the-envelope is not enough (round 4's finding on round
+        3's approach). Only :func:`_extract_safe_detail_code`'s CONTENT
+        check -- a ``detail`` field that fullmatches the app's tight
+        machine-code charset -- is ever echoed; that charset structurally
+        excludes ``/ : ? & % @`` and whitespace, so a matching string cannot
+        carry a URL or CR/LF no matter where the response actually
+        originated. ``message`` free text is never logged at all any more.
+        Any other body (the actual 2026-07-28 canary recurrence was
+        app-origin JSON with a conforming ``detail``, so this is the
+        exceptional path) logs status, a validated media type
+        (:func:`_safe_media_type` -- a ``Content-Type`` parameter could
+        otherwise smuggle a secret), byte length, and an IRREVERSIBLE
         fingerprint instead: still enough to correlate repeated occurrences
         of the same opaque body across log lines, never a byte of its
         content. No request header (the bearer token) is ever included
-        either way. The updater sidecar's stdout is read straight off
-        ``docker logs`` -- it never passes through the app's
-        ``log_capture_service`` capture pipeline, so this call site cannot
-        lean on that pipeline's own ``redact_secrets`` pass as a second line
-        of defense and composes it directly instead.
+        either way.
         """
-        envelope = _parse_app_error_envelope(response)
-        if envelope is not None:
-            detail, message = envelope
+        detail = _extract_safe_detail_code(response)
+        if detail is not None:
             _logger.warning(
                 "coordinator request returned HTTP status error (app envelope): "
-                "path=%s status=%d detail=%s message=%s",
+                "path=%s status=%d detail=%s",
                 path,
                 response.status_code,
-                redact_secrets(safe_text(detail[:_MAX_LOGGED_FIELD_CHARS])),
-                redact_secrets(safe_text(message[:_MAX_LOGGED_FIELD_CHARS])),
+                detail,
             )
             return
         body_bytes = response.content
         fingerprint = hashlib.sha256(body_bytes).hexdigest()[:_FINGERPRINT_HEX_CHARS]
-        content_type = response.headers.get("content-type", "")
+        media_type = _safe_media_type(response.headers.get("content-type", ""))
         _logger.warning(
             "coordinator request returned HTTP status error (opaque body): "
             "path=%s status=%d content_type=%s content_length=%d fingerprint=%s",
             path,
             response.status_code,
-            safe_text(content_type[:_MAX_LOGGED_CONTENT_TYPE_CHARS]),
+            media_type,
             len(body_bytes),
             fingerprint,
         )

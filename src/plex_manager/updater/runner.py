@@ -137,12 +137,14 @@ class UpdaterRunner:
                 # exception is CoordinatorClient._post's own non-2xx branch
                 # (issue #539, see CoordinatorClient._log_non_2xx) -- not here,
                 # and not the bearer token either way. Even there, arbitrary
-                # response TEXT is never echoed: only the app's own recognized
-                # AppError envelope fields (detail/message, bounded, safe_text/
-                # redact_secrets'd) when the body parses as that shape, else a
-                # status/content-type/length/fingerprint summary for anything
-                # else (a proxy debug page, HTML, arbitrary prose could carry
-                # an unlabeled secret neither barrier is guaranteed to catch).
+                # response TEXT is never echoed: body shape alone does not
+                # authenticate origin (round 4), so only a ``detail`` field
+                # that fullmatches the app's own tight machine-code charset
+                # (a string that structurally cannot carry a URL or CR/LF) is
+                # ever logged; free-text ``message`` is never read. Anything
+                # else logs status, a charset-validated media type, byte
+                # length, and an irreversible fingerprint instead -- never a
+                # byte of unvalidated body content.
                 _logger.warning("container updater iteration failed (%s)", exc.code)
             except Exception:
                 _logger.exception("container updater iteration failed unexpectedly")

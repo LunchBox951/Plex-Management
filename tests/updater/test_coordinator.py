@@ -8,7 +8,6 @@ import json
 import httpx
 import pytest
 
-from plex_manager.logsafe import redact_secrets, safe_text
 from plex_manager.updater.coordinator import CoordinatorClient, CoordinatorError
 
 _TOKEN = "coordinator-test-token-0123456789"  # noqa: S105 - synthetic test credential
@@ -174,15 +173,19 @@ async def test_outcome_omits_unknown_optional_fields() -> None:
     }
 
 
-async def test_non_2xx_app_error_envelope_logs_detail_and_message(
+async def test_non_2xx_app_error_envelope_logs_detail_code_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """issue #539: a non-2xx coordinator response whose body is the app's own
-    ``AppError`` JSON envelope (``web/errors.py``'s ``{"detail": ..., ...
-    "message": ...}``) must log the recognized ``detail``/``message`` fields
-    -- e.g. the actual 2026-07-28 canary recurrence, which was app-origin
-    JSON -- while keeping the existing ``coordinator_unavailable``
-    classification."""
+    """issue #539: a non-2xx coordinator response whose body carries a
+    ``detail`` field matching the app's machine-code charset (``web/
+    errors.py``'s ``AppError`` envelope shape, e.g. the actual 2026-07-28
+    canary recurrence, which was app-origin JSON) must log that code --
+    while keeping the existing ``coordinator_unavailable`` classification.
+
+    Review round 4: ``message`` is no longer read or logged at all (see
+    ``test_non_2xx_look_alike_envelope_never_logs_message_secret`` below for
+    why), so this only pins the ``detail``-only echo.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -209,36 +212,35 @@ async def test_non_2xx_app_error_envelope_logs_detail_and_message(
         "(app envelope)" in message
         and "status=500" in message
         and "detail=coordinator_lease_store_unreachable" in message
-        and "message=The lease store connection pool is exhausted." in message
         for message in messages
     )
+    # message is never read, let alone logged -- not even redacted.
+    assert all("message=" not in message for message in messages)
     # The bearer token must never reach the log.
     assert all(_TOKEN not in message for message in messages)
 
 
-async def test_non_2xx_app_error_envelope_message_is_capped_and_line_boundary_safe(
+async def test_non_2xx_look_alike_envelope_never_logs_message_secret(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A pathological ``message`` field must be capped BEFORE the line-
-    boundary/redaction barriers run (no log-flooding), and a CR/LF *within*
-    the cap must never be able to forge a second log record (issue #539).
-
-    The CR/LF sits at offset 100 -- well inside the 500-char field cap -- so
-    cap and barrier are both exercised. A JSON string value can only ever
-    carry a CR/LF as the ``\\r\\n`` escape sequence (valid JSON has no raw
-    control byte in a string), so ``response.json()`` decodes it back to a
-    real CR/LF before this body ever reaches ``_log_non_2xx`` -- exactly the
-    shape a hostile/malfunctioning coordinator could still send even though
-    it is JSON. The expectation is built from the SAME real ``safe_text``/
-    ``redact_secrets`` pipeline the call site runs, so mutating either one
-    out of ``_log_non_2xx`` breaks the equality below.
-    """
-    oversized_message = ("x" * 100) + "\r\nFAKE LOG LINE INJECTED" + ("x" * 600)
-    expected_logged_message = redact_secrets(safe_text(oversized_message[:500]))
+    """issue #539 review round 4: a body with string ``detail``/``message``
+    fields does not authenticate origin -- round 3's shape-only predicate let
+    a look-alike proxy/relay body pass with a secret-bearing URL riding
+    ``message`` (neither ``safe_text`` nor ``redact_secrets`` is guaranteed
+    to catch an UNLABELED secret in free text). ``message`` is now never
+    read at all, so the secret cannot reach the log regardless of whether
+    the surrounding body is a genuine ``AppError`` envelope or a look-alike
+    -- while the ``detail`` code (the actual diagnostic payload) still
+    echoes normally."""
+    secret_marker = "SECRETTOKEN9999"  # noqa: S105 - synthetic test marker, not a credential
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            503, json={"detail": "coordinator_busy", "message": oversized_message}
+            500,
+            json={
+                "detail": "coordinator_lease_store_unreachable",
+                "message": f"See https://host/download/{secret_marker} for details",
+            },
         )
 
     async with httpx.AsyncClient(
@@ -253,16 +255,148 @@ async def test_non_2xx_app_error_envelope_message_is_capped_and_line_boundary_sa
 
     messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert len(messages) == 1
-    logged_message = messages[0].rsplit("message=", 1)[1]
-    assert logged_message == expected_logged_message
-    # Sanity checks spelling out what the equality above proves: the barrier
-    # neutralized the CR/LF (rather than the cap coincidentally slicing it
-    # away -- it didn't, the phrase is still present, just on one line), and
-    # only the first 500 raw chars were ever considered.
-    assert "\r" not in logged_message
-    assert "\n" not in logged_message
-    assert "FAKE LOG LINE INJECTED" in logged_message
-    assert logged_message.count("x") == 476
+    message = messages[0]
+    assert "detail=coordinator_lease_store_unreachable" in message
+    # The secret (and the whole message field) must be absent from EVERY
+    # captured record, not just this one.
+    assert all(secret_marker not in record.getMessage() for record in caplog.records)
+    assert "message=" not in message
+
+
+async def test_non_2xx_non_conforming_detail_is_treated_as_opaque(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``detail`` field that IS a string but does not fullmatch the app's
+    machine-code charset (here it embeds a secret-bearing URL itself) must
+    fall through to the opaque branch exactly like a missing/wrong-typed
+    ``detail`` -- the charset check is a strict allowlist, not a best-effort
+    filter (issue #539 review round 4)."""
+    secret_marker = "DETAILSECRET42"  # noqa: S105 - synthetic test marker, not a credential
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "detail": f"see https://host/download/{secret_marker}",
+                "message": "irrelevant",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError):
+            await client.eligibility()
+
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert all(secret_marker not in record.getMessage() for record in caplog.records)
+    assert "(opaque body)" in messages[0]
+    assert "status=500" in messages[0]
+
+
+async def test_non_2xx_content_type_parameter_is_stripped_before_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #539 review round 4: a ``Content-Type`` parameter can smuggle a
+    secret (``application/json; source="https://host/...secret..."``) past a
+    naive whole-header log. Only the media type before the first ``;`` is
+    ever logged, and only when it fullmatches the RFC 6838 token charset."""
+    secret_marker = "CTSECRET777"  # noqa: S105 - synthetic test marker, not a credential
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            text="upstream proxy error",
+            headers={
+                "content-type": f'application/json; source="https://internal.example/{secret_marker}"'
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError):
+            await client.eligibility()
+
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    message = messages[0]
+    assert all(secret_marker not in record.getMessage() for record in caplog.records)
+    # The parameter is stripped entirely -- only the bare media type remains.
+    assert "content_type=application/json" in message
+    assert "source=" not in message
+
+
+async def test_non_2xx_invalid_content_type_logs_fixed_marker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``Content-Type`` header that does not fullmatch the media-type
+    charset (missing/malformed, no ``type/subtype`` shape) logs the fixed
+    marker ``content_type=invalid`` rather than any part of the raw header
+    value (issue #539 review round 4)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502, text="upstream proxy error", headers={"content-type": "not a media type"}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError):
+            await client.eligibility()
+
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "content_type=invalid" in messages[0]
+
+
+async def test_non_2xx_deeply_nested_json_body_still_classifies_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #539 review round 4: pathologically deep JSON nesting makes
+    ``response.json()`` raise ``RecursionError`` -- not a ``ValueError`` --
+    which a ``ValueError``-only catch would let escape ``_log_non_2xx``
+    uncaught, aborting ``_post`` before it ever raises ``CoordinatorError``.
+    Classification must complete regardless, falling through to the opaque
+    branch (a JSON body this deeply nested is certainly not a conforming
+    ``{"detail": "<code>"}`` envelope)."""
+    nested_body = ("[" * 3000) + ("]" * 3000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, content=nested_body.encode("ascii"), headers={"content-type": "application/json"}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError) as exc_info:
+            await client.eligibility()
+
+    assert exc_info.value.code == "coordinator_unavailable"
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "(opaque body)" in messages[0]
+    assert "status=500" in messages[0]
+    assert f"content_length={len(nested_body)}" in messages[0]
 
 
 async def test_non_2xx_non_app_shape_body_never_logs_body_text(
