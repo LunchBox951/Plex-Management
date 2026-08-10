@@ -135,9 +135,14 @@ class UpdaterRunner:
                 # Codes are fixed locally; bearer values and Docker engine
                 # response bodies never enter this log line. The one deliberate
                 # exception is CoordinatorClient._post's own non-2xx branch
-                # (issue #539), which logs a capped, safe_text/redact_secrets'd
-                # slice of the coordinator's HTTP response body at its own call
-                # site -- not here, and not the bearer token either way.
+                # (issue #539, see CoordinatorClient._log_non_2xx) -- not here,
+                # and not the bearer token either way. Even there, arbitrary
+                # response TEXT is never echoed: only the app's own recognized
+                # AppError envelope fields (detail/message, bounded, safe_text/
+                # redact_secrets'd) when the body parses as that shape, else a
+                # status/content-type/length/fingerprint summary for anything
+                # else (a proxy debug page, HTML, arbitrary prose could carry
+                # an unlabeled secret neither barrier is guaranteed to catch).
                 _logger.warning("container updater iteration failed (%s)", exc.code)
             except Exception:
                 _logger.exception("container updater iteration failed unexpectedly")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Final, Literal, cast
@@ -15,15 +16,25 @@ Outcome = Literal["no_update", "update_available", "succeeded", "failed", "rolle
 
 _logger = logging.getLogger(__name__)
 
-#: Cap on the response body chars logged on a non-2xx coordinator response
-#: (issue #539). The coordinator is an internal endpoint, but the cap keeps a
-#: pathological/oversized body from flooding the log; ``safe_text`` on top
-#: keeps a forged CR/LF in the body from faking a second log record. The
-#: updater sidecar's stdout is read straight off ``docker logs`` -- it never
-#: passes through the app's ``log_capture_service`` capture pipeline, so this
-#: call site cannot lean on that pipeline's own ``redact_secrets`` pass as a
-#: second line of defense; ``_post`` below composes ``redact_secrets`` itself.
-_MAX_LOGGED_BODY_CHARS: Final = 500
+#: Cap on the ``detail``/``message`` field chars logged on a non-2xx
+#: coordinator response whose body is the app's own AppError envelope (issue
+#: #539, review round 3) -- bounds a pathological field without needing one
+#: (both are normally short operator-facing prose/codes; see
+#: :func:`_parse_app_error_envelope`).
+_MAX_LOGGED_FIELD_CHARS: Final = 500
+
+#: Cap on the logged ``Content-Type`` header for a non-app-shape body. Also
+#: server-controlled input; bounded and safe_text'd for the same reason as
+#: every other value on this path even though a compliant header is short.
+_MAX_LOGGED_CONTENT_TYPE_CHARS: Final = 128
+
+#: Hex digits of the SHA-256 fingerprint logged for a non-app-shape body
+#: (issue #539 review round 3) -- long enough to correlate repeated
+#: occurrences of the SAME opaque body across log lines, short enough to stay
+#: unmistakably a fingerprint rather than a hash an operator might try to
+#: reverse. Mirrors :func:`~plex_manager.logsafe.safe_guid`'s own redaction
+#: hash length.
+_FINGERPRINT_HEX_CHARS: Final = 12
 
 
 class CoordinatorError(RuntimeError):
@@ -68,6 +79,47 @@ def _optional_string(value: object) -> str | None:
     return value
 
 
+def _parse_app_error_envelope(response: httpx.Response) -> tuple[str, str] | None:
+    """Recognize the app's own ``AppError`` JSON envelope on a non-2xx body
+    (``web/errors.py``'s ``{"detail": <code>, "message": <text>, "hint"?:
+    ..., "diagnostics"?: ...}``, see ``_envelope``/``install_error_handlers``)
+    -- the ONLY body shape this client ever echoes any text from.
+
+    Returns ``(detail, message)`` when the parsed JSON is a dict carrying
+    both as strings; ``None`` for anything else (not JSON, not a dict,
+    missing/non-string fields) -- including a body that is valid JSON but
+    merely LOOKS similar, which is treated exactly as opaque as one that
+    isn't JSON at all (see :meth:`CoordinatorClient._log_non_2xx`).
+
+    Why only these two fields, and why this is the only recognized shape:
+    ``AppError.message``/``hint`` are operator-facing prose the APP ITSELF
+    constructs and ``diagnostics`` is explicitly documented as NON-secret
+    context (``AppError``'s own docstring) -- the envelope is safe to echo
+    BY THE APP'S OWN CONTRACT, unlike arbitrary response text. An
+    intermediary/proxy debug page, raw HTML, or any other non-envelope body
+    could carry an unlabeled token or a secret-bearing URL
+    (``https://host/download/<token>``) that neither ``safe_text`` (line-
+    boundary only) nor ``redact_secrets`` (key-name/shape-based) is
+    guaranteed to catch -- truncating that text would still leave it
+    logged, just shorter. ``hint``/``diagnostics`` are recognized as part of
+    the shape check (a genuine envelope may carry them) but deliberately NOT
+    returned/logged: the review scope for issue #539 is ``detail``/
+    ``message`` only.
+    """
+    try:
+        parsed: object = response.json()
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    parsed_dict = cast("dict[str, object]", parsed)
+    detail = parsed_dict.get("detail")
+    message = parsed_dict.get("message")
+    if not isinstance(detail, str) or not isinstance(message, str):
+        return None
+    return detail, message
+
+
 class CoordinatorClient:
     """Small fail-closed client; no Docker identifier crosses this boundary."""
 
@@ -110,23 +162,65 @@ class CoordinatorClient:
             response.raise_for_status()
         except httpx.HTTPError as exc:
             # A response DID arrive, so unlike the transport-error branch
-            # above there is real diagnostic evidence: log the status code and
-            # a bounded, line-boundary-safe slice of the body (issue #539 --
-            # the 2026-07-28 canary 500s on /eligibility left no evidence
-            # because this classification was previously silent). No request
-            # header (the bearer token) is ever included. The cap is applied
-            # BEFORE safe_text/redact_secrets so both stay bounded work; the
-            # two-deep composition mirrors log_capture_service._capture's own
-            # (issue #153) -- see _MAX_LOGGED_BODY_CHARS above for why this
-            # call site cannot rely on that pipeline's pass instead.
-            _logger.warning(
-                "coordinator request returned HTTP status error: path=%s status=%d body=%s",
-                path,
-                response.status_code,
-                redact_secrets(safe_text(response.text[:_MAX_LOGGED_BODY_CHARS])),
-            )
+            # above there is real diagnostic evidence (issue #539 -- the
+            # 2026-07-28 canary 500s on /eligibility left no evidence because
+            # this classification was previously silent): log it, but never
+            # echo arbitrary response text (review round 3 -- see
+            # _log_non_2xx/_parse_app_error_envelope for why).
+            self._log_non_2xx(path, response)
             raise CoordinatorError("coordinator_unavailable") from exc
         return _object(response)
+
+    def _log_non_2xx(self, path: str, response: httpx.Response) -> None:
+        """Log a non-2xx coordinator response without ever echoing arbitrary
+        response text (issue #539 review round 3).
+
+        Truncation alone does not make an unrecognized body non-secret: an
+        intermediary/proxy debug page returned instead of the app's own
+        response could carry an unlabeled token or a secret-bearing URL
+        (``https://host/download/<token>``) that neither ``safe_text``
+        (line-boundary only) nor ``redact_secrets`` (key-name/shape-based) is
+        guaranteed to catch within the first N characters. So body TEXT is
+        only ever logged when it parses as the app's own AppError envelope
+        (:func:`_parse_app_error_envelope`) -- content the app itself
+        constructed and guarantees non-secret by contract -- and even then
+        only the recognized ``detail``/``message`` fields, bounded and run
+        through ``safe_text``/``redact_secrets``. Any other body (the actual
+        #539 recurrence case was app-origin JSON, so this is the exceptional
+        path) logs status/content-type/length plus an IRREVERSIBLE
+        fingerprint instead: still enough to correlate repeated occurrences
+        of the same opaque body across log lines, never a byte of its
+        content. No request header (the bearer token) is ever included
+        either way. The updater sidecar's stdout is read straight off
+        ``docker logs`` -- it never passes through the app's
+        ``log_capture_service`` capture pipeline, so this call site cannot
+        lean on that pipeline's own ``redact_secrets`` pass as a second line
+        of defense and composes it directly instead.
+        """
+        envelope = _parse_app_error_envelope(response)
+        if envelope is not None:
+            detail, message = envelope
+            _logger.warning(
+                "coordinator request returned HTTP status error (app envelope): "
+                "path=%s status=%d detail=%s message=%s",
+                path,
+                response.status_code,
+                redact_secrets(safe_text(detail[:_MAX_LOGGED_FIELD_CHARS])),
+                redact_secrets(safe_text(message[:_MAX_LOGGED_FIELD_CHARS])),
+            )
+            return
+        body_bytes = response.content
+        fingerprint = hashlib.sha256(body_bytes).hexdigest()[:_FINGERPRINT_HEX_CHARS]
+        content_type = response.headers.get("content-type", "")
+        _logger.warning(
+            "coordinator request returned HTTP status error (opaque body): "
+            "path=%s status=%d content_type=%s content_length=%d fingerprint=%s",
+            path,
+            response.status_code,
+            safe_text(content_type[:_MAX_LOGGED_CONTENT_TYPE_CHARS]),
+            len(body_bytes),
+            fingerprint,
+        )
 
     async def eligibility(self) -> Eligibility:
         data = await self._post("eligibility")
