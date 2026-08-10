@@ -19,7 +19,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   account signed out?" from the durable audit record, and honest SSE close
   reasons: the realtime stream's final frame now names why it closed
   (share revoked vs sign-in expired vs idle vs absolute expiry, and more),
-  with truthful sign-in-screen wording (#556, #567).
+  with truthful sign-in-screen wording. Note the realtime stream is
+  admin-only while the sweep exempts admins, so a swept shared user cannot
+  yet receive their own close reason — the audit surface is the operative
+  answer for them; direct delivery is tracked in #569 (#556, #567).
 - Entitlement/share-state schema and a `plex_access_service` module extracting
   the plex.tv share-verdict ladder (schema and ladder extraction only — no
   loop, no enforcement yet); PR-1 of the auth-revalidation design (#555).
@@ -54,13 +57,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-root pressure-exclusion lease — a correction beginning inside a sweep's
   await windows defeats the sweep (corrections never wait), enforced down to
   the delete boundary before the durable marker arms; denied or defeated
-  manual sweeps are visible in `POST /ops/evict` and on the Status page
-  (#526, #568).
-- Updater: non-2xx coordinator responses now log the request path, status,
-  and either the exact app error code (allowlisted) or an opaque-body
-  summary (allowlisted media type, byte length, fingerprint) instead of a
-  bare `coordinator_unavailable` — the next #539 recurrence is attributable
-  from the sidecar log alone, and nothing arbitrary can reach the log (#566).
+  manual sweeps are visible in `POST /api/v1/ops/evict` and on the Status
+  page (#526, #568).
+- Updater: non-2xx coordinator responses (other than the separately-handled
+  409 conflict path) now log the request path, status, and either the exact
+  app error code (allowlisted) or an opaque-body summary (allowlisted media
+  type, byte length, fingerprint) instead of a bare
+  `coordinator_unavailable` — the next #539 recurrence is attributable from
+  the sidecar log alone, and nothing arbitrary can reach the log (#566).
 - Eviction: walk-skipped candidates now carry an explicit `None` size
   sentinel instead of a fabricated `0.0`, and eviction/retention sweeps now
   log their duration on completion — including the common below-pressure

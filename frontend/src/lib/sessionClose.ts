@@ -35,7 +35,7 @@ interface NoticeCopy {
  * changed would be a lie.
  */
 const NOTICES: Record<string, NoticeCopy> = {
-  // KNOWN GAP (tracked follow-up to #556): the two share-revalidation reasons
+  // KNOWN GAP (tracked in issue #569): the two share-revalidation reasons
   // below are currently undeliverable to the person they describe. `/api/v1/events`
   // is admin-only and `RealtimeProvider` mounts only for admins, while the sweep
   // never signs an admin out (ADR-0005) — so the set of users holding a stream
