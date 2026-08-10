@@ -32,8 +32,11 @@ dependencies = [
     # parse output drives the safety-critical CAM/TS hard cutoff, so a silent
     # upgrade must never shift classification (golden tests guard it too).
     "guessit==4.1.0",
-    # Fernet encryption for secrets at rest (ADR-0005).
-    "cryptography>=42",
+    # Fernet encryption for secrets at rest (ADR-0005). Floor raised to 50 by
+    # GHSA-g6cj-pr64-35w5 (PKCS#7 Bleichenbacher oracle, affects >=44,<50): the
+    # constraints file governs CI and the image, but the floor must not resolve
+    # to an advisory-affected release on any other install path.
+    "cryptography>=50",
 ]
 
 [project.optional-dependencies]
