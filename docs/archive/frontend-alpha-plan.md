@@ -7,7 +7,7 @@
   ([ADR-0009](../adr/0009-frontend-typed-spa.md)).
 
 This is a planning artifact for the alpha; like [`alpha-plan.md`](alpha-plan.md)
-it is removed at the v1 cleanup ([issue #3](https://github.com/LunchBox951/Plex-Management/issues/3)).
+it was archived at the v1 cleanup ([issue #3](https://github.com/LunchBox951/Plex-Management/issues/3)).
 The durable decision lives in ADR-0009. Design source: the Claude Design handoff
 ([issue #7](https://github.com/LunchBox951/Plex-Management/issues/7)) — *a
 template, not a source of truth; engineering docs win on conflict.*

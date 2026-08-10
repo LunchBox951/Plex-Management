@@ -10,7 +10,7 @@
   build against. Front end is out of scope this session.
 
 This is a planning artifact for the alpha; per [issue #3](https://github.com/LunchBox951/Plex-Management/issues/3)
-it is removed at the v1 cleanup. The durable decisions live in the ADRs.
+it was archived at the v1 cleanup. The durable decisions live in the ADRs.
 
 ## The alpha's right edge
 

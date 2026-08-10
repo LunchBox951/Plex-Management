@@ -13,8 +13,10 @@ single app — with two differences that define the project:
 > loop is built and tested for movies, TV, and anime — search, grab, reconcile,
 > import, Plex scan, Plex availability dedupe, disk-pressure eviction,
 > operability (health/logs/retention/eviction), auto-grab, and in-app correction
-> surfaces. A 7-day live beta run is set to begin gathering real-world data ahead
-> of a v1 stable promotion. Browser Plex sign-in/session auth is built; the
+> surfaces. The 7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with
+> fixes landing continuously into `:edge` through the soak; after a renewed
+> soak of the post-fix build, 1.0.0 was promoted to `:stable` on Aug 9, 2026.
+> Browser Plex sign-in/session auth is built; the
 > bundled first-party container updater is available as an opt-in Compose
 > profile.
 
@@ -385,7 +387,7 @@ See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
 ## Documentation
 
 - [Design overview](docs/design/overview.md)
-- [Historical backend-alpha plan](docs/design/alpha-plan.md)
+- [Historical backend-alpha plan](docs/archive/alpha-plan.md)
 - [REST API contract (OpenAPI)](docs/api/openapi.json)
 - [Architecture Decision Records](docs/adr/)
 - [Security policy](SECURITY.md)
