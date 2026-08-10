@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-09
+
 _Package metadata is `1.0.0` (see `src/plex_manager/__init__.py`). The
 canary-proven `edge-c1bf4eb` image was promoted to `:stable` / `1.0.0` on
 Aug 9, 2026 by re-tag (no rebuild — ADR-0004). The 1.0.0 runbook (issue #3)

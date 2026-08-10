@@ -387,7 +387,7 @@ See [ADR-0002](docs/adr/0002-python-typed-stack.md) and
 ## Documentation
 
 - [Design overview](docs/design/overview.md)
-- [Historical backend-alpha plan](docs/design/alpha-plan.md)
+- [Historical backend-alpha plan](docs/archive/alpha-plan.md)
 - [REST API contract (OpenAPI)](docs/api/openapi.json)
 - [Architecture Decision Records](docs/adr/)
 - [Security policy](SECURITY.md)
