@@ -77,6 +77,7 @@ from plex_manager.web.deps import (
     SECRET_MASK,
     SECRET_SETTING_KEYS,
     SESSION_COOKIE_NAME,
+    SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
     WATCHLIST_SYNC_ENABLED_DEFAULT,
     WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
@@ -101,6 +102,7 @@ from plex_manager.web.deps import (
     resolve_eviction_interval_minutes,
     resolve_log_max_rows,
     resolve_log_retention_days,
+    resolve_share_revalidation_interval_hours,
     resolve_watchlist_sync_interval_minutes,
 )
 from plex_manager.web.errors import AppError
@@ -1054,6 +1056,16 @@ def _sanitize_typed_settings(raw: dict[str, str | None]) -> dict[str, object | N
         watchlist_interval,
         WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
         watchlist_interval_honored,
+    )
+
+    share_interval, share_interval_honored = resolve_share_revalidation_interval_hours(
+        raw.get("share_revalidation_interval_hours")
+    )
+    out["share_revalidation_interval_hours"] = _present_effective(
+        raw.get("share_revalidation_interval_hours"),
+        share_interval,
+        SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+        share_interval_honored,
     )
 
     grace, grace_honored = resolve_eviction_grace_days(raw.get("eviction_grace_days"))

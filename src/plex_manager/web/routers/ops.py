@@ -60,7 +60,12 @@ from plex_manager.domain.disk_usage import used_percent
 from plex_manager.ports.download_client import DownloadClientPort
 from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
-from plex_manager.services import eviction_service, purge_service, watchlist_service
+from plex_manager.services import (
+    eviction_service,
+    plex_access_service,
+    purge_service,
+    watchlist_service,
+)
 from plex_manager.services.eviction_service import EvictionOutcome
 from plex_manager.services.health_service import (
     SUBSYSTEM_CACHE_KEYS,
@@ -102,6 +107,7 @@ from plex_manager.web.deps import (
     get_qbittorrent_optional,
     get_reconcile_status,
     get_session,
+    get_share_sweep_status,
     get_tv_root_optional,
     get_watchlist_status,
     require_admin,
@@ -122,6 +128,7 @@ from plex_manager.web.schemas import (
     LogsResponse,
     LogsTailResponse,
     ReconcileStatusItem,
+    ShareSweepStatusItem,
     SubsystemHealthItem,
     WatchlistStatusItem,
 )
@@ -159,6 +166,9 @@ async def health_endpoint(
     autograb_status: Annotated[AutograbStatus, Depends(get_autograb_status)],
     watchlist_status: Annotated[
         watchlist_service.WatchlistWorkerStatus, Depends(get_watchlist_status)
+    ],
+    share_sweep_status: Annotated[
+        plex_access_service.ShareSweepStatus, Depends(get_share_sweep_status)
     ],
 ) -> HealthResponse:
     """One read: per-subsystem reachability, disk gauges, and the reconcile +
@@ -256,6 +266,25 @@ async def health_endpoint(
             failed_users=watchlist_status.failed_users,
             failed_entries=watchlist_status.failed_entries,
             skipped_users=watchlist_status.skipped_users,
+        ),
+        share_sweep=ShareSweepStatusItem(
+            state=share_sweep_status.state,
+            last_run_at=share_sweep_status.last_run_at,
+            last_ok_at=share_sweep_status.last_ok_at,
+            last_error_type=share_sweep_status.last_error_type,
+            last_error_at=share_sweep_status.last_error_at,
+            checked=share_sweep_status.checked,
+            authorized=share_sweep_status.authorized,
+            share_revoked=share_sweep_status.share_revoked,
+            token_stale=share_sweep_status.token_stale,
+            unknown=share_sweep_status.unknown,
+            unverifiable=share_sweep_status.unverifiable,
+            skipped=share_sweep_status.skipped,
+            admins_exempted=share_sweep_status.admins_exempted,
+            anchor_deferred=share_sweep_status.anchor_deferred,
+            signed_out=share_sweep_status.signed_out,
+            sessions_revoked=share_sweep_status.sessions_revoked,
+            due_remaining=share_sweep_status.due_remaining,
         ),
     )
 

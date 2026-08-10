@@ -33,6 +33,7 @@ from typing import Any, cast
 
 from sqlalchemy import CursorResult, and_, delete, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from plex_manager.models import AuthSession
 
@@ -41,6 +42,7 @@ __all__ = [
     "SESSION_LAST_SEEN_REFRESH_INTERVAL",
     "SESSION_SWEEP_INTERVAL_SECONDS",
     "SESSION_SWEEP_RETENTION",
+    "active_session_conditions",
     "ensure_utc",
     "revoke_recovery_sessions",
     "revoke_user_sessions",
@@ -108,11 +110,43 @@ def session_is_idle_expired(auth_session: AuthSession, *, now: datetime) -> bool
     return session_idle_deadline(auth_session) <= now
 
 
+def active_session_conditions(now: datetime) -> tuple[ColumnElement[bool], ...]:
+    """The SQL definition of "this session can still authenticate", as of ``now``.
+
+    ONE definition, deliberately: the admin sessions list
+    (``auth.list_active_sessions_endpoint``) and the share-revalidation sweep's
+    due-selection (``plex_access_service``) both need exactly this predicate, and
+    two hand-copied versions would be free to drift — a sweep that considered a
+    session live while the admin list did not (or vice versa) would revoke people
+    the operator cannot see, or skip people they can. It mirrors the row-level
+    check the auth path applies per request (``web.deps``): not revoked, inside
+    the absolute ``expires_at`` cap, and seen within
+    :data:`SESSION_IDLE_WINDOW` (``created_at`` standing in for a session that
+    has never refreshed ``last_seen_at``).
+
+    Returned as a tuple so callers splat it into ``.where(*conditions)`` and can
+    freely add their own predicates (e.g. ``user_id IS NULL`` for the recovery
+    group) without nesting.
+
+    NOT used by :func:`revoke_user_sessions` / :func:`revoke_recovery_sessions`,
+    which deliberately cast wider: they stamp every not-yet-revoked row, including
+    ones already expired or idled out, so a revocation leaves no ambiguous
+    "unrevoked but dead" rows behind for the sweep to reason about.
+    """
+    idle_cutoff = now - SESSION_IDLE_WINDOW
+    return (
+        AuthSession.revoked_at.is_(None),
+        AuthSession.expires_at > now,
+        func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
+    )
+
+
 async def revoke_user_sessions(
     session: AsyncSession,
     user_id: int,
     *,
     now: datetime | None = None,
+    created_at_or_before: datetime | None = None,
 ) -> int:
     """Stamp ``revoked_at`` on every ACTIVE session for ``user_id``; return count.
 
@@ -122,15 +156,25 @@ async def revoke_user_sessions(
     convention) rather than deleting; the sweep reclaims the row later. Only rows
     whose ``revoked_at`` is still NULL are touched, so a re-revoke is a harmless
     no-op that reports 0. The caller owns the commit.
+
+    ``created_at_or_before`` narrows the revocation to sessions that already
+    existed at a given instant, leaving anything minted after it alone. An
+    operator-initiated revoke passes ``None`` (revoke everything, the intuitive
+    meaning of the button), but an AUTOMATED revoke acting on a decision made
+    earlier must pass the instant that decision was validated -- otherwise a
+    sign-in completing in between has its brand-new session cut on the strength
+    of a verdict that predates it. See
+    ``plex_access_service.apply_share_verdict`` for the one caller that needs it.
     """
     stamp = now if now is not None else datetime.now(UTC)
+    stmt = update(AuthSession).where(
+        AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None)
+    )
+    if created_at_or_before is not None:
+        stmt = stmt.where(AuthSession.created_at <= created_at_or_before)
     result = cast(
         CursorResult[Any],
-        await session.execute(
-            update(AuthSession)
-            .where(AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None))
-            .values(revoked_at=stamp)
-        ),
+        await session.execute(stmt.values(revoked_at=stamp)),
     )
     return result.rowcount
 

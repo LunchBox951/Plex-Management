@@ -79,6 +79,25 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       failed_entries: 0,
       skipped_users: 0,
     },
+    share_sweep: {
+      state: 'ok',
+      last_run_at: '2026-01-01T00:00:00Z',
+      last_ok_at: '2026-01-01T00:00:00Z',
+      last_error_type: null,
+      last_error_at: null,
+      checked: 0,
+      authorized: 0,
+      share_revoked: 0,
+      token_stale: 0,
+      unknown: 0,
+      unverifiable: 0,
+      skipped: 0,
+      admins_exempted: 0,
+      anchor_deferred: 0,
+      signed_out: 0,
+      sessions_revoked: 0,
+      due_remaining: 0,
+    },
     ...overrides,
   }
 }
@@ -201,7 +220,8 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(8)
+    // 8 before the share re-check panel joined the background-loop row (#391).
+    expect(cards).toHaveLength(9)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',
@@ -954,6 +974,25 @@ describe('Status', () => {
           failed_entries: 0,
           skipped_users: 0,
         },
+        share_sweep: {
+          state: 'starting',
+          last_run_at: null,
+          last_ok_at: null,
+          last_error_type: null,
+          last_error_at: null,
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 0,
+        },
       }),
       isLoading: false,
       isError: false,
@@ -965,8 +1004,8 @@ describe('Status', () => {
 
     // Never — a fresh boot must not read as "clean" just because failures==0.
     expect(screen.queryByText('running clean')).not.toBeInTheDocument()
-    // All three background panels show the honest "starting up".
-    expect(screen.getAllByText('starting up')).toHaveLength(3)
+    // All four background panels show the honest "starting up".
+    expect(screen.getAllByText('starting up')).toHaveLength(4)
     // Both "Last run" and "Last success" render the same honest placeholder.
     const neverValues = screen.getAllByText('never')
     expect(neverValues.length).toBeGreaterThan(0)
@@ -1088,6 +1127,308 @@ describe('Status', () => {
     expect(lastRun).not.toHaveTextContent('never')
     expect(lastSuccess).not.toHaveTextContent('never')
     expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
+  })
+
+  it('distinguishes an undetermined share re-check from an actual sign-out', () => {
+    // The honesty case (issue #391): plex.tv was unreachable for two users, so
+    // the sweep revoked NOBODY. If the panel let that read like a clean run —
+    // or like a revocation — the operator would draw the wrong conclusion from
+    // the one screen they have.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'degraded',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 5,
+          authorized: 3,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 2,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 4,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const heading = screen.getByRole('heading', { name: 'Plex share re-check' })
+    const panel = heading.closest('article')
+    expect(panel).not.toBeNull()
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('degraded')).toBeInTheDocument()
+
+    const undetermined = sweep.getByText('Undetermined').nextElementSibling
+    expect(undetermined).toHaveTextContent('2')
+    expect(undetermined).toHaveClass('font-semibold', 'text-searching')
+
+    // Nobody lost access, and the panel must say so plainly.
+    const signedOut = sweep.getByText('Signed out').nextElementSibling
+    expect(signedOut).toHaveTextContent('0')
+    expect(signedOut).not.toHaveClass('text-searching')
+
+    // The backlog the per-tick budget could not reach stays visible.
+    expect(sweep.getByText('Still due').nextElementSibling).toHaveTextContent('4')
+    // A degraded tick must not overwrite the last genuinely successful run.
+    const lastRun = sweep.getByText('Last run').nextElementSibling
+    const lastSuccess = sweep.getByText('Last success').nextElementSibling
+    expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
+  })
+
+  it('reports the sign-out count the backend measured, not a sum of verdicts', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 4,
+          authorized: 1,
+          share_revoked: 2,
+          token_stale: 1,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
+          signed_out: 3,
+          sessions_revoked: 5,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    // A sweep that revoked people is the worker WORKING, not failing.
+    expect(sweep.getByText('running clean')).toBeInTheDocument()
+    const signedOut = sweep.getByText('Signed out').nextElementSibling
+    expect(signedOut).toHaveTextContent('3')
+    expect(signedOut).toHaveClass('font-semibold', 'text-searching')
+    // Exception-only rows stay out of the way on an ordinary tick.
+    expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Held (anchor unconfirmed)')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Admins held')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Skipped')).not.toBeInTheDocument()
+  })
+
+  it('reads a stale server anchor as loudly as a crash, not as a hiccup', () => {
+    // The rebuilt-Plex-server case (issue #391): every user looks revoked
+    // because the stored machine identifier is stale, so the sweep enforced
+    // NOTHING. Showing this as a routine "degraded" would let an operator
+    // ignore the one state that means the guard is switched off.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_mismatch',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'PlexAnchorMismatch',
+          last_error_at: '2026-01-02T00:00:01Z',
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 6,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 6,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor mismatch')).toBeInTheDocument()
+    const held = sweep.getByText('Held (server changed)').nextElementSibling
+    expect(held).toHaveTextContent('6')
+    expect(held).toHaveClass('font-semibold', 'text-error')
+    // Nobody was signed out, and the reason is named.
+    expect(sweep.getByText('Signed out').nextElementSibling).toHaveTextContent('0')
+    expect(sweep.getByText(/PlexAnchorMismatch/)).toBeInTheDocument()
+  })
+
+  it('does not claim the server changed when it merely could not be reached', () => {
+    // A Plex outage coinciding with a would-revoke verdict holds the sign-out
+    // just as firmly, but it never established an identity change — saying so
+    // would send the operator hunting a configuration fault that never happened.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_unconfirmed',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'PlexAnchorUnconfirmed',
+          last_error_at: '2026-01-02T00:00:01Z',
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 2,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 2,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor unconfirmed')).toBeInTheDocument()
+    expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
+    // Neutral about the cause: "unreachable" would be wrong when the anchor is
+    // unconfirmed because no plex_url/plex_token was configured to probe with —
+    // no network attempt was ever made in that case.
+    expect(sweep.queryByText('Held (server unreachable)')).not.toBeInTheDocument()
+    const held = sweep.getByText('Held (anchor unconfirmed)').nextElementSibling
+    expect(held).toHaveTextContent('2')
+    // Warn, not error: an unestablished anchor is not a configuration fault.
+    expect(held).toHaveClass('font-semibold', 'text-searching')
+    expect(held).not.toHaveClass('text-error')
+  })
+
+  it('surfaces skipped candidates only when the tick actually skipped some', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 3,
+          authorized: 3,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 2,
+          admins_exempted: 0,
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('Skipped').nextElementSibling).toHaveTextContent('2')
+  })
+
+  it('does not count an exempted admin as signed out', () => {
+    // One revoked viewer plus one exempted admin: two share_revoked VERDICTS but
+    // only one person actually cut. Summing the verdict tallies in the UI
+    // reported "Signed out 2" and overstated the blast radius.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 2,
+          authorized: 0,
+          share_revoked: 2,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 1,
+          anchor_deferred: 0,
+          signed_out: 1,
+          sessions_revoked: 1,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('Signed out').nextElementSibling).toHaveTextContent('1')
+    // The admin is never signed out automatically, so the operator has to be
+    // told it happened rather than left wondering why nothing did.
+    const held = sweep.getByText('Admins held').nextElementSibling
+    expect(held).toHaveTextContent('1')
+    expect(held).toHaveClass('font-semibold', 'text-searching')
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {

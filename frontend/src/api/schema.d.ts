@@ -2320,6 +2320,7 @@ export interface components {
             /** Disks */
             disks: components["schemas"]["DiskGaugeItem"][];
             reconcile: components["schemas"]["ReconcileStatusItem"];
+            share_sweep: components["schemas"]["ShareSweepStatusItem"];
             /** Subsystems */
             subsystems: components["schemas"]["SubsystemHealthItem"][];
             watchlist: components["schemas"]["WatchlistStatusItem"];
@@ -2995,6 +2996,8 @@ export interface components {
             qbittorrent_url?: string | null;
             /** Qbittorrent Username */
             qbittorrent_username?: string | null;
+            /** Share Revalidation Interval Hours */
+            share_revalidation_interval_hours?: number | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
             /** Tv Root */
@@ -3087,6 +3090,8 @@ export interface components {
             qbittorrent_url?: string | null;
             /** Qbittorrent Username */
             qbittorrent_username?: string | null;
+            /** Share Revalidation Interval Hours */
+            share_revalidation_interval_hours?: number | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
             /** Tv Root */
@@ -3164,6 +3169,95 @@ export interface components {
              * @default false
              */
             setup_token_required: boolean;
+        };
+        /**
+         * ShareSweepStatusItem
+         * @description The share-revalidation sweep's health (issue #391).
+         *
+         *     ``unknown`` is the field that makes this honest: a sweep that could not reach
+         *     plex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,
+         *     which an operator must be able to tell apart from a clean ``ok`` sweep that
+         *     found everyone still entitled. The two anchor states are the louder cousin --
+         *     ``anchor_deferred`` share-loss verdicts were acted on for nobody because the
+         *     server anchor did not hold -- and they stay separate for the same reason:
+         *     ``anchor_mismatch`` means the server reported a DIFFERENT machine identifier
+         *     (established, needs a repoint), while ``anchor_unconfirmed`` means it could
+         *     not be asked at all (an outage, or missing credentials).
+         */
+        ShareSweepStatusItem: {
+            /**
+             * Admins Exempted
+             * @default 0
+             */
+            admins_exempted: number;
+            /**
+             * Anchor Deferred
+             * @default 0
+             */
+            anchor_deferred: number;
+            /**
+             * Authorized
+             * @default 0
+             */
+            authorized: number;
+            /**
+             * Checked
+             * @default 0
+             */
+            checked: number;
+            /**
+             * Due Remaining
+             * @default 0
+             */
+            due_remaining: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+            /**
+             * Sessions Revoked
+             * @default 0
+             */
+            sessions_revoked: number;
+            /**
+             * Share Revoked
+             * @default 0
+             */
+            share_revoked: number;
+            /**
+             * Signed Out
+             * @default 0
+             */
+            signed_out: number;
+            /**
+             * Skipped
+             * @default 0
+             */
+            skipped: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "starting" | "ok" | "degraded" | "anchor_mismatch" | "anchor_unconfirmed" | "not_configured" | "probe_failed" | "error";
+            /**
+             * Token Stale
+             * @default 0
+             */
+            token_stale: number;
+            /**
+             * Unknown
+             * @default 0
+             */
+            unknown: number;
+            /**
+             * Unverifiable
+             * @default 0
+             */
+            unverifiable: number;
         };
         /**
          * SubsystemHealthItem

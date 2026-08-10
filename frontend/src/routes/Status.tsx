@@ -605,6 +605,155 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
   )
 }
 
+/** The periodic Plex-share revalidation sweep (issue #391).
+ *
+ * The counters are what make it honest: `unknown` is a plex.tv failure that
+ * revoked nobody, `signed out` is people the sweep actually cut off, and
+ * `still due` is the backlog the per-tick budget could not reach. A degraded
+ * sweep with a non-zero `unknown` and zero sign-outs is a very different fact
+ * from a clean one, and the operator must be able to see which they have.
+ */
+function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
+  // A CONFIRMED identity change is a configuration fault only a repoint fixes,
+  // so it reads as loudly as a crash. Merely being unable to ask (a Plex outage,
+  // missing credentials) is the same class of transient as any other probe
+  // failure — claiming "the server changed" there would send an operator hunting
+  // a change that never happened.
+  const anchorChanged = sweep.state === 'anchor_mismatch'
+  const tone: DotTone =
+    sweep.state === 'ok'
+      ? 'ok'
+      : sweep.state === 'degraded' ||
+          sweep.state === 'probe_failed' ||
+          sweep.state === 'anchor_unconfirmed'
+        ? 'warn'
+        : sweep.state === 'error' || anchorChanged
+          ? 'error'
+          : 'neutral'
+  const label =
+    sweep.state === 'starting'
+      ? 'starting up'
+      : sweep.state === 'ok'
+        ? 'running clean'
+        : sweep.state.replaceAll('_', ' ')
+  return (
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 font-display text-sm font-semibold text-ink">
+          Plex share re-check
+        </h3>
+        <div className="shrink-0">
+          <Dot tone={tone} label={label} />
+        </div>
+      </div>
+      <dl className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-1.5 font-mono text-xs">
+        <dt className="min-w-0 text-faint">Last run</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(sweep.last_run_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Last success</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(sweep.last_ok_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Checked</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.checked}
+        </dd>
+        <dt className="min-w-0 text-faint">Still entitled</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.authorized}
+        </dd>
+        {/* The backend's own tally, not `share_revoked + token_stale` — those
+            count VERDICTS, and an admin-exempted share loss is a verdict nobody
+            was signed out for. Summing them here would report 2 sign-outs for
+            one revoked viewer plus one exempted admin. */}
+        <dt className="min-w-0 text-faint">Signed out</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            sweep.signed_out > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {sweep.signed_out}
+        </dd>
+        {/* A transient plex.tv failure is the one outcome that must never be
+            mistaken for a revocation — it is why the tick reads degraded. */}
+        <dt className="min-w-0 text-faint">Undetermined</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            sweep.unknown > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {sweep.unknown}
+        </dd>
+        {/* Sign-outs the sweep knowingly withheld because the server anchor did
+            not hold. The label distinguishes the two causes — a confirmed
+            identity change vs. simply not being able to establish one — because
+            only the first is a configuration fault. The unconfirmed wording stays
+            neutral about the cause: it covers a failed probe AND the case where
+            no plex_url/plex_token was configured to probe with, i.e. no network
+            attempt was ever made. Exception-only rows: rendered when non-zero,
+            not as routine statistics. */}
+        {sweep.anchor_deferred > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">
+              {anchorChanged ? 'Held (server changed)' : 'Held (anchor unconfirmed)'}
+            </dt>
+            <dd
+              className={cn(
+                'min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]',
+                anchorChanged ? 'text-error' : 'text-searching',
+              )}
+            >
+              {sweep.anchor_deferred}
+            </dd>
+          </>
+        ) : null}
+        {/* Candidates the tick wrote nothing for (a mid-sweep re-sign-in, or a
+            deleted row): budget that produced no verdict, so it is visible
+            rather than silently making the tick look smaller. */}
+        {sweep.skipped > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Skipped</dt>
+            <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+              {sweep.skipped}
+            </dd>
+          </>
+        ) : null}
+        {/* An admin whose share looks gone is never signed out automatically
+            (ADR-0005 never-locked-out) — surfaced so the operator can go act on
+            it by hand rather than wondering why nothing happened. */}
+        {sweep.admins_exempted > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Admins held</dt>
+            <dd className="min-w-0 text-right font-semibold text-searching tabular-nums [overflow-wrap:anywhere]">
+              {sweep.admins_exempted}
+            </dd>
+          </>
+        ) : null}
+        <dt className="min-w-0 text-faint">Still due</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.due_remaining}
+        </dd>
+        {sweep.last_error_type ? (
+          <>
+            <dt className="min-w-0 text-faint">Last error</dt>
+            <dd className="min-w-0 text-right text-error tabular-nums [overflow-wrap:anywhere]">
+              {sweep.last_error_type} · {formatTimestamp(sweep.last_error_at)}
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    </article>
+  )
+}
+
 /** One configured library root: a usage bar, plus a ranked preview of what a
  * pressure sweep WOULD evict from it (never evicts anything itself — the
  * preview lists every eligible title regardless of current pressure, so the
@@ -1015,6 +1164,7 @@ export function Status() {
             <ReconcilePanel reconcile={health.data.reconcile} />
             <AutograbPanel autograb={health.data.autograb} />
             <WatchlistPanel watchlist={health.data.watchlist} />
+            <ShareSweepPanel sweep={health.data.share_sweep} />
           </div>
         </section>
       ) : null}

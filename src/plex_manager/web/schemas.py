@@ -29,6 +29,8 @@ from plex_manager.web.settings_bounds import (
     EVICTION_INTERVAL_MAX_MINUTES,
     LOG_MAX_ROWS_MAX,
     LOG_RETENTION_DAYS_MAX,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
 )
 from plex_manager.web.url_validation import url_shape_error
 
@@ -91,6 +93,7 @@ __all__ = [
     "SettingsUpdate",
     "SetupCompleteRequest",
     "SetupStatusResponse",
+    "ShareSweepStatusItem",
     "SubsystemHealthItem",
     "TileKey",
     "TmdbValidateRequest",
@@ -695,6 +698,11 @@ class SettingsResponse(BaseModel):
     automatic_update_idle_only: bool | None = None
     watchlist_sync_enabled: bool | None = None
     watchlist_sync_interval_minutes: float | None = None
+    # Share revalidation (issue #391) — how often the sweep re-derives each
+    # signed-in user's Plex-share verdict, i.e. the worst-case window in which a
+    # revoked share still works here. Same unset/degraded-to-default ``None``
+    # wire semantics as every other typed operability field above.
+    share_revalidation_interval_hours: float | None = None
 
 
 class AppApiKeyResponse(BaseModel):
@@ -874,6 +882,11 @@ class SettingsUpdate(BaseModel):
     watchlist_sync_enabled: bool | None = Field(default=None)
     watchlist_sync_interval_minutes: float | None = Field(
         default=None, gt=0, le=EVICTION_INTERVAL_MAX_MINUTES
+    )
+    share_revalidation_interval_hours: float | None = Field(
+        default=None,
+        ge=SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
+        le=SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
     )
 
     @field_validator("plex_url", "prowlarr_url", "qbittorrent_url")
@@ -1867,6 +1880,53 @@ class WatchlistStatusItem(BaseModel):
     skipped_users: int = 0
 
 
+class ShareSweepStatusItem(BaseModel):
+    """The share-revalidation sweep's health (issue #391).
+
+    ``unknown`` is the field that makes this honest: a sweep that could not reach
+    plex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,
+    which an operator must be able to tell apart from a clean ``ok`` sweep that
+    found everyone still entitled. The two anchor states are the louder cousin --
+    ``anchor_deferred`` share-loss verdicts were acted on for nobody because the
+    server anchor did not hold -- and they stay separate for the same reason:
+    ``anchor_mismatch`` means the server reported a DIFFERENT machine identifier
+    (established, needs a repoint), while ``anchor_unconfirmed`` means it could
+    not be asked at all (an outage, or missing credentials).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal[
+        "starting",
+        "ok",
+        "degraded",
+        "anchor_mismatch",
+        "anchor_unconfirmed",
+        "not_configured",
+        "probe_failed",
+        "error",
+    ]
+    last_run_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error_type: str | None = None
+    last_error_at: datetime | None = None
+    checked: int = 0
+    authorized: int = 0
+    share_revoked: int = 0
+    token_stale: int = 0
+    unknown: int = 0
+    unverifiable: int = 0
+    skipped: int = 0
+    admins_exempted: int = 0
+    anchor_deferred: int = 0
+    signed_out: int = 0
+    """Users actually signed out. Reported rather than derived from
+    ``share_revoked + token_stale``, which overstates whenever an admin was
+    exempted from the sign-out half."""
+    sessions_revoked: int = 0
+    due_remaining: int = 0
+
+
 class HealthResponse(BaseModel):
     """``GET /api/v1/ops/health`` -- one read answering "is every subsystem
     healthy, is the reconcile loop running, how full is the disk"."""
@@ -1878,6 +1938,7 @@ class HealthResponse(BaseModel):
     reconcile: ReconcileStatusItem
     autograb: AutograbStatusItem
     watchlist: WatchlistStatusItem
+    share_sweep: ShareSweepStatusItem
 
 
 # --------------------------------------------------------------------------- #

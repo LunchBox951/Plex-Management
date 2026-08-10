@@ -168,6 +168,21 @@ function healthResponse(
       failed_entries: 0,
       skipped_users: 0,
     },
+    share_sweep: {
+      state: 'starting',
+      checked: 0,
+      authorized: 0,
+      share_revoked: 0,
+      token_stale: 0,
+      unknown: 0,
+      unverifiable: 0,
+      skipped: 0,
+      admins_exempted: 0,
+      anchor_deferred: 0,
+      signed_out: 0,
+      sessions_revoked: 0,
+      due_remaining: 0,
+    },
   }
 }
 
@@ -1036,6 +1051,38 @@ describe('Settings — operability fields (ADR-0012, R3-1)', () => {
       expect.objectContaining({
         title: 'Save failed',
         description: expect.stringMatching(/watchlist sync interval.*10080/i),
+        intent: 'error',
+      }),
+    )
+    expect(h.mutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('saves an edited Plex share re-check interval', async () => {
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Plex share re-check interval (hours)'), {
+      target: { value: '2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1))
+    expect(lastBody().share_revalidation_interval_hours).toBe(2)
+  })
+
+  it('rejects a Plex share re-check interval outside the backend bounds', async () => {
+    // The interval is a security exposure window, so the form refuses a value
+    // the backend would 422 on rather than letting the operator believe a
+    // 1000-hour window was accepted.
+    render(<Settings />, { wrapper: Wrapper })
+    fireEvent.change(screen.getByLabelText('Plex share re-check interval (hours)'), {
+      target: { value: '169' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => expect(h.toast).toHaveBeenCalledTimes(1))
+    expect(h.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Save failed',
+        description: expect.stringMatching(/share re-check interval.*1 and 168/i),
         intent: 'error',
       }),
     )

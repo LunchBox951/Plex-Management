@@ -47,6 +47,9 @@ from plex_manager.web.deps import (
     LOG_RETENTION_DAYS_MAX,
     PLEX_MACHINE_ID_SETTING,
     SECRET_SETTING_KEYS,
+    SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
     WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     AuthContext,
     AuthMethod,
@@ -65,11 +68,13 @@ from plex_manager.web.deps import (
     get_log_max_rows,
     get_log_retention_days,
     get_movies_root_optional,
+    get_share_revalidation_interval_hours,
     get_tv_root_optional,
     get_watchlist_sync_interval_minutes,
     hash_session_token,
     load_system_settings,
     require_api_key,
+    resolve_share_revalidation_interval_hours,
 )
 from plex_manager.web.events import get_event_hub
 from plex_manager.web.routers import auth as auth_module
@@ -90,6 +95,7 @@ _FLOAT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "eviction_interval_minutes",
     "watchlist_sync_interval_minutes",
     "auto_grab_interval_seconds",
+    "share_revalidation_interval_hours",
 )
 _INT_TYPED_SETTING_KEYS: tuple[str, ...] = (
     "eviction_grace_days",
@@ -2497,6 +2503,118 @@ async def test_get_settings_default_auto_grab_timing_when_unset(
         )
     assert AUTO_GRAB_INTERVAL_SECONDS_DEFAULT == 60.0
     assert AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT == 5
+
+
+# --------------------------------------------------------------------------- #
+# Share revalidation interval (issue #391)
+# --------------------------------------------------------------------------- #
+def test_share_revalidation_interval_bounds_are_enforced_at_write_time() -> None:
+    for bad in (
+        float("inf"),
+        float("nan"),
+        float("-inf"),
+        0.0,
+        SHARE_REVALIDATION_INTERVAL_HOURS_MIN - 0.5,
+        SHARE_REVALIDATION_INTERVAL_HOURS_MAX + 1,
+    ):
+        with pytest.raises(ValidationError):
+            SettingsUpdate(share_revalidation_interval_hours=bad)
+    SettingsUpdate(share_revalidation_interval_hours=SHARE_REVALIDATION_INTERVAL_HOURS_MIN)
+    SettingsUpdate(share_revalidation_interval_hours=SHARE_REVALIDATION_INTERVAL_HOURS_MAX)
+    SettingsUpdate(share_revalidation_interval_hours=12.0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "honored"),
+    [
+        pytest.param(None, SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, True, id="unset"),
+        pytest.param("12", 12.0, True, id="in_range"),
+        pytest.param("nonsense", SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False, id="garbage"),
+        pytest.param("inf", SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False, id="non_finite"),
+        pytest.param("0", SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False, id="zero"),
+        pytest.param("-4", SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False, id="negative"),
+        pytest.param(
+            "0.25", SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False, id="below_floor_defaults"
+        ),
+        pytest.param(
+            "100000", SHARE_REVALIDATION_INTERVAL_HOURS_MAX, False, id="above_ceiling_clamps"
+        ),
+    ],
+)
+def test_resolve_share_revalidation_interval_hours_degrades_honestly(
+    raw: str | None, expected: float, honored: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A corrupt or hand-edited stored value must never wedge the sweep, and an
+    ignored setting must never be silent (north star #3)."""
+    with caplog.at_level(logging.WARNING, logger="plex_manager.web.deps"):
+        value, was_honored = resolve_share_revalidation_interval_hours(raw)
+    assert value == expected
+    assert was_honored is honored
+    if not honored:
+        assert "share_revalidation_interval_hours" in caplog.text
+
+
+async def test_put_round_trips_share_revalidation_interval(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    headers = {"X-Api-Key": _API_KEY}
+    put = await client.put(
+        "/api/v1/settings", json={"share_revalidation_interval_hours": 2.0}, headers=headers
+    )
+    assert put.status_code == 200
+    assert put.json()["share_revalidation_interval_hours"] == 2.0
+
+    got = (await client.get("/api/v1/settings", headers=headers)).json()
+    assert got == put.json()
+
+    # The getter the sweep actually reads must see the same value.
+    async with sessionmaker_() as session:
+        assert await get_share_revalidation_interval_hours(session) == 2.0
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        0,
+        -1,
+        SHARE_REVALIDATION_INTERVAL_HOURS_MIN - 0.5,
+        SHARE_REVALIDATION_INTERVAL_HOURS_MAX + 1,
+        float("inf"),
+    ],
+)
+async def test_put_rejects_out_of_range_share_revalidation_interval(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker, bad_value: float
+) -> None:
+    """The interval is a security exposure window: a value that would widen it
+    past the weekly ceiling (or hot-loop below the floor) is refused visibly,
+    never stored and silently ignored."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    # Hand-encoded (not ``json=``) so the non-finite case can be sent at all --
+    # ``json.dumps`` emits bare ``Infinity``, which the stdlib encoder refuses to
+    # produce through httpx's strict path.
+    put = await client.put(
+        "/api/v1/settings",
+        content=json.dumps({"share_revalidation_interval_hours": bad_value}).encode(),
+        headers={"X-Api-Key": _API_KEY, "Content-Type": "application/json"},
+    )
+    assert put.status_code == 422
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("share_revalidation_interval_hours") is None
+
+
+async def test_get_settings_defaults_share_revalidation_interval_when_unset(
+    client: httpx.AsyncClient, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    body = (await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})).json()
+    assert body["share_revalidation_interval_hours"] is None
+    async with sessionmaker_() as session:
+        assert (
+            await get_share_revalidation_interval_hours(session)
+            == SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT
+        )
+    assert SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT == 6.0
 
 
 @pytest.mark.parametrize(

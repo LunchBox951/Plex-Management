@@ -78,6 +78,7 @@ from plex_manager.services.health_service import (
     SubsystemHealth,
     TtlCache,
 )
+from plex_manager.services.plex_access_service import ShareSweepStatus
 from plex_manager.services.update_policy import (
     AUTOMATIC_UPDATE_IDLE_ONLY_DEFAULT,
     AUTOMATIC_UPDATE_TIMEZONE_DEFAULT,
@@ -99,6 +100,8 @@ from plex_manager.web.settings_bounds import (
     EVICTION_INTERVAL_MAX_MINUTES,
     LOG_MAX_ROWS_MAX,
     LOG_RETENTION_DAYS_MAX,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+    SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
 )
 
 __all__ = [
@@ -138,6 +141,7 @@ __all__ = [
     "SECRET_SETTING_KEYS",
     "SESSION_COOKIE_NAME",
     "SETUP_TOKEN_HEADER_NAME",
+    "SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT",
     "WATCHLIST_SYNC_ENABLED_DEFAULT",
     "WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT",
     "AuthContext",
@@ -184,6 +188,8 @@ __all__ = [
     "get_quality_profile",
     "get_reconcile_status",
     "get_session",
+    "get_share_revalidation_interval_hours",
+    "get_share_sweep_status",
     "get_tmdb",
     "get_tv_root",
     "get_tv_root_optional",
@@ -208,6 +214,7 @@ __all__ = [
     "resolve_log_retention_days",
     "resolve_prowlarr",
     "resolve_qbittorrent",
+    "resolve_share_revalidation_interval_hours",
     "resolve_tmdb",
     "resolve_watchlist_sync_interval_minutes",
 ]
@@ -451,6 +458,12 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     "auto_grab_max_searches_per_cycle",
     "watchlist_sync_enabled",
     "watchlist_sync_interval_minutes",
+    # Share revalidation (issue #391): how often the sweep re-derives each
+    # signed-in user's Plex-share verdict. Read fresh every tick (see
+    # get_share_revalidation_interval_hours and web/app.py's _share_sweep_loop),
+    # so a web edit narrows -- or widens -- the exposure window on the next
+    # 15-minute tick with no restart.
+    "share_revalidation_interval_hours",
     # Anime library routing (ADR-0015): two OPTIONAL roots, mirroring tv_root's
     # optional treatment exactly. Unset ⇒ anime imports fall back to
     # movies_root/tv_root, i.e. identical behavior to before this feature
@@ -913,6 +926,20 @@ def get_watchlist_status(request: Request) -> WatchlistWorkerStatus:
     if not isinstance(current, WatchlistWorkerStatus):
         current = WatchlistWorkerStatus()
         request.app.state.watchlist_status = current
+    return current
+
+
+def get_share_sweep_status(request: Request) -> ShareSweepStatus:
+    """The share-revalidation sweep's live status (issue #391).
+
+    Exact mirror of :func:`get_watchlist_status`, defensive for the same reason:
+    ``lifespan`` seeds this once, but ``/ops/health`` is also exercised against
+    apps built without it.
+    """
+    current = getattr(request.app.state, "share_sweep_status", None)
+    if not isinstance(current, ShareSweepStatus):
+        current = ShareSweepStatus()
+        request.app.state.share_sweep_status = current
     return current
 
 
@@ -1844,6 +1871,15 @@ AUTO_GRAB_INTERVAL_SECONDS_DEFAULT: float = 60.0
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_DEFAULT: int = AUTO_GRAB_MAX_SEARCHES_PER_CYCLE
 WATCHLIST_SYNC_ENABLED_DEFAULT: bool = True
 WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT: float = 15.0
+# How stale one user's Plex-share verdict may get before the revalidation sweep
+# re-derives it (issue #391). 6h is the ratified default: it drops the worst-case
+# "revoked upstream, still working here" window from the 7-30 day session
+# lifetime to ~6 hours, at a plex.tv cost an order of magnitude BELOW the
+# watchlist worker's existing per-15-minute probe of the same endpoint. There is
+# deliberately no enabled/disabled toggle beside it -- the ceiling in
+# ``settings_bounds`` is what bounds the exposure, and "off" is not an option a
+# security window gets to offer.
+SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT: float = 6.0
 
 # Upper bounds for the three settings above that feed directly into a sleep
 # duration or a timedelta cutoff (issue #92) live in ``web.settings_bounds``,
@@ -2071,6 +2107,50 @@ def resolve_watchlist_sync_interval_minutes(raw: str | None) -> tuple[float, boo
             EVICTION_INTERVAL_MAX_MINUTES,
         )
         return EVICTION_INTERVAL_MAX_MINUTES, False
+    return parsed, True
+
+
+def resolve_share_revalidation_interval_hours(raw: str | None) -> tuple[float, bool]:
+    """Resolve the share-revalidation interval to ``[
+    SHARE_REVALIDATION_INTERVAL_HOURS_MIN, SHARE_REVALIDATION_INTERVAL_HOURS_MAX]``
+    (issue #391).
+
+    Same directional policy as :func:`resolve_auto_grab_interval_seconds`: above
+    the MAX clamps to it, below the MIN (including zero/negative) falls back to
+    the DEFAULT, and unparsable/non-finite does too. The reason for CLAMPING at
+    the top rather than defaulting is specific to this knob being a security
+    window: a stored 10000 meant "check rarely", and clamping to the weekly
+    ceiling honors that intent as far as it is allowed to go, whereas snapping
+    silently back to 6h would hide the refusal. Every degradation is a WARNING
+    naming the key (north star #3: an ignored setting is never silent).
+    """
+    if raw is None:
+        return SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, True
+    parsed = _parse_finite_float(raw)
+    if parsed is None:
+        _logger.warning(
+            "setting 'share_revalidation_interval_hours' has an unparsable or non-finite "
+            "value %r; using default %s",
+            raw,
+            SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+        )
+        return SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False
+    if parsed > SHARE_REVALIDATION_INTERVAL_HOURS_MAX:
+        _logger.warning(
+            "setting 'share_revalidation_interval_hours' is %s, above %s; clamping to %s",
+            parsed,
+            SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+            SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+        )
+        return SHARE_REVALIDATION_INTERVAL_HOURS_MAX, False
+    if parsed < SHARE_REVALIDATION_INTERVAL_HOURS_MIN:
+        _logger.warning(
+            "setting 'share_revalidation_interval_hours' is %s, below %s; using default %s",
+            parsed,
+            SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
+            SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+        )
+        return SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT, False
     return parsed, True
 
 
@@ -2451,5 +2531,12 @@ async def get_watchlist_sync_enabled(session: AsyncSession) -> bool:
 async def get_watchlist_sync_interval_minutes(session: AsyncSession) -> float:
     value, _honored = resolve_watchlist_sync_interval_minutes(
         await SettingsStore(session).get("watchlist_sync_interval_minutes")
+    )
+    return value
+
+
+async def get_share_revalidation_interval_hours(session: AsyncSession) -> float:
+    value, _honored = resolve_share_revalidation_interval_hours(
+        await SettingsStore(session).get("share_revalidation_interval_hours")
     )
     return value
