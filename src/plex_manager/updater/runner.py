@@ -137,14 +137,16 @@ class UpdaterRunner:
                 # exception is CoordinatorClient._post's own non-2xx branch
                 # (issue #539, see CoordinatorClient._log_non_2xx) -- not here,
                 # and not the bearer token either way. Even there, arbitrary
-                # response TEXT is never echoed: body shape alone does not
-                # authenticate origin (round 4), so only a ``detail`` field
-                # that fullmatches the app's own tight machine-code charset
-                # (a string that structurally cannot carry a URL or CR/LF) is
-                # ever logged; free-text ``message`` is never read. Anything
-                # else logs status, a charset-validated media type, byte
-                # length, and an irreversible fingerprint instead -- never a
-                # byte of unvalidated body content.
+                # response TEXT is never echoed: neither body shape (round 3)
+                # nor a charset check on ``detail`` alone (round 4 -- a bare
+                # credential can happen to be lowercase hex) authenticates
+                # origin, so only a ``detail`` field EQUAL TO one of the
+                # finite, actually-possible codes these endpoints can send is
+                # ever logged (round 5's exact allowlist); free-text
+                # ``message`` is never read. Anything else logs status, an
+                # allowlisted media type, byte length, and an irreversible
+                # fingerprint instead -- never a byte of unvalidated body
+                # content.
                 _logger.warning("container updater iteration failed (%s)", exc.code)
             except Exception:
                 _logger.exception("container updater iteration failed unexpectedly")

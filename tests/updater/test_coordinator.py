@@ -177,22 +177,24 @@ async def test_non_2xx_app_error_envelope_logs_detail_code_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """issue #539: a non-2xx coordinator response whose body carries a
-    ``detail`` field matching the app's machine-code charset (``web/
-    errors.py``'s ``AppError`` envelope shape, e.g. the actual 2026-07-28
-    canary recurrence, which was app-origin JSON) must log that code --
-    while keeping the existing ``coordinator_unavailable`` classification.
+    ``detail`` field equal to one of the exact codes the coordinator's
+    internal endpoints can actually send (``updater_coordinator_unavailable``
+    -- ``web/updater_auth.py``/``web/routers/updates.py``'s ``_coordinator()``
+    helper, status 503, the same code family behind the real 2026-07-28
+    canary recurrence) must log that code -- while keeping the existing
+    ``coordinator_unavailable`` classification.
 
-    Review round 4: ``message`` is no longer read or logged at all (see
+    ``message`` is no longer read or logged at all (see
     ``test_non_2xx_look_alike_envelope_never_logs_message_secret`` below for
     why), so this only pins the ``detail``-only echo.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            500,
+            503,
             json={
-                "detail": "coordinator_lease_store_unreachable",
-                "message": "The lease store connection pool is exhausted.",
+                "detail": "updater_coordinator_unavailable",
+                "message": "The update coordinator is not available.",
             },
         )
 
@@ -210,8 +212,8 @@ async def test_non_2xx_app_error_envelope_logs_detail_code_only(
     messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert any(
         "(app envelope)" in message
-        and "status=500" in message
-        and "detail=coordinator_lease_store_unreachable" in message
+        and "status=503" in message
+        and "detail=updater_coordinator_unavailable" in message
         for message in messages
     )
     # message is never read, let alone logged -- not even redacted.
@@ -236,9 +238,9 @@ async def test_non_2xx_look_alike_envelope_never_logs_message_secret(
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            500,
+            503,
             json={
-                "detail": "coordinator_lease_store_unreachable",
+                "detail": "updater_coordinator_unavailable",
                 "message": f"See https://host/download/{secret_marker} for details",
             },
         )
@@ -256,7 +258,7 @@ async def test_non_2xx_look_alike_envelope_never_logs_message_secret(
     messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert len(messages) == 1
     message = messages[0]
-    assert "detail=coordinator_lease_store_unreachable" in message
+    assert "detail=updater_coordinator_unavailable" in message
     # The secret (and the whole message field) must be absent from EVERY
     # captured record, not just this one.
     assert all(secret_marker not in record.getMessage() for record in caplog.records)
@@ -266,11 +268,11 @@ async def test_non_2xx_look_alike_envelope_never_logs_message_secret(
 async def test_non_2xx_non_conforming_detail_is_treated_as_opaque(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A ``detail`` field that IS a string but does not fullmatch the app's
-    machine-code charset (here it embeds a secret-bearing URL itself) must
-    fall through to the opaque branch exactly like a missing/wrong-typed
-    ``detail`` -- the charset check is a strict allowlist, not a best-effort
-    filter (issue #539 review round 4)."""
+    """A ``detail`` field that IS a string but is not one of the exact known
+    codes (here it embeds a secret-bearing URL itself) must fall through to
+    the opaque branch exactly like a missing/wrong-typed ``detail`` -- the
+    allowlist is exact-match, not a best-effort filter (issue #539 review
+    round 5)."""
     secret_marker = "DETAILSECRET42"  # noqa: S105 - synthetic test marker, not a credential
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -299,13 +301,47 @@ async def test_non_2xx_non_conforming_detail_is_treated_as_opaque(
     assert "status=500" in messages[0]
 
 
+async def test_non_2xx_hex_credential_shaped_detail_is_treated_as_opaque(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #539 review round 5: a bare lowercase-hex credential
+    (``{"detail": "deadbeef..."}``) fullmatches round 4's
+    ``[a-z0-9_]{1,64}`` charset check just as well as a real machine code --
+    the charset check alone could not tell them apart. The round-5 EXACT
+    allowlist closes this: a hex-shaped string is not a MEMBER of
+    ``_KNOWN_COORDINATOR_DETAIL_CODES`` regardless of how code-like it
+    looks, so it falls to the opaque branch and never reaches the log by
+    name."""
+    hex_credential = "deadbeefcafe1234567890abcdef1234567890abcdef12"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": hex_credential, "message": "irrelevant"})
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError):
+            await client.eligibility()
+
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert all(hex_credential not in record.getMessage() for record in caplog.records)
+    assert "(opaque body)" in messages[0]
+    assert "detail=" not in messages[0]
+
+
 async def test_non_2xx_content_type_parameter_is_stripped_before_logging(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """issue #539 review round 4: a ``Content-Type`` parameter can smuggle a
     secret (``application/json; source="https://host/...secret..."``) past a
     naive whole-header log. Only the media type before the first ``;`` is
-    ever logged, and only when it fullmatches the RFC 6838 token charset."""
+    ever logged, and only when it is a MEMBER of the exact known-media-type
+    allowlist (round 5)."""
     secret_marker = "CTSECRET777"  # noqa: S105 - synthetic test marker, not a credential
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -336,17 +372,25 @@ async def test_non_2xx_content_type_parameter_is_stripped_before_logging(
     assert "source=" not in message
 
 
-async def test_non_2xx_invalid_content_type_logs_fixed_marker(
+async def test_non_2xx_credential_shaped_media_type_logs_other(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A ``Content-Type`` header that does not fullmatch the media-type
-    charset (missing/malformed, no ``type/subtype`` shape) logs the fixed
-    marker ``content_type=invalid`` rather than any part of the raw header
-    value (issue #539 review round 4)."""
+    """issue #539 review round 5: round 4's RFC 6838 token-charset check
+    still accepted a credential-shaped subtype
+    (``application/SECRETTOKEN9999`` is valid token syntax, so it fullmatched
+    the regex and would have been logged verbatim). The exact
+    ``_KNOWN_MEDIA_TYPES`` allowlist closes this: only literally
+    ``application/json``/``application/problem+json``/``text/plain``/
+    ``text/html`` are ever echoed; anything else -- including this
+    syntactically-valid-but-unknown subtype -- logs the fixed marker
+    ``content_type=other``."""
+    secret_marker = "SECRETTOKEN9999"  # noqa: S105 - synthetic test marker, not a credential
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            502, text="upstream proxy error", headers={"content-type": "not a media type"}
+            502,
+            text="upstream proxy error",
+            headers={"content-type": f"application/{secret_marker}"},
         )
 
     async with httpx.AsyncClient(
@@ -361,7 +405,37 @@ async def test_non_2xx_invalid_content_type_logs_fixed_marker(
 
     messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
     assert len(messages) == 1
-    assert "content_type=invalid" in messages[0]
+    assert all(secret_marker not in record.getMessage() for record in caplog.records)
+    assert "content_type=other" in messages[0]
+
+
+async def test_non_2xx_unknown_but_innocent_content_type_logs_other(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``Content-Type`` that is well-formed and entirely innocuous but
+    simply isn't in the exact known-media-type set (e.g. an XML error body
+    some proxies emit) still logs the fixed marker ``content_type=other`` --
+    the allowlist is exact-match, not a best-effort filter (issue #539
+    review round 5)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502, text="<error>bad gateway</error>", headers={"content-type": "application/xml"}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError):
+            await client.eligibility()
+
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "content_type=other" in messages[0]
 
 
 async def test_non_2xx_deeply_nested_json_body_still_classifies_and_logs(
