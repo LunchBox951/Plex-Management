@@ -443,7 +443,9 @@ class _PressureLeaseDefeated(Exception):
     primitive runs after the delete-worker permit is held and immediately before
     the destructive worker starts. The primitive propagates a hook failure
     unchanged and starts no delete, so the caller catching this has a hard
-    guarantee that nothing left disk and the claimed row can simply be restored.
+    guarantee that nothing left disk and the claimed row can simply be restored --
+    including from the hook's post-arm phase, where the restore also takes the
+    incomplete-delete marker back off (see the handler in :func:`_evict_one`).
 
     This is the BARRIER half of the lease. The sweep also consults the lease
     before drawing each victim, but that check has the same await-window hole
@@ -451,7 +453,10 @@ class _PressureLeaseDefeated(Exception):
     re-read, the purge primitive's own preflight probes and its unbounded wait
     for one of four delete permits all sit between it and the first unlinked
     byte). Re-reading the latch HERE is what makes "no eviction delete starts
-    after a correction claimed a path under this root" true rather than likely.
+    after a correction claimed a path under this root" true rather than likely --
+    and the hook reads it TWICE, once before arming the durable marker and once
+    after the arming commit, because those arming awaits are themselves a window a
+    correction can start inside (#570).
 
     ``reason`` is the STATIC literal the defeating verb supplied to
     :func:`~plex_manager.services.purge_service.revoke_pressure_exclusions` --
@@ -3004,21 +3009,43 @@ async def _evict_one(
 
     async def _mark_delete_started() -> None:
         nonlocal delete_marker_committed
-        # THE PRESSURE-EXCLUSION BARRIER (issue #526), read FIRST -- before the
-        # marker is armed, so a defeated lease leaves the row byte-for-byte as the
-        # claim left it and the restore below has nothing to compensate. Everything
-        # that authorized this delete (the root's free-space probe, candidate
-        # ranking, the claim CAS) predates the primitive's two preflight probes and
-        # its UNBOUNDED wait for one of four delete permits; a correction claiming a
-        # path under this root anywhere in that stretch invalidates the reading, and
-        # this latch is the last cancellable point at which the sweep can still act
-        # on that. After it returns, only a synchronous thread start separates this
-        # from the first unlinked byte.
+        # THE PRESSURE-EXCLUSION BARRIER (issues #526 / #570). This hook is the last
+        # place the sweep can still cancel: everything that authorized this delete
+        # (the root's free-space probe, candidate ranking, the claim CAS) predates
+        # the primitive's two preflight probes and its UNBOUNDED wait for one of four
+        # delete permits, and a correction claiming a path under this root anywhere
+        # in that stretch invalidates the reading. So the latch is read in TWO
+        # phases, around the arming awaits -- one read is not enough, because the
+        # arming itself suspends (#570).
+        #
+        # PHASE 1, before the marker is armed: the cheap defeat. Nothing durable has
+        # been written yet, so the row is left byte-for-byte as the claim left it.
         if pressure_lease is not None and pressure_lease.revoked_reason is not None:
             raise _PressureLeaseDefeated(pressure_lease.revoked_reason)
         await _arm_partial_delete(session, pending, library_path)
         await session.commit()
         delete_marker_committed = True
+        # PHASE 2, after the marker is DURABLY armed: the barrier proper. The two
+        # awaits just above are ordinary suspension points -- a correction's
+        # ``report_issue`` can run to completion inside either of them, revoking this
+        # lease -- and phase 1 alone would let the worker start anyway, against a
+        # pressure reading the correction had already invalidated (#570, the same
+        # race class as #526 one layer deeper). Re-read the latch here, as the LAST
+        # statement of the hook: the primitive performs no ``await`` between this
+        # returning and its synchronous ``Thread.start()``, so on this single event
+        # loop nothing can interleave between this read and the first unlinked byte.
+        # A defeat here costs one extra compensating commit rather than a delete: the
+        # armed marker is taken back off by the restore below, in the same
+        # transaction that returns the row to ``available``.
+        #
+        # THE RESIDUAL, stated: this read leaves no window of its own. What it cannot
+        # cover is a correction whose revocation lands AFTER it -- which, there being
+        # no suspension point left, means the delete worker is already running. That
+        # is exclusion 1 of ``_run_sweep``'s invariant (an irreducible
+        # physical-completion sliver over an independently eligible victim that is
+        # never the correction's own path), not a hole this hook could close.
+        if pressure_lease is not None and pressure_lease.revoked_reason is not None:
+            raise _PressureLeaseDefeated(pressure_lease.revoked_reason)
 
     # Hardlink-aware reclaimable-bytes measurement + the root-guarded delete are
     # both done by the shared ``purge_service.purge_library_path`` primitive
@@ -3037,18 +3064,28 @@ async def _evict_one(
         )
     except _PressureLeaseDefeated as defeated:
         # A correction claimed a path under this root while this eviction was in
-        # flight. The boundary hook raised BEFORE arming the marker and the primitive
-        # started no delete, so the tree is provably intact and nothing needs
-        # compensating -- release the claim the ordinary way a refused delete does,
-        # so the row is never stranded ``evicted`` over a live file, and let the next
-        # sweep re-decide it against the post-correction disk reading.
+        # flight. Whichever of the hook's two phases raised, the primitive started no
+        # delete, so the tree is provably intact -- release the claim the ordinary
+        # way a refused delete does, so the row is never stranded ``evicted`` over a
+        # live file, and let the next sweep re-decide it against the post-correction
+        # disk reading. That one restore covers BOTH phases without a second code
+        # path: :func:`_restore_after_failed_delete` disarms the incomplete-delete
+        # marker in the very transaction it restores in (its whole precondition is an
+        # intact tree), so a phase-2 defeat -- which armed and committed the marker a
+        # moment ago -- needs no separate :func:`_disarm_unstarted_delete` step, and
+        # the row ends up exactly where a pre-arm defeat leaves it. The log says
+        # which phase it was, because "a marker was armed and taken back off" is a
+        # real event a reader of the row's history would otherwise have to guess at.
         await _restore_after_failed_delete(session, pending)
         _logger.info(
-            "eviction of %r%s revoked at the delete boundary: %s; restored to "
+            "eviction of %r%s revoked at the delete boundary (%s): %s; restored to "
             "'available' (nothing deleted), and the next sweep re-reads pressure "
             "after the correction settles",
             safe_text(candidate.title),
             season_note,
+            "after the incomplete-delete marker was armed, now disarmed by the restore"
+            if delete_marker_committed
+            else "before the incomplete-delete marker was armed",
             defeated.reason,
             extra={
                 "request_id": safe_int(pending.media_request_id),
@@ -3800,8 +3837,10 @@ async def _run_sweep(
     #     ``run_eviction_sweep``, so even THIS sweep's first reading is covered)
     #     across candidate assembly, every claim, and every delete -- and re-read at
     #     the DELETE BOUNDARY itself, inside the purge primitive's ``before_delete``
-    #     hook under the held delete permit (see ``_evict_one``). That last read is
-    #     what makes the invariant true rather than likely.
+    #     hook under the held delete permit (see ``_evict_one``), on both sides of
+    #     the awaits that arm the durable marker (#570). That last read, with no
+    #     ``await`` left between it and the synchronous worker start, is what makes
+    #     the invariant true rather than likely.
     #
     # INVARIANT (the guarantee that replaces the old residual): once a correction has
     # claimed a path under this root, this sweep starts NO further RETENTION eviction
