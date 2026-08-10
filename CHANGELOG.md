@@ -7,6 +7,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Capture-only section entitlements (PR-3 of the auth-revalidation design):
+  the share sweep and a detached post-sign-in step now record each shared
+  user's Plex section entitlements (no enforcement yet — that is PR-5), with
+  capture counters, a `capture_unavailable` / `capture_anchor_blocked` signal
+  on `GET /api/v1/ops/health`, and a missing-anchor backfill when Plex
+  settings are re-saved. Ships two migrations
+  (`c8198009583d`, `c5cf0a125f5f`) (#484, #560).
+- Admin-readable "Automatic sign-outs" audit surface
+  (`GET /api/v1/auth/sign-outs` + a Settings section) answering "why was this
+  account signed out?" from the durable audit record, and honest SSE close
+  reasons: the realtime stream's final frame now names why it closed
+  (share revoked vs sign-in expired vs idle vs absolute expiry, and more),
+  with truthful sign-in-screen wording (#556, #567).
 - Entitlement/share-state schema and a `plex_access_service` module extracting
   the plex.tv share-verdict ladder (schema and ladder extraction only — no
   loop, no enforcement yet); PR-1 of the auth-revalidation design (#555).
@@ -37,6 +50,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#561).
 
 ### Fixed
+- Eviction: operator corrections and pressure sweeps are now serialized by a
+  per-root pressure-exclusion lease — a correction beginning inside a sweep's
+  await windows defeats the sweep (corrections never wait), enforced down to
+  the delete boundary before the durable marker arms; denied or defeated
+  manual sweeps are visible in `POST /ops/evict` and on the Status page
+  (#526, #568).
+- Updater: non-2xx coordinator responses now log the request path, status,
+  and either the exact app error code (allowlisted) or an opaque-body
+  summary (allowlisted media type, byte length, fingerprint) instead of a
+  bare `coordinator_unavailable` — the next #539 recurrence is attributable
+  from the sidecar log alone, and nothing arbitrary can reach the log (#566).
 - Eviction: walk-skipped candidates now carry an explicit `None` size
   sentinel instead of a fabricated `0.0`, and eviction/retention sweeps now
   log their duration on completion — including the common below-pressure
