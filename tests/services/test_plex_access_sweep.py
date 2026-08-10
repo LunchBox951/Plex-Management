@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.models import AuditLog, AuthSession, User
-from plex_manager.services import plex_access_service
+from plex_manager.services import plex_access_service, session_lifecycle
 from plex_manager.services.plex_access_service import (
     AnchorCheck,
     EntitlementSnapshot,
@@ -341,6 +341,57 @@ async def test_a_perpetually_failing_cohort_cannot_starve_the_rest_of_the_backlo
         assert user.share_check_failures > 0
 
 
+async def test_a_crashing_cohort_cannot_starve_the_backlog_either(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The same starvation reached through the DEFENSIVE branch: when
+    ``check_share`` raises something that is not a mapped ``PlexVerifyError``,
+    no verdict is produced at all. Recording only an in-memory ``last_error``
+    left ``share_check_failed_at`` untouched, so the crashing cohort stayed at
+    the head of the due queue and consumed every tick's budget forever (Codex
+    round 2 on PR #557). The failed ATTEMPT has to be persisted so they rotate.
+    """
+    now = datetime.now(UTC)
+    user_ids = [
+        await _add_user(
+            sessionmaker_,
+            username=f"viewer{index}",
+            token=f"token-{index}",
+            share_checked_at=now - timedelta(days=10 - index),
+        )
+        for index in range(5)
+    ]
+    crashing = {f"token-{index}" for index in range(2)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("X-Plex-Token", "") in crashing:
+            raise RuntimeError("client blew up in a way check_share does not map")
+        return httpx.Response(200, json=[_server_resource(_MACHINE_ID)])
+
+    for _ in range(3):  # ceil(5 / 2)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            plex_tv = PlexTvClient(client, client_identifier="pm-test")
+            await sweep_shares(
+                sessionmaker_,
+                plex_tv,
+                _MACHINE_ID,
+                revalidate_after=_INTERVAL,
+                limit=2,
+                confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
+            )
+
+    for user_id in user_ids[2:]:
+        user = await _load(sessionmaker_, user_id)
+        assert user.share_state == "authorized", f"user {user_id} was starved by the crash"
+    # The crash is recorded as an attempt, exactly as an UNKNOWN verdict is.
+    for user_id in user_ids[:2]:
+        user = await _load(sessionmaker_, user_id)
+        assert user.share_check_failures > 0
+        assert user.share_check_failed_at is not None
+        # ... but it is NOT a verdict: their last known state is untouched.
+        assert user.share_state is None
+
+
 async def test_budget_caps_the_tick_and_the_backlog_is_reported_not_dropped(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -601,6 +652,66 @@ async def test_a_sign_in_committed_after_check_share_is_not_revoked(
     assert await _audit_rows(sessionmaker_) == []
     user = await _load(sessionmaker_, user_id)
     assert user.share_state is None
+
+
+async def test_the_revocation_statement_itself_refuses_a_stale_token(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The guard at the STATEMENT level, not just as a Python pre-check: the
+    revocation UPDATE carries the token condition, so a sign-in that committed a
+    new token makes it match zero rows even when the UPDATE runs afterwards.
+
+    Fernet is non-deterministic, so the condition compares the stored CIPHERTEXT
+    byte-for-byte rather than binding a re-encrypted plaintext (which could never
+    match). This drives ``revoke_user_sessions`` directly so nothing but the
+    statement's own predicate can be responsible for the outcome.
+    """
+    user_id = await _add_user(sessionmaker_, token="old-token")  # noqa: S106
+
+    # The ciphertext as the sweep's guard would have captured it...
+    async with sessionmaker_() as session:
+        stale_ciphertext = (
+            await session.execute(
+                select(plex_access_service._stored_token_ciphertext()).where(User.id == user_id)  # pyright: ignore[reportPrivateUsage]
+            )
+        ).scalar_one()
+
+    # ... and then a sign-in commits a NEW token.
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.encrypted_plex_token = "brand-new-token"  # noqa: S105
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        revoked = await session_lifecycle.revoke_user_sessions(
+            session,
+            user_id,
+            only_if_user_matches=plex_access_service._stored_token_ciphertext()  # pyright: ignore[reportPrivateUsage]
+            == stale_ciphertext,
+        )
+        await session.commit()
+
+    assert revoked == 0
+    assert await _live_session_count(sessionmaker_, user_id) == 1
+
+    # Positive control: the SAME statement shape against the CURRENT ciphertext
+    # does revoke, so the zero above is the guard biting and not a broken query.
+    async with sessionmaker_() as session:
+        current_ciphertext = (
+            await session.execute(
+                select(plex_access_service._stored_token_ciphertext()).where(User.id == user_id)  # pyright: ignore[reportPrivateUsage]
+            )
+        ).scalar_one()
+        revoked_now = await session_lifecycle.revoke_user_sessions(
+            session,
+            user_id,
+            only_if_user_matches=plex_access_service._stored_token_ciphertext()  # pyright: ignore[reportPrivateUsage]
+            == current_ciphertext,
+        )
+        await session.commit()
+    assert revoked_now == 1
+    assert await _live_session_count(sessionmaker_, user_id) == 0
 
 
 async def test_a_session_created_after_the_guard_survives_a_genuine_revocation(
