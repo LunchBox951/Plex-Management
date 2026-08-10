@@ -15,9 +15,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   confirmed share loss now signs the user out and closes their realtime
   stream instead of waiting out session expiry (7-30 days). Owner/admin
   accounts are exempt from sweep-driven revocation, and the sweep withholds
-  every sign-out during a server-identity anchor mismatch. Status surfaces on
-  `GET /ops/health` and the Status page as `share_sweep` (#557, PR-2 of the
-  auth-revalidation design).
+  revoked-share sign-outs during a server-identity anchor mismatch
+  (stale-token verdicts still sign out — the credential is dead regardless
+  of which server is anchored). Status surfaces on `GET /api/v1/ops/health`
+  and the Status page as `share_sweep` (#557, PR-2 of the auth-revalidation
+  design).
 
 ### Changed
 - CI: parallelized the Python quality-gate test run, and eliminated pytest
