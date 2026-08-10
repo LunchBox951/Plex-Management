@@ -32,6 +32,7 @@ __all__ = [
     "EventHub",
     "EventSubscription",
     "RealtimeEvent",
+    "StreamClosed",
     "close_realtime_streams",
     "current_build_id",
     "detect_multiworker_signals",
@@ -47,11 +48,30 @@ _BUILD_ID_ENV = "PLEX_MANAGER_BUILD_ID"
 _GUNICORN_WORKERS_RE = re.compile(r"(?:^|\s)(?:--workers|-w)(?:=|\s+)(\d+)(?:\s|$)")
 
 
+@dataclass(frozen=True)
 class _StreamClosed:
-    """Sentinel delivered to subscribers when the server intentionally closes."""
+    """Sentinel delivered to subscribers when the server intentionally closes.
+
+    It carries the ``reason`` the closer named so the SSE endpoint can put an
+    honest final frame on the wire instead of an unexplained disconnect
+    (north star #3, issue #556). ``None`` is a close with nothing to say —
+    teardown of a stream whose own client already went away.
+    """
+
+    reason: str | None = None
 
 
-_STREAM_CLOSED = _StreamClosed()
+class StreamClosed(StopAsyncIteration):
+    """Raised by :meth:`EventSubscription.get` once the server closed the stream.
+
+    Deliberately a ``StopAsyncIteration`` subclass: every existing consumer
+    already treats that as "the stream ended", and only the callers that want to
+    TELL the client why need to know about the narrower type.
+    """
+
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -101,21 +121,21 @@ class EventSubscription:
         return self._closed
 
     async def get(self) -> RealtimeEvent:
-        """Return the next event, or raise ``StopAsyncIteration`` after close."""
+        """Return the next event, or raise :class:`StreamClosed` after close."""
         item = await self._queue.get()
         if isinstance(item, _StreamClosed):
             self.close()
-            raise StopAsyncIteration
+            raise StreamClosed(item.reason)
         return item
 
-    def close(self) -> None:
-        """Unsubscribe and wake any waiter with a close sentinel."""
+    def close(self, *, reason: str | None = None) -> None:
+        """Unsubscribe and wake any waiter with a (reason-carrying) sentinel."""
         if self._closed:
             return
         self._closed = True
         self._hub.unsubscribe(self)
         self._clear_queue()
-        self._queue.put_nowait(_STREAM_CLOSED)
+        self._queue.put_nowait(_StreamClosed(reason=reason))
 
     def _clear_queue(self) -> None:
         while True:
@@ -223,14 +243,20 @@ class EventHub:
         auth_method: str | None = None,
         user_id: int | None = None,
     ) -> None:
-        """Close subscriptions matching an optional credential/principal filter."""
-        _ = reason
+        """Close subscriptions matching an optional credential/principal filter.
+
+        ``reason`` rides the close sentinel all the way to the SSE endpoint,
+        which emits it as a final ``closed`` frame. A browser whose session was
+        cut by the share-revalidation sweep therefore learns *which* honest
+        message to show ("your Plex share was removed" vs "your Plex sign-in
+        expired") instead of seeing an unexplained disconnect (issue #556).
+        """
         for subscription in tuple(self._subscribers):
             if auth_method is not None and subscription.auth_method != auth_method:
                 continue
             if user_id is not None and subscription.user_id != user_id:
                 continue
-            subscription.close()
+            subscription.close(reason=reason)
 
     def unsubscribe(self, subscription: EventSubscription) -> None:
         self._subscribers.discard(subscription)

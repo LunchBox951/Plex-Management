@@ -12,6 +12,7 @@ import type {
   AppApiKeyResponse,
   AppApiKeyStatusResponse,
   AuthMeResponse,
+  AutomaticSignOutsResponse,
   BlocklistResponse,
   CompactStateResponse,
   CreateRequestBody,
@@ -396,6 +397,33 @@ export function useRevokeRecoverySessions() {
       void qc.invalidateQueries({ queryKey: queryKeys.activeSessions })
       void qc.invalidateQueries({ queryKey: queryKeys.authMe })
     },
+  })
+}
+
+/** How many automatic sign-outs the Settings panel asks for. */
+export const AUTOMATIC_SIGN_OUT_LIMIT = 25
+
+/**
+ * The sign-outs the app performed on its own, newest first (admin-only).
+ *
+ * The durable half of "why was I signed out?": the share-revalidation sweep can
+ * revoke sessions with nobody pressing a button, and the Logs-page line saying
+ * so is eventually trimmed by log retention. These rows come from the audit
+ * trail instead, so the answer survives (issue #556).
+ *
+ * Same polling posture as `useActiveSessions` and for the same reason — there
+ * is no realtime topic for the sweep, so the panel heals itself while mounted
+ * rather than needing a reload.
+ */
+export function useAutomaticSignOuts(enabled = true, limit = AUTOMATIC_SIGN_OUT_LIMIT) {
+  return useQuery({
+    queryKey: queryKeys.automaticSignOuts(limit),
+    enabled,
+    retry: false,
+    refetchInterval: enabled ? 60_000 : false,
+    refetchOnWindowFocus: true,
+    queryFn: async (): Promise<AutomaticSignOutsResponse> =>
+      unwrap(await client.GET('/api/v1/auth/sign-outs', { params: { query: { limit } } })),
   })
 }
 

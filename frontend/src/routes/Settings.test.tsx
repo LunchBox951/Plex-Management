@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ActiveSessionUser,
+  AutomaticSignOut,
   HealthResponse,
   PlexLibraryOption,
   RecoverySessionGroup,
@@ -41,6 +42,13 @@ const h = vi.hoisted(() => ({
   revokeSessionsPending: false,
   revokeRecoveryMutateAsync: vi.fn(),
   revokeRecoveryPending: false,
+  // Settings → Automatic sign-outs (issue #556). Empty by default: an install
+  // where the sweep has never signed anyone out is the ordinary case.
+  signOuts: [] as AutomaticSignOut[],
+  signOutsLoading: false,
+  signOutsIsError: false,
+  signOutsError: null as ApiError | null,
+  signOutsRefetch: vi.fn(),
   // Settings → Access recovery-key status ({ exists }). A mutable flag so a
   // generate/revoke mock can flip it; the ensuing re-render reflects the new
   // state (the status endpoint only ever reports existence, never the key).
@@ -106,6 +114,14 @@ vi.mock('../api/hooks', () => ({
     mutateAsync: h.revokeRecoveryMutateAsync,
     isPending: h.revokeRecoveryPending,
   }),
+  useAutomaticSignOuts: () => ({
+    data:
+      h.signOutsLoading || h.signOutsIsError ? undefined : { entries: h.signOuts, limit: 25 },
+    isLoading: h.signOutsLoading,
+    isError: h.signOutsIsError,
+    error: h.signOutsError,
+    refetch: h.signOutsRefetch,
+  }),
 }))
 
 vi.mock('../components/ui/toast', () => ({
@@ -133,6 +149,11 @@ beforeEach(() => {
   h.revokeSessionsPending = false
   h.revokeRecoveryMutateAsync.mockReset()
   h.revokeRecoveryPending = false
+  h.signOuts = []
+  h.signOutsLoading = false
+  h.signOutsIsError = false
+  h.signOutsError = null
+  h.signOutsRefetch.mockReset()
 })
 
 function lastBody(): SettingsUpdate {
@@ -1515,5 +1536,96 @@ describe('Settings — Signed-in sessions (issue #56)', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke sessions' }))
     await waitFor(() => expect(h.revokeRecoveryMutateAsync).toHaveBeenCalledTimes(1))
     expect(h.toast).toHaveBeenCalledWith(expect.objectContaining({ intent: 'success' }))
+  })
+})
+
+describe('Settings — Automatic sign-outs (issue #556)', () => {
+  beforeEach(() => {
+    h.settingsData = CONFIGURED_SERVICES
+  })
+
+  function signOutsSection() {
+    const section = screen.getByRole('heading', { name: 'Automatic sign-outs' }).closest('section')
+    if (section === null) throw new Error('automatic sign-outs section not found')
+    return within(section)
+  }
+
+  function signOut(overrides: Partial<AutomaticSignOut> = {}): AutomaticSignOut {
+    return {
+      id: 1,
+      occurred_at: '2026-08-09T10:00:00Z',
+      action_type: 'user.share_revoked',
+      user_id: 7,
+      username: 'guest',
+      previous_share_state: 'authorized',
+      share_state: 'share_revoked',
+      sessions_revoked: 2,
+      admin_exempt: false,
+      signed_out: true,
+      description: 'Automatic share revalidation: …',
+      ...overrides,
+    }
+  }
+
+  it('shows an honest empty state when the app has never signed anyone out', () => {
+    h.signOuts = []
+    render(<Settings />, { wrapper: Wrapper })
+    expect(signOutsSection().getByText(/Nobody has been signed out automatically/)).toBeInTheDocument()
+  })
+
+  it('names a revoked share and how many sessions it cut', () => {
+    h.signOuts = [signOut()]
+    render(<Settings />, { wrapper: Wrapper })
+    const section = signOutsSection()
+    expect(section.getByText('guest')).toBeInTheDocument()
+    expect(section.getByText('Plex share removed')).toBeInTheDocument()
+    expect(section.getByText(/2 sessions revoked/)).toBeInTheDocument()
+  })
+
+  it('does not describe a stale token as removed access', () => {
+    // The whole point of the two action types: a dead credential is not a
+    // revoked share, and telling the operator otherwise would be a lie.
+    h.signOuts = [
+      signOut({
+        id: 2,
+        action_type: 'user.plex_sign_in_expired',
+        share_state: 'token_stale',
+        sessions_revoked: 1,
+      }),
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    const section = signOutsSection()
+    expect(section.getByText('Plex sign-in expired')).toBeInTheDocument()
+    expect(section.queryByText('Plex share removed')).not.toBeInTheDocument()
+    expect(section.getByText(/1 session revoked/)).toBeInTheDocument()
+  })
+
+  it('reports an admin-exempt verdict as recorded but NOT signed out', () => {
+    h.signOuts = [
+      signOut({ id: 3, admin_exempt: true, signed_out: false, sessions_revoked: 0 }),
+    ]
+    render(<Settings />, { wrapper: Wrapper })
+    const section = signOutsSection()
+    expect(section.getByText('not signed out — admin')).toBeInTheDocument()
+    expect(section.getByText(/sessions left alone/)).toBeInTheDocument()
+    expect(section.queryByText(/0 sessions revoked/)).not.toBeInTheDocument()
+  })
+
+  it('still shows the record when the account it describes is gone', () => {
+    // The audit row deliberately outlives the user row, so a deleted account
+    // must not take the explanation of what happened with it.
+    h.signOuts = [signOut({ id: 4, username: null })]
+    render(<Settings />, { wrapper: Wrapper })
+    expect(signOutsSection().getByText('user #7')).toBeInTheDocument()
+  })
+
+  it('surfaces a failed fetch with a retry instead of an empty list', () => {
+    h.signOutsIsError = true
+    h.signOutsError = { message: 'nope', status: 500 } as ApiError
+    render(<Settings />, { wrapper: Wrapper })
+    const section = signOutsSection()
+    expect(section.queryByText(/Nobody has been signed out/)).not.toBeInTheDocument()
+    fireEvent.click(section.getByRole('button', { name: 'Retry' }))
+    expect(h.signOutsRefetch).toHaveBeenCalledTimes(1)
   })
 })

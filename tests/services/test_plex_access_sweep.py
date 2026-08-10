@@ -146,7 +146,7 @@ async def _sweep(
     *,
     limit: int = plex_access_service.SHARE_SWEEP_USER_BUDGET,
     anchor: AnchorCheck = AnchorCheck.CONFIRMED,
-    on_signed_out: Callable[[int], None] | None = None,
+    on_signed_out: Callable[[int, ShareVerdict], None] | None = None,
 ) -> plex_access_service.ShareSweepResult:
     """Sweep with the anchor CONFIRMED unless a test says otherwise.
 
@@ -479,6 +479,9 @@ async def test_share_revoked_signs_the_user_out_and_writes_an_audit_row(
         "share_state": "share_revoked",
         "sessions_revoked": 1,
         "admin_exempt": False,
+        # Stamped in, not left to a join: the audit row outlives the user row it
+        # describes, and the freed primary key can be reused (issue #556).
+        "username": "viewer",
     }
     assert rows[0].description is not None
     assert "no longer has access" in rows[0].description
@@ -851,6 +854,7 @@ async def test_admin_share_loss_is_recorded_but_never_signs_them_out(
         "share_state": "share_revoked",
         "sessions_revoked": 0,
         "admin_exempt": True,
+        "username": "owner",
     }
     assert rows[0].description is not None
     assert "did NOT sign it out" in rows[0].description
@@ -1088,7 +1092,7 @@ async def test_a_later_users_check_blowing_up_leaves_the_earlier_close_done(
             _MACHINE_ID,
             revalidate_after=_INTERVAL,
             confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
-            on_signed_out=closed.append,
+            on_signed_out=lambda user_id, _verdict: closed.append(user_id),
         )
 
     # A: revoked AND closed. B: never got a verdict, so untouched and still due.
@@ -1112,7 +1116,7 @@ async def test_each_revocation_closes_its_stream_before_the_next_user_is_touched
     closed: list[int] = []
     revoked_when_closed: list[int] = []
 
-    def on_signed_out(user_id: int) -> None:
+    def on_signed_out(user_id: int, _verdict: ShareVerdict) -> None:
         closed.append(user_id)
         if user_id == first_id:
             # Prove the close happens AFTER the commit, not optimistically
@@ -1128,6 +1132,31 @@ async def test_each_revocation_closes_its_stream_before_the_next_user_is_touched
     assert result.signed_out_user_ids == (first_id, second_id)
 
 
+async def test_the_sign_out_callback_is_told_which_verdict_signed_the_user_out(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The web layer turns this into the close reason the browser shows, and the
+    two causes need different words — so the verdict has to travel with the id
+    (issue #556)."""
+    revoked_id = await _add_user(sessionmaker_, username="revoked")
+    seen: list[tuple[int, ShareVerdict]] = []
+
+    await _sweep(
+        sessionmaker_,
+        [_server_resource("some-other-server")],
+        on_signed_out=lambda user_id, verdict: seen.append((user_id, verdict)),
+    )
+    assert seen == [(revoked_id, ShareVerdict.SHARE_REVOKED)]
+
+    stale_id = await _add_user(sessionmaker_, username="stale")
+    seen.clear()
+
+    await _sweep(
+        sessionmaker_, 401, on_signed_out=lambda user_id, verdict: seen.append((user_id, verdict))
+    )
+    assert seen == [(stale_id, ShareVerdict.TOKEN_STALE)]
+
+
 async def test_a_later_users_failure_cannot_strand_an_earlier_closed_revocation(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1135,7 +1164,7 @@ async def test_a_later_users_failure_cannot_strand_an_earlier_closed_revocation(
     await _add_user(sessionmaker_, username="beta")
     closed: list[int] = []
 
-    def on_signed_out(user_id: int) -> None:
+    def on_signed_out(user_id: int, _verdict: ShareVerdict) -> None:
         closed.append(user_id)
         if user_id != first_id:
             raise RuntimeError("stream close blew up for the second user")

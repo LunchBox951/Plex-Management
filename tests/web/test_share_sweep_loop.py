@@ -28,7 +28,7 @@ from plex_manager.models import AuditLog, AuthSession, User
 from plex_manager.services import plex_access_service
 from plex_manager.web import app as app_module
 from plex_manager.web.deps import PLEX_MACHINE_ID_SETTING, AuthMethod, SettingsStore
-from plex_manager.web.events import get_event_hub
+from plex_manager.web.events import EventSubscription, StreamClosed, get_event_hub
 
 SeedFn = Callable[..., Awaitable[None]]
 
@@ -159,6 +159,39 @@ async def test_confirmed_revoke_closes_the_users_open_realtime_stream(
     assert bystander_stream.closed is True
     # The break-glass recovery stream has no Plex identity and is never collateral.
     assert recovery_stream.closed is False
+
+
+async def _close_reason(subscription: EventSubscription) -> str | None:
+    """Drain a closed subscription and return the reason it was closed with."""
+    with pytest.raises(StreamClosed) as closed:
+        while True:
+            await subscription.get()
+    return closed.value.reason
+
+
+async def test_a_revoked_share_and_a_stale_token_close_streams_with_different_reasons(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """Issue #556: the close frame carries WHY, and the two sign-out causes are
+    not the same fact. Telling someone their access was removed when plex.tv
+    merely rejected their (password-changed) token would be a lie."""
+    await seed(initialized=True)
+    await _configure_server(app)
+    revoked_id = await _signed_in_user(app, username="revoked")
+    hub = get_event_hub(app)
+    revoked_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=revoked_id)
+
+    await _use_transport(app, _plex_tv_transport([_server_resource("some-other-server")]))
+    assert await _tick(app) == 1
+    assert await _close_reason(revoked_stream) == "share_revalidation_share_revoked"
+
+    stale_id = await _signed_in_user(app, username="stale")
+    stale_stream = hub.subscribe(auth_method=AuthMethod.plex_session.value, user_id=stale_id)
+
+    # plex.tv rejects the credential outright: TOKEN_STALE, not a share verdict.
+    await _use_transport(app, _plex_tv_transport(401))
+    assert await _tick(app) == 1
+    assert await _close_reason(stale_stream) == "share_revalidation_token_stale"
 
 
 async def test_transient_failure_never_closes_a_stream_or_revokes(

@@ -2,6 +2,11 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { toApiError } from '../lib/errors'
 import { PlexPinError } from '../lib/plexOAuth'
+import {
+  clearSessionCloseNotice,
+  getSessionCloseNotice,
+  noteSessionClose,
+} from '../lib/sessionClose'
 import { PlexLogin } from './PlexLogin'
 
 const h = vi.hoisted(() => ({
@@ -32,6 +37,7 @@ describe('PlexLogin', () => {
     h.openPlexPopup.mockReturnValue(POPUP)
     h.runPlexPinFlow.mockResolvedValue('plex-token-xyz')
     h.signIn.mockResolvedValue({ authenticated: true, auth_method: 'plex_session', user: null })
+    clearSessionCloseNotice()
   })
 
   it('opens the popup, runs the PIN flow, verifies the token, and fires onSignedIn', async () => {
@@ -116,5 +122,35 @@ describe('PlexLogin', () => {
     h.runPlexPinFlow.mockResolvedValue('plex-token-xyz')
     fireEvent.click(button)
     await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1))
+  })
+
+  describe('sign-out explanation (issue #556)', () => {
+    it('says nothing when the session simply was never established', () => {
+      render(<PlexLogin onSignedIn={vi.fn()} />)
+
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    })
+
+    it('explains a sweep sign-out with the reason the server named', () => {
+      noteSessionClose('share_revalidation_token_stale')
+      render(<PlexLogin onSignedIn={vi.fn()} />)
+
+      const notice = screen.getByRole('status')
+      expect(notice).toHaveTextContent('Your Plex sign-in expired')
+      // Not "your access was removed" — a dead token proves nothing about the share.
+      expect(notice).toHaveTextContent(/was NOT removed/)
+    })
+
+    it('drops the explanation once a new session is signed in', async () => {
+      noteSessionClose('share_revalidation_share_revoked')
+      const onSignedIn = vi.fn()
+      render(<PlexLogin onSignedIn={onSignedIn} />)
+      expect(screen.getByRole('status')).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: /sign in with plex/i }))
+
+      await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1))
+      expect(getSessionCloseNotice()).toBeNull()
+    })
   })
 })

@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from plex_manager.web.deps import AuthContext, require_admin_short_session
-from plex_manager.web.events import RealtimeEvent, get_event_hub
+from plex_manager.web.events import RealtimeEvent, StreamClosed, get_event_hub
 
 __all__ = ["router"]
 
@@ -22,6 +22,17 @@ router = APIRouter(
 )
 
 _HEARTBEAT_SECONDS = 15.0
+
+#: SSE event name of the final frame naming why the server ended the stream.
+CLOSE_EVENT = "closed"
+
+#: The close reason for a stream the server retired because the session behind
+#: it reached its own idle/absolute deadline. Every other reason is supplied by
+#: whoever called ``close_realtime_streams`` (``session_logged_out``,
+#: ``sessions_revoked``, ``permission_downgraded``, ``app_key_rotated``,
+#: ``app_key_revoked``, ``plex_server_repointed``, and the share-sweep pair
+#: ``share_revalidation_share_revoked`` / ``share_revalidation_token_stale``).
+SESSION_EXPIRED_REASON = "session_expired"
 
 
 def _monotonic() -> float:
@@ -45,6 +56,11 @@ async def events_endpoint(
     Shared Plex users retain the normal polling path instead: global queue,
     blocklist, and request-activity signals would otherwise reveal admin-only or
     other-user activity even when the REST resources themselves stay filtered.
+
+    When the SERVER ends the stream it sends one final ``closed`` frame naming
+    the reason (``{"reason": "..."}``) before the body terminates, so the browser
+    can show the honest message for that cause instead of treating every close as
+    an anonymous network blip. A client-initiated disconnect gets no such frame.
     """
     # The pending ``subscription.get()`` is held as a *persistent* task and raced
     # against the heartbeat with ``asyncio.wait``, which leaves the loser pending
@@ -78,6 +94,10 @@ async def events_endpoint(
         remaining = (min(session_deadlines) - now).total_seconds()
         lease_deadline = _monotonic() + max(0.0, remaining)
     getter: asyncio.Task[RealtimeEvent] | None = None
+    # Why this stream ended, when the server is the one that ended it and has
+    # something honest to say. Stays ``None`` for a client-side disconnect —
+    # there is nobody left to tell, so no final frame is emitted.
+    close_reason: str | None = None
     try:
         while True:
             if await request.is_disconnected():
@@ -86,12 +106,14 @@ async def events_endpoint(
             if lease_deadline is not None:
                 lease_remaining = lease_deadline - _monotonic()
                 if lease_remaining <= 0:
+                    close_reason = SESSION_EXPIRED_REASON
                     break
                 timeout = min(timeout, lease_remaining)
             if getter is None:
                 getter = asyncio.ensure_future(subscription.get())
             if not await _wait_for_getter(getter, timeout=timeout):
                 if lease_deadline is not None and _monotonic() >= lease_deadline:
+                    close_reason = SESSION_EXPIRED_REASON
                     break
                 # Heartbeat: the getter stays pending for the next iteration, so
                 # no enqueued event is ever discarded by a timeout cancellation.
@@ -99,11 +121,20 @@ async def events_endpoint(
                 continue
             try:
                 event = getter.result()
+            except StreamClosed as closed:
+                # The hub cut this stream (logout, revoke, key rotation, the
+                # share-revalidation sweep, …). It named a reason; put it on the
+                # wire as the last frame so the browser can say WHY rather than
+                # showing a bare reconnect (issue #556).
+                close_reason = closed.reason
+                break
             except StopAsyncIteration:
                 break
             finally:
                 getter = None
             yield ServerSentEvent(data=event.payload(), event="realtime", id=str(event.seq))
+        if close_reason is not None:
+            yield ServerSentEvent(data={"reason": close_reason}, event=CLOSE_EVENT)
     finally:
         if getter is not None and not getter.done():
             getter.cancel()

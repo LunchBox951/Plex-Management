@@ -2,6 +2,7 @@ import { type ReactNode, useState } from 'react'
 import {
   useActiveSessions,
   useAppKeyStatus,
+  useAutomaticSignOuts,
   useOpsHealth,
   useRevokeAppKey,
   useRevokeRecoverySessions,
@@ -13,6 +14,7 @@ import {
 } from '../api/hooks'
 import type {
   ActiveSessionUser,
+  AutomaticSignOut,
   AutomaticUpdateWeekday,
   SettingsResponse,
   SettingsUpdate,
@@ -771,6 +773,106 @@ function SessionsSection() {
           </Button>
         </div>
       </Dialog>
+    </section>
+  )
+}
+
+/** How the two automatic sign-out causes read to an operator. */
+function signOutCause(entry: AutomaticSignOut): { label: string; detail: string } {
+  if (entry.action_type.startsWith('user.plex_sign_in_expired')) {
+    return {
+      label: 'Plex sign-in expired',
+      // Deliberately NOT "access removed": plex.tv rejected the credential
+      // before it could say anything about the share.
+      detail: 'Plex rejected the saved sign-in, so access could not be re-checked.',
+    }
+  }
+  if (entry.action_type.startsWith('user.share_revoked')) {
+    return {
+      label: 'Plex share removed',
+      detail: 'Plex confirmed this account no longer has access to the server.',
+    }
+  }
+  // Unreachable while the backend only writes the two families above, but a new
+  // one must show up honestly rather than being silently mislabeled as a share
+  // removal.
+  return { label: entry.action_type, detail: '' }
+}
+
+/**
+ * Settings → Automatic sign-outs (issue #556). The share-revalidation sweep
+ * (#391) can end someone's sessions with nobody pressing a button, and until now
+ * the only web-visible trace was a Logs-page line that log retention eventually
+ * trims. These rows come from the durable audit trail, so "why was I signed
+ * out?" has an answer that does not require a terminal (north star #2).
+ *
+ * Read-only by design: the audit trail is immutable, and the correction levers
+ * for what it reports (revoke by hand, re-share in Plex, sign in again) already
+ * exist above and in Plex itself.
+ */
+function AutomaticSignOutsSection() {
+  const signOuts = useAutomaticSignOuts()
+  const entries = signOuts.data?.entries ?? []
+
+  return (
+    <section className="rounded-xl border border-hairline bg-surface p-5">
+      <h2 className="font-display text-sm font-semibold text-ink">Automatic sign-outs</h2>
+      <p className="mt-1 text-xs text-faint">
+        Sign-outs the app performed by itself, from the periodic Plex share re-check. This is the
+        durable record — unlike the Logs page, it is not trimmed by log retention.
+      </p>
+
+      <div className="mt-4">
+        {signOuts.isLoading ? (
+          <p className="text-xs text-faint">Loading sign-outs…</p>
+        ) : signOuts.isError ? (
+          <div className="flex flex-col gap-3">
+            <AuthErrorCard error={signOuts.error} />
+            <div>
+              <Button variant="secondary" onClick={() => void signOuts.refetch()}>
+                Retry
+              </Button>
+            </div>
+          </div>
+        ) : entries.length === 0 ? (
+          <p className="text-xs text-faint">
+            Nobody has been signed out automatically. Every sign-out so far was a person pressing a
+            button.
+          </p>
+        ) : (
+          <ul className="flex flex-col divide-y divide-hairline">
+            {entries.map((entry) => {
+              const cause = signOutCause(entry)
+              return (
+                <li key={entry.id} className="flex flex-col gap-1 py-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-medium text-ink">
+                      {entry.username ?? `user #${entry.user_id ?? 'unknown'}`}
+                    </span>
+                    <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+                      {cause.label}
+                    </span>
+                    {entry.admin_exempt ? (
+                      <span className="rounded bg-gold/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gold">
+                        not signed out — admin
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="text-xs text-faint">
+                    {formatLastSeen(entry.occurred_at)} ·{' '}
+                    {entry.admin_exempt
+                      ? 'sessions left alone so an administrator can never be locked out — revoke by hand above if the removal is genuine'
+                      : `${entry.sessions_revoked} ${
+                          entry.sessions_revoked === 1 ? 'session' : 'sessions'
+                        } revoked`}
+                  </div>
+                  {cause.detail ? <p className="text-xs text-muted">{cause.detail}</p> : null}
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
     </section>
   )
 }
@@ -1706,6 +1808,8 @@ export function Settings() {
       <AccessSection />
 
       <SessionsSection />
+
+      <AutomaticSignOutsSection />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <section className="rounded-[10px] border border-hairline bg-surface p-4">

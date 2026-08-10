@@ -202,6 +202,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/sign-outs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Automatic Sign Outs Endpoint
+         * @description The sign-outs the app performed on its own, newest first (admin-only).
+         *
+         *     The companion to :func:`list_active_sessions_endpoint`: that one answers "who
+         *     is signed in", this one answers "who did the app sign OUT, and why". The
+         *     share-revalidation sweep (issue #391) revokes sessions without an operator
+         *     action, and its only web-visible trace was a Logs-page line that
+         *     ``log_retention_days``/``log_max_rows`` eventually trims. The ``AuditLog``
+         *     row is the durable record; this endpoint is how it reaches the browser, so
+         *     the answer never requires a terminal (north star #2, issue #556).
+         *
+         *     Deliberately narrow — NOT a generic audit-log browser. Only the
+         *     automatic-sign-out action family
+         *     (:data:`~plex_manager.services.audit_service.AUTOMATIC_SIGN_OUT_ACTION_TYPES`)
+         *     is selected, so other audit rows (request handoffs, coordinator resets, and
+         *     anything added later) do not become a web resource nobody reviewed.
+         *
+         *     Admin-only for the same reason the sessions list is: the rows name other
+         *     people's accounts and their access state. Nothing secret-bearing is
+         *     returned — the sweep's rows carry share states and counts, never a token,
+         *     session id, or IP.
+         */
+        get: operations["list_automatic_sign_outs_endpoint_api_v1_auth_sign_outs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/blocklist": {
         parameters: {
             query?: never;
@@ -318,6 +357,11 @@ export interface paths {
          *     Shared Plex users retain the normal polling path instead: global queue,
          *     blocklist, and request-activity signals would otherwise reveal admin-only or
          *     other-user activity even when the REST resources themselves stay filtered.
+         *
+         *     When the SERVER ends the stream it sends one final ``closed`` frame naming
+         *     the reason (``{"reason": "..."}``) before the body terminates, so the browser
+         *     can show the honest message for that cause instead of treating every close as
+         *     an anonymous network blip. A client-initiated disconnect gets no such frame.
          */
         get: operations["events_endpoint_api_v1_events_get"];
         put?: never;
@@ -1900,6 +1944,71 @@ export interface components {
             last_ok_at?: string | null;
             /** Last Run At */
             last_run_at?: string | null;
+        };
+        /**
+         * AutomaticSignOut
+         * @description One sign-out the app performed on its own, read from the audit trail.
+         *
+         *     The share-revalidation sweep (issue #391) can cut a user's sessions without
+         *     anyone pressing a button, so "why was I signed out?" needs a durable,
+         *     web-readable answer — not a log line that log retention will eventually trim
+         *     (issue #556). Every field here comes from the ``AuditLog`` row the sweep
+         *     wrote in the same transaction as the revocation.
+         *
+         *     ``action_type`` keeps the two causes apart, because they mean different
+         *     things to the person affected:
+         *
+         *     * ``user.share_revoked`` — plex.tv confirmed the account no longer reaches
+         *       this server. Access really is gone.
+         *     * ``user.plex_sign_in_expired`` — plex.tv rejected the stored credential, so
+         *       the share could not be checked at all. Access was NOT removed; signing in
+         *       with Plex again restores it.
+         *
+         *     Either action type may carry the ``_admin_exempt`` suffix, which records a
+         *     verdict deliberately NOT acted on for an owner/admin (ADR-0005's
+         *     never-locked-out rule). Those rows report ``signed_out: false`` — they are
+         *     the operator's cue to revoke by hand if the removal is genuine.
+         */
+        AutomaticSignOut: {
+            /** Action Type */
+            action_type: string;
+            /** Admin Exempt */
+            admin_exempt: boolean;
+            /** Description */
+            description: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /** Previous Share State */
+            previous_share_state: string | null;
+            /** Sessions Revoked */
+            sessions_revoked: number;
+            /** Share State */
+            share_state: string | null;
+            /** Signed Out */
+            signed_out: boolean;
+            /** User Id */
+            user_id: number | null;
+            /** Username */
+            username: string | null;
+        };
+        /**
+         * AutomaticSignOutsResponse
+         * @description The most recent automatic sign-outs, newest first (admin view).
+         *
+         *     Deliberately not a general audit browser: only the automatic-sign-out action
+         *     family is exposed, so the audit table's other rows never become an
+         *     unreviewed web resource. ``limit`` echoes the bound actually applied.
+         */
+        AutomaticSignOutsResponse: {
+            /** Entries */
+            entries: components["schemas"]["AutomaticSignOut"][];
+            /** Limit */
+            limit: number;
         };
         /**
          * BlocklistEntry
@@ -3833,6 +3942,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RevokeSessionsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_automatic_sign_outs_endpoint_api_v1_auth_sign_outs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomaticSignOutsResponse"];
                 };
             };
             /** @description Validation Error */

@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Final, NamedTuple, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ from plex_manager.adapters.plex.oauth import (
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
 from plex_manager.models import AuthSession, SystemSettings, User
-from plex_manager.services import session_lifecycle
+from plex_manager.services import audit_service, session_lifecycle
 
 # The deps MODULE itself is imported (not just names from it) so the shared
 # process-local ``plex_identity_generation`` counter is read/re-checked as
@@ -78,6 +78,8 @@ from plex_manager.web.schemas import (
     ActiveSessionUser,
     AuthMeResponse,
     AuthUser,
+    AutomaticSignOut,
+    AutomaticSignOutsResponse,
     PlexSignInRequest,
     RecoverySessionGroup,
     RevokeSessionsRequest,
@@ -742,6 +744,63 @@ async def revoke_user_sessions_endpoint(
             user_id=body.user_id,
         )
     return RevokeSessionsResponse(revoked=revoked)
+
+
+#: Bounds on ``GET /auth/sign-outs``. The panel shows a recent-history list, not
+#: a paginated archive, so the ceiling is small and the whole answer is one page.
+SIGN_OUT_HISTORY_DEFAULT_LIMIT: Final = 25
+SIGN_OUT_HISTORY_MAX_LIMIT: Final = 200
+
+
+@router.get("/sign-outs")
+async def list_automatic_sign_outs_endpoint(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(require_admin)],
+    limit: Annotated[
+        int, Query(ge=1, le=SIGN_OUT_HISTORY_MAX_LIMIT)
+    ] = SIGN_OUT_HISTORY_DEFAULT_LIMIT,
+) -> AutomaticSignOutsResponse:
+    """The sign-outs the app performed on its own, newest first (admin-only).
+
+    The companion to :func:`list_active_sessions_endpoint`: that one answers "who
+    is signed in", this one answers "who did the app sign OUT, and why". The
+    share-revalidation sweep (issue #391) revokes sessions without an operator
+    action, and its only web-visible trace was a Logs-page line that
+    ``log_retention_days``/``log_max_rows`` eventually trims. The ``AuditLog``
+    row is the durable record; this endpoint is how it reaches the browser, so
+    the answer never requires a terminal (north star #2, issue #556).
+
+    Deliberately narrow — NOT a generic audit-log browser. Only the
+    automatic-sign-out action family
+    (:data:`~plex_manager.services.audit_service.AUTOMATIC_SIGN_OUT_ACTION_TYPES`)
+    is selected, so other audit rows (request handoffs, coordinator resets, and
+    anything added later) do not become a web resource nobody reviewed.
+
+    Admin-only for the same reason the sessions list is: the rows name other
+    people's accounts and their access state. Nothing secret-bearing is
+    returned — the sweep's rows carry share states and counts, never a token,
+    session id, or IP.
+    """
+    records = await audit_service.list_automatic_sign_outs(session, limit=limit)
+    return AutomaticSignOutsResponse(
+        entries=[
+            AutomaticSignOut(
+                id=record.id,
+                occurred_at=record.occurred_at,
+                action_type=record.action_type,
+                user_id=record.user_id,
+                username=record.username,
+                previous_share_state=record.previous_share_state,
+                share_state=record.share_state,
+                sessions_revoked=record.sessions_revoked,
+                admin_exempt=record.admin_exempt,
+                signed_out=record.signed_out,
+                description=record.description,
+            )
+            for record in records
+        ],
+        limit=limit,
+    )
 
 
 # --------------------------------------------------------------------------- #

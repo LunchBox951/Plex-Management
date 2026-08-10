@@ -629,11 +629,12 @@ async def apply_share_verdict(
     made it fire. A genuinely removed admin is still revocable by hand from the
     sessions page; this only refuses to do it AUTOMATICALLY.
 
-    "Why was I signed out?" is answerable today from the Logs page -- each
-    sign-out emits a pinned, user-id-tagged log line naming the verdict. The
-    ``AuditLog`` row is the durable, queryable record of the same event; a read
-    surface for it is follow-up work, so the log line (not the audit table) is
-    the current operator answer path.
+    "Why was I signed out?" is answered from the ``AuditLog`` row written here:
+    ``audit_service.list_automatic_sign_outs`` reads it back and Settings ->
+    "Automatic sign-outs" renders it (issue #556). That row is the DURABLE
+    record; the pinned, user-id-tagged log line each sign-out also emits is the
+    same fact in the log stream, but it is subject to log retention trimming, so
+    the audit surface -- not the Logs page -- is the answer path.
 
     ``expected_token`` closes the mid-sweep re-sign-in race: the verdict was
     computed against the token read during due-selection, and a user who signed
@@ -738,7 +739,7 @@ async def apply_share_verdict(
 
     if verdict is ShareVerdict.SHARE_REVOKED:
         _clear_entitlements(user)
-        action_type = "user.share_revoked"
+        action_type = audit_service.SHARE_REVOKED_ACTION
         description = (
             "Automatic share revalidation: this Plex account no longer has access to the "
             "configured server, so every browser session was signed out."
@@ -748,7 +749,7 @@ async def apply_share_verdict(
         # before it could say anything about the share. Same machinery, honest
         # (and different) words -- the operator-facing distinction the design
         # ratified.
-        action_type = "user.plex_sign_in_expired"
+        action_type = audit_service.PLEX_SIGN_IN_EXPIRED_ACTION
         description = (
             "Automatic share revalidation: token stale -- this account's Plex sign-in expired, "
             "so its access could no longer be verified and every browser session was signed "
@@ -756,7 +757,7 @@ async def apply_share_verdict(
         )
 
     if admin_exempt:
-        action_type = f"{action_type}_admin_exempt"
+        action_type = audit_service.admin_exempt_action(action_type)
         description = (
             "Automatic share revalidation recorded "
             f"'{verdict.value}' for this ADMIN account, but did NOT sign it out: an "
@@ -781,13 +782,19 @@ async def apply_share_verdict(
         session,
         actor_user_id=None,
         action_type=action_type,
-        entity_type="user",
+        entity_type=audit_service.USER_ENTITY_TYPE,
         entity_id=user.id,
         old_value={"share_state": previous_state},
         new_value={
             "share_state": verdict.value,
             "sessions_revoked": revoked,
             "admin_exempt": admin_exempt,
+            # Stamped INTO the row, not left to a later join on ``entity_id``:
+            # the audit trail outlives the ``users`` row it describes, and
+            # ``entity_id`` carries no FK, so a join is the wrong authority for
+            # "who was this". A username is not a secret -- the admin sessions
+            # list shows the same names.
+            "username": user.username,
         },
         description=description,
     )
@@ -822,7 +829,7 @@ async def sweep_shares(
     limit: int = SHARE_SWEEP_USER_BUDGET,
     now: datetime | None = None,
     confirm_anchor: Callable[[], Awaitable[AnchorCheck]] | None = None,
-    on_signed_out: Callable[[int], None] | None = None,
+    on_signed_out: Callable[[int, ShareVerdict], None] | None = None,
 ) -> ShareSweepResult:
     """Revalidate up to ``limit`` due users, strictly sequentially.
 
@@ -851,8 +858,12 @@ async def sweep_shares(
     fail-safe, never fail-open, because the failure mode being guarded is a total
     sign-out.
 
-    ``on_signed_out`` is invoked with a user id IMMEDIATELY after the transaction
-    that revoked their sessions commits -- never batched to the end. Closing the
+    ``on_signed_out`` is invoked with the user id AND the verdict that signed them
+    out, IMMEDIATELY after the transaction that revoked their sessions commits --
+    never batched to the end. The verdict travels with the id because the two
+    sign-out causes need DIFFERENT words at the browser ("your share was removed"
+    vs "your Plex sign-in expired", issue #556); collapsing them into one close
+    reason would hand the user a message that is wrong half the time. Closing the
     realtime stream needs the FastAPI app (``web.events.close_realtime_streams``)
     which this module must not import, but deferring the whole batch would mean a
     later user's exception strands an already-committed revocation with a live
@@ -975,7 +986,7 @@ async def sweep_shares(
             # Immediately, on the committed side of the revocation (issue #183).
             if on_signed_out is not None:
                 try:
-                    on_signed_out(user_id)
+                    on_signed_out(user_id, snapshot.verdict)
                 except Exception as exc:
                     last_error = type(exc).__name__
                     _logger.exception(

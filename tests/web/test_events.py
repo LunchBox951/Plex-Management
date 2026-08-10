@@ -31,6 +31,7 @@ from plex_manager.web.deps import (
 from plex_manager.web.events import (
     EventHub,
     RealtimeEvent,
+    StreamClosed,
     close_realtime_streams,
     current_build_id,
     get_event_hub,
@@ -54,6 +55,16 @@ def _data_json(frame: str) -> dict[str, Any]:
             parsed: dict[str, Any] = json.loads(line[len("data:") :].strip())
             return parsed
     raise AssertionError(f"no data field in frame: {frame!r}")
+
+
+def _close_reason(frames: list[str]) -> str | None:
+    """Return the reason from the stream's final ``closed`` frame, if it sent one."""
+    for frame in frames:
+        if any(line.strip() == "event: closed" for line in frame.splitlines()):
+            reason = _data_json(frame)["reason"]
+            assert isinstance(reason, str)
+            return reason
+    return None
 
 
 async def _wait_subscribers_zero(app: FastAPI, timeout: float = 2.0) -> None:
@@ -174,14 +185,19 @@ class _AsgiStream:
         frame, self._buf = self._buf.split("\n\n", 1)
         return frame
 
-    async def expect_body_end(self, timeout: float = 3.0) -> None:
-        """Assert the response body terminates (server closed the stream)."""
+    async def drain_to_end(self, timeout: float = 3.0) -> list[str]:
+        """Return every remaining frame, asserting the body terminates."""
+        frames: list[str] = []
         try:
             for _ in range(200):
-                await self.next_frame(timeout=timeout)
+                frames.append(await self.next_frame(timeout=timeout))
         except StopAsyncIteration:
-            return
+            return frames
         raise AssertionError("stream did not close")
+
+    async def expect_body_end(self, timeout: float = 3.0) -> None:
+        """Assert the response body terminates (server closed the stream)."""
+        _ = await self.drain_to_end(timeout=timeout)
 
     async def __aexit__(self, *_exc: object) -> None:
         self._disconnect.set()
@@ -241,9 +257,28 @@ async def test_event_hub_close_all_wakes_and_closes_subscribers() -> None:
 
     hub.close_all(reason="app_key_rotated")
 
-    with pytest.raises(StopAsyncIteration):
+    # StreamClosed IS a StopAsyncIteration, so every pre-existing consumer that
+    # only knows the base type keeps working — and it carries the reason for the
+    # ones that want to tell the client why (issue #556).
+    with pytest.raises(StopAsyncIteration) as stop:
         await subscription.get()
+    assert isinstance(stop.value, StreamClosed)
+    assert stop.value.reason == "app_key_rotated"
     assert hub.subscriber_count == 0
+
+
+async def test_event_hub_close_without_a_reason_says_nothing_rather_than_guessing() -> None:
+    """A subscription torn down by its OWN client (the SSE endpoint's ``finally``)
+    has nobody to explain anything to; it must not invent a reason."""
+    hub = EventHub(max_queue_size=2)
+    subscription = hub.subscribe()
+    _ = await subscription.get()
+
+    subscription.close()
+
+    with pytest.raises(StreamClosed) as stop:
+        await subscription.get()
+    assert stop.value.reason is None
 
 
 async def test_event_hub_close_matching_only_closes_selected_principal() -> None:
@@ -260,8 +295,9 @@ async def test_event_hub_close_matching_only_closes_selected_principal() -> None
         user_id=7,
     )
 
-    with pytest.raises(StopAsyncIteration):
+    with pytest.raises(StreamClosed) as stop:
         await selected.get()
+    assert stop.value.reason == "session_logged_out"
     assert not api_key.closed
     assert not other_user.closed
     assert hub.subscriber_count == 2
@@ -739,3 +775,95 @@ async def test_events_stream_closes_via_close_all_helper(
         await stream.expect_body_end()
 
     await _wait_subscribers_zero(app)
+
+
+async def test_server_closed_stream_names_its_reason_in_a_final_frame(
+    app: FastAPI,
+    seed: SeedFn,
+) -> None:
+    """Issue #556: a server-side close puts WHY on the wire before the body ends,
+    so the browser can explain the sign-out instead of showing a bare
+    reconnect."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with _AsgiStream(app, _HEADERS) as stream:
+        assert stream.status == 200
+        _ = await stream.next_frame()  # sync
+
+        close_realtime_streams(app, reason="share_revalidation_token_stale")
+
+        frames = await stream.drain_to_end()
+
+    assert _close_reason(frames) == "share_revalidation_token_stale"
+    await _wait_subscribers_zero(app)
+
+
+async def test_logout_close_frame_carries_the_logout_reason(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+) -> None:
+    await seed(initialized=True)
+    _user_id, cookies, csrf = await _browser_session(
+        sessionmaker_, tag="logout-reason", is_admin=True
+    )
+
+    async with _AsgiStream(app, _cookie_headers(cookies)) as stream:
+        assert stream.status == 200
+        _ = await stream.next_frame()  # sync
+
+        client.cookies.update(cookies)
+        assert (await client.post("/api/v1/auth/logout", headers=csrf)).status_code == 204
+
+        frames = await stream.drain_to_end()
+
+    assert _close_reason(frames) == "session_logged_out"
+    await _wait_subscribers_zero(app)
+
+
+async def test_stream_retired_at_its_session_deadline_says_the_session_expired(
+    app: FastAPI,
+    seed: SeedFn,
+) -> None:
+    """The lease expiring is the server's decision too, so it explains itself
+    rather than looking like a dropped connection."""
+    await seed(initialized=True)
+
+    async def _expiring_admin() -> AuthContext:
+        return AuthContext(
+            method=AuthMethod.plex_session,
+            user_id=79,
+            is_admin=True,
+            session_expires_at=datetime.now(UTC) + timedelta(seconds=0.5),
+        )
+
+    app.dependency_overrides[require_admin_short_session] = _expiring_admin
+    try:
+        async with _AsgiStream(app, {}) as stream:
+            assert stream.status == 200
+            _ = await stream.next_frame()  # sync
+            frames = await stream.drain_to_end(timeout=2.0)
+    finally:
+        app.dependency_overrides.pop(require_admin_short_session, None)
+
+    assert _close_reason(frames) == "session_expired"
+    await _wait_subscribers_zero(app)
+
+
+async def test_a_client_disconnect_is_not_dressed_up_as_a_server_close(
+    app: FastAPI,
+    seed: SeedFn,
+) -> None:
+    """Nobody is listening after the client hangs up, and a stream the SERVER
+    never ended has no reason to give — inventing one would be noise, not
+    honesty."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+
+    async with _AsgiStream(app, _HEADERS) as stream:
+        assert stream.status == 200
+        _ = await stream.next_frame()  # sync
+
+    await _wait_subscribers_zero(app)
+    hub = get_event_hub(app)
+    assert hub.subscriber_count == 0
