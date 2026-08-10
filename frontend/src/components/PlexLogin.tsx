@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { usePlexSignIn } from '../api/hooks'
 import { type ApiError, isApiError, toApiError } from '../lib/errors'
 import { PlexPinError, openPlexPopup, runPlexPinFlow } from '../lib/plexOAuth'
+import { clearSessionCloseNotice, useSessionCloseNotice } from '../lib/sessionClose'
 import { AuthErrorCard } from './AuthErrorCard'
 import { Button } from './ui/Button'
 
@@ -41,6 +42,10 @@ export function PlexLogin({
   const signIn = usePlexSignIn()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<ApiError | PlexPinError | undefined>(undefined)
+  // Why the last session ended, if the server told us before closing the stream.
+  // Landing on a sign-in screen with no explanation is exactly the silence issue
+  // #556 set out to remove; a fresh install simply has nothing to show here.
+  const closeNotice = useSessionCloseNotice()
 
   const startSignIn = () => {
     if (busy) return
@@ -55,6 +60,9 @@ export function PlexLogin({
     try {
       const authToken = await runPlexPinFlow(popup)
       await signIn.mutateAsync({ auth_token: authToken })
+      // The explanation belonged to the session that just ended; keeping it would
+      // haunt the new one with a stale "you were signed out".
+      clearSessionCloseNotice()
       onSignedIn()
     } catch (err) {
       setError(toDisplayError(err))
@@ -102,6 +110,16 @@ export function PlexLogin({
 
   return (
     <div className="mx-auto max-w-md px-5 py-24">
+      {closeNotice ? (
+        <div
+          role="status"
+          className="mb-4 rounded-xl border border-hairline bg-surface p-4"
+          data-close-reason={closeNotice.reason}
+        >
+          <div className="font-display text-sm font-semibold text-ink">{closeNotice.title}</div>
+          <p className="mt-1 text-sm text-muted">{closeNotice.message}</p>
+        </div>
+      ) : null}
       <div className="rounded-xl border border-hairline bg-surface p-6">
         <div className="font-display text-xl font-extrabold">Sign in</div>
         <p className="mt-2 text-sm text-muted">Use a Plex account with access to this server.</p>

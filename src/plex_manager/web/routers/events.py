@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from plex_manager.web.deps import AuthContext, require_admin_short_session
-from plex_manager.web.events import RealtimeEvent, get_event_hub
+from plex_manager.web.events import RealtimeEvent, StreamClosed, get_event_hub
 
 __all__ = ["router"]
 
@@ -22,6 +22,26 @@ router = APIRouter(
 )
 
 _HEARTBEAT_SECONDS = 15.0
+
+#: SSE event name of the final frame naming why the server ended the stream.
+CLOSE_EVENT = "closed"
+
+#: A stream retired because the session behind it hit its ABSOLUTE age cap —
+#: the bound no amount of activity can extend.
+SESSION_EXPIRED_REASON = "session_expired"
+
+#: A stream retired because the session behind it hit its IDLE window. Kept
+#: distinct from the absolute cap because the two are not the same fact and a
+#: user can act on only one of them ("you were away too long" vs "sessions end
+#: a fixed time after sign-in regardless"); one reason covering both would have
+#: to describe them vaguely enough to be useless.
+SESSION_IDLE_REASON = "session_idle_timeout"
+
+#: Every other reason is supplied by whoever called ``close_realtime_streams``
+#: (``session_logged_out``, ``sessions_revoked``, ``permission_downgraded``,
+#: ``app_key_rotated``, ``app_key_revoked``, ``plex_server_repointed``,
+#: ``shutdown``, and the share-sweep pair ``share_revalidation_share_revoked`` /
+#: ``share_revalidation_token_stale``).
 
 
 def _monotonic() -> float:
@@ -45,6 +65,11 @@ async def events_endpoint(
     Shared Plex users retain the normal polling path instead: global queue,
     blocklist, and request-activity signals would otherwise reveal admin-only or
     other-user activity even when the REST resources themselves stay filtered.
+
+    When the SERVER ends the stream it sends one final ``closed`` frame naming
+    the reason (``{"reason": "..."}``) before the body terminates, so the browser
+    can show the honest message for that cause instead of treating every close as
+    an anonymous network blip. A client-initiated disconnect gets no such frame.
     """
     # The pending ``subscription.get()`` is held as a *persistent* task and raced
     # against the heartbeat with ``asyncio.wait``, which leaves the loser pending
@@ -67,17 +92,31 @@ async def events_endpoint(
     # REST call from the same session already 401s. Connect counts as activity
     # (the auth dependency just slid ``last_seen`` forward, throttled), so a
     # continuously-open stream re-leases on each reconnect. The tighter bound wins.
+    # Which bound wins also decides WHICH reason the close frame carries, so the
+    # two are resolved together rather than by a ``min()`` that forgets what it
+    # picked. A tie goes to the absolute cap: it is the bound activity cannot
+    # extend, so it is the more fundamental fact about the session.
     now = datetime.now(UTC)
-    session_deadlines = [
-        deadline
-        for deadline in (auth.session_expires_at, auth.session_idle_deadline)
-        if deadline is not None
-    ]
+    absolute_deadline = auth.session_expires_at
+    idle_deadline = auth.session_idle_deadline
     lease_deadline: float | None = None
-    if session_deadlines:
-        remaining = (min(session_deadlines) - now).total_seconds()
+    lease_reason = SESSION_EXPIRED_REASON
+    bound: datetime | None = None
+    if idle_deadline is not None and (
+        absolute_deadline is None or idle_deadline < absolute_deadline
+    ):
+        bound = idle_deadline
+        lease_reason = SESSION_IDLE_REASON
+    elif absolute_deadline is not None:
+        bound = absolute_deadline
+    if bound is not None:
+        remaining = (bound - now).total_seconds()
         lease_deadline = _monotonic() + max(0.0, remaining)
     getter: asyncio.Task[RealtimeEvent] | None = None
+    # Why this stream ended, when the server is the one that ended it and has
+    # something honest to say. Stays ``None`` for a client-side disconnect —
+    # there is nobody left to tell, so no final frame is emitted.
+    close_reason: str | None = None
     try:
         while True:
             if await request.is_disconnected():
@@ -86,12 +125,14 @@ async def events_endpoint(
             if lease_deadline is not None:
                 lease_remaining = lease_deadline - _monotonic()
                 if lease_remaining <= 0:
+                    close_reason = lease_reason
                     break
                 timeout = min(timeout, lease_remaining)
             if getter is None:
                 getter = asyncio.ensure_future(subscription.get())
             if not await _wait_for_getter(getter, timeout=timeout):
                 if lease_deadline is not None and _monotonic() >= lease_deadline:
+                    close_reason = lease_reason
                     break
                 # Heartbeat: the getter stays pending for the next iteration, so
                 # no enqueued event is ever discarded by a timeout cancellation.
@@ -99,11 +140,20 @@ async def events_endpoint(
                 continue
             try:
                 event = getter.result()
+            except StreamClosed as closed:
+                # The hub cut this stream (logout, revoke, key rotation, the
+                # share-revalidation sweep, …). It named a reason; put it on the
+                # wire as the last frame so the browser can say WHY rather than
+                # showing a bare reconnect (issue #556).
+                close_reason = closed.reason
+                break
             except StopAsyncIteration:
                 break
             finally:
                 getter = None
             yield ServerSentEvent(data=event.payload(), event="realtime", id=str(event.seq))
+        if close_reason is not None:
+            yield ServerSentEvent(data={"reason": close_reason}, event=CLOSE_EVENT)
     finally:
         if getter is not None and not getter.done():
             getter.cancel()

@@ -157,7 +157,7 @@ async def _sweep(
     *,
     limit: int = plex_access_service.SHARE_SWEEP_USER_BUDGET,
     anchor: AnchorCheck = AnchorCheck.CONFIRMED,
-    on_signed_out: Callable[[int], None] | None = None,
+    on_signed_out: Callable[[int, ShareVerdict], None] | None = None,
     capture: plex_access_service.EntitlementCaptureContext
     | plex_access_service.CaptureUnavailableReason
     | None = None,
@@ -498,6 +498,9 @@ async def test_share_revoked_signs_the_user_out_and_writes_an_audit_row(
         "share_state": "share_revoked",
         "sessions_revoked": 1,
         "admin_exempt": False,
+        # Stamped in, not left to a join: the audit row outlives the user row it
+        # describes, and the freed primary key can be reused (issue #556).
+        "username": "viewer",
     }
     assert rows[0].description is not None
     assert "no longer has access" in rows[0].description
@@ -583,6 +586,103 @@ async def test_unverifiable_stamps_state_without_revoking(sessionmaker_: Session
     assert user.share_checked_at is not None
     assert await _live_session_count(sessionmaker_, user_id) == 1
     assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_a_verdict_that_cut_no_live_session_is_recorded_but_is_not_a_sign_out(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Due-selection saw a live session, but the user idled out (or logged out)
+    before the conditioned revoke ran. The verdict is real and must be recorded;
+    the SIGN-OUT is not, and neither the count, the words, nor the outcome may
+    claim otherwise."""
+    user_id = await _add_user(sessionmaker_, session_idle=True)
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        outcome = await apply_share_verdict(
+            session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token="user-token",  # noqa: S106
+            now=datetime.now(UTC),
+        )
+        await session.commit()
+
+    assert outcome.applied is True
+    assert outcome.signed_out is False
+    assert outcome.sessions_revoked == 0
+    # The verdict IS persisted -- this is not a skip.
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "share_revoked"
+
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 0
+    assert rows[0].description is not None
+    # The words must agree with the number: no claim that sessions were cut.
+    assert "No browser session was signed out" in rows[0].description
+    assert "no longer has access" in rows[0].description
+    # The dead row is still tidied away, leaving nothing unrevoked-but-dead.
+    assert await _live_session_count(sessionmaker_, user_id) == 0
+
+
+async def test_liveness_is_measured_at_revocation_time_not_tick_start(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The sweep captures its tick-start instant once, then runs a whole batch of
+    sequential Plex checks; a session can idle out in that window. The liveness
+    count must be measured at the revocation's own ``guard_moment``, not the
+    stale tick-start ``now`` -- against tick-start time an already-dead session
+    still looks live, and the row would report a sign-out that cut nothing."""
+    user_id = await _add_user(sessionmaker_, session_idle=True)
+    # A tick-start instant at which the (now long-idle) session still looked
+    # live: one minute after its last_seen_at, thirty days ago.
+    stale_tick_start = datetime.now(UTC) - timedelta(days=30) + timedelta(minutes=1)
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        outcome = await apply_share_verdict(
+            session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token="user-token",  # noqa: S106
+            now=stale_tick_start,
+        )
+        await session.commit()
+
+    assert outcome.signed_out is False
+    assert outcome.sessions_revoked == 0
+    rows = await _audit_rows(sessionmaker_)
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 0
+    # The dead row is still tidied away.
+    assert await _live_session_count(sessionmaker_, user_id) == 0
+
+
+async def test_a_sign_out_that_cut_sessions_says_how_many(
+    sessionmaker_: SessionMaker,
+) -> None:
+    user_id = await _add_user(sessionmaker_)
+
+    result = await _sweep(sessionmaker_, [_server_resource("some-other-server")])
+
+    assert result.sessions_revoked == 1
+    rows = await _audit_rows(sessionmaker_)
+    assert rows[0].description is not None
+    # Singular, and the number matches ``sessions_revoked``.
+    assert "1 browser session signed out." in rows[0].description
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 1
+    assert await _live_session_count(sessionmaker_, user_id) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -870,6 +970,7 @@ async def test_admin_share_loss_is_recorded_but_never_signs_them_out(
         "share_state": "share_revoked",
         "sessions_revoked": 0,
         "admin_exempt": True,
+        "username": "owner",
     }
     assert rows[0].description is not None
     assert "did NOT sign it out" in rows[0].description
@@ -1107,7 +1208,7 @@ async def test_a_later_users_check_blowing_up_leaves_the_earlier_close_done(
             _MACHINE_ID,
             revalidate_after=_INTERVAL,
             confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
-            on_signed_out=closed.append,
+            on_signed_out=lambda user_id, _verdict: closed.append(user_id),
         )
 
     # A: revoked AND closed. B: never got a verdict, so untouched and still due.
@@ -1131,7 +1232,7 @@ async def test_each_revocation_closes_its_stream_before_the_next_user_is_touched
     closed: list[int] = []
     revoked_when_closed: list[int] = []
 
-    def on_signed_out(user_id: int) -> None:
+    def on_signed_out(user_id: int, _verdict: ShareVerdict) -> None:
         closed.append(user_id)
         if user_id == first_id:
             # Prove the close happens AFTER the commit, not optimistically
@@ -1147,6 +1248,31 @@ async def test_each_revocation_closes_its_stream_before_the_next_user_is_touched
     assert result.signed_out_user_ids == (first_id, second_id)
 
 
+async def test_the_sign_out_callback_is_told_which_verdict_signed_the_user_out(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The web layer turns this into the close reason the browser shows, and the
+    two causes need different words — so the verdict has to travel with the id
+    (issue #556)."""
+    revoked_id = await _add_user(sessionmaker_, username="revoked")
+    seen: list[tuple[int, ShareVerdict]] = []
+
+    await _sweep(
+        sessionmaker_,
+        [_server_resource("some-other-server")],
+        on_signed_out=lambda user_id, verdict: seen.append((user_id, verdict)),
+    )
+    assert seen == [(revoked_id, ShareVerdict.SHARE_REVOKED)]
+
+    stale_id = await _add_user(sessionmaker_, username="stale")
+    seen.clear()
+
+    await _sweep(
+        sessionmaker_, 401, on_signed_out=lambda user_id, verdict: seen.append((user_id, verdict))
+    )
+    assert seen == [(stale_id, ShareVerdict.TOKEN_STALE)]
+
+
 async def test_a_later_users_failure_cannot_strand_an_earlier_closed_revocation(
     sessionmaker_: SessionMaker,
 ) -> None:
@@ -1154,7 +1280,7 @@ async def test_a_later_users_failure_cannot_strand_an_earlier_closed_revocation(
     await _add_user(sessionmaker_, username="beta")
     closed: list[int] = []
 
-    def on_signed_out(user_id: int) -> None:
+    def on_signed_out(user_id: int, _verdict: ShareVerdict) -> None:
         closed.append(user_id)
         if user_id != first_id:
             raise RuntimeError("stream close blew up for the second user")

@@ -3,6 +3,7 @@ import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { queryKeys } from './queryClient'
 import { setRealtimeConnected } from './realtimeState'
 import { setRealtimeReloadRequired } from './realtimeReload'
+import { clearSessionCloseNotice, noteSessionClose } from './sessionClose'
 
 export interface RealtimeEventPayload {
   seq?: number
@@ -11,19 +12,31 @@ export interface RealtimeEventPayload {
   app_version?: string
 }
 
-/**
- * Parse an SSE byte stream into typed events.
- *
- * ``onBytes`` fires on EVERY received chunk — including heartbeat comment frames
- * (``: ping``) and any other non-``data`` frames the parser otherwise discards.
- * The reconnect watchdog relies on this: a healthy but idle stream still emits a
- * server heartbeat every ~15s, so a silence longer than that means the
- * connection is dead/zombied even though no application event was due.
- */
+/** SSE `event:` name of the final frame naming why the SERVER ended the stream. */
+export const CLOSE_EVENT_NAME = 'closed'
+
+export interface ParseSseHandlers {
+  onEvent: (event: RealtimeEventPayload) => void
+  /**
+   * Fires on EVERY received chunk — including heartbeat comment frames
+   * (`: ping`) and any other non-`data` frames the parser otherwise discards.
+   * The reconnect watchdog relies on this: a healthy but idle stream still emits
+   * a server heartbeat every ~15s, so a silence longer than that means the
+   * connection is dead/zombied even though no application event was due.
+   */
+  onBytes?: () => void
+  /**
+   * Fires for the server's final `closed` frame, carrying the reason it named.
+   * A dropped connection produces no such frame — that asymmetry is the point:
+   * only a deliberate server-side close can explain itself (issue #556).
+   */
+  onClose?: (reason: string) => void
+}
+
+/** Parse an SSE byte stream into typed events. */
 export async function parseSseStream(
   stream: ReadableStream<Uint8Array>,
-  onEvent: (event: RealtimeEventPayload) => void,
-  onBytes?: () => void,
+  { onEvent, onBytes, onClose }: ParseSseHandlers,
 ): Promise<void> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -51,19 +64,26 @@ export async function parseSseStream(
     while (boundary !== -1) {
       const frame = buffer.slice(0, boundary)
       buffer = buffer.slice(boundary + 2)
-      emitFrame(frame, onEvent)
+      emitFrame(frame, onEvent, onClose)
       boundary = buffer.indexOf('\n\n')
     }
   }
 
   buffer += normalizeChunk(decoder.decode(), true)
   if (buffer.trim().length > 0) {
-    emitFrame(buffer, onEvent)
+    emitFrame(buffer, onEvent, onClose)
   }
 }
 
-function emitFrame(frame: string, onEvent: (event: RealtimeEventPayload) => void): void {
+function emitFrame(
+  frame: string,
+  onEvent: (event: RealtimeEventPayload) => void,
+  onClose?: (reason: string) => void,
+): void {
   const data: string[] = []
+  // The server's close frame is distinguished by its `event:` name, not by its
+  // payload shape, so the name has to be read rather than discarded.
+  let eventName = ''
   for (const rawLine of frame.split(/\r\n|\n|\r/)) {
     if (rawLine.length === 0 || rawLine.startsWith(':')) continue
     const colon = rawLine.indexOf(':')
@@ -71,10 +91,24 @@ function emitFrame(frame: string, onEvent: (event: RealtimeEventPayload) => void
     let value = colon === -1 ? '' : rawLine.slice(colon + 1)
     if (value.startsWith(' ')) value = value.slice(1)
     if (field === 'data') data.push(value)
+    else if (field === 'event') eventName = value
   }
   if (data.length === 0) return
   const parsed: unknown = JSON.parse(data.join('\n'))
+  if (eventName === CLOSE_EVENT_NAME) {
+    const reason = closeReasonOf(parsed)
+    // A close frame we cannot read is dropped rather than guessed at: the stream
+    // is ending either way, and inventing a reason is worse than none.
+    if (reason !== null) onClose?.(reason)
+    return
+  }
   if (isRealtimeEvent(parsed)) onEvent(parsed)
+}
+
+function closeReasonOf(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null || !('reason' in value)) return null
+  const reason = (value as { reason: unknown }).reason
+  return typeof reason === 'string' && reason.length > 0 ? reason : null
 }
 
 function isRealtimeEvent(value: unknown): value is RealtimeEventPayload {
@@ -231,19 +265,27 @@ export function startRealtimeStream({
           throw new Error(`realtime stream failed: ${response.status}`)
         }
         setRealtimeConnected(true)
+        // An authenticated stream is live, so whatever ended the LAST one did not
+        // end the session. Clearing here keeps the explanation self-correcting:
+        // only a close the session did not survive (the reconnect 401s instead)
+        // can still be showing when the sign-in screen appears.
+        clearSessionCloseNotice()
         connectedAt = now()
         lastByteAt = connectedAt
         armWatchdog()
-        await parseSseStream(
-          response.body,
-          (event) => {
+        await parseSseStream(response.body, {
+          onEvent: (event) => {
             noteVersion(event)
             applyRealtimeEvent(queryClient, event)
           },
-          () => {
+          onBytes: () => {
             lastByteAt = now()
           },
-        )
+          // The server said WHY it ended this stream. Record it before the
+          // reconnect/401 dance so the sign-in screen can explain the sign-out
+          // instead of appearing out of nowhere (issue #556).
+          onClose: noteSessionClose,
+        })
       } catch {
         // Network error, a watchdog abort, or a teardown abort. Teardown sets
         // `stopped` (handled below); everything else falls through to reconnect.

@@ -463,6 +463,74 @@ class RevokeSessionsResponse(BaseModel):
     revoked: int
 
 
+class AutomaticSignOut(BaseModel):
+    """One sign-out the app performed on its own, read from the audit trail.
+
+    The share-revalidation sweep (issue #391) can cut a user's sessions without
+    anyone pressing a button, so "why was I signed out?" needs a durable,
+    web-readable answer — not a log line that log retention will eventually trim
+    (issue #556). Every field here comes from the ``AuditLog`` row the sweep
+    wrote in the same transaction as the revocation.
+
+    ``action_type`` keeps the two causes apart, because they mean different
+    things to the person affected:
+
+    * ``user.share_revoked`` — plex.tv confirmed the account no longer reaches
+      this server. Access really is gone.
+    * ``user.plex_sign_in_expired`` — plex.tv rejected the stored credential, so
+      the share could not be checked at all. Access was NOT removed; signing in
+      with Plex again restores it.
+
+    Either action type may carry the ``_admin_exempt`` suffix, which records a
+    verdict deliberately NOT acted on for an owner/admin (ADR-0005's
+    never-locked-out rule). Those rows report ``signed_out: false`` — they are
+    the operator's cue to revoke by hand if the removal is genuine.
+
+    ``signed_out`` is false whenever nothing was actually cut — an admin-exempt
+    verdict, or a revoke that found no live session left (the user logged out
+    between due-selection and the revoke). ``sessions_revoked`` says how many.
+
+    ``username`` is the name recorded IN the row at the moment of the sign-out,
+    so it stays correct after the account is renamed or deleted. It is null for
+    rows written before that stamp existed: the subject is then genuinely
+    unknown, since ``user_id`` alone can be reused by a later account and must
+    not be resolved back to a name.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    occurred_at: datetime
+    action_type: str
+    # The user the sign-out was ABOUT (the audit row's subject). Null only if the
+    # row predates a known user or the account was later deleted — the record of
+    # what happened deliberately outlives the account it describes.
+    user_id: int | None
+    username: str | None
+    previous_share_state: str | None
+    share_state: str | None
+    sessions_revoked: int
+    admin_exempt: bool
+    # False exactly when ``admin_exempt`` is true: the verdict was recorded but
+    # the sessions were left alone.
+    signed_out: bool
+    description: str | None
+
+
+class AutomaticSignOutsResponse(BaseModel):
+    """The most recent automatic sign-outs, newest first (admin view).
+
+    Deliberately not a general audit browser: only the automatic-sign-out action
+    family is exposed, so the audit table's other rows never become an
+    unreviewed web resource. ``limit`` echoes the bound actually applied.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    entries: list[AutomaticSignOut]
+    limit: int
+
+
 # --------------------------------------------------------------------------- #
 # Setup completion + status
 # --------------------------------------------------------------------------- #

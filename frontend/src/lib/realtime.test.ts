@@ -4,6 +4,7 @@ import { AUTH_EXPIRED_EVENT } from '../api/client'
 import { applyRealtimeEvent, parseSseStream, startRealtimeStream } from './realtime'
 import { queryKeys } from './queryClient'
 import { getRealtimeReloadRequired, setRealtimeReloadRequired } from './realtimeReload'
+import { clearSessionCloseNotice, getSessionCloseNotice } from './sessionClose'
 
 function streamFrom(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -27,6 +28,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   setRealtimeReloadRequired(false)
+  clearSessionCloseNotice()
 })
 
 describe('parseSseStream', () => {
@@ -35,7 +37,7 @@ describe('parseSseStream', () => {
 
     await parseSseStream(
       streamFrom(': ping\n\nevent: realtime\ndata: {"topics":["requests"]}\nid: 5\n\n'),
-      (event) => events.push(event),
+      { onEvent: (event) => events.push(event) },
     )
 
     expect(events).toEqual([{ topics: ['requests'] }])
@@ -46,7 +48,7 @@ describe('parseSseStream', () => {
 
     await parseSseStream(
       streamFromChunks('event: realtime\r\ndata: {"topics":["queue"]}\r', '\n\r', '\n'),
-      (event) => events.push(event),
+      { onEvent: (event) => events.push(event) },
     )
 
     expect(events).toEqual([{ topics: ['queue'] }])
@@ -56,16 +58,44 @@ describe('parseSseStream', () => {
     const events: unknown[] = []
     let bytes = 0
 
-    await parseSseStream(
-      streamFrom(': ping\n\n'),
-      (event) => events.push(event),
-      () => {
+    await parseSseStream(streamFrom(': ping\n\n'), {
+      onEvent: (event) => events.push(event),
+      onBytes: () => {
         bytes += 1
       },
-    )
+    })
 
     expect(events).toEqual([])
     expect(bytes).toBe(1)
+  })
+
+  it('routes the server close frame to onClose, not to the event handler', async () => {
+    const events: unknown[] = []
+    const closes: string[] = []
+
+    await parseSseStream(
+      streamFrom(
+        'event: realtime\ndata: {"topics":["queue"]}\n\n' +
+          'event: closed\ndata: {"reason":"share_revalidation_token_stale"}\n\n',
+      ),
+      { onEvent: (event) => events.push(event), onClose: (reason) => closes.push(reason) },
+    )
+
+    expect(events).toEqual([{ topics: ['queue'] }])
+    expect(closes).toEqual(['share_revalidation_token_stale'])
+  })
+
+  it('drops a close frame with no readable reason rather than inventing one', async () => {
+    const closes: string[] = []
+
+    await parseSseStream(streamFrom('event: closed\ndata: {"reason":""}\n\n'), {
+      onEvent: () => {
+        throw new Error('a close frame must never be delivered as an event')
+      },
+      onClose: (reason) => closes.push(reason),
+    })
+
+    expect(closes).toEqual([])
   })
 })
 
@@ -240,6 +270,77 @@ describe('startRealtimeStream version awareness', () => {
     await vi.advanceTimersByTimeAsync(50)
     expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(getRealtimeReloadRequired()).toBe(true)
+
+    stop()
+    qc.clear()
+  })
+})
+
+describe('startRealtimeStream close reasons (issue #556)', () => {
+  it('records the reason the server named before it closed the stream', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          status: 200,
+          ok: true,
+          body: streamFrom(
+            'event: realtime\ndata: {"topics":["sync"],"reason":"connected"}\n\n' +
+              'event: closed\ndata: {"reason":"share_revalidation_share_revoked"}\n\n',
+          ),
+        }) as unknown as Response,
+    )
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 10_000,
+      maxDelayMs: 10_000,
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getSessionCloseNotice()?.reason).toBe('share_revalidation_share_revoked')
+
+    stop()
+    qc.clear()
+  })
+
+  it('drops a stale explanation once an authenticated stream reconnects', async () => {
+    // A reconnect that AUTHENTICATES proves the session outlived whatever ended
+    // the previous stream, so the message must not linger to mislead later.
+    vi.useFakeTimers()
+    let call = 0
+    const fetchImpl = vi.fn(async () => {
+      call += 1
+      // First connection is closed by the server; the second one stays up.
+      const body =
+        call === 1
+          ? streamFrom('event: closed\ndata: {"reason":"session_expired"}\n\n')
+          : new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode('event: realtime\ndata: {"topics":["sync"]}\n\n'),
+                )
+              },
+            })
+      return { status: 200, ok: true, body } as unknown as Response
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    const stop = startRealtimeStream({
+      queryClient: qc,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getSessionCloseNotice()?.reason).toBe('session_expired')
+
+    await vi.advanceTimersByTimeAsync(50)
+    expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(getSessionCloseNotice()).toBeNull()
 
     stop()
     qc.clear()

@@ -59,6 +59,9 @@ export const queryKeys = {
   // Active browser sessions per user (admin session management). Off the
   // ['settings'] prefix — an ordinary settings save must not refetch it.
   activeSessions: ['auth', 'sessions'] as const,
+  // The durable audit trail of sign-outs the app performed on its own — the
+  // answer to "why was I signed out?" that outlives log retention (issue #556).
+  automaticSignOuts: (limit: number) => ['auth', 'sign-outs', limit] as const,
   requests: ['requests'] as const,
   request: (id: number) => ['requests', id] as const,
   // Issue #370 phase 2 — nested UNDER the ['requests'] prefix on purpose: every

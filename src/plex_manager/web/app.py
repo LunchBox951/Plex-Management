@@ -1101,6 +1101,22 @@ async def _session_sweep_loop(app: FastAPI) -> None:
         await asyncio.sleep(session_lifecycle.SESSION_SWEEP_INTERVAL_SECONDS)
 
 
+# The realtime close reason each sign-out verdict puts on the wire. Two entries,
+# not one, because the browser turns this string into the sentence explaining the
+# sign-out: a revoked share and a dead Plex token are different facts and the
+# design (issue #391) ratified different operator-facing words for them. Mirrors
+# the ``audit_service`` action types written for the same two verdicts.
+_SHARE_SWEEP_CLOSE_REASONS: Final[dict[plex_access_service.ShareVerdict, str]] = {
+    plex_access_service.ShareVerdict.SHARE_REVOKED: "share_revalidation_share_revoked",
+    plex_access_service.ShareVerdict.TOKEN_STALE: "share_revalidation_token_stale",
+}
+
+#: Fallback close reason if a verdict outside the two above ever signs someone
+#: out. It should be unreachable; it exists so an upstream contract change closes
+#: the stream honestly-but-vaguely instead of inventing a wrong message.
+_SHARE_SWEEP_CLOSE_REASON_FALLBACK: Final = "share_revalidation_signed_out"
+
+
 def _get_share_sweep_status(app: FastAPI) -> plex_access_service.ShareSweepStatus:
     """Return ``app.state.share_sweep_status``, lazily creating it if absent.
 
@@ -1316,13 +1332,36 @@ async def _share_sweep_once(app: FastAPI) -> int:
         status.mark_skipped("not_configured")
         return 0
 
-    def _close_signed_out_stream(user_id: int) -> None:
+    def _close_signed_out_stream(user_id: int, verdict: plex_access_service.ShareVerdict) -> None:
         # Mirrors the manual revoke path exactly (auth.revoke_sessions_endpoint):
         # per-user, plex_session-scoped, so a recovery cookie or another user's
         # stream is never collateral.
+        #
+        # The reason is verdict-specific, not one generic
+        # "share_revalidation_signed_out": the browser renders it as the message
+        # explaining the sign-out, and "your Plex share was removed" is simply
+        # untrue for a stale token (plex.tv rejected the credential before it
+        # could say anything about the share). Same split as the AuditLog rows.
+        #
+        # KNOWN GAP (tracked follow-up to #556): this close reason cannot
+        # currently REACH the user it describes. ``/api/v1/events`` is admin-only
+        # and this sweep never signs an admin out (ADR-0005 exemption in
+        # ``apply_share_verdict``), so a swept user never had a stream to close;
+        # the call below is a no-op for them and their browser learns nothing.
+        # It is still correct to make: it closes any stream that DOES match, and
+        # the pairing with the revocation is the #183 invariant. The operator's
+        # answer path meanwhile is Settings -> Automatic sign-outs.
+        reason = _SHARE_SWEEP_CLOSE_REASONS.get(verdict)
+        if reason is None:  # pragma: no cover - only two verdicts ever sign out
+            _logger.warning(
+                "share revalidation signed a user out on an unmapped verdict (%s); "
+                "closing their realtime stream with a generic reason",
+                verdict.value,
+            )
+            reason = _SHARE_SWEEP_CLOSE_REASON_FALLBACK
         close_realtime_streams(
             app,
-            reason="share_revalidation_signed_out",
+            reason=reason,
             auth_method=AuthMethod.plex_session.value,
             user_id=user_id,
         )

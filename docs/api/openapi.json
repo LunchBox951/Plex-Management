@@ -396,6 +396,128 @@
         "title": "AutograbStatusItem",
         "type": "object"
       },
+      "AutomaticSignOut": {
+        "description": "One sign-out the app performed on its own, read from the audit trail.\n\nThe share-revalidation sweep (issue #391) can cut a user's sessions without\nanyone pressing a button, so \"why was I signed out?\" needs a durable,\nweb-readable answer \u2014 not a log line that log retention will eventually trim\n(issue #556). Every field here comes from the ``AuditLog`` row the sweep\nwrote in the same transaction as the revocation.\n\n``action_type`` keeps the two causes apart, because they mean different\nthings to the person affected:\n\n* ``user.share_revoked`` \u2014 plex.tv confirmed the account no longer reaches\n  this server. Access really is gone.\n* ``user.plex_sign_in_expired`` \u2014 plex.tv rejected the stored credential, so\n  the share could not be checked at all. Access was NOT removed; signing in\n  with Plex again restores it.\n\nEither action type may carry the ``_admin_exempt`` suffix, which records a\nverdict deliberately NOT acted on for an owner/admin (ADR-0005's\nnever-locked-out rule). Those rows report ``signed_out: false`` \u2014 they are\nthe operator's cue to revoke by hand if the removal is genuine.\n\n``signed_out`` is false whenever nothing was actually cut \u2014 an admin-exempt\nverdict, or a revoke that found no live session left (the user logged out\nbetween due-selection and the revoke). ``sessions_revoked`` says how many.\n\n``username`` is the name recorded IN the row at the moment of the sign-out,\nso it stays correct after the account is renamed or deleted. It is null for\nrows written before that stamp existed: the subject is then genuinely\nunknown, since ``user_id`` alone can be reused by a later account and must\nnot be resolved back to a name.",
+        "properties": {
+          "action_type": {
+            "title": "Action Type",
+            "type": "string"
+          },
+          "admin_exempt": {
+            "title": "Admin Exempt",
+            "type": "boolean"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "previous_share_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Share State"
+          },
+          "sessions_revoked": {
+            "title": "Sessions Revoked",
+            "type": "integer"
+          },
+          "share_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share State"
+          },
+          "signed_out": {
+            "title": "Signed Out",
+            "type": "boolean"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          }
+        },
+        "required": [
+          "id",
+          "occurred_at",
+          "action_type",
+          "user_id",
+          "username",
+          "previous_share_state",
+          "share_state",
+          "sessions_revoked",
+          "admin_exempt",
+          "signed_out",
+          "description"
+        ],
+        "title": "AutomaticSignOut",
+        "type": "object"
+      },
+      "AutomaticSignOutsResponse": {
+        "description": "The most recent automatic sign-outs, newest first (admin view).\n\nDeliberately not a general audit browser: only the automatic-sign-out action\nfamily is exposed, so the audit table's other rows never become an\nunreviewed web resource. ``limit`` echoes the bound actually applied.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/AutomaticSignOut"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entries",
+          "limit"
+        ],
+        "title": "AutomaticSignOutsResponse",
+        "type": "object"
+      },
       "BlocklistEntry": {
         "description": "A blocklist entry as returned to the client.",
         "properties": {
@@ -5120,6 +5242,60 @@
         ]
       }
     },
+    "/api/v1/auth/sign-outs": {
+      "get": {
+        "description": "The sign-outs the app performed on its own, newest first (admin-only).\n\nThe companion to :func:`list_active_sessions_endpoint`: that one answers \"who\nis signed in\", this one answers \"who did the app sign OUT, and why\". The\nshare-revalidation sweep (issue #391) revokes sessions without an operator\naction, and its only web-visible trace was a Logs-page line that\n``log_retention_days``/``log_max_rows`` eventually trims. The ``AuditLog``\nrow is the durable record; this endpoint is how it reaches the browser, so\nthe answer never requires a terminal (north star #2, issue #556).\n\nDeliberately narrow \u2014 NOT a generic audit-log browser. Only the\nautomatic-sign-out action family\n(:data:`~plex_manager.services.audit_service.AUTOMATIC_SIGN_OUT_ACTION_TYPES`)\nis selected, so other audit rows (request handoffs, coordinator resets, and\nanything added later) do not become a web resource nobody reviewed.\n\nAdmin-only for the same reason the sessions list is: the rows name other\npeople's accounts and their access state. Nothing secret-bearing is\nreturned \u2014 the sweep's rows carry share states and counts, never a token,\nsession id, or IP.",
+        "operationId": "list_automatic_sign_outs_endpoint_api_v1_auth_sign_outs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSignOutsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "APIKeyCookie": []
+          }
+        ],
+        "summary": "List Automatic Sign Outs Endpoint",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/api/v1/blocklist": {
       "get": {
         "description": "List blocklist entries, optionally scoped to one media item.",
@@ -5448,7 +5624,7 @@
     },
     "/api/v1/events": {
       "get": {
-        "description": "Stream realtime invalidation events for the authenticated admin SPA.\n\nThe stream holds no DB session. Each event is a hint to refetch existing REST\nresources, so reconnects and overflow collapse to a broad ``sync`` event.\nShared Plex users retain the normal polling path instead: global queue,\nblocklist, and request-activity signals would otherwise reveal admin-only or\nother-user activity even when the REST resources themselves stay filtered.",
+        "description": "Stream realtime invalidation events for the authenticated admin SPA.\n\nThe stream holds no DB session. Each event is a hint to refetch existing REST\nresources, so reconnects and overflow collapse to a broad ``sync`` event.\nShared Plex users retain the normal polling path instead: global queue,\nblocklist, and request-activity signals would otherwise reveal admin-only or\nother-user activity even when the REST resources themselves stay filtered.\n\nWhen the SERVER ends the stream it sends one final ``closed`` frame naming\nthe reason (``{\"reason\": \"...\"}``) before the body terminates, so the browser\ncan show the honest message for that cause instead of treating every close as\nan anonymous network blip. A client-initiated disconnect gets no such frame.",
         "operationId": "events_endpoint_api_v1_events_get",
         "responses": {
           "200": {
