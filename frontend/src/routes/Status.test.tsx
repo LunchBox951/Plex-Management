@@ -860,6 +860,53 @@ describe('Status', () => {
     )
   })
 
+  it('explains a root that stood down for a correction instead of saying nothing was eligible', async () => {
+    // Issue #526: an operator correction owning the root's free space makes the
+    // sweep DECLINE, which comes back as an empty `evicted` -- byte-identical to
+    // "no root is under pressure". Left unhandled, the operator presses the
+    // button mid-report-issue and is told nothing was eligible, which is simply
+    // untrue. It is also NOT an error, so it must not borrow the failure toast.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
+    const declined: EvictResponse = {
+      evicted: [],
+      errors: [],
+      stood_down: [
+        {
+          root: 'movies_root',
+          reason: 'an operator correction purge was already active under this root',
+        },
+      ],
+    }
+    const mutateAsync = vi.fn().mockResolvedValue(declined)
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync, isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+    fireEvent.click(screen.getByRole('button', { name: /free space now/i }))
+
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Nothing to free',
+          description: expect.stringContaining('correction is already reclaiming'),
+        }),
+      ),
+    )
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: expect.stringContaining('movies_root'),
+          description: expect.stringContaining('re-reads pressure'),
+          intent: 'info',
+        }),
+      ),
+    )
+    // Declining is not failing: it must never be reported as a sweep failure.
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ intent: 'warning' }),
+    )
+  })
+
   it('labels a partial removal as pending recovery', async () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({ data: health(), isLoading: false, isError: false })
     ;(useOpsDisk as unknown as Mock).mockReturnValue({ data: disk(), isLoading: false, isError: false })
