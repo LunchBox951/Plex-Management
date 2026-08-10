@@ -17,7 +17,9 @@ open, so the fix is a reservation with a defeat channel:
 * the sweep stands down before drawing its next victim, and -- the actual barrier
   -- re-reads the defeat latch at the delete boundary, under the held delete
   permit, with nothing but a synchronous thread start left before the first
-  unlinked byte.
+  unlinked byte. That boundary read happens TWICE, on both sides of the awaits
+  that arm the durable incomplete-delete marker, because those awaits are
+  themselves a window a correction can start inside (issue #570).
 
 Uses the REAL ``LocalFileSystem`` against ``tmp_path`` and the REAL
 ``report_issue`` verb for the wiring test, so nothing here proves the lease works
@@ -348,7 +350,7 @@ async def test_a_correction_starting_before_assembly_defers_without_crawling_ple
 
 
 async def test_a_correction_starting_after_the_claim_is_revoked_at_the_delete_boundary(
-    sessionmaker_: SessionMaker, tmp_path: Path
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE BARRIER: the deepest await window, past every cheap recheck.
 
@@ -373,13 +375,23 @@ async def test_a_correction_starting_after_the_claim_is_revoked_at_the_delete_bo
     )
 
     try:
-        outcomes = await _sweep_one_movie_root(sessionmaker_, root=root, library=library)
+        with caplog.at_level(logging.INFO, logger=eviction_service.__name__):
+            outcomes = await _sweep_one_movie_root(sessionmaker_, root=root, library=library)
     finally:
         purge_service.end_purge(correction_path)
 
     assert library.fired, "the correction never landed inside the pre-claim re-read"
     assert outcomes == []
     assert Path(victim).exists(), "bytes left disk after a correction had already claimed"
+    # Pin PHASE 1 specifically: this defeat must be caught by the cheap pre-arm
+    # read (no durable write, no compensating restore commit), not by the
+    # post-arm phase-2 recheck -- removing phase 1 would otherwise be invisible
+    # to the suite, since phase 2 produces the identical end state.
+    assert any(
+        record.name == eviction_service.__name__
+        and "before the incomplete-delete marker was armed" in record.getMessage()
+        for record in caplog.records
+    )
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         evicted_history = (
@@ -398,6 +410,83 @@ async def test_a_correction_starting_after_the_claim_is_revoked_at_the_delete_bo
     assert row.library_path == victim
     assert row.partial_delete_path is None, "a delete that never started must arm no marker"
     assert evicted_history == []
+
+
+async def test_a_correction_starting_inside_the_marker_arm_awaits_stops_the_delete(
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE LAST WINDOW (issue #570): the boundary hook's own awaits.
+
+    The test above lands the correction before the hook begins, which its FIRST
+    latch read catches. But the hook is not atomic: between that read and the
+    delete it arms the durable incomplete-delete marker and COMMITS it, and both
+    of those suspend. A correction running to completion inside either window
+    revokes the lease while the hook is mid-flight, and a single up-front read
+    would let the worker start anyway -- against the very free-space reading the
+    correction invalidated (the #526 race class, one layer deeper).
+
+    So the correction is started here from inside ``_arm_partial_delete``, after
+    the real arming has run: the strictest placement, because the marker is armed
+    AND the phase-1 read has already passed. The hook's post-commit read must
+    catch it, and the defeat must cost nothing durable -- no delete, no marker
+    left armed over an intact tree for recovery to converge, and the claim back to
+    ``available`` exactly as a pre-arm defeat leaves it."""
+    root = tmp_path / "movies"
+    victim = _movie_file(root, "Armed Then Spared (2020).mkv")
+    correction_path = _movie_file(root, "Correction In Progress (2019).mkv")
+    request_id = await _available_movie(
+        sessionmaker_, tmdb_id=7011, title="Armed Then Spared", library_path=victim
+    )
+    library = FakeLibrary(
+        watch_states={(7011, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    armed: list[str] = []
+    real_arm = eviction_service._arm_partial_delete  # pyright: ignore[reportPrivateUsage]
+
+    async def _arm_then_start_a_correction(
+        session: AsyncSession,
+        pending: eviction_service._Pending,  # pyright: ignore[reportPrivateUsage]
+        library_path: str,
+    ) -> None:
+        await real_arm(session, pending, library_path)
+        armed.append(library_path)
+        _start_correction_purge(correction_path)
+
+    monkeypatch.setattr(eviction_service, "_arm_partial_delete", _arm_then_start_a_correction)
+    reported: list[str] = []
+
+    # The per-candidate defeat line is the SERVICE logger's, not the sweep-summary
+    # telemetry child's (which only reports the trailing stand-down).
+    with caplog.at_level(logging.INFO, logger=eviction_service.__name__):
+        try:
+            outcomes = await _sweep_one_movie_root(
+                sessionmaker_, root=root, library=library, on_stood_down=reported.append
+            )
+        finally:
+            purge_service.end_purge(correction_path)
+
+    assert armed == [victim], "the correction never landed inside the marker-arm awaits"
+    assert outcomes == []
+    assert Path(victim).exists(), "the delete started against an invalidated pressure reading"
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.available
+    assert row.library_path == victim
+    # The compensation, and the whole reason a post-arm defeat needs one: a marker
+    # left armed over an intact tree is what recovery CONVERGES (deletes) rather
+    # than restores (#515 policy), so the restore has to take it back off.
+    assert row.partial_delete_path is None, "an armed marker outlived a delete that never ran"
+    assert reported == [_CORRECTION_REASON]
+    assert any(
+        "revoked at the delete boundary" in record.getMessage()
+        and "after the incomplete-delete marker was armed" in record.getMessage()
+        for record in caplog.records
+        if record.name == eviction_service.__name__
+    ), "the defeat was not reported as the post-arm one it was"
 
 
 async def test_a_defeat_at_the_final_victim_is_still_reported_by_the_sweep(
