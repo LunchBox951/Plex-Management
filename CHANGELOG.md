@@ -38,10 +38,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - Eviction: walk-skipped candidates now carry an explicit `None` size
-  sentinel instead of a fabricated `0.0`, and every eviction/retention sweep
-  return path logs duration plus walked-vs-skipped telemetry, including the
-  common below-pressure tick that previously returned in total silence
-  (#554).
+  sentinel instead of a fabricated `0.0`, and eviction/retention sweeps now
+  log their duration on completion — including the common below-pressure
+  tick that previously returned in total silence — with walked-vs-skipped
+  counts included once candidate assembly has occurred (#554).
 - Grab now refuses, rather than transparently restarts, an unsafe
   attachment-loss recovery (a blocklisted release, a settled request or
   season, or a torrent removal that is in-flight or already completed) —
