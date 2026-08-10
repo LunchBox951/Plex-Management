@@ -30,6 +30,8 @@ __all__ = [
     "EVICTION_INTERVAL_MAX_MINUTES",
     "LOG_MAX_ROWS_MAX",
     "LOG_RETENTION_DAYS_MAX",
+    "SHARE_REVALIDATION_INTERVAL_HOURS_MAX",
+    "SHARE_REVALIDATION_INTERVAL_HOURS_MIN",
 ]
 
 # The disk-pressure trigger threshold and target are a USED-DISK PERCENT, so both
@@ -90,3 +92,18 @@ AUTO_GRAB_INTERVAL_SECONDS_MAX: float = 3600.0
 # (``auto_grab_service.AUTO_GRAB_MAX_SEARCHES_PER_CYCLE``).
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MIN: int = 2
 AUTO_GRAB_MAX_SEARCHES_PER_CYCLE_MAX: int = 50
+
+# How stale a user's Plex-share verdict may get before the revalidation sweep
+# re-derives it (issue #391). This is a SECURITY exposure window, not a
+# convenience cadence: it is the worst case for how long a Plex share that was
+# revoked upstream keeps working here, so the ceiling exists to stop a stored
+# value from quietly restoring the 7-30 day window the sweep was built to close.
+#
+# Floor 1h, not lower: the sweep costs one plex.tv round trip per signed-in user
+# per interval, and an interval shorter than the 15-minute tick would just make
+# every tick re-check everybody without shortening the window any further.
+# Ceiling 168h (7 days) equals the session idle window -- past that the sweep
+# would be slower than sessions expiring on their own, i.e. effectively off,
+# which is not a state this knob is allowed to reach.
+SHARE_REVALIDATION_INTERVAL_HOURS_MIN: float = 1.0
+SHARE_REVALIDATION_INTERVAL_HOURS_MAX: float = 168.0

@@ -2320,6 +2320,7 @@ export interface components {
             /** Disks */
             disks: components["schemas"]["DiskGaugeItem"][];
             reconcile: components["schemas"]["ReconcileStatusItem"];
+            share_sweep: components["schemas"]["ShareSweepStatusItem"];
             /** Subsystems */
             subsystems: components["schemas"]["SubsystemHealthItem"][];
             watchlist: components["schemas"]["WatchlistStatusItem"];
@@ -2995,6 +2996,8 @@ export interface components {
             qbittorrent_url?: string | null;
             /** Qbittorrent Username */
             qbittorrent_username?: string | null;
+            /** Share Revalidation Interval Hours */
+            share_revalidation_interval_hours?: number | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
             /** Tv Root */
@@ -3087,6 +3090,8 @@ export interface components {
             qbittorrent_url?: string | null;
             /** Qbittorrent Username */
             qbittorrent_username?: string | null;
+            /** Share Revalidation Interval Hours */
+            share_revalidation_interval_hours?: number | null;
             /** Tmdb Api Key */
             tmdb_api_key?: string | null;
             /** Tv Root */
@@ -3164,6 +3169,70 @@ export interface components {
              * @default false
              */
             setup_token_required: boolean;
+        };
+        /**
+         * ShareSweepStatusItem
+         * @description The share-revalidation sweep's health (issue #391).
+         *
+         *     ``unknown`` is the field that makes this honest: a sweep that could not reach
+         *     plex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,
+         *     which an operator must be able to tell apart from a clean ``ok`` sweep that
+         *     found everyone still entitled.
+         */
+        ShareSweepStatusItem: {
+            /**
+             * Authorized
+             * @default 0
+             */
+            authorized: number;
+            /**
+             * Checked
+             * @default 0
+             */
+            checked: number;
+            /**
+             * Due Remaining
+             * @default 0
+             */
+            due_remaining: number;
+            /** Last Error At */
+            last_error_at?: string | null;
+            /** Last Error Type */
+            last_error_type?: string | null;
+            /** Last Ok At */
+            last_ok_at?: string | null;
+            /** Last Run At */
+            last_run_at?: string | null;
+            /**
+             * Sessions Revoked
+             * @default 0
+             */
+            sessions_revoked: number;
+            /**
+             * Share Revoked
+             * @default 0
+             */
+            share_revoked: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "starting" | "ok" | "degraded" | "not_configured" | "probe_failed" | "error";
+            /**
+             * Token Stale
+             * @default 0
+             */
+            token_stale: number;
+            /**
+             * Unknown
+             * @default 0
+             */
+            unknown: number;
+            /**
+             * Unverifiable
+             * @default 0
+             */
+            unverifiable: number;
         };
         /**
          * SubsystemHealthItem

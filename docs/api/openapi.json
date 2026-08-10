@@ -1325,6 +1325,9 @@
           "reconcile": {
             "$ref": "#/components/schemas/ReconcileStatusItem"
           },
+          "share_sweep": {
+            "$ref": "#/components/schemas/ShareSweepStatusItem"
+          },
           "subsystems": {
             "items": {
               "$ref": "#/components/schemas/SubsystemHealthItem"
@@ -1341,7 +1344,8 @@
           "disks",
           "reconcile",
           "autograb",
-          "watchlist"
+          "watchlist",
+          "share_sweep"
         ],
         "title": "HealthResponse",
         "type": "object"
@@ -2956,6 +2960,17 @@
             ],
             "title": "Qbittorrent Username"
           },
+          "share_revalidation_interval_hours": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share Revalidation Interval Hours"
+          },
           "tmdb_api_key": {
             "anyOf": [
               {
@@ -3333,6 +3348,19 @@
             ],
             "title": "Qbittorrent Username"
           },
+          "share_revalidation_interval_hours": {
+            "anyOf": [
+              {
+                "maximum": 168.0,
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share Revalidation Interval Hours"
+          },
           "tmdb_api_key": {
             "anyOf": [
               {
@@ -3555,6 +3583,115 @@
           "initialized"
         ],
         "title": "SetupStatusResponse",
+        "type": "object"
+      },
+      "ShareSweepStatusItem": {
+        "description": "The share-revalidation sweep's health (issue #391).\n\n``unknown`` is the field that makes this honest: a sweep that could not reach\nplex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,\nwhich an operator must be able to tell apart from a clean ``ok`` sweep that\nfound everyone still entitled.",
+        "properties": {
+          "authorized": {
+            "default": 0,
+            "title": "Authorized",
+            "type": "integer"
+          },
+          "checked": {
+            "default": 0,
+            "title": "Checked",
+            "type": "integer"
+          },
+          "due_remaining": {
+            "default": 0,
+            "title": "Due Remaining",
+            "type": "integer"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Type"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Ok At"
+          },
+          "last_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run At"
+          },
+          "sessions_revoked": {
+            "default": 0,
+            "title": "Sessions Revoked",
+            "type": "integer"
+          },
+          "share_revoked": {
+            "default": 0,
+            "title": "Share Revoked",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "ok",
+              "degraded",
+              "not_configured",
+              "probe_failed",
+              "error"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "token_stale": {
+            "default": 0,
+            "title": "Token Stale",
+            "type": "integer"
+          },
+          "unknown": {
+            "default": 0,
+            "title": "Unknown",
+            "type": "integer"
+          },
+          "unverifiable": {
+            "default": 0,
+            "title": "Unverifiable",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "ShareSweepStatusItem",
         "type": "object"
       },
       "SubsystemHealthItem": {

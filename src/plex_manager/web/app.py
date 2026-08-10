@@ -14,7 +14,7 @@ import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Final, Literal, cast
 from urllib.parse import quote
@@ -47,6 +47,7 @@ from plex_manager.services import (
     eviction_service,
     import_service,
     log_capture_service,
+    plex_access_service,
     purge_service,
     queue_service,
     retention_telemetry_service,
@@ -74,6 +75,7 @@ from plex_manager.web.deps import (
     EVICTION_INTERVAL_MINUTES_DEFAULT,
     PLEX_MACHINE_ID_SETTING,
     SESSION_COOKIE_NAME,
+    AuthMethod,
     ServiceNotConfiguredError,
     SettingsStore,
     configured_setup_token,
@@ -99,6 +101,7 @@ from plex_manager.web.deps import (
     get_movies_root_optional,
     get_parser,
     get_quality_profile,
+    get_share_revalidation_interval_hours,
     get_tv_root_optional,
     get_watchlist_sync_enabled,
     get_watchlist_sync_interval_minutes,
@@ -110,6 +113,7 @@ from plex_manager.web.deps import (
 from plex_manager.web.errors import install_error_handlers
 from plex_manager.web.events import (
     EventHub,
+    close_realtime_streams,
     current_build_id,
     detect_multiworker_signals,
     get_event_hub,
@@ -1084,6 +1088,117 @@ async def _session_sweep_loop(app: FastAPI) -> None:
         await asyncio.sleep(session_lifecycle.SESSION_SWEEP_INTERVAL_SECONDS)
 
 
+def _get_share_sweep_status(app: FastAPI) -> plex_access_service.ShareSweepStatus:
+    """Return ``app.state.share_sweep_status``, lazily creating it if absent.
+
+    The exact mirror of :func:`_get_autograb_status`: ``lifespan`` creates this
+    once up front, but ``_share_sweep_once`` is also called directly against a
+    bare ``FastAPI()`` in tests.
+    """
+    status = getattr(app.state, "share_sweep_status", None)
+    if not isinstance(status, plex_access_service.ShareSweepStatus):
+        status = plex_access_service.ShareSweepStatus()
+        app.state.share_sweep_status = status
+    return status
+
+
+async def _share_sweep_once(app: FastAPI) -> int:
+    """Re-derive the Plex-share verdict for the users whose turn has come.
+
+    The whole point of issue #391: sessions validate LOCALLY (ADR-0016 keeps
+    plex.tv off the per-request path), so before this loop existed a share
+    revoked upstream kept working here until the session expired -- 7 to 30 days.
+    Revalidating on a schedule cuts that worst case to the configured interval
+    (default 6h). Zero exposure would mean plex.tv on every request, which
+    ADR-0016 rejects; this is the honest middle.
+
+    The tick is thin by design: candidate selection, the verdict ladder, the
+    revocation and the audit row all live in ``plex_access_service`` (no web
+    imports). What is left here is what only the web layer can do -- resolve the
+    configured server, read the operator's interval, and CLOSE the realtime
+    streams of everyone the sweep signed out. That last step is the #183 lesson:
+    stamping ``revoked_at`` alone leaves a revoked user's open SSE connection
+    happily delivering events, so the manual admin revoke path
+    (``auth.revoke_sessions_endpoint``) pairs the two and so must this.
+    """
+    maker = app.state.sessionmaker
+    client = app.state.http_client
+    status = _get_share_sweep_status(app)
+    status.mark_started()
+    async with maker() as session:
+        client_identifier = await auth_router._get_or_create_client_identifier(session)  # pyright: ignore[reportPrivateUsage]
+        # Same create-once discipline as the watchlist tick: commit a just-minted
+        # identifier immediately rather than letting an uncommitted mint register
+        # a fresh plex.tv device on every tick.
+        await session.commit()
+        plex_tv = PlexTvClient(client, client_identifier=client_identifier)
+        # Shared with the watchlist worker deliberately: "which server is this
+        # install pointed at, and can we reach it" has exactly one answer, and a
+        # second copy of the tri-state ladder would be a second place to drift.
+        resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
+        interval_hours = await get_share_revalidation_interval_hours(session)
+    if resolution.probe_error is not None:
+        # Configured but unreachable. Revoke NOBODY: an outage is not evidence
+        # that anyone lost their share (north star #3), and reporting a distinct
+        # state keeps it from being mislabeled as an absence.
+        status.mark_probe_failed(resolution.probe_error)
+        return 0
+    machine_identifier = resolution.machine_identifier
+    if machine_identifier is None:
+        # No configured server and no cached identifier: there is nothing to
+        # revalidate against, so there is no verdict to be had. Also never a
+        # revocation.
+        status.mark_skipped("not_configured")
+        return 0
+    result = await plex_access_service.sweep_shares(
+        maker,
+        plex_tv,
+        machine_identifier,
+        revalidate_after=timedelta(hours=interval_hours),
+        limit=plex_access_service.SHARE_SWEEP_USER_BUDGET,
+    )
+    for user_id in result.signed_out_user_ids:
+        # Mirrors the manual revoke path exactly (auth.revoke_sessions_endpoint):
+        # per-user, plex_session-scoped, so a recovery cookie or another user's
+        # stream is never collateral.
+        close_realtime_streams(
+            app,
+            reason="share_revalidation_signed_out",
+            auth_method=AuthMethod.plex_session.value,
+            user_id=user_id,
+        )
+    status.mark_completed(result)
+    if result.share_revoked or result.token_stale:
+        _logger.info(
+            "share revalidation sweep signed out %s user(s) across %s checked "
+            "(%s revoked share(s), %s stale token(s))",
+            safe_int(len(result.signed_out_user_ids)),
+            safe_int(result.checked),
+            safe_int(result.share_revoked),
+            safe_int(result.token_stale),
+        )
+    return result.checked
+
+
+async def _share_sweep_loop(app: FastAPI) -> None:
+    """Sibling background task re-confirming Plex shares (issue #391).
+
+    Fixed 15-minute wake, unlike ``_watchlist_sync_loop``'s configurable sleep:
+    here the operator-tunable knob (``share_revalidation_interval_hours``) is the
+    per-user DUE cutoff, not the tick cadence, and the tick re-reads it every
+    time -- so a shortened window takes effect within one tick without needing a
+    wake event. Mirrors ``_session_sweep_loop``'s shape otherwise: one bad cycle
+    is caught, recorded on the status, and never allowed to kill the loop.
+    """
+    while True:
+        try:
+            await _share_sweep_once(app)
+        except Exception as exc:
+            _get_share_sweep_status(app).mark_error(exc)
+            _logger.exception("share revalidation sweep tick failed; continuing")
+        await asyncio.sleep(plex_access_service.SHARE_SWEEP_TICK_SECONDS)
+
+
 async def _eviction_tick(app: FastAPI) -> float:
     """Run one destructive eviction pass unless updater maintenance is draining."""
     coordinator = await _ensure_update_coordinator(app)
@@ -1799,6 +1914,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.autograb_wake_event = asyncio.Event()
     app.state.watchlist_status = watchlist_service.WatchlistWorkerStatus()
     app.state.watchlist_wake_event = asyncio.Event()
+    app.state.share_sweep_status = plex_access_service.ShareSweepStatus()
     # In-process grab-pipeline cooldown registry (ADR-0013 round-3 #2), owned here so
     # it survives across auto-grab ticks; a restart clears it, like the health record.
     autograb_cooldowns: auto_grab_service.CooldownRegistry = {}
@@ -1825,6 +1941,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     eviction_task = asyncio.create_task(_eviction_loop(app))
     watchlist_task = asyncio.create_task(_watchlist_sync_loop(app))
     session_sweep_task = asyncio.create_task(_session_sweep_loop(app))
+    # The share-revalidation sweep (issue #391) is a SIBLING of the session
+    # sweep, not a phase of it: that one reclaims dead session ROWS, this one
+    # decides which LIVE sessions have stopped being entitled to exist.
+    share_sweep_task = asyncio.create_task(_share_sweep_loop(app))
     background_tasks = (
         reconcile_task,
         autograb_task,
@@ -1832,6 +1952,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         eviction_task,
         watchlist_task,
         session_sweep_task,
+        share_sweep_task,
     )
     try:
         yield

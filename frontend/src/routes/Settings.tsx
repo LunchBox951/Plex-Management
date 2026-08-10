@@ -103,6 +103,14 @@ function browserTimezone(): string {
 const WATCHLIST_SYNC_ENABLED_DEFAULT = true
 const WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT = 15
 const WATCHLIST_SYNC_INTERVAL_MINUTES_MAX = 10_080
+// Share revalidation (issue #391) — mirrors the backend default/bounds
+// (web/deps.py SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+// web/settings_bounds.py SHARE_REVALIDATION_INTERVAL_HOURS_MIN/MAX). This is
+// the worst-case window in which a Plex share revoked upstream still works
+// here, so the ceiling is a real bound, not a formality.
+const SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT = 6
+const SHARE_REVALIDATION_INTERVAL_HOURS_MIN = 1
+const SHARE_REVALIDATION_INTERVAL_HOURS_MAX = 168
 
 interface FormState {
   plex_url: string
@@ -144,6 +152,7 @@ interface FormState {
   automatic_update_idle_only: boolean
   watchlist_sync_enabled: boolean
   watchlist_sync_interval_minutes: string
+  share_revalidation_interval_hours: string
 }
 
 /** Plaintext fields prefill from current values; secret inputs always start empty. */
@@ -198,6 +207,9 @@ function initialForm(data: SettingsResponse): FormState {
     watchlist_sync_interval_minutes: String(
       data.watchlist_sync_interval_minutes ?? WATCHLIST_SYNC_INTERVAL_MINUTES_DEFAULT,
     ),
+    share_revalidation_interval_hours: String(
+      data.share_revalidation_interval_hours ?? SHARE_REVALIDATION_INTERVAL_HOURS_DEFAULT,
+    ),
   }
 }
 
@@ -220,6 +232,7 @@ type NumberKey =
   | 'eviction_grace_days'
   | 'eviction_interval_minutes'
   | 'watchlist_sync_interval_minutes'
+  | 'share_revalidation_interval_hours'
   | 'log_retention_days'
   | 'log_max_rows'
   | 'auto_grab_interval_seconds'
@@ -241,6 +254,7 @@ const NUMBER_FIELD_LABELS: Record<NumberKey, string> = {
   eviction_grace_days: 'Eviction grace period (days)',
   eviction_interval_minutes: 'Eviction check interval (minutes)',
   watchlist_sync_interval_minutes: 'Watchlist sync interval (minutes)',
+  share_revalidation_interval_hours: 'Plex share re-check interval (hours)',
   log_retention_days: 'Log retention (days)',
   log_max_rows: 'Log retention (max rows)',
   auto_grab_interval_seconds: 'Auto-grab check interval (seconds)',
@@ -992,6 +1006,19 @@ export function Settings() {
       return
     }
 
+    const shareInterval = Number(form.share_revalidation_interval_hours)
+    if (
+      shareInterval < SHARE_REVALIDATION_INTERVAL_HOURS_MIN ||
+      shareInterval > SHARE_REVALIDATION_INTERVAL_HOURS_MAX
+    ) {
+      toast({
+        title: 'Save failed',
+        description: `Plex share re-check interval must be between ${SHARE_REVALIDATION_INTERVAL_HOURS_MIN} and ${SHARE_REVALIDATION_INTERVAL_HOURS_MAX} hours.`,
+        intent: 'error',
+      })
+      return
+    }
+
     if (!isIanaTimezone(form.automatic_update_timezone)) {
       toast({
         title: 'Save failed',
@@ -1088,6 +1115,7 @@ export function Settings() {
       automatic_update_idle_only: form.automatic_update_idle_only,
       watchlist_sync_enabled: form.watchlist_sync_enabled,
       watchlist_sync_interval_minutes: Number(form.watchlist_sync_interval_minutes),
+      share_revalidation_interval_hours: Number(form.share_revalidation_interval_hours),
     }
     if (form.plex_token) body.plex_token = form.plex_token
     if (form.prowlarr_api_key) body.prowlarr_api_key = form.prowlarr_api_key
@@ -1528,6 +1556,22 @@ export function Settings() {
               'Watchlist sync interval (minutes)',
               { min: 0.1, max: WATCHLIST_SYNC_INTERVAL_MINUTES_MAX, step: 0.1 },
             )}
+            {numberField(
+              'share_revalidation_interval_hours',
+              'Plex share re-check interval (hours)',
+              {
+                min: SHARE_REVALIDATION_INTERVAL_HOURS_MIN,
+                max: SHARE_REVALIDATION_INTERVAL_HOURS_MAX,
+                step: 1,
+              },
+            )}
+            <p className="text-xs text-faint">
+              How often each signed-in user’s Plex share is re-confirmed with plex.tv. Sessions are
+              checked locally on every request, so this is the worst case for how long someone whose
+              share you removed in Plex keeps access here — shorter closes that window sooner, at
+              the cost of more plex.tv calls. Anyone whose share is gone is signed out
+              automatically, with the reason recorded.
+            </p>
           </div>
         </section>
 

@@ -22,19 +22,25 @@ not-yet-refreshed credential, while a share genuinely revoked is a stronger,
 actionable signal. :class:`ShareVerdict` keeps them apart as ``TOKEN_STALE``
 and ``SHARE_REVOKED``.
 
-This module owns policy only -- no web imports, no enforcement, no callers
-that act on a verdict. ``deps``/routers/``app`` (and, later, the session sweep)
-depend on this module; it never depends on them, mirroring the discipline in
-``session_lifecycle.py``. This PR (stage 1 of the design) wires nothing new
-up: nothing calls :func:`check_share` yet outside its delegate and tests, no
-loop reads or writes ``users.share_state``, and no route enforces anything
-based on it.
+This module owns policy only -- no web imports. ``deps``/routers/``app`` depend
+on this module; it never depends on them, mirroring the discipline in
+``session_lifecycle.py``. Stage 2 of the design (#391 PR-2) adds the periodic
+revalidation sweep (:func:`sweep_shares`) that turns a verdict into persisted
+state and, on a confirmed loss, into a sign-out; ``web/app.py`` owns only the
+task that ticks it and the realtime-stream close that the web layer alone can
+perform. Section-entitlement CAPTURE is still #484 scope (PR-3): this module
+reads verdicts, never section keys.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import Enum
+from typing import TYPE_CHECKING, Literal
+
+from sqlalchemy import func, or_, select
 
 from plex_manager.adapters.plex.oauth import (
     CODE_TOKEN_INVALID,
@@ -42,12 +48,47 @@ from plex_manager.adapters.plex.oauth import (
     PlexVerifyError,
     account_server_resource,
 )
+from plex_manager.logsafe import safe_int
+from plex_manager.models import AuthSession, User
+from plex_manager.services import audit_service, session_lifecycle
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from sqlalchemy.sql.elements import ColumnElement
 
 __all__ = [
+    "SHARE_SWEEP_TICK_SECONDS",
+    "SHARE_SWEEP_USER_BUDGET",
     "EntitlementSnapshot",
+    "ShareSweepResult",
+    "ShareSweepStatus",
     "ShareVerdict",
+    "ShareVerdictOutcome",
+    "apply_share_verdict",
     "check_share",
+    "count_due_share_checks",
+    "list_due_share_checks",
+    "sweep_shares",
 ]
+
+_logger = logging.getLogger(__name__)
+
+# How often ``web/app.py``'s ``_share_sweep_loop`` wakes. Deliberately SHORTER
+# than the per-user revalidation interval (``share_revalidation_interval_hours``,
+# default 6h): the tick is the polling granularity, the interval is the policy.
+# A 15-minute wake means a user whose 6h is up waits at most 15 more minutes,
+# while the per-tick budget below keeps the plex.tv load an order of magnitude
+# BELOW the watchlist worker's (which already runs the same ``fetch_resources``
+# probe for every token-bearing user every 15 minutes and throws the verdict
+# away).
+SHARE_SWEEP_TICK_SECONDS: float = 900.0
+
+# The most users one tick will revalidate. Strictly sequential (never gathered):
+# 20 serial plex.tv calls is a trickle, and a burst of parallel calls against
+# plex.tv from a self-hosted install is exactly what ADR-0016 keeps off the
+# request path. A backlog beyond this budget is not dropped -- it is reported as
+# ``ShareSweepStatus.due_remaining`` and drains over subsequent ticks.
+SHARE_SWEEP_USER_BUDGET: int = 20
 
 
 class ShareVerdict(Enum):
@@ -159,4 +200,432 @@ async def check_share(
         )
     return EntitlementSnapshot(
         verdict=ShareVerdict.AUTHORIZED, section_keys=None, machine_identifier=machine_identifier
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Periodic revalidation sweep (issue #391 PR-2)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ShareVerdictOutcome:
+    """What :func:`apply_share_verdict` actually did for one user.
+
+    ``applied`` is ``False`` only for the mid-sweep re-sign-in guard: the stored
+    token changed between due-selection and this write, so the verdict describes
+    a credential the user no longer holds and NOTHING was written. Never a
+    failure -- the next tick re-checks the new token.
+    """
+
+    applied: bool
+    signed_out: bool
+    sessions_revoked: int
+
+
+@dataclass(frozen=True)
+class ShareSweepResult:
+    """One tick's tally, the input to :meth:`ShareSweepStatus.mark_completed`.
+
+    ``signed_out_user_ids`` is returned rather than acted on here on purpose:
+    closing a signed-out user's open SSE stream needs the FastAPI app object
+    (``web.events.close_realtime_streams``), and this module must never import
+    the web layer. The caller owns that half of the revocation -- see
+    ``web/app.py:_share_sweep_once``, and issue #183 for why skipping it leaves
+    a revoked user's realtime stream alive and still delivering.
+    """
+
+    checked: int = 0
+    authorized: int = 0
+    share_revoked: int = 0
+    token_stale: int = 0
+    unknown: int = 0
+    unverifiable: int = 0
+    skipped: int = 0
+    sessions_revoked: int = 0
+    due_remaining: int = 0
+    signed_out_user_ids: tuple[int, ...] = ()
+    last_error_type: str | None = None
+
+
+@dataclass
+class ShareSweepStatus:
+    """Operator-facing health of the share-revalidation sweep.
+
+    Modeled on ``watchlist_service.WatchlistWorkerStatus`` (same state ladder,
+    same "a tick that could not do its job never claims ok" discipline), because
+    the two workers fail in the same ways: the configured server can be absent
+    (``not_configured``), present but unreachable (``probe_failed``), or the tick
+    can die outright (``error``).
+
+    The honesty rule this type exists to enforce (north star #3): a transient
+    plex.tv failure is a DEGRADED sweep with a visible ``unknown`` count -- never
+    a revocation, and never a silent ``ok``. An operator reading /health must be
+    able to tell "nobody lost access" from "we could not tell whether anybody
+    lost access".
+    """
+
+    state: Literal["starting", "ok", "degraded", "not_configured", "probe_failed", "error"] = field(
+        default="starting"
+    )
+    last_run_at: datetime | None = field(default=None)
+    last_ok_at: datetime | None = field(default=None)
+    last_error_type: str | None = field(default=None)
+    last_error_at: datetime | None = field(default=None)
+    checked: int = field(default=0)
+    authorized: int = field(default=0)
+    share_revoked: int = field(default=0)
+    token_stale: int = field(default=0)
+    unknown: int = field(default=0)
+    unverifiable: int = field(default=0)
+    sessions_revoked: int = field(default=0)
+    due_remaining: int = field(default=0)
+    """Users still due a revalidation after this tick spent its budget. A
+    persistently non-zero value is the operator's signal that the backlog drains
+    slower than it accumulates (i.e. the effective interval is longer than the
+    configured one), which would otherwise be invisible."""
+
+    def _reset_counters(self) -> None:
+        self.checked = self.authorized = self.share_revoked = self.token_stale = 0
+        self.unknown = self.unverifiable = self.sessions_revoked = self.due_remaining = 0
+
+    def mark_started(self) -> None:
+        self.last_run_at = datetime.now(UTC)
+
+    def mark_skipped(self, state: Literal["not_configured"]) -> None:
+        """Record a tick that intentionally did no work (nothing to check against)."""
+        self.state = state
+        self.last_error_type = None
+        self.last_error_at = None
+        self._reset_counters()
+
+    def mark_probe_failed(self, exc: PlexVerifyError) -> None:
+        """The Plex server IS configured but its identity probe failed.
+
+        Distinct from ``not_configured`` (an absence) and from ``error`` (an
+        exception that escaped the tick): a known, actionable outage that
+        self-heals on the next successful probe -- and one that revoked nobody.
+        """
+        self.state = "probe_failed"
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = datetime.now(UTC)
+        self._reset_counters()
+
+    def mark_completed(self, result: ShareSweepResult) -> None:
+        # UNKNOWN verdicts degrade the tick exactly as watchlist's skipped users
+        # do: the sweep ran but could not answer for someone, so it has NOT
+        # succeeded and must not advance ``last_ok_at``. Confirmed revocations
+        # and stale tokens do NOT degrade it -- those are the sweep working.
+        self.state = "degraded" if result.unknown or result.last_error_type else "ok"
+        if self.state == "ok":
+            self.last_ok_at = datetime.now(UTC)
+        self.checked = result.checked
+        self.authorized = result.authorized
+        self.share_revoked = result.share_revoked
+        self.token_stale = result.token_stale
+        self.unknown = result.unknown
+        self.unverifiable = result.unverifiable
+        self.sessions_revoked = result.sessions_revoked
+        self.due_remaining = result.due_remaining
+        self.last_error_type = result.last_error_type
+        self.last_error_at = datetime.now(UTC) if result.last_error_type is not None else None
+
+    def mark_error(self, exc: BaseException) -> None:
+        self.state = "error"
+        self.last_error_type = type(exc).__name__
+        self.last_error_at = datetime.now(UTC)
+        self._reset_counters()
+
+
+def _due_predicate(now: datetime, revalidate_after: timedelta) -> ColumnElement[bool]:
+    """Users whose share verdict has never been computed, or has aged out."""
+    cutoff = now - revalidate_after
+    return or_(User.share_checked_at.is_(None), User.share_checked_at < cutoff)
+
+
+def _holds_live_session(now: datetime) -> ColumnElement[bool]:
+    """EXISTS a still-usable browser session for this user.
+
+    The predicate is the EXACT one the admin sessions list uses
+    (``web.routers.auth.list_active_sessions_endpoint``): not revoked, not past
+    the absolute ``expires_at`` cap, not idled out past
+    :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Scoping the sweep to it keeps
+    the plex.tv load proportional to who is actually SIGNED IN rather than to
+    every account that ever signed in -- and revoking the sessions of a user who
+    holds none would be a no-op anyway. Recovery sessions (``user_id`` NULL, no
+    Plex identity) can never satisfy the join, so the break-glass credential is
+    structurally out of this sweep's reach.
+    """
+    idle_cutoff = now - session_lifecycle.SESSION_IDLE_WINDOW
+    return (
+        select(AuthSession.id)
+        .where(
+            AuthSession.user_id == User.id,
+            AuthSession.revoked_at.is_(None),
+            AuthSession.expires_at > now,
+            func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
+        )
+        .exists()
+    )
+
+
+async def list_due_share_checks(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    revalidate_after: timedelta,
+    limit: int,
+) -> list[User]:
+    """The next (at most ``limit``) signed-in users due a share revalidation.
+
+    Ordered oldest-check-first with never-checked users ahead of everyone
+    (``NULLS FIRST`` stated explicitly, since PostgreSQL sorts NULLs LAST on ASC
+    while SQLite sorts them first). ``share_check_failed_at`` breaks the tie so a
+    user whose check just came back UNKNOWN -- which deliberately does NOT stamp
+    ``share_checked_at``, keeping them due -- rotates to the BACK of the equally
+    -due queue instead of monopolising every tick's budget during a plex.tv
+    outage and starving users who have never been checked at all.
+    """
+    stmt = (
+        select(User)
+        .where(_holds_live_session(now), _due_predicate(now, revalidate_after))
+        .order_by(
+            User.share_checked_at.asc().nulls_first(),
+            User.share_check_failed_at.asc().nulls_first(),
+            User.id,
+        )
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def count_due_share_checks(
+    session: AsyncSession, *, now: datetime, revalidate_after: timedelta
+) -> int:
+    """How many signed-in users are due a revalidation right now (backlog size)."""
+    stmt = (
+        select(func.count())
+        .select_from(User)
+        .where(_holds_live_session(now), _due_predicate(now, revalidate_after))
+    )
+    return (await session.execute(stmt)).scalar_one()
+
+
+def _clear_entitlements(user: User) -> None:
+    """Drop a captured section snapshot that a confirmed revoke has invalidated.
+
+    Back to the tri-state ``NULL`` ("never captured"), never ``[]`` ("captured,
+    entitled to nothing"): a revoked share tells us nothing about which sections
+    the account could see, so recording an authoritative empty capture would be a
+    lie the #484 enforcement sites would later act on.
+    """
+    user.entitled_section_keys = None
+    user.entitlements_machine_id = None
+
+
+async def apply_share_verdict(
+    session: AsyncSession,
+    user: User,
+    snapshot: EntitlementSnapshot,
+    *,
+    expected_token: str | None,
+    now: datetime,
+) -> ShareVerdictOutcome:
+    """Persist one verdict -- and, on a confirmed loss, sign the user out.
+
+    The verdict -> action table (all five ratified on issue #391; do not collapse
+    any two of them):
+
+    * ``AUTHORIZED`` -- stamp state + checked-at, reset the failure counter.
+      Nothing else: section capture is #484 scope (PR-3), so the entitlement
+      columns are never WRITTEN here.
+    * ``SHARE_REVOKED`` -- plex.tv answered authoritatively that the account no
+      longer reaches this server. Revoke every session, clear the entitlement
+      snapshot, and write an ``AuditLog`` row saying so, so "why was I signed
+      out?" is answerable from the UI without a terminal.
+    * ``TOKEN_STALE`` -- ALSO signs the user out (ratified), because a dead
+      credential means we can no longer verify them at all. Labeled distinctly in
+      both ``share_state`` and the audit description: the Plex sign-in expired,
+      access was NOT removed. Entitlements are RETAINED -- nothing disproved them.
+    * ``UNKNOWN`` -- a transient plex.tv failure. NEVER revokes. Increments the
+      failure counter and stamps ``share_check_failed_at``; ``share_state`` and
+      ``share_checked_at`` are deliberately left alone, so the last KNOWN verdict
+      survives the outage and the user stays due for a prompt retry.
+    * ``UNVERIFIABLE`` -- no stored token to check. Stamp the state only; there is
+      nothing to revoke and nothing was disproved.
+
+    ``expected_token`` closes the mid-sweep re-sign-in race: the verdict was
+    computed against the token read during due-selection, and a user who signed
+    in again since then holds a NEW token this verdict says nothing about.
+    Re-reading it inside this transaction and refusing to act on a mismatch means
+    a fresh sign-in is never signed straight back out (the same guard shape as
+    ``watchlist_service.clear_user_snapshot``'s ``expected_token``).
+    """
+    if user.encrypted_plex_token != expected_token:
+        _logger.info(
+            "share revalidation skipped for user_id=%s: the stored Plex token changed "
+            "since this tick selected them; re-checking on a later tick",
+            safe_int(user.id),
+        )
+        return ShareVerdictOutcome(applied=False, signed_out=False, sessions_revoked=0)
+
+    verdict = snapshot.verdict
+    if verdict is ShareVerdict.UNKNOWN:
+        # Fail OPEN, loudly. Leaving share_state/share_checked_at untouched is
+        # the point: a plex.tv outage must not overwrite the last real verdict,
+        # and the user must stay due so the answer is re-sought promptly.
+        user.share_check_failures += 1
+        user.share_check_failed_at = now
+        await session.flush()
+        _logger.warning(
+            "share revalidation could not be determined for user_id=%s "
+            "(consecutive failures: %s); retaining existing access",
+            safe_int(user.id),
+            safe_int(user.share_check_failures),
+        )
+        return ShareVerdictOutcome(applied=True, signed_out=False, sessions_revoked=0)
+
+    previous_state = user.share_state
+    user.share_state = verdict.value
+    user.share_checked_at = now
+    # Any verdict that is not UNKNOWN is a definitive answer, so the
+    # consecutive-could-not-determine streak ends here (see the column comment on
+    # ``User.share_check_failures``).
+    user.share_check_failures = 0
+    user.share_check_failed_at = None
+
+    if verdict is ShareVerdict.AUTHORIZED or verdict is ShareVerdict.UNVERIFIABLE:
+        await session.flush()
+        return ShareVerdictOutcome(applied=True, signed_out=False, sessions_revoked=0)
+
+    if verdict is ShareVerdict.SHARE_REVOKED:
+        _clear_entitlements(user)
+        action_type = "user.share_revoked"
+        description = (
+            "Automatic share revalidation: this Plex account no longer has access to the "
+            "configured server, so every browser session was signed out."
+        )
+    else:  # ShareVerdict.TOKEN_STALE
+        # Deliberately NOT "access removed": plex.tv rejected the credential
+        # before it could say anything about the share. Same machinery, honest
+        # (and different) words -- the operator-facing distinction the design
+        # ratified.
+        action_type = "user.plex_sign_in_expired"
+        description = (
+            "Automatic share revalidation: token stale -- this account's Plex sign-in expired, "
+            "so its access could no longer be verified and every browser session was signed "
+            "out. Access to the server was not removed; signing in with Plex again restores it."
+        )
+
+    revoked = await session_lifecycle.revoke_user_sessions(session, user.id, now=now)
+    await audit_service.record(
+        session,
+        actor_user_id=None,
+        action_type=action_type,
+        entity_type="user",
+        entity_id=user.id,
+        old_value={"share_state": previous_state},
+        new_value={"share_state": verdict.value, "sessions_revoked": revoked},
+        description=description,
+    )
+    _logger.info(
+        "share revalidation signed out user_id=%s (%s); revoked %s session(s)",
+        safe_int(user.id),
+        verdict.value,
+        safe_int(revoked),
+    )
+    return ShareVerdictOutcome(applied=True, signed_out=True, sessions_revoked=revoked)
+
+
+async def sweep_shares(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    plex_tv: PlexTvClient,
+    machine_identifier: str,
+    *,
+    revalidate_after: timedelta,
+    limit: int = SHARE_SWEEP_USER_BUDGET,
+    now: datetime | None = None,
+) -> ShareSweepResult:
+    """Revalidate up to ``limit`` due users, strictly sequentially.
+
+    This is the whole of #391's answer to "a revoked Plex share keeps API access
+    for 7-30 days": the exposure window becomes the revalidation interval
+    (default 6h) instead of the session lifetime. Zero exposure would require
+    plex.tv on the per-request path, which ADR-0016 rejects.
+
+    Takes a ``sessionmaker`` rather than a session because each user's plex.tv
+    call is real network latency: one transaction spanning 20 serial calls would
+    hold a write lock for the length of the whole sweep. Selection runs in its
+    own short transaction, each verdict is applied and committed in its own, and
+    the network calls happen BETWEEN transactions -- which is also why
+    :func:`apply_share_verdict` re-checks the token it was selected with.
+
+    One user's failure never ends the sweep: an unexpected exception is counted,
+    surfaced through ``last_error_type`` (degrading the tick), and the remaining
+    users are still checked.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    async with sessionmaker() as session:
+        due_total = await count_due_share_checks(
+            session, now=moment, revalidate_after=revalidate_after
+        )
+        candidates = [
+            (user.id, user.encrypted_plex_token)
+            for user in await list_due_share_checks(
+                session, now=moment, revalidate_after=revalidate_after, limit=limit
+            )
+        ]
+
+    tallies: dict[ShareVerdict, int] = dict.fromkeys(ShareVerdict, 0)
+    checked = 0
+    skipped = 0
+    sessions_revoked = 0
+    signed_out: list[int] = []
+    last_error: str | None = None
+
+    for user_id, token in candidates:
+        try:
+            snapshot = await check_share(plex_tv, machine_identifier, token=token)
+        except Exception as exc:  # pragma: no cover - defensive; check_share maps its own errors
+            last_error = type(exc).__name__
+            _logger.warning(
+                "share revalidation errored for user_id=%s (%s); leaving access unchanged",
+                safe_int(user_id),
+                type(exc).__name__,
+            )
+            continue
+        async with sessionmaker() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                # Deleted between selection and now -- nothing to stamp, and no
+                # sessions left to revoke (the FK cascades).
+                skipped += 1
+                continue
+            outcome = await apply_share_verdict(
+                session,
+                user,
+                snapshot,
+                expected_token=token,
+                now=datetime.now(UTC),
+            )
+            await session.commit()
+        if not outcome.applied:
+            skipped += 1
+            continue
+        checked += 1
+        tallies[snapshot.verdict] += 1
+        sessions_revoked += outcome.sessions_revoked
+        if outcome.signed_out:
+            signed_out.append(user_id)
+
+    return ShareSweepResult(
+        checked=checked,
+        authorized=tallies[ShareVerdict.AUTHORIZED],
+        share_revoked=tallies[ShareVerdict.SHARE_REVOKED],
+        token_stale=tallies[ShareVerdict.TOKEN_STALE],
+        unknown=tallies[ShareVerdict.UNKNOWN],
+        unverifiable=tallies[ShareVerdict.UNVERIFIABLE],
+        skipped=skipped,
+        sessions_revoked=sessions_revoked,
+        due_remaining=max(due_total - len(candidates), 0),
+        signed_out_user_ids=tuple(signed_out),
+        last_error_type=last_error,
     )

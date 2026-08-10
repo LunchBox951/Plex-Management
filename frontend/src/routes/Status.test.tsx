@@ -79,6 +79,21 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       failed_entries: 0,
       skipped_users: 0,
     },
+    share_sweep: {
+      state: 'ok',
+      last_run_at: '2026-01-01T00:00:00Z',
+      last_ok_at: '2026-01-01T00:00:00Z',
+      last_error_type: null,
+      last_error_at: null,
+      checked: 0,
+      authorized: 0,
+      share_revoked: 0,
+      token_stale: 0,
+      unknown: 0,
+      unverifiable: 0,
+      sessions_revoked: 0,
+      due_remaining: 0,
+    },
     ...overrides,
   }
 }
@@ -201,7 +216,8 @@ describe('Status', () => {
     expect(screen.getByRole('heading', { level: 3, name: 'movies_root' })).toBeInTheDocument()
 
     const cards = container.querySelectorAll('article')
-    expect(cards).toHaveLength(8)
+    // 8 before the share re-check panel joined the background-loop row (#391).
+    expect(cards).toHaveLength(9)
     for (const card of cards) {
       expect(card).toHaveClass(
         'rounded-[10px]',
@@ -954,6 +970,21 @@ describe('Status', () => {
           failed_entries: 0,
           skipped_users: 0,
         },
+        share_sweep: {
+          state: 'starting',
+          last_run_at: null,
+          last_ok_at: null,
+          last_error_type: null,
+          last_error_at: null,
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          sessions_revoked: 0,
+          due_remaining: 0,
+        },
       }),
       isLoading: false,
       isError: false,
@@ -965,8 +996,8 @@ describe('Status', () => {
 
     // Never — a fresh boot must not read as "clean" just because failures==0.
     expect(screen.queryByText('running clean')).not.toBeInTheDocument()
-    // All three background panels show the honest "starting up".
-    expect(screen.getAllByText('starting up')).toHaveLength(3)
+    // All four background panels show the honest "starting up".
+    expect(screen.getAllByText('starting up')).toHaveLength(4)
     // Both "Last run" and "Last success" render the same honest placeholder.
     const neverValues = screen.getAllByText('never')
     expect(neverValues.length).toBeGreaterThan(0)
@@ -1088,6 +1119,104 @@ describe('Status', () => {
     expect(lastRun).not.toHaveTextContent('never')
     expect(lastSuccess).not.toHaveTextContent('never')
     expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
+  })
+
+  it('distinguishes an undetermined share re-check from an actual sign-out', () => {
+    // The honesty case (issue #391): plex.tv was unreachable for two users, so
+    // the sweep revoked NOBODY. If the panel let that read like a clean run —
+    // or like a revocation — the operator would draw the wrong conclusion from
+    // the one screen they have.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'degraded',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 5,
+          authorized: 3,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 2,
+          unverifiable: 0,
+          sessions_revoked: 0,
+          due_remaining: 4,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const heading = screen.getByRole('heading', { name: 'Plex share re-check' })
+    const panel = heading.closest('article')
+    expect(panel).not.toBeNull()
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('degraded')).toBeInTheDocument()
+
+    const undetermined = sweep.getByText('Undetermined').nextElementSibling
+    expect(undetermined).toHaveTextContent('2')
+    expect(undetermined).toHaveClass('font-semibold', 'text-searching')
+
+    // Nobody lost access, and the panel must say so plainly.
+    const signedOut = sweep.getByText('Signed out').nextElementSibling
+    expect(signedOut).toHaveTextContent('0')
+    expect(signedOut).not.toHaveClass('text-searching')
+
+    // The backlog the per-tick budget could not reach stays visible.
+    expect(sweep.getByText('Still due').nextElementSibling).toHaveTextContent('4')
+    // A degraded tick must not overwrite the last genuinely successful run.
+    const lastRun = sweep.getByText('Last run').nextElementSibling
+    const lastSuccess = sweep.getByText('Last success').nextElementSibling
+    expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
+  })
+
+  it('counts revoked shares and stale tokens together as sign-outs', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 4,
+          authorized: 1,
+          share_revoked: 2,
+          token_stale: 1,
+          unknown: 0,
+          unverifiable: 0,
+          sessions_revoked: 5,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    // A sweep that revoked people is the worker WORKING, not failing.
+    expect(sweep.getByText('running clean')).toBeInTheDocument()
+    const signedOut = sweep.getByText('Signed out').nextElementSibling
+    expect(signedOut).toHaveTextContent('3')
+    expect(signedOut).toHaveClass('font-semibold', 'text-searching')
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {

@@ -605,6 +605,98 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
   )
 }
 
+/** The periodic Plex-share revalidation sweep (issue #391).
+ *
+ * The counters are what make it honest: `unknown` is a plex.tv failure that
+ * revoked nobody, `signed out` is people the sweep actually cut off, and
+ * `still due` is the backlog the per-tick budget could not reach. A degraded
+ * sweep with a non-zero `unknown` and zero sign-outs is a very different fact
+ * from a clean one, and the operator must be able to see which they have.
+ */
+function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
+  const tone: DotTone =
+    sweep.state === 'ok'
+      ? 'ok'
+      : sweep.state === 'degraded' || sweep.state === 'probe_failed'
+        ? 'warn'
+        : sweep.state === 'error'
+          ? 'error'
+          : 'neutral'
+  const label =
+    sweep.state === 'starting'
+      ? 'starting up'
+      : sweep.state === 'ok'
+        ? 'running clean'
+        : sweep.state.replace('_', ' ')
+  return (
+    <article
+      className={cn(
+        'min-w-0 rounded-[10px] border border-hairline bg-surface',
+        adminRowPadding,
+      )}
+    >
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <h3 className="min-w-0 font-display text-sm font-semibold text-ink">
+          Plex share re-check
+        </h3>
+        <div className="shrink-0">
+          <Dot tone={tone} label={label} />
+        </div>
+      </div>
+      <dl className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-1.5 font-mono text-xs">
+        <dt className="min-w-0 text-faint">Last run</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(sweep.last_run_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Last success</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {formatTimestamp(sweep.last_ok_at)}
+        </dd>
+        <dt className="min-w-0 text-faint">Checked</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.checked}
+        </dd>
+        <dt className="min-w-0 text-faint">Still entitled</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.authorized}
+        </dd>
+        <dt className="min-w-0 text-faint">Signed out</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            sweep.share_revoked + sweep.token_stale > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {sweep.share_revoked + sweep.token_stale}
+        </dd>
+        {/* A transient plex.tv failure is the one outcome that must never be
+            mistaken for a revocation — it is why the tick reads degraded. */}
+        <dt className="min-w-0 text-faint">Undetermined</dt>
+        <dd
+          className={cn(
+            'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
+            sweep.unknown > 0 ? 'font-semibold text-searching' : '',
+          )}
+        >
+          {sweep.unknown}
+        </dd>
+        <dt className="min-w-0 text-faint">Still due</dt>
+        <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+          {sweep.due_remaining}
+        </dd>
+        {sweep.last_error_type ? (
+          <>
+            <dt className="min-w-0 text-faint">Last error</dt>
+            <dd className="min-w-0 text-right text-error tabular-nums [overflow-wrap:anywhere]">
+              {sweep.last_error_type} · {formatTimestamp(sweep.last_error_at)}
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    </article>
+  )
+}
+
 /** One configured library root: a usage bar, plus a ranked preview of what a
  * pressure sweep WOULD evict from it (never evicts anything itself — the
  * preview lists every eligible title regardless of current pressure, so the
@@ -1015,6 +1107,7 @@ export function Status() {
             <ReconcilePanel reconcile={health.data.reconcile} />
             <AutograbPanel autograb={health.data.autograb} />
             <WatchlistPanel watchlist={health.data.watchlist} />
+            <ShareSweepPanel sweep={health.data.share_sweep} />
           </div>
         </section>
       ) : null}
