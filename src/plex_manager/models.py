@@ -267,6 +267,43 @@ class User(Base):
     permissions: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Entitlement / share-state snapshot (issue #391, #484 design, PR-1: schema
+    # only -- nothing writes or reads these columns yet). Populated by a future
+    # sweep built on ``plex_access_service.check_share``.
+    #
+    # ``entitled_section_keys`` is tri-state: ``NULL`` means library sections
+    # have never been captured for this user (the state every row starts and
+    # stays in until a later PR wires up capture); ``[]`` means a capture pass
+    # ran and found the account entitled to zero sections. Collapsing those two
+    # would make "never captured" indistinguishable from "captured, entitled to
+    # nothing" -- the same tri-state discipline as
+    # ``plex_access_service.EntitlementSnapshot.section_keys``.
+    #
+    # ``none_as_null=True`` is load-bearing for that tri-state (and a deliberate
+    # deviation from the repo's other bare ``sa.JSON`` columns, none of which
+    # distinguish NULL from a JSON value): bare ``sa.JSON`` stores an assigned
+    # ``None`` as the JSON text ``'null'``, which a ``WHERE entitled_section_keys
+    # IS NULL`` reset-to-never-captured query would silently miss.
+    entitled_section_keys: Mapped[list[str] | None] = mapped_column(sa.JSON(none_as_null=True))
+    # The configured server's ``machineIdentifier`` the snapshot above was
+    # captured against, so a stale snapshot from a since-repointed server is
+    # never mistaken for one that matches today's configuration.
+    entitlements_machine_id: Mapped[str | None] = mapped_column(String)
+    # Lowercase ``plex_access_service.ShareVerdict`` name from the most recent
+    # check (e.g. ``"authorized"``, ``"share_revoked"``); ``NULL`` until a
+    # sweep runs.
+    share_state: Mapped[str | None] = mapped_column(String, index=True)
+    # When ``share_state`` was last (re)computed.
+    share_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # Consecutive failed-to-determine (UNKNOWN) checks since the last non-UNKNOWN
+    # verdict; a future sweep's backoff signal. ``sa.text("0")`` (not
+    # ``sa.false()``) renders the dialect's integer-zero literal, matching the
+    # ``permissions`` column's convention above.
+    share_check_failures: Mapped[int] = mapped_column(default=0, server_default=sa.text("0"))
+    # When ``share_check_failures`` was last incremented (i.e. the most recent
+    # UNKNOWN verdict), independent of ``share_checked_at`` which advances on
+    # every check including a successful one.
+    share_check_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Setting(Base):

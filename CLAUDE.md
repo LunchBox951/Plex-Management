@@ -11,10 +11,11 @@ into a single app. It is a ground-up rewrite of the `prototype/` service. Read
 [`docs/design/overview.md`](docs/design/overview.md) first; every major decision
 has an ADR under [`docs/adr/`](docs/adr/).
 
-Status: v1 beta, feature-complete — the request → watchable → correct loop for
-movies, TV, and anime is built and tested. The 7-day live canary run (Jul 25 -
-Aug 1, 2026) is complete; 1.0.0 was promoted to `:stable` on Aug 9, 2026.
-v1.x feature work is still gated on explicit tasking.
+Status: 1.0.0 released — promoted to `:stable` on Aug 9, 2026 after the 7-day
+live canary run (Jul 25 - Aug 1, 2026) and a renewed soak. The request →
+watchable → correct loop for movies, TV, and anime is built and tested; `:edge`
+remains the canary channel. v1.x feature work is still gated on explicit
+tasking.
 
 ## North stars (don't violate these)
 

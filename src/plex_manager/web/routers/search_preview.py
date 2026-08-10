@@ -155,7 +155,7 @@ async def _resolve_descriptor(
         )
     if body.tmdb_id is None or body.media_type is None or body.title is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="request_id_or_descriptor_required",
         )
     return body.tmdb_id, body.title, body.media_type, body.year, body.season, body.episodes
@@ -210,11 +210,11 @@ async def run_preview(
     if media_type == "tv":
         if season is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="tv_grab_requires_season"
             )
     elif season is not None or episodes:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="movie_grab_rejects_season"
         )
     return await decision_service.preview(
         prowlarr,

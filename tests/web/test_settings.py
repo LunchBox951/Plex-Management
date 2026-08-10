@@ -815,10 +815,10 @@ async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
     cookies, csrf = await _admin_session_cookies(app, plex_id=9205, tag="typo")
     await _use_transport(app, _unreachable_transport())
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://typo-wrong-host:32400", "plex_token": _SEED_PLEX_TOKEN},
-        cookies=cookies,
         headers=csrf,
     )
 
@@ -829,7 +829,7 @@ async def test_put_unreachable_new_plex_url_is_502_and_commits_nothing(
     assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
     assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
     # The caller's session still works — they can immediately fix the typo.
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def test_put_masked_and_unchanged_plex_values_keep_cached_machine_id(
@@ -868,17 +868,17 @@ async def test_put_url_change_with_no_stored_token_skips_probe_and_keeps_session
     cookies, csrf = await _admin_session_cookies(app, plex_id=9206, tag="half")
     await _use_transport(app, _no_probe_transport())
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://new:32400"},
-        cookies=cookies,
         headers=csrf,
     )
 
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) is None  # stale anchor dropped
     assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def _active_session_count(sessionmaker_: SessionMaker) -> int:
@@ -919,10 +919,10 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
         ),
     )
 
+    client.cookies.update(admin_cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
 
@@ -939,9 +939,12 @@ async def test_put_plex_repoint_revokes_every_active_session_including_the_calle
     assert ownership and ownership[0].headers.get("X-Plex-Token") == _SEED_OAUTH_TOKEN
 
     # Both old-server sessions must re-sign-in against the NEW server.
-    assert (await client.get("/api/v1/settings", cookies=admin_cookies)).status_code == 401
-    assert (await client.get("/api/v1/settings", cookies=other_cookies)).status_code == 401
+    assert (await client.get("/api/v1/settings")).status_code == 401
+    client.cookies.clear()
+    client.cookies.update(other_cookies)
+    assert (await client.get("/api/v1/settings")).status_code == 401
     # The X-Api-Key recovery path is untouched — the repoint never locks the API out.
+    client.cookies.clear()
     assert (
         await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     ).status_code == 200
@@ -960,10 +963,10 @@ async def test_put_reachable_but_unauthorized_token_is_422_and_commits_nothing(
     cookies, csrf = await _admin_session_cookies(app, plex_id=9207, tag="badtoken")
     await _use_transport(app, _repoint_transport(identity="NEW-MID", authorized=False))
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
-        cookies=cookies,
         headers=csrf,
     )
 
@@ -973,7 +976,7 @@ async def test_put_reachable_but_unauthorized_token_is_422_and_commits_nothing(
         assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
     assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
     assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def test_put_session_admin_repoint_to_non_owned_server_is_403(
@@ -993,10 +996,10 @@ async def test_put_session_admin_repoint_to_non_owned_server_is_403(
         _repoint_transport(identity="NEW-MID", resources=[_shared_resource("NEW-MID")]),
     )
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://new:32400", "plex_token": _SEED_PLEX_TOKEN},
-        cookies=cookies,
         headers=csrf,
     )
 
@@ -1006,7 +1009,7 @@ async def test_put_session_admin_repoint_to_non_owned_server_is_403(
         assert await SettingsStore(session).get("plex_url") == "http://old:32400"  # unchanged
     assert await _stored_machine_id(sessionmaker_) == "OLD-MID"  # unchanged
     assert await _active_session_count(sessionmaker_) == 1  # nobody signed out
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
@@ -1032,8 +1035,10 @@ async def test_put_api_key_repoint_skips_ownership_and_still_revokes(
     assert put.status_code == 200
     assert await _stored_machine_id(sessionmaker_) == "NEW-MID"
     assert await _active_session_count(sessionmaker_) == 0  # browser sessions revoked
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 401
+    client.cookies.update(cookies)
+    assert (await client.get("/api/v1/settings")).status_code == 401
     # The api key keeps working — the recoverable half of the asymmetry.
+    client.cookies.clear()
     assert (
         await client.get("/api/v1/settings", headers={"X-Api-Key": _API_KEY})
     ).status_code == 200
@@ -1185,16 +1190,16 @@ async def test_put_non_plex_fields_keep_sessions_active(
     root = tmp_path / "tv"
     root.mkdir()
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"tv_root": str(root), "prowlarr_url": "http://prowlarr.local:9696"},
-        cookies=cookies,
         headers=csrf,
     )
 
     assert put.status_code == 200
     assert await _active_session_count(sessionmaker_) == 1  # still signed in
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def test_put_masked_and_unchanged_plex_values_keep_sessions_active(
@@ -1208,16 +1213,16 @@ async def test_put_masked_and_unchanged_plex_values_keep_sessions_active(
     cookies, csrf = await _admin_session_cookies(app, plex_id=9204, tag="masked")
     await _use_transport(app, _no_probe_transport())
 
+    client.cookies.update(cookies)
     put = await client.put(
         "/api/v1/settings",
         json={"plex_url": "http://old:32400", "plex_token": "***"},
-        cookies=cookies,
         headers=csrf,
     )
 
     assert put.status_code == 200
     assert await _active_session_count(sessionmaker_) == 1  # still signed in
-    assert (await client.get("/api/v1/settings", cookies=cookies)).status_code == 200
+    assert (await client.get("/api/v1/settings")).status_code == 200
 
 
 async def test_secret_is_stored_encrypted(
@@ -4461,10 +4466,22 @@ async def test_rotate_app_key_cas_serializes_two_concurrent_session_rotations(
         ),
     )
 
-    first, second = await asyncio.gather(
-        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_a, headers=headers_a),
-        client.post("/api/v1/settings/app-key/rotate", cookies=cookies_b, headers=headers_b),
-    )
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            cookies=cookies_a,
+        ) as client_a,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            cookies=cookies_b,
+        ) as client_b,
+    ):
+        first, second = await asyncio.gather(
+            client_a.post("/api/v1/settings/app-key/rotate", headers=headers_a),
+            client_b.post("/api/v1/settings/app-key/rotate", headers=headers_b),
+        )
 
     # Exactly one 200 (the winner) and one honest 409 (the loser) — never two 200s.
     assert sorted([first.status_code, second.status_code]) == [200, 409]
@@ -4537,7 +4554,8 @@ async def test_rotate_app_key_via_recovery_cookie_succeeds(
     await seed(initialized=True, app_api_key=_API_KEY)
     cookies, csrf = await _recovery_session_cookies(app, tag="rotate")
 
-    rotate = await client.post("/api/v1/settings/app-key/rotate", cookies=cookies, headers=csrf)
+    client.cookies.update(cookies)
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers=csrf)
 
     assert rotate.status_code == 200
     new_key = rotate.json()["app_api_key"]
@@ -4559,7 +4577,8 @@ async def test_revoke_app_key_via_recovery_cookie_succeeds(
     await seed(initialized=True, app_api_key=_API_KEY)
     cookies, csrf = await _recovery_session_cookies(app, tag="revoke")
 
-    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    client.cookies.update(cookies)
+    revoke = await client.delete("/api/v1/settings/app-key", headers=csrf)
 
     assert revoke.status_code == 204
     async with sessionmaker_() as session:
@@ -4607,7 +4626,8 @@ async def test_revoke_app_key_revokes_active_recovery_sessions(
 
     assert await _recovery_session_states(sessionmaker_) == [True]
     # The revoked recovery cookie no longer authenticates a later request.
-    later = await client.get("/api/v1/settings", cookies=cookies)
+    client.cookies.update(cookies)
+    later = await client.get("/api/v1/settings")
     assert later.status_code == 401
 
 
@@ -4643,9 +4663,8 @@ async def test_rotate_via_recovery_cookie_keeps_actor_and_revokes_other_recovery
     actor_cookies, actor_csrf = await _recovery_session_cookies(app, tag="actor")
     other_cookies, _ = await _recovery_session_cookies(app, tag="other")
 
-    rotate = await client.post(
-        "/api/v1/settings/app-key/rotate", cookies=actor_cookies, headers=actor_csrf
-    )
+    client.cookies.update(actor_cookies)
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers=actor_csrf)
 
     assert rotate.status_code == 200
     new_key = rotate.json()["app_api_key"]
@@ -4656,10 +4675,12 @@ async def test_rotate_via_recovery_cookie_keeps_actor_and_revokes_other_recovery
     assert await _recovery_session_revoked(sessionmaker_, tag="other") is True
 
     # The actor can still authenticate with their cookie after the rotation …
-    still_valid = await client.get("/api/v1/settings", cookies=actor_cookies)
+    still_valid = await client.get("/api/v1/settings")
     assert still_valid.status_code == 200
     # … while the revoked bystander recovery cookie no longer authenticates.
-    locked_out = await client.get("/api/v1/settings", cookies=other_cookies)
+    client.cookies.clear()
+    client.cookies.update(other_cookies)
+    locked_out = await client.get("/api/v1/settings")
     assert locked_out.status_code == 401
 
 
@@ -4685,9 +4706,9 @@ async def test_rotate_via_recovery_cookie_with_stale_header_succeeds_and_keeps_a
     actor_cookies, actor_csrf = await _recovery_session_cookies(app, tag="stale-actor")
     await _recovery_session_cookies(app, tag="stale-other")
 
+    client.cookies.update(actor_cookies)
     rotate = await client.post(
         "/api/v1/settings/app-key/rotate",
-        cookies=actor_cookies,
         headers={**actor_csrf, "X-Api-Key": "stale-or-mistyped-key"},
     )
 
@@ -4699,7 +4720,7 @@ async def test_rotate_via_recovery_cookie_with_stale_header_succeeds_and_keeps_a
     # session survives, the bystander recovery session is revoked.
     assert await _recovery_session_revoked(sessionmaker_, tag="stale-actor") is False
     assert await _recovery_session_revoked(sessionmaker_, tag="stale-other") is True
-    still_valid = await client.get("/api/v1/settings", cookies=actor_cookies)
+    still_valid = await client.get("/api/v1/settings")
     assert still_valid.status_code == 200
 
 
@@ -4716,9 +4737,9 @@ async def test_revoke_via_recovery_cookie_with_stale_header_succeeds(
     await seed(initialized=True, app_api_key=_API_KEY)
     cookies, csrf = await _recovery_session_cookies(app, tag="stale-revoker")
 
+    client.cookies.update(cookies)
     revoke = await client.delete(
         "/api/v1/settings/app-key",
-        cookies=cookies,
         headers={**csrf, "X-Api-Key": "stale-or-mistyped-key"},
     )
 
@@ -4750,9 +4771,8 @@ async def test_rotate_via_plex_session_still_revokes_every_recovery_session(
     await _recovery_session_cookies(app, tag="sweep-b")
     admin_cookies, admin_csrf = await _admin_session_cookies(app, plex_id=9301, tag="rotator")
 
-    rotate = await client.post(
-        "/api/v1/settings/app-key/rotate", cookies=admin_cookies, headers=admin_csrf
-    )
+    client.cookies.update(admin_cookies)
+    rotate = await client.post("/api/v1/settings/app-key/rotate", headers=admin_csrf)
 
     assert rotate.status_code == 200
     # BOTH recovery sessions were revoked — the Plex rotator is not exempt.
@@ -4822,7 +4842,8 @@ async def test_app_key_status_false_on_fresh_keyless_init(
     await seed(initialized=True)
     cookies, _ = await _admin_session_cookies(app, plex_id=7001, tag="status-empty")
 
-    response = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/settings/app-key/status")
     assert response.status_code == 200
     assert response.json() == {"exists": False}
 
@@ -4857,7 +4878,8 @@ async def test_reveal_app_key_404s_when_no_key_exists(
     await seed(initialized=True)
     cookies, _ = await _admin_session_cookies(app, plex_id=7002, tag="reveal-absent")
 
-    response = await client.get("/api/v1/settings/app-key", cookies=cookies)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/settings/app-key")
     assert response.status_code == 404
     body = response.json()
     assert body["detail"] == "app_key_not_set"
@@ -4872,10 +4894,15 @@ async def test_generate_app_key_from_null_mints_and_flips_status_true(
     await seed(initialized=True)
     cookies, csrf = await _admin_session_cookies(app, plex_id=7003, tag="generate")
 
-    generate = await client.post("/api/v1/settings/app-key/rotate", cookies=cookies, headers=csrf)
+    client.cookies.update(cookies)
+    generate = await client.post("/api/v1/settings/app-key/rotate", headers=csrf)
     assert generate.status_code == 200
     new_key = generate.json()["app_api_key"]
     assert len(new_key) > 20  # matches setup's historical token_urlsafe(32) shape
+
+    # Drop the admin session so the minted key -- not the cookie -- is what
+    # authenticates the two reads below.
+    client.cookies.clear()
 
     # Status now reports a key exists, without disclosing it.
     status_after = await client.get(
@@ -4909,7 +4936,8 @@ async def test_revoke_app_key_returns_204_and_old_key_401s(
 
     # A Plex-session admin still gets in and sees the key is gone.
     cookies, _ = await _admin_session_cookies(app, plex_id=7004, tag="revoked")
-    status_after = await client.get("/api/v1/settings/app-key/status", cookies=cookies)
+    client.cookies.update(cookies)
+    status_after = await client.get("/api/v1/settings/app-key/status")
     assert status_after.status_code == 200
     assert status_after.json() == {"exists": False}
 
@@ -4930,7 +4958,8 @@ async def test_revoke_app_key_is_idempotent_when_no_key_exists(
     await seed(initialized=True)
     cookies, csrf = await _admin_session_cookies(app, plex_id=7005, tag="revoke-noop")
 
-    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    client.cookies.update(cookies)
+    revoke = await client.delete("/api/v1/settings/app-key", headers=csrf)
     assert revoke.status_code == 204
     assert revoke.content == b""
 
@@ -5010,7 +5039,8 @@ async def test_revoke_app_key_via_session_auth_clears_present_key(
     await seed(initialized=True, app_api_key=_API_KEY)
     cookies, csrf = await _admin_session_cookies(app, plex_id=7006, tag="revoke-present")
 
-    revoke = await client.delete("/api/v1/settings/app-key", cookies=cookies, headers=csrf)
+    client.cookies.update(cookies)
+    revoke = await client.delete("/api/v1/settings/app-key", headers=csrf)
     assert revoke.status_code == 204
     assert revoke.content == b""
 

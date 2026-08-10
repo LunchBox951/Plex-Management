@@ -9,8 +9,9 @@ Plex Manager v2 is a self-hosted, unified Plex request and automation service.
 Read `docs/design/overview.md` first, then the ADRs in `docs/adr/` for durable
 decisions.
 
-Current status: v1 beta, feature-complete for the request -> watchable ->
-correct loop across movies, TV, and anime. Browser access uses Plex sign-in with
+Current status: 1.0.0 released — promoted to `:stable` on Aug 9, 2026; the
+request -> watchable -> correct loop is complete across movies, TV, and anime,
+and `:edge` remains the canary channel. Browser access uses Plex sign-in with
 session cookies; `X-Api-Key` is an optional recovery/automation credential.
 
 ## Architecture

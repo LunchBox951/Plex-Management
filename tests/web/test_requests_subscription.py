@@ -91,14 +91,15 @@ async def test_withdraw_endpoint_subscriber_gets_settled_false_and_drops_off_the
         )
         await session.commit()
 
+    client.cookies.update(sub_cookies)
     response = await client.delete(
-        f"/api/v1/requests/{request_id}/subscription", cookies=sub_cookies, headers=sub_headers
+        f"/api/v1/requests/{request_id}/subscription", headers=sub_headers
     )
     assert response.status_code == 200
     # Mere subscription removal -- others remain, nothing torn down (#351).
     assert response.json() == {"settled": False}
 
-    list_response = await client.get("/api/v1/requests", cookies=sub_cookies, headers=sub_headers)
+    list_response = await client.get("/api/v1/requests", headers=sub_headers)
     assert list_response.status_code == 200
     assert list_response.json()["requests"] == []
 
@@ -133,8 +134,9 @@ async def test_withdraw_endpoint_last_participant_teardown_returns_settled_true(
         session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
         await session.commit()
 
+    client.cookies.update(owner_cookies)
     response = await client.delete(
-        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+        f"/api/v1/requests/{request_id}/subscription", headers=owner_headers
     )
     assert response.status_code == 200
     assert response.json() == {"settled": True}
@@ -162,9 +164,9 @@ async def test_withdraw_endpoint_404_for_non_subscriber(
         await session.commit()
         request_id = request.id
 
+    client.cookies.update(outsider_cookies)
     response = await client.delete(
         f"/api/v1/requests/{request_id}/subscription",
-        cookies=outsider_cookies,
         headers=outsider_headers,
     )
     assert response.status_code == 404
@@ -176,9 +178,8 @@ async def test_withdraw_endpoint_404_for_unknown_request(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     _user_id, cookies, headers = await _user_session(app, tag="nobody")
-    response = await client.delete(
-        "/api/v1/requests/999999/subscription", cookies=cookies, headers=headers
-    )
+    client.cookies.update(cookies)
+    response = await client.delete("/api/v1/requests/999999/subscription", headers=headers)
     assert response.status_code == 404
     assert response.json()["detail"] == "request_not_found"
 
@@ -294,16 +295,17 @@ async def test_withdraw_endpoint_owner_with_others_hands_off_ownership(
         session.add(RequestSubscriber(request_id=request_id, user_id=other_id))
         await session.commit()
 
+    client.cookies.update(owner_cookies)
     response = await client.delete(
-        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+        f"/api/v1/requests/{request_id}/subscription", headers=owner_headers
     )
     assert response.status_code == 200
     # Owner handoff to the remaining participant -- a mere removal, not a teardown.
     assert response.json() == {"settled": False}
 
-    get_response = await client.get(
-        f"/api/v1/requests/{request_id}", cookies=other_cookies, headers=other_headers
-    )
+    client.cookies.clear()
+    client.cookies.update(other_cookies)
+    get_response = await client.get(f"/api/v1/requests/{request_id}", headers=other_headers)
     assert get_response.status_code == 200
     body = get_response.json()
     assert body["is_owner"] is True
@@ -333,9 +335,8 @@ async def test_cancel_endpoint_non_admin_owner_with_others_returns_409(
         session.add(RequestSubscriber(request_id=request_id, user_id=other_id))
         await session.commit()
 
-    response = await client.post(
-        f"/api/v1/requests/{request_id}/cancel", cookies=owner_cookies, headers=owner_headers
-    )
+    client.cookies.update(owner_cookies)
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=owner_headers)
     assert response.status_code == 409
     assert response.json()["detail"] == "has_other_participants"
     async with sessionmaker_() as session:
@@ -372,9 +373,8 @@ async def test_cancel_endpoint_non_admin_sole_owner_settles_and_keeps_subscripti
 
     qbt = FakeQbittorrent()
     override_adapters(app, qbt=qbt)
-    response = await client.post(
-        f"/api/v1/requests/{request_id}/cancel", cookies=owner_cookies, headers=owner_headers
-    )
+    client.cookies.update(owner_cookies)
+    response = await client.post(f"/api/v1/requests/{request_id}/cancel", headers=owner_headers)
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "cancelled"
@@ -453,8 +453,9 @@ async def test_withdraw_endpoint_409_service_not_configured_last_participant(
         )
         await session.commit()
 
+    client.cookies.update(owner_cookies)
     response = await client.delete(
-        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+        f"/api/v1/requests/{request_id}/subscription", headers=owner_headers
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "service_not_configured"
@@ -486,8 +487,9 @@ async def test_withdraw_endpoint_409_last_participant_on_import_blocked(
         session.add(RequestSubscriber(request_id=request_id, user_id=owner_id))
         await session.commit()
 
+    client.cookies.update(owner_cookies)
     response = await client.delete(
-        f"/api/v1/requests/{request_id}/subscription", cookies=owner_cookies, headers=owner_headers
+        f"/api/v1/requests/{request_id}/subscription", headers=owner_headers
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "withdrawal_blocked_active_request"
@@ -524,45 +526,42 @@ async def test_request_response_flags_for_owner_subscriber_and_admin_non_subscri
         session.add(RequestSubscriber(request_id=request_id, user_id=subscriber_id))
         await session.commit()
 
-    owner_view = (
-        await client.get(
-            f"/api/v1/requests/{request_id}", cookies=owner_cookies, headers=owner_headers
-        )
-    ).json()
+    client.cookies.update(owner_cookies)
+    owner_view = (await client.get(f"/api/v1/requests/{request_id}", headers=owner_headers)).json()
     assert owner_view["is_owner"] is True
     assert owner_view["can_mutate"] is True
     assert owner_view["can_withdraw"] is True
     assert owner_view["has_other_participants"] is True
 
+    client.cookies.clear()
+    client.cookies.update(sub_cookies)
     subscriber_view = (
-        await client.get(f"/api/v1/requests/{request_id}", cookies=sub_cookies, headers=sub_headers)
+        await client.get(f"/api/v1/requests/{request_id}", headers=sub_headers)
     ).json()
     assert subscriber_view["is_owner"] is False
     assert subscriber_view["can_mutate"] is False
     assert subscriber_view["can_withdraw"] is True
     assert subscriber_view["has_other_participants"] is True
 
-    admin_view = (
-        await client.get(
-            f"/api/v1/requests/{request_id}", cookies=admin_cookies, headers=admin_headers
-        )
-    ).json()
+    client.cookies.clear()
+    client.cookies.update(admin_cookies)
+    admin_view = (await client.get(f"/api/v1/requests/{request_id}", headers=admin_headers)).json()
     assert admin_view["is_owner"] is False
     assert admin_view["can_mutate"] is True  # admin always mutates
     assert admin_view["can_withdraw"] is False  # not a subscriber -- uses POST /cancel
     assert admin_view["has_other_participants"] is True  # 2 real subscribers, admin isn't one
 
     # The list endpoint's batched path must agree with the single-record path.
-    owner_list = (
-        await client.get("/api/v1/requests", cookies=owner_cookies, headers=owner_headers)
-    ).json()["requests"]
+    client.cookies.clear()
+    client.cookies.update(owner_cookies)
+    owner_list = (await client.get("/api/v1/requests", headers=owner_headers)).json()["requests"]
     assert len(owner_list) == 1
     assert owner_list[0]["can_withdraw"] is True
     assert owner_list[0]["has_other_participants"] is True
 
-    admin_list = (
-        await client.get("/api/v1/requests", cookies=admin_cookies, headers=admin_headers)
-    ).json()["requests"]
+    client.cookies.clear()
+    client.cookies.update(admin_cookies)
+    admin_list = (await client.get("/api/v1/requests", headers=admin_headers)).json()["requests"]
     assert len(admin_list) == 1
     assert admin_list[0]["can_withdraw"] is False
     assert admin_list[0]["has_other_participants"] is True

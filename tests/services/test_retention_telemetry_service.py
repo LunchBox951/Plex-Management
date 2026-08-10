@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -289,6 +290,57 @@ async def test_sweep_emits_the_expected_aggregate_and_per_candidate_events(
     # Every id goes through extra={}, never interpolated into the message text.
     assert getattr(per_candidate, "request_id", None) is not None
     assert getattr(per_candidate, "tmdb_id", None) == 1
+
+
+async def test_sweep_telemetry_reports_walked_vs_skipped_from_the_real_walk_skip_sentinel(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #353: the walked/skipped counts in the aggregate log line must be
+    derived from the REAL ``assemble_candidates`` walk-skip sentinel (not a
+    fake), so an ineligible row here is honestly reported ``skipped`` and never
+    silently miscounted as ``walked``."""
+    watched_path = _movie_file(tmp_path, "Watched.mkv", size=100)
+    unwatched_path = _movie_file(tmp_path, "Unwatched.mkv", size=100)
+    await _movie(
+        sessionmaker_,
+        tmdb_id=1,
+        title="Watched",
+        library_path=watched_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    await _movie(
+        sessionmaker_,
+        tmdb_id=2,
+        title="Unwatched",
+        library_path=unwatched_path,
+        completed_at=_STALE - timedelta(days=2),
+    )
+    library = FakeLibrary(
+        watch_states={
+            (1, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (2, "movie", None): WatchState(watched=False, last_viewed_at=None),
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger=_TELEMETRY_LOGGER):
+        async with sessionmaker_() as session:
+            await retention_telemetry_service.run_retention_telemetry_sweep(
+                session=session,
+                library=library,
+                fs=_local_fs(tmp_path),
+                media_type="movie",
+                root_path=str(tmp_path),
+                grace_days=_GRACE_DAYS,
+                threshold_pct=_THRESHOLD,
+                target_pct=_TARGET,
+                now=_NOW,
+            )
+
+    aggregate = next(r for r in caplog.records if r.name == _TELEMETRY_LOGGER).getMessage()
+    # 1 walk-eligible (Watched: eligible, actually walked), 1 walk-skipped
+    # (Unwatched: ruled out by is_evictable before any os.walk).
+    assert "walk_eligible=1, walk_skipped=1" in aggregate
+    assert re.search(r"sweep_duration=\d+\.\d{3}s", aggregate) is not None
 
 
 async def test_sweep_leaves_the_interval_unknown_without_a_completed_at(
@@ -1225,6 +1277,12 @@ async def test_classify_partitions_every_candidate_into_exactly_one_bucket_set(
     assert f"no_path={partition.no_path_count}" in aggregate
     assert f"guard_refused={partition.guard_refused_count}" in aggregate
     assert f"preexisting_watch={partition.preexisting_watch_count}" in aggregate
+    # Issue #353 telemetry: every fake candidate here carries a real (walked)
+    # ``size_percent=0.0``, never the walk-skip ``None`` sentinel, so all four
+    # are reported walk-eligible and none skipped -- plus a real measured
+    # duration.
+    assert f"walk_eligible={len(candidates)}, walk_skipped=0" in aggregate
+    assert re.search(r"sweep_duration=\d+\.\d{3}s", aggregate) is not None
 
 
 async def test_classify_deduplicates_two_candidate_rows_sharing_a_library_path(

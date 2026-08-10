@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,7 @@ def _run(
 
 
 def _tables(db_path: Path) -> set[str]:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         return {
             str(row[0])
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -56,7 +57,7 @@ def _tables(db_path: Path) -> set[str]:
 
 
 def _columns(db_path: Path, table: str) -> set[str]:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
@@ -69,7 +70,7 @@ def test_existing_install_gains_seeded_coordinator_and_lease_indexes(
 
     _run(db_path, "head", monkeypatch)
     assert {"update_coordinator_state", "maintenance_leases"} <= _tables(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         state = connection.execute(
             "SELECT id, requested_action, action_generation, phase, "
             "last_operation, last_from_build, last_to_build, last_outcome_token_hash, "
@@ -106,7 +107,7 @@ def test_sidecar_observability_columns_expand_and_reverse(
     # Expand-only: the pre-existing columns are untouched.
     assert before <= after
     # Every new column is NULL on the pre-existing seeded singleton row.
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         selected = ", ".join(sorted(_SIDECAR_OBSERVABILITY_COLUMNS))
         values = connection.execute(
             f"SELECT {selected} FROM update_coordinator_state WHERE id = 1"  # noqa: S608

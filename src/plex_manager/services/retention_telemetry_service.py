@@ -171,6 +171,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -181,6 +182,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.logsafe import safe_text
 from plex_manager.models import MediaRequest, SeasonRequest
 from plex_manager.services import eviction_service, purge_service
 from plex_manager.services.health_service import read_disk_usage
@@ -325,10 +327,26 @@ def _sum_estimated_bytes(candidates: Sequence[EvictionCandidate], total_bytes: i
     basis ``eviction_service`` itself uses before a delete. A non-positive
     ``total_bytes`` (an unreadable/empty root) yields ``0`` rather than a bogus
     figure.
+
+    ``candidates`` here is always ``partition.eligible`` (or a subset of it):
+    ``rank_eviction_candidates``'s eligibility test never depends on size, so a
+    row this module ever ranks eligible was, by ``assemble_candidates``'s own
+    construction, also WALKED at the same cutoff -- it can never carry the
+    walk-skip ``None`` sentinel (issue #353). The ``None`` branch below is
+    still explicit rather than assumed: it costs one comparison and means a
+    future caller that (incorrectly) sums over the raw superset degrades to an
+    honest undercount instead of a ``TypeError``.
     """
     if total_bytes <= 0:
         return 0
-    return sum(round(candidate.size_percent / 100.0 * total_bytes) for candidate in candidates)
+    return sum(
+        round(
+            (candidate.size_percent if candidate.size_percent is not None else 0.0)
+            / 100.0
+            * total_bytes
+        )
+        for candidate in candidates
+    )
 
 
 # Idle-age (now - last_viewed_at) buckets for the per-root distribution, taken
@@ -677,6 +695,18 @@ async def run_retention_telemetry_sweep(
          -- rows set aside from the metrics above (no breadcrumb, delete-guard
          refusal, a view predating completion), reported so the dataset shows they
          exist without any metric being overstated (see the module docstring).
+       * ``walk_eligible`` / ``walk_skipped`` (issue #353) -- how many of the
+         raw (pre-dedup) candidate rows
+         :func:`~plex_manager.services.eviction_service.assemble_candidates`
+         allowed into the ``os.walk`` size lookup (pathless rows and
+         shared-path cache hits among them pay no actual walk) versus
+         walk-skipped as already-ineligible at ``grace_cutoff`` (issue #304),
+         derived from each candidate's ``size_percent is None`` walk-skip
+         sentinel -- the row-based ineligible:eligible ratio the walk-skip
+         optimization's perf premise needs to confirm from canary logs -- plus
+         ``sweep_duration`` measured from assembly through this aggregate
+         line's emission (the per-title emission loop below runs after the
+         clock is read).
     2. One event PER title/season with any recorded view — INCLUDING a
        started-but-unfinished one (``watched=False`` but a view timestamp
        exists): its completed_at -> last_viewed_at interval (labelled
@@ -716,6 +746,7 @@ async def run_retention_telemetry_sweep(
     ``LogCaptureHandler.dropped_count`` (never silently lost) — see
     :data:`_QUEUE_SAFETY_MARGIN`.
     """
+    sweep_started = time.monotonic()
     try:
         # ``shutil.disk_usage`` (a ``statvfs`` syscall) can stall on a hung
         # NFS/SMB mount. Use the shared abandonable substrate (mirrors
@@ -729,10 +760,11 @@ async def run_retention_telemetry_sweep(
         )
     except OSError as exc:
         _logger.warning(
-            "retention telemetry sweep skipped for %s root %s (%s)",
+            "retention telemetry sweep skipped for %s root %s (%s) after sweep_duration=%.3fs",
             media_type,
-            root_path,
+            safe_text(root_path),
             type(exc).__name__,
+            time.monotonic() - sweep_started,
         )
         return
 
@@ -745,8 +777,10 @@ async def run_retention_telemetry_sweep(
     # exactly a row those subsets exclude anyway. Never narrows the RETURNED
     # superset (see ``assemble_candidates``'s docstring) -- the time-to-watch
     # dataset below still sees every started-but-unfinished/unwatched/pinned row,
-    # just with an honest ``size_percent=0.0`` for the ones nothing here ever
-    # sums bytes over.
+    # just with the explicit walk-skip ``size_percent=None`` sentinel (issue
+    # #353) for the ones nothing here ever sums bytes over -- never the
+    # fabricated ``0.0`` an earlier revision used, which made a skipped row
+    # indistinguishable from a genuinely empty title.
     grace_cutoff = moment - timedelta(days=grace_days)
 
     # ONE raw read for ALL products: every available title/season, no grace or
@@ -767,6 +801,15 @@ async def run_retention_telemetry_sweep(
         all_roots=all_roots,
         grace_cutoff=grace_cutoff,
     )
+
+    # Issue #353 telemetry: derived straight from the walk-skip SENTINEL
+    # (``size_percent is None``) every ineligible-at-``grace_cutoff`` row now
+    # carries -- no separate counter threaded through ``assemble_candidates``,
+    # so this can never drift from what the single raw read above actually
+    # walked. This is the ineligible:eligible ratio the walk-skip optimization's
+    # perf premise needs to confirm from canary logs.
+    candidates_skipped = sum(1 for candidate in candidates if candidate.size_percent is None)
+    candidates_walked = len(candidates) - candidates_skipped
 
     # SINGLE classification pass: partition the raw candidates ONCE into the
     # metric-eligible sets and the labelled exclusion counts (no_path / guard_refused
@@ -844,7 +887,10 @@ async def run_retention_telemetry_sweep(
         "recorded watch activity, idle-age distribution: %s; excluded (kept "
         "honest, never deleted): no_path=%d, guard_refused=%d, preexisting_watch=%d; "
         "deferred_rows=%d (per-title rows beyond this sweep's emission budget, "
-        "retried next tick)",
+        "retried next tick); candidate assembly (pre-dedup row counts): "
+        "walk_eligible=%d, walk_skipped=%d (already ineligible at this sweep's "
+        "grace cutoff, no os.walk paid -- issue #304); "
+        "sweep_duration=%.3fs",
         media_type,
         root_path,
         len(partition.eligible),
@@ -859,6 +905,9 @@ async def run_retention_telemetry_sweep(
         partition.guard_refused_count,
         partition.preexisting_watch_count,
         deferred_rows,
+        candidates_walked,
+        candidates_skipped,
+        time.monotonic() - sweep_started,
     )
 
     # Emit at most the effective budget's worth this sweep; the deferred tail
