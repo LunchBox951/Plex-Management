@@ -132,8 +132,12 @@ class UpdaterRunner:
             try:
                 await self.run_once()
             except (CoordinatorError, DockerError, UpdaterError) as exc:
-                # Codes are fixed locally; Docker/HTTP response bodies and bearer
-                # values never enter the log capture pipeline.
+                # Codes are fixed locally; bearer values and Docker engine
+                # response bodies never enter this log line. The one deliberate
+                # exception is CoordinatorClient._post's own non-2xx branch
+                # (issue #539), which logs a capped, safe_text/redact_secrets'd
+                # slice of the coordinator's HTTP response body at its own call
+                # site -- not here, and not the bearer token either way.
                 _logger.warning("container updater iteration failed (%s)", exc.code)
             except Exception:
                 _logger.exception("container updater iteration failed unexpectedly")

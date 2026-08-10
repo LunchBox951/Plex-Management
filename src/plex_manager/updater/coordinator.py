@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Final, Literal, cast
 
 import httpx
 
+from plex_manager.logsafe import redact_secrets, safe_text
+
 Action = Literal["none", "check", "install"]
 Outcome = Literal["no_update", "update_available", "succeeded", "failed", "rolled_back"]
+
+_logger = logging.getLogger(__name__)
+
+#: Cap on the response body chars logged on a non-2xx coordinator response
+#: (issue #539). The coordinator is an internal endpoint, but the cap keeps a
+#: pathological/oversized body from flooding the log; ``safe_text`` on top
+#: keeps a forged CR/LF in the body from faking a second log record. The
+#: updater sidecar's stdout is read straight off ``docker logs`` -- it never
+#: passes through the app's ``log_capture_service`` capture pipeline, so this
+#: call site cannot lean on that pipeline's own ``redact_secrets`` pass as a
+#: second line of defense; ``_post`` below composes ``redact_secrets`` itself.
+_MAX_LOGGED_BODY_CHARS: Final = 500
 
 
 class CoordinatorError(RuntimeError):
@@ -83,12 +98,33 @@ class CoordinatorClient:
         try:
             response = await self._client.post(path, headers=self._headers, json=body)
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # Transport-level failure (connection refused/reset, timeout, no
+            # response at all): there is no status code or body to report, so
+            # this branch stays a bare classification. Logged distinctly from
+            # the HTTP-status branch below by message wording -- if this ever
+            # grows its own logging, the two must stay tellable apart.
             raise CoordinatorError("coordinator_unavailable") from exc
         if response.status_code == 409:
             raise CoordinatorError("coordinator_conflict")
         try:
             response.raise_for_status()
         except httpx.HTTPError as exc:
+            # A response DID arrive, so unlike the transport-error branch
+            # above there is real diagnostic evidence: log the status code and
+            # a bounded, line-boundary-safe slice of the body (issue #539 --
+            # the 2026-07-28 canary 500s on /eligibility left no evidence
+            # because this classification was previously silent). No request
+            # header (the bearer token) is ever included. The cap is applied
+            # BEFORE safe_text/redact_secrets so both stay bounded work; the
+            # two-deep composition mirrors log_capture_service._capture's own
+            # (issue #153) -- see _MAX_LOGGED_BODY_CHARS above for why this
+            # call site cannot rely on that pipeline's pass instead.
+            _logger.warning(
+                "coordinator request returned HTTP status error: path=%s status=%d body=%s",
+                path,
+                response.status_code,
+                redact_secrets(safe_text(response.text[:_MAX_LOGGED_BODY_CHARS])),
+            )
             raise CoordinatorError("coordinator_unavailable") from exc
         return _object(response)
 
