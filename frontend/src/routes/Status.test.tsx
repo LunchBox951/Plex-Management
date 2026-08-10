@@ -1231,7 +1231,9 @@ describe('Status', () => {
     expect(signedOut).toHaveClass('font-semibold', 'text-searching')
     // Exception-only rows stay out of the way on an ordinary tick.
     expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Held (server unreachable)')).not.toBeInTheDocument()
     expect(sweep.queryByText('Admins held')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Skipped')).not.toBeInTheDocument()
   })
 
   it('reads a stale server anchor as loudly as a crash, not as a hiccup', () => {
@@ -1281,6 +1283,93 @@ describe('Status', () => {
     // Nobody was signed out, and the reason is named.
     expect(sweep.getByText('Signed out').nextElementSibling).toHaveTextContent('0')
     expect(sweep.getByText(/PlexAnchorMismatch/)).toBeInTheDocument()
+  })
+
+  it('does not claim the server changed when it merely could not be reached', () => {
+    // A Plex outage coinciding with a would-revoke verdict holds the sign-out
+    // just as firmly, but it never established an identity change — saying so
+    // would send the operator hunting a configuration fault that never happened.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_unconfirmed',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'PlexAnchorUnconfirmed',
+          last_error_at: '2026-01-02T00:00:01Z',
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 2,
+          sessions_revoked: 0,
+          due_remaining: 2,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor unconfirmed')).toBeInTheDocument()
+    expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
+    const held = sweep.getByText('Held (server unreachable)').nextElementSibling
+    expect(held).toHaveTextContent('2')
+    // Warn, not error: a transient outage is not a configuration fault.
+    expect(held).toHaveClass('font-semibold', 'text-searching')
+    expect(held).not.toHaveClass('text-error')
+  })
+
+  it('surfaces skipped candidates only when the tick actually skipped some', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 3,
+          authorized: 3,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 2,
+          admins_exempted: 0,
+          anchor_deferred: 0,
+          sessions_revoked: 0,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('Skipped').nextElementSibling).toHaveTextContent('2')
   })
 
   it('surfaces an admin the sweep declined to sign out', () => {

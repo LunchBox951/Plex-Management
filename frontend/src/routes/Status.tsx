@@ -614,14 +614,20 @@ function WatchlistPanel({ watchlist }: { watchlist: HealthResponse['watchlist'] 
  * from a clean one, and the operator must be able to see which they have.
  */
 function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
+  // A CONFIRMED identity change is a configuration fault only a repoint fixes,
+  // so it reads as loudly as a crash. Merely being unable to ask (a Plex outage,
+  // missing credentials) is the same class of transient as any other probe
+  // failure — claiming "the server changed" there would send an operator hunting
+  // a change that never happened.
+  const anchorChanged = sweep.state === 'anchor_mismatch'
   const tone: DotTone =
     sweep.state === 'ok'
       ? 'ok'
-      : sweep.state === 'degraded' || sweep.state === 'probe_failed'
+      : sweep.state === 'degraded' ||
+          sweep.state === 'probe_failed' ||
+          sweep.state === 'anchor_unconfirmed'
         ? 'warn'
-        : // A stale server anchor is not a hiccup: nothing is being enforced
-          // until an operator repoints, so it reads as loudly as a crash.
-          sweep.state === 'error' || sweep.state === 'anchor_mismatch'
+        : sweep.state === 'error' || anchorChanged
           ? 'error'
           : 'neutral'
   const label =
@@ -629,7 +635,7 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
       ? 'starting up'
       : sweep.state === 'ok'
         ? 'running clean'
-        : sweep.state.replace('_', ' ')
+        : sweep.state.replaceAll('_', ' ')
   return (
     <article
       className={cn(
@@ -682,14 +688,34 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
         >
           {sweep.unknown}
         </dd>
-        {/* The sweep knowingly enforcing nothing, because the configured Plex
-            machine identifier no longer matches the server. Only rendered when
-            non-zero — it is an exception state, not a routine statistic. */}
+        {/* Sign-outs the sweep knowingly withheld because the server anchor did
+            not hold. The label distinguishes the two causes — a confirmed
+            identity change vs. simply not being able to ask — because only the
+            first one is a configuration fault. Exception-only rows: rendered
+            when non-zero, not as routine statistics. */}
         {sweep.anchor_deferred > 0 ? (
           <>
-            <dt className="min-w-0 text-faint">Held (server changed)</dt>
-            <dd className="min-w-0 text-right font-semibold text-error tabular-nums [overflow-wrap:anywhere]">
+            <dt className="min-w-0 text-faint">
+              {anchorChanged ? 'Held (server changed)' : 'Held (server unreachable)'}
+            </dt>
+            <dd
+              className={cn(
+                'min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]',
+                anchorChanged ? 'text-error' : 'text-searching',
+              )}
+            >
               {sweep.anchor_deferred}
+            </dd>
+          </>
+        ) : null}
+        {/* Candidates the tick wrote nothing for (a mid-sweep re-sign-in, or a
+            deleted row): budget that produced no verdict, so it is visible
+            rather than silently making the tick look smaller. */}
+        {sweep.skipped > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Skipped</dt>
+            <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+              {sweep.skipped}
             </dd>
           </>
         ) : null}

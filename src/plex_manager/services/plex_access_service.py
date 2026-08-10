@@ -274,6 +274,14 @@ class ShareSweepResult:
     skipped: int = 0
     admins_exempted: int = 0
     anchor_deferred: int = 0
+    anchor_state: AnchorCheck | None = None
+    """WHICH anchor answer caused ``anchor_deferred``, or ``None`` if the anchor
+    was never consulted. Carried separately from the count because "the server
+    reported a different identifier" and "we could not reach the server to ask"
+    are different facts, and only the first one establishes that the server
+    changed -- collapsing them would let a plain outage render as a confirmed
+    identity change (the same conflation ``probe_failed`` vs ``not_configured``
+    exists to prevent, issue #327)."""
     sessions_revoked: int = 0
     due_remaining: int = 0
     signed_out_user_ids: tuple[int, ...] = ()
@@ -302,6 +310,7 @@ class ShareSweepStatus:
         "ok",
         "degraded",
         "anchor_mismatch",
+        "anchor_unconfirmed",
         "not_configured",
         "probe_failed",
         "error",
@@ -330,7 +339,10 @@ class ShareSweepStatus:
     """Share-loss verdicts this tick refused to act on because the server anchor
     could not be confirmed live (see :class:`AnchorCheck`). These users were left
     due, so nothing is lost -- but a persistently non-zero value means the sweep
-    is not actually protecting anything and needs the operator's attention."""
+    is not actually protecting anything and needs the operator's attention. Read
+    it together with ``state``, which says WHY: ``anchor_mismatch`` (the server
+    reported a different identifier -- an established fact needing a repoint) or
+    ``anchor_unconfirmed`` (we could not ask -- possibly just an outage)."""
     sessions_revoked: int = field(default=0)
     due_remaining: int = field(default=0)
     """Users still due a revalidation once this tick finished. A persistently
@@ -366,17 +378,25 @@ class ShareSweepStatus:
         self._reset_counters()
 
     def mark_completed(self, result: ShareSweepResult) -> None:
-        # ``anchor_mismatch`` outranks plain ``degraded``: it is the one state an
-        # operator has to act on (the configured machine identifier no longer
-        # matches the server), and it must not be hidden behind the generic
-        # label a plex.tv hiccup also produces.
+        # Both anchor states outrank plain ``degraded`` -- the sweep enforced
+        # nothing, which the operator has to know -- but they are NOT the same
+        # claim and must never be collapsed: ``anchor_mismatch`` asserts the
+        # server answered with a DIFFERENT identifier (established fact, needs a
+        # repoint), while ``anchor_unconfirmed`` says only that we could not ask
+        # (an outage, or missing credentials). Reporting a mismatch we never
+        # established would send an operator hunting a configuration change that
+        # never happened.
         #
         # UNKNOWN verdicts degrade the tick exactly as watchlist's skipped users
         # do: the sweep ran but could not answer for someone, so it has NOT
         # succeeded and must not advance ``last_ok_at``. Confirmed revocations
         # and stale tokens do NOT degrade it -- those are the sweep working.
         if result.anchor_deferred:
-            self.state = "anchor_mismatch"
+            self.state = (
+                "anchor_mismatch"
+                if result.anchor_state is AnchorCheck.MISMATCHED
+                else "anchor_unconfirmed"
+            )
         elif result.unknown or result.last_error_type:
             self.state = "degraded"
         else:
@@ -823,6 +843,7 @@ async def sweep_shares(
         skipped=skipped,
         admins_exempted=admins_exempted,
         anchor_deferred=anchor_deferred,
+        anchor_state=anchor,
         sessions_revoked=sessions_revoked,
         due_remaining=due_remaining,
         signed_out_user_ids=tuple(signed_out),

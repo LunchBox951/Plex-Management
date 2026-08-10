@@ -252,7 +252,8 @@ async def test_unreachable_server_cannot_confirm_the_anchor_so_nobody_is_revoked
 ) -> None:
     """plex.tv is reachable and says the share is gone, but the configured server
     cannot be reached to prove the anchor still holds. Fail safe: an unconfirmed
-    anchor blocks the sign-out exactly as a mismatched one does."""
+    anchor blocks the sign-out exactly as a mismatched one does -- but it must
+    NOT claim the server changed, because that was never established."""
     await seed(initialized=True)
     await _configure_server(app)
     user_id = await _signed_in_user(app)
@@ -262,7 +263,27 @@ async def test_unreachable_server_cannot_confirm_the_anchor_so_nobody_is_revoked
 
     assert await _tick(app) == 0
     status = app.state.share_sweep_status
-    assert status.state == "anchor_mismatch"
+    assert status.state == "anchor_unconfirmed"
+    assert status.anchor_deferred == 1
+    assert await _live_sessions(app, user_id) == 1
+
+
+async def test_missing_plex_credentials_cannot_confirm_the_anchor_either(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """A cached anchor with no url/token to re-read it against: nothing to
+    confirm with, so share-loss verdicts are held and the state says only that
+    it is unconfirmed."""
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        await SettingsStore(session).set(PLEX_MACHINE_ID_SETTING, _MACHINE_ID)
+        await session.commit()
+    user_id = await _signed_in_user(app)
+    await _use_transport(app, _plex_tv_transport([_server_resource("some-other-server")]))
+
+    assert await _tick(app) == 0
+    status = app.state.share_sweep_status
+    assert status.state == "anchor_unconfirmed"
     assert status.anchor_deferred == 1
     assert await _live_sessions(app, user_id) == 1
 

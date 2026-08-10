@@ -3586,7 +3586,7 @@
         "type": "object"
       },
       "ShareSweepStatusItem": {
-        "description": "The share-revalidation sweep's health (issue #391).\n\n``unknown`` is the field that makes this honest: a sweep that could not reach\nplex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,\nwhich an operator must be able to tell apart from a clean ``ok`` sweep that\nfound everyone still entitled. ``anchor_mismatch`` / ``anchor_deferred`` are\nthe louder cousin: the stored Plex machine identifier no longer matches the\nserver, so share-loss verdicts are meaningless and none were acted on.",
+        "description": "The share-revalidation sweep's health (issue #391).\n\n``unknown`` is the field that makes this honest: a sweep that could not reach\nplex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,\nwhich an operator must be able to tell apart from a clean ``ok`` sweep that\nfound everyone still entitled. The two anchor states are the louder cousin --\n``anchor_deferred`` share-loss verdicts were acted on for nobody because the\nserver anchor did not hold -- and they stay separate for the same reason:\n``anchor_mismatch`` means the server reported a DIFFERENT machine identifier\n(established, needs a repoint), while ``anchor_unconfirmed`` means it could\nnot be asked at all (an outage, or missing credentials).",
         "properties": {
           "admins_exempted": {
             "default": 0,
@@ -3681,6 +3681,7 @@
               "ok",
               "degraded",
               "anchor_mismatch",
+              "anchor_unconfirmed",
               "not_configured",
               "probe_failed",
               "error"

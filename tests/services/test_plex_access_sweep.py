@@ -602,7 +602,7 @@ async def test_rebuilt_server_revokes_nobody_and_leaves_everyone_due(
     assert result.due_remaining == 4
 
 
-async def test_anchor_fault_reports_a_named_state_not_a_generic_degraded(
+async def test_confirmed_identity_change_reports_anchor_mismatch(
     sessionmaker_: SessionMaker,
 ) -> None:
     await _add_user(sessionmaker_)
@@ -617,6 +617,46 @@ async def test_anchor_fault_reports_a_named_state_not_a_generic_degraded(
     assert status.anchor_deferred == 1
     assert status.last_error_type == "PlexAnchorMismatch"
     assert status.last_ok_at is None
+
+
+async def test_unreachable_anchor_reports_unconfirmed_not_a_claimed_change(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A Plex outage that happens to coincide with a would-revoke verdict must
+    NOT be reported as "the server changed": we never established that. Same
+    conflation the ``probe_failed``/``not_configured`` split exists to prevent
+    (#327) -- an unestablished identity change would send the operator hunting a
+    configuration fault that never happened."""
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_, [_server_resource("some-other-server")], anchor=AnchorCheck.UNCONFIRMED
+    )
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == "anchor_unconfirmed"
+    assert status.anchor_deferred == 1
+    assert status.last_error_type == "PlexAnchorUnconfirmed"
+    # Still withheld every sign-out -- the two states differ in what they CLAIM,
+    # never in how safely they behave.
+    assert result.sessions_revoked == 0
+    assert status.last_ok_at is None
+
+
+async def test_result_carries_which_anchor_answer_deferred_the_tick(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _add_user(sessionmaker_)
+    mismatched = await _sweep(
+        sessionmaker_, [_server_resource("rebuilt-server")], anchor=AnchorCheck.MISMATCHED
+    )
+    assert mismatched.anchor_state is AnchorCheck.MISMATCHED
+    unconfirmed = await _sweep(
+        sessionmaker_, [_server_resource("rebuilt-server")], anchor=AnchorCheck.UNCONFIRMED
+    )
+    assert unconfirmed.anchor_state is AnchorCheck.UNCONFIRMED
+    # A tick that never needed to ask reports no anchor answer at all.
+    clean = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)])
+    assert clean.anchor_state is None
 
 
 async def test_anchor_is_confirmed_at_most_once_per_tick(sessionmaker_: SessionMaker) -> None:

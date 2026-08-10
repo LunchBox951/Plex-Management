@@ -1886,9 +1886,12 @@ class ShareSweepStatusItem(BaseModel):
     ``unknown`` is the field that makes this honest: a sweep that could not reach
     plex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,
     which an operator must be able to tell apart from a clean ``ok`` sweep that
-    found everyone still entitled. ``anchor_mismatch`` / ``anchor_deferred`` are
-    the louder cousin: the stored Plex machine identifier no longer matches the
-    server, so share-loss verdicts are meaningless and none were acted on.
+    found everyone still entitled. The two anchor states are the louder cousin --
+    ``anchor_deferred`` share-loss verdicts were acted on for nobody because the
+    server anchor did not hold -- and they stay separate for the same reason:
+    ``anchor_mismatch`` means the server reported a DIFFERENT machine identifier
+    (established, needs a repoint), while ``anchor_unconfirmed`` means it could
+    not be asked at all (an outage, or missing credentials).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -1898,6 +1901,7 @@ class ShareSweepStatusItem(BaseModel):
         "ok",
         "degraded",
         "anchor_mismatch",
+        "anchor_unconfirmed",
         "not_configured",
         "probe_failed",
         "error",
