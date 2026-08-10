@@ -8527,6 +8527,216 @@ async def test_a_proactive_sweep_is_not_suppressed_by_an_active_correction_purge
     assert correction_season.partial_delete_path == str(correction_dir)
 
 
+async def test_a_correction_purge_defers_only_its_own_root_when_a_second_root_is_also_pressured(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Second-pressured-root scenario pin (issue #526, requested during #519
+    review of the defer above).
+
+    Defense in depth alongside
+    ``test_a_correction_purge_on_another_root_does_not_defer_this_roots_evictions``:
+    that test pressures only the root the correction does NOT own, so the
+    sibling root's own sweep is never itself run under real pressure -- it is
+    simply never exercised. This test puts BOTH roots under genuine pressure in
+    the same run and sweeps both, adding the scenario of a sibling root that is
+    simultaneously full AND actively swept while a neighboring root's
+    correction is in progress, and proving the ownership scope still holds root
+    B to its own disk state in that shape.
+
+    This is not the only test that catches ``_owned_by_root`` being
+    short-circuited to ``True`` -- the sibling test above (and two nested-root
+    candidate-assembly tests) already do, empirically. This test adds scenario
+    coverage the existing suite does not exercise; it is not closing a gap the
+    existing suite is blind to."""
+    root_a = tmp_path / "tv"
+    root_b = tmp_path / "tv-anime"
+    correction_dir = root_a / "Corrected Here" / "Season 01"
+    correction_dir.mkdir(parents=True)
+    (correction_dir / "Corrected.Here.S01E01.mkv").write_bytes(b"0" * 1024)
+    await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4995,
+        title="Corrected Here",
+        season_dir=correction_dir,
+        status=RequestStatus.searching,
+    )
+    victim_a_dir = root_a / "Same Root Victim" / "Season 01"
+    victim_a_dir.mkdir(parents=True)
+    (victim_a_dir / "Same.Root.Victim.S01E01.mkv").write_bytes(b"0" * 1024)
+    victim_a_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=4997, title="Same Root Victim", seasons={1: str(victim_a_dir)}
+    )
+    victim_b_dir = root_b / "Also Pressured Root Victim" / "Season 01"
+    victim_b_dir.mkdir(parents=True)
+    (victim_b_dir / "Also.Pressured.Root.Victim.S01E01.mkv").write_bytes(b"0" * 1024)
+    victim_b_show_id = await _show_with_seasons(
+        sessionmaker_,
+        tmdb_id=4996,
+        title="Also Pressured Root Victim",
+        seasons={1: str(victim_b_dir)},
+    )
+    all_roots = [str(root_a), str(root_b)]
+    library = FakeLibrary(
+        watch_states={
+            (4997, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+            (4996, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    fs = LocalFileSystem(library_roots=all_roots)
+
+    purge_service.begin_purge(str(correction_dir))
+    try:
+        # Root A: OWNS the active correction purge. Deferred despite its own
+        # pressure and its own eligible victim.
+        async with sessionmaker_() as session:
+            outcomes_a = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="tv",
+                root_path=str(root_a),
+                all_roots=all_roots,
+                threshold_pct=0.0,  # always-evict pressure: only the defer could stop it
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+        assert outcomes_a == []
+        assert victim_a_dir.exists()  # deferred: the pre-correction snapshot is stale
+        assert correction_dir.exists()
+
+        # Root B: ALSO under pressure, but owns nothing the correction claimed.
+        # Real ownership scoping must not defer it; a short-circuited-to-True
+        # ``_owned_by_root`` would.
+        async with sessionmaker_() as session:
+            outcomes_b = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="tv",
+                root_path=str(root_b),
+                all_roots=all_roots,
+                threshold_pct=0.0,  # genuinely pressured; root A's correction can't relieve it
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+    finally:
+        purge_service.end_purge(str(correction_dir))
+
+    assert [o.title for o in outcomes_b] == ["Also Pressured Root Victim"]
+    assert not victim_b_dir.exists()
+    async with sessionmaker_() as session:
+        victim_a = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == victim_a_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+        victim_b = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == victim_b_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+    assert victim_a.status is RequestStatus.available
+    assert victim_b.status is RequestStatus.evicted
+
+
+async def test_the_correction_purge_defer_applies_only_to_the_non_proactive_sweep_pass(
+    sessionmaker_: SessionMaker, tmp_path: Path
+) -> None:
+    """Proactive-sweep scenario pin (issue #526, requested during #519 review of
+    the defer above).
+
+    Defense in depth alongside
+    ``test_a_proactive_sweep_is_not_suppressed_by_an_active_correction_purge``:
+    that test only ever calls ``run_eviction_sweep`` with ``proactive=True``
+    against a single fresh fixture. This test instead sweeps the exact SAME
+    correction-purge fixture twice -- once ``proactive=False`` (must defer) and
+    once ``proactive=True`` (must not) -- pinning the deferred and
+    not-deferred outcomes back-to-back against identical state, an explicit A/B
+    contrast the existing sibling test does not itself exercise.
+
+    This is not the only test that catches the ``not proactive`` condition
+    being dropped -- the sibling test above already does, empirically. This
+    test adds scenario coverage the existing suite does not exercise; it is
+    not closing a gap the existing suite is blind to."""
+    root = tmp_path / "tv"
+    correction_dir = root / "Corrected Either Way" / "Season 01"
+    correction_dir.mkdir(parents=True)
+    (correction_dir / "Corrected.Either.Way.S01E01.mkv").write_bytes(b"0" * 1024)
+    await _rearmed_partial_season(
+        sessionmaker_,
+        tmdb_id=4998,
+        title="Corrected Either Way",
+        season_dir=correction_dir,
+        status=RequestStatus.searching,
+    )
+    victim_dir = root / "Same Setup Victim" / "Season 01"
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "Same.Setup.Victim.S01E01.mkv").write_bytes(b"0" * 1024)
+    victim_show_id = await _show_with_seasons(
+        sessionmaker_, tmdb_id=4999, title="Same Setup Victim", seasons={1: str(victim_dir)}
+    )
+    library = FakeLibrary(
+        watch_states={(4999, "tv", 1): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    fs = LocalFileSystem(library_roots=[str(root)])
+
+    purge_service.begin_purge(str(correction_dir))
+    try:
+        # Pass 1: NON-PROACTIVE, under real pressure -- only the defer can stop it.
+        async with sessionmaker_() as session:
+            non_proactive_outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="tv",
+                root_path=str(root),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+        assert non_proactive_outcomes == []
+        assert victim_dir.exists()  # deferred: the pre-correction snapshot is stale
+
+        # Pass 2: PROACTIVE, over the identical still-active purge -- must NOT defer.
+        async with sessionmaker_() as session:
+            proactive_outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="tv",
+                root_path=str(root),
+                threshold_pct=101.0,  # unreachable: only ``proactive`` can evict here
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+                proactive=True,
+            )
+    finally:
+        purge_service.end_purge(str(correction_dir))
+
+    assert [o.title for o in proactive_outcomes] == ["Same Setup Victim"]
+    assert not victim_dir.exists()
+    assert correction_dir.exists()  # the correction's own path stays protected either way
+    async with sessionmaker_() as session:
+        victim = (
+            (
+                await session.execute(
+                    select(SeasonRequest).where(SeasonRequest.media_request_id == victim_show_id)
+                )
+            )
+            .scalars()
+            .one()
+        )
+    assert victim.status is RequestStatus.evicted
+
+
 async def test_a_cancelled_regrabs_remains_are_left_alone_while_a_pack_covers_the_season(
     sessionmaker_: SessionMaker, tmp_path: Path
 ) -> None:
