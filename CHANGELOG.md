@@ -6,6 +6,66 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Entitlement/share-state schema and a `plex_access_service` module extracting
+  the plex.tv share-verdict ladder (schema and ladder extraction only — no
+  loop, no enforcement yet); PR-1 of the auth-revalidation design (#555).
+- Periodic Plex share-revalidation sweep: signed-in users are re-checked
+  against plex.tv on a bounded interval (default 6h, admin-editable), and a
+  confirmed share loss now signs the user out and closes their realtime
+  stream instead of waiting out session expiry (7-30 days). Owner/admin
+  accounts are exempt from sweep-driven revocation, and the sweep withholds
+  revoked-share sign-outs during a server-identity anchor mismatch
+  (stale-token verdicts still sign out — the credential is dead regardless
+  of which server is anchored). Status surfaces on `GET /api/v1/ops/health`
+  and the Status page as `share_sweep` (#557, PR-2 of the auth-revalidation
+  design).
+
+### Changed
+- CI: parallelized the Python quality-gate test run, and eliminated pytest
+  warnings under Python 3.12 and 3.14 (#543, #544).
+- Repo docs: archived the completed v1 planning docs under `docs/archive/`,
+  removed the now-unused `init.sh` reference-clone bootstrap script,
+  refreshed the post-1.0 status banners across README, CLAUDE.md, and
+  AGENTS.md, and annotated CONTRIBUTING.md's release checklist (the
+  changelog-cut step may defer to promotion-day cleanup) (#542, #551, #553).
+- `python-deps` group bump: fastapi, uvicorn, alembic, guessit, ruff, mako,
+  cffi, starlette, websockets (#550).
+- `frontend-deps` dev-dependency group bumps: `@types/react`,
+  `@types/react-dom`, `@vitejs/plugin-react`, `jsdom`, `vite` (#545), then
+  `@testing-library/user-event`, `globals`, `typescript-eslint`, `vite`
+  (#561).
+
+### Fixed
+- Eviction: walk-skipped candidates now carry an explicit `None` size
+  sentinel instead of a fabricated `0.0`, and eviction/retention sweeps now
+  log their duration on completion — including the common below-pressure
+  tick that previously returned in total silence — with walked-vs-skipped
+  counts included once candidate assembly has occurred (#554).
+- Grab now refuses, rather than transparently restarts, an unsafe
+  attachment-loss recovery (a blocklisted release, a settled request or
+  season, or a torrent removal that is in-flight or already completed) —
+  the prior client re-add machinery could strand or delete torrents, across
+  four review rounds. Ownership is re-proven at the client and is never
+  carried across a removal (#532, #472).
+- Share-revalidation sweep: the token guard is now atomic with the
+  revocation itself (a correlated `EXISTS` over the stored ciphertext
+  instead of a separate compare-then-update), and an unmapped `check_share`
+  exception now persists a failed-attempt stamp so a crashing cohort can no
+  longer starve the rest of the sweep's backlog (#559).
+
+### Security
+- Bumped `cryptography` to 50.0.0, resolving GHSA-g6cj-pr64-35w5 (a
+  Bleichenbacher timing oracle in PKCS#7 decryption affecting
+  `cryptography` `>=44,<50`). Only Fernet is used in this codebase
+  (`adapters/encryption.py`), so this is a supply-chain hygiene bump rather
+  than an exploitable path here. **Not
+  included in the released `1.0.0` image** — the promoted `:stable` build is
+  bit-identical to the canary-proven `edge-c1bf4eb` image, which predates
+  this bump (#548).
+- Bumped the transitive `js-yaml` dev dependency to 4.3.1, resolving a
+  quadratic-CPU DoS in `!!omap` resolution (GHSA-5p4m-2wfm-xmqj) (#547).
+
 ## [1.0.0] - 2026-08-09
 
 _Package metadata is `1.0.0` (see `src/plex_manager/__init__.py`). The
