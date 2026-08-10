@@ -95,6 +95,16 @@ class _TtlCache[V]:
 
     Only successful results are stored; misses (``None``) are not cached, so the
     sentinel ambiguity between "absent" and "cached None" never arises.
+
+    Eviction happens on WRITE as well as on read, because reads alone cannot
+    bound this cache: every key carries a hash of the credential it was fetched
+    with (see :data:`_SECTIONS_CACHE`), so a rotated Plex token retires its key
+    forever -- nothing ever calls ``get`` on it again to notice it expired.
+    Entitlement capture (#484) rotates a key per user per sign-in, so a
+    long-running process would otherwise accumulate one dead snapshot per
+    historical credential with no upper bound. The sweep is O(entries) on a dict
+    whose live size is "credentials seen in the last TTL", and only runs when
+    something is being stored anyway.
     """
 
     def __init__(self, ttl_seconds: float) -> None:
@@ -112,7 +122,10 @@ class _TtlCache[V]:
         return value
 
     def set(self, key: str, value: V) -> None:
-        self._store[key] = (time.monotonic() + self._ttl, value)
+        now = time.monotonic()
+        for expired in [k for k, (expires_at, _) in self._store.items() if expires_at <= now]:
+            del self._store[expired]
+        self._store[key] = (now + self._ttl, value)
 
     def clear(self) -> None:
         self._store.clear()
@@ -285,6 +298,13 @@ def _parse_sections_envelope(payload: Mapping[str, object]) -> list[LibrarySecti
       shape a genuinely empty Plex server actually emits (it reports the count
       and simply omits the array). Absent ``Directory`` with a non-zero or
       missing ``size`` means rows were expected and did not arrive.
+    * ``size``, when present alongside ``Directory``, must EQUAL the number of
+      rows. The server states how many sections it is describing; a truncated
+      body (``size: 2`` with one row) or a stripped array (``size: 1`` with
+      none) contradicts itself, and taking the rows that did arrive as the
+      library set is the same wrongful narrowing as a phantom empty. This
+      endpoint is never paginated, so the count and the array always agree on a
+      healthy response.
     * Every row must carry the fields that IDENTIFY a section (``key``,
       ``title``, ``type``). A row missing them is a broken response, and
       silently discarding it would hand the caller a SMALLER library set than
@@ -312,8 +332,15 @@ def _parse_sections_envelope(payload: Mapping[str, object]) -> list[LibrarySecti
         raise PlexLibraryError(
             "Plex returned a /library/sections body whose Directory is not a list"
         )
+    rows = cast("Sequence[object]", directory)
+    declared_size = _get_int(container, "size")
+    if declared_size is not None and declared_size != len(rows):
+        raise PlexLibraryError(
+            "Plex returned a /library/sections body whose declared size does not match "
+            "the number of Directory rows"
+        )
     sections: list[LibrarySection] = []
-    for entry in cast("Sequence[object]", directory):
+    for entry in rows:
         row = _as_mapping(entry)
         if (
             _get_str(row, "key") is None

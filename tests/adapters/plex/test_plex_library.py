@@ -23,7 +23,10 @@ import httpx
 import pytest
 
 from plex_manager.adapters.plex import PlexLibrary
+from plex_manager.adapters.plex import library as library_module
 from plex_manager.adapters.plex.library import (
+    _CACHE_TTL_SECONDS,  # pyright: ignore[reportPrivateUsage]
+    _SECTIONS_CACHE,  # pyright: ignore[reportPrivateUsage]
     PlexAuthError,
     PlexLibraryError,
     _ArtworkKeys,  # pyright: ignore[reportPrivateUsage]
@@ -183,6 +186,31 @@ async def test_list_sections_maps_type_and_locations() -> None:
             "a row missing its type",
             id="row_missing_type",
         ),
+        pytest.param(
+            {
+                "MediaContainer": {
+                    "size": 2,
+                    "Directory": [{"key": "1", "title": "Movies", "type": "movie"}],
+                }
+            },
+            "a truncated body: two sections promised, one delivered",
+            id="size_exceeds_rows",
+        ),
+        pytest.param(
+            {"MediaContainer": {"size": 1, "Directory": []}},
+            "one section promised, the array stripped empty",
+            id="size_with_empty_rows",
+        ),
+        pytest.param(
+            {
+                "MediaContainer": {
+                    "size": 0,
+                    "Directory": [{"key": "1", "title": "Movies", "type": "movie"}],
+                }
+            },
+            "zero sections declared, a row delivered anyway",
+            id="rows_exceed_size",
+        ),
     ],
 )
 async def test_list_sections_rejects_a_malformed_envelope(body: dict[str, Any], why: str) -> None:
@@ -190,8 +218,9 @@ async def test_list_sections_rejects_a_malformed_envelope(body: dict[str, Any], 
 
     A 200 that does not faithfully describe the library set must raise rather
     than be read as fewer (or zero) libraries: silently dropping an unparseable
-    row would hand callers a narrowed library set, which entitlement capture
-    would then persist as an authoritative snapshot.
+    row -- or believing an array shorter than the ``size`` the server itself
+    declared -- would hand callers a narrowed library set, which entitlement
+    capture would then persist as an authoritative snapshot.
     """
     adapter = _adapter(lambda _request, b=body: httpx.Response(200, json=b))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
     with pytest.raises(PlexLibraryError):
@@ -275,6 +304,40 @@ async def test_list_sections_use_cache_false_reflects_a_new_outage() -> None:
     down_adapter = PlexLibrary(down_client, base_url="http://outage-plex:32400", token=TOKEN)
     with pytest.raises(PlexAuthError):
         await down_adapter.list_sections(use_cache=False)
+
+
+async def test_expired_credential_keys_do_not_accumulate_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sections cache is keyed by server + a hash of the CREDENTIAL, so a
+    rotated Plex token retires its key: nothing ever reads it again to notice it
+    expired. Entitlement capture (#484) reads live sections per user per sweep,
+    so an evict-on-read-only cache would grow one dead snapshot per historical
+    credential for the life of the process. Expired entries must therefore be
+    dropped on WRITE too.
+    """
+
+    class _Clock:
+        now = 1_000.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = _Clock()
+    monkeypatch.setattr(library_module, "time", clock)
+
+    base = "http://rotating-plex:32400"
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=SECTIONS))
+    )
+    for index in range(3):
+        token = f"rotated-token-{index}"
+        await PlexLibrary(client, base_url=base, token=token).list_sections()
+        clock.now += _CACHE_TTL_SECONDS + 1  # the previous token's entry ages out
+
+    # Only the newest credential's entry survives -- the two retired ones were
+    # purged by the writes that followed them, without anyone re-reading them.
+    assert len(_SECTIONS_CACHE._store) == 1  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_list_sections_cache_is_keyed_by_token_not_just_url() -> None:
