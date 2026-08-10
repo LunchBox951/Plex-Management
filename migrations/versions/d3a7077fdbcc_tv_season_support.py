@@ -1,7 +1,7 @@
 """tv season support
 
 Three schema changes for TV (seasons + episodes) support, all part of the same
-logical change (see ``docs/design/tv-beta-plan.md`` sections 4/5/12) so they
+logical change (see ``docs/archive/tv-beta-plan.md`` sections 4/5/12) so they
 ship as one revision:
 
 1. ``uq_media_requests_active``: add ``partially_available`` to the predicate.

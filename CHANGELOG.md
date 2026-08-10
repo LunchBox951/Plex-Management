@@ -6,10 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_No released versions yet — no Git tags or GitHub releases exist, and package
-metadata is still `0.0.0`. The request → watchable → correct loop for movies,
-TV, and anime is feature-complete; a milestone canary/feature-freeze run
-precedes the first stable promotion (see the "Version 1.0" milestone)._
+## [1.0.0] - 2026-08-09
+
+_Package metadata is `1.0.0` (see `src/plex_manager/__init__.py`). The
+canary-proven `edge-c1bf4eb` image was promoted to `:stable` / `1.0.0` on
+Aug 9, 2026 by re-tag (no rebuild — ADR-0004). The 1.0.0 runbook (issue #3)
+deliberately departed from CONTRIBUTING.md's checklist ordering here: the
+`## [1.0.0]` changelog cut lands in promotion-day cleanup after the re-tag,
+so the promoted bytes are exactly the renewed-soak canary build at the cost
+of the cut not being baked into that image. The request → watchable →
+correct loop for movies, TV, and anime is feature-complete; the 7-day live
+canary run (Jul 25 - Aug 1, 2026) completed, fixes from it landed in
+`:edge` on Aug 2, and the renewed soak of the promoted build ran clean from
+Aug 3 (see the "Version 1.0" milestone)._
 
 ### Added
 - Typed React/Vite single-page app, contract-bound to the published OpenAPI
@@ -55,11 +64,16 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
 - Configured service URLs (Plex/Prowlarr/qBittorrent/TMDB) are origin-confined,
   and changing a service's destination requires explicit operator consent
   ([ADR-0018](docs/adr/0018-origin-confined-service-urls.md)).
-- 17 Alembic migrations have shipped since the alpha's initial schema; every
+- 28 Alembic migrations have shipped since the alpha's initial schema; every
   container start runs `alembic upgrade head` before serving. Rollback and
   backup expectations are now documented honestly rather than implied — see
   [ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) and
   the README "Backup & recovery" section.
+- Runtime container base migrated from Debian `python:3.14-slim` to a
+  digest-pinned Wolfi/glibc base, shrinking the base-OS vulnerability surface
+  while preserving the Python 3.14, glibc-wheel, `ffprobe`, and numeric-UID
+  production contract ([ADR-0027](docs/adr/0027-wolfi-container-base.md),
+  #18).
 
 ### Fixed
 - A broad honesty/resilience pass: no unhandled 500s on parse, settings
@@ -68,6 +82,37 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
   request-row dedup healing (folds duplicates, self-heals false "available"
   claims); qBittorrent session reuse across polling cycles with stall healing;
   host/container path-visibility healing for library and download roots.
+- Canary-soak eviction/correction-order hardening: recovery now finishes
+  marker-owned movie correction purges left incomplete across replacement
+  statuses, defers recovery while a correction purge is still active, and
+  recovers advanced marker-owned purges instead of stranding them; the
+  incomplete-delete outcome is persisted on the eviction claim row itself so
+  a later sweep can't re-derive stale state (#540, #524, #519, #525, #495).
+- Purge probe-lifecycle races: correction-path probes are isolated from
+  eviction's own probes, a probe's own deadline cancellation is distinguished
+  from an external cancel, and `remove_torrent`'s local mount-sensitive
+  reads run on the same abandonable probe substrate so a wedged or
+  unresponsive mount can't strand a purge past the filesystem-probe
+  deadline (qBittorrent API calls keep their own adapter timeout)
+  (#518, #522, #493).
+- Filesystem publish-lock and containment: stale publish locks are reclaimed
+  on rollback and the remaining reclaim races closed, xattrs survive the
+  cross-device copy fallback, and import publication is anchored to
+  no-follow descriptors inside the configured library root instead of
+  trusting a path string (#521, #541, #500, #499).
+- Import/availability/grab race closures: the import finalize path locks its
+  parent before scope bookkeeping and re-reads scopes before terminal
+  finalize so a late same-hash attach still imports; availability promotion
+  binds its CAS to the actually-observed completion and guards against a
+  correction re-arm mid-promotion; `mark_available`'s CAS boolean return is
+  honored instead of assumed; a same-hash torrent removal verifies scope
+  ownership before its lost-CAS cleanup; and admin cancel now serializes
+  with the per-media lock (#498, #492, #523, #489, #508, #491, #367).
+- Health/updater/logs operability: shared health-probe lifecycle gaps are
+  closed, promotion log extras are sanitized and cite the actual probe
+  bound, the import-cycle download ID is normalized in logs, and partial
+  eviction outcomes are surfaced instead of collapsing to a single
+  pass/fail (#473, #509, #520, #517, #527).
 
 ### Security
 - Header-safe credential handling, atomic and symlink-safe encryption-key
@@ -77,6 +122,7 @@ precedes the first stable promotion (see the "Version 1.0" milestone)._
 - An ownership-claim guard before deleting library files on eviction/correction.
 
 ### Deferred
-- The host auto-updater mechanism (Watchtower vs. a systemd timer) is not
-  bundled in the compose file yet — each host is designed to auto-pull its
-  release channel, but wiring the updater itself remains an open decision.
+- The updater sidecar's self-recreation (ADR-0025 Stage 1, tracked by #390).
+  The first-party container updater itself *is* bundled as an opt-in Compose
+  profile (`--profile auto-update`) with Stage 0 detect-and-surface behavior;
+  only its ability to recreate itself after an update remains deferred.

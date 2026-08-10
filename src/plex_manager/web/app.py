@@ -1112,24 +1112,31 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
     — and, deliberately, the telemetry sweep too: it is part of the SAME
     eviction subsystem tick, so turning eviction off also stops its extra
     per-tick Plex watch-state polling.
+
+    It does NOT stop interrupted OPERATOR corrections from converging: the
+    disabled tick still runs :func:`~plex_manager.services.eviction_service.
+    run_correction_recovery_sweep` per root (recovery only — nothing evicted,
+    no telemetry). That switch governs the retention bot, and a report-issue
+    purge the operator already asked for must not be stranded ``import_blocked``
+    behind its own remnants until someone re-enables eviction.
     """
     sessionmaker = app.state.sessionmaker
     client = app.state.http_client
     async with sessionmaker() as session:
         interval_minutes = await get_eviction_interval_minutes(session)
-        if not await get_eviction_enabled(session):
-            return interval_minutes * 60.0
+        eviction_enabled = await get_eviction_enabled(session)
 
         library = await get_library_optional(session, client)
         if library is None:
-            # Nothing is evictable without Plex to resolve watch state from --
-            # never guess, never evict blind.
+            # Nothing is evictable -- nor recoverable -- without Plex to resolve
+            # watch state from and to refresh once media leaves disk: never
+            # guess, never evict blind.
             return interval_minutes * 60.0
+        try:
+            qbt = await resolve_qbittorrent(app.state, session, client)
+        except ServiceNotConfiguredError:
+            qbt = None
 
-        threshold_pct = await get_disk_pressure_threshold_percent(session)
-        target_pct = await get_disk_pressure_target_percent(session)
-        grace_days = await get_eviction_grace_days(session)
-        proactive_enabled = await get_eviction_proactive_enabled(session)
         movies_root = await get_movies_root_optional(session)
         tv_root = await get_tv_root_optional(session)
         anime_movie_root = await get_anime_movie_root_optional(session)
@@ -1153,6 +1160,57 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
         # parent's disk pressure must never evict (or telemetry-count) the child
         # mount's content (see eviction_service._owned_by_root).
         all_roots: list[str] = [r for _mt, r in roots if r]
+
+        if not eviction_enabled:
+            # The kill switch turns the RETENTION bot off; it never withdraws a
+            # correction the operator already asked for. A report-issue purge
+            # interrupted mid-delete leaves remnants at a DETERMINISTIC
+            # destination, so its replacement import keeps failing against them --
+            # a deadlock only this recovery pass can break, and one that would
+            # otherwise sit there until someone re-enabled eviction (a terminal in
+            # all but name). Recovery ONLY: nothing is evicted, no proactive pass,
+            # and no telemetry sweep (the disabled tick still does no extra Plex
+            # watch-state polling). See eviction_service.
+            # run_correction_recovery_sweep for what that narrowing covers.
+            for media_type, root in roots:
+                if not root:
+                    continue
+                try:
+                    await eviction_service.run_correction_recovery_sweep(
+                        session=session,
+                        library=library,
+                        fs=fs,
+                        media_type=media_type,
+                        root_path=root,
+                        all_roots=all_roots,
+                        qbt=qbt,
+                    )
+                except Exception:
+                    # Same per-root posture as the sweeps below: one root's
+                    # failure must never skip the roots after it, and the shared
+                    # session is rolled back (itself guarded) so a poisoned
+                    # transaction cannot cascade into them.
+                    _logger.exception(
+                        "correction recovery failed for %s root %s; continuing "
+                        "with remaining roots",
+                        media_type,
+                        root,
+                    )
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        _logger.exception(
+                            "rollback after a failed correction recovery for %s "
+                            "root %s also failed; continuing",
+                            media_type,
+                            root,
+                        )
+            return interval_minutes * 60.0
+
+        threshold_pct = await get_disk_pressure_threshold_percent(session)
+        target_pct = await get_disk_pressure_target_percent(session)
+        grace_days = await get_eviction_grace_days(session)
+        proactive_enabled = await get_eviction_proactive_enabled(session)
         for media_type, root in roots:
             if not root:
                 continue
@@ -1252,6 +1310,7 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
                     threshold_pct=threshold_pct,
                     target_pct=target_pct,
                     grace_days=grace_days,
+                    qbt=qbt,
                 )
             except Exception:
                 _logger.exception(
@@ -1309,6 +1368,7 @@ async def _eviction_tick_leased(app: FastAPI) -> float:
                         target_pct=target_pct,
                         grace_days=grace_days,
                         proactive=True,
+                        qbt=qbt,
                     )
                 except Exception:
                     _logger.exception(
