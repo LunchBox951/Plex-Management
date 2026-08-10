@@ -70,6 +70,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
@@ -93,6 +94,7 @@ from plex_manager.repositories.season_requests import SqlSeasonRequestRepository
 from plex_manager.services import purge_service, season_request_service, watchlist_service
 from plex_manager.services.health_service import read_disk_usage
 from plex_manager.services.library_roots import deepest_containing_root
+from plex_manager.services.log_capture_service import EVICTION_TELEMETRY_LOGGER_NAME
 from plex_manager.services.purge_service import PurgeOutcome
 
 if TYPE_CHECKING:
@@ -113,6 +115,12 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+# Issue #353's sweep-telemetry records go through this pinned ``.telemetry``
+# child (same pattern as auto-grab's): ``configure_logging`` pins it to INFO so
+# the canary evidence is created at any operator ``log_level``, and
+# ``prune_once`` gives it the telemetry retention floor. Operational eviction
+# logging stays on ``_logger`` with ordinary level/retention semantics.
+_telemetry_logger = logging.getLogger(EVICTION_TELEMETRY_LOGGER_NAME)
 
 
 @dataclass(frozen=True)
@@ -870,9 +878,16 @@ async def _movie_candidates(
     two can never drift) already says can never be evicted at this cutoff --
     pinned, in-flight, unwatched, or still within grace. The row is still
     returned (the RAW-superset contract every caller of :func:`assemble_candidates`
-    depends on is never narrowed here — see its docstring), just with the honest
-    ``size_percent=0.0`` fallback the module already uses for an unknown size,
-    never a real walk. ``None`` (the default) walks every row exactly like
+    depends on is never narrowed here — see its docstring), just with the
+    explicit ``size_percent=None`` walk-skip SENTINEL (issue #353), never a
+    real walk. This is deliberately DISTINCT from a real, measured zero (a
+    genuinely empty/zero-byte title still walks and reports a real ``0.0``):
+    conflating the two, as an earlier revision of this optimization did, made a
+    fabricated "unknown" indistinguishable from a genuinely empty title to any
+    future caller that sums size over the raw superset rather than
+    ``partition.eligible``/the selected set — see
+    :class:`~plex_manager.domain.eviction.EvictionCandidate`'s docstring for
+    the full contract. ``None`` (the default) walks every row exactly like
     before this optimization existed -- a caller with no grace policy in hand
     yet (or a test proving the walk itself) gets the old, unconditional behavior.
     """
@@ -923,7 +938,11 @@ async def _movie_candidates(
         )
         if grace_cutoff is not None and not is_evictable(prospective, grace_cutoff):
             size_bytes = None
-            candidate = prospective
+            # Explicit walk-skip SENTINEL (issue #353), never the fabricated
+            # ``0.0`` an earlier revision left here -- see this function's
+            # docstring and ``EvictionCandidate.size_percent``'s for the full
+            # "distinguishable from a genuinely empty title" contract.
+            candidate = replace(prospective, size_percent=None)
         else:
             size_bytes = await _sized_path(row.library_path, size_cache)
             size_percent = (
@@ -959,7 +978,8 @@ async def _season_candidates(
     ``grace_cutoff`` (issue #304): see :func:`_movie_candidates`'s twin
     docstring paragraph -- identical walk-skip optimization, same
     :func:`~plex_manager.domain.eviction.is_evictable` predicate, same RAW
-    superset contract.
+    superset contract, same explicit ``size_percent=None`` sentinel (issue
+    #353) rather than a fabricated zero.
     """
     season_repo = SqlSeasonRequestRepository(session)
     request_repo = SqlRequestRepository(session)
@@ -1027,7 +1047,9 @@ async def _season_candidates(
         )
         if grace_cutoff is not None and not is_evictable(prospective, grace_cutoff):
             size_bytes = None
-            candidate = prospective
+            # Explicit walk-skip SENTINEL (issue #353) -- see
+            # ``_movie_candidates``'s twin comment.
+            candidate = replace(prospective, size_percent=None)
         else:
             size_bytes = await _sized_path(row.library_path, size_cache)
             size_percent = (
@@ -3220,9 +3242,12 @@ async def assemble_candidates(
     optimization -- NOT a filter on the returned list. When given, a row that
     :func:`~plex_manager.domain.eviction.is_evictable` already rules out at this
     cutoff (pinned, in-flight, unwatched, or still within grace) skips the
-    expensive ``os.walk`` size lookup and reports the honest ``size_percent=0.0``
-    fallback instead; it still appears in the returned superset exactly like
-    every other row (see :func:`_movie_candidates`/:func:`_season_candidates`),
+    expensive ``os.walk`` size lookup and reports the explicit
+    ``size_percent=None`` walk-skip SENTINEL instead (issue #353 -- never the
+    fabricated ``0.0`` an earlier revision used, which made a skipped row
+    indistinguishable from a genuinely empty title to a consumer that sums size
+    over the raw superset); it still appears in the returned superset exactly
+    like every other row (see :func:`_movie_candidates`/:func:`_season_candidates`),
     so the retention-telemetry time-to-watch dataset -- which explicitly wants
     started-but-unfinished/unwatched/pinned rows -- is never silently narrowed.
     ``None`` (the default) walks every row unconditionally, exactly like before
@@ -3552,7 +3577,19 @@ async def _run_sweep(
     qbt: DownloadClientPort | None = None,
 ) -> list[EvictionOutcome]:
     """The sweep body, entered only under :func:`run_eviction_sweep`'s
-    serialization latch — see the public docstring."""
+    serialization latch — see the public docstring.
+
+    Every return path below logs an honest, always-on TELEMETRY line (issue
+    #353's perf-confirmation half; an exception escaping this body -- e.g.
+    from a disk re-probe -- propagates without one): wall-clock duration plus,
+    once candidate assembly has actually run, how many rows were walk-eligible
+    for the ``os.walk`` size lookup versus walk-skipped as already-ineligible (issue
+    #304) -- the exact ineligible:eligible ratio the walk-skip optimization's
+    perf premise needs to confirm from canary logs. The common below-threshold
+    tick previously returned in total silence; that silence is exactly why the
+    canary checkpoints in #353 found zero matching log lines.
+    """
+    sweep_started = time.monotonic()
     try:
         # A hung/unresponsive mount must neither freeze the event loop nor keep
         # CPython alive through its joined default executor after shutdown's bound.
@@ -3563,10 +3600,11 @@ async def _run_sweep(
         )
     except OSError as exc:
         _logger.warning(
-            "eviction sweep skipped for %s root %s (%s)",
+            "eviction sweep skipped for %s root %s (%s) after %.3fs",
             media_type,
             root_path,
             type(exc).__name__,
+            time.monotonic() - sweep_started,
         )
         return []
 
@@ -3637,9 +3675,11 @@ async def _run_sweep(
     ):
         _logger.info(
             "eviction sweep deferred for %s root %s: an operator correction purge "
-            "is active under this root; pressure will be re-read after it settles",
+            "is active under this root; pressure will be re-read after it settles "
+            "(%.3fs)",
             media_type,
             safe_text(root_path),
+            time.monotonic() - sweep_started,
         )
         return []
 
@@ -3653,6 +3693,20 @@ async def _run_sweep(
         # repeated cost for a large library on every tick the disk ISN'T under
         # pressure -- the common case. A proactive sweep has no pressure gate, so
         # this check is skipped for it (it always needs the full candidate set).
+        #
+        # This is also the tick that previously logged NOTHING (issue #353): the
+        # common no-pressure case, which is exactly why the canary checkpoints
+        # found zero sweep-telemetry lines. Logged here, cheaply, before paying
+        # for any candidate assembly.
+        _telemetry_logger.info(
+            "eviction sweep telemetry: %s root %s below pressure threshold "
+            "(%.1f%% used < %.1f%% threshold); no candidates assembled, %.3fs",
+            media_type,
+            safe_text(root_path),
+            disk_used_pct,
+            threshold_pct,
+            time.monotonic() - sweep_started,
+        )
         return []
     # The cutoff above is shared by recovery and fresh candidate selection so both
     # paths apply one sweep-wide grace decision.
@@ -3664,10 +3718,25 @@ async def _run_sweep(
         )
     )
     if not pairs:
+        _telemetry_logger.info(
+            "eviction sweep telemetry: %s root %s -- 0 available row(s) owned "
+            "by this root; nothing to evict, %.3fs",
+            media_type,
+            safe_text(root_path),
+            time.monotonic() - sweep_started,
+        )
         return []
 
     pending_by_id: dict[int, _Pending] = {id(candidate): pending for candidate, pending in pairs}
     candidates = [candidate for candidate, _pending in pairs]
+
+    # Issue #353 telemetry: derived straight from the walk-skip SENTINEL
+    # (``size_percent is None``) every ineligible-at-``grace_cutoff`` row now
+    # carries -- no separate counter threaded through ``_movie_candidates`` /
+    # ``_season_candidates``, so this can never drift from what assembly
+    # actually walked. Logged once, in the final summary below.
+    candidates_skipped = sum(1 for candidate in candidates if candidate.size_percent is None)
+    candidates_walked = len(candidates) - candidates_skipped
 
     # The full stalest-first ranking, computed once: `select_evictions`'s result
     # is always a PREFIX of this same ordering (it ranks internally via this
@@ -3781,4 +3850,17 @@ async def _run_sweep(
                 break
             await _attempt(candidate)
 
+    _telemetry_logger.info(
+        "eviction sweep telemetry: %s root %s took %.3fs -- %d candidate(s) "
+        "walk-eligible (size measured; pathless rows and shared-path cache hits "
+        "pay no os.walk), %d walk-skipped (already ineligible at this sweep's "
+        "grace cutoff, issue #304 -- see EvictionCandidate.size_percent's "
+        "None sentinel), %d evicted",
+        media_type,
+        safe_text(root_path),
+        time.monotonic() - sweep_started,
+        candidates_walked,
+        candidates_skipped,
+        len(outcomes),
+    )
     return outcomes

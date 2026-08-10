@@ -18,10 +18,18 @@ size_percent` — its estimated share of the ROOT's total capacity (i.e. already
 never needs a root's total-byte count threaded through it: :func:`select_evictions`
 stays entirely in percentage space, the same space ``used_pct``/``threshold_pct``/
 ``target_pct`` already live in (see :mod:`plex_manager.domain.disk_usage` for the
-byte -> percentage conversion the caller uses to build it). A candidate whose size
-is unknown reports ``0.0``: it is still evictable (unwatched/pinned/grace rules are
-unaffected), it just never helps close the gap toward the target on its own — an
-honest "we don't know how much this saves" rather than a fabricated guess.
+byte -> percentage conversion the caller uses to build it). ``size_percent`` is
+``None`` (issue #353) when the caller never measured this candidate's on-disk
+footprint at all — e.g. the service layer's walk-skip optimization for a row
+already ruled out at a given cutoff (see :func:`is_evictable`) — and a real
+measured ``0.0`` when the caller DID look and found (or could only honestly
+report) nothing. Both are still evictable (unwatched/pinned/grace rules never
+depend on size) and both contribute nothing toward closing the gap to the
+target, but they are no longer the SAME value: a raw candidate list may contain
+either, and a consumer summing bytes over it must treat ``None`` as "unmeasured,
+do not count" rather than silently folding it into a genuine zero (honesty over
+silence — a future caller aggregating over the raw superset must undercount
+visibly, by skipping the row, never invisibly by trusting a fabricated 0.0).
 
 Honesty over silence: eviction never touches ``keep_forever`` or unwatched
 content, never fires without disk pressure (:func:`select_evictions` returns an
@@ -86,7 +94,9 @@ class EvictionCandidate:
 
     ``size_percent`` is this candidate's on-disk footprint as a percentage of its
     root's total capacity (see module docstring); used only to project the
-    running used% as candidates are picked.
+    running used% as candidates are picked. ``None`` means it was never
+    measured (the walk-skip sentinel, issue #353) rather than a real, measured
+    zero — see the module docstring for the full contract.
     """
 
     request_id: int
@@ -99,7 +109,7 @@ class EvictionCandidate:
     keep_forever: bool
     in_flight: bool
     library_path: str | None
-    size_percent: float
+    size_percent: float | None
     watchlisted: bool = False
 
 
@@ -204,6 +214,16 @@ def select_evictions(
     function never invents a candidate that was not eligible, so under-shooting
     the target is a possible, honestly-reported outcome (the caller's disk gauge
     will show the sweep did not fully relieve pressure).
+
+    A ranked candidate's ``size_percent`` is ``None`` (issue #353's walk-skip
+    sentinel) only when a caller's own bookkeeping is inconsistent with the
+    ``grace_cutoff`` passed here -- eligibility never depends on size, so every
+    candidate this function ranks as eligible AT this same cutoff was, by the
+    service layer's construction, also walked at it. Still handled explicitly
+    rather than assumed: an unmeasured candidate contributes ``0`` to the
+    projection (the same "never helps close the gap" honest fallback a measured
+    ``0.0`` already gets), never a crash over a caller that passes raw,
+    hand-built candidates.
     """
     if used_pct < threshold_pct:
         return []
@@ -216,7 +236,7 @@ def select_evictions(
         if projected <= target_pct:
             break
         selected.append(candidate)
-        projected -= candidate.size_percent
+        projected -= candidate.size_percent if candidate.size_percent is not None else 0.0
 
     return selected
 
