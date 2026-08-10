@@ -3603,6 +3603,21 @@
             "title": "Authorized",
             "type": "integer"
           },
+          "capture_failed": {
+            "default": 0,
+            "title": "Capture Failed",
+            "type": "integer"
+          },
+          "capture_skipped": {
+            "default": 0,
+            "title": "Capture Skipped",
+            "type": "integer"
+          },
+          "captured": {
+            "default": 0,
+            "title": "Captured",
+            "type": "integer"
+          },
           "checked": {
             "default": 0,
             "title": "Checked",

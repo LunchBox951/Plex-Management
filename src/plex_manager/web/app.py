@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, Response
 
 from plex_manager import __version__
 from plex_manager.adapters.encryption import prepare_encryption
-from plex_manager.adapters.plex.library import PlexAuthError, PlexLibraryError
+from plex_manager.adapters.plex.library import PlexAuthError, PlexLibrary, PlexLibraryError
 from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
 from plex_manager.adapters.plex.watchlist import PlexWatchlist
 from plex_manager.adapters.prowlarr import IndexerError, IndexerRateLimitError
@@ -41,6 +41,7 @@ from plex_manager.db import get_sessionmaker
 from plex_manager.domain.disk_usage import used_percent
 from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import User
+from plex_manager.ports.library import LibraryPort
 from plex_manager.repositories.log_events import SqlLogEventRepository
 from plex_manager.services import (
     auto_grab_service,
@@ -69,6 +70,7 @@ from plex_manager.services.update_coordination_service import (
 # cross-module attribute read CodeQL can see, unlike a ``from``-imported bare
 # name (see the ``Cell`` docstring in ``web.deps``; alerts #363/#368, issue #385).
 from plex_manager.web import deps
+from plex_manager.web.background import detached_tasks
 from plex_manager.web.deps import (
     AUTO_GRAB_INTERVAL_SECONDS_DEFAULT,
     CSRF_HEADER_NAME,
@@ -1102,6 +1104,74 @@ def _get_share_sweep_status(app: FastAPI) -> plex_access_service.ShareSweepStatu
     return status
 
 
+def _entitlement_capture_context(
+    client: httpx.AsyncClient,
+    plex_url: str | None,
+    service_token: str | None,
+    *,
+    cached_anchor: str | None,
+) -> plex_access_service.EntitlementCaptureContext | None:
+    """Lend the sweep what it needs to capture section entitlements (#484 PR-3).
+
+    The composition root's job, not the service's: only this layer knows that a
+    ``LibraryPort`` is a ``PlexLibrary`` over the shared HTTP client and the
+    configured base url. ``None`` when Plex is not configured -- there is nothing
+    to capture against, and the sweep simply does no capture that tick.
+
+    The per-user client is built with the USER's token deliberately: capturing
+    with the owner token would return the owner's view for everybody, which is
+    precisely the thing this PR exists to distinguish. ``PlexLibrary`` keys its
+    sections cache by ``base_url`` + a HASH of the token, so one user's filtered
+    view can never be served to (or poisoned by) another's.
+
+    ``cached_anchor`` is the STORED ``plex_machine_identifier``, and capture is
+    declined outright without it. On an upgraded install the sweep can still
+    resolve an identifier by probing ``/identity`` live, but that probe is
+    deliberately NOT persisted here, and this function deliberately does not
+    backfill the setting: the anchor is the id post-init sign-in trusts to admit
+    users, and every existing writer of it (``/setup/complete``, the
+    ``PUT /settings`` repoint) commits it only after the full verification ladder
+    -- ``/identity`` derive, an AUTHENTICATED ``list_sections``, and the ownership
+    assertion -- precisely because ``/identity`` is unauthenticated and
+    reachability alone would bless a wrong or replaced server. A background loop
+    silently promoting a bare probe to that anchor would route around the check
+    that write path exists to enforce. So capture waits for the operator's own
+    verified action (finishing setup, or re-saving the Plex settings, which runs
+    the ladder and persists the id); until then it is skipped and counted, not
+    silently failing every tick.
+    """
+    if not plex_url or not cached_anchor:
+        return None
+
+    def _library_for_token(token: str) -> LibraryPort | None:
+        try:
+            return PlexLibrary(client, plex_url, token)
+        except PlexLibraryError:
+            # A malformed stored ``plex_url``. Never fatal to the tick -- the
+            # sweep's own verdict work does not need the server at all.
+            _logger.warning(
+                "entitlement capture is unavailable: the configured Plex server URL is invalid"
+            )
+            return None
+
+    async def _owner_section_count() -> int | None:
+        """How many sections the OWNER token sees -- the filtering baseline."""
+        if not service_token:
+            return None
+        library = _library_for_token(service_token)
+        if library is None:
+            return None
+        # Uncached for the same reason the per-user read is: a stale baseline
+        # would silently mislabel a genuinely filtered view as ``full``.
+        return len(await library.list_sections(use_cache=False))
+
+    return plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        owner_section_count=_owner_section_count,
+        anchor_setting_key=PLEX_MACHINE_ID_SETTING,
+    )
+
+
 async def _confirm_share_anchor(
     app: FastAPI, plex_tv: PlexTvClient, machine_identifier: str
 ) -> plex_access_service.AnchorCheck:
@@ -1192,6 +1262,17 @@ async def _share_sweep_once(app: FastAPI) -> int:
         # second copy of the tri-state ladder would be a second place to drift.
         resolution = await _resolve_watchlist_server_identity(SettingsStore(session), plex_tv)
         interval_hours = await get_share_revalidation_interval_hours(session)
+        # Read once for the entitlement capture below (#484 PR-3): the per-user
+        # library client talks to the SERVER, not plex.tv, so it needs the
+        # configured base url; the service token supplies the owner baseline the
+        # capture telemetry compares each user's view against.
+        store = SettingsStore(session)
+        plex_url = await store.get("plex_url")
+        plex_service_token = await store.get("plex_token")
+        # The STORED anchor, distinct from the resolver's live-probe fallback:
+        # capture only stamps against an operator-verified identifier (see
+        # ``_entitlement_capture_context``).
+        cached_anchor = await store.get(PLEX_MACHINE_ID_SETTING)
     if resolution.probe_error is not None:
         # Configured but unreachable. Revoke NOBODY: an outage is not evidence
         # that anyone lost their share (north star #3), and reporting a distinct
@@ -1228,6 +1309,9 @@ async def _share_sweep_once(app: FastAPI) -> int:
         limit=plex_access_service.SHARE_SWEEP_USER_BUDGET,
         confirm_anchor=_confirm,
         on_signed_out=_close_signed_out_stream,
+        capture=_entitlement_capture_context(
+            client, plex_url, plex_service_token, cached_anchor=cached_anchor
+        ),
     )
     status.mark_completed(result)
     if result.share_revoked or result.token_stale:
@@ -2020,14 +2104,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
     finally:
         get_event_hub(app).close_all(reason="shutdown")
-        for task in background_tasks:
+        # Detached request-spawned work (``web.background``) shuts down with the
+        # loops: an entitlement capture waiting out a black-holed Plex server
+        # would otherwise be torn down mid-await by loop close and surface as an
+        # ugly "task was destroyed but it is pending" instead of a clean cancel.
+        shutdown_tasks = (*background_tasks, *tuple(detached_tasks(app)))
+        for task in shutdown_tasks:
             task.cancel()
         # Await every cancelled task so its cleanup runs, bounded (issue #401):
         # see ``_await_background_tasks_shutdown`` -- a purge/eviction delete's
         # cancellation-shielded off-thread ``fs.delete`` (PR #395 / issue #128)
         # can otherwise stall this wait forever behind a hung mount.
         await _await_background_tasks_shutdown(
-            background_tasks,
+            shutdown_tasks,
             timeout_seconds=get_settings().shutdown_task_timeout_seconds,
         )
         await app.state.http_client.aclose()

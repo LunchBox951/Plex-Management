@@ -436,3 +436,43 @@ async def test_loop_survives_a_failing_tick_and_records_it(
     assert isinstance(status, plex_access_service.ShareSweepStatus)
     assert status.state == "error"
     assert status.last_error_type == "RuntimeError"
+
+
+# --------------------------------------------------------------------------- #
+# Entitlement capture wiring (issue #484 PR-3)
+# --------------------------------------------------------------------------- #
+async def test_capture_is_declined_without_an_operator_verified_anchor(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """An upgraded install (url + token, no cached identifier) resolves an
+    identifier by probing ``/identity`` live -- but that probe is NOT the anchor.
+
+    Every writer of ``plex_machine_identifier`` commits it only after the full
+    verification ladder (``/identity`` derive + an AUTHENTICATED ``list_sections``
+    + the ownership assertion), because ``/identity`` is unauthenticated and
+    reachability alone would bless a replaced server. A background sweep must not
+    route around that, so it declines capture rather than backfilling the anchor
+    itself -- and, critically, never writes the setting.
+    """
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.local:32400")
+        await store.set("plex_token", "service-token")
+        await session.commit()
+    user_id = await _signed_in_user(app)
+    await _use_transport(app, _plex_tv_transport([_server_resource(_MACHINE_ID)]))
+
+    # The verdict work runs normally against the live-probed identity.
+    assert await _tick(app) == 1
+    status = app.state.share_sweep_status
+    assert status.authorized == 1
+    assert status.captured == 0
+
+    async with app.state.sessionmaker() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        assert user.share_state == "authorized"
+        assert user.entitled_section_keys is None
+        # The anchor was NOT silently backfilled from the unauthenticated probe.
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None

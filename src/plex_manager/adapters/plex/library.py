@@ -263,6 +263,74 @@ def _parse_section(entry: Mapping[str, object]) -> LibrarySection | None:
     return LibrarySection(key=key, title=title, type=section_type, locations=locations)
 
 
+def _parse_sections_envelope(payload: Mapping[str, object]) -> list[LibrarySection]:
+    """Validate and parse a ``/library/sections`` body. Malformed -> raise.
+
+    "Malformed is never empty" (the #296 resources lesson). A 200 that does not
+    faithfully DESCRIBE the library set -- a reverse proxy's error page, a
+    captive portal, a truncated body, a row missing its identifying fields --
+    must never be read as "this token sees fewer (or zero) libraries". Every
+    caller acts on that difference: setup validation would report a missing movie
+    library, the folder picker would show nothing, and entitlement capture (#484)
+    would persist an authoritative snapshot that PR-5's enforcement later reads
+    as a partial or total blackout.
+
+    The complete well-formed grammar, so shapes are validated once here rather
+    than patched one at a time:
+
+    * ``MediaContainer`` must be present and a mapping.
+    * ``Directory``, when present, must be a LIST. A non-list is a shape error,
+      not an empty library set.
+    * ``Directory`` may be ABSENT only alongside an explicit ``size: 0`` -- the
+      shape a genuinely empty Plex server actually emits (it reports the count
+      and simply omits the array). Absent ``Directory`` with a non-zero or
+      missing ``size`` means rows were expected and did not arrive.
+    * Every row must carry the fields that IDENTIFY a section (``key``,
+      ``title``, ``type``). A row missing them is a broken response, and
+      silently discarding it would hand the caller a SMALLER library set than
+      the server has -- the same wrongful-narrowing failure as a phantom empty.
+
+    A row that is well-formed but of a type this app does not manage (``photo``,
+    ``artist``, ...) is deliberately NOT an error: the server described it
+    honestly and we simply have no use for it, so it is dropped.
+    """
+    container_node = payload.get("MediaContainer")
+    if not isinstance(container_node, Mapping):
+        raise PlexLibraryError(
+            "Plex returned a 200 for /library/sections with no MediaContainer envelope"
+        )
+    container = _media_container(payload)
+    directory = container.get("Directory")
+    if directory is None:
+        if _get_int(container, "size") != 0:
+            raise PlexLibraryError(
+                "Plex returned a /library/sections body with no Directory rows and no "
+                "explicit size of 0"
+            )
+        return []
+    if not isinstance(directory, list):
+        raise PlexLibraryError(
+            "Plex returned a /library/sections body whose Directory is not a list"
+        )
+    sections: list[LibrarySection] = []
+    for entry in cast("Sequence[object]", directory):
+        row = _as_mapping(entry)
+        if (
+            _get_str(row, "key") is None
+            or _get_str(row, "title") is None
+            or _get_str(row, "type") is None
+        ):
+            raise PlexLibraryError(
+                "Plex returned a /library/sections row missing its key, title or type"
+            )
+        section = _parse_section(row)
+        # ``None`` here can now only mean a well-formed row of an unmanaged type
+        # (photo/music) -- a legitimate drop, not a broken response.
+        if section is not None:
+            sections.append(section)
+    return sections
+
+
 def _extract_tmdb_ids(text: str) -> list[int]:
     """Pull every ``tmdb://`` / ``themoviedb://`` numeric id out of a guid string."""
     return [int(match) for match in _TMDB_GUID_RE.findall(text)]
@@ -759,12 +827,7 @@ class PlexLibrary:
             if cached is not None:
                 return list(cached)
         payload = await self._get("/library/sections")
-        container = _media_container(payload)
-        sections: list[LibrarySection] = []
-        for entry in _as_sequence(container.get("Directory")):
-            section = _parse_section(_as_mapping(entry))
-            if section is not None:
-                sections.append(section)
+        sections = _parse_sections_envelope(payload)
         # Cache only a list that CONTAINS a movie section. A no-movie result is a
         # self-healing negative: validate_plex reports ok=False and tells the operator
         # to add a Movie library and test again, so caching the empty/show-only

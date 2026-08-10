@@ -3201,6 +3201,21 @@ export interface components {
              */
             authorized: number;
             /**
+             * Capture Failed
+             * @default 0
+             */
+            capture_failed: number;
+            /**
+             * Capture Skipped
+             * @default 0
+             */
+            capture_skipped: number;
+            /**
+             * Captured
+             * @default 0
+             */
+            captured: number;
+            /**
              * Checked
              * @default 0
              */

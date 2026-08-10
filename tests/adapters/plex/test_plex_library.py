@@ -132,6 +132,99 @@ async def test_list_sections_maps_type_and_locations() -> None:
     assert shows.locations == ("/data/tv",)
 
 
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        pytest.param({}, "no envelope at all", id="no_envelope"),
+        pytest.param({"MediaContainer": None}, "envelope is null", id="null_envelope"),
+        pytest.param(
+            {"MediaContainer": []}, "envelope is not a mapping", id="envelope_not_mapping"
+        ),
+        pytest.param({"foo": "bar"}, "some other document", id="wrong_document"),
+        pytest.param(
+            {"MediaContainer": {"size": 1}}, "rows promised, none delivered", id="size_without_rows"
+        ),
+        pytest.param({"MediaContainer": {}}, "no rows and no explicit size", id="no_rows_no_size"),
+        pytest.param(
+            {"MediaContainer": {"size": 0, "Directory": {"key": "1"}}},
+            "Directory is not a list",
+            id="directory_not_a_list",
+        ),
+        pytest.param(
+            {
+                "MediaContainer": {
+                    "size": 2,
+                    "Directory": [
+                        {"key": "1", "title": "Movies", "type": "movie"},
+                        {"title": "Nameless", "type": "movie"},  # no key
+                    ],
+                }
+            },
+            "a row missing its key, mixed among valid ones",
+            id="row_missing_key",
+        ),
+        pytest.param(
+            {
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [{"key": "1", "type": "movie"}],  # no title
+                }
+            },
+            "a row missing its title",
+            id="row_missing_title",
+        ),
+        pytest.param(
+            {
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [{"key": "1", "title": "Movies"}],  # no type
+                }
+            },
+            "a row missing its type",
+            id="row_missing_type",
+        ),
+    ],
+)
+async def test_list_sections_rejects_a_malformed_envelope(body: dict[str, Any], why: str) -> None:
+    """Malformed is never empty (the #296 lesson), and never SMALLER either.
+
+    A 200 that does not faithfully describe the library set must raise rather
+    than be read as fewer (or zero) libraries: silently dropping an unparseable
+    row would hand callers a narrowed library set, which entitlement capture
+    would then persist as an authoritative snapshot.
+    """
+    adapter = _adapter(lambda _request, b=body: httpx.Response(200, json=b))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    with pytest.raises(PlexLibraryError):
+        await adapter.list_sections(use_cache=False)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # What a genuinely empty Plex server emits: it reports the count and
+        # simply omits the array.
+        pytest.param({"MediaContainer": {"size": 0}}, id="empty_server_omits_directory"),
+        pytest.param(
+            {"MediaContainer": {"size": 0, "Directory": []}}, id="explicit_empty_directory"
+        ),
+        pytest.param({"MediaContainer": {"Directory": []}}, id="empty_directory_without_size"),
+    ],
+)
+async def test_list_sections_accepts_the_genuine_empty_shapes(body: dict[str, Any]) -> None:
+    """The honest counterpart: a server with no libraries really does answer
+    empty, and that must stay an empty list rather than an error."""
+    adapter = _adapter(lambda _request, b=body: httpx.Response(200, json=b))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    assert await adapter.list_sections(use_cache=False) == []
+
+
+async def test_list_sections_still_drops_a_well_formed_unmanaged_section() -> None:
+    """A photo/music library is DESCRIBED honestly by the server; we simply do
+    not manage that kind. Dropping it is correct -- only rows the server failed
+    to describe are an error."""
+    sections = await _adapter(_main_handler).list_sections()
+    assert [section.type for section in sections] == ["movie", "show"]
+
+
 async def test_list_sections_is_cached_per_base_url() -> None:
     calls = {"n": 0}
 

@@ -726,6 +726,19 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
             </dd>
           </>
         ) : null}
+        {/* Entitlement capture is deliberately harmless and enforces nothing yet
+            (#484 PR-3), so a clean tick says nothing about it — the per-user
+            telemetry lives in the logs. Only FAILURES earn a row here, and even
+            then in the neutral tone: the previous snapshot survived and no
+            verdict changed. */}
+        {sweep.capture_failed > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads failed</dt>
+            <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+              {sweep.capture_failed}
+            </dd>
+          </>
+        ) : null}
         {/* An admin whose share looks gone is never signed out automatically
             (ADR-0005 never-locked-out) — surfaced so the operator can go act on
             it by hand rather than wondering why nothing happened. */}

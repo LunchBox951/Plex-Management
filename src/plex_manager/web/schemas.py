@@ -1919,6 +1919,17 @@ class ShareSweepStatusItem(BaseModel):
     skipped: int = 0
     admins_exempted: int = 0
     anchor_deferred: int = 0
+    captured: int = 0
+    """Users whose section entitlements were captured this tick (#484 PR-3).
+    Capture-only: nothing enforces on those columns yet."""
+    capture_failed: int = 0
+    """Captures attempted and not persisted. Deliberately harmless -- the
+    previous snapshot survives and no verdict changes -- so it is surfaced
+    rather than left invisible."""
+    capture_skipped: int = 0
+    """Captures not even attempted, because an earlier one found the Plex server
+    unreachable and the tick stopped trying. Distinct from ``capture_failed`` so
+    a dead server's real cost to the tick is visible."""
     signed_out: int = 0
     """Users actually signed out. Reported rather than derived from
     ``share_revoked + token_stale``, which overstates whenever an admin was
