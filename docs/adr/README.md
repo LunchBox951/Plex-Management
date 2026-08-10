@@ -33,6 +33,7 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0025](0025-updater-sidecar-self-recreation-lifecycle.md) | Automatic recreation of the updater sidecar (successor-spawn self-refresh) | Proposed |
 | [0026](0026-redact-at-rotation-historical-log-secrets.md) | Redact rotated secrets at rotation time; retain no historical secret material | Accepted |
 | [0027](0027-wolfi-container-base.md) | Digest-pinned Wolfi/glibc container base with exact APK packages | Accepted |
+| [0029](0029-durable-pre-add-intent.md) | Durable pre-add intent for the grab window (qualifies ADR-0006's port contract; `0028` is earmarked by the #484 auth series) | Proposed |
 
 ADRs 0001–0007 were accepted on **2026-06-29** during the v2 brainstorming
 session; 0008 during the first backend-alpha session; 0009 during the
