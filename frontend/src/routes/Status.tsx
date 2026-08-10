@@ -739,6 +739,23 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
             </dd>
           </>
         ) : null}
+        {/* Capture switched OFF for the whole install (typically an upgrade that
+            never re-saved its Plex settings, so there is no verified server
+            anchor to stamp a snapshot with). Without this row the panel shows a
+            clean tick and no capture numbers at all — exactly what a healthy
+            install with nothing to capture looks like. The value names the
+            REMEDY rather than a count: a number of skipped users tells an
+            operator nothing about what to press (north star #2). */}
+        {sweep.capture_unavailable ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement capture</dt>
+            <dd className="min-w-0 text-right font-semibold text-searching [overflow-wrap:anywhere]">
+              {sweep.capture_unavailable === 'no_server_anchor'
+                ? 'off — re-save Plex settings'
+                : 'off — Plex not configured'}
+            </dd>
+          </>
+        ) : null}
         {/* An admin whose share looks gone is never signed out automatically
             (ADR-0005 never-locked-out) — surfaced so the operator can go act on
             it by hand rather than wondering why nothing happened. */}

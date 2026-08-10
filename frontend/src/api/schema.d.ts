@@ -3210,6 +3210,8 @@ export interface components {
              * @default 0
              */
             capture_skipped: number;
+            /** Capture Unavailable */
+            capture_unavailable?: ("not_configured" | "no_server_anchor") | null;
             /**
              * Captured
              * @default 0

@@ -1927,9 +1927,17 @@ class ShareSweepStatusItem(BaseModel):
     previous snapshot survives and no verdict changes -- so it is surfaced
     rather than left invisible."""
     capture_skipped: int = 0
-    """Captures not even attempted, because an earlier one found the Plex server
-    unreachable and the tick stopped trying. Distinct from ``capture_failed`` so
-    a dead server's real cost to the tick is visible."""
+    """Captures not even attempted: an earlier one found the Plex server
+    unreachable and the tick stopped trying, or capture is switched off for this
+    install (``capture_unavailable``). Distinct from ``capture_failed`` so a dead
+    server's real cost to the tick is visible."""
+    capture_unavailable: Literal["not_configured", "no_server_anchor"] | None = None
+    """Why capture is switched off, or ``null`` when it is running. Without it an
+    upgraded install with no verified ``plex_machine_identifier`` would report an
+    ``ok`` sweep with authorized users and permanent zeros for all three capture
+    counters -- identical to a healthy tick with nothing to capture. The remedy
+    is to finish setup, or re-save the Plex settings so the verified server
+    anchor a snapshot is stamped with gets recorded."""
     signed_out: int = 0
     """Users actually signed out. Reported rather than derived from
     ``share_revoked + token_stale``, which overstates whenever an admin was

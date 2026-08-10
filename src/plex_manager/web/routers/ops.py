@@ -285,6 +285,7 @@ async def health_endpoint(
             captured=share_sweep_status.captured,
             capture_failed=share_sweep_status.capture_failed,
             capture_skipped=share_sweep_status.capture_skipped,
+            capture_unavailable=share_sweep_status.capture_unavailable,
             signed_out=share_sweep_status.signed_out,
             sessions_revoked=share_sweep_status.sessions_revoked,
             due_remaining=share_sweep_status.due_remaining,

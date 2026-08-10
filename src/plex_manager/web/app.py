@@ -1110,13 +1110,17 @@ def _entitlement_capture_context(
     service_token: str | None,
     *,
     cached_anchor: str | None,
-) -> plex_access_service.EntitlementCaptureContext | None:
+) -> plex_access_service.EntitlementCaptureContext | plex_access_service.CaptureUnavailableReason:
     """Lend the sweep what it needs to capture section entitlements (#484 PR-3).
 
     The composition root's job, not the service's: only this layer knows that a
     ``LibraryPort`` is a ``PlexLibrary`` over the shared HTTP client and the
-    configured base url. ``None`` when Plex is not configured -- there is nothing
-    to capture against, and the sweep simply does no capture that tick.
+    configured base url. When capture cannot run at all this returns the REASON
+    instead of a context, which the sweep counts (``capture_skipped``) and
+    reports (``ShareSweepStatus.capture_unavailable``, surfaced on /health)
+    rather than doing nothing quietly: a gate nobody can see is indistinguishable
+    from a tick that had nothing to capture, and would leave the operator no way
+    to learn that capture has been off since the upgrade.
 
     The per-user client is built with the USER's token deliberately: capturing
     with the owner token would return the owner's view for everybody, which is
@@ -1140,8 +1144,10 @@ def _entitlement_capture_context(
     the ladder and persists the id); until then it is skipped and counted, not
     silently failing every tick.
     """
-    if not plex_url or not cached_anchor:
-        return None
+    if not plex_url:
+        return "not_configured"
+    if not cached_anchor:
+        return "no_server_anchor"
 
     def _library_for_token(token: str) -> LibraryPort | None:
         try:

@@ -72,6 +72,7 @@ __all__ = [
     "SHARE_SWEEP_TICK_SECONDS",
     "SHARE_SWEEP_USER_BUDGET",
     "AnchorCheck",
+    "CaptureUnavailableReason",
     "DueShareCandidate",
     "EntitlementCapture",
     "EntitlementCaptureContext",
@@ -261,6 +262,17 @@ class AnchorCheck(Enum):
     confirmation a mass sign-out requires, so it blocks the same way."""
 
 
+# Why a tick was handed no entitlement-capture context at all (#484 PR-3). The
+# composition root owns the gate -- only it knows whether Plex is configured and
+# whether an operator-verified server anchor exists -- but a gate nobody reports
+# is a silent disable: ``captured``/``capture_failed``/``capture_skipped`` would
+# all sit at zero on an ``ok`` sweep forever. Carried as a REASON rather than a
+# flag for the same "which fact" discipline as ``AnchorCheck``: "Plex is not
+# configured" and "configured, but no verified anchor to stamp against" have
+# different remedies.
+CaptureUnavailableReason = Literal["not_configured", "no_server_anchor"]
+
+
 @dataclass(frozen=True)
 class ShareVerdictOutcome:
     """What :func:`apply_share_verdict` actually did for one user.
@@ -301,6 +313,10 @@ class ShareSweepResult:
     captured: int = 0
     capture_failed: int = 0
     capture_skipped: int = 0
+    capture_unavailable: CaptureUnavailableReason | None = None
+    """Set when the tick had NO capture context, which is why every one of its
+    AUTHORIZED users landed in ``capture_skipped``. ``None`` means capture was
+    wired up (whether or not it captured anything)."""
     anchor_state: AnchorCheck | None = None
     """WHICH anchor answer caused ``anchor_deferred``, or ``None`` if the anchor
     was never consulted. Carried separately from the count because "the server
@@ -377,9 +393,10 @@ class ShareSweepStatus:
     actually running, not a signal that anything is being enforced."""
     capture_skipped: int = field(default=0)
     """AUTHORIZED users this tick did not even ATTEMPT to capture: the circuit
-    broke after an unreachable server, or the tick could not confirm the server
-    anchor. Distinct from ``capture_failed`` (which we DID try): conflating the
-    two would hide how much of a tick a dead server cost.
+    broke after an unreachable server, the tick could not confirm the server
+    anchor, or capture is switched off for this install entirely (see
+    ``capture_unavailable``). Distinct from ``capture_failed`` (which we DID
+    try): conflating the two would hide how much of a tick a dead server cost.
 
     NOT retried within the tick and NOT rescheduled: a skipped user is
     recaptured at their next due window (bounded by
@@ -395,6 +412,14 @@ class ShareSweepStatus:
     Surfaced separately from ``captured`` because a capture failure is
     deliberately harmless -- the previous snapshot survives and the verdict is
     unaffected -- and would otherwise be completely invisible."""
+    capture_unavailable: CaptureUnavailableReason | None = field(default=None)
+    """Why capture is switched OFF for this install, or ``None`` when it is
+    wired up. Without it, an upgraded install that has ``plex_url`` and
+    ``plex_token`` but no operator-verified ``plex_machine_identifier`` would
+    report an ``ok`` sweep with authorized users and three zeros forever --
+    indistinguishable from "capture ran and there was nothing to do". The count
+    alone cannot say WHY, and the remedy (finish setup, or re-save the Plex
+    settings so the verified anchor is recorded) is not guessable from it."""
     signed_out: int = field(default=0)
     """Users this tick actually signed out. NOT ``share_revoked + token_stale``:
     an admin-exempted share loss counts toward those verdict tallies but nobody
@@ -413,6 +438,7 @@ class ShareSweepStatus:
         self.unknown = self.unverifiable = self.sessions_revoked = self.due_remaining = 0
         self.skipped = self.admins_exempted = self.anchor_deferred = self.signed_out = 0
         self.captured = self.capture_failed = self.capture_skipped = 0
+        self.capture_unavailable = None
 
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
@@ -474,6 +500,7 @@ class ShareSweepStatus:
         self.captured = result.captured
         self.capture_failed = result.capture_failed
         self.capture_skipped = result.capture_skipped
+        self.capture_unavailable = result.capture_unavailable
         self.signed_out = len(result.signed_out_user_ids)
         self.sessions_revoked = result.sessions_revoked
         self.due_remaining = result.due_remaining
@@ -1161,7 +1188,7 @@ async def sweep_shares(
     now: datetime | None = None,
     confirm_anchor: Callable[[], Awaitable[AnchorCheck]] | None = None,
     on_signed_out: Callable[[int], None] | None = None,
-    capture: EntitlementCaptureContext | None = None,
+    capture: EntitlementCaptureContext | CaptureUnavailableReason | None = None,
 ) -> ShareSweepResult:
     """Revalidate up to ``limit`` due users, strictly sequentially.
 
@@ -1209,6 +1236,15 @@ async def sweep_shares(
     counted and logged, and leaves the previous snapshot untouched. Omitted
     (``None``) the sweep behaves exactly as it did before capture existed.
 
+    ``capture`` may instead be a :data:`CaptureUnavailableReason` -- the
+    composition root saying "I am deliberately handing you no context, and this
+    is why". Every AUTHORIZED user is then counted in ``capture_skipped`` and the
+    reason is reported on the result, because a gate that reports nothing is a
+    silent disable: an operator would read an ``ok`` sweep with authorized users
+    and three permanent zeros and have no way to tell that capture is off (north
+    star #3). ``None`` remains "no capture wired here at all" (the pre-capture
+    sweep, and most tests), which counts nothing.
+
     Capture is best-effort by design and has no retry state of its own: see
     ``ShareSweepStatus.capture_skipped`` for the cadence a skipped user actually
     gets, and why that is acceptable while nothing reads these columns.
@@ -1218,6 +1254,10 @@ async def sweep_shares(
     users are still checked.
     """
     moment = now if now is not None else datetime.now(UTC)
+    # Split the one parameter into its two meanings once, up front, so the
+    # capture path below never has to re-narrow it.
+    capture_context = capture if isinstance(capture, EntitlementCaptureContext) else None
+    capture_unavailable = capture if isinstance(capture, str) else None
     async with sessionmaker() as session:
         candidates = [
             DueShareCandidate(
@@ -1256,9 +1296,9 @@ async def sweep_shares(
         nonlocal owner_sections, owner_sections_resolved
         if not owner_sections_resolved:
             owner_sections_resolved = True
-            if capture is not None:
+            if capture_context is not None:
                 try:
-                    owner_sections = await capture.owner_section_count()
+                    owner_sections = await capture_context.owner_section_count()
                 except Exception as exc:
                     # The baseline is telemetry, never a gate: losing it degrades
                     # the log line to ``scope=baseline_unknown`` and nothing else.
@@ -1286,7 +1326,16 @@ async def sweep_shares(
         nonlocal captured, capture_failed, capture_skipped, capture_circuit_open
         user_id = candidate.user_id
         token = candidate.token
-        if capture is None or token is None:
+        if token is None:
+            return
+        if capture_unavailable is not None:
+            # Capture is switched off for the whole install, not for this user.
+            # Counted anyway (and reported once, after the loop): the alternative
+            # is an ok sweep whose capture counters are all zero forever, which
+            # looks exactly like a healthy tick with nothing to capture.
+            capture_skipped += 1
+            return
+        if capture_context is None:
             return
         if capture_circuit_open:
             # The server already failed once this tick, so the remaining users
@@ -1295,7 +1344,7 @@ async def sweep_shares(
             capture_skipped += 1
             return
         try:
-            library = capture.library_for_token(token)
+            library = capture_context.library_for_token(token)
         except Exception:
             capture_failed += 1
             _logger.exception(
@@ -1347,7 +1396,7 @@ async def sweep_shares(
                     session,
                     user_id,
                     attempt.capture,
-                    anchor_setting_key=capture.anchor_setting_key,
+                    anchor_setting_key=capture_context.anchor_setting_key,
                     expected_token_ciphertext=candidate.token_ciphertext,
                 )
                 await session.commit()
@@ -1485,6 +1534,19 @@ async def sweep_shares(
                         safe_int(user_id),
                     )
 
+    if capture_unavailable is not None and capture_skipped:
+        # Once per tick, not once per user, and only when the gate actually cost
+        # something -- an install with no authorized users due is not owed a
+        # warning about a capture it would not have run anyway.
+        _logger.warning(
+            "entitlement capture did not run this tick (%s): %s authorized user(s) were "
+            "skipped. Verdicts and sessions are unaffected, and no stored snapshot was "
+            "touched. Capture starts once the Plex settings are saved (finishing setup, or "
+            "re-saving them, records the verified server anchor a snapshot is stamped with).",
+            safe_text(capture_unavailable),
+            safe_int(capture_skipped),
+        )
+
     async with sessionmaker() as session:
         # Recomputed, never inferred from the budget: a user leaves the backlog
         # only if this tick actually stamped ``share_checked_at``. Subtracting the
@@ -1509,6 +1571,7 @@ async def sweep_shares(
         captured=captured,
         capture_failed=capture_failed,
         capture_skipped=capture_skipped,
+        capture_unavailable=capture_unavailable,
         sessions_revoked=sessions_revoked,
         due_remaining=due_remaining,
         signed_out_user_ids=tuple(signed_out),

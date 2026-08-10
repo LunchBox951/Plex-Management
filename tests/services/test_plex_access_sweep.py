@@ -158,7 +158,9 @@ async def _sweep(
     limit: int = plex_access_service.SHARE_SWEEP_USER_BUDGET,
     anchor: AnchorCheck = AnchorCheck.CONFIRMED,
     on_signed_out: Callable[[int], None] | None = None,
-    capture: plex_access_service.EntitlementCaptureContext | None = None,
+    capture: plex_access_service.EntitlementCaptureContext
+    | plex_access_service.CaptureUnavailableReason
+    | None = None,
 ) -> plex_access_service.ShareSweepResult:
     """Sweep with the anchor CONFIRMED unless a test says otherwise.
 
@@ -1294,9 +1296,41 @@ async def test_sweep_without_a_capture_context_writes_no_entitlements(
     result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)])
     assert result.authorized == 1
     assert result.captured == 0
+    # Nothing was wired up, so there is no gate to report either.
+    assert result.capture_skipped == 0
+    assert result.capture_unavailable is None
     user = await _load(sessionmaker_, user_id)
     assert user.entitled_section_keys is None
     assert user.entitlements_machine_id is None
+
+
+@pytest.mark.parametrize("reason", ["not_configured", "no_server_anchor"])
+async def test_a_declined_capture_counts_and_names_itself(
+    sessionmaker_: SessionMaker, reason: plex_access_service.CaptureUnavailableReason
+) -> None:
+    """The composition root can decline capture (no Plex, or no operator-verified
+    server anchor to stamp a snapshot with), but declining silently would leave
+    ``captured``/``capture_failed``/``capture_skipped`` at zero on an ``ok``
+    sweep forever -- identical on /health to a tick with nothing to capture. Each
+    AUTHORIZED user is counted as skipped and the reason travels with the tally.
+    """
+    user_id = await _add_user(sessionmaker_)
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=reason)
+
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 0
+    assert result.capture_skipped == 1
+    assert result.capture_unavailable == reason
+    # The verdict half is untouched: a declined capture is not a degraded sweep.
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "authorized"
+    assert user.entitled_section_keys is None
+
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == "ok"
+    assert status.capture_unavailable == reason
 
 
 @pytest.mark.parametrize(
