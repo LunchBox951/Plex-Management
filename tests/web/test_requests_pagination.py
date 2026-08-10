@@ -205,9 +205,8 @@ async def test_shared_user_page_visibility_is_enforced_in_sql(
         params: dict[str, int] = {"limit": 3}
         if cursor is not None:
             params["cursor"] = cursor
-        response = await client.get(
-            "/api/v1/requests", params=params, cookies=cookies, headers=headers
-        )
+        client.cookies.update(cookies)
+        response = await client.get("/api/v1/requests", params=params, headers=headers)
         assert response.status_code == 200
         body = response.json()
         seen.extend(r["id"] for r in body["requests"])
@@ -250,9 +249,8 @@ async def test_admin_page_membership_is_scoped_to_the_page_ids(
 
     monkeypatch.setattr(SqlRequestRepository, "subscribed_request_ids_among", spying_among)
 
-    response = await client.get(
-        "/api/v1/requests", params={"limit": 5}, cookies=cookies, headers=headers
-    )
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/requests", params={"limit": 5}, headers=headers)
     assert response.status_code == 200
     body = response.json()
     page_ids = [r["id"] for r in body["requests"]]
