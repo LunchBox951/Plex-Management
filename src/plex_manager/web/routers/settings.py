@@ -1651,14 +1651,35 @@ async def _verify_plex_repoint(
                 "Re-enter the Plex token so a stored credential is never sent to a new destination."
             ),
         )
+    return True, await _run_plex_identity_ladder(
+        session, store, client, context, url=effective_url, token=effective_token
+    )
+
+
+async def _run_plex_identity_ladder(
+    session: AsyncSession,
+    store: SettingsStore,
+    client: httpx.AsyncClient,
+    context: AuthContext,
+    *,
+    url: str,
+    token: str,
+) -> str:
+    """Derive and fully verify a server's machine identifier. Raises on any rung.
+
+    The three rungs documented on :func:`_verify_plex_repoint`, factored out so
+    the repoint path and the missing-anchor backfill below cannot drift apart --
+    the anchor is the id post-init sign-in trusts, and it must never be written
+    by a weaker check than the one that first established it.
+    """
     plex_tv = PlexTvClient(
         client,
         client_identifier=await store.get(_CLIENT_ID_SETTING) or _FALLBACK_CLIENT_IDENTIFIER,
     )
-    machine_identifier = await plex_tv.fetch_server_identity(effective_url, effective_token)
+    machine_identifier = await plex_tv.fetch_server_identity(url, token)
     # /identity is unauthenticated: prove the EFFECTIVE token is actually
     # accepted by the replacement server before anything is committed.
-    await assert_plex_token_authorized(client, effective_url, effective_token)
+    await assert_plex_token_authorized(client, url, token)
     if context.method is AuthMethod.plex_session and context.user_id is not None:
         # Session callers get the wizard's ownership bar (ladder step 3 above).
         user = await session.get(User, context.user_id)
@@ -1672,7 +1693,76 @@ async def _verify_plex_repoint(
             )
         resources = await plex_tv.fetch_resources(admin_oauth_token)
         assert_admin_owns_server(resources, machine_identifier)
-    return True, machine_identifier
+    return machine_identifier
+
+
+async def _backfill_missing_plex_anchor(
+    body: SettingsUpdate,
+    session: AsyncSession,
+    store: SettingsStore,
+    client: httpx.AsyncClient,
+    context: AuthContext,
+) -> str | None:
+    """Record the ``plex_machine_identifier`` an upgraded install never had.
+
+    Why this exists: an install set up before the anchor was introduced has
+    ``plex_url`` and ``plex_token`` but no anchor row, and #484 entitlement
+    capture is declined outright without one (``app._entitlement_capture_context``
+    -- a background loop must not mint the id sign-in trusts). The status panel
+    told such operators to re-save their Plex settings, but
+    :func:`_verify_plex_repoint` returns "unchanged" for a re-save that submits
+    the same URL and the masked token, so the anchor was never written and
+    capture stayed off forever with no way to turn it on from the web UI (Codex
+    review of PR-3, and the ADR-0005 never-locked-out spirit: the remedy has to
+    be a button that works).
+
+    Deliberately narrow:
+
+    * Only when this PUT actually SUBMITS a Plex identity field -- the operator
+      saving the Plex section. An unrelated save (log retention, disk pressure)
+      still pays no live Plex round-trip.
+    * Only when no anchor is stored. Once recorded, this never runs again.
+    * Only the stored, unchanged pair -- there is nothing being repointed here,
+      so the identity is derived from what is already configured.
+    * BEST-EFFORT: any failure is logged and the save proceeds untouched. The
+      operator may be saving other fields, and a Plex outage must not 502 an
+      unrelated settings write. Capture simply stays visibly off (the sweep
+      keeps reporting ``capture_unavailable``) until a save succeeds.
+
+    Sessions are NOT revoked on success, unlike a repoint: nothing moved. The
+    id being recorded is the one this install was already resolving live on
+    every sign-in -- it is now pinned, and pinned behind a STRONGER check than
+    the bare ``/identity`` probe that fallback used.
+    """
+    submits_plex_identity = any(
+        field in body.model_fields_set and getattr(body, field) is not None
+        for field in ("plex_url", "plex_token")
+    )
+    if not submits_plex_identity or await store.get(PLEX_MACHINE_ID_SETTING):
+        return None
+    stored_url = await store.get("plex_url")
+    stored_token = await store.get("plex_token")
+    if not stored_url or not stored_token:
+        return None
+    try:
+        machine_identifier = await _run_plex_identity_ladder(
+            session, store, client, context, url=stored_url, token=stored_token
+        )
+    except Exception as exc:
+        # Never fatal to the save, and never silent: the type alone says which
+        # rung refused (unreachable server, rejected token, non-owned server).
+        _logger.warning(
+            "could not record the Plex server anchor this install is missing (%s); "
+            "the settings were still saved, and entitlement capture stays off until "
+            "a later save verifies the server",
+            type(exc).__name__,
+        )
+        return None
+    _logger.info(
+        "recorded the Plex server anchor this install was missing; entitlement capture "
+        "is enabled from the next share-revalidation tick"
+    )
+    return machine_identifier
 
 
 async def _reject_changed_base_stored_credential_reuse(
@@ -1858,6 +1948,14 @@ async def put_settings_endpoint(
         plex_identity_changed, machine_identifier = await _verify_plex_repoint(
             body, session, store, client, context
         )
+        # A re-save that changes nothing is not a repoint -- but on an install
+        # that never recorded one, it is the operator's chance to establish the
+        # anchor #484 capture needs. Verified by the same ladder; best-effort.
+        backfilled_anchor = (
+            None
+            if plex_identity_changed
+            else await _backfill_missing_plex_anchor(body, session, store, client, context)
+        )
         # Likewise verify every submitted library root is visible to THIS container
         # (issue #132) before anything is written.
         resolved_roots = await _resolve_root_writes(body)
@@ -1910,6 +2008,11 @@ async def put_settings_endpoint(
                         .where(AuthSession.revoked_at.is_(None))
                         .values(revoked_at=datetime.now(UTC))
                     )
+            elif backfilled_anchor is not None:
+                # Recording an anchor the install was missing. NO session
+                # revocation: nothing repointed -- this pins the identity every
+                # sign-in was already resolving live, just behind the full ladder.
+                await store.set(PLEX_MACHINE_ID_SETTING, backfilled_anchor)
 
         def _post_commit_invalidations() -> None:
             """Every must-run invalidation once THIS PUT's writes are durable.

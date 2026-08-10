@@ -57,6 +57,7 @@ __all__ = [
     "ErrorEnvelope",
     "EvictErrorItem",
     "EvictResponse",
+    "EvictStoodDownItem",
     "EvictionCandidateItem",
     "EvictionOutcomeItem",
     "GrabRequest",
@@ -1919,6 +1920,30 @@ class ShareSweepStatusItem(BaseModel):
     skipped: int = 0
     admins_exempted: int = 0
     anchor_deferred: int = 0
+    captured: int = 0
+    """Users whose section entitlements were captured this tick (#484 PR-3).
+    Capture-only: nothing enforces on those columns yet."""
+    capture_failed: int = 0
+    """Captures attempted and not persisted. Deliberately harmless -- the
+    previous snapshot survives and no verdict changes -- so it is surfaced
+    rather than left invisible."""
+    capture_skipped: int = 0
+    """Captures not even attempted: an earlier one found the Plex server
+    unreachable and the tick stopped trying, or capture is switched off for this
+    install (``capture_unavailable``). Distinct from ``capture_failed`` so a dead
+    server's real cost to the tick is visible."""
+    capture_anchor_blocked: int = 0
+    """Captures refused because the tick could not confirm the configured
+    server's identity live. Read with ``state``: it is what makes the sweep
+    report ``anchor_mismatch``/``anchor_unconfirmed`` on a tick where every
+    verdict was AUTHORIZED and no sign-out needed deferring."""
+    capture_unavailable: Literal["not_configured", "no_server_anchor"] | None = None
+    """Why capture is switched off, or ``null`` when it is running. Without it an
+    upgraded install with no verified ``plex_machine_identifier`` would report an
+    ``ok`` sweep with authorized users and permanent zeros for all three capture
+    counters -- identical to a healthy tick with nothing to capture. The remedy
+    is to finish setup, or re-save the Plex settings so the verified server
+    anchor a snapshot is stamped with gets recorded."""
     signed_out: int = 0
     """Users actually signed out. Reported rather than derived from
     ``share_revoked + token_stale``, which overstates whenever an admin was
@@ -2079,18 +2104,46 @@ class EvictErrorItem(BaseModel):
     detail: str
 
 
+class EvictStoodDownItem(BaseModel):
+    """One root whose sweep DECLINED to evict because an operator correction owns
+    that root's free space right now (issue #526).
+
+    Neither a failure nor a plain "nothing to do": the sweep was healthy and the
+    root may well be under pressure, but a correction purge either already held a
+    claim under it or started during the sweep and defeated its pressure-exclusion
+    lease -- so continuing would delete watched titles against a free-space reading
+    that correction is about to change. Reported rather than left in the log
+    (honesty over silence): an operator who presses "free space" and gets an empty
+    ``evicted`` deserves to know the difference between "nothing was eligible" and
+    "your own correction is already reclaiming this root", and that the next sweep
+    re-reads pressure once it settles.
+
+    ``reason`` is a STATIC, operator-facing sentence chosen by the sweep -- never a
+    path, a request-derived value, or an exception message.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    root: Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"]
+    reason: str
+
+
 class EvictResponse(BaseModel):
     """The result of a manual disk-pressure sweep (north-star #1: a button that
     frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
     root was under pressure, or nothing was eligible). ``errors`` is populated
     per-root when THAT root's own sweep raised -- every other root's outcome
     in ``evicted`` still stands; the sweep never aborts one root's already
-    committed work just because a sibling root failed."""
+    committed work just because a sibling root failed. ``stood_down`` names any
+    root that deliberately declined because an operator correction owns its free
+    space (issue #526) -- the third honest shape of an empty ``evicted``, and the
+    one an operator would otherwise mistake for "the button did nothing"."""
 
     model_config = ConfigDict(frozen=True)
 
     evicted: list[EvictionOutcomeItem]
     errors: list[EvictErrorItem] = Field(default_factory=list[EvictErrorItem])
+    stood_down: list[EvictStoodDownItem] = Field(default_factory=list[EvictStoodDownItem])
 
 
 # --------------------------------------------------------------------------- #

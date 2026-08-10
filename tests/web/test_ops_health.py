@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from plex_manager.services import path_visibility
 from plex_manager.services.health_service import ReconcileStatus
+from plex_manager.services.plex_access_service import ShareSweepResult, ShareSweepStatus
 from plex_manager.services.watchlist_service import WatchlistWorkerStatus
 from plex_manager.web.deps import SettingsStore
 
@@ -285,3 +286,31 @@ async def test_health_reflects_degraded_watchlist_status(
     assert watchlist["existing"] == 2
     assert watchlist["failed_users"] == 1
     assert watchlist["failed_entries"] == 1
+
+
+async def test_health_names_why_entitlement_capture_is_switched_off(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """An ``ok`` sweep whose capture counters are all zero is ambiguous: it reads
+    the same whether capture ran with nothing to do or is disabled entirely. The
+    reason is surfaced so the operator can act on it (#484 PR-3)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    sweep = ShareSweepStatus()
+    sweep.mark_started()
+    sweep.mark_completed(
+        ShareSweepResult(
+            checked=3,
+            authorized=3,
+            capture_skipped=3,
+            capture_unavailable="no_server_anchor",
+        )
+    )
+    app.state.share_sweep_status = sweep
+
+    share_sweep = (await client.get("/api/v1/ops/health", headers=_HEADERS)).json()["share_sweep"]
+    assert share_sweep["state"] == "ok"
+    assert share_sweep["authorized"] == 3
+    assert share_sweep["captured"] == 0
+    assert share_sweep["capture_failed"] == 0
+    assert share_sweep["capture_skipped"] == 3
+    assert share_sweep["capture_unavailable"] == "no_server_anchor"

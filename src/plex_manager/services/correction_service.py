@@ -62,6 +62,15 @@ a terminal):
   process and stays armed after a partial delete precisely so a replacement can be
   fetched, whereas this window ends with the coroutine that owns it.
 
+  In the SAME await-free step as that claim, the verb also DEFEATS every root-scoped
+  pressure-exclusion lease covering the breadcrumb
+  (``purge_service.revoke_pressure_exclusions``, issue #526). The path claim only
+  protects this correction's OWN tree; the lease is how a disk-pressure eviction
+  sweep already mid-flight under the same root learns that the free-space reading it
+  is deleting against has just been invalidated. The correction never waits for that
+  sweep -- it defeats it and proceeds, and the sweep stands down before it starts any
+  further delete.
+
   Hardlink caveat (ADR-0014): a same-filesystem import hardlinks the library file
   to the download client's seed copy, so purging the library file ALONE frees
   nothing -- BOTH the torrent-with-data (b) AND the library file (c) must go.
@@ -1047,16 +1056,30 @@ async def report_issue(
     # await and (f)'s commit makes the whole destructive-to-durable stretch one
     # correction-owned span, which recovery declines to touch by path.
     #
-    # HONEST RESIDUAL (issue #526): this serializes recovery against the correction's
-    # OWN path only. A pressure sweep that already probed disk and assembled its
-    # candidate set BEFORE this claim was taken can still evict OTHER titles that were
-    # genuinely eligible at that moment -- the claim cannot retroactively un-take a
-    # snapshot. That is bounded (those victims were evictable on their own merits) and
-    # tracked separately; nothing here claims correction and eviction are fully
-    # serialized against each other.
+    # The path claim serializes recovery against the correction's OWN path. It says
+    # nothing about a pressure sweep already mid-flight over OTHER titles under the
+    # same root -- that sweep probed disk before this claim existed, and this
+    # correction is about to change the reading it will delete against. Closing that
+    # (issue #526) is the second line below: DEFEAT every root-scoped
+    # pressure-exclusion lease covering this path, in the SAME await-free step as the
+    # claim, so no task can ever observe one without the other.
+    #
+    # Defeat, not wait. The lease holder is a retention sweep whose work the next
+    # periodic tick redoes; this is an operator standing at a broken title. Making
+    # the correction queue behind a full sweep (a Plex crawl, an os.walk per
+    # candidate, one or more multi-GB rmtrees) would turn a button press into a
+    # multi-minute stall for no correctness gain, which is exactly the "hand the
+    # operator a button" north star inverted. So the correction wins by construction
+    # and the sweep stands down at its next destructive decision point -- the last of
+    # which is inside the purge primitive's own delete boundary, under the held delete
+    # permit (see ``eviction_service._run_sweep``).
     purge_claim = target.library_path
-    if purge_claim is not None and not purge_service.begin_purge(purge_claim):
-        raise ImportInProgressError(request_id)
+    if purge_claim is not None:
+        if not purge_service.begin_purge(purge_claim):
+            raise ImportInProgressError(request_id)
+        purge_service.revoke_pressure_exclusions(
+            purge_claim, reason="an operator report-issue correction claimed a path under it"
+        )
     try:
         try:
             if is_tv and target.season is not None:

@@ -10,7 +10,7 @@ through real ``httpx.MockTransport`` responses so the two stay wired together.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -18,8 +18,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from plex_manager.adapters.plex.library import PlexLibrary, reset_caches
 from plex_manager.adapters.plex.oauth import PlexTvClient
-from plex_manager.models import AuditLog, AuthSession, User
+from plex_manager.models import AuditLog, AuthSession, Setting, User
 from plex_manager.services import plex_access_service, session_lifecycle
 from plex_manager.services.plex_access_service import (
     AnchorCheck,
@@ -33,7 +34,17 @@ from plex_manager.services.plex_access_service import (
 
 SessionMaker = async_sessionmaker[AsyncSession]
 
+
+@pytest.fixture(autouse=True)
+def _clear_library_caches() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """``PlexLibrary`` caches sections per (base_url, token-hash) at module level."""
+    reset_caches()
+    yield
+    reset_caches()
+
+
 _MACHINE_ID = "configured-server-machine-id"
+_ANCHOR_KEY = "plex_machine_identifier"
 _INTERVAL = timedelta(hours=6)
 
 
@@ -147,12 +158,19 @@ async def _sweep(
     limit: int = plex_access_service.SHARE_SWEEP_USER_BUDGET,
     anchor: AnchorCheck = AnchorCheck.CONFIRMED,
     on_signed_out: Callable[[int], None] | None = None,
+    capture: plex_access_service.EntitlementCaptureContext
+    | plex_access_service.CaptureUnavailableReason
+    | None = None,
 ) -> plex_access_service.ShareSweepResult:
     """Sweep with the anchor CONFIRMED unless a test says otherwise.
 
     Confirmed is the ordinary state of a healthy install (the configured server
     still reports the identifier we stored), so it is the right default for the
     verdict-behavior tests; the anchor-fault tests override it explicitly.
+
+    ``capture`` defaults to ``None`` -- entitlement capture is opt-in, so every
+    pre-existing verdict test here also pins that the sweep behaves exactly as it
+    did before capture existed.
     """
     async with httpx.AsyncClient(transport=_resources_transport(payload)) as client:
         plex_tv = PlexTvClient(client, client_identifier="pm-test")
@@ -164,6 +182,7 @@ async def _sweep(
             limit=limit,
             confirm_anchor=_anchor(anchor),
             on_signed_out=on_signed_out,
+            capture=capture,
         )
 
 
@@ -1194,3 +1213,674 @@ def test_status_reports_ok_for_a_sweep_that_revoked_someone() -> None:
     assert status.last_ok_at is not None
     assert status.share_revoked == 1
     assert status.sessions_revoked == 1
+
+
+# --------------------------------------------------------------------------- #
+# Section-entitlement capture inside the sweep (issue #484 PR-3)
+# --------------------------------------------------------------------------- #
+_SECTIONS_PAYLOAD: dict[str, object] = {
+    "MediaContainer": {
+        "size": 2,
+        "Directory": [
+            {"key": "1", "title": "Movies", "type": "movie", "Location": [{"id": 1, "path": "/x"}]},
+            {"key": "2", "title": "TV", "type": "show", "Location": [{"id": 2, "path": "/y"}]},
+        ],
+    }
+}
+
+
+async def _configure_anchor(sessionmaker: SessionMaker, machine_id: str = _MACHINE_ID) -> None:
+    """The settings row ``store_entitlements`` re-reads inside its own write."""
+    async with sessionmaker() as session:
+        session.add(Setting(key=_ANCHOR_KEY, value=machine_id))
+        await session.commit()
+
+
+def _capture_context(
+    *,
+    section_keys: tuple[str, ...] = ("1",),
+    service_sections: int | None = 2,
+    fail: bool = False,
+    calls: list[str] | None = None,
+) -> plex_access_service.EntitlementCaptureContext:
+    """A capture context over a REAL ``PlexLibrary`` and a mock Plex server."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request.headers.get("X-Plex-Token", ""))
+        if fail:
+            return httpx.Response(500, json={})
+        directory = [
+            {"key": key, "title": f"S{key}", "type": "movie", "Location": [{"id": 1, "path": "/x"}]}
+            for key in section_keys
+        ]
+        return httpx.Response(
+            200, json={"MediaContainer": {"size": len(directory), "Directory": directory}}
+        )
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        transport = httpx.MockTransport(handler)
+        return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
+
+    async def _service_section_count() -> int | None:
+        return service_sections
+
+    return plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+
+
+async def test_sweep_captures_entitlements_for_an_authorized_user(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _configure_anchor(sessionmaker_)
+    user_id = await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_, [_server_resource(_MACHINE_ID)], capture=_capture_context()
+    )
+    assert result.authorized == 1
+    assert result.captured == 1
+    assert result.capture_failed == 0
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys == ["1"]
+    assert user.entitlements_machine_id == _MACHINE_ID
+
+
+async def test_sweep_without_a_capture_context_writes_no_entitlements(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Capture is opt-in: the sweep is byte-for-byte its pre-#484 self without it."""
+    user_id = await _add_user(sessionmaker_)
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)])
+    assert result.authorized == 1
+    assert result.captured == 0
+    # Nothing was wired up, so there is no gate to report either.
+    assert result.capture_skipped == 0
+    assert result.capture_unavailable is None
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys is None
+    assert user.entitlements_machine_id is None
+
+
+@pytest.mark.parametrize("reason", ["not_configured", "no_server_anchor"])
+async def test_a_declined_capture_counts_and_names_itself(
+    sessionmaker_: SessionMaker, reason: plex_access_service.CaptureUnavailableReason
+) -> None:
+    """The composition root can decline capture (no Plex, or no operator-verified
+    server anchor to stamp a snapshot with), but declining silently would leave
+    ``captured``/``capture_failed``/``capture_skipped`` at zero on an ``ok``
+    sweep forever -- identical on /health to a tick with nothing to capture. Each
+    AUTHORIZED user is counted as skipped and the reason travels with the tally.
+    """
+    user_id = await _add_user(sessionmaker_)
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=reason)
+
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 0
+    assert result.capture_skipped == 1
+    assert result.capture_unavailable == reason
+    # The verdict half is untouched: a declined capture is not a degraded sweep.
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "authorized"
+    assert user.entitled_section_keys is None
+
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == "ok"
+    assert status.capture_unavailable == reason
+
+
+@pytest.mark.parametrize(
+    ("payload", "label"),
+    [
+        pytest.param([_server_resource("some-other-server")], "share_revoked", id="share_revoked"),
+        pytest.param(401, "token_stale", id="token_stale"),
+        pytest.param(500, "unknown", id="unknown"),
+    ],
+)
+async def test_sweep_never_spends_a_server_call_on_a_non_authorized_verdict(
+    sessionmaker_: SessionMaker, payload: list[dict[str, object]] | int, label: str
+) -> None:
+    """The budget promise: capture costs one SERVER call per already-confirmed
+    user and nothing at all for anyone else."""
+    user_id = await _add_user(sessionmaker_)
+    calls: list[str] = []
+    result = await _sweep(sessionmaker_, payload, capture=_capture_context(calls=calls))
+    assert calls == []
+    assert result.captured == 0
+    assert result.capture_failed == 0
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys is None
+
+
+async def test_sweep_capture_failure_is_counted_and_harmless(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _configure_anchor(sessionmaker_)
+    """A refusing/unreachable server must not touch the verdict, the sign-out
+    machinery, or a previously captured snapshot."""
+    user_id = await _add_user(sessionmaker_)
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.entitled_section_keys = ["9"]
+        user.entitlements_machine_id = _MACHINE_ID
+        await session.commit()
+
+    result = await _sweep(
+        sessionmaker_, [_server_resource(_MACHINE_ID)], capture=_capture_context(fail=True)
+    )
+
+    # The verdict landed exactly as it would without capture.
+    assert result.authorized == 1
+    assert result.checked == 1
+    assert result.captured == 0
+    assert result.capture_failed == 1
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "authorized"
+    # The PREVIOUS snapshot survives a failed capture untouched.
+    assert user.entitled_section_keys == ["9"]
+
+
+async def test_sweep_capture_respects_the_per_tick_budget(sessionmaker_: SessionMaker) -> None:
+    """Capture rides the existing budget rather than widening it: at most one
+    server call per user the tick was already allowed to check."""
+    await _configure_anchor(sessionmaker_)
+    for index in range(5):
+        await _add_user(sessionmaker_, username=f"viewer{index}", token=f"token-{index}")
+    calls: list[str] = []
+    result = await _sweep(
+        sessionmaker_,
+        [_server_resource(_MACHINE_ID)],
+        limit=2,
+        capture=_capture_context(calls=calls),
+    )
+    assert result.checked == 2
+    assert result.captured == 2
+    # Exactly one server call per user the budget already allowed -- never one
+    # per candidate. (The owner baseline is stubbed in this helper, so every
+    # recorded call here is a per-user capture.)
+    assert calls == ["token-0", "token-1"]
+
+
+async def test_sweep_resolves_the_owner_baseline_at_most_once_per_tick(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _configure_anchor(sessionmaker_)
+    for index in range(3):
+        await _add_user(sessionmaker_, username=f"viewer{index}", token=f"token-{index}")
+    baseline_calls = 0
+
+    async def _service_section_count() -> int | None:
+        nonlocal baseline_calls
+        baseline_calls += 1
+        return 2
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        transport = httpx.MockTransport(lambda _r: httpx.Response(200, json=_SECTIONS_PAYLOAD))
+        return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+    assert result.captured == 3
+    assert baseline_calls == 1
+
+
+async def test_sweep_skips_the_baseline_entirely_when_nothing_is_captured(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _add_user(sessionmaker_)
+    baseline_calls = 0
+
+    async def _service_section_count() -> int | None:
+        nonlocal baseline_calls
+        baseline_calls += 1
+        return 2
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=lambda _token: None,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+    # No library to capture with: not a failure, and no baseline worth reading.
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+    assert result.captured == 0
+    assert result.capture_failed == 0
+    assert baseline_calls == 0
+
+
+def test_status_surfaces_the_capture_counters() -> None:
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(
+        plex_access_service.ShareSweepResult(checked=3, authorized=3, captured=2, capture_failed=1)
+    )
+    # Capture enforces nothing yet, so a failed capture must NOT degrade the tick.
+    assert status.state == "ok"
+    assert status.captured == 2
+    assert status.capture_failed == 1
+
+
+async def test_a_raising_library_factory_only_degrades_capture(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The capture path's totality must not rest on a web-layer callable
+    behaving: a ``library_for_token`` that throws is capture's problem alone, and
+    the verdict work of the tick stands."""
+    await _configure_anchor(sessionmaker_)
+    user_id = await _add_user(sessionmaker_)
+
+    def _explode(_token: str) -> PlexLibrary:
+        raise RuntimeError("composition root blew up")
+
+    async def _service_section_count() -> int | None:
+        return 2
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_explode,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+
+    # The verdict landed; only the capture counter moved.
+    assert result.checked == 1
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 1
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "authorized"
+    assert user.entitled_section_keys is None
+
+
+@pytest.mark.parametrize(
+    ("anchor", "expected_state"),
+    [
+        pytest.param(AnchorCheck.MISMATCHED, "anchor_mismatch", id="mismatched"),
+        pytest.param(AnchorCheck.UNCONFIRMED, "anchor_unconfirmed", id="unconfirmed"),
+    ],
+)
+async def test_an_anchor_that_blocks_only_capture_still_reports_its_state(
+    sessionmaker_: SessionMaker, anchor: AnchorCheck, expected_state: str
+) -> None:
+    """Everyone is AUTHORIZED, so no share-loss verdict needs deferring -- but the
+    anchor check still refuses every capture (Codex review of PR-3).
+
+    Before, ``anchor_deferred`` stayed 0 and the tick reported a clean ``ok``
+    while capture was blocked for the entire fleet. The commonest shape of this
+    is a live ``/identity`` outage with plex.tv still answering, which is an
+    actionable condition, not a silent one.
+    """
+    await _configure_anchor(sessionmaker_)
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_,
+        [_server_resource(_MACHINE_ID)],
+        anchor=anchor,
+        capture=_capture_context(),
+    )
+
+    assert result.authorized == 1
+    assert result.anchor_deferred == 0  # nobody was about to be signed out
+    assert result.captured == 0
+    assert result.capture_skipped == 1
+    assert result.capture_anchor_blocked == 1
+    assert result.anchor_state is anchor
+
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == expected_state
+    assert status.last_ok_at is None
+    assert status.capture_anchor_blocked == 1
+
+
+async def test_a_confirmed_anchor_never_flags_capture_as_blocked(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The counterpart: the ordinary healthy tick keeps reporting ``ok``."""
+    await _configure_anchor(sessionmaker_)
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_, [_server_resource(_MACHINE_ID)], capture=_capture_context()
+    )
+    assert result.captured == 1
+    assert result.capture_anchor_blocked == 0
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == "ok"
+
+
+async def test_an_unreachable_server_breaks_the_capture_circuit_for_the_tick(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A black-holed Plex server costs one full client timeout PER authorized
+    user, which at a full budget is minutes of tick wall time spent learning the
+    same thing 20 times. The first server-level failure stops the rest."""
+    await _configure_anchor(sessionmaker_)
+    for index in range(4):
+        await _add_user(sessionmaker_, username=f"viewer{index}", token=f"token-{index}")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("X-Plex-Token", ""))
+        raise httpx.ConnectError("plex server black hole", request=request)
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        transport = httpx.MockTransport(handler)
+        return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
+
+    async def _service_section_count() -> int | None:
+        return None
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+
+    # Exactly ONE server call, not one per authorized user.
+    assert len(calls) == 1
+    assert result.capture_failed == 1
+    assert result.capture_skipped == 3
+    # Every verdict still landed: the sweep talks to plex.tv, not to this server.
+    assert result.checked == 4
+    assert result.authorized == 4
+
+
+async def test_a_refused_token_does_not_break_the_circuit_for_everyone_else(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A 401 is about THIS user's token, not the server -- the next user's
+    capture must still be attempted. Tripping on it would let one bad token
+    suppress capture for the whole install."""
+    await _configure_anchor(sessionmaker_)
+    for index in range(3):
+        await _add_user(sessionmaker_, username=f"viewer{index}", token=f"token-{index}")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("X-Plex-Token", "")
+        calls.append(token)
+        if token == "token-0":  # noqa: S105 - a fake token id, not a credential
+            return httpx.Response(401, json={})
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [
+                        {
+                            "key": "1",
+                            "title": "Movies",
+                            "type": "movie",
+                            "Location": [{"id": 1, "path": "/x"}],
+                        }
+                    ],
+                }
+            },
+        )
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        transport = httpx.MockTransport(handler)
+        return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
+
+    async def _service_section_count() -> int | None:
+        return 1
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+    result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+
+    assert calls == ["token-0", "token-1", "token-2"]
+    assert result.capture_failed == 1
+    assert result.capture_skipped == 0
+    assert result.captured == 2
+
+
+async def test_a_repoint_mid_sweep_discards_the_capture_but_keeps_the_verdict(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The anchor is re-read by the write itself, so a repoint landing between
+    the capture and the store is caught -- and it is capture's problem only."""
+    await _configure_anchor(sessionmaker_, "a-different-server")
+    user_id = await _add_user(sessionmaker_)
+
+    result = await _sweep(
+        sessionmaker_, [_server_resource(_MACHINE_ID)], capture=_capture_context()
+    )
+
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 1
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "authorized"
+    assert user.entitled_section_keys is None
+
+
+async def test_capture_never_stamps_when_the_anchor_is_not_confirmed(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A replacement server at the SAME plex_url answers happily, and the
+    settings row still holds the OLD id -- so the row guard alone would accept
+    the new server's sections under the old anchor. Capture therefore rides the
+    tick's live /identity confirmation, exactly as the revocation path does."""
+    await _configure_anchor(sessionmaker_)
+    user_id = await _add_user(sessionmaker_)
+    calls: list[str] = []
+
+    result = await _sweep(
+        sessionmaker_,
+        [_server_resource(_MACHINE_ID)],
+        anchor=AnchorCheck.MISMATCHED,
+        capture=_capture_context(calls=calls),
+    )
+
+    # The verdict work still happened; only the stamping was withheld.
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_skipped == 1
+    # And no server call was spent on a capture that could never be stamped.
+    assert calls == []
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys is None
+    assert user.entitlements_machine_id is None
+
+
+async def test_capture_skips_when_the_anchor_cannot_be_confirmed_at_all(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _configure_anchor(sessionmaker_)
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_,
+        [_server_resource(_MACHINE_ID)],
+        anchor=AnchorCheck.UNCONFIRMED,
+        capture=_capture_context(),
+    )
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_skipped == 1
+
+
+async def test_a_rotated_token_mid_sweep_discards_that_users_capture(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The sweep's capture is taken with the token read before the network call;
+    if a sign-in rotates it in that window, the stale write must not land."""
+    await _configure_anchor(sessionmaker_)
+    user_id = await _add_user(sessionmaker_, token="original-token")  # noqa: S106
+
+    rotated = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal rotated
+        if not rotated:
+            rotated = True
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [
+                        {
+                            "key": "1",
+                            "title": "Movies",
+                            "type": "movie",
+                            "Location": [{"id": 1, "path": "/x"}],
+                        }
+                    ],
+                }
+            },
+        )
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        # Rotate the stored credential the moment the capture client is built --
+        # i.e. after the guard read it, before the write lands.
+        return PlexLibrary(
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            "http://plex.local:32400",
+            token,
+        )
+
+    async def _service_section_count() -> int | None:
+        return 1
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+
+    async def rotate_now() -> None:
+        async with sessionmaker_() as session:
+            user = await session.get(User, user_id)
+            assert user is not None
+            user.encrypted_plex_token = "rotated-by-a-sign-in"  # noqa: S105
+            await session.commit()
+
+    # Rotate between the guard read and the store: the section handler runs
+    # in-between, so rotating from it lands in exactly that window.
+    original_attempt = plex_access_service._attempt_capture  # pyright: ignore[reportPrivateUsage]
+
+    async def rotating_attempt(*args: object, **kwargs: object) -> object:
+        await rotate_now()
+        return await original_attempt(*args, **kwargs)  # pyright: ignore[reportCallIssue, reportArgumentType]
+
+    plex_access_service._attempt_capture = rotating_attempt  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    try:
+        result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+    finally:
+        plex_access_service._attempt_capture = original_attempt  # pyright: ignore[reportPrivateUsage]
+
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 1
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys is None
+
+
+async def test_a_rotation_between_verdict_and_capture_write_is_refused(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The sweep's capture must present the ciphertext of the credential its
+    library client is BOUND to -- the one read when the candidate was selected --
+    not a fresh read taken after the verdict.
+
+    Here a sign-in rotates the token while the capture's section read is in
+    flight. A re-read would pick up the NEW ciphertext, pass the write guard, and
+    stamp the old token's view over the newer credential's. Carrying the
+    selection-time ciphertext makes the write match zero rows instead.
+    """
+    await _configure_anchor(sessionmaker_)
+    user_id = await _add_user(sessionmaker_, token="original-token")  # noqa: S106
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [
+                        {
+                            "key": "9",
+                            "title": "Old view",
+                            "type": "movie",
+                            "Location": [{"id": 1, "path": "/x"}],
+                        }
+                    ],
+                }
+            },
+        )
+
+    def _library_for_token(token: str) -> PlexLibrary:
+        return PlexLibrary(
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            "http://plex.local:32400",
+            token,
+        )
+
+    async def _service_section_count() -> int | None:
+        return 1
+
+    context = plex_access_service.EntitlementCaptureContext(
+        library_for_token=_library_for_token,
+        service_section_count=_service_section_count,
+        anchor_setting_key=_ANCHOR_KEY,
+    )
+
+    # Rotate the stored credential exactly between the verdict and the capture
+    # write, by hooking the section read the capture performs in between.
+    original_attempt = plex_access_service._attempt_capture  # pyright: ignore[reportPrivateUsage]
+
+    async def rotating_attempt(*args: object, **kwargs: object) -> object:
+        async with sessionmaker_() as session:
+            user = await session.get(User, user_id)
+            assert user is not None
+            user.encrypted_plex_token = "rotated-by-a-sign-in"  # noqa: S105
+            await session.commit()
+        return await original_attempt(*args, **kwargs)  # pyright: ignore[reportCallIssue, reportArgumentType]
+
+    plex_access_service._attempt_capture = rotating_attempt  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    try:
+        result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
+    finally:
+        plex_access_service._attempt_capture = original_attempt  # pyright: ignore[reportPrivateUsage]
+
+    # The verdict landed; the stale-credential snapshot did not.
+    assert result.authorized == 1
+    assert result.captured == 0
+    assert result.capture_failed == 1
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys is None
+    assert user.encrypted_plex_token == "rotated-by-a-sign-in"  # noqa: S105
+
+
+async def test_the_candidate_carries_the_ciphertext_of_its_own_token(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The selection statement reads the decrypted token and its raw ciphertext
+    together, so the two can never come from different row versions."""
+    user_id = await _add_user(sessionmaker_, token="a-token")  # noqa: S106
+    async with sessionmaker_() as session:
+        candidates = await plex_access_service._select_due_candidates(  # pyright: ignore[reportPrivateUsage]
+            session,
+            now=datetime.now(UTC),
+            revalidate_after=_INTERVAL,
+            limit=20,
+        )
+        expected = await plex_access_service.read_token_ciphertext(session, user_id)
+    assert len(candidates) == 1
+    user, ciphertext = candidates[0]
+    assert user.id == user_id
+    assert user.encrypted_plex_token == "a-token"  # noqa: S105
+    assert ciphertext == expected

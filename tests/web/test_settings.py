@@ -887,6 +887,147 @@ async def test_put_url_change_with_no_stored_token_skips_probe_and_keeps_session
     assert (await client.get("/api/v1/settings")).status_code == 200
 
 
+# --------------------------------------------------------------------------- #
+# An install that predates the anchor can RECORD one from Settings (#484 PR-3)  #
+# --------------------------------------------------------------------------- #
+async def test_re_saving_plex_settings_records_a_missing_anchor(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The remedy the sweep advertises has to actually work.
+
+    An install set up before ``plex_machine_identifier`` existed has the url and
+    token but no anchor, and #484 entitlement capture is declined outright
+    without one. A plain re-save is NOT a repoint -- same url, masked token --
+    so the repoint ladder correctly reports "nothing changed" and used to write
+    nothing, leaving capture off with no web-operable way to turn it on (Codex
+    review of PR-3). Submitting the Plex section now runs the SAME full ladder
+    against the stored pair and records the id it derives.
+    """
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex:32400")
+        await store.set("plex_token", _SEED_PLEX_TOKEN)
+        await session.commit()
+    assert await _stored_machine_id(sessionmaker_) is None
+    probes: list[httpx.Request] = []
+    await _use_transport(app, _repoint_transport(identity="LIVE-MID", probes=probes))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://plex:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "LIVE-MID"
+    # The full ladder ran against the STORED pair -- not just an /identity peek.
+    assert [str(probe.url) for probe in probes] == [
+        "http://plex:32400/identity",
+        "http://plex:32400/library/sections",
+    ]
+
+
+async def test_recording_a_missing_anchor_signs_nobody_out(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Unlike a repoint, nothing MOVED: the id being recorded is the one sign-in
+    was already resolving live on this install, now pinned behind a stronger
+    check. Revoking every session for that would be a gratuitous fleet-wide
+    sign-out (ADR-0005 never-locked-out)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex:32400")
+        await store.set("plex_token", _SEED_PLEX_TOKEN)
+        await session.commit()
+    await _admin_session_cookies(app, plex_id=9301, tag="anchor-adm")
+    assert await _active_session_count(sessionmaker_) == 1
+    await _use_transport(app, _repoint_transport(identity="LIVE-MID"))
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://plex:32400", "plex_token": "***"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) == "LIVE-MID"
+    assert await _active_session_count(sessionmaker_) == 1
+
+
+async def test_an_unverifiable_server_never_fails_the_settings_save(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """Best-effort by design: the operator may be saving unrelated fields, and a
+    Plex outage must not 502 the whole write. Capture simply stays visibly off
+    (the sweep keeps reporting ``capture_unavailable``) until a later save
+    verifies the server."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex:32400")
+        await store.set("plex_token", _SEED_PLEX_TOKEN)
+        await session.commit()
+    await _use_transport(app, _unreachable_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://plex:32400", "plex_token": "***", "log_retention_days": 14},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get("log_retention_days") == "14"
+
+
+async def test_a_save_that_does_not_touch_plex_never_probes_for_the_anchor(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The narrowness that keeps this from becoming a live round-trip on every
+    settings write: only a PUT that actually submits the Plex section may spend
+    one."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex:32400")
+        await store.set("plex_token", _SEED_PLEX_TOKEN)
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"log_retention_days": 21},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None
+
+
+async def test_a_half_configured_install_has_nothing_to_verify(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """No stored token means no ladder to run -- and certainly no bare
+    ``/identity`` peek promoted to the anchor."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("plex_url", "http://plex:32400")
+        await session.commit()
+    await _use_transport(app, _no_probe_transport())
+
+    put = await client.put(
+        "/api/v1/settings",
+        json={"plex_url": "http://plex:32400"},
+        headers={"X-Api-Key": _API_KEY},
+    )
+
+    assert put.status_code == 200
+    assert await _stored_machine_id(sessionmaker_) is None
+
+
 async def _active_session_count(sessionmaker_: SessionMaker) -> int:
     """Count auth sessions that are still usable (``revoked_at`` unset)."""
     async with sessionmaker_() as session:

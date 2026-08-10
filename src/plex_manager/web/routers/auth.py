@@ -15,6 +15,7 @@ browser access uses this Plex sign-in plus an HTTP-only session cookie.
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 from collections.abc import Sequence
@@ -22,11 +23,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Final, NamedTuple, cast
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, Request, Response, status
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from plex_manager.adapters.plex.library import PlexLibrary
 from plex_manager.adapters.plex.oauth import (
     PlexAccount,
     PlexResource,
@@ -36,8 +38,9 @@ from plex_manager.adapters.plex.oauth import (
 )
 from plex_manager.config import get_settings
 from plex_manager.db import get_session
+from plex_manager.logsafe import safe_int
 from plex_manager.models import AuthSession, SystemSettings, User
-from plex_manager.services import session_lifecycle
+from plex_manager.services import plex_access_service, session_lifecycle
 
 # The deps MODULE itself is imported (not just names from it) so the shared
 # process-local ``plex_identity_generation`` counter is read/re-checked as
@@ -46,6 +49,7 @@ from plex_manager.services import session_lifecycle
 # docstring in ``web.deps``; alerts #363/#368, issue #385). ``secret_rotation``
 # reads the same-module lock the same way.
 from plex_manager.web import deps
+from plex_manager.web.background import spawn_detached
 from plex_manager.web.deps import (
     CSRF_COOKIE_NAME,
     PLEX_MACHINE_ID_SETTING,
@@ -85,6 +89,8 @@ from plex_manager.web.schemas import (
 )
 
 __all__ = ["router"]
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -303,6 +309,13 @@ async def plex_sign_in_endpoint(
     # (both see ``old_token is None``, the loser overwrites the winner). The
     # ordinary tail therefore confirms its no-retire basis against the COMMITTED
     # token under the lock and re-dispatches as a rotation if it moved.
+    # The ciphertext of the token row THIS sign-in wrote, read inside the same
+    # transaction that wrote it. Handed to the detached capture so that task
+    # carries ITS OWN credential's identity: re-reading it later would let an
+    # older, slower capture pick up a NEWER sign-in's ciphertext, pass the write
+    # guard, and overwrite the newer credential's snapshot with the old token's
+    # view (Codex round 3 on PR #560).
+    signed_in_token_ciphertext: str | None = None
     for _ in range(_MAX_SIGN_IN_SHAPE_ATTEMPTS):
         if old_token is not None and old_token != body.auth_token:
             # ROTATION: the stored token VALUE is changing (issue #374). Replace
@@ -352,6 +365,9 @@ async def plex_sign_in_endpoint(
                 # fresh post-yield ``secret_values()`` read narrows to the NEW
                 # value.
                 await session.flush()
+                signed_in_token_ciphertext = await plex_access_service.read_token_ciphertext(
+                    session, user.id
+                )
             # The demoted-stream close already ran inside the boundary
             # (``on_committed``); only response construction remains out here.
             _set_session_cookies(
@@ -375,6 +391,11 @@ async def plex_sign_in_endpoint(
                 user, account, permissions=staged_permissions, token=body.auth_token
             )
             await _issue_browser_session(session, response, request=request, user_id=user.id)
+            # After the issuance commit: the row now holds THIS sign-in's token,
+            # and pre-init concurrency is already serialized by the claim CAS.
+            signed_in_token_ciphertext = await plex_access_service.read_token_ciphertext(
+                session, user.id
+            )
             _close_demoted_streams()
             break
 
@@ -439,6 +460,14 @@ async def plex_sign_in_endpoint(
             # post-commit, before any remembered cancellation is honored, matching
             # the rotation branch's ordering (issue #183).
             await commit_to_completion(session, on_committed=_close_demoted_streams)
+            # Read AFTER the commit but STILL UNDER ``secret_rotation_lock``: any
+            # concurrent rotation must take the same lock, so nothing can have
+            # replaced this token between the commit and this read. Deliberately
+            # not a pre-commit flush -- forcing the staged session INSERT out
+            # early would change this locked tail's write timing.
+            signed_in_token_ciphertext = await plex_access_service.read_token_ciphertext(
+                session, user.id
+            )
             _set_session_cookies(
                 response,
                 request=request,
@@ -458,6 +487,27 @@ async def plex_sign_in_endpoint(
             message="Sign-in kept racing a credential change. Please try again.",
             hint="Retry the sign-in in a moment.",
         )
+    # Sign-in is the cheapest possible capture point (#484 PR-3): we are already
+    # holding a FRESH, just-verified token for this account, so entitlements are
+    # current from the very first session instead of waiting up to one
+    # revalidation interval for the sweep to reach them.
+    #
+    # DETACHED, not awaited: the capture talks to the Plex server, which may be a
+    # LAN address that black-holes for the full client timeout. Awaiting it here
+    # would stall every sign-in behind an unreachable server -- the one endpoint
+    # that has to keep working when the install is misconfigured. The task holds
+    # its own session (never this request's) and is total, so nothing it does can
+    # reach back into this response.
+    spawn_detached(
+        request.app,
+        _capture_entitlements_after_sign_in(
+            request.app,
+            user_id=user.id,
+            token=body.auth_token,
+            expected_token_ciphertext=signed_in_token_ciphertext,
+        ),
+        name="entitlement-capture-at-sign-in",
+    )
     return _me_response(
         AuthContext(
             method=AuthMethod.plex_session,
@@ -792,6 +842,99 @@ async def _claim_or_resume_setup(
                 hint="Finish setup from the account that started it, or reset the database.",
             )
     return True  # claimant (or resuming claimant) is the admin
+
+
+async def _client_identifier_for_capture(app: FastAPI) -> str:
+    """The plex.tv client identifier, minted-and-committed once if absent.
+
+    Its own short transaction, exactly as the sweep tick does: an uncommitted
+    mint would register a fresh plex.tv device on every sign-in.
+    """
+    async with app.state.sessionmaker() as session:
+        client_identifier = await _get_or_create_client_identifier(session)
+        await session.commit()
+        return client_identifier
+
+
+async def _capture_entitlements_after_sign_in(
+    app: FastAPI, *, user_id: int, token: str, expected_token_ciphertext: str | None
+) -> None:
+    """Capture this account's visible library sections (#484 PR-3). Never raises.
+
+    Runs DETACHED from the sign-in request (see the call site) and opens its OWN
+    session, for two independent reasons:
+
+    * The Plex server here may be a LAN address that black-holes, in which case
+      this waits out the full client timeout. On the request path that would
+      stall every sign-in -- precisely the endpoint an operator needs working
+      when the install is misbehaving.
+    * Holding the request's session across that call would span a network round
+      trip with an open transaction, the exact discipline ``sweep_shares``
+      documents and observes for the same reason.
+
+    TOTAL by contract: sign-in has already committed and responded by the time
+    this runs, so every failure mode -- Plex unconfigured, an unreachable or
+    refusing server, a bad URL, a write error -- must leave the previous
+    entitlement snapshot exactly as it was and disturb nothing else.
+
+    Skipped outright when no ``plex_machine_identifier`` is cached: a capture is
+    only meaningful stamped with the anchor it was taken against, and that anchor
+    is only ever written by an operator-verified path (see
+    ``app._entitlement_capture_context`` for why a background probe must not
+    backfill it).
+
+    The cached anchor is then CONFIRMED against a live ``/identity`` before
+    anything is stamped. A replacement server at the same ``plex_url`` answers
+    happily and would otherwise have ITS sections written under the OLD
+    identifier -- which the settings-row guard in ``store_entitlements`` cannot
+    catch, since that row still holds the old id. The extra probe is free here
+    precisely because this runs off the request path.
+    """
+    try:
+        async with app.state.sessionmaker() as session:
+            store = SettingsStore(session)
+            machine_identifier = await store.get(PLEX_MACHINE_ID_SETTING)
+            plex_url = await store.get("plex_url")
+        if not machine_identifier or not plex_url:
+            return
+        # The settings read is CLOSED before the network calls -- no transaction
+        # is held across them. Each write below opens its own.
+        client_identifier = await _client_identifier_for_capture(app)
+        plex_tv = PlexTvClient(app.state.http_client, client_identifier=client_identifier)
+        live_identifier = await plex_tv.fetch_server_identity(plex_url, token)
+        if live_identifier != machine_identifier:
+            _logger.warning(
+                "entitlement capture at sign-in skipped for user_id=%s: the server at the "
+                "configured URL reports a different machine identifier than the stored "
+                "one, so its sections must not be stamped with the stored anchor",
+                safe_int(user_id),
+            )
+            return
+        library = PlexLibrary(app.state.http_client, plex_url, token)
+        capture = await plex_access_service.capture_entitlements(
+            library, machine_identifier=machine_identifier, user_id=user_id
+        )
+        if capture is None:
+            return
+        async with app.state.sessionmaker() as session:
+            stored = await plex_access_service.store_entitlements(
+                session,
+                user_id,
+                capture,
+                anchor_setting_key=PLEX_MACHINE_ID_SETTING,
+                expected_token_ciphertext=expected_token_ciphertext,
+            )
+            if stored:
+                await session.commit()
+    except Exception:
+        # Deliberately broad and deliberately swallowed: this is enrichment
+        # hanging off an already-committed sign-in. Logged with a traceback so it
+        # is never silent (north star #3), then dropped.
+        _logger.exception(
+            "entitlement capture at sign-in failed for user_id=%s; the sign-in itself "
+            "succeeded and the previous snapshot is unchanged",
+            safe_int(user_id),
+        )
 
 
 async def _post_init_access(
