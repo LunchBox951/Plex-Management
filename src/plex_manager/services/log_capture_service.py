@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AUTO_GRAB_TELEMETRY_LOGGER_NAME",
     "DECISION_TELEMETRY_LOGGER_NAME",
+    "EVICTION_TELEMETRY_LOGGER_NAME",
     "LOG_DRAIN_INTERVAL_SECONDS",
     "LOG_PRUNE_INTERVAL_SECONDS",
     "QUEUE_MAXSIZE",
@@ -184,6 +185,14 @@ _TELEMETRY_LOGGER_LEVEL: Final = logging.INFO
 #:   the durable sink sees them unchanged.
 DECISION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.decision_service"
 AUTO_GRAB_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.auto_grab_service.telemetry"
+#: Issue #353's sweep-telemetry lines (duration + walk-eligible/walk-skipped
+#: counts on every ``_run_sweep`` return path). Same ``.telemetry`` CHILD
+#: pattern as auto-grab: only the sweep-evidence records go through the child;
+#: eviction's operational logging stays on the module logger with ordinary
+#: level/retention semantics. These records are the canary evidence the
+#: walk-skip optimization's perf premise is confirmed from, so they must be
+#: CREATED at any operator ``log_level`` and must SURVIVE default pruning.
+EVICTION_TELEMETRY_LOGGER_NAME: Final = "plex_manager.services.eviction_service.telemetry"
 
 #: THE definition of "a telemetry logger" -- deliberately one tuple driving BOTH
 #: telemetry behaviors, so they can never drift apart:
@@ -203,6 +212,7 @@ _TELEMETRY_LOGGERS: Final = (
     TELEMETRY_LOGGER_NAME,
     DECISION_TELEMETRY_LOGGER_NAME,
     AUTO_GRAB_TELEMETRY_LOGGER_NAME,
+    EVICTION_TELEMETRY_LOGGER_NAME,
 )
 
 #: Third-party HTTP client loggers that MUST be kept quieter than whatever the

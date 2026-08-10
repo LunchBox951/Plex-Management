@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -490,7 +491,9 @@ async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_movie_ro
     already rules out (unwatched, pinned, in-flight, or still within grace) must
     never pay for the ``os.walk`` size lookup -- but it still appears in the
     RETURNED raw superset (never dropped, per ``assemble_candidates``'s
-    contract), reporting the honest ``size_percent=0.0`` "unknown" fallback."""
+    contract), reporting the explicit ``size_percent=None`` walk-skip sentinel
+    (issue #353) -- distinguishable from a genuinely empty/zero-byte title,
+    which still walks and reports a real ``0.0``."""
     eligible_path = _movie_file(tmp_path, "Eligible.mkv")
     unwatched_path = _movie_file(tmp_path, "Unwatched.mkv")
     pinned_path = _movie_file(tmp_path, "Pinned.mkv")
@@ -556,12 +559,103 @@ async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_movie_ro
     # walk-skip optimization.
     assert set(by_title) == {"Eligible", "Unwatched", "Pinned", "Recent", "InFlight"}
     assert by_title["Eligible"].size_percent == pytest.approx(1024 / 1_000_000 * 100.0)
-    # Ineligible rows report the same honest "unknown size" fallback a missing
-    # breadcrumb already uses, never a fabricated guess and never a real walk.
-    assert by_title["Unwatched"].size_percent == 0.0
-    assert by_title["Pinned"].size_percent == 0.0
-    assert by_title["Recent"].size_percent == 0.0
-    assert by_title["InFlight"].size_percent == 0.0
+    # Ineligible rows report the explicit walk-skip sentinel (issue #353), never
+    # a fabricated ``0.0`` and never a real walk -- distinguishable from a
+    # genuinely empty title, which would still walk and report a real ``0.0``.
+    assert by_title["Unwatched"].size_percent is None
+    assert by_title["Pinned"].size_percent is None
+    assert by_title["Recent"].size_percent is None
+    assert by_title["InFlight"].size_percent is None
+
+
+async def test_run_eviction_sweep_logs_walked_vs_skipped_telemetry_and_duration(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #353's perf-confirmation half: a real sweep must log, unconditionally,
+    how many candidates it walked versus walk-skipped (derived from the same
+    ``size_percent is None`` sentinel the contract-hardening half of #353 added)
+    plus the sweep's wall-clock duration -- the exact data a canary log grep for
+    "sweep" + "duration" previously found zero matching lines for."""
+    eligible_path = _movie_file(tmp_path, "Eligible.mkv")
+    unwatched_path = _movie_file(tmp_path, "Unwatched.mkv")
+    pinned_path = _movie_file(tmp_path, "Pinned.mkv")
+
+    await _movie(sessionmaker_, tmdb_id=1101, title="Eligible", library_path=eligible_path)
+    await _movie(sessionmaker_, tmdb_id=1102, title="Unwatched", library_path=unwatched_path)
+    await _movie(
+        sessionmaker_, tmdb_id=1103, title="Pinned", library_path=pinned_path, keep_forever=True
+    )
+
+    library = FakeLibrary(
+        watch_states={
+            (1101, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+            (1102, "movie", None): WatchState(watched=False, last_viewed_at=None),
+            (1103, "movie", None): WatchState(watched=True, last_viewed_at=_STALE),
+        }
+    )
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.eviction_service"):
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=0.0,
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    assert [o.title for o in outcomes] == ["Eligible"]
+    telemetry = [r for r in caplog.records if "eviction sweep telemetry" in r.getMessage()]
+    assert len(telemetry) == 1
+    # The record must come from the PINNED telemetry child (level-pinned to INFO
+    # and retention-floored by log_capture_service._TELEMETRY_LOGGERS), so an
+    # operator running at WARNING still produces the canary evidence.
+    assert telemetry[0].name == "plex_manager.services.eviction_service.telemetry"
+    message = telemetry[0].getMessage()
+    # 1 walk-eligible (Eligible, actually paid for os.walk), 2 walk-skipped
+    # (Unwatched + Pinned, ruled out by is_evictable before any walk), 1 evicted.
+    assert "1 candidate(s) walk-eligible" in message
+    assert "2 walk-skipped" in message
+    assert "1 evicted" in message
+    # A real wall-clock duration was measured and formatted, not a placeholder.
+    assert re.search(r"took \d+\.\d{3}s", message) is not None
+
+
+async def test_run_eviction_sweep_logs_telemetry_below_pressure_threshold(
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The common no-pressure tick previously returned in total silence -- exactly
+    why the issue #353 canary checkpoints found zero sweep-telemetry log lines.
+    It must now log a cheap summary before the pressure pre-check returns, with
+    no candidate assembly (and so no os.walk) paid for."""
+    library = FakeLibrary()
+    fs = LocalFileSystem(library_roots=[str(tmp_path)])
+
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.eviction_service"):
+        async with sessionmaker_() as session:
+            outcomes = await eviction_service.run_eviction_sweep(
+                session=session,
+                library=library,
+                fs=fs,
+                media_type="movie",
+                root_path=str(tmp_path),
+                threshold_pct=101.0,  # unreachable -- real usage can never hit this
+                target_pct=0.0,
+                grace_days=_GRACE_DAYS,
+            )
+
+    assert outcomes == []
+    telemetry = [r for r in caplog.records if "eviction sweep telemetry" in r.getMessage()]
+    assert len(telemetry) == 1
+    assert telemetry[0].name == "plex_manager.services.eviction_service.telemetry"
+    message = telemetry[0].getMessage()
+    assert "below pressure threshold" in message
+    assert "no candidates assembled" in message
+    assert re.search(r"\d+\.\d{3}s", message) is not None
 
 
 async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_season_rows(
@@ -656,10 +750,11 @@ async def test_assemble_candidates_skips_the_walk_for_policy_ineligible_season_r
         "InFlight Show",
     }
     assert by_title["Eligible Show"].size_percent == pytest.approx(2048 / 1_000_000 * 100.0)
-    assert by_title["Unwatched Show"].size_percent == 0.0
-    assert by_title["Pinned Show"].size_percent == 0.0
-    assert by_title["Recent Show"].size_percent == 0.0
-    assert by_title["InFlight Show"].size_percent == 0.0
+    # Same explicit walk-skip sentinel as the movie twin above (issue #353).
+    assert by_title["Unwatched Show"].size_percent is None
+    assert by_title["Pinned Show"].size_percent is None
+    assert by_title["Recent Show"].size_percent is None
+    assert by_title["InFlight Show"].size_percent is None
 
 
 async def test_assemble_candidates_walks_every_row_when_grace_cutoff_is_omitted(

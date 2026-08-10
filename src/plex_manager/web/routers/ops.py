@@ -586,7 +586,16 @@ async def _disk_root_item(
                 season=c.season,
                 status=c.status,
                 last_viewed_at=c.last_viewed_at,
-                size_percent=c.size_percent,
+                # ``ranked`` is ``preview_candidates``'s RANKED (eligible) output --
+                # ``rank_eviction_candidates``'s eligibility test never depends on
+                # size, so a candidate that made it into this set was, by
+                # ``assemble_candidates``'s own construction, also WALKED at this
+                # same cutoff (see ``EvictionCandidate.size_percent``'s docstring,
+                # issue #353). It can therefore never actually carry the walk-skip
+                # ``None`` sentinel here; the fallback is a defensive invariant
+                # guard, never a fabricated guess for a row this endpoint chose to
+                # surface.
+                size_percent=c.size_percent if c.size_percent is not None else 0.0,
                 library_path=c.library_path,
             )
             for c in ranked
