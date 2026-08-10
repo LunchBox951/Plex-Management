@@ -631,10 +631,13 @@ async def test_events_stream_closes_at_idle_deadline(
             assert sync["topics"] == ["sync"]
             assert sync["reason"] == "connected"
 
-            await stream.expect_body_end()
+            frames = await stream.drain_to_end()
     finally:
         app.dependency_overrides.pop(require_admin_short_session, None)
 
+    # The IDLE bound won here (5s vs the 30-day cap), so the close frame must say
+    # so rather than sharing one vague reason with the absolute cap.
+    assert _close_reason(frames) == "session_idle_timeout"
     assert wait_calls == 2
     assert timeouts[0] == 5.0
     assert 0.0 < timeouts[0] < events_router._HEARTBEAT_SECONDS  # pyright: ignore[reportPrivateUsage]
@@ -827,7 +830,12 @@ async def test_stream_retired_at_its_session_deadline_says_the_session_expired(
     seed: SeedFn,
 ) -> None:
     """The lease expiring is the server's decision too, so it explains itself
-    rather than looking like a dropped connection."""
+    rather than looking like a dropped connection.
+
+    This session's ABSOLUTE cap is the binding bound (there is no idle deadline),
+    so the reason is the maximum-age one, distinct from the idle-window reason
+    asserted in ``test_events_stream_closes_at_idle_deadline``.
+    """
     await seed(initialized=True)
 
     async def _expiring_admin() -> AuthContext:

@@ -260,12 +260,14 @@ async def test_sign_outs_survive_the_deletion_of_the_account_they_describe(
     assert entry["username"] == "departed"
 
 
-async def test_legacy_sign_out_rows_still_name_the_user_by_join(
+async def test_legacy_sign_out_rows_report_an_unknown_subject_not_a_joined_name(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
 ) -> None:
     """Rows written before the username stamp existed (the sweep shipped in
-    #557) must still resolve a name, and must not break when the account is
-    gone."""
+    #557) must NOT be attributed by joining ``entity_id`` back to ``users``:
+    that id is reusable and the account may since have been renamed, so the join
+    can confidently display an unrelated person. An honest unknown is the only
+    safe answer."""
     await seed(initialized=True, app_api_key=_API_KEY)
     client.cookies.update(await _admin_cookies(app))
     present_id = await _add_user(app, plex_id=205, username="still-here")
@@ -275,8 +277,60 @@ async def test_legacy_sign_out_rows_still_name_the_user_by_join(
     entries = (await client.get("/api/v1/auth/sign-outs")).json()["entries"]
 
     by_user = {entry["user_id"]: entry for entry in entries}
-    assert by_user[present_id]["username"] == "still-here"
+    # The account still exists under that exact id — and is STILL not named,
+    # because the row itself never recorded who it was.
+    assert by_user[present_id]["username"] is None
     assert by_user[4242]["username"] is None
+
+
+async def test_a_renamed_account_cannot_relabel_an_older_sign_out(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """The stamped name is a snapshot of who it was, not a live lookup."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    client.cookies.update(await _admin_cookies(app))
+    user_id = await _add_user(app, plex_id=208, username="before")
+    await _record_sign_out(
+        app,
+        user_id=user_id,
+        action_type=audit_service.SHARE_REVOKED_ACTION,
+        username="before",
+    )
+    async with app.state.sessionmaker() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.username = "after"
+        await session.commit()
+
+    entry = (await client.get("/api/v1/auth/sign-outs")).json()["entries"][0]
+
+    assert entry["username"] == "before"
+
+
+async def test_a_revoke_that_cut_nothing_is_not_reported_as_a_sign_out(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn
+) -> None:
+    """Due-selection sees a live session, but the conditioned revoke runs later
+    and can find nothing left to cut (the user logged out mid-sweep). The
+    verdict is real; the sign-out is not."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    client.cookies.update(await _admin_cookies(app))
+    user_id = await _add_user(app, plex_id=209, username="already-gone")
+    await _record_sign_out(
+        app,
+        user_id=user_id,
+        action_type=audit_service.SHARE_REVOKED_ACTION,
+        sessions_revoked=0,
+        username="already-gone",
+    )
+
+    entry = (await client.get("/api/v1/auth/sign-outs")).json()["entries"][0]
+
+    assert entry["admin_exempt"] is False
+    assert entry["sessions_revoked"] == 0
+    # Not exempt, but nothing was cut — claiming a sign-out would describe an
+    # action the app never took.
+    assert entry["signed_out"] is False
 
 
 async def test_sign_outs_are_not_a_generic_audit_browser(
@@ -369,4 +423,7 @@ async def test_sign_outs_tolerate_a_wrong_shaped_audit_payload(
     assert entry["share_state"] is None
     assert entry["sessions_revoked"] == 0
     assert entry["admin_exempt"] is False
-    assert entry["signed_out"] is True
+    # An unreadable count degrades to 0, and 0 sessions cut is not a sign-out —
+    # a row we cannot parse must not be reported as a confident action.
+    assert entry["signed_out"] is False
+    assert entry["username"] is None

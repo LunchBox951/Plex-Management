@@ -35,6 +35,17 @@ interface NoticeCopy {
  * changed would be a lie.
  */
 const NOTICES: Record<string, NoticeCopy> = {
+  // KNOWN GAP (tracked follow-up to #556): the two share-revalidation reasons
+  // below are currently undeliverable to the person they describe. `/api/v1/events`
+  // is admin-only and `RealtimeProvider` mounts only for admins, while the sweep
+  // never signs an admin out (ADR-0005) — so the set of users holding a stream
+  // and the set of users the sweep cuts do not intersect. A swept user's next
+  // REST call 401s and they reach the sign-in screen with no notice at all.
+  // Delivering to them needs a reason persisted on the session row, which is
+  // session-model design deliberately out of this change's scope. The copy is
+  // kept (and tested) because it is correct the moment a delivery path exists,
+  // and because Settings → Automatic sign-outs already answers the same
+  // question for the operator today.
   share_revalidation_share_revoked: {
     title: 'Your Plex access was removed',
     message:
@@ -75,9 +86,20 @@ const NOTICES: Record<string, NoticeCopy> = {
       'This account’s administrator access on this server was removed, so its live admin connection was closed. You are still signed in with the access you now have.',
     signedOut: false,
   },
+  // The server emits two DISTINCT reasons here (`routers/events.py`) because a
+  // session dies two ways and only one of them is about the user's behaviour.
+  // One shared "your session expired" string had to hedge on both and told the
+  // user nothing they could act on.
   session_expired: {
-    title: 'Your session expired',
-    message: 'Sessions end after a period of inactivity. Sign in with Plex again to continue.',
+    title: 'Your session reached its maximum age',
+    message:
+      'Sessions end a fixed time after you sign in, however active you have been. Sign in with Plex again to continue.',
+    signedOut: true,
+  },
+  session_idle_timeout: {
+    title: 'You were signed out for inactivity',
+    message:
+      'This session sat unused for long enough to expire. Sign in with Plex again to continue.',
     signedOut: true,
   },
   plex_server_repointed: {
@@ -86,15 +108,25 @@ const NOTICES: Record<string, NoticeCopy> = {
       'This install was pointed at a different Plex server, so every session was ended. Sign in again against the new server.',
     signedOut: true,
   },
+  // BOTH are sign-outs for the tabs that receive them. `_revoke_recovery_sessions`
+  // revokes every live recovery-cookie session on rotate (exempting only the
+  // ACTING admin's own cookie) and every one of them on revoke (no exemption at
+  // all — with the key destroyed there is no new key to hand back). A tab whose
+  // session survived, i.e. the actor's, reconnects successfully and the
+  // connect-time clear drops the notice, so `true` costs it nothing; marking
+  // these `false` instead would discard the final frame and land every OTHER
+  // recovery tab on an unexplained login screen.
   app_key_rotated: {
     title: 'The access key was rotated',
-    message: 'The shared API key changed, so this connection was closed. Reconnecting…',
-    signedOut: false,
+    message:
+      'The recovery key this session was opened with has been replaced, so the session ended. Exchange the new recovery key, or sign in with Plex.',
+    signedOut: true,
   },
   app_key_revoked: {
     title: 'The access key was revoked',
-    message: 'The shared API key was removed, so this connection was closed.',
-    signedOut: false,
+    message:
+      'The recovery key this session was opened with has been removed, so the session ended. Sign in with Plex, or generate a new recovery key from another admin session.',
+    signedOut: true,
   },
   // The single most common server-side close: every graceful shutdown/restart
   // ends every stream (`web/app.py`'s lifespan). Sessions survive a restart, so

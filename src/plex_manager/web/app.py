@@ -1232,6 +1232,15 @@ async def _share_sweep_once(app: FastAPI) -> int:
         # explaining the sign-out, and "your Plex share was removed" is simply
         # untrue for a stale token (plex.tv rejected the credential before it
         # could say anything about the share). Same split as the AuditLog rows.
+        #
+        # KNOWN GAP (tracked follow-up to #556): this close reason cannot
+        # currently REACH the user it describes. ``/api/v1/events`` is admin-only
+        # and this sweep never signs an admin out (ADR-0005 exemption in
+        # ``apply_share_verdict``), so a swept user never had a stream to close;
+        # the call below is a no-op for them and their browser learns nothing.
+        # It is still correct to make: it closes any stream that DOES match, and
+        # the pairing with the revocation is the #183 invariant. The operator's
+        # answer path meanwhile is Settings -> Automatic sign-outs.
         reason = _SHARE_SWEEP_CLOSE_REASONS.get(verdict)
         if reason is None:  # pragma: no cover - only two verdicts ever sign out
             _logger.warning(

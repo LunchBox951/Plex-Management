@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import select
 
-from plex_manager.models import AuditLog, User
+from plex_manager.models import AuditLog
 from plex_manager.services.session_lifecycle import ensure_utc
 
 if TYPE_CHECKING:
@@ -102,12 +102,23 @@ class SignOutAuditRecord:
 
     @property
     def signed_out(self) -> bool:
-        """Whether this verdict actually cut the user's sessions.
+        """Whether this verdict actually cut any of the user's sessions.
 
-        An admin-exempt row records a share loss that was deliberately NOT acted
-        on, so reporting it as a sign-out would be a lie in the operator's face.
+        BOTH conditions are load-bearing, because there are two ways to record a
+        share loss that signed nobody out:
+
+        * ``admin_exempt`` — the sweep deliberately declined to act (ADR-0005's
+          never-locked-out rule).
+        * ``sessions_revoked == 0`` — it tried and there was nothing left to cut.
+          Due-selection sees a live session, but the revoke runs later and is
+          conditioned (unchanged token, sessions that predate the guard moment):
+          a user who logged out mid-sweep leaves a row that is honest about the
+          verdict yet cut nothing.
+
+        Reporting either as a sign-out would tell the operator the app did
+        something it did not do.
         """
-        return not self.admin_exempt
+        return not self.admin_exempt and self.sessions_revoked > 0
 
 
 async def record(
@@ -182,20 +193,21 @@ async def list_automatic_sign_outs(
     answer to "why was I signed out?", not a general audit browser. ``limit`` is
     the caller's already-validated bound.
 
-    ``username`` prefers the name STAMPED into the row when it was written, and
-    only falls back to an OUTER join on ``entity_id``. That order matters: the
-    audit trail deliberately outlives the ``users`` row it describes
-    (``AuditLog.user_id`` is ``ON DELETE SET NULL`` and ``entity_id`` carries no
-    FK at all), so a join is not an authority for "who was this" -- a primary key
-    freed by a deletion and later reused would make the join confidently name the
-    WRONG person. Rows written before the stamp existed still resolve through the
-    join, and an account deleted since simply reports ``username: None`` rather
-    than dropping the record of what happened.
+    ``username`` comes ONLY from the name stamped into the row when it was
+    written; a row without one reports ``None``, never a name recovered by
+    joining ``entity_id`` back to ``users``. The audit trail deliberately
+    outlives the ``users`` row it describes (``AuditLog.user_id`` is
+    ``ON DELETE SET NULL`` and ``entity_id`` carries no FK at all), so that join
+    is not an authority for "who was this": a rename, or a primary key freed by
+    a deletion and later reused, makes it confidently display an unrelated
+    account. Pre-stamp rows -- only reachable on installs that ran #557's sweep
+    before this shipped -- therefore surface as an honest unknown. Losing a name
+    that was probably right beats displaying one that is occasionally, and
+    invisibly, wrong.
     """
     rows = (
         await session.execute(
-            select(AuditLog, User.username)
-            .outerjoin(User, User.id == AuditLog.entity_id)
+            select(AuditLog)
             .where(
                 AuditLog.entity_type == USER_ENTITY_TYPE,
                 AuditLog.action_type.in_(AUTOMATIC_SIGN_OUT_ACTION_TYPES),
@@ -206,19 +218,19 @@ async def list_automatic_sign_outs(
             .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
             .limit(limit)
         )
-    ).all()
+    ).scalars()
     return [
         SignOutAuditRecord(
             id=entry.id,
             occurred_at=ensure_utc(entry.created_at),
             action_type=entry.action_type,
             user_id=entry.entity_id,
-            username=_json_str(entry.new_value, "username") or username,
+            username=_json_str(entry.new_value, "username"),
             previous_share_state=_json_str(entry.old_value, "share_state"),
             share_state=_json_str(entry.new_value, "share_state"),
             sessions_revoked=_json_int(entry.new_value, "sessions_revoked"),
             admin_exempt=_json_bool(entry.new_value, "admin_exempt"),
             description=entry.description,
         )
-        for entry, username in rows
+        for entry in rows
     ]

@@ -21,6 +21,7 @@ import type {
   SubsystemHealthItem,
 } from '../api/types'
 import { libraryOptionNote, libraryOptionValue } from '../api/types'
+import { cn } from '../lib/cn'
 import type { ApiError } from '../lib/errors'
 import { AuthErrorCard } from '../components/AuthErrorCard'
 import { AdminPageHeader } from '../components/ui/AdminPageHeader'
@@ -777,6 +778,18 @@ function SessionsSection() {
   )
 }
 
+/**
+ * Who a sign-out was about. The backend only reports a name it recorded AT the
+ * sign-out, so a null one means the subject is genuinely unknown — a row from
+ * before that stamp existed. The numeric id is shown as a weak hint but never
+ * dressed up as an identity: ids are reusable, so resolving one back to whoever
+ * holds it now is exactly the misattribution the backend refuses to do.
+ */
+function signOutSubject(entry: AutomaticSignOut): string {
+  if (entry.username !== null) return entry.username
+  return entry.user_id === null ? 'Unknown account' : `Unknown account (id ${entry.user_id})`
+}
+
 /** How the two automatic sign-out causes read to an operator. */
 function signOutCause(entry: AutomaticSignOut): { label: string; detail: string } {
   if (entry.action_type.startsWith('user.plex_sign_in_expired')) {
@@ -846,8 +859,13 @@ function AutomaticSignOutsSection() {
               return (
                 <li key={entry.id} className="flex flex-col gap-1 py-3">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="truncate text-sm font-medium text-ink">
-                      {entry.username ?? `user #${entry.user_id ?? 'unknown'}`}
+                    <span
+                      className={cn(
+                        'truncate text-sm',
+                        entry.username === null ? 'italic text-muted' : 'font-medium text-ink',
+                      )}
+                    >
+                      {signOutSubject(entry)}
                     </span>
                     <span className="rounded bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
                       {cause.label}

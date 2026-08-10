@@ -34,6 +34,10 @@ SeedFn = Callable[..., Awaitable[None]]
 
 _MACHINE_ID = "configured-server-machine-id"
 
+#: Upper bound on frames ``_close_reason`` will drain before giving up. A closed
+#: subscription only ever holds the connect-time sync event plus the sentinel.
+_MAX_DRAINED_FRAMES = 100
+
 
 def _server_resource(machine_id: str) -> dict[str, object]:
     return {
@@ -162,11 +166,20 @@ async def test_confirmed_revoke_closes_the_users_open_realtime_stream(
 
 
 async def _close_reason(subscription: EventSubscription) -> str | None:
-    """Drain a closed subscription and return the reason it was closed with."""
-    with pytest.raises(StreamClosed) as closed:
-        while True:
+    """Drain a closed subscription and return the reason it was closed with.
+
+    The drain is BOUNDED and the close is caught explicitly rather than wrapped
+    in ``pytest.raises(...)`` around a ``while True``: that shape left the
+    ``return`` statically unreachable (CodeQL ``py/unreachable-statement``),
+    since the only exit from the loop is an exception the context manager
+    swallows. Failing loudly when the stream never closes also beats hanging.
+    """
+    for _ in range(_MAX_DRAINED_FRAMES):
+        try:
             await subscription.get()
-    return closed.value.reason
+        except StreamClosed as closed:
+            return closed.reason
+    raise AssertionError("the subscription delivered events but was never closed")
 
 
 async def test_a_revoked_share_and_a_stale_token_close_streams_with_different_reasons(

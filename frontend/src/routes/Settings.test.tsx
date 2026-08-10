@@ -1611,12 +1611,21 @@ describe('Settings — Automatic sign-outs (issue #556)', () => {
     expect(section.queryByText(/0 sessions revoked/)).not.toBeInTheDocument()
   })
 
-  it('still shows the record when the account it describes is gone', () => {
-    // The audit row deliberately outlives the user row, so a deleted account
-    // must not take the explanation of what happened with it.
+  it('still shows the record when the subject cannot be named', () => {
+    // The audit row deliberately outlives the user row, so an unnamed subject
+    // must not take the explanation of what happened with it — but it must also
+    // not be dressed up as an identity, since ids are reusable.
     h.signOuts = [signOut({ id: 4, username: null })]
     render(<Settings />, { wrapper: Wrapper })
-    expect(signOutsSection().getByText('user #7')).toBeInTheDocument()
+    const section = signOutsSection()
+    expect(section.getByText('Unknown account (id 7)')).toBeInTheDocument()
+    expect(section.getByText('Plex share removed')).toBeInTheDocument()
+  })
+
+  it('says plainly that a row cut nothing rather than implying a sign-out', () => {
+    h.signOuts = [signOut({ id: 5, sessions_revoked: 0, signed_out: false })]
+    render(<Settings />, { wrapper: Wrapper })
+    expect(signOutsSection().getByText(/0 sessions revoked/)).toBeInTheDocument()
   })
 
   it('surfaces a failed fetch with a retry instead of an empty list', () => {

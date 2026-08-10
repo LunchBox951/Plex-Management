@@ -30,9 +30,25 @@ describe('describeSessionClose', () => {
     expect(notice.signedOut).toBe(true)
   })
 
-  it('does not treat a key rotation as a sign-out', () => {
-    expect(describeSessionClose('app_key_rotated').signedOut).toBe(false)
-    expect(describeSessionClose('app_key_revoked').signedOut).toBe(false)
+  it('treats both app-key changes as sign-outs for the tabs that get them', () => {
+    // `_revoke_recovery_sessions` revokes every recovery-cookie session on
+    // revoke (no exemption) and every non-acting one on rotate. Marking these
+    // as non-sign-outs would drop the final frame and strand those tabs on an
+    // unexplained login screen; the acting tab reconnects and self-clears.
+    expect(describeSessionClose('app_key_rotated').signedOut).toBe(true)
+    expect(describeSessionClose('app_key_revoked').signedOut).toBe(true)
+  })
+
+  it('keeps the two ways a session can expire apart', () => {
+    const absolute = describeSessionClose('session_expired')
+    const idle = describeSessionClose('session_idle_timeout')
+
+    expect(absolute.title).not.toBe(idle.title)
+    // The absolute cap is emphatically NOT about inactivity — the old shared
+    // copy claimed it was.
+    expect(absolute.message).toMatch(/however active/i)
+    expect(absolute.message).not.toMatch(/inactivity/i)
+    expect(idle.title).toMatch(/inactivity/i)
   })
 
   it('does not treat a graceful shutdown as a sign-out', () => {
@@ -69,9 +85,11 @@ describe('the session-close notice store', () => {
   })
 
   it('ignores closes that did not end the session', () => {
-    // Rotating the shared API key closes admin streams but leaves the browser's
-    // own cookie session alive; showing "you were signed out" would be false.
-    noteSessionClose('app_key_rotated')
+    // A graceful restart closes every stream but leaves sessions intact, and a
+    // demotion only closes the admin-only stream; showing "you were signed out"
+    // for either would be false.
+    noteSessionClose('shutdown')
+    noteSessionClose('permission_downgraded')
     expect(getSessionCloseNotice()).toBeNull()
   })
 })

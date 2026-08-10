@@ -636,6 +636,14 @@ async def apply_share_verdict(
     same fact in the log stream, but it is subject to log retention trimming, so
     the audit surface -- not the Logs page -- is the answer path.
 
+    That answer path is the OPERATOR's. The signed-out USER is still told
+    nothing: the realtime close reason cannot reach them, because
+    ``/api/v1/events`` is admin-only and the admin exemption directly below
+    means nobody this branch signs out ever held a stream. Closing that loop
+    needs the revocation reason persisted on the session row so the sign-in
+    screen can read it back -- session-model work tracked as a follow-up to
+    #556, not something the close-reason plumbing can reach on its own.
+
     ``expected_token`` closes the mid-sweep re-sign-in race: the verdict was
     computed against the token read during due-selection, and a user who signed
     in again since then holds a NEW token this verdict says nothing about (the

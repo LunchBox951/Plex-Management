@@ -1968,6 +1968,16 @@ export interface components {
          *     verdict deliberately NOT acted on for an owner/admin (ADR-0005's
          *     never-locked-out rule). Those rows report ``signed_out: false`` — they are
          *     the operator's cue to revoke by hand if the removal is genuine.
+         *
+         *     ``signed_out`` is false whenever nothing was actually cut — an admin-exempt
+         *     verdict, or a revoke that found no live session left (the user logged out
+         *     between due-selection and the revoke). ``sessions_revoked`` says how many.
+         *
+         *     ``username`` is the name recorded IN the row at the moment of the sign-out,
+         *     so it stays correct after the account is renamed or deleted. It is null for
+         *     rows written before that stamp existed: the subject is then genuinely
+         *     unknown, since ``user_id`` alone can be reused by a later account and must
+         *     not be resolved back to a name.
          */
         AutomaticSignOut: {
             /** Action Type */
