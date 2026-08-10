@@ -463,8 +463,10 @@ def active_purge_paths() -> tuple[str, ...]:
 # Revocation is a signal, not an interrupt: the holder must read
 # ``lease.revoked_reason`` at the points where it is about to do something
 # destructive. The eviction sweep reads it before drawing each victim AND, as the
-# real barrier, inside the purge primitive's ``before_delete`` hook -- after the
-# delete permit is held, with nothing but a synchronous thread start left. TWO
+# real barrier, TWICE inside the purge primitive's ``before_delete`` hook --
+# before arming the incomplete-delete marker and again after the arm commit
+# (issue #570), after the delete permit is held, with nothing but a synchronous
+# thread start left. TWO
 # kinds of bytes can still leave under a defeated lease, and both are deliberate:
 #
 # * a delete worker that had ALREADY been started -- past the boundary hook there

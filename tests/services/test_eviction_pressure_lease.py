@@ -350,7 +350,7 @@ async def test_a_correction_starting_before_assembly_defers_without_crawling_ple
 
 
 async def test_a_correction_starting_after_the_claim_is_revoked_at_the_delete_boundary(
-    sessionmaker_: SessionMaker, tmp_path: Path
+    sessionmaker_: SessionMaker, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE BARRIER: the deepest await window, past every cheap recheck.
 
@@ -375,13 +375,23 @@ async def test_a_correction_starting_after_the_claim_is_revoked_at_the_delete_bo
     )
 
     try:
-        outcomes = await _sweep_one_movie_root(sessionmaker_, root=root, library=library)
+        with caplog.at_level(logging.INFO, logger=eviction_service.__name__):
+            outcomes = await _sweep_one_movie_root(sessionmaker_, root=root, library=library)
     finally:
         purge_service.end_purge(correction_path)
 
     assert library.fired, "the correction never landed inside the pre-claim re-read"
     assert outcomes == []
     assert Path(victim).exists(), "bytes left disk after a correction had already claimed"
+    # Pin PHASE 1 specifically: this defeat must be caught by the cheap pre-arm
+    # read (no durable write, no compensating restore commit), not by the
+    # post-arm phase-2 recheck -- removing phase 1 would otherwise be invisible
+    # to the suite, since phase 2 produces the identical end state.
+    assert any(
+        record.name == eviction_service.__name__
+        and "before the incomplete-delete marker was armed" in record.getMessage()
+        for record in caplog.records
+    )
     async with sessionmaker_() as session:
         row = await session.get(MediaRequest, request_id)
         evicted_history = (
