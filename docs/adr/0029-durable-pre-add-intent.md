@@ -349,6 +349,7 @@ New table `download_add_intents`:
 | `source_ref` | the replayable source, **encrypted at rest**; credential-bearing indexer URLs are never persisted verbatim |
 | `save_path`, `category` | the directed path (issues #133/#157) and the submitted category (the fixed `plex-manager-intent`) |
 | `client_created` | nullable bool — `AddResult.created` as reported by `add_prepared`, written post-add. The proof that authorizes remove-with-data (see *Ownership model*); NULL means "unknown, operator-gated" |
+| `submitting_since` | nullable timestamp — the **submission lease**. Stamped in the same pre-add commit, cleared when `add_prepared` resolves. A live lease forbids the absent-transition from deleting the row (see *The submission lease*) |
 | `media_request_id` | FK → `media_requests`, `ON DELETE SET NULL` |
 | `observed_request_status`, `observed_season_status` | the premise the grab decision observed — the CAS operands at activation, exactly as `grab()` uses them today |
 | `release_json` | the `ScoredRelease` fields needed to rebuild scopes and claims — **the release's** `target_seasons`/`covered_seasons`, not the request's stored episode filters (see lesson L10) |
@@ -397,7 +398,10 @@ prepared         --proven absent, premise stale-->  [claim released, row deleted
 prepared         --source unresolvable / hash mismatch / premise conflict
                    / foreign-category hash-->       needs_attention
 prepared         --operator cancel-->               cancel_requested
-cancel_requested --proven absent-->                 [row deleted]
+cancel_requested --proven absent AND no live submission lease-->
+                                                    [row deleted]
+cancel_requested --proven absent BUT lease live-->  cancel_requested (wait for
+                                                    the submitter to resolve)
 cancel_requested --present and owned-->             remove, then [row deleted]
 cancel_requested --client unavailable-->            cancel_requested (retry;
                                                     UI reports cleanup deferred)
@@ -434,6 +438,52 @@ Consequently the recovery probe's category test **accepts either**
 `plex-manager-intent` or `plex-manager` as ours-by-corroboration, because those
 are precisely the two states the post-commit ordering can leave behind.
 
+**A deferred recategorize needs a durable trigger, and one reader must be able
+to see the category.** "Best-effort, retried next cycle" is not free: once the
+intent row is deleted, nothing records that the recategorize is still owed. A
+crash between the activation commit and the `set_category` call — or a
+`set_category` that simply fails — leaves the torrent under
+`plex-manager-intent` permanently. Neither existing reader can repair it:
+tracked reconciliation works from `DownloadStatus`, which **exposes no category
+field at all**, and the I3 sweep subtracts tracked hashes, so an activated
+torrent is excluded from the very sweep that would notice its category. The
+result is a silently mislabeled torrent that also violates the sweep's premise
+that `plex-manager-intent` means "not yet activated".
+
+Two additions close it. First, `downloads` gains a `pending_recategorize` flag,
+set inside the activation transaction and cleared only on a **confirmed**
+`set_category`; the reconcile loop, which already iterates tracked rows, retries
+any row still carrying it. That is the durable trigger, and it survives the
+intent's deletion because it lives on the row that outlives it. Second,
+`DownloadStatus` gains a `category` field — qBittorrent's `/torrents/info`
+already returns it, and this ADR is already qualifying the port — so the retry
+can *verify* rather than blind-write, and an externally recategorized torrent
+becomes detectable instead of invisible. The flag is the requirement; the field
+is what makes the repair honest.
+
+**The submission lease.** R2 makes `prepared` deliberately ambiguous — "the
+client may or may not hold this hash, ask" — and the recovery algorithm resolves
+that ambiguity by probing. But a probe cannot distinguish *"never submitted"*
+from *"a submitter is inside `add_prepared` right now and the client has not
+finished accepting it"*. Without a durable record of submission-in-progress,
+cancellation observes the hash absent, deletes the intent, and the in-flight call
+then creates a torrent with **neither an intent nor a `Download`** behind it —
+#481 reproduced by the very path meant to prevent it. A CAS on the intent row
+cannot close this: the race is against an external await that no committed state
+describes.
+
+So the pre-add commit — the one that already writes the intent and its claims —
+additionally stamps `submitting_since`, and it is cleared when `add_prepared`
+resolves either way. **No absent-transition may delete or release an intent
+while its lease is live**; the cancel path leaves the row in
+`cancel_requested` and retries on a later cycle, when the submitter will have
+recorded its outcome. The lease carries a timeout because a crashed submitter
+would otherwise pin the intent forever — and expiry is safe precisely because a
+crashed process has no in-flight call: after the timeout the probe-based logic
+is sound again. The timeout must exceed the adapter's own add timeout, and its
+expiry is a surfaced event, not a silent reclaim (north star 3). This costs no
+extra commit; it adds one column to a write that already happens.
+
 **Superseding a parked intent (the re-park loop).** A parked intent releases its
 ownership tokens (L3) but its client torrent may still exist under our intent
 category. A later grab of the same release resolves the *same* hash, and
@@ -464,11 +514,41 @@ self-inflicted causes (duplicate-add, and premise-conflict parks whose premise
 has since resolved). Foreign-category and hash-mismatch parks stay
 operator-gated and are surfaced, never auto-cleared.
 
-`needs_attention` **releases every ownership token completely** — the claim
-rows' owner columns are cleared (or the claim rows deleted) *and* the
-`torrent_hash` ceases to reserve the hash against a future grab — while the row
-itself is retained with a reason and surfaced in the UI. Partial release is the
-specific defect L3 records.
+**`needs_attention` is two states, not one.** L3's rule — a parked intent is
+inert in every guard — was derived from parks that are *historical*: the
+incident is over, nothing of ours is running in the client, and retaining
+tokens would permanently block parking and eviction for the title. But two park
+causes leave **live client mutations this app created**: a hash-mismatch /
+re-submit-cap park may have leaked one or more torrents that are downloading
+right now, and a premise-conflict park may have an owned torrent still running.
+Releasing coverage for those would make our own live torrents invisible to the
+park and eviction guards and admit a replacement grab — recreating exactly the
+unclaimed-coverage window of #477 that this ADR exists to close.
+
+So parks are classified on **two independent axes**, and the reason code carries
+both:
+
+| Park cause | Supersedable? (round-3 rule) | Claims on park |
+|---|---|---|
+| `duplicate_add` — our own duplicate-add no-op | **Yes** | Released (inert) |
+| `premise_conflict` — request/season moved on mid-flight | Yes, once the premise resolves | **Retained** while an owned torrent is live |
+| `hash_mismatch` / `resubmit_cap` — we created torrents we cannot address | No | **Retained** |
+| `foreign_category` — the hash belongs to someone else | No (a provenance refusal) | Released — nothing of ours is live |
+| `source_unresolvable` — never submitted | Yes, once a source resolves | Released (inert) |
+
+Retention is **conditional and terminating**, which is what reconciles it with
+L3: a retained claim is held only until its torrent is removed, adopted, or
+proven absent, and each of those is a button in the I3 surface. It is not the
+indefinite hold L3 warned about — that defect was a *permanent* block with no
+exit. What must never happen is the other failure: releasing tokens for a
+torrent that is still moving bytes. Where the two rules would conflict, **the
+liveness axis wins**, because an invisible live torrent is the more dangerous
+state.
+
+In every case the `torrent_hash` ceases to *reserve* the hash against a future
+grab (see *Hash uniqueness*), and the row is retained with its reason and
+surfaced in the UI. Partial release is still the defect L3 records; the fix is
+to release the right things, not fewer things.
 
 **Hash uniqueness is partial, not absolute.** Three requirements collide if
 `torrent_hash` carries a plain `UNIQUE`: the column is `NOT NULL` from I2, a
@@ -683,11 +763,11 @@ every `needs_attention` residue from Part 1 terminates at a button.
 | Before `prepare_add` | none | untouched | none needed | no grab exists |
 | After `prepare_add`, before the intent commit | none | untouched | none needed — `prepare_add` mutates nothing, so a lost prepare loses only computation | no grab exists |
 | **After the intent commit, before `add_prepared`** | `prepared` + claims | untouched | probe by hash → proven absent → re-submit if the premise holds, else release the claims and delete | **claimed** — park and eviction refused |
-| **Inside `add_prepared` (ambiguous 5xx / proxy / unparsable)** | `prepared` + claims | unknown | probe by hash; category-verified present → activate; proven absent → re-submit. The intent is released only on *proven rejection* | **claimed** |
+| **Inside `add_prepared` (ambiguous 5xx / proxy / unparsable)** | `prepared` + claims + a live `submitting_since` | unknown | probe by hash; category-verified present → activate; proven absent → re-submit. The intent is released only on *proven rejection*. A crash here strands a **stale lease**, which expires on timeout — safe, because a crashed process has no in-flight call | **claimed**; the lease additionally blocks a concurrent cancel from deleting the row |
 | **After `add_prepared` returns, before the activation commit — the #481 window** | `prepared` + claims (+ `client_created`) | torrent exists under `plex-manager-intent` | probe → present + category is one of ours → activate in one transaction (create `Download`, swap claim owners, attach scopes, write `grabbed` history, delete intent) | **claimed** |
-| **After the activation commit, before the best-effort recategorize** | `Download` + claims + history | torrent still under `plex-manager-intent` | none required — the row is tracked and reconciles normally; the next cycle retries the recategorize. This row exists *because* the recategorize was moved out of the transaction | claim owned by the download |
+| **After the activation commit, before the best-effort recategorize** | `Download` + claims + history + `pending_recategorize` | torrent still under `plex-manager-intent` | the row is tracked and reconciles normally; the reconcile loop retries the recategorize **because `pending_recategorize` is set** — without that durable flag nothing would ever notice, since `DownloadStatus` carries no category and the sweep excludes tracked hashes. This row exists *because* the recategorize was moved out of the transaction | claim owned by the download |
 | After the activation commit and the recategorize | `Download` + claims + history | torrent under `plex-manager` | ordinary tracked reconciliation | claim owned by the download |
-| Hash mismatch (client resolved a different hash than `prepare_add` derived) | `prepared` + claims | a torrent under our intent category with an unexpected hash | The probe asks about *our* hash, so this is **indistinguishable from "never added"** and the intent re-submits. The re-submit cap bounds the leak and then parks `needs_attention`; the I3 sweep is what actually surfaces the leaked torrents. **Never** a silent adopt | **claimed** until the cap is hit, then released on parking |
+| Hash mismatch (client resolved a different hash than `prepare_add` derived) | `prepared` + claims | a torrent under our intent category with an unexpected hash | The probe asks about *our* hash, so this is **indistinguishable from "never added"** and the intent re-submits. The re-submit cap bounds the leak and then parks `needs_attention`; the I3 sweep is what actually surfaces the leaked torrents. **Never** a silent adopt | **claimed throughout** — this park class **retains** its claims, because the leaked torrents may still be downloading (see the park taxonomy) |
 | Any of the above on a release rolled back to N-1 | `prepared` rows present, unactivatable | as above | N-1 cannot activate. See the honest residual under *Consequences* | see residual |
 
 ### Staging
@@ -926,8 +1006,12 @@ review deliberately rather than continuously.*
   `created=False`, **and its refusal to fire on a foreign-category park**;
   `client_created` surviving activation and gating report-issue and cancel, with
   NULL treated as ask-not-skip; the partial hash-uniqueness index permitting a
-  parked row and its successor to coexist; and the re-submit cap parking instead
-  of leaking under a hash mismatch.
+  parked row and its successor to coexist; the re-submit cap parking instead of
+  leaking under a hash mismatch; **a cancel racing an in-flight `add_prepared`,
+  which must not delete the intent while the lease is live** (and must proceed
+  once it expires); a retained-claim park keeping its coverage until its torrent
+  is removed, adopted, or proven absent; and `pending_recategorize` surviving a
+  crash and being retried to a confirmed category.
 
 ## Implementation scope
 
@@ -935,16 +1019,18 @@ review deliberately rather than continuously.*
   (claim-owner columns + two tables), the pre-add commit, the owner-swap
   activation on the post-add success path, the widened predicates at every read
   site, `exclude_intent_id` at all eight `_active_conflict_for_targets` call
-  sites, the stale-claim reaper, and the guard tests. No port change, no
-  frontend. Independently shippable and soakable. Sized above the first
+  sites, the submission lease, `pending_recategorize` and its retry, the
+  stale-claim reaper, and the guard tests. No port change, no frontend.
+  Independently shippable and soakable. Sized above the first
   estimate deliberately: the self-exclusion threading is mechanical but
   unforgiving, and the owner swap is real logic on the hottest error-handling
   path in the file.
 - **I1b (movie claims): Small.** Request-level claim writes on the download
   side and a movie eviction predicate that consults them.
 - **I2 (port split + client-facing recovery): Large.** The port contract change
-  and its adapter work (including the v2-magnet route and persisting
-  `client_created`), intent recovery with per-item isolation and backoff, the
+  and its adapter work (including the v2-magnet route, persisting
+  `client_created`, and adding `category` to `DownloadStatus`), intent recovery
+  with per-item isolation and backoff, the park-liveness taxonomy, the
   hash becoming `NOT NULL`, the single retirement point, the parked-intent
   supersession rule, and the cancel↔recovery serialization. This is where every
   #538 P1 lived; it deserves its own review window against a frozen commit.
