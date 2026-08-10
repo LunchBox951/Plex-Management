@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint format type test check run migrate openapi docker-build \
+.PHONY: help install lint format type test test-ci check run migrate openapi docker-build \
 	ui-install gen-client ui-check ui-build test-updater-docker
 
 help: ## Show this help
@@ -21,6 +21,9 @@ type: ## Type-check with pyright (strict)
 
 test: ## Run the test suite with coverage
 	pytest
+
+test-ci: ## Run CI tests in parallel, then timing-sensitive tests serially
+	python -m scripts.ci_test
 
 check: ## Run all CI gates locally
 	python -m plex_manager.web.openapi_export

@@ -394,6 +394,36 @@ def test_generate_key_file_concurrent_fallback_agrees_on_one_key(
     assert (file_backed_key.stat().st_mode & 0o777) == 0o600
 
 
+def test_fallback_contender_deterministically_adopts_live_holders_key(
+    file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock loser adopts the holder's completed key without reaping its lock.
+
+    The concurrent fallback test above proves multi-worker convergence, but its
+    winning interleaving is intentionally nondeterministic. Pin the adoption
+    branch directly so coverage and behavior do not depend on thread scheduling.
+    """
+    winner = Fernet.generate_key()
+    lock_dir = file_backed_key.with_name(file_backed_key.name + ".lock")
+    lock_dir.mkdir()
+
+    def _no_existing(_path: Path) -> None:
+        return None
+
+    def _adopt_winner(_path: Path) -> bytes:
+        return winner
+
+    monkeypatch.setattr(encryption, "_read_valid_key_once", _no_existing)
+    monkeypatch.setattr(encryption, "_read_valid_key", _adopt_winner)
+
+    adopted = encryption._publish_key_no_hardlink(  # pyright: ignore[reportPrivateUsage]
+        file_backed_key, Fernet.generate_key()
+    )
+
+    assert adopted == winner
+    assert lock_dir.is_dir()
+
+
 def test_fallback_resumed_holder_cannot_replace_published_key(
     file_backed_key: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -630,6 +660,29 @@ def test_reap_stale_key_tempfiles_removes_old_orphans_only(tmp_path: Path) -> No
 
     assert not orphan.exists()
     assert fresh.exists()
+
+
+def test_reap_stale_key_tempfiles_ignores_unlink_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate disappearing during the best-effort sweep is harmless."""
+    orphan = tmp_path / ".secret.raced.tmp"
+    orphan.write_bytes(b"junk")
+    old = time.time() - 3600
+    os.utime(orphan, (old, old))
+
+    real_unlink = Path.unlink
+
+    def _raced_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == orphan:
+            raise FileNotFoundError(path)
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _raced_unlink)
+
+    encryption._reap_stale_key_tempfiles(tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert orphan.exists()
 
 
 def test_secret_override_still_drives_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
