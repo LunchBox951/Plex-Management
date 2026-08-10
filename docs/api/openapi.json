@@ -1080,7 +1080,7 @@
         "type": "object"
       },
       "EvictResponse": {
-        "description": "The result of a manual disk-pressure sweep (north-star #1: a button that\nfrees space on demand). Empty ``evicted`` is a normal, honest outcome (no\nroot was under pressure, or nothing was eligible). ``errors`` is populated\nper-root when THAT root's own sweep raised -- every other root's outcome\nin ``evicted`` still stands; the sweep never aborts one root's already\ncommitted work just because a sibling root failed.",
+        "description": "The result of a manual disk-pressure sweep (north-star #1: a button that\nfrees space on demand). Empty ``evicted`` is a normal, honest outcome (no\nroot was under pressure, or nothing was eligible). ``errors`` is populated\nper-root when THAT root's own sweep raised -- every other root's outcome\nin ``evicted`` still stands; the sweep never aborts one root's already\ncommitted work just because a sibling root failed. ``stood_down`` names any\nroot that deliberately declined because an operator correction owns its free\nspace (issue #526) -- the third honest shape of an empty ``evicted``, and the\none an operator would otherwise mistake for \"the button did nothing\".",
         "properties": {
           "errors": {
             "items": {
@@ -1095,12 +1095,44 @@
             },
             "title": "Evicted",
             "type": "array"
+          },
+          "stood_down": {
+            "items": {
+              "$ref": "#/components/schemas/EvictStoodDownItem"
+            },
+            "title": "Stood Down",
+            "type": "array"
           }
         },
         "required": [
           "evicted"
         ],
         "title": "EvictResponse",
+        "type": "object"
+      },
+      "EvictStoodDownItem": {
+        "description": "One root whose sweep DECLINED to evict because an operator correction owns\nthat root's free space right now (issue #526).\n\nNeither a failure nor a plain \"nothing to do\": the sweep was healthy and the\nroot may well be under pressure, but a correction purge either already held a\nclaim under it or started during the sweep and defeated its pressure-exclusion\nlease -- so continuing would delete watched titles against a free-space reading\nthat correction is about to change. Reported rather than left in the log\n(honesty over silence): an operator who presses \"free space\" and gets an empty\n``evicted`` deserves to know the difference between \"nothing was eligible\" and\n\"your own correction is already reclaiming this root\", and that the next sweep\nre-reads pressure once it settles.\n\n``reason`` is a STATIC, operator-facing sentence chosen by the sweep -- never a\npath, a request-derived value, or an exception message.",
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "root": {
+            "enum": [
+              "movies_root",
+              "tv_root",
+              "anime_movie_root",
+              "anime_tv_root"
+            ],
+            "title": "Root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "reason"
+        ],
+        "title": "EvictStoodDownItem",
         "type": "object"
       },
       "EvictionCandidateItem": {
@@ -5828,7 +5860,7 @@
     },
     "/api/v1/ops/evict": {
       "post": {
-        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.\n\nEach root's sweep is INDEPENDENT: one root raising (e.g. a transient\n``PlexLibraryError`` resolving TV watch state during candidate assembly)\nmust never abort a root that has not run yet, nor hide what an EARLIER\nroot already deleted and committed. A bare 500 here would do exactly that\n\u2014 the operator would see \"Free space failed\" with no indication that,\nsay, the movies root already freed real space \u2014 which is a dishonest,\nsilent-partial-success state north star #2 forbids. So every root's sweep\nis individually caught; a caught failure is logged and recorded in\n``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,\nand the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 \u2014\npartial completion is a first-class, visible outcome, not a terminal one.",
+        "description": "Manually trigger a pressure-triggered eviction sweep across every\nconfigured root \u2014 the north-star #1 button: free space on demand.\n\nRuns REGARDLESS of the ``eviction_enabled`` master switch: that setting\ngates the AUTOMATIC periodic sweep (``web/app.py``'s ``_eviction_tick``),\nnever this explicit, operator-initiated action \u2014 an operator who disabled\nthe background loop must still be able to free space on demand without\nre-enabling it. Still pressure-gated (a root already below\n``disk_pressure_threshold_percent`` evicts nothing \u2014 an empty ``evicted``\nis a normal, honest outcome) and still honours every other rule (watched,\npast grace, un-pinned, not in flight): this is the SAME sweep the periodic\ntask runs, just invoked synchronously instead of on a timer. Requires Plex\n(409 ``service_not_configured`` otherwise \u2014 watch state can't be resolved\nwithout it); an unset root is simply skipped, not an error.\n\nInvalidates :func:`_get_disk_preview_cache` after the sweep: without this,\n``GET /disk`` would keep serving the pre-eviction snapshot (stale\ncandidates the operator just deleted, stale free-space gauge) for up to\nits ~15s TTL, contradicting north-star #3 for the very endpoint that IS\nthe correction button.\n\nEach root's sweep is INDEPENDENT: one root raising (e.g. a transient\n``PlexLibraryError`` resolving TV watch state during candidate assembly)\nmust never abort a root that has not run yet, nor hide what an EARLIER\nroot already deleted and committed. A bare 500 here would do exactly that\n\u2014 the operator would see \"Free space failed\" with no indication that,\nsay, the movies root already freed real space \u2014 which is a dishonest,\nsilent-partial-success state north star #2 forbids. So every root's sweep\nis individually caught; a caught failure is logged and recorded in\n``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,\nand the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 \u2014\npartial completion is a first-class, visible outcome, not a terminal one.\n\nA root can also DECLINE rather than fail (issue #526): an operator correction\npurge owning that root's free space either denies the sweep its\npressure-exclusion lease or defeats it mid-run, and continuing would delete\nwatched titles against a reading that correction is about to change. That is\nneither an error nor \"nothing was eligible\", so it is reported per-root in\n``stood_down`` with the sweep's own static reason \u2014 otherwise an operator who\npressed this button while a report-issue was running would see an empty\n``evicted`` and no explanation, which is exactly the silence north star #3\nforbids. Whatever the OTHER roots evicted still stands.",
         "operationId": "evict_endpoint_api_v1_ops_evict_post",
         "responses": {
           "200": {

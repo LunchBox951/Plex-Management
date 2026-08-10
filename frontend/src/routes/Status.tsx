@@ -972,6 +972,9 @@ export function Status() {
       const result = await evict.mutateAsync()
       const partialEvictions = result.evicted.filter((outcome) => outcome.partial)
       const completeEvictions = result.evicted.filter((outcome) => !outcome.partial)
+      // Optional in the generated type (server-side default `[]`) but always on
+      // the wire — guarded for the same reason `errors` is below.
+      const stoodDown = result.stood_down ?? []
       toast({
         // Only fully removed titles count as "freed": a partial delete left
         // content on disk, so counting it would overstate the outcome.
@@ -997,9 +1000,32 @@ export function Status() {
               ]
                 .filter(Boolean)
                 .join('. ')
-            : 'No root is under pressure, or nothing eligible was found.',
+            : // "Nothing to free" has THREE causes and only two of them mean
+              // there was nothing to do. A root that stood down (issue #526) was
+              // healthy and possibly under real pressure — it declined because
+              // the operator's own correction is already reclaiming it — so
+              // saying "nothing eligible was found" there would be a plain lie.
+              stoodDown.length > 0
+              ? 'A correction is already reclaiming space — see the note below.'
+              : 'No root is under pressure, or nothing eligible was found.',
         intent: partialEvictions.length > 0 ? 'warning' : 'success',
       })
+      if (stoodDown.length > 0) {
+        // NOT an error and NOT a failure: the sweep deliberately declined
+        // because an operator correction owns that root's free space right now,
+        // and deleting more against a reading that correction is about to change
+        // would destroy watched titles nobody needed to lose. Told plainly, with
+        // what happens next, so the button never looks like it silently did
+        // nothing (north star #3) — a separate toast, exactly like `errors`
+        // below, so a mixed sweep's real evictions still read correctly above.
+        toast({
+          title: `Held off on ${stoodDown.map((s) => s.root).join(', ')}`,
+          description: `${stoodDown
+            .map((s) => s.reason)
+            .join('; ')}. The next sweep re-reads pressure once it settles.`,
+          intent: 'info',
+        })
+      }
       // `errors` is optional in the generated type (it has a server-side
       // default of `[]`) but always present on the wire -- guard anyway so a
       // contract regen never turns this into a runtime crash.

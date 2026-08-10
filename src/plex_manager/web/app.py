@@ -163,13 +163,21 @@ def _warn_if_multi_process() -> None:
     Several in-process registries assume a SINGLE Python process (issue #240):
     ``services.queue_service``'s removal-physics guards (``_removals_in_flight`` /
     ``_operator_fail_claims`` -- the same-hash grab/cancel/mark-failed race
-    closer), ``services.purge_service``'s purge-vs-import path serialization, and
+    closer), ``services.purge_service``'s purge-vs-import path serialization, its
+    root-scoped pressure-exclusion leases (``_PRESSURE_EXCLUSION_LEASES``, issue
+    #526 -- the correction-vs-eviction serialization), and
     ``web.routers.settings``'s ``_rotate_lock`` / ``_settings_update_lock`` are
-    all plain in-process ``dict``/``asyncio.Lock`` state with no cross-process
-    coordination -- each additional worker process (``uvicorn --workers>1``) or
-    container replica gets its OWN independent copy, silently REOPENING every
-    race those registries exist to close, with no error and no log line to say
-    so. This app deliberately does not build real multi-process coordination
+    all plain in-process ``dict``/``list``/``asyncio.Lock`` state with no
+    cross-process coordination -- each additional worker process
+    (``uvicorn --workers>1``) or container replica gets its OWN independent copy,
+    silently REOPENING every race those registries exist to close, with no error
+    and no log line to say so. The lease registry fails in a particularly quiet
+    way: a sweep in process B holds a lease that no correction in process A can
+    reach, and B's own acquisition cannot see A's purge claims either, so both
+    the deny and the defeat halves degrade to no-ops and the sweep goes back to
+    deleting against a reading an operator's correction has already invalidated --
+    exactly the #526 race, silently reopened. This app deliberately does not build
+    real multi-process coordination
     (a DB-level lock/CAS) for that -- see this repo's CLAUDE.md north star
     "honesty over silence": the fix here is making the violated assumption
     LOUD at startup instead of leaving it silent, not adding the coordination
@@ -189,12 +197,15 @@ def _warn_if_multi_process() -> None:
     if signals:
         _logger.warning(
             "multi-worker configuration detected (%s): this app assumes a "
-            "SINGLE process. Its in-process removal/settings-rotation guards "
+            "SINGLE process. Its in-process removal, purge-path, "
+            "pressure-exclusion-lease and settings-rotation guards "
             "(queue_service, purge_service, web.routers.settings) do not "
             "coordinate across worker processes or container replicas, so "
             "running more than one silently reopens the same-hash download "
-            "races those guards exist to close. Run exactly one worker/replica "
-            "of this app.",
+            "races those guards exist to close -- and lets a disk-pressure "
+            "eviction sweep in one process keep deleting against a reading an "
+            "operator correction in another has already invalidated. Run exactly "
+            "one worker/replica of this app.",
             ", ".join(sorted(signals)),
         )
 

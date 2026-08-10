@@ -122,6 +122,7 @@ from plex_manager.web.schemas import (
     EvictionCandidateItem,
     EvictionOutcomeItem,
     EvictResponse,
+    EvictStoodDownItem,
     HealthResponse,
     LiveLogRecordItem,
     LogEventItem,
@@ -483,6 +484,14 @@ async def export_logs_endpoint(
 # --------------------------------------------------------------------------- #
 # Component 3 — disk-pressure eviction: preview + manual trigger
 # --------------------------------------------------------------------------- #
+#: The configured-root SETTING KEYS ``POST /evict`` reports against. A root is
+#: named to the operator by the setting they would edit, never by its filesystem
+#: path (which is host-namespace detail and, unlike a fixed key set, not
+#: obviously safe to echo back). Shared by ``EvictErrorItem.root`` and
+#: ``EvictStoodDownItem.root`` so the two report in one vocabulary.
+type RootLabel = Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"]
+
+
 def _get_disk_preview_cache(request: Request) -> TtlCache[DiskRootItem]:
     """Return the process-wide, per-root disk/candidate-preview TTL cache.
 
@@ -773,6 +782,16 @@ async def evict_endpoint(
     ``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,
     and the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 —
     partial completion is a first-class, visible outcome, not a terminal one.
+
+    A root can also DECLINE rather than fail (issue #526): an operator correction
+    purge owning that root's free space either denies the sweep its
+    pressure-exclusion lease or defeats it mid-run, and continuing would delete
+    watched titles against a reading that correction is about to change. That is
+    neither an error nor "nothing was eligible", so it is reported per-root in
+    ``stood_down`` with the sweep's own static reason — otherwise an operator who
+    pressed this button while a report-issue was running would see an empty
+    ``evicted`` and no explanation, which is exactly the silence north star #3
+    forbids. Whatever the OTHER roots evicted still stands.
     """
     movies_root = await get_movies_root_optional(session)
     tv_root = await get_tv_root_optional(session)
@@ -788,14 +807,7 @@ async def evict_endpoint(
     # each breadcrumb to its DEEPEST containing configured root, so an anime
     # library_path is never a candidate unless its root is listed here, even
     # though ``fs`` above already allows deleting it.
-    roots: tuple[
-        tuple[
-            Literal["movie", "tv"],
-            Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"],
-            str | None,
-        ],
-        ...,
-    ] = (
+    roots: tuple[tuple[Literal["movie", "tv"], RootLabel, str | None], ...] = (
         ("movie", "movies_root", movies_root),
         ("tv", "tv_root", tv_root),
         ("movie", "anime_movie_root", anime_movie_root),
@@ -808,9 +820,17 @@ async def evict_endpoint(
     all_roots: list[str] = [r for _mt, _label, r in roots if r]
     outcomes: list[EvictionOutcome] = []
     errors: list[EvictErrorItem] = []
+    stood_down: list[EvictStoodDownItem] = []
     for media_type, root_label, root in roots:
         if not root:
             continue
+
+        # Bound to THIS root's label so the sweep, which knows only its own path,
+        # reports in the same vocabulary ``errors`` already uses. The sweep calls
+        # it at most once, with a static reason (see ``run_eviction_sweep``).
+        def _record_stand_down(reason: str, root_label: RootLabel = root_label) -> None:
+            stood_down.append(EvictStoodDownItem(root=root_label, reason=reason))
+
         try:
             outcomes.extend(
                 await eviction_service.run_eviction_sweep(
@@ -824,6 +844,7 @@ async def evict_endpoint(
                     target_pct=target_pct,
                     grace_days=grace_days,
                     qbt=qbt,
+                    on_stood_down=_record_stand_down,
                 )
             )
         except Exception as exc:
@@ -873,6 +894,7 @@ async def evict_endpoint(
         )
 
     return EvictResponse(
+        stood_down=stood_down,
         evicted=[
             EvictionOutcomeItem(
                 request_id=o.request_id,
