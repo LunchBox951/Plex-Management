@@ -3177,9 +3177,21 @@ export interface components {
          *     ``unknown`` is the field that makes this honest: a sweep that could not reach
          *     plex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,
          *     which an operator must be able to tell apart from a clean ``ok`` sweep that
-         *     found everyone still entitled.
+         *     found everyone still entitled. ``anchor_mismatch`` / ``anchor_deferred`` are
+         *     the louder cousin: the stored Plex machine identifier no longer matches the
+         *     server, so share-loss verdicts are meaningless and none were acted on.
          */
         ShareSweepStatusItem: {
+            /**
+             * Admins Exempted
+             * @default 0
+             */
+            admins_exempted: number;
+            /**
+             * Anchor Deferred
+             * @default 0
+             */
+            anchor_deferred: number;
             /**
              * Authorized
              * @default 0
@@ -3214,10 +3226,15 @@ export interface components {
              */
             share_revoked: number;
             /**
+             * Skipped
+             * @default 0
+             */
+            skipped: number;
+            /**
              * State
              * @enum {string}
              */
-            state: "starting" | "ok" | "degraded" | "not_configured" | "probe_failed" | "error";
+            state: "starting" | "ok" | "degraded" | "anchor_mismatch" | "not_configured" | "probe_failed" | "error";
             /**
              * Token Stale
              * @default 0

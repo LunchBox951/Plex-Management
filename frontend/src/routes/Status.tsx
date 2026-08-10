@@ -619,7 +619,9 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
       ? 'ok'
       : sweep.state === 'degraded' || sweep.state === 'probe_failed'
         ? 'warn'
-        : sweep.state === 'error'
+        : // A stale server anchor is not a hiccup: nothing is being enforced
+          // until an operator repoints, so it reads as loudly as a crash.
+          sweep.state === 'error' || sweep.state === 'anchor_mismatch'
           ? 'error'
           : 'neutral'
   const label =
@@ -680,6 +682,28 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
         >
           {sweep.unknown}
         </dd>
+        {/* The sweep knowingly enforcing nothing, because the configured Plex
+            machine identifier no longer matches the server. Only rendered when
+            non-zero — it is an exception state, not a routine statistic. */}
+        {sweep.anchor_deferred > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Held (server changed)</dt>
+            <dd className="min-w-0 text-right font-semibold text-error tabular-nums [overflow-wrap:anywhere]">
+              {sweep.anchor_deferred}
+            </dd>
+          </>
+        ) : null}
+        {/* An admin whose share looks gone is never signed out automatically
+            (ADR-0005 never-locked-out) — surfaced so the operator can go act on
+            it by hand rather than wondering why nothing happened. */}
+        {sweep.admins_exempted > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Admins held</dt>
+            <dd className="min-w-0 text-right font-semibold text-searching tabular-nums [overflow-wrap:anywhere]">
+              {sweep.admins_exempted}
+            </dd>
+          </>
+        ) : null}
         <dt className="min-w-0 text-faint">Still due</dt>
         <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
           {sweep.due_remaining}

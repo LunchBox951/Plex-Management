@@ -628,12 +628,11 @@ async def list_active_sessions_endpoint(
     is visible and cuttable, not an invisible standing grant.
     """
     now = datetime.now(UTC)
-    idle_cutoff = now - session_lifecycle.SESSION_IDLE_WINDOW
-    active_session = (
-        AuthSession.revoked_at.is_(None),
-        AuthSession.expires_at > now,
-        func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
-    )
+    # One shared definition of "still authenticates" (see
+    # ``session_lifecycle.active_session_conditions``): the share-revalidation
+    # sweep selects its candidates with the SAME predicate, so this list can
+    # never disagree with who that sweep considers signed in.
+    active_session = session_lifecycle.active_session_conditions(now)
     result = await session.execute(
         select(
             User.id,

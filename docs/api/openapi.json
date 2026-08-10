@@ -3586,8 +3586,18 @@
         "type": "object"
       },
       "ShareSweepStatusItem": {
-        "description": "The share-revalidation sweep's health (issue #391).\n\n``unknown`` is the field that makes this honest: a sweep that could not reach\nplex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,\nwhich an operator must be able to tell apart from a clean ``ok`` sweep that\nfound everyone still entitled.",
+        "description": "The share-revalidation sweep's health (issue #391).\n\n``unknown`` is the field that makes this honest: a sweep that could not reach\nplex.tv reports ``degraded`` with a non-zero ``unknown`` and revokes nobody,\nwhich an operator must be able to tell apart from a clean ``ok`` sweep that\nfound everyone still entitled. ``anchor_mismatch`` / ``anchor_deferred`` are\nthe louder cousin: the stored Plex machine identifier no longer matches the\nserver, so share-loss verdicts are meaningless and none were acted on.",
         "properties": {
+          "admins_exempted": {
+            "default": 0,
+            "title": "Admins Exempted",
+            "type": "integer"
+          },
+          "anchor_deferred": {
+            "default": 0,
+            "title": "Anchor Deferred",
+            "type": "integer"
+          },
           "authorized": {
             "default": 0,
             "title": "Authorized",
@@ -3660,11 +3670,17 @@
             "title": "Share Revoked",
             "type": "integer"
           },
+          "skipped": {
+            "default": 0,
+            "title": "Skipped",
+            "type": "integer"
+          },
           "state": {
             "enum": [
               "starting",
               "ok",
               "degraded",
+              "anchor_mismatch",
               "not_configured",
               "probe_failed",
               "error"

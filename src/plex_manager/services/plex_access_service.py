@@ -35,6 +35,7 @@ reads verdicts, never section keys.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
 __all__ = [
     "SHARE_SWEEP_TICK_SECONDS",
     "SHARE_SWEEP_USER_BUDGET",
+    "AnchorCheck",
     "EntitlementSnapshot",
     "ShareSweepResult",
     "ShareSweepStatus",
@@ -206,6 +208,35 @@ async def check_share(
 # --------------------------------------------------------------------------- #
 # Periodic revalidation sweep (issue #391 PR-2)
 # --------------------------------------------------------------------------- #
+class AnchorCheck(Enum):
+    """Whether the server the verdicts were computed against is still THE server.
+
+    Every verdict in a tick is judged against one ``machineIdentifier`` -- and on
+    an install that has the identifier cached at setup, that anchor is read from
+    the settings row without ever asking the server whether it still holds. If
+    the Plex server is rebuilt or re-claimed it comes back with a NEW identifier,
+    at which point plex.tv truthfully reports that nobody's account reaches the
+    OLD one and every single user's verdict is :attr:`ShareVerdict.SHARE_REVOKED`
+    -- a total, self-inflicted sign-out of an install whose only web-operable
+    repair (an admin repointing via ``PUT /settings``) needs a live admin
+    session. So a confirmed revoke is acted on only behind a LIVE re-read of the
+    anchor.
+    """
+
+    CONFIRMED = "confirmed"
+    """A live ``/identity`` probe returned the same identifier the verdicts used."""
+
+    MISMATCHED = "mismatched"
+    """The configured server answered with a DIFFERENT identifier: the anchor is
+    stale (rebuilt/re-claimed/repointed server), so this tick's share-loss
+    verdicts describe the old server and mean nothing about today's."""
+
+    UNCONFIRMED = "unconfirmed"
+    """The anchor could not be re-read at all (probe failed, or no
+    url/token to probe with). Not evidence of a mismatch -- and equally not the
+    confirmation a mass sign-out requires, so it blocks the same way."""
+
+
 @dataclass(frozen=True)
 class ShareVerdictOutcome:
     """What :func:`apply_share_verdict` actually did for one user.
@@ -214,23 +245,24 @@ class ShareVerdictOutcome:
     token changed between due-selection and this write, so the verdict describes
     a credential the user no longer holds and NOTHING was written. Never a
     failure -- the next tick re-checks the new token.
+
+    ``admin_exempt`` records that a share-loss verdict was stamped for an
+    owner/admin but NOT acted on (see :func:`apply_share_verdict`).
     """
 
     applied: bool
     signed_out: bool
     sessions_revoked: int
+    admin_exempt: bool = False
 
 
 @dataclass(frozen=True)
 class ShareSweepResult:
     """One tick's tally, the input to :meth:`ShareSweepStatus.mark_completed`.
 
-    ``signed_out_user_ids`` is returned rather than acted on here on purpose:
-    closing a signed-out user's open SSE stream needs the FastAPI app object
-    (``web.events.close_realtime_streams``), and this module must never import
-    the web layer. The caller owns that half of the revocation -- see
-    ``web/app.py:_share_sweep_once``, and issue #183 for why skipping it leaves
-    a revoked user's realtime stream alive and still delivering.
+    ``signed_out_user_ids`` is reported for telemetry, but closing those users'
+    realtime streams is NOT deferred to the end of the tick: see the
+    ``on_signed_out`` parameter of :func:`sweep_shares`.
     """
 
     checked: int = 0
@@ -240,6 +272,8 @@ class ShareSweepResult:
     unknown: int = 0
     unverifiable: int = 0
     skipped: int = 0
+    admins_exempted: int = 0
+    anchor_deferred: int = 0
     sessions_revoked: int = 0
     due_remaining: int = 0
     signed_out_user_ids: tuple[int, ...] = ()
@@ -263,9 +297,15 @@ class ShareSweepStatus:
     lost access".
     """
 
-    state: Literal["starting", "ok", "degraded", "not_configured", "probe_failed", "error"] = field(
-        default="starting"
-    )
+    state: Literal[
+        "starting",
+        "ok",
+        "degraded",
+        "anchor_mismatch",
+        "not_configured",
+        "probe_failed",
+        "error",
+    ] = field(default="starting")
     last_run_at: datetime | None = field(default=None)
     last_ok_at: datetime | None = field(default=None)
     last_error_type: str | None = field(default=None)
@@ -276,16 +316,32 @@ class ShareSweepStatus:
     token_stale: int = field(default=0)
     unknown: int = field(default=0)
     unverifiable: int = field(default=0)
+    skipped: int = field(default=0)
+    """Candidates the tick wrote nothing for: their stored token changed since
+    selection (a mid-sweep re-sign-in), or the row was deleted. Surfaced rather
+    than folded into ``checked`` so a tick whose budget went mostly to skips is
+    visible instead of looking like a smaller tick."""
+    admins_exempted: int = field(default=0)
+    """Owner/admin users whose share-loss verdict was recorded but deliberately
+    NOT acted on. Never zero-and-silent: if the sweep is declining to sign an
+    admin out, the operator must be able to see that it happened and go look at
+    the audit row."""
+    anchor_deferred: int = field(default=0)
+    """Share-loss verdicts this tick refused to act on because the server anchor
+    could not be confirmed live (see :class:`AnchorCheck`). These users were left
+    due, so nothing is lost -- but a persistently non-zero value means the sweep
+    is not actually protecting anything and needs the operator's attention."""
     sessions_revoked: int = field(default=0)
     due_remaining: int = field(default=0)
-    """Users still due a revalidation after this tick spent its budget. A
-    persistently non-zero value is the operator's signal that the backlog drains
-    slower than it accumulates (i.e. the effective interval is longer than the
-    configured one), which would otherwise be invisible."""
+    """Users still due a revalidation once this tick finished. A persistently
+    non-zero value is the operator's signal that the backlog drains slower than
+    it accumulates (i.e. the effective interval is longer than the configured
+    one), which would otherwise be invisible."""
 
     def _reset_counters(self) -> None:
         self.checked = self.authorized = self.share_revoked = self.token_stale = 0
         self.unknown = self.unverifiable = self.sessions_revoked = self.due_remaining = 0
+        self.skipped = self.admins_exempted = self.anchor_deferred = 0
 
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
@@ -310,11 +366,21 @@ class ShareSweepStatus:
         self._reset_counters()
 
     def mark_completed(self, result: ShareSweepResult) -> None:
+        # ``anchor_mismatch`` outranks plain ``degraded``: it is the one state an
+        # operator has to act on (the configured machine identifier no longer
+        # matches the server), and it must not be hidden behind the generic
+        # label a plex.tv hiccup also produces.
+        #
         # UNKNOWN verdicts degrade the tick exactly as watchlist's skipped users
         # do: the sweep ran but could not answer for someone, so it has NOT
         # succeeded and must not advance ``last_ok_at``. Confirmed revocations
         # and stale tokens do NOT degrade it -- those are the sweep working.
-        self.state = "degraded" if result.unknown or result.last_error_type else "ok"
+        if result.anchor_deferred:
+            self.state = "anchor_mismatch"
+        elif result.unknown or result.last_error_type:
+            self.state = "degraded"
+        else:
+            self.state = "ok"
         if self.state == "ok":
             self.last_ok_at = datetime.now(UTC)
         self.checked = result.checked
@@ -323,6 +389,9 @@ class ShareSweepStatus:
         self.token_stale = result.token_stale
         self.unknown = result.unknown
         self.unverifiable = result.unverifiable
+        self.skipped = result.skipped
+        self.admins_exempted = result.admins_exempted
+        self.anchor_deferred = result.anchor_deferred
         self.sessions_revoked = result.sessions_revoked
         self.due_remaining = result.due_remaining
         self.last_error_type = result.last_error_type
@@ -344,24 +413,21 @@ def _due_predicate(now: datetime, revalidate_after: timedelta) -> ColumnElement[
 def _holds_live_session(now: datetime) -> ColumnElement[bool]:
     """EXISTS a still-usable browser session for this user.
 
-    The predicate is the EXACT one the admin sessions list uses
-    (``web.routers.auth.list_active_sessions_endpoint``): not revoked, not past
-    the absolute ``expires_at`` cap, not idled out past
-    :data:`session_lifecycle.SESSION_IDLE_WINDOW`. Scoping the sweep to it keeps
-    the plex.tv load proportional to who is actually SIGNED IN rather than to
-    every account that ever signed in -- and revoking the sessions of a user who
-    holds none would be a no-op anyway. Recovery sessions (``user_id`` NULL, no
-    Plex identity) can never satisfy the join, so the break-glass credential is
-    structurally out of this sweep's reach.
+    The predicate is literally the one the admin sessions list uses --
+    :func:`session_lifecycle.active_session_conditions`, shared so the two can
+    never drift (the sweep must never revoke someone the operator's session list
+    does not show as signed in). Scoping the sweep to it keeps the plex.tv load
+    proportional to who is actually SIGNED IN rather than to every account that
+    ever signed in -- and revoking the sessions of a user who holds none would be
+    a no-op anyway. Recovery sessions (``user_id`` NULL, no Plex identity) can
+    never satisfy the join, so the break-glass credential is structurally out of
+    this sweep's reach.
     """
-    idle_cutoff = now - session_lifecycle.SESSION_IDLE_WINDOW
     return (
         select(AuthSession.id)
         .where(
             AuthSession.user_id == User.id,
-            AuthSession.revoked_at.is_(None),
-            AuthSession.expires_at > now,
-            func.coalesce(AuthSession.last_seen_at, AuthSession.created_at) > idle_cutoff,
+            *session_lifecycle.active_session_conditions(now),
         )
         .exists()
     )
@@ -439,8 +505,7 @@ async def apply_share_verdict(
       columns are never WRITTEN here.
     * ``SHARE_REVOKED`` -- plex.tv answered authoritatively that the account no
       longer reaches this server. Revoke every session, clear the entitlement
-      snapshot, and write an ``AuditLog`` row saying so, so "why was I signed
-      out?" is answerable from the UI without a terminal.
+      snapshot, and write an ``AuditLog`` row saying so.
     * ``TOKEN_STALE`` -- ALSO signs the user out (ratified), because a dead
       credential means we can no longer verify them at all. Labeled distinctly in
       both ``share_state`` and the audit description: the Plex sign-in expired,
@@ -451,6 +516,22 @@ async def apply_share_verdict(
       survives the outage and the user stays due for a prompt retry.
     * ``UNVERIFIABLE`` -- no stored token to check. Stamp the state only; there is
       nothing to revoke and nothing was disproved.
+
+    **Owner/admin accounts are exempt from the sign-out half.** Both share-loss
+    verdicts are still recorded honestly (``share_state``, an audit row, a WARNING
+    log) for an admin, but their sessions are never cut. The reason is ADR-0005's
+    never-locked-out rule, which the repoint path already honors: an admin is the
+    only principal who can repair a wrong server anchor from the web
+    (``PUT /settings``), and that needs a live admin session -- so a sweep allowed
+    to sign admins out could destroy the very credential needed to undo whatever
+    made it fire. A genuinely removed admin is still revocable by hand from the
+    sessions page; this only refuses to do it AUTOMATICALLY.
+
+    "Why was I signed out?" is answerable today from the Logs page -- each
+    sign-out emits a pinned, user-id-tagged log line naming the verdict. The
+    ``AuditLog`` row is the durable, queryable record of the same event; a read
+    surface for it is follow-up work, so the log line (not the audit table) is
+    the current operator answer path.
 
     ``expected_token`` closes the mid-sweep re-sign-in race: the verdict was
     computed against the token read during due-selection, and a user who signed
@@ -496,6 +577,10 @@ async def apply_share_verdict(
         await session.flush()
         return ShareVerdictOutcome(applied=True, signed_out=False, sessions_revoked=0)
 
+    # Owner/admin: never signed out automatically (see the docstring -- ADR-0005
+    # never-locked-out). Their verdict is still recorded, loudly.
+    admin_exempt = user.permissions > 0
+
     if verdict is ShareVerdict.SHARE_REVOKED:
         _clear_entitlements(user)
         action_type = "user.share_revoked"
@@ -515,7 +600,19 @@ async def apply_share_verdict(
             "out. Access to the server was not removed; signing in with Plex again restores it."
         )
 
-    revoked = await session_lifecycle.revoke_user_sessions(session, user.id, now=now)
+    if admin_exempt:
+        action_type = f"{action_type}_admin_exempt"
+        description = (
+            "Automatic share revalidation recorded "
+            f"'{verdict.value}' for this ADMIN account, but did NOT sign it out: an "
+            "administrator is the only principal who can repair a wrong Plex server "
+            "configuration from the web, so this sweep never cuts the session that repair "
+            "needs. Review it and revoke by hand from the sessions page if the removal is "
+            "genuine."
+        )
+        revoked = 0
+    else:
+        revoked = await session_lifecycle.revoke_user_sessions(session, user.id, now=now)
     await audit_service.record(
         session,
         actor_user_id=None,
@@ -523,9 +620,26 @@ async def apply_share_verdict(
         entity_type="user",
         entity_id=user.id,
         old_value={"share_state": previous_state},
-        new_value={"share_state": verdict.value, "sessions_revoked": revoked},
+        new_value={
+            "share_state": verdict.value,
+            "sessions_revoked": revoked,
+            "admin_exempt": admin_exempt,
+        },
         description=description,
     )
+    if admin_exempt:
+        # WARNING, not INFO: an admin losing their share is exactly the state an
+        # operator has to look at, and the sweep declining to act on it must be
+        # impossible to miss in the log stream.
+        _logger.warning(
+            "share revalidation recorded %s for ADMIN user_id=%s but did not sign them out "
+            "(never-locked-out rule); revoke by hand from the sessions page if intended",
+            verdict.value,
+            safe_int(user.id),
+        )
+        return ShareVerdictOutcome(
+            applied=True, signed_out=False, sessions_revoked=0, admin_exempt=True
+        )
     _logger.info(
         "share revalidation signed out user_id=%s (%s); revoked %s session(s)",
         safe_int(user.id),
@@ -543,6 +657,8 @@ async def sweep_shares(
     revalidate_after: timedelta,
     limit: int = SHARE_SWEEP_USER_BUDGET,
     now: datetime | None = None,
+    confirm_anchor: Callable[[], Awaitable[AnchorCheck]] | None = None,
+    on_signed_out: Callable[[int], None] | None = None,
 ) -> ShareSweepResult:
     """Revalidate up to ``limit`` due users, strictly sequentially.
 
@@ -558,15 +674,34 @@ async def sweep_shares(
     the network calls happen BETWEEN transactions -- which is also why
     :func:`apply_share_verdict` re-checks the token it was selected with.
 
+    ``confirm_anchor`` re-reads the configured server's ``machineIdentifier``
+    live. It is awaited AT MOST ONCE per tick, lazily -- only when the tick is
+    about to act on its first :attr:`ShareVerdict.SHARE_REVOKED`, so a sweep that
+    finds everyone still entitled costs no extra probe -- and its answer gates
+    every share-loss verdict in that tick. Anything but
+    :attr:`AnchorCheck.CONFIRMED` means the anchor those verdicts were computed
+    against cannot be trusted (a rebuilt or re-claimed server hands out a new
+    identifier, which makes plex.tv truthfully report EVERY user as revoked), so
+    none of them are acted on and every affected user is left DUE for the next
+    tick. Omitting the callable is treated as :attr:`AnchorCheck.UNCONFIRMED`:
+    fail-safe, never fail-open, because the failure mode being guarded is a total
+    sign-out.
+
+    ``on_signed_out`` is invoked with a user id IMMEDIATELY after the transaction
+    that revoked their sessions commits -- never batched to the end. Closing the
+    realtime stream needs the FastAPI app (``web.events.close_realtime_streams``)
+    which this module must not import, but deferring the whole batch would mean a
+    later user's exception strands an already-committed revocation with a live
+    SSE stream, and a revoked user is no longer due-selected, so nothing would
+    ever come back to close it (issue #183). A raising callback is logged and
+    degrades the tick; it never aborts the sweep.
+
     One user's failure never ends the sweep: an unexpected exception is counted,
     surfaced through ``last_error_type`` (degrading the tick), and the remaining
     users are still checked.
     """
     moment = now if now is not None else datetime.now(UTC)
     async with sessionmaker() as session:
-        due_total = await count_due_share_checks(
-            session, now=moment, revalidate_after=revalidate_after
-        )
         candidates = [
             (user.id, user.encrypted_plex_token)
             for user in await list_due_share_checks(
@@ -577,9 +712,41 @@ async def sweep_shares(
     tallies: dict[ShareVerdict, int] = dict.fromkeys(ShareVerdict, 0)
     checked = 0
     skipped = 0
+    admins_exempted = 0
+    anchor_deferred = 0
     sessions_revoked = 0
     signed_out: list[int] = []
     last_error: str | None = None
+    anchor: AnchorCheck | None = None
+
+    async def _anchor_confirmed() -> bool:
+        """Resolve (once per tick) whether the server anchor still holds."""
+        nonlocal anchor, last_error
+        if anchor is None:
+            if confirm_anchor is None:
+                anchor = AnchorCheck.UNCONFIRMED
+            else:
+                try:
+                    anchor = await confirm_anchor()
+                except Exception as exc:
+                    _logger.exception("share revalidation anchor confirmation raised; deferring")
+                    last_error = type(exc).__name__
+                    anchor = AnchorCheck.UNCONFIRMED
+            if anchor is not AnchorCheck.CONFIRMED:
+                # One line per tick, not per user -- and WARNING, because the
+                # sweep is now knowingly not enforcing anything.
+                _logger.warning(
+                    "share revalidation will not act on share-loss verdicts this tick: the "
+                    "configured Plex server's machine identifier could not be confirmed (%s). "
+                    "Affected users keep their access and stay due for the next tick.",
+                    anchor.value,
+                )
+                last_error = (
+                    "PlexAnchorMismatch"
+                    if anchor is AnchorCheck.MISMATCHED
+                    else last_error or "PlexAnchorUnconfirmed"
+                )
+        return anchor is AnchorCheck.CONFIRMED
 
     for user_id, token in candidates:
         try:
@@ -591,6 +758,12 @@ async def sweep_shares(
                 safe_int(user_id),
                 type(exc).__name__,
             )
+            continue
+        if snapshot.verdict is ShareVerdict.SHARE_REVOKED and not await _anchor_confirmed():
+            # Act on NOTHING: no stamp, no revoke, no audit row. Leaving
+            # share_checked_at untouched keeps this user due, so a genuine
+            # revocation is still caught as soon as the anchor is trustworthy.
+            anchor_deferred += 1
             continue
         async with sessionmaker() as session:
             user = await session.get(User, user_id)
@@ -613,8 +786,32 @@ async def sweep_shares(
         checked += 1
         tallies[snapshot.verdict] += 1
         sessions_revoked += outcome.sessions_revoked
+        if outcome.admin_exempt:
+            admins_exempted += 1
         if outcome.signed_out:
             signed_out.append(user_id)
+            # Immediately, on the committed side of the revocation (issue #183).
+            if on_signed_out is not None:
+                try:
+                    on_signed_out(user_id)
+                except Exception as exc:
+                    last_error = type(exc).__name__
+                    _logger.exception(
+                        "share revalidation revoked user_id=%s but closing their realtime "
+                        "stream failed; the session is revoked and their next request will "
+                        "401, but an open stream may survive until it reconnects",
+                        safe_int(user_id),
+                    )
+
+    async with sessionmaker() as session:
+        # Recomputed, never inferred from the budget: a user leaves the backlog
+        # only if this tick actually stamped ``share_checked_at``. Subtracting the
+        # candidate count instead would report a comfortable 0 during a plex.tv
+        # outage, when in truth every one of those UNKNOWN users is still owed a
+        # check -- exactly the moment the number needs to be honest.
+        due_remaining = await count_due_share_checks(
+            session, now=moment, revalidate_after=revalidate_after
+        )
 
     return ShareSweepResult(
         checked=checked,
@@ -624,8 +821,10 @@ async def sweep_shares(
         unknown=tallies[ShareVerdict.UNKNOWN],
         unverifiable=tallies[ShareVerdict.UNVERIFIABLE],
         skipped=skipped,
+        admins_exempted=admins_exempted,
+        anchor_deferred=anchor_deferred,
         sessions_revoked=sessions_revoked,
-        due_remaining=max(due_total - len(candidates), 0),
+        due_remaining=due_remaining,
         signed_out_user_ids=tuple(signed_out),
         last_error_type=last_error,
     )

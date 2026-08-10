@@ -91,6 +91,9 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       token_stale: 0,
       unknown: 0,
       unverifiable: 0,
+      skipped: 0,
+      admins_exempted: 0,
+      anchor_deferred: 0,
       sessions_revoked: 0,
       due_remaining: 0,
     },
@@ -982,6 +985,9 @@ describe('Status', () => {
           token_stale: 0,
           unknown: 0,
           unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
           sessions_revoked: 0,
           due_remaining: 0,
         },
@@ -1140,6 +1146,9 @@ describe('Status', () => {
           token_stale: 0,
           unknown: 2,
           unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
           sessions_revoked: 0,
           due_remaining: 4,
         },
@@ -1194,6 +1203,9 @@ describe('Status', () => {
           token_stale: 1,
           unknown: 0,
           unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 0,
           sessions_revoked: 5,
           due_remaining: 0,
         },
@@ -1217,6 +1229,101 @@ describe('Status', () => {
     const signedOut = sweep.getByText('Signed out').nextElementSibling
     expect(signedOut).toHaveTextContent('3')
     expect(signedOut).toHaveClass('font-semibold', 'text-searching')
+    // Exception-only rows stay out of the way on an ordinary tick.
+    expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Admins held')).not.toBeInTheDocument()
+  })
+
+  it('reads a stale server anchor as loudly as a crash, not as a hiccup', () => {
+    // The rebuilt-Plex-server case (issue #391): every user looks revoked
+    // because the stored machine identifier is stale, so the sweep enforced
+    // NOTHING. Showing this as a routine "degraded" would let an operator
+    // ignore the one state that means the guard is switched off.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_mismatch',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: 'PlexAnchorMismatch',
+          last_error_at: '2026-01-02T00:00:01Z',
+          checked: 0,
+          authorized: 0,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          anchor_deferred: 6,
+          sessions_revoked: 0,
+          due_remaining: 6,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor mismatch')).toBeInTheDocument()
+    const held = sweep.getByText('Held (server changed)').nextElementSibling
+    expect(held).toHaveTextContent('6')
+    expect(held).toHaveClass('font-semibold', 'text-error')
+    // Nobody was signed out, and the reason is named.
+    expect(sweep.getByText('Signed out').nextElementSibling).toHaveTextContent('0')
+    expect(sweep.getByText(/PlexAnchorMismatch/)).toBeInTheDocument()
+  })
+
+  it('surfaces an admin the sweep declined to sign out', () => {
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 2,
+          authorized: 0,
+          share_revoked: 2,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 1,
+          anchor_deferred: 0,
+          sessions_revoked: 1,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    // The admin is never signed out automatically, so the operator has to be
+    // told it happened rather than left wondering why nothing did.
+    const held = sweep.getByText('Admins held').nextElementSibling
+    expect(held).toHaveTextContent('1')
+    expect(held).toHaveClass('font-semibold', 'text-searching')
   })
 
   it('surfaces how many scopes are in a grab-pipeline cooldown', () => {

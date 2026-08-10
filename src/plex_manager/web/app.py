@@ -1102,6 +1102,57 @@ def _get_share_sweep_status(app: FastAPI) -> plex_access_service.ShareSweepStatu
     return status
 
 
+async def _confirm_share_anchor(
+    app: FastAPI, plex_tv: PlexTvClient, machine_identifier: str
+) -> plex_access_service.AnchorCheck:
+    """Re-read the configured server's identity and compare it to the anchor.
+
+    The lockout this exists to prevent: ``_resolve_watchlist_server_identity``
+    prefers the ``plex_machine_identifier`` cached at setup and returns it WITHOUT
+    contacting the server. If that server is rebuilt or re-claimed it comes back
+    with a new identifier, and plex.tv then truthfully answers that no account
+    reaches the OLD one -- so every user's verdict is ``SHARE_REVOKED`` and an
+    unguarded sweep would sign out the entire install, including the admin whose
+    live session is the only web-operable way to repoint it (``PUT /settings``).
+    That is precisely the never-locked-out state ADR-0005 forbids and the repoint
+    path already refuses to create.
+
+    So a live ``/identity`` probe of the configured ``plex_url`` must return the
+    same identifier before any share-loss verdict is acted on. Not reachable, not
+    configured, or a different identifier all resolve to "do not act": the sweep
+    would rather leave a genuinely-revoked share live for another interval than
+    sign out an install because its own anchor went stale.
+    """
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        plex_url = await store.get("plex_url")
+        plex_token = await store.get("plex_token")
+    if not plex_url or not plex_token:
+        # A cached anchor with no credentials to re-read it: nothing to confirm
+        # against. Honest UNCONFIRMED, never an assumed pass.
+        return plex_access_service.AnchorCheck.UNCONFIRMED
+    try:
+        live_identifier = await plex_tv.fetch_server_identity(plex_url, plex_token)
+    except PlexVerifyError as exc:
+        _logger.warning(
+            "share revalidation could not re-confirm the configured Plex server's identity "
+            "(%s); share-loss verdicts are deferred this tick",
+            safe_text(exc.code),
+        )
+        return plex_access_service.AnchorCheck.UNCONFIRMED
+    if live_identifier != machine_identifier:
+        # Deliberately NOT logging either identifier: the message has to be
+        # actionable without publishing server identity into the log store.
+        _logger.warning(
+            "share revalidation found the configured Plex server reporting a DIFFERENT "
+            "machine identifier than the stored one -- the server was likely rebuilt, "
+            "re-claimed, or repointed. No user will be signed out until an admin updates "
+            "the Plex server settings."
+        )
+        return plex_access_service.AnchorCheck.MISMATCHED
+    return plex_access_service.AnchorCheck.CONFIRMED
+
+
 async def _share_sweep_once(app: FastAPI) -> int:
     """Re-derive the Plex-share verdict for the users whose turn has come.
 
@@ -1115,11 +1166,15 @@ async def _share_sweep_once(app: FastAPI) -> int:
     The tick is thin by design: candidate selection, the verdict ladder, the
     revocation and the audit row all live in ``plex_access_service`` (no web
     imports). What is left here is what only the web layer can do -- resolve the
-    configured server, read the operator's interval, and CLOSE the realtime
-    streams of everyone the sweep signed out. That last step is the #183 lesson:
-    stamping ``revoked_at`` alone leaves a revoked user's open SSE connection
-    happily delivering events, so the manual admin revoke path
-    (``auth.revoke_sessions_endpoint``) pairs the two and so must this.
+    configured server, read the operator's interval, re-confirm the server anchor
+    live (:func:`_confirm_share_anchor`), and CLOSE the realtime streams of each
+    user the sweep signs out. That last step is the #183 lesson: stamping
+    ``revoked_at`` alone leaves a revoked user's open SSE connection happily
+    delivering events, so the manual admin revoke path
+    (``auth.revoke_sessions_endpoint``) pairs the two and so must this. It is
+    handed to the service as a per-user callback rather than run over a batch at
+    the end, so a later failure can never strand an already-committed revocation
+    with a live stream nothing will ever come back to close.
     """
     maker = app.state.sessionmaker
     client = app.state.http_client
@@ -1150,14 +1205,8 @@ async def _share_sweep_once(app: FastAPI) -> int:
         # revocation.
         status.mark_skipped("not_configured")
         return 0
-    result = await plex_access_service.sweep_shares(
-        maker,
-        plex_tv,
-        machine_identifier,
-        revalidate_after=timedelta(hours=interval_hours),
-        limit=plex_access_service.SHARE_SWEEP_USER_BUDGET,
-    )
-    for user_id in result.signed_out_user_ids:
+
+    def _close_signed_out_stream(user_id: int) -> None:
         # Mirrors the manual revoke path exactly (auth.revoke_sessions_endpoint):
         # per-user, plex_session-scoped, so a recovery cookie or another user's
         # stream is never collateral.
@@ -1167,6 +1216,19 @@ async def _share_sweep_once(app: FastAPI) -> int:
             auth_method=AuthMethod.plex_session.value,
             user_id=user_id,
         )
+
+    async def _confirm() -> plex_access_service.AnchorCheck:
+        return await _confirm_share_anchor(app, plex_tv, machine_identifier)
+
+    result = await plex_access_service.sweep_shares(
+        maker,
+        plex_tv,
+        machine_identifier,
+        revalidate_after=timedelta(hours=interval_hours),
+        limit=plex_access_service.SHARE_SWEEP_USER_BUDGET,
+        confirm_anchor=_confirm,
+        on_signed_out=_close_signed_out_stream,
+    )
     status.mark_completed(result)
     if result.share_revoked or result.token_stale:
         _logger.info(

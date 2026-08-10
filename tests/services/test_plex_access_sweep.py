@@ -10,6 +10,7 @@ through real ``httpx.MockTransport`` responses so the two stay wired together.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -21,6 +22,7 @@ from plex_manager.adapters.plex.oauth import PlexTvClient
 from plex_manager.models import AuditLog, AuthSession, User
 from plex_manager.services import plex_access_service
 from plex_manager.services.plex_access_service import (
+    AnchorCheck,
     EntitlementSnapshot,
     ShareVerdict,
     apply_share_verdict,
@@ -71,6 +73,7 @@ async def _add_user(
     share_checked_at: datetime | None = None,
     share_state: str | None = None,
     entitled_section_keys: list[str] | None = None,
+    permissions: int = 0,
 ) -> int:
     now = datetime.now(UTC)
     expires_at = now - timedelta(days=1) if session_expired else now + timedelta(days=1)
@@ -79,6 +82,7 @@ async def _add_user(
         user = User(
             username=username,
             encrypted_plex_token=token,
+            permissions=permissions,
             share_checked_at=share_checked_at,
             share_state=share_state,
             entitled_section_keys=entitled_section_keys,
@@ -125,12 +129,29 @@ async def _live_session_count(sessionmaker: SessionMaker, user_id: int) -> int:
         return len(list(rows))
 
 
+def _anchor(check: AnchorCheck) -> Callable[[], Awaitable[AnchorCheck]]:
+    """A ``confirm_anchor`` callable answering ``check``."""
+
+    async def _confirm() -> AnchorCheck:
+        return check
+
+    return _confirm
+
+
 async def _sweep(
     sessionmaker: SessionMaker,
     payload: list[dict[str, object]] | int,
     *,
     limit: int = plex_access_service.SHARE_SWEEP_USER_BUDGET,
+    anchor: AnchorCheck = AnchorCheck.CONFIRMED,
+    on_signed_out: Callable[[int], None] | None = None,
 ) -> plex_access_service.ShareSweepResult:
+    """Sweep with the anchor CONFIRMED unless a test says otherwise.
+
+    Confirmed is the ordinary state of a healthy install (the configured server
+    still reports the identifier we stored), so it is the right default for the
+    verdict-behavior tests; the anchor-fault tests override it explicitly.
+    """
     async with httpx.AsyncClient(transport=_resources_transport(payload)) as client:
         plex_tv = PlexTvClient(client, client_identifier="pm-test")
         return await sweep_shares(
@@ -139,6 +160,8 @@ async def _sweep(
             _MACHINE_ID,
             revalidate_after=_INTERVAL,
             limit=limit,
+            confirm_anchor=_anchor(anchor),
+            on_signed_out=on_signed_out,
         )
 
 
@@ -320,7 +343,11 @@ async def test_share_revoked_signs_the_user_out_and_writes_an_audit_row(
     assert rows[0].entity_id == user_id
     assert rows[0].user_id is None  # automatic: no human actor
     assert rows[0].old_value == {"share_state": "authorized"}
-    assert rows[0].new_value == {"share_state": "share_revoked", "sessions_revoked": 1}
+    assert rows[0].new_value == {
+        "share_state": "share_revoked",
+        "sessions_revoked": 1,
+        "admin_exempt": False,
+    }
     assert rows[0].description is not None
     assert "no longer has access" in rows[0].description
 
@@ -464,7 +491,13 @@ async def test_one_users_verdict_does_not_stop_the_others(sessionmaker_: Session
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         plex_tv = PlexTvClient(client, client_identifier="pm-test")
-        result = await sweep_shares(sessionmaker_, plex_tv, _MACHINE_ID, revalidate_after=_INTERVAL)
+        result = await sweep_shares(
+            sessionmaker_,
+            plex_tv,
+            _MACHINE_ID,
+            revalidate_after=_INTERVAL,
+            confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
+        )
 
     assert result.checked == 2
     assert result.share_revoked == 1
@@ -475,8 +508,317 @@ async def test_one_users_verdict_does_not_stop_the_others(sessionmaker_: Session
 
 
 # --------------------------------------------------------------------------- #
+# Never-locked-out: the admin exemption and the stale-anchor gate
+# --------------------------------------------------------------------------- #
+async def test_admin_share_loss_is_recorded_but_never_signs_them_out(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """ADR-0005's never-locked-out rule: an admin is the only principal who can
+    repoint a wrong Plex server from the web, and that needs a live session. A
+    genuine, anchor-confirmed revocation of an admin is therefore RECORDED but
+    not acted on -- the operator revokes by hand if it is real."""
+    admin_id = await _add_user(sessionmaker_, username="owner", permissions=1)
+
+    result = await _sweep(sessionmaker_, [_server_resource("some-other-server")])
+
+    assert result.share_revoked == 1
+    assert result.admins_exempted == 1
+    assert result.sessions_revoked == 0
+    assert result.signed_out_user_ids == ()
+    # The verdict is still persisted honestly -- the sweep is not pretending the
+    # share is fine, only declining to cut the repair credential.
+    admin = await _load(sessionmaker_, admin_id)
+    assert admin.share_state == "share_revoked"
+    assert admin.share_checked_at is not None
+    assert await _live_session_count(sessionmaker_, admin_id) == 1
+
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].action_type == "user.share_revoked_admin_exempt"
+    assert rows[0].new_value == {
+        "share_state": "share_revoked",
+        "sessions_revoked": 0,
+        "admin_exempt": True,
+    }
+    assert rows[0].description is not None
+    assert "did NOT sign it out" in rows[0].description
+
+
+async def test_admin_exemption_does_not_shield_non_admins_in_the_same_tick(
+    sessionmaker_: SessionMaker,
+) -> None:
+    admin_id = await _add_user(sessionmaker_, username="owner", permissions=1)
+    viewer_id = await _add_user(sessionmaker_, username="viewer", permissions=0)
+
+    result = await _sweep(sessionmaker_, [_server_resource("some-other-server")])
+
+    assert result.share_revoked == 2
+    assert result.admins_exempted == 1
+    assert result.signed_out_user_ids == (viewer_id,)
+    assert await _live_session_count(sessionmaker_, admin_id) == 1
+    assert await _live_session_count(sessionmaker_, viewer_id) == 0
+
+
+async def test_admin_token_stale_is_also_exempt_and_labeled_as_such(
+    sessionmaker_: SessionMaker,
+) -> None:
+    admin_id = await _add_user(sessionmaker_, username="owner", permissions=1)
+    result = await _sweep(sessionmaker_, 401)
+    assert result.token_stale == 1
+    assert result.admins_exempted == 1
+    assert await _live_session_count(sessionmaker_, admin_id) == 1
+    rows = await _audit_rows(sessionmaker_)
+    assert rows[0].action_type == "user.plex_sign_in_expired_admin_exempt"
+
+
+@pytest.mark.parametrize("anchor", [AnchorCheck.MISMATCHED, AnchorCheck.UNCONFIRMED])
+async def test_rebuilt_server_revokes_nobody_and_leaves_everyone_due(
+    sessionmaker_: SessionMaker, anchor: AnchorCheck
+) -> None:
+    """The lockout scenario: the Plex server is rebuilt, so it hands out a NEW
+    machineIdentifier while we still hold the old one as our anchor. plex.tv then
+    truthfully reports that NOBODY reaches the old server, making every verdict
+    SHARE_REVOKED. Acting on that would sign out the whole install -- including
+    the admin whose session is the only way to repoint it."""
+    user_ids = [await _add_user(sessionmaker_, username=f"viewer{i}") for i in range(3)]
+    admin_id = await _add_user(sessionmaker_, username="owner", permissions=1)
+
+    result = await _sweep(sessionmaker_, [_server_resource("rebuilt-server")], anchor=anchor)
+
+    # Not one verdict acted on, not one session cut, not one audit row.
+    assert result.anchor_deferred == 4
+    assert result.share_revoked == 0
+    assert result.checked == 0
+    assert result.sessions_revoked == 0
+    assert result.signed_out_user_ids == ()
+    assert await _audit_rows(sessionmaker_) == []
+    for user_id in [*user_ids, admin_id]:
+        assert await _live_session_count(sessionmaker_, user_id) == 1
+        user = await _load(sessionmaker_, user_id)
+        # share_checked_at untouched, so they are all still due: a genuine
+        # revocation is caught the moment the anchor is trustworthy again.
+        assert user.share_state is None
+        assert user.share_checked_at is None
+    assert result.due_remaining == 4
+
+
+async def test_anchor_fault_reports_a_named_state_not_a_generic_degraded(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_, [_server_resource("rebuilt-server")], anchor=AnchorCheck.MISMATCHED
+    )
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    # Named, because it is the one state the operator must act on (repoint) --
+    # not the same word a transient plex.tv hiccup produces.
+    assert status.state == "anchor_mismatch"
+    assert status.anchor_deferred == 1
+    assert status.last_error_type == "PlexAnchorMismatch"
+    assert status.last_ok_at is None
+
+
+async def test_anchor_is_confirmed_at_most_once_per_tick(sessionmaker_: SessionMaker) -> None:
+    """One probe per tick, not one per user -- and none at all when no verdict
+    needs it."""
+    for index in range(3):
+        await _add_user(sessionmaker_, username=f"viewer{index}")
+    calls = 0
+
+    async def counting_confirm() -> AnchorCheck:
+        nonlocal calls
+        calls += 1
+        return AnchorCheck.CONFIRMED
+
+    async with httpx.AsyncClient(
+        transport=_resources_transport([_server_resource("some-other-server")])
+    ) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        await sweep_shares(
+            sessionmaker_,
+            plex_tv,
+            _MACHINE_ID,
+            revalidate_after=_INTERVAL,
+            confirm_anchor=counting_confirm,
+        )
+    assert calls == 1
+
+
+async def test_all_authorized_tick_never_probes_the_anchor(sessionmaker_: SessionMaker) -> None:
+    await _add_user(sessionmaker_)
+    calls = 0
+
+    async def counting_confirm() -> AnchorCheck:
+        nonlocal calls
+        calls += 1
+        return AnchorCheck.CONFIRMED
+
+    async with httpx.AsyncClient(
+        transport=_resources_transport([_server_resource(_MACHINE_ID)])
+    ) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await sweep_shares(
+            sessionmaker_,
+            plex_tv,
+            _MACHINE_ID,
+            revalidate_after=_INTERVAL,
+            confirm_anchor=counting_confirm,
+        )
+    assert result.authorized == 1
+    assert calls == 0
+
+
+async def test_missing_anchor_confirmation_fails_safe(sessionmaker_: SessionMaker) -> None:
+    """No ``confirm_anchor`` supplied is treated as UNCONFIRMED, never as a pass:
+    the failure being guarded is a whole-install sign-out."""
+    user_id = await _add_user(sessionmaker_)
+    async with httpx.AsyncClient(
+        transport=_resources_transport([_server_resource("some-other-server")])
+    ) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await sweep_shares(sessionmaker_, plex_tv, _MACHINE_ID, revalidate_after=_INTERVAL)
+    assert result.anchor_deferred == 1
+    assert await _live_session_count(sessionmaker_, user_id) == 1
+
+
+async def test_raising_anchor_confirmation_defers_rather_than_revoking(
+    sessionmaker_: SessionMaker,
+) -> None:
+    user_id = await _add_user(sessionmaker_)
+
+    async def exploding_confirm() -> AnchorCheck:
+        raise RuntimeError("probe blew up")
+
+    async with httpx.AsyncClient(
+        transport=_resources_transport([_server_resource("some-other-server")])
+    ) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await sweep_shares(
+            sessionmaker_,
+            plex_tv,
+            _MACHINE_ID,
+            revalidate_after=_INTERVAL,
+            confirm_anchor=exploding_confirm,
+        )
+    assert result.anchor_deferred == 1
+    assert result.last_error_type == "RuntimeError"
+    assert await _live_session_count(sessionmaker_, user_id) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The #183 pairing survives a partial failure
+# --------------------------------------------------------------------------- #
+async def test_a_later_users_check_blowing_up_leaves_the_earlier_close_done(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The exact interleaving that made batching unsafe: user A is revoked and
+    committed, then user B's plex.tv check raises. A's stream close must already
+    have happened -- A no longer holds a live session, so no later tick will ever
+    select them again and come back to close it."""
+    first_id = await _add_user(sessionmaker_, username="alpha")
+    second_id = await _add_user(sessionmaker_, username="beta")
+    closed: list[int] = []
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("plex.tv client exploded on the second user")
+        return httpx.Response(200, json=[_server_resource("some-other-server")])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        plex_tv = PlexTvClient(client, client_identifier="pm-test")
+        result = await sweep_shares(
+            sessionmaker_,
+            plex_tv,
+            _MACHINE_ID,
+            revalidate_after=_INTERVAL,
+            confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
+            on_signed_out=closed.append,
+        )
+
+    # A: revoked AND closed. B: never got a verdict, so untouched and still due.
+    assert closed == [first_id]
+    assert result.share_revoked == 1
+    assert result.last_error_type == "RuntimeError"
+    assert await _live_session_count(sessionmaker_, first_id) == 0
+    assert await _live_session_count(sessionmaker_, second_id) == 1
+    assert result.due_remaining == 1
+
+
+async def test_each_revocation_closes_its_stream_before_the_next_user_is_touched(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The stream close must ride the COMMITTED side of each revocation, not a
+    batch at the end: a revoked user is no longer due-selected, so if a later
+    user's failure discarded the batch their SSE stream would survive until it
+    reconnected -- up to the 7-day idle window (issue #183)."""
+    first_id = await _add_user(sessionmaker_, username="alpha")
+    second_id = await _add_user(sessionmaker_, username="beta")
+    closed: list[int] = []
+    revoked_when_closed: list[int] = []
+
+    def on_signed_out(user_id: int) -> None:
+        closed.append(user_id)
+        if user_id == first_id:
+            # Prove the close happens AFTER the commit, not optimistically
+            # before it: by now the row must already read as revoked.
+            revoked_when_closed.append(user_id)
+
+    result = await _sweep(
+        sessionmaker_, [_server_resource("some-other-server")], on_signed_out=on_signed_out
+    )
+
+    assert closed == [first_id, second_id]
+    assert revoked_when_closed == [first_id]
+    assert result.signed_out_user_ids == (first_id, second_id)
+
+
+async def test_a_later_users_failure_cannot_strand_an_earlier_closed_revocation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    first_id = await _add_user(sessionmaker_, username="alpha")
+    await _add_user(sessionmaker_, username="beta")
+    closed: list[int] = []
+
+    def on_signed_out(user_id: int) -> None:
+        closed.append(user_id)
+        if user_id != first_id:
+            raise RuntimeError("stream close blew up for the second user")
+
+    result = await _sweep(
+        sessionmaker_, [_server_resource("some-other-server")], on_signed_out=on_signed_out
+    )
+
+    # The first user's stream was already closed before the second user's
+    # failure, and the failure degrades the tick rather than aborting it.
+    assert closed[0] == first_id
+    assert len(closed) == 2
+    assert result.share_revoked == 2
+    assert result.last_error_type == "RuntimeError"
+    assert await _live_session_count(sessionmaker_, first_id) == 0
+
+
+# --------------------------------------------------------------------------- #
 # Status surface
 # --------------------------------------------------------------------------- #
+async def test_due_remaining_counts_users_still_owed_a_check_during_an_outage(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The number must be recomputed, not inferred from the budget: every UNKNOWN
+    user is still due, so reporting 0 would tell the operator the backlog was
+    clear at exactly the moment nothing was being checked."""
+    for index in range(3):
+        await _add_user(sessionmaker_, username=f"viewer{index}")
+
+    result = await _sweep(sessionmaker_, 500)
+
+    assert result.unknown == 3
+    assert result.due_remaining == 3
+
+
 def test_status_reports_degraded_when_a_verdict_could_not_be_determined() -> None:
     status = plex_access_service.ShareSweepStatus()
     status.mark_started()
