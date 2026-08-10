@@ -368,7 +368,11 @@ anything. Two rules close it:
   reported alongside the `category` field this ADR already adds to
   `DownloadStatus`), and destructive removal re-proves it matches before acting.
   A re-added torrent carries a new `added_on`, so it fails the comparison even
-  when the hash and the flag both look right.
+  when the hash and the flag both look right. **This applies to every
+  destructive removal, without exception** — report-issue, eviction cleanup, and
+  the `cancel_requested` recovery path alike. The cancel path is not a special
+  case that may remove on `client_created` alone: it removes with data, so it
+  re-proves instance identity first.
 
 The first rule alone is insufficient — a delete-and-re-add that completes
 between two polls is never observed as absent — which is why the instance
@@ -789,7 +793,12 @@ The reconcile loop gains two readers around the existing one:
 3. **Client-only observation sweep** (its own slow cadence, *not* the ~15 s
    reconcile). Two exact-match `get_all_statuses(category=...)` calls — one for
    `plex-manager`, one for `plex-manager-intent` — diffed against tracked hashes
-   ∪ intent hashes. The remainder is recorded as bounded observations in
+   ∪ intent hashes. **"Tracked" here means every `downloads` row's hash, not
+   just the active ones**: an imported torrent is terminal in our state machine
+   but frequently still present in the client and seeding, and deriving the
+   subtraction set from `list_active()` would misclassify every one of them as
+   client-only and offer the operator a remove button for a healthy seeding
+   import. The remainder is recorded as bounded observations in
    `client_only_torrents`. Its cadence is deliberately decoupled from the
    reconcile poll so C6 holds, and it is **not** a category-free inventory: an
    operator's unrelated torrents are none of the app's business.
@@ -1241,6 +1250,73 @@ revision or its PRs), because they do not change the option choice:
    adapter does (degrade to operator-gated removal, or synthesize a marker at
    add time) is left open, and is the kind of thing ADR-0006's port contract
    should state explicitly when a second adapter actually arrives.
+
+### Open questions raised in review
+
+This ADR went through seven substantive review rounds, and each new mechanism
+kept surfacing further edge cases. That is not a sign the design is wrong; it is
+a measurement of how large the surface is — which is itself an argument for the
+release-separated staging, since each increment gets its own implementation
+review against real code rather than against a document. The following
+constraints were raised late and are recorded here as obligations on the
+implementing changes rather than resolved with more speculative machinery. Each
+states what must be true; where the direction is obvious it is named in one
+sentence.
+
+11. **I1's stale-claim reaper cannot distinguish crash-after-add from
+    crash-before-submission.** In I1 the intent has no hash, so nothing lets the
+    reaper ask the client whether a torrent exists. **Constraint:** reaping must
+    never free coverage without positive evidence that no add occurred —
+    silently freeing a claim whose torrent is live is precisely the #477 gap.
+    *Direction:* the `submitting_since` lease is the only local evidence
+    available; a claim whose lease was never stamped can be reaped safely, while
+    one stamped-then-orphaned should be surfaced rather than silently freed.
+    This may be what forces the hash earlier than I2 — which is a legitimate
+    outcome for I1 to discover.
+12. **Intent creation must revalidate its premise atomically.** A cancellation
+    (or any status write) can commit between the grab's premise read and the
+    intent commit, so an intent can be born already stale, holding claims for a
+    request nobody wants. **Constraint:** the intent commit must be
+    compare-and-swap against the status it observed, not an unconditional
+    insert. *Direction:* mirror the CAS `grab()` already performs on its post-add
+    status move, using the `observed_*_status` columns this ADR already defines.
+13. **I2's attention states have no inspection surface until I3.** I2 can park
+    intents `needs_attention`, but the list, adopt, and discard verbs are I3
+    work. **Constraint:** the staging table must either pull a minimal I2
+    observation surface forward or state plainly that parks are log-only for one
+    increment. This is a real north-star-1 tension — a state the operator cannot
+    see or act on is exactly what north star 1 forbids — and it must be accepted
+    explicitly, not by omission. *Direction:* the same staging precedent used for
+    the destructive gate (ship the honest surface first, enforce later) applies
+    here.
+14. **A `foreign_category` park is unsupersedable, which can loop candidate
+    selection.** Such a park releases its hash's uniqueness reservation but
+    refuses adoption by design, so the next grab of the same release resolves the
+    same hash, re-adds, and parks again indefinitely. **Constraint:** a parked
+    foreign hash must feed release-candidate selection as an exclusion, so the
+    selector moves to another candidate instead of retrying the same one
+    forever. *Direction:* the blocklist is the existing mechanism of this shape;
+    whether this reuses it or needs a distinct, non-punitive exclusion (the
+    release is not bad, it is merely unavailable to us) is the open part.
+15. **Retained claims are keyed to a `media_request_id` that may settle or be
+    replaced.** `download_coverage_claims.media_request_id` is `ON DELETE SET
+    NULL`, and a cancelled or settled request can be replaced by a new active row
+    for the same title, against which the old claim no longer protects anything.
+    **Constraint:** a retained claim's protective scope must survive replacement
+    of the request row it was created under. *Direction:* `find_active_coverage_title`
+    (#470) already solved exactly this for downloads by protecting on the
+    `(tmdb_id, season)` title key rather than the request id; the intent-owned
+    case should follow it rather than invent a second rule.
+16. **A caller-supplied `infoHash` is untrusted metadata.** Part 2's obligation 4
+    permits Prowlarr's `infoHash` to satisfy `prepare_add` so v2/hybrid magnets
+    stay grabbable, but an indexer-supplied hash is not proof of what the client
+    actually holds. **Constraint:** the caller-supplied hash may be used to
+    *submit*, but only the hash qBittorrent itself reports may be used to probe,
+    adopt, activate, or destroy. Identity for every ownership decision comes from
+    the client's own report, never from indexer metadata. *Direction:* this needs
+    reconciling with obligation 4's non-empty-hash requirement — most likely by
+    distinguishing a *provisional* hash used for submission from a *confirmed*
+    hash written back once the client reports it.
 
 ## Alternatives considered
 
