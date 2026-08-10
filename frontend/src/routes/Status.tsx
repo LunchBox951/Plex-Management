@@ -668,14 +668,18 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
         <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
           {sweep.authorized}
         </dd>
+        {/* The backend's own tally, not `share_revoked + token_stale` — those
+            count VERDICTS, and an admin-exempted share loss is a verdict nobody
+            was signed out for. Summing them here would report 2 sign-outs for
+            one revoked viewer plus one exempted admin. */}
         <dt className="min-w-0 text-faint">Signed out</dt>
         <dd
           className={cn(
             'min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]',
-            sweep.share_revoked + sweep.token_stale > 0 ? 'font-semibold text-searching' : '',
+            sweep.signed_out > 0 ? 'font-semibold text-searching' : '',
           )}
         >
-          {sweep.share_revoked + sweep.token_stale}
+          {sweep.signed_out}
         </dd>
         {/* A transient plex.tv failure is the one outcome that must never be
             mistaken for a revocation — it is why the tick reads degraded. */}
@@ -690,13 +694,16 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
         </dd>
         {/* Sign-outs the sweep knowingly withheld because the server anchor did
             not hold. The label distinguishes the two causes — a confirmed
-            identity change vs. simply not being able to ask — because only the
-            first one is a configuration fault. Exception-only rows: rendered
-            when non-zero, not as routine statistics. */}
+            identity change vs. simply not being able to establish one — because
+            only the first is a configuration fault. The unconfirmed wording stays
+            neutral about the cause: it covers a failed probe AND the case where
+            no plex_url/plex_token was configured to probe with, i.e. no network
+            attempt was ever made. Exception-only rows: rendered when non-zero,
+            not as routine statistics. */}
         {sweep.anchor_deferred > 0 ? (
           <>
             <dt className="min-w-0 text-faint">
-              {anchorChanged ? 'Held (server changed)' : 'Held (server unreachable)'}
+              {anchorChanged ? 'Held (server changed)' : 'Held (anchor unconfirmed)'}
             </dt>
             <dd
               className={cn(

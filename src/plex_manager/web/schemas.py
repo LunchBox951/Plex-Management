@@ -1919,6 +1919,10 @@ class ShareSweepStatusItem(BaseModel):
     skipped: int = 0
     admins_exempted: int = 0
     anchor_deferred: int = 0
+    signed_out: int = 0
+    """Users actually signed out. Reported rather than derived from
+    ``share_revoked + token_stale``, which overstates whenever an admin was
+    exempted from the sign-out half."""
     sessions_revoked: int = 0
     due_remaining: int = 0
 

@@ -3229,6 +3229,11 @@ export interface components {
              */
             share_revoked: number;
             /**
+             * Signed Out
+             * @default 0
+             */
+            signed_out: number;
+            /**
              * Skipped
              * @default 0
              */

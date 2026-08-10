@@ -310,6 +310,9 @@ async def test_admin_is_never_signed_out_by_a_genuine_revocation(
     assert status.share_revoked == 2
     assert status.admins_exempted == 1
     assert status.sessions_revoked == 1
+    # Two share-loss VERDICTS but only one person cut: the reported tally is the
+    # measured one, never share_revoked + token_stale (which would say 2).
+    assert status.signed_out == 1
 
     assert admin_stream.closed is False
     assert viewer_stream.closed is True

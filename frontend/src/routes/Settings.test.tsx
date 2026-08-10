@@ -179,6 +179,7 @@ function healthResponse(
       skipped: 0,
       admins_exempted: 0,
       anchor_deferred: 0,
+      signed_out: 0,
       sessions_revoked: 0,
       due_remaining: 0,
     },

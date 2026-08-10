@@ -3670,6 +3670,11 @@
             "title": "Share Revoked",
             "type": "integer"
           },
+          "signed_out": {
+            "default": 0,
+            "title": "Signed Out",
+            "type": "integer"
+          },
           "skipped": {
             "default": 0,
             "title": "Skipped",

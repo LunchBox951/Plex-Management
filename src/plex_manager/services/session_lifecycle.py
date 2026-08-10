@@ -146,6 +146,7 @@ async def revoke_user_sessions(
     user_id: int,
     *,
     now: datetime | None = None,
+    created_at_or_before: datetime | None = None,
 ) -> int:
     """Stamp ``revoked_at`` on every ACTIVE session for ``user_id``; return count.
 
@@ -155,15 +156,25 @@ async def revoke_user_sessions(
     convention) rather than deleting; the sweep reclaims the row later. Only rows
     whose ``revoked_at`` is still NULL are touched, so a re-revoke is a harmless
     no-op that reports 0. The caller owns the commit.
+
+    ``created_at_or_before`` narrows the revocation to sessions that already
+    existed at a given instant, leaving anything minted after it alone. An
+    operator-initiated revoke passes ``None`` (revoke everything, the intuitive
+    meaning of the button), but an AUTOMATED revoke acting on a decision made
+    earlier must pass the instant that decision was validated -- otherwise a
+    sign-in completing in between has its brand-new session cut on the strength
+    of a verdict that predates it. See
+    ``plex_access_service.apply_share_verdict`` for the one caller that needs it.
     """
     stamp = now if now is not None else datetime.now(UTC)
+    stmt = update(AuthSession).where(
+        AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None)
+    )
+    if created_at_or_before is not None:
+        stmt = stmt.where(AuthSession.created_at <= created_at_or_before)
     result = cast(
         CursorResult[Any],
-        await session.execute(
-            update(AuthSession)
-            .where(AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None))
-            .values(revoked_at=stamp)
-        ),
+        await session.execute(stmt.values(revoked_at=stamp)),
     )
     return result.rowcount
 

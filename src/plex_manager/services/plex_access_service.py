@@ -41,7 +41,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 
 from plex_manager.adapters.plex.oauth import (
     CODE_TOKEN_INVALID,
@@ -91,6 +91,13 @@ SHARE_SWEEP_TICK_SECONDS: float = 900.0
 # request path. A backlog beyond this budget is not dropped -- it is reported as
 # ``ShareSweepStatus.due_remaining`` and drains over subsequent ticks.
 SHARE_SWEEP_USER_BUDGET: int = 20
+
+# The "never attempted" floor for the due-queue ordering (see
+# ``_last_attempt_at``). Any real attempt timestamp is later than this, so a user
+# with neither a check nor a failure recorded sorts ahead of everyone who has
+# been tried -- backend-independently, without relying on either dialect's
+# default NULL collation.
+_NEVER_ATTEMPTED = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class ShareVerdict(Enum):
@@ -343,6 +350,12 @@ class ShareSweepStatus:
     it together with ``state``, which says WHY: ``anchor_mismatch`` (the server
     reported a different identifier -- an established fact needing a repoint) or
     ``anchor_unconfirmed`` (we could not ask -- possibly just an outage)."""
+    signed_out: int = field(default=0)
+    """Users this tick actually signed out. NOT ``share_revoked + token_stale``:
+    an admin-exempted share loss counts toward those verdict tallies but nobody
+    was cut, so deriving the figure would overstate it (Codex review of PR #557).
+    The sweep is the only thing that knows which verdicts became sign-outs, so it
+    reports the number rather than leaving a consumer to infer it."""
     sessions_revoked: int = field(default=0)
     due_remaining: int = field(default=0)
     """Users still due a revalidation once this tick finished. A persistently
@@ -353,7 +366,7 @@ class ShareSweepStatus:
     def _reset_counters(self) -> None:
         self.checked = self.authorized = self.share_revoked = self.token_stale = 0
         self.unknown = self.unverifiable = self.sessions_revoked = self.due_remaining = 0
-        self.skipped = self.admins_exempted = self.anchor_deferred = 0
+        self.skipped = self.admins_exempted = self.anchor_deferred = self.signed_out = 0
 
     def mark_started(self) -> None:
         self.last_run_at = datetime.now(UTC)
@@ -412,6 +425,7 @@ class ShareSweepStatus:
         self.skipped = result.skipped
         self.admins_exempted = result.admins_exempted
         self.anchor_deferred = result.anchor_deferred
+        self.signed_out = len(result.signed_out_user_ids)
         self.sessions_revoked = result.sessions_revoked
         self.due_remaining = result.due_remaining
         self.last_error_type = result.last_error_type
@@ -453,6 +467,30 @@ def _holds_live_session(now: datetime) -> ColumnElement[bool]:
     )
 
 
+def _last_attempt_at() -> ColumnElement[datetime]:
+    """When this user was last ATTEMPTED, successfully or not.
+
+    ``GREATEST(share_checked_at, share_check_failed_at)`` with ``NULL`` folded to
+    the epoch, spelled as a portable ``CASE`` because ``GREATEST`` does not exist
+    on SQLite and ``max(a, b)`` is a two-argument scalar there but an AGGREGATE on
+    PostgreSQL -- the one spelling that means the same thing on both backends.
+
+    Ordering on last ATTEMPT rather than last SUCCESS is what stops the sweep
+    from starving (Codex review of PR #557). ``share_checked_at`` alone was the
+    primary key, and an UNKNOWN verdict deliberately never advances it, so during
+    a partial plex.tv outage the same oldest-checked cohort was re-selected every
+    tick, forever, and the ``share_check_failed_at`` tiebreak could not help --
+    it only applies to EXACT ``share_checked_at`` ties, which established accounts
+    with distinct timestamps never have. A genuinely-revoked user sitting behind
+    that cohort would then keep their access indefinitely, defeating the whole
+    point of the sweep. Keying on the attempt means a failed check rotates a user
+    to the BACK of the queue while leaving them due, so the backlog always drains.
+    """
+    checked = func.coalesce(User.share_checked_at, _NEVER_ATTEMPTED)
+    failed = func.coalesce(User.share_check_failed_at, _NEVER_ATTEMPTED)
+    return case((checked > failed, checked), else_=failed)
+
+
 async def list_due_share_checks(
     session: AsyncSession,
     *,
@@ -462,22 +500,19 @@ async def list_due_share_checks(
 ) -> list[User]:
     """The next (at most ``limit``) signed-in users due a share revalidation.
 
-    Ordered oldest-check-first with never-checked users ahead of everyone
-    (``NULLS FIRST`` stated explicitly, since PostgreSQL sorts NULLs LAST on ASC
-    while SQLite sorts them first). ``share_check_failed_at`` breaks the tie so a
-    user whose check just came back UNKNOWN -- which deliberately does NOT stamp
-    ``share_checked_at``, keeping them due -- rotates to the BACK of the equally
-    -due queue instead of monopolising every tick's budget during a plex.tv
-    outage and starving users who have never been checked at all.
+    Ordered oldest-ATTEMPT-first (:func:`_last_attempt_at`), so a user whose
+    check just came back UNKNOWN goes to the back of the queue while staying due,
+    and the whole backlog is covered within ``ceil(due / limit)`` ticks no matter
+    how many of those checks fail. A user who has never been attempted at all has
+    both timestamps ``NULL``, which folds to the epoch and sorts them first --
+    the NULLS-FIRST semantics the previous explicit ``nulls_first()`` provided,
+    now backend-independent rather than dialect-dependent. ``id`` is the final
+    tiebreak so the order is total and the rotation deterministic.
     """
     stmt = (
         select(User)
         .where(_holds_live_session(now), _due_predicate(now, revalidate_after))
-        .order_by(
-            User.share_checked_at.asc().nulls_first(),
-            User.share_check_failed_at.asc().nulls_first(),
-            User.id,
-        )
+        .order_by(_last_attempt_at().asc(), User.id)
         .limit(limit)
     )
     return list((await session.execute(stmt)).scalars().all())
@@ -555,12 +590,38 @@ async def apply_share_verdict(
 
     ``expected_token`` closes the mid-sweep re-sign-in race: the verdict was
     computed against the token read during due-selection, and a user who signed
-    in again since then holds a NEW token this verdict says nothing about.
-    Re-reading it inside this transaction and refusing to act on a mismatch means
-    a fresh sign-in is never signed straight back out (the same guard shape as
-    ``watchlist_service.clear_user_snapshot``'s ``expected_token``).
+    in again since then holds a NEW token this verdict says nothing about (the
+    same guard shape as ``watchlist_service.clear_user_snapshot``'s
+    ``expected_token``). Two things make that guard actually hold against a
+    sign-in landing mid-apply (Codex review of PR #557):
+
+    1. The token is re-read with a fresh in-transaction ``SELECT`` rather than
+       trusted from the ``user`` instance loaded before this tick's network call,
+       and NOTHING is awaited between that read and the revocation below -- so no
+       other task can interleave, and under READ COMMITTED the read observes a
+       sign-in that has already committed.
+    2. The revocation is bounded to sessions that existed AT that read
+       (``created_at_or_before``). A session minted after it belongs to the fresh
+       sign-in and must survive. This is the belt to (1)'s braces and is what
+       covers the PostgreSQL MVCC posture, where a concurrent sign-in can commit
+       between our statements and be invisible to a snapshot taken earlier.
+
+    Residual, stated rather than hidden: the bound compares a Python-side instant
+    against ``AuthSession.created_at``, which is a server-side default
+    (``func.now()``). Under clock skew between app and database the bound could
+    spare a session it was meant to cut, which the next sweep after the
+    revalidation interval re-evaluates -- the same worst case the interval
+    already defines. The bound errs toward keeping a session rather than cutting
+    a legitimate new one, which is the direction ADR-0005 asks for.
     """
-    if user.encrypted_plex_token != expected_token:
+    # Deliberately the FIRST await of this branch and the last one before the
+    # revoke: see the docstring. ``guard_moment`` is captured before the read so
+    # the bound can never exclude a session that existed when we looked.
+    guard_moment = datetime.now(UTC)
+    stored_token = (
+        await session.execute(select(User.encrypted_plex_token).where(User.id == user.id))
+    ).scalar_one_or_none()
+    if stored_token != expected_token:
         _logger.info(
             "share revalidation skipped for user_id=%s: the stored Plex token changed "
             "since this tick selected them; re-checking on a later tick",
@@ -632,7 +693,12 @@ async def apply_share_verdict(
         )
         revoked = 0
     else:
-        revoked = await session_lifecycle.revoke_user_sessions(session, user.id, now=now)
+        # Bounded to what existed at ``guard_moment`` -- nothing has been awaited
+        # since that read, so a session newer than it can only be a sign-in this
+        # verdict knows nothing about.
+        revoked = await session_lifecycle.revoke_user_sessions(
+            session, user.id, now=now, created_at_or_before=guard_moment
+        )
     await audit_service.record(
         session,
         actor_user_id=None,

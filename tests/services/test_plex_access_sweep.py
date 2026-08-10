@@ -71,6 +71,7 @@ async def _add_user(
     session_expired: bool = False,
     session_idle: bool = False,
     share_checked_at: datetime | None = None,
+    share_check_failed_at: datetime | None = None,
     share_state: str | None = None,
     entitled_section_keys: list[str] | None = None,
     permissions: int = 0,
@@ -84,6 +85,7 @@ async def _add_user(
             encrypted_plex_token=token,
             permissions=permissions,
             share_checked_at=share_checked_at,
+            share_check_failed_at=share_check_failed_at,
             share_state=share_state,
             entitled_section_keys=entitled_section_keys,
             entitlements_machine_id=_MACHINE_ID if entitled_section_keys is not None else None,
@@ -244,12 +246,13 @@ async def test_recovery_session_never_makes_a_user_due(sessionmaker_: SessionMak
     assert due == []
 
 
-async def test_never_checked_users_are_ordered_ahead_of_previously_checked_ones(
+async def test_never_attempted_users_are_ordered_ahead_of_previously_checked_ones(
     sessionmaker_: SessionMaker,
 ) -> None:
-    """NULLS FIRST is stated explicitly because PostgreSQL sorts NULLs LAST on
-    ASC; without it, a user who has never been checked could sit behind everyone
-    forever on one of the two supported backends."""
+    """A never-attempted user (both timestamps NULL) folds to the epoch and sorts
+    first -- the NULLS-FIRST semantics, made backend-independent rather than
+    leaning on a dialect's default NULL collation (PostgreSQL sorts NULLs LAST on
+    ASC, so without this they could sit behind everyone forever)."""
     now = datetime.now(UTC)
     checked = await _add_user(
         sessionmaker_, username="checked", share_checked_at=now - timedelta(hours=7)
@@ -258,6 +261,84 @@ async def test_never_checked_users_are_ordered_ahead_of_previously_checked_ones(
     async with sessionmaker_() as session:
         due = await list_due_share_checks(session, now=now, revalidate_after=_INTERVAL, limit=20)
     assert [user.id for user in due] == [never, checked]
+
+
+async def test_a_failed_attempt_rotates_a_user_behind_one_checked_longer_ago(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The ordering key is the last ATTEMPT, not the last success. An UNKNOWN
+    verdict never advances ``share_checked_at`` (by design), so ordering on that
+    alone would re-select the same user forever; ``share_check_failed_at`` has to
+    count toward their position even though their ``share_checked_at`` is older."""
+    now = datetime.now(UTC)
+    just_failed = await _add_user(
+        sessionmaker_,
+        username="just-failed",
+        share_checked_at=now - timedelta(days=9),
+        share_check_failed_at=now - timedelta(seconds=5),
+    )
+    checked_long_ago = await _add_user(
+        sessionmaker_, username="stale", share_checked_at=now - timedelta(days=2)
+    )
+    async with sessionmaker_() as session:
+        due = await list_due_share_checks(session, now=now, revalidate_after=_INTERVAL, limit=20)
+    # Despite having the OLDEST share_checked_at, the just-failed user goes last.
+    assert [user.id for user in due] == [checked_long_ago, just_failed]
+
+
+async def test_a_perpetually_failing_cohort_cannot_starve_the_rest_of_the_backlog(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The starvation bug (Codex review of PR #557): with ``share_checked_at`` as
+    the primary sort key, the two oldest-checked users failing every tick were
+    re-selected every tick forever, and users behind them -- including a
+    genuinely revoked one -- were never checked at all. Established accounts have
+    distinct ``share_checked_at`` values, so the failed-at tiebreak never applied.
+
+    With the last-ATTEMPT key the whole backlog is covered within
+    ``ceil(due / budget)`` ticks no matter how many checks fail.
+    """
+    now = datetime.now(UTC)
+    # Distinct share_checked_at values, oldest first -- the shape the old
+    # ordering starved. The two oldest always fail; the rest would be revoked.
+    user_ids = [
+        await _add_user(
+            sessionmaker_,
+            username=f"viewer{index}",
+            token=f"token-{index}",
+            share_checked_at=now - timedelta(days=10 - index),
+        )
+        for index in range(5)
+    ]
+    always_failing = {f"token-{index}" for index in range(2)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("X-Plex-Token", "") in always_failing:
+            return httpx.Response(500, json={})
+        return httpx.Response(200, json=[_server_resource(_MACHINE_ID)])
+
+    # ceil(5 due / 2 per tick) == 3 ticks to cover everyone.
+    for _ in range(3):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            plex_tv = PlexTvClient(client, client_identifier="pm-test")
+            await sweep_shares(
+                sessionmaker_,
+                plex_tv,
+                _MACHINE_ID,
+                revalidate_after=_INTERVAL,
+                limit=2,
+                confirm_anchor=_anchor(AnchorCheck.CONFIRMED),
+            )
+
+    # Every user behind the failing cohort got a real verdict.
+    for user_id in user_ids[2:]:
+        user = await _load(sessionmaker_, user_id)
+        assert user.share_state == "authorized", f"user {user_id} was starved"
+    # The failing pair is still due (their checks never succeeded) -- withheld
+    # from the queue by rotation, not dropped from it.
+    for user_id in user_ids[:2]:
+        user = await _load(sessionmaker_, user_id)
+        assert user.share_check_failures > 0
 
 
 async def test_budget_caps_the_tick_and_the_backlog_is_reported_not_dropped(
@@ -466,6 +547,126 @@ async def test_a_user_who_signed_in_again_mid_sweep_is_not_signed_straight_back_
     assert user.share_state is None
     assert await _live_session_count(sessionmaker_, user_id) == 1
     assert await _audit_rows(sessionmaker_) == []
+
+
+async def test_a_sign_in_committed_after_check_share_is_not_revoked(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The interleaving Codex flagged: the user is loaded, the plex.tv verdict
+    comes back SHARE_REVOKED, and THEN a sign-in commits a new token and a new
+    session. The guard has to re-read the token from the database rather than
+    trust the value loaded before the network call, or the brand-new session is
+    cut on a verdict that predates it."""
+    user_id = await _add_user(sessionmaker_, token="old-token")  # noqa: S106
+
+    async with sessionmaker_() as apply_session:
+        # The row as the sweep loaded it, BEFORE the network call.
+        user = await apply_session.get(User, user_id)
+        assert user is not None
+        assert user.encrypted_plex_token == "old-token"  # noqa: S105
+
+        # ... plex.tv answers SHARE_REVOKED ... and meanwhile a sign-in lands.
+        async with sessionmaker_() as sign_in:
+            fresh = await sign_in.get(User, user_id)
+            assert fresh is not None
+            fresh.encrypted_plex_token = "brand-new-token"  # noqa: S105
+            sign_in.add(
+                AuthSession(
+                    user_id=user_id,
+                    token_hash="hash-fresh-sign-in",  # noqa: S106 - a digest
+                    created_at=datetime.now(UTC),
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                    last_seen_at=datetime.now(UTC),
+                )
+            )
+            await sign_in.commit()
+
+        outcome = await apply_share_verdict(
+            apply_session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token="old-token",  # noqa: S106
+            now=datetime.now(UTC),
+        )
+        await apply_session.commit()
+
+    assert outcome.applied is False
+    assert outcome.sessions_revoked == 0
+    # Both the pre-existing session and the fresh one survive untouched.
+    assert await _live_session_count(sessionmaker_, user_id) == 2
+    assert await _audit_rows(sessionmaker_) == []
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state is None
+
+
+async def test_a_session_created_after_the_guard_survives_a_genuine_revocation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The MVCC belt to the re-read's braces: even when the token is UNCHANGED --
+    so the guard legitimately passes and the revocation is genuine -- a session
+    minted after the guard instant belongs to a sign-in this verdict never saw
+    and must survive. Sessions that existed at the guard are still cut."""
+    user_id = await _add_user(sessionmaker_, username="viewer", with_session=False)
+    now = datetime.now(UTC)
+    async with sessionmaker_() as session:
+        # One session predating the guard (must be revoked) and one dated after
+        # it (must survive) -- the deterministic stand-in for a sign-in landing
+        # between the re-read and the UPDATE under PostgreSQL MVCC.
+        session.add(
+            AuthSession(
+                user_id=user_id,
+                token_hash="hash-existing",  # noqa: S106 - a digest
+                created_at=now - timedelta(minutes=5),
+                expires_at=now + timedelta(days=1),
+                last_seen_at=now,
+            )
+        )
+        session.add(
+            AuthSession(
+                user_id=user_id,
+                token_hash="hash-after-guard",  # noqa: S106 - a digest
+                created_at=now + timedelta(minutes=5),
+                expires_at=now + timedelta(days=1),
+                last_seen_at=now,
+            )
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        outcome = await apply_share_verdict(
+            session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token=user.encrypted_plex_token,
+            now=datetime.now(UTC),
+        )
+        await session.commit()
+
+    # The verdict WAS applied and the old session cut -- only the newer one is
+    # spared, so a genuine revocation is not weakened into a no-op.
+    assert outcome.applied is True
+    assert outcome.signed_out is True
+    assert outcome.sessions_revoked == 1
+    assert await _live_session_count(sessionmaker_, user_id) == 1
+    async with sessionmaker_() as session:
+        surviving = (
+            await session.execute(
+                select(AuthSession.token_hash).where(
+                    AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None)
+                )
+            )
+        ).scalar_one()
+    assert surviving == "hash-after-guard"
 
 
 async def test_one_users_verdict_does_not_stop_the_others(sessionmaker_: SessionMaker) -> None:

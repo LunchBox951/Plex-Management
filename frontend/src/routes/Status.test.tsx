@@ -94,6 +94,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       skipped: 0,
       admins_exempted: 0,
       anchor_deferred: 0,
+      signed_out: 0,
       sessions_revoked: 0,
       due_remaining: 0,
     },
@@ -988,6 +989,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 0,
           anchor_deferred: 0,
+          signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 0,
         },
@@ -1149,6 +1151,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 0,
           anchor_deferred: 0,
+          signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 4,
         },
@@ -1188,7 +1191,7 @@ describe('Status', () => {
     expect(lastRun?.textContent).not.toBe(lastSuccess?.textContent)
   })
 
-  it('counts revoked shares and stale tokens together as sign-outs', () => {
+  it('reports the sign-out count the backend measured, not a sum of verdicts', () => {
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       data: health({
         share_sweep: {
@@ -1206,6 +1209,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 0,
           anchor_deferred: 0,
+          signed_out: 3,
           sessions_revoked: 5,
           due_remaining: 0,
         },
@@ -1231,7 +1235,7 @@ describe('Status', () => {
     expect(signedOut).toHaveClass('font-semibold', 'text-searching')
     // Exception-only rows stay out of the way on an ordinary tick.
     expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
-    expect(sweep.queryByText('Held (server unreachable)')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Held (anchor unconfirmed)')).not.toBeInTheDocument()
     expect(sweep.queryByText('Admins held')).not.toBeInTheDocument()
     expect(sweep.queryByText('Skipped')).not.toBeInTheDocument()
   })
@@ -1258,6 +1262,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 0,
           anchor_deferred: 6,
+          signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 6,
         },
@@ -1306,6 +1311,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 0,
           anchor_deferred: 2,
+          signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 2,
         },
@@ -1326,9 +1332,13 @@ describe('Status', () => {
     const sweep = within(panel as HTMLElement)
     expect(sweep.getByText('anchor unconfirmed')).toBeInTheDocument()
     expect(sweep.queryByText('Held (server changed)')).not.toBeInTheDocument()
-    const held = sweep.getByText('Held (server unreachable)').nextElementSibling
+    // Neutral about the cause: "unreachable" would be wrong when the anchor is
+    // unconfirmed because no plex_url/plex_token was configured to probe with —
+    // no network attempt was ever made in that case.
+    expect(sweep.queryByText('Held (server unreachable)')).not.toBeInTheDocument()
+    const held = sweep.getByText('Held (anchor unconfirmed)').nextElementSibling
     expect(held).toHaveTextContent('2')
-    // Warn, not error: a transient outage is not a configuration fault.
+    // Warn, not error: an unestablished anchor is not a configuration fault.
     expect(held).toHaveClass('font-semibold', 'text-searching')
     expect(held).not.toHaveClass('text-error')
   })
@@ -1351,6 +1361,7 @@ describe('Status', () => {
           skipped: 2,
           admins_exempted: 0,
           anchor_deferred: 0,
+          signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 0,
         },
@@ -1372,7 +1383,10 @@ describe('Status', () => {
     expect(sweep.getByText('Skipped').nextElementSibling).toHaveTextContent('2')
   })
 
-  it('surfaces an admin the sweep declined to sign out', () => {
+  it('does not count an exempted admin as signed out', () => {
+    // One revoked viewer plus one exempted admin: two share_revoked VERDICTS but
+    // only one person actually cut. Summing the verdict tallies in the UI
+    // reported "Signed out 2" and overstated the blast radius.
     ;(useOpsHealth as unknown as Mock).mockReturnValue({
       data: health({
         share_sweep: {
@@ -1390,6 +1404,7 @@ describe('Status', () => {
           skipped: 0,
           admins_exempted: 1,
           anchor_deferred: 0,
+          signed_out: 1,
           sessions_revoked: 1,
           due_remaining: 0,
         },
@@ -1408,6 +1423,7 @@ describe('Status', () => {
 
     const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
     const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('Signed out').nextElementSibling).toHaveTextContent('1')
     // The admin is never signed out automatically, so the operator has to be
     // told it happened rather than left wondering why nothing did.
     const held = sweep.getByText('Admins held').nextElementSibling
