@@ -708,17 +708,18 @@ HTTP fetch), submit it, and report the resulting hash. The split makes the first
 two separable:
 
 ```python
-class PreparedAdd(BaseModel):        # frozen, like AddResult / DownloadStatus
-    torrent_hash: str                # lowercased, non-empty — the whole point
-    payload_ref: ...                 # opaque handle to the resolved payload
+class PreparedAdd(BaseModel):  # frozen, like AddResult / DownloadStatus
+    torrent_hash: str  # lowercased, non-empty — the whole point
+    payload_ref: ...  # opaque handle to the resolved payload
     save_path: str
     category: str
 
-async def prepare_add(self, magnet_or_url: str, save_path: str,
-                      category: str) -> PreparedAdd: ...
+
+async def prepare_add(self, magnet_or_url: str, save_path: str, category: str) -> PreparedAdd: ...
 async def add_prepared(self, prepared: PreparedAdd) -> AddResult: ...
-async def add(self, magnet_or_url: str, save_path: str,
-              category: str) -> AddResult: ...   # compatibility composition
+async def add(
+    self, magnet_or_url: str, save_path: str, category: str
+) -> AddResult: ...  # compatibility composition
 ```
 
 Contract obligations, all of which belong in the port's docstrings because the
