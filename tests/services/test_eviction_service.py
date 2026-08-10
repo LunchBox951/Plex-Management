@@ -8328,12 +8328,12 @@ async def test_active_correction_purge_defers_pressure_evictions_on_the_same_roo
     root, so a sweep must not select other victims from its pre-correction disk
     snapshot while that purge still owns the path.
 
-    What this does NOT prove (issue #526): the claim is checked once, when the sweep
-    reaches that line. A correction that starts LATER -- while candidate assembly is
-    awaiting Plex -- is not seen by this sweep, and already-eligible victims can
-    still be evicted off the now-stale snapshot. The two tests that follow bound the
-    defer (by root, and to pressure-triggered sweeps); none of the three claim
-    corrections and sweeps are serialized against each other."""
+    This is the ACQUISITION-DENIED half of the pressure-exclusion lease (issue
+    #526): the claim already exists when the sweep asks for the lease, so it never
+    gets one and defers. The correction that starts LATER -- inside one of the
+    sweep's await windows -- is the REVOCATION half, covered in
+    ``test_eviction_pressure_lease.py``. The two tests that follow bound this defer
+    (by root, and to pressure-triggered sweeps)."""
     root = tmp_path / "tv"
     correction_dir = root / "Correction In Progress" / "Season 01"
     correction_dir.mkdir(parents=True)

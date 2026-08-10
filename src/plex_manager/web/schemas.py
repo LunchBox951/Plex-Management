@@ -57,6 +57,7 @@ __all__ = [
     "ErrorEnvelope",
     "EvictErrorItem",
     "EvictResponse",
+    "EvictStoodDownItem",
     "EvictionCandidateItem",
     "EvictionOutcomeItem",
     "GrabRequest",
@@ -2079,18 +2080,46 @@ class EvictErrorItem(BaseModel):
     detail: str
 
 
+class EvictStoodDownItem(BaseModel):
+    """One root whose sweep DECLINED to evict because an operator correction owns
+    that root's free space right now (issue #526).
+
+    Neither a failure nor a plain "nothing to do": the sweep was healthy and the
+    root may well be under pressure, but a correction purge either already held a
+    claim under it or started during the sweep and defeated its pressure-exclusion
+    lease -- so continuing would delete watched titles against a free-space reading
+    that correction is about to change. Reported rather than left in the log
+    (honesty over silence): an operator who presses "free space" and gets an empty
+    ``evicted`` deserves to know the difference between "nothing was eligible" and
+    "your own correction is already reclaiming this root", and that the next sweep
+    re-reads pressure once it settles.
+
+    ``reason`` is a STATIC, operator-facing sentence chosen by the sweep -- never a
+    path, a request-derived value, or an exception message.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    root: Literal["movies_root", "tv_root", "anime_movie_root", "anime_tv_root"]
+    reason: str
+
+
 class EvictResponse(BaseModel):
     """The result of a manual disk-pressure sweep (north-star #1: a button that
     frees space on demand). Empty ``evicted`` is a normal, honest outcome (no
     root was under pressure, or nothing was eligible). ``errors`` is populated
     per-root when THAT root's own sweep raised -- every other root's outcome
     in ``evicted`` still stands; the sweep never aborts one root's already
-    committed work just because a sibling root failed."""
+    committed work just because a sibling root failed. ``stood_down`` names any
+    root that deliberately declined because an operator correction owns its free
+    space (issue #526) -- the third honest shape of an empty ``evicted``, and the
+    one an operator would otherwise mistake for "the button did nothing"."""
 
     model_config = ConfigDict(frozen=True)
 
     evicted: list[EvictionOutcomeItem]
     errors: list[EvictErrorItem] = Field(default_factory=list[EvictErrorItem])
+    stood_down: list[EvictStoodDownItem] = Field(default_factory=list[EvictStoodDownItem])
 
 
 # --------------------------------------------------------------------------- #

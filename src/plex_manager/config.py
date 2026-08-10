@@ -182,14 +182,20 @@ class Settings(BaseSettings):
     # deployment that sets this by convention) is about to violate the
     # single-process assumption several in-process registries depend on for
     # correctness (issue #240): ``services.queue_service``'s removal-physics
-    # guards (``_removals_in_flight`` / ``_operator_fail_claims``) and
-    # ``services.purge_service``'s purge-vs-import path serialization are
-    # plain in-process dicts coordinated with no ``await`` between check and
-    # register, exactly like ``web.routers.settings``'s ``_rotate_lock`` /
+    # guards (``_removals_in_flight`` / ``_operator_fail_claims``),
+    # ``services.purge_service``'s purge-vs-import path serialization, and that
+    # same module's root-scoped pressure-exclusion leases
+    # (``_PRESSURE_EXCLUSION_LEASES``, issue #526) are plain in-process
+    # dicts/lists coordinated with no ``await`` between check and register,
+    # exactly like ``web.routers.settings``'s ``_rotate_lock`` /
     # ``_settings_update_lock`` already document. A second worker process (or
     # container replica) would silently reopen every race those registries
     # close, because each process/container gets its OWN copy with no
-    # cross-process coordination. Deliberately NOT a hard failure: the app
+    # cross-process coordination -- for the leases specifically, a sweep in one
+    # process would hold a lease no correction in another process can defeat (and
+    # would not see that other process's purge claims when acquiring), so an
+    # eviction sweep resumes deleting against a free-space reading an operator's
+    # correction has already invalidated. Deliberately NOT a hard failure: the app
     # remains fully usable single-process without this variable ever being
     # set, and building real multi-process coordination (a DB-level lock/CAS
     # spanning every one of these registries) is out of scope for this fix —
