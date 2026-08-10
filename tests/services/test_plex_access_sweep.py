@@ -569,6 +569,66 @@ async def test_unverifiable_stamps_state_without_revoking(sessionmaker_: Session
     assert await _audit_rows(sessionmaker_) == []
 
 
+async def test_a_verdict_that_cut_no_live_session_is_recorded_but_is_not_a_sign_out(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """Due-selection saw a live session, but the user idled out (or logged out)
+    before the conditioned revoke ran. The verdict is real and must be recorded;
+    the SIGN-OUT is not, and neither the count, the words, nor the outcome may
+    claim otherwise."""
+    user_id = await _add_user(sessionmaker_, session_idle=True)
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        outcome = await apply_share_verdict(
+            session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token="user-token",  # noqa: S106
+            now=datetime.now(UTC),
+        )
+        await session.commit()
+
+    assert outcome.applied is True
+    assert outcome.signed_out is False
+    assert outcome.sessions_revoked == 0
+    # The verdict IS persisted -- this is not a skip.
+    user = await _load(sessionmaker_, user_id)
+    assert user.share_state == "share_revoked"
+
+    rows = await _audit_rows(sessionmaker_)
+    assert len(rows) == 1
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 0
+    assert rows[0].description is not None
+    # The words must agree with the number: no claim that sessions were cut.
+    assert "No browser session was signed out" in rows[0].description
+    assert "no longer has access" in rows[0].description
+    # The dead row is still tidied away, leaving nothing unrevoked-but-dead.
+    assert await _live_session_count(sessionmaker_, user_id) == 0
+
+
+async def test_a_sign_out_that_cut_sessions_says_how_many(
+    sessionmaker_: SessionMaker,
+) -> None:
+    user_id = await _add_user(sessionmaker_)
+
+    result = await _sweep(sessionmaker_, [_server_resource("some-other-server")])
+
+    assert result.sessions_revoked == 1
+    rows = await _audit_rows(sessionmaker_)
+    assert rows[0].description is not None
+    # Singular, and the number matches ``sessions_revoked``.
+    assert "1 browser session signed out." in rows[0].description
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 1
+    assert await _live_session_count(sessionmaker_, user_id) == 0
+
+
 # --------------------------------------------------------------------------- #
 # Races and isolation
 # --------------------------------------------------------------------------- #

@@ -585,6 +585,15 @@ async def logout_endpoint(
             auth_session.revoked_at = datetime.now(UTC)
             await session.commit()
     if revoked_user_id is not None:
+        # NOTE (deliberate, but wider than the revocation): only THIS cookie was
+        # revoked, yet this closes every stream the user has open, including on
+        # devices whose sessions remain valid. Those reconnect immediately, so
+        # the cost is realtime churn rather than lost access -- but it is why the
+        # ``session_logged_out`` close reason must not be presented to the
+        # browser as "you were signed out" (see ``lib/sessionClose.ts``): for
+        # most recipients of this frame it is simply untrue. Narrowing the close
+        # to the acting connection would need a session identity on
+        # ``AuthContext`` and on each subscription, which the hub does not carry.
         close_realtime_streams(
             request.app,
             reason="session_logged_out",

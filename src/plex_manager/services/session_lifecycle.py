@@ -128,10 +128,13 @@ def active_session_conditions(now: datetime) -> tuple[ColumnElement[bool], ...]:
     freely add their own predicates (e.g. ``user_id IS NULL`` for the recovery
     group) without nesting.
 
-    NOT used by :func:`revoke_user_sessions` / :func:`revoke_recovery_sessions`,
-    which deliberately cast wider: they stamp every not-yet-revoked row, including
-    ones already expired or idled out, so a revocation leaves no ambiguous
-    "unrevoked but dead" rows behind for the sweep to reason about.
+    NOT used to choose WHAT :func:`revoke_user_sessions` /
+    :func:`revoke_recovery_sessions` stamp: they deliberately cast wider, hitting
+    every not-yet-revoked row including ones already expired or idled out, so a
+    revocation leaves no ambiguous "unrevoked but dead" rows behind for the sweep
+    to reason about. It IS used to decide what they COUNT when a caller asks for
+    ``count_only_active`` -- the stamp stays wide, the reported number narrows to
+    sessions that could still authenticate.
     """
     idle_cutoff = now - SESSION_IDLE_WINDOW
     return (
@@ -148,8 +151,9 @@ async def revoke_user_sessions(
     now: datetime | None = None,
     created_at_or_before: datetime | None = None,
     only_if_user_matches: ColumnElement[bool] | None = None,
+    count_only_active: bool = False,
 ) -> int:
-    """Stamp ``revoked_at`` on every ACTIVE session for ``user_id``; return count.
+    """Stamp ``revoked_at`` on every unrevoked session for ``user_id``; return count.
 
     An admin lever (issue #56): a removed or demoted Plex user keeps a locally
     validated session until revocation, so this is the on-demand way to cut it
@@ -187,8 +191,33 @@ async def revoke_user_sessions(
     makes the statement match zero rows. This module stays ignorant of what the
     predicate means -- and, deliberately, of encryption: the caller owns how its
     column compares.
+
+    ``count_only_active`` changes WHAT IS COUNTED, never what is stamped. The
+    stamp stays deliberately wide (see :func:`active_session_conditions`: rows
+    already expired or idled out are revoked too, so no ambiguous
+    "unrevoked but dead" rows survive), but the returned number is then the
+    count of sessions that could still AUTHENTICATE at ``stamp`` -- measured
+    before the UPDATE, since stamping makes every row fail the active test. A
+    caller that reports "N sessions were signed out" to a human needs that
+    narrower number: a row cut after it had already idled out ended nothing the
+    user could have used, and counting it would inflate an automatic sign-out
+    into an action it never performed. ``only_if_user_matches`` is honoured
+    either way -- if the guard rejects the UPDATE it matches zero rows, and the
+    active count is reported as 0 rather than as what would have been cut.
     """
     stamp = now if now is not None else datetime.now(UTC)
+    active_count: int | None = None
+    if count_only_active:
+        # BEFORE the update: ``active_session_conditions`` requires
+        # ``revoked_at IS NULL``, which the stamp below is about to falsify.
+        active_stmt = (
+            select(func.count())
+            .select_from(AuthSession)
+            .where(AuthSession.user_id == user_id, *active_session_conditions(stamp))
+        )
+        if created_at_or_before is not None:
+            active_stmt = active_stmt.where(AuthSession.created_at <= created_at_or_before)
+        active_count = await session.scalar(active_stmt) or 0
     stmt = update(AuthSession).where(
         AuthSession.user_id == user_id, AuthSession.revoked_at.is_(None)
     )
@@ -200,7 +229,12 @@ async def revoke_user_sessions(
         CursorResult[Any],
         await session.execute(stmt.values(revoked_at=stamp)),
     )
-    return result.rowcount
+    if active_count is None:
+        return result.rowcount
+    # The guard predicate is a property of the USER row, identical for every
+    # session, so the UPDATE is all-or-nothing: a zero rowcount means it was
+    # rejected outright and nothing -- active or not -- was cut.
+    return active_count if result.rowcount else 0
 
 
 async def revoke_recovery_sessions(

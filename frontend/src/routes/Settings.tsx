@@ -831,8 +831,9 @@ function AutomaticSignOutsSection() {
     <section className="rounded-xl border border-hairline bg-surface p-5">
       <h2 className="font-display text-sm font-semibold text-ink">Automatic sign-outs</h2>
       <p className="mt-1 text-xs text-faint">
-        Sign-outs the app performed by itself, from the periodic Plex share re-check. This is the
-        durable record — unlike the Logs page, it is not trimmed by log retention.
+        Sign-outs decided by the periodic Plex share re-check — not every automatic one: a session
+        that expires or idles out ends on its own and is not recorded here. This is the durable
+        record — unlike the Logs page, it is not trimmed by log retention.
       </p>
 
       <div className="mt-4">
@@ -849,8 +850,8 @@ function AutomaticSignOutsSection() {
           </div>
         ) : entries.length === 0 ? (
           <p className="text-xs text-faint">
-            Nobody has been signed out automatically. Every sign-out so far was a person pressing a
-            button.
+            The Plex share re-check has not signed anyone out. Sessions that simply expired or
+            idled out are not listed here — they are not a re-check decision.
           </p>
         ) : (
           <ul className="flex flex-col divide-y divide-hairline">

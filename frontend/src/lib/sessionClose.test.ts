@@ -90,6 +90,10 @@ describe('the session-close notice store', () => {
     // for either would be false.
     noteSessionClose('shutdown')
     noteSessionClose('permission_downgraded')
+    // `/auth/logout` revokes only the caller's cookie yet closes every stream
+    // the account has open, so this frame reaches other devices whose sessions
+    // are still valid — it must not park a sign-out notice in their memory.
+    noteSessionClose('session_logged_out')
     expect(getSessionCloseNotice()).toBeNull()
   })
 })

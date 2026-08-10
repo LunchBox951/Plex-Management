@@ -748,20 +748,20 @@ async def apply_share_verdict(
     if verdict is ShareVerdict.SHARE_REVOKED:
         _clear_entitlements(user)
         action_type = audit_service.SHARE_REVOKED_ACTION
-        description = (
+        finding = (
             "Automatic share revalidation: this Plex account no longer has access to the "
-            "configured server, so every browser session was signed out."
+            "configured server."
         )
+        # Deliberately NOT "access removed" for the stale-token case: plex.tv
+        # rejected the credential before it could say anything about the share.
+        # Same machinery, honest (and different) words -- the operator-facing
+        # distinction the design ratified.
     else:  # ShareVerdict.TOKEN_STALE
-        # Deliberately NOT "access removed": plex.tv rejected the credential
-        # before it could say anything about the share. Same machinery, honest
-        # (and different) words -- the operator-facing distinction the design
-        # ratified.
         action_type = audit_service.PLEX_SIGN_IN_EXPIRED_ACTION
-        description = (
+        finding = (
             "Automatic share revalidation: token stale -- this account's Plex sign-in expired, "
-            "so its access could no longer be verified and every browser session was signed "
-            "out. Access to the server was not removed; signing in with Plex again restores it."
+            "so its access could no longer be verified. Access to the server was not removed; "
+            "signing in with Plex again restores it."
         )
 
     if admin_exempt:
@@ -779,13 +779,30 @@ async def apply_share_verdict(
         # ONE conditioned statement (see the docstring): the token equality is
         # re-asserted by the UPDATE itself against the latest committed row, and
         # the revocation is bounded to sessions that existed at ``guard_moment``.
+        # ``count_only_active`` keeps the reported number to sessions that could
+        # still authenticate: the stamp still tidies away rows that had already
+        # expired or idled out, but sweeping up a dead row is not a sign-out and
+        # must not be counted as one.
         revoked = await session_lifecycle.revoke_user_sessions(
             session,
             user.id,
             now=now,
             created_at_or_before=guard_moment,
             only_if_user_matches=_stored_token_ciphertext() == stored_ciphertext,
+            count_only_active=True,
         )
+        # Composed AFTER the revoke so the words match the number. The verdict is
+        # true either way, but "every browser session was signed out" is not: the
+        # conditioned UPDATE can cut nothing at all (the user signed out, or
+        # re-signed-in, between due-selection and here).
+        if revoked:
+            sessions = "session" if revoked == 1 else "sessions"
+            description = f"{finding} {revoked} browser {sessions} signed out."
+        else:
+            description = (
+                f"{finding} No browser session was signed out -- none was still active by the "
+                "time the revocation ran."
+            )
     await audit_service.record(
         session,
         actor_user_id=None,
@@ -819,6 +836,20 @@ async def apply_share_verdict(
         return ShareVerdictOutcome(
             applied=True, signed_out=False, sessions_revoked=0, admin_exempt=True
         )
+    if not revoked:
+        # The verdict stands and is recorded, but no LIVE session was cut, so
+        # this is not a sign-out. Reporting it as one would contradict the audit
+        # row written just above, inflate the tick's telemetry, and -- worst --
+        # fire ``on_signed_out`` for a user whose zero count may mean the token
+        # guard rejected the revoke because they just signed in again, closing
+        # the realtime stream of the very session that guard exists to protect.
+        _logger.info(
+            "share revalidation recorded %s for user_id=%s but signed nobody out: no active "
+            "session remained by the time the revocation ran",
+            verdict.value,
+            safe_int(user.id),
+        )
+        return ShareVerdictOutcome(applied=True, signed_out=False, sessions_revoked=0)
     _logger.info(
         "share revalidation signed out user_id=%s (%s); revoked %s session(s)",
         safe_int(user.id),

@@ -1567,10 +1567,15 @@ describe('Settings — Automatic sign-outs (issue #556)', () => {
     }
   }
 
-  it('shows an honest empty state when the app has never signed anyone out', () => {
+  it('claims only what the list actually covers when it is empty', () => {
+    // An expired or idled-out session is also an automatic sign-out, but it
+    // writes no audit row — so an empty list cannot claim that every sign-out
+    // so far was somebody pressing a button.
     h.signOuts = []
     render(<Settings />, { wrapper: Wrapper })
-    expect(signOutsSection().getByText(/Nobody has been signed out automatically/)).toBeInTheDocument()
+    const section = signOutsSection()
+    expect(section.getByText(/re-check has not signed anyone out/)).toBeInTheDocument()
+    expect(section.getByText(/expire.*or idled out are not listed here/)).toBeInTheDocument()
   })
 
   it('names a revoked share and how many sessions it cut', () => {

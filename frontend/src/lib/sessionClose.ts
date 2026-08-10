@@ -64,10 +64,17 @@ const NOTICES: Record<string, NoticeCopy> = {
       'An automatic re-check with Plex ended this session. Sign in with Plex again; if it keeps happening, check Settings → Automatic sign-outs for the recorded reason.',
     signedOut: true,
   },
+  // NOT flagged as a sign-out, even though it usually follows one. `/auth/logout`
+  // revokes ONLY the caller's own cookie but closes every realtime stream for
+  // that user, so this reason reaches the account's OTHER devices too — whose
+  // sessions are still perfectly valid. Marking it `true` would park a "you were
+  // signed out" notice in those tabs' memory to be misattributed to a later,
+  // unrelated 401. The tab that actually signed out loses nothing by the
+  // silence: it just pressed the button and knows exactly why it is here.
   session_logged_out: {
-    title: 'You signed out',
-    message: 'This session ended because it was signed out.',
-    signedOut: true,
+    title: 'Signed out',
+    message: 'This account signed out in this browser.',
+    signedOut: false,
   },
   sessions_revoked: {
     title: 'An administrator signed this session out',

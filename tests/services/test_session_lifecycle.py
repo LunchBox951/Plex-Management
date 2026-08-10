@@ -140,6 +140,123 @@ async def test_revoke_user_sessions_revokes_only_active_rows(
         assert await sl.revoke_user_sessions(session, user.id, now=_NOW) == 0
 
 
+async def test_count_only_active_still_stamps_dead_rows_but_does_not_count_them(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A revoke that only swept up already-dead rows ended nothing the user could
+    have used. The stamp stays wide (no ambiguous "unrevoked but dead" rows left
+    behind), but the REPORTED count must not inflate that into a sign-out."""
+    async with sessionmaker_() as session:
+        user = await _make_user(session, plex_id=1234)
+        session.add_all(
+            [
+                _session(
+                    user_id=user.id,
+                    tag="live",
+                    created_at=_NOW,
+                    expires_at=_NOW + timedelta(days=30),
+                    last_seen_at=_NOW,
+                ),
+                _session(  # past the absolute cap
+                    user_id=user.id,
+                    tag="expired",
+                    created_at=_NOW - timedelta(days=60),
+                    expires_at=_NOW - timedelta(days=1),
+                    last_seen_at=_NOW - timedelta(days=40),
+                ),
+                _session(  # inside the cap but idled out
+                    user_id=user.id,
+                    tag="idle",
+                    created_at=_NOW - timedelta(days=30),
+                    expires_at=_NOW + timedelta(days=1),
+                    last_seen_at=_NOW - sl.SESSION_IDLE_WINDOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        await session.commit()
+
+        counted = await sl.revoke_user_sessions(session, user.id, now=_NOW, count_only_active=True)
+        await session.commit()
+
+        # Only the live one is counted...
+        assert counted == 1
+        # ...but all three were stamped, leaving nothing unrevoked-but-dead.
+        unrevoked = await session.execute(
+            select(func.count())
+            .select_from(AuthSession)
+            .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+        )
+        assert unrevoked.scalar_one() == 0
+
+
+async def test_count_only_active_reports_zero_when_every_row_was_already_dead(
+    sessionmaker_: SessionMaker,
+) -> None:
+    async with sessionmaker_() as session:
+        user = await _make_user(session, plex_id=4321)
+        session.add(
+            _session(
+                user_id=user.id,
+                tag="idle-only",
+                created_at=_NOW - timedelta(days=30),
+                expires_at=_NOW + timedelta(days=1),
+                last_seen_at=_NOW - sl.SESSION_IDLE_WINDOW - timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+        counted = await sl.revoke_user_sessions(session, user.id, now=_NOW, count_only_active=True)
+        await session.commit()
+
+        # A row WAS stamped, but nothing usable ended.
+        assert counted == 0
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(AuthSession)
+                .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+            )
+        ) == 0
+
+
+async def test_count_only_active_reports_zero_when_the_user_guard_rejects_the_revoke(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The guard is a property of the USER row, so the UPDATE is all-or-nothing:
+    a rejected revoke must report 0, not what it would have cut."""
+    async with sessionmaker_() as session:
+        user = await _make_user(session, plex_id=5678)
+        session.add(
+            _session(
+                user_id=user.id,
+                tag="live",
+                created_at=_NOW,
+                expires_at=_NOW + timedelta(days=30),
+                last_seen_at=_NOW,
+            )
+        )
+        await session.commit()
+
+        counted = await sl.revoke_user_sessions(
+            session,
+            user.id,
+            now=_NOW,
+            only_if_user_matches=User.plex_id == 999_999,  # never true
+            count_only_active=True,
+        )
+        await session.commit()
+
+        assert counted == 0
+        # Nothing was stamped either — the session survives untouched.
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(AuthSession)
+                .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+            )
+        ) == 1
+
+
 async def test_revoke_recovery_sessions_targets_only_null_user_rows(
     sessionmaker_: SessionMaker,
 ) -> None:
