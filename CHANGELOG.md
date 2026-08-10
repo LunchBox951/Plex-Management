@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-09
+
 _Package metadata is `1.0.0` (see `src/plex_manager/__init__.py`). The
 canary-proven `edge-c1bf4eb` image was promoted to `:stable` / `1.0.0` on
 Aug 9, 2026 by re-tag (no rebuild — ADR-0004). The 1.0.0 runbook (issue #3)
@@ -62,7 +64,7 @@ Aug 3 (see the "Version 1.0" milestone)._
 - Configured service URLs (Plex/Prowlarr/qBittorrent/TMDB) are origin-confined,
   and changing a service's destination requires explicit operator consent
   ([ADR-0018](docs/adr/0018-origin-confined-service-urls.md)).
-- 17 Alembic migrations have shipped since the alpha's initial schema; every
+- 28 Alembic migrations have shipped since the alpha's initial schema; every
   container start runs `alembic upgrade head` before serving. Rollback and
   backup expectations are now documented honestly rather than implied — see
   [ADR-0023](docs/adr/0023-database-rollback-and-pre-migration-backup.md) and
@@ -120,6 +122,7 @@ Aug 3 (see the "Version 1.0" milestone)._
 - An ownership-claim guard before deleting library files on eviction/correction.
 
 ### Deferred
-- The host auto-updater mechanism (Watchtower vs. a systemd timer) is not
-  bundled in the compose file yet — each host is designed to auto-pull its
-  release channel, but wiring the updater itself remains an open decision.
+- The updater sidecar's self-recreation (ADR-0025 Stage 1, tracked by #390).
+  The first-party container updater itself *is* bundled as an opt-in Compose
+  profile (`--profile auto-update`) with Stage 0 detect-and-surface behavior;
+  only its ability to recreate itself after an update remains deferred.

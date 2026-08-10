@@ -2,7 +2,7 @@
 
 Four schema deltas for the operability beta (ADR-0012), shipped as one revision
 since they are part of the same logical change (see
-``docs/design/operability-beta-plan.md``):
+``docs/archive/operability-beta-plan.md``):
 
 1. New ``log_events`` table — the durable, LLM-diagnosable log trail. Populated
    only by the capture pipeline's async drain task, never the synchronous

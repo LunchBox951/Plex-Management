@@ -7,7 +7,7 @@
 
 ## Context
 
-The early beta ([`beta-plan.md`](../design/beta-plan.md)) closed the
+The early beta ([`beta-plan.md`](../archive/beta-plan.md)) closed the
 request → watchable loop for **movies only** and deliberately deferred TV. The
 schema was built TV-aware from day one (`MediaType.tv`, a `season_requests`
 table, `Download.season` / `Download.episodes_json`), but the *logic* — naming,

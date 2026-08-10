@@ -420,7 +420,7 @@ KNOWN_SETTING_KEYS: tuple[str, ...] = (
     # (never secret) config: disk-pressure eviction tuning + the log-retention
     # window. Read via the typed getters below, each with a safe, honest
     # fallback default when unset or unparsable (never a crash, never a silently
-    # wrong threshold) -- see ``docs/design/operability-beta-plan.md``.
+    # wrong threshold) -- see ``docs/archive/operability-beta-plan.md``.
     "disk_pressure_threshold_percent",
     "disk_pressure_target_percent",
     "eviction_grace_days",
@@ -1814,7 +1814,7 @@ def get_quality_profile() -> QualityProfile:
 # --------------------------------------------------------------------------- #
 # Operability beta (ADR-0012): typed, web-editable numeric/boolean settings
 # --------------------------------------------------------------------------- #
-# Safe defaults per the blueprint (``docs/design/operability-beta-plan.md``).
+# Safe defaults per the blueprint (``docs/archive/operability-beta-plan.md``).
 # Exported so the services layer / tests can reference the SAME numbers a fresh
 # install effectively runs with, without duplicating the literal.
 DISK_PRESSURE_THRESHOLD_PERCENT_DEFAULT: float = 90.0

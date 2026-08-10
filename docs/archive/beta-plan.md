@@ -8,7 +8,7 @@
   exists.
 
 This is a planning artifact for the beta; like [`alpha-plan.md`](alpha-plan.md)
-and [`frontend-alpha-plan.md`](frontend-alpha-plan.md) it is removed at the v1
+and [`frontend-alpha-plan.md`](frontend-alpha-plan.md) it was archived at the v1
 cleanup ([issue #3](https://github.com/LunchBox951/Plex-Management/issues/3)). The
 durable decisions live in the ADRs — primarily
 [ADR-0010](../adr/0010-import-pipeline-honest-availability.md) (import pipeline,
