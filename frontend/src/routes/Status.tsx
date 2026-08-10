@@ -726,6 +726,55 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
             </dd>
           </>
         ) : null}
+        {/* Entitlement capture is deliberately harmless and enforces nothing yet
+            (#484 PR-3), so a clean tick says nothing about it — the per-user
+            telemetry lives in the logs. Only FAILURES earn a row here, and even
+            then in the neutral tone: the previous snapshot survived and no
+            verdict changed. */}
+        {sweep.capture_failed > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads failed</dt>
+            <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+              {sweep.capture_failed}
+            </dd>
+          </>
+        ) : null}
+        {/* Captures the live anchor check refused. Shown with the same weight as
+            the deferred sign-outs above and for the same reason: the anchor is
+            what makes a stamped snapshot trustworthy, so a tick that could not
+            confirm it did not do its job — even when every verdict happened to
+            be AUTHORIZED and nothing needed deferring. The panel's state label
+            says which answer it was. */}
+        {sweep.capture_anchor_blocked > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads held</dt>
+            <dd
+              className={cn(
+                'min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]',
+                anchorChanged ? 'text-error' : 'text-searching',
+              )}
+            >
+              {sweep.capture_anchor_blocked}
+            </dd>
+          </>
+        ) : null}
+        {/* Capture switched OFF for the whole install (typically an upgrade that
+            never re-saved its Plex settings, so there is no verified server
+            anchor to stamp a snapshot with). Without this row the panel shows a
+            clean tick and no capture numbers at all — exactly what a healthy
+            install with nothing to capture looks like. The value names the
+            REMEDY rather than a count: a number of skipped users tells an
+            operator nothing about what to press (north star #2). */}
+        {sweep.capture_unavailable ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement capture</dt>
+            <dd className="min-w-0 text-right font-semibold text-searching [overflow-wrap:anywhere]">
+              {sweep.capture_unavailable === 'no_server_anchor'
+                ? 'off — re-save Plex settings'
+                : 'off — Plex not configured'}
+            </dd>
+          </>
+        ) : null}
         {/* An admin whose share looks gone is never signed out automatically
             (ADR-0005 never-locked-out) — surfaced so the operator can go act on
             it by hand rather than wondering why nothing happened. */}

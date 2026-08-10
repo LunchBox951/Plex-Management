@@ -3243,6 +3243,28 @@ export interface components {
              */
             authorized: number;
             /**
+             * Capture Anchor Blocked
+             * @default 0
+             */
+            capture_anchor_blocked: number;
+            /**
+             * Capture Failed
+             * @default 0
+             */
+            capture_failed: number;
+            /**
+             * Capture Skipped
+             * @default 0
+             */
+            capture_skipped: number;
+            /** Capture Unavailable */
+            capture_unavailable?: ("not_configured" | "no_server_anchor") | null;
+            /**
+             * Captured
+             * @default 0
+             */
+            captured: number;
+            /**
              * Checked
              * @default 0
              */

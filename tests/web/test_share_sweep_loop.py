@@ -16,6 +16,7 @@ sign out everyone including the admin who is the only one able to repoint it
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
@@ -332,6 +333,9 @@ async def test_clean_sweep_reports_ok(app: FastAPI, seed: SeedFn) -> None:
     assert status.authorized == 1
     assert status.last_ok_at is not None
     assert status.last_run_at is not None
+    # A properly configured install never flies the capture-disabled flag: it is
+    # a real signal, not a permanent decoration.
+    assert status.capture_unavailable is None
 
 
 async def test_unconfigured_server_reports_not_configured_and_revokes_nobody(
@@ -436,3 +440,58 @@ async def test_loop_survives_a_failing_tick_and_records_it(
     assert isinstance(status, plex_access_service.ShareSweepStatus)
     assert status.state == "error"
     assert status.last_error_type == "RuntimeError"
+
+
+# --------------------------------------------------------------------------- #
+# Entitlement capture wiring (issue #484 PR-3)
+# --------------------------------------------------------------------------- #
+async def test_capture_is_declined_without_an_operator_verified_anchor(
+    app: FastAPI, seed: SeedFn, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An upgraded install (url + token, no cached identifier) resolves an
+    identifier by probing ``/identity`` live -- but that probe is NOT the anchor.
+
+    Every writer of ``plex_machine_identifier`` commits it only after the full
+    verification ladder (``/identity`` derive + an AUTHENTICATED ``list_sections``
+    + the ownership assertion), because ``/identity`` is unauthenticated and
+    reachability alone would bless a replaced server. A background sweep must not
+    route around that, so it declines capture rather than backfilling the anchor
+    itself -- and, critically, never writes the setting.
+
+    Declining is not the same as going quiet, though: the skipped users are
+    counted and the REASON is reported, because three permanent zeros on an
+    otherwise ``ok`` sweep are indistinguishable from a healthy tick that had
+    nothing to capture (north star #3).
+    """
+    await seed(initialized=True)
+    async with app.state.sessionmaker() as session:
+        store = SettingsStore(session)
+        await store.set("plex_url", "http://plex.local:32400")
+        await store.set("plex_token", "service-token")
+        await session.commit()
+    user_id = await _signed_in_user(app)
+    await _use_transport(app, _plex_tv_transport([_server_resource(_MACHINE_ID)]))
+
+    # The verdict work runs normally against the live-probed identity.
+    with caplog.at_level("WARNING"):
+        assert await _tick(app) == 1
+    status = app.state.share_sweep_status
+    assert status.authorized == 1
+    assert status.captured == 0
+    assert status.capture_failed == 0
+    # Counted, not silently absent -- and the reason names the remedy.
+    assert status.capture_skipped == 1
+    assert status.capture_unavailable == "no_server_anchor"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "entitlement capture did not run this tick" in message and "no_server_anchor" in message
+        for message in warnings
+    )
+
+    async with app.state.sessionmaker() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        assert user.share_state == "authorized"
+        assert user.entitled_section_keys is None
+        # The anchor was NOT silently backfilled from the unauthenticated probe.
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None

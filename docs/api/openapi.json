@@ -3635,6 +3635,41 @@
             "title": "Authorized",
             "type": "integer"
           },
+          "capture_anchor_blocked": {
+            "default": 0,
+            "title": "Capture Anchor Blocked",
+            "type": "integer"
+          },
+          "capture_failed": {
+            "default": 0,
+            "title": "Capture Failed",
+            "type": "integer"
+          },
+          "capture_skipped": {
+            "default": 0,
+            "title": "Capture Skipped",
+            "type": "integer"
+          },
+          "capture_unavailable": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_configured",
+                  "no_server_anchor"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Unavailable"
+          },
+          "captured": {
+            "default": 0,
+            "title": "Captured",
+            "type": "integer"
+          },
           "checked": {
             "default": 0,
             "title": "Checked",

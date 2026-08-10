@@ -93,6 +93,10 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       unverifiable: 0,
       skipped: 0,
       admins_exempted: 0,
+      captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
       signed_out: 0,
       sessions_revoked: 0,
@@ -1035,7 +1039,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 0,
-          anchor_deferred: 0,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 0,
@@ -1197,7 +1205,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 0,
-          anchor_deferred: 0,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 4,
@@ -1255,7 +1267,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 0,
-          anchor_deferred: 0,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 0,
           signed_out: 3,
           sessions_revoked: 5,
           due_remaining: 0,
@@ -1285,6 +1301,113 @@ describe('Status', () => {
     expect(sweep.queryByText('Held (anchor unconfirmed)')).not.toBeInTheDocument()
     expect(sweep.queryByText('Admins held')).not.toBeInTheDocument()
     expect(sweep.queryByText('Skipped')).not.toBeInTheDocument()
+    expect(sweep.queryByText('Entitlement capture')).not.toBeInTheDocument()
+  })
+
+  it('shows entitlement reads held when only capture hit the stale anchor', () => {
+    // Every verdict came back AUTHORIZED, so no sign-out needed deferring — but
+    // the live /identity check still refused every capture. That used to render
+    // as a clean 'running clean' tick with nothing to see.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_unconfirmed',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 2,
+          authorized: 2,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          captured: 0,
+          capture_failed: 0,
+          capture_skipped: 2,
+          capture_anchor_blocked: 2,
+          capture_unavailable: null,
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 2,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor unconfirmed')).toBeInTheDocument()
+    const held = sweep.getByText('Entitlement reads held').nextElementSibling
+    expect(held).toHaveTextContent('2')
+    expect(held).toHaveClass('font-semibold', 'text-searching')
+    // Capture is not switched off install-wide — that is a different signal.
+    expect(sweep.queryByText('Entitlement capture')).not.toBeInTheDocument()
+  })
+
+  it('names the remedy when entitlement capture is switched off install-wide', () => {
+    // An upgraded install with no verified plex_machine_identifier captures
+    // nothing, forever. Every capture counter reads zero on an otherwise clean
+    // tick — identical to a healthy install with nothing to capture — so the
+    // panel has to say so, and say what to press about it.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'ok',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-02T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 3,
+          authorized: 3,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          captured: 0,
+          capture_failed: 0,
+          capture_skipped: 3,
+          capture_anchor_blocked: 0,
+          capture_unavailable: 'no_server_anchor',
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 0,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    // The verdict half really is running clean; only capture is off.
+    expect(sweep.getByText('running clean')).toBeInTheDocument()
+    const capture = sweep.getByText('Entitlement capture').nextElementSibling
+    expect(capture).toHaveTextContent('re-save Plex settings')
+    expect(capture).toHaveClass('font-semibold', 'text-searching')
   })
 
   it('reads a stale server anchor as loudly as a crash, not as a hiccup', () => {
@@ -1308,7 +1431,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 0,
-          anchor_deferred: 6,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 6,
           signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 6,
@@ -1357,7 +1484,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 0,
-          anchor_deferred: 2,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 2,
           signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 2,
@@ -1407,7 +1538,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 2,
           admins_exempted: 0,
-          anchor_deferred: 0,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
           due_remaining: 0,
@@ -1450,7 +1585,11 @@ describe('Status', () => {
           unverifiable: 0,
           skipped: 0,
           admins_exempted: 1,
-          anchor_deferred: 0,
+          captured: 0,
+      capture_failed: 0,
+      capture_skipped: 0,
+      capture_anchor_blocked: 0,
+      anchor_deferred: 0,
           signed_out: 1,
           sessions_revoked: 1,
           due_remaining: 0,

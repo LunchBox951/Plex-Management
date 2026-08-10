@@ -1920,6 +1920,30 @@ class ShareSweepStatusItem(BaseModel):
     skipped: int = 0
     admins_exempted: int = 0
     anchor_deferred: int = 0
+    captured: int = 0
+    """Users whose section entitlements were captured this tick (#484 PR-3).
+    Capture-only: nothing enforces on those columns yet."""
+    capture_failed: int = 0
+    """Captures attempted and not persisted. Deliberately harmless -- the
+    previous snapshot survives and no verdict changes -- so it is surfaced
+    rather than left invisible."""
+    capture_skipped: int = 0
+    """Captures not even attempted: an earlier one found the Plex server
+    unreachable and the tick stopped trying, or capture is switched off for this
+    install (``capture_unavailable``). Distinct from ``capture_failed`` so a dead
+    server's real cost to the tick is visible."""
+    capture_anchor_blocked: int = 0
+    """Captures refused because the tick could not confirm the configured
+    server's identity live. Read with ``state``: it is what makes the sweep
+    report ``anchor_mismatch``/``anchor_unconfirmed`` on a tick where every
+    verdict was AUTHORIZED and no sign-out needed deferring."""
+    capture_unavailable: Literal["not_configured", "no_server_anchor"] | None = None
+    """Why capture is switched off, or ``null`` when it is running. Without it an
+    upgraded install with no verified ``plex_machine_identifier`` would report an
+    ``ok`` sweep with authorized users and permanent zeros for all three capture
+    counters -- identical to a healthy tick with nothing to capture. The remedy
+    is to finish setup, or re-save the Plex settings so the verified server
+    anchor a snapshot is stamped with gets recorded."""
     signed_out: int = 0
     """Users actually signed out. Reported rather than derived from
     ``share_revoked + token_stale``, which overstates whenever an admin was
