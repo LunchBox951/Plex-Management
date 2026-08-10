@@ -182,6 +182,7 @@ from plex_manager.domain.eviction import (
     rank_eviction_candidates,
     select_evictions,
 )
+from plex_manager.logsafe import safe_text
 from plex_manager.models import MediaRequest, SeasonRequest
 from plex_manager.services import eviction_service, purge_service
 from plex_manager.services.health_service import read_disk_usage
@@ -759,10 +760,11 @@ async def run_retention_telemetry_sweep(
         )
     except OSError as exc:
         _logger.warning(
-            "retention telemetry sweep skipped for %s root %s (%s)",
+            "retention telemetry sweep skipped for %s root %s (%s) after sweep_duration=%.3fs",
             media_type,
-            root_path,
+            safe_text(root_path),
             type(exc).__name__,
+            time.monotonic() - sweep_started,
         )
         return
 

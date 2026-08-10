@@ -3599,10 +3599,10 @@ async def _run_sweep(
             operation_name="eviction sweep disk-usage probe",
         )
     except OSError as exc:
-        _logger.warning(
+        _telemetry_logger.warning(
             "eviction sweep skipped for %s root %s (%s) after %.3fs",
             media_type,
-            root_path,
+            safe_text(root_path),
             type(exc).__name__,
             time.monotonic() - sweep_started,
         )
@@ -3673,7 +3673,7 @@ async def _run_sweep(
         _owned_by_root(active_path, root_path, scope)
         for active_path in purge_service.active_purge_paths()
     ):
-        _logger.info(
+        _telemetry_logger.info(
             "eviction sweep deferred for %s root %s: an operator correction purge "
             "is active under this root; pressure will be re-read after it settles "
             "(%.3fs)",
