@@ -572,6 +572,16 @@ export interface paths {
          *     ``errors`` (never swallowed), ``evicted`` still lists whatever succeeded,
          *     and the endpoint ALWAYS reaches ``cache.clear()`` and returns 200 —
          *     partial completion is a first-class, visible outcome, not a terminal one.
+         *
+         *     A root can also DECLINE rather than fail (issue #526): an operator correction
+         *     purge owning that root's free space either denies the sweep its
+         *     pressure-exclusion lease or defeats it mid-run, and continuing would delete
+         *     watched titles against a reading that correction is about to change. That is
+         *     neither an error nor "nothing was eligible", so it is reported per-root in
+         *     ``stood_down`` with the sweep's own static reason — otherwise an operator who
+         *     pressed this button while a report-issue was running would see an empty
+         *     ``evicted`` and no explanation, which is exactly the silence north star #3
+         *     forbids. Whatever the OTHER roots evicted still stands.
          */
         post: operations["evict_endpoint_api_v1_ops_evict_post"];
         delete?: never;
@@ -2331,13 +2341,45 @@ export interface components {
          *     root was under pressure, or nothing was eligible). ``errors`` is populated
          *     per-root when THAT root's own sweep raised -- every other root's outcome
          *     in ``evicted`` still stands; the sweep never aborts one root's already
-         *     committed work just because a sibling root failed.
+         *     committed work just because a sibling root failed. ``stood_down`` names any
+         *     root that deliberately declined because an operator correction owns its free
+         *     space (issue #526) -- the third honest shape of an empty ``evicted``, and the
+         *     one an operator would otherwise mistake for "the button did nothing".
          */
         EvictResponse: {
             /** Errors */
             errors?: components["schemas"]["EvictErrorItem"][];
             /** Evicted */
             evicted: components["schemas"]["EvictionOutcomeItem"][];
+            /** Stood Down */
+            stood_down?: components["schemas"]["EvictStoodDownItem"][];
+        };
+        /**
+         * EvictStoodDownItem
+         * @description One root whose sweep DECLINED to evict because an operator correction owns
+         *     that root's free space right now (issue #526).
+         *
+         *     Neither a failure nor a plain "nothing to do": the sweep was healthy and the
+         *     root may well be under pressure, but a correction purge either already held a
+         *     claim under it or started during the sweep and defeated its pressure-exclusion
+         *     lease -- so continuing would delete watched titles against a free-space reading
+         *     that correction is about to change. Reported rather than left in the log
+         *     (honesty over silence): an operator who presses "free space" and gets an empty
+         *     ``evicted`` deserves to know the difference between "nothing was eligible" and
+         *     "your own correction is already reclaiming this root", and that the next sweep
+         *     re-reads pressure once it settles.
+         *
+         *     ``reason`` is a STATIC, operator-facing sentence chosen by the sweep -- never a
+         *     path, a request-derived value, or an exception message.
+         */
+        EvictStoodDownItem: {
+            /** Reason */
+            reason: string;
+            /**
+             * Root
+             * @enum {string}
+             */
+            root: "movies_root" | "tv_root" | "anime_movie_root" | "anime_tv_root";
         };
         /**
          * EvictionCandidateItem
@@ -3319,6 +3361,28 @@ export interface components {
              * @default 0
              */
             authorized: number;
+            /**
+             * Capture Anchor Blocked
+             * @default 0
+             */
+            capture_anchor_blocked: number;
+            /**
+             * Capture Failed
+             * @default 0
+             */
+            capture_failed: number;
+            /**
+             * Capture Skipped
+             * @default 0
+             */
+            capture_skipped: number;
+            /** Capture Unavailable */
+            capture_unavailable?: ("not_configured" | "no_server_anchor") | null;
+            /**
+             * Captured
+             * @default 0
+             */
+            captured: number;
             /**
              * Checked
              * @default 0

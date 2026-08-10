@@ -289,6 +289,16 @@ class User(Base):
     # captured against, so a stale snapshot from a since-repointed server is
     # never mistaken for one that matches today's configuration.
     entitlements_machine_id: Mapped[str | None] = mapped_column(String)
+    # When the section read that produced the snapshot above COMPLETED -- not
+    # when it was written. Two captures for the same user can be in flight at
+    # once (the sweep's, and a sign-in's detached task); when both used the same
+    # credential and anchor, the ciphertext/anchor guards on the write pass for
+    # either ordering, so whichever finished its WRITE last would win even if it
+    # had read first. ``store_entitlements`` therefore refuses a capture older
+    # than the stored one, and this is the column that makes that comparable.
+    # ``NULL`` for a snapshot written before this column existed, which is
+    # treated as "older than anything" so the next capture always lands.
+    entitlements_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Lowercase ``plex_access_service.ShareVerdict`` name from the most recent
     # check (e.g. ``"authorized"``, ``"share_revoked"``); ``NULL`` until a
     # sweep runs.

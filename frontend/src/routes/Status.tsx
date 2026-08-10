@@ -726,6 +726,55 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
             </dd>
           </>
         ) : null}
+        {/* Entitlement capture is deliberately harmless and enforces nothing yet
+            (#484 PR-3), so a clean tick says nothing about it — the per-user
+            telemetry lives in the logs. Only FAILURES earn a row here, and even
+            then in the neutral tone: the previous snapshot survived and no
+            verdict changed. */}
+        {sweep.capture_failed > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads failed</dt>
+            <dd className="min-w-0 text-right text-ink tabular-nums [overflow-wrap:anywhere]">
+              {sweep.capture_failed}
+            </dd>
+          </>
+        ) : null}
+        {/* Captures the live anchor check refused. Shown with the same weight as
+            the deferred sign-outs above and for the same reason: the anchor is
+            what makes a stamped snapshot trustworthy, so a tick that could not
+            confirm it did not do its job — even when every verdict happened to
+            be AUTHORIZED and nothing needed deferring. The panel's state label
+            says which answer it was. */}
+        {sweep.capture_anchor_blocked > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads held</dt>
+            <dd
+              className={cn(
+                'min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]',
+                anchorChanged ? 'text-error' : 'text-searching',
+              )}
+            >
+              {sweep.capture_anchor_blocked}
+            </dd>
+          </>
+        ) : null}
+        {/* Capture switched OFF for the whole install (typically an upgrade that
+            never re-saved its Plex settings, so there is no verified server
+            anchor to stamp a snapshot with). Without this row the panel shows a
+            clean tick and no capture numbers at all — exactly what a healthy
+            install with nothing to capture looks like. The value names the
+            REMEDY rather than a count: a number of skipped users tells an
+            operator nothing about what to press (north star #2). */}
+        {sweep.capture_unavailable ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement capture</dt>
+            <dd className="min-w-0 text-right font-semibold text-searching [overflow-wrap:anywhere]">
+              {sweep.capture_unavailable === 'no_server_anchor'
+                ? 'off — re-save Plex settings'
+                : 'off — Plex not configured'}
+            </dd>
+          </>
+        ) : null}
         {/* An admin whose share looks gone is never signed out automatically
             (ADR-0005 never-locked-out) — surfaced so the operator can go act on
             it by hand rather than wondering why nothing happened. */}
@@ -923,6 +972,9 @@ export function Status() {
       const result = await evict.mutateAsync()
       const partialEvictions = result.evicted.filter((outcome) => outcome.partial)
       const completeEvictions = result.evicted.filter((outcome) => !outcome.partial)
+      // Optional in the generated type (server-side default `[]`) but always on
+      // the wire — guarded for the same reason `errors` is below.
+      const stoodDown = result.stood_down ?? []
       toast({
         // Only fully removed titles count as "freed": a partial delete left
         // content on disk, so counting it would overstate the outcome.
@@ -948,9 +1000,32 @@ export function Status() {
               ]
                 .filter(Boolean)
                 .join('. ')
-            : 'No root is under pressure, or nothing eligible was found.',
+            : // "Nothing to free" has THREE causes and only two of them mean
+              // there was nothing to do. A root that stood down (issue #526) was
+              // healthy and possibly under real pressure — it declined because
+              // the operator's own correction is already reclaiming it — so
+              // saying "nothing eligible was found" there would be a plain lie.
+              stoodDown.length > 0
+              ? 'A correction is already reclaiming space — see the note below.'
+              : 'No root is under pressure, or nothing eligible was found.',
         intent: partialEvictions.length > 0 ? 'warning' : 'success',
       })
+      if (stoodDown.length > 0) {
+        // NOT an error and NOT a failure: the sweep deliberately declined
+        // because an operator correction owns that root's free space right now,
+        // and deleting more against a reading that correction is about to change
+        // would destroy watched titles nobody needed to lose. Told plainly, with
+        // what happens next, so the button never looks like it silently did
+        // nothing (north star #3) — a separate toast, exactly like `errors`
+        // below, so a mixed sweep's real evictions still read correctly above.
+        toast({
+          title: `Held off on ${stoodDown.map((s) => s.root).join(', ')}`,
+          description: `${stoodDown
+            .map((s) => s.reason)
+            .join('; ')}. The next sweep re-reads pressure once it settles.`,
+          intent: 'info',
+        })
+      }
       // `errors` is optional in the generated type (it has a server-side
       // default of `[]`) but always present on the wire -- guard anyway so a
       // contract regen never turns this into a runtime crash.

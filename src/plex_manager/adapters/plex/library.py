@@ -95,6 +95,16 @@ class _TtlCache[V]:
 
     Only successful results are stored; misses (``None``) are not cached, so the
     sentinel ambiguity between "absent" and "cached None" never arises.
+
+    Eviction happens on WRITE as well as on read, because reads alone cannot
+    bound this cache: every key carries a hash of the credential it was fetched
+    with (see :data:`_SECTIONS_CACHE`), so a rotated Plex token retires its key
+    forever -- nothing ever calls ``get`` on it again to notice it expired.
+    Entitlement capture (#484) rotates a key per user per sign-in, so a
+    long-running process would otherwise accumulate one dead snapshot per
+    historical credential with no upper bound. The sweep is O(entries) on a dict
+    whose live size is "credentials seen in the last TTL", and only runs when
+    something is being stored anyway.
     """
 
     def __init__(self, ttl_seconds: float) -> None:
@@ -112,7 +122,10 @@ class _TtlCache[V]:
         return value
 
     def set(self, key: str, value: V) -> None:
-        self._store[key] = (time.monotonic() + self._ttl, value)
+        now = time.monotonic()
+        for expired in [k for k, (expires_at, _) in self._store.items() if expires_at <= now]:
+            del self._store[expired]
+        self._store[key] = (now + self._ttl, value)
 
     def clear(self) -> None:
         self._store.clear()
@@ -261,6 +274,88 @@ def _parse_section(entry: Mapping[str, object]) -> LibrarySection | None:
         if (path := _get_str(_as_mapping(loc), "path")) is not None
     )
     return LibrarySection(key=key, title=title, type=section_type, locations=locations)
+
+
+def _parse_sections_envelope(payload: Mapping[str, object]) -> list[LibrarySection]:
+    """Validate and parse a ``/library/sections`` body. Malformed -> raise.
+
+    "Malformed is never empty" (the #296 resources lesson). A 200 that does not
+    faithfully DESCRIBE the library set -- a reverse proxy's error page, a
+    captive portal, a truncated body, a row missing its identifying fields --
+    must never be read as "this token sees fewer (or zero) libraries". Every
+    caller acts on that difference: setup validation would report a missing movie
+    library, the folder picker would show nothing, and entitlement capture (#484)
+    would persist an authoritative snapshot that PR-5's enforcement later reads
+    as a partial or total blackout.
+
+    The complete well-formed grammar, so shapes are validated once here rather
+    than patched one at a time:
+
+    * ``MediaContainer`` must be present and a mapping.
+    * ``Directory``, when present, must be a LIST. A non-list is a shape error,
+      not an empty library set.
+    * ``Directory`` may be ABSENT only alongside an explicit ``size: 0`` -- the
+      shape a genuinely empty Plex server actually emits (it reports the count
+      and simply omits the array). Absent ``Directory`` with a non-zero or
+      missing ``size`` means rows were expected and did not arrive.
+    * ``size``, when present alongside ``Directory``, must EQUAL the number of
+      rows. The server states how many sections it is describing; a truncated
+      body (``size: 2`` with one row) or a stripped array (``size: 1`` with
+      none) contradicts itself, and taking the rows that did arrive as the
+      library set is the same wrongful narrowing as a phantom empty. This
+      endpoint is never paginated, so the count and the array always agree on a
+      healthy response.
+    * Every row must carry the fields that IDENTIFY a section (``key``,
+      ``title``, ``type``). A row missing them is a broken response, and
+      silently discarding it would hand the caller a SMALLER library set than
+      the server has -- the same wrongful-narrowing failure as a phantom empty.
+
+    A row that is well-formed but of a type this app does not manage (``photo``,
+    ``artist``, ...) is deliberately NOT an error: the server described it
+    honestly and we simply have no use for it, so it is dropped.
+    """
+    container_node = payload.get("MediaContainer")
+    if not isinstance(container_node, Mapping):
+        raise PlexLibraryError(
+            "Plex returned a 200 for /library/sections with no MediaContainer envelope"
+        )
+    container = _media_container(payload)
+    directory = container.get("Directory")
+    if directory is None:
+        if _get_int(container, "size") != 0:
+            raise PlexLibraryError(
+                "Plex returned a /library/sections body with no Directory rows and no "
+                "explicit size of 0"
+            )
+        return []
+    if not isinstance(directory, list):
+        raise PlexLibraryError(
+            "Plex returned a /library/sections body whose Directory is not a list"
+        )
+    rows = cast("Sequence[object]", directory)
+    declared_size = _get_int(container, "size")
+    if declared_size is not None and declared_size != len(rows):
+        raise PlexLibraryError(
+            "Plex returned a /library/sections body whose declared size does not match "
+            "the number of Directory rows"
+        )
+    sections: list[LibrarySection] = []
+    for entry in rows:
+        row = _as_mapping(entry)
+        if (
+            _get_str(row, "key") is None
+            or _get_str(row, "title") is None
+            or _get_str(row, "type") is None
+        ):
+            raise PlexLibraryError(
+                "Plex returned a /library/sections row missing its key, title or type"
+            )
+        section = _parse_section(row)
+        # ``None`` here can now only mean a well-formed row of an unmanaged type
+        # (photo/music) -- a legitimate drop, not a broken response.
+        if section is not None:
+            sections.append(section)
+    return sections
 
 
 def _extract_tmdb_ids(text: str) -> list[int]:
@@ -759,12 +854,7 @@ class PlexLibrary:
             if cached is not None:
                 return list(cached)
         payload = await self._get("/library/sections")
-        container = _media_container(payload)
-        sections: list[LibrarySection] = []
-        for entry in _as_sequence(container.get("Directory")):
-            section = _parse_section(_as_mapping(entry))
-            if section is not None:
-                sections.append(section)
+        sections = _parse_sections_envelope(payload)
         # Cache only a list that CONTAINS a movie section. A no-movie result is a
         # self-healing negative: validate_plex reports ok=False and tells the operator
         # to add a Movie library and test again, so caching the empty/show-only

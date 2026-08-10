@@ -142,6 +142,7 @@ filterwarnings = [
 markers = [
     "ci_serial: timing- or thread-sensitive tests run serially in CI",
     "docker: disposable tests that require a local Docker Engine and explicit opt-in",
+    "entitlement_capture: opts a web test in to the DETACHED sign-in entitlement capture",
 ]
 
 [tool.coverage.run]

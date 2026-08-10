@@ -27,6 +27,7 @@ from plex_manager.adapters import encryption
 from plex_manager.config import get_settings
 from plex_manager.db import Base, enable_sqlite_fk_enforcement, get_session
 from plex_manager.models import SystemSettings
+from plex_manager.web.routers import auth as auth_router
 
 SessionMaker = async_sessionmaker[AsyncSession]
 SeedFn = Callable[..., Awaitable[None]]
@@ -84,6 +85,35 @@ def seed(sessionmaker_: SessionMaker) -> SeedFn:
 def _ok_transport() -> httpx.MockTransport:
     """A default transport that answers any request with a trivial 200."""
     return httpx.MockTransport(lambda _request: httpx.Response(200, text="ok"))
+
+
+@pytest.fixture(autouse=True)
+def _no_detached_entitlement_capture(  # pyright: ignore[reportUnusedFunction]
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neutralize sign-in's DETACHED entitlement capture unless a test opts in.
+
+    Not squeamishness about background work -- a harness constraint. The web
+    suite runs on ONE in-memory SQLite connection (``StaticPool``: an in-memory
+    database cannot be shared any other way), so every ``AsyncSession`` in a test
+    is really the same connection and the same transaction. A task that commits
+    off the request path can therefore commit or roll back an unrelated
+    in-flight request's work -- something that cannot happen in production, where
+    each session takes its own pooled connection.
+
+    Left on, that makes any test driving two concurrent requests
+    nondeterministic. Tests that actually exercise capture mark themselves
+    ``@pytest.mark.entitlement_capture`` and get the real thing.
+    """
+    if "entitlement_capture" in request.keywords:
+        return
+
+    async def _skip(
+        _app: FastAPI, *, user_id: int, token: str, expected_token_ciphertext: str | None
+    ) -> None:
+        return
+
+    monkeypatch.setattr(auth_router, "_capture_entitlements_after_sign_in", _skip)
 
 
 @pytest.fixture
