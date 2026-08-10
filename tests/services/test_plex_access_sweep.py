@@ -612,6 +612,43 @@ async def test_a_verdict_that_cut_no_live_session_is_recorded_but_is_not_a_sign_
     assert await _live_session_count(sessionmaker_, user_id) == 0
 
 
+async def test_liveness_is_measured_at_revocation_time_not_tick_start(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The sweep captures its tick-start instant once, then runs a whole batch of
+    sequential Plex checks; a session can idle out in that window. The liveness
+    count must be measured at the revocation's own ``guard_moment``, not the
+    stale tick-start ``now`` -- against tick-start time an already-dead session
+    still looks live, and the row would report a sign-out that cut nothing."""
+    user_id = await _add_user(sessionmaker_, session_idle=True)
+    # A tick-start instant at which the (now long-idle) session still looked
+    # live: one minute after its last_seen_at, thirty days ago.
+    stale_tick_start = datetime.now(UTC) - timedelta(days=30) + timedelta(minutes=1)
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        outcome = await apply_share_verdict(
+            session,
+            user,
+            EntitlementSnapshot(
+                verdict=ShareVerdict.SHARE_REVOKED,
+                section_keys=None,
+                machine_identifier=_MACHINE_ID,
+            ),
+            expected_token="user-token",  # noqa: S106
+            now=stale_tick_start,
+        )
+        await session.commit()
+
+    assert outcome.signed_out is False
+    assert outcome.sessions_revoked == 0
+    rows = await _audit_rows(sessionmaker_)
+    assert rows[0].new_value is not None
+    assert rows[0].new_value["sessions_revoked"] == 0
+    # The dead row is still tidied away.
+    assert await _live_session_count(sessionmaker_, user_id) == 0
+
+
 async def test_a_sign_out_that_cut_sessions_says_how_many(
     sessionmaker_: SessionMaker,
 ) -> None:

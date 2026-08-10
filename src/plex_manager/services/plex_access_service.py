@@ -782,11 +782,16 @@ async def apply_share_verdict(
         # ``count_only_active`` keeps the reported number to sessions that could
         # still authenticate: the stamp still tidies away rows that had already
         # expired or idled out, but sweeping up a dead row is not a sign-out and
-        # must not be counted as one.
+        # must not be counted as one. Liveness is measured at ``guard_moment``,
+        # NOT the sweep's tick-start ``now``: up to a whole batch of sequential
+        # Plex checks can run between tick start and this branch, and a session
+        # that expired or idled out in that window ended nothing this revocation
+        # can claim -- counting it against tick-start time would report a
+        # sign-out for an already-dead session.
         revoked = await session_lifecycle.revoke_user_sessions(
             session,
             user.id,
-            now=now,
+            now=guard_moment,
             created_at_or_before=guard_moment,
             only_if_user_matches=_stored_token_ciphertext() == stored_ciphertext,
             count_only_active=True,
