@@ -10,14 +10,10 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import CursorResult, delete, exists, select
 
-from plex_manager.adapters.plex.oauth import (
-    CODE_TOKEN_INVALID,
-    PlexTvClient,
-    PlexVerifyError,
-    account_server_resource,
-)
+from plex_manager.adapters.plex.oauth import PlexTvClient, PlexVerifyError
 from plex_manager.models import MediaType, Setting, User, WatchlistItem
 from plex_manager.services import request_service
+from plex_manager.services.plex_access_service import ShareVerdict, check_share
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -219,24 +215,29 @@ async def revalidate_sync_user(
     uses (``auth._post_init_access``): authorized iff the account still
     advertises the configured server as a reachable resource.
 
-    Distinguishes a rejected/unauthorized token (:attr:`SyncUserAuthorization.
-    STALE` -- skip it) from a transient plex.tv failure (:attr:`SyncUserAuthorization.
-    UNKNOWN` -- skip this tick but keep the snapshot), so a plex.tv outage is
+    A thin delegate onto :func:`~plex_manager.services.plex_access_service.
+    check_share` (issue #391 PR-1): that function is the single source of truth
+    for the ladder and distinguishes a dead credential from a confirmed-revoked
+    share (:attr:`~plex_manager.services.plex_access_service.ShareVerdict.
+    TOKEN_STALE` vs. :attr:`~plex_manager.services.plex_access_service.
+    ShareVerdict.SHARE_REVOKED`) -- a distinction watchlist sync has never
+    needed, so both collapse back onto :attr:`SyncUserAuthorization.STALE` here
+    to keep this function's name, signature, and behavior unchanged for every
+    existing caller. A transient plex.tv failure (:attr:`~plex_manager.services.
+    plex_access_service.ShareVerdict.UNKNOWN`) maps onto :attr:`SyncUserAuthorization.
+    UNKNOWN` -- skip this tick but keep the snapshot -- so a plex.tv outage is
     never mistaken for a revoked account.
     """
-    try:
-        resources = await plex_tv.fetch_resources(token)
-    except PlexVerifyError as exc:
-        # A token plex.tv rejected outright (401/403) can never be re-authorized
-        # for the configured server, so its owner is STALE rather than
-        # "unknown/retry". Keyed off the oauth adapter's shared error code so the
-        # coupling is compile-time, not a hand-copied literal.
-        if exc.code == CODE_TOKEN_INVALID:
-            return SyncUserAuthorization.STALE
-        return SyncUserAuthorization.UNKNOWN
-    if account_server_resource(resources, machine_identifier) is None:
+    snapshot = await check_share(plex_tv, machine_identifier, token=token)
+    if snapshot.verdict is ShareVerdict.AUTHORIZED:
+        return SyncUserAuthorization.AUTHORIZED
+    if snapshot.verdict in (ShareVerdict.TOKEN_STALE, ShareVerdict.SHARE_REVOKED):
         return SyncUserAuthorization.STALE
-    return SyncUserAuthorization.AUTHORIZED
+    # UNKNOWN (transient plex.tv failure) and UNVERIFIABLE (no token -- cannot
+    # occur here since ``token`` is a required non-optional argument) both fall
+    # through to UNKNOWN: a watchlist sync tick must never treat "could not
+    # check" as "revoked".
+    return SyncUserAuthorization.UNKNOWN
 
 
 async def clear_snapshots(session: AsyncSession) -> int:
