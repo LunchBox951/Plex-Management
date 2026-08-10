@@ -319,6 +319,25 @@ reported the torrent **already present**, expressly so a failed grab never
 removes a pre-existing torrent it did not create. When a crash loses it — the
 `created` flag was never written — removal is **operator-gated**, not inferred.
 
+**The gate is staged, because enforcing it before the UI exists would break
+working buttons.** I2 writes `client_created` but the adopt/remove confirmation
+path is I3 work, and on upgrade *every* pre-existing `Download` migrates to
+NULL. A gate that hard-refuses on NULL would therefore make cancel and
+report-issue unusable for the entire existing library the moment I2 lands, with
+no in-app way through — a north-star-1 regression introduced by a north-star-1
+feature. So the gate is enforced by value, not all at once:
+
+- **`false`** (positively known not-created) → **gated from I2**. This value is
+  only ever written by I2-and-later activation, so gating it immediately
+  regresses nothing that previously worked.
+- **NULL** (unknown, including every migrated legacy row) → **warn-only until
+  I3**. Behaviour is exactly today's: the removal proceeds, and the UI states
+  plainly that ownership could not be proven. When I3 lands the confirmation
+  path, NULL is promoted to requiring explicit adoption.
+
+The warn-only interval is not a gap in safety relative to today — it *is*
+today's behaviour, surfaced honestly for the first time (north star 3).
+
 **The flag must outlive the intent.** Activation deletes the intent row, so a
 flag stored only on `download_add_intents` would evaporate one transaction after
 the torrent became tracked — and the supersession rule below deliberately routes
@@ -332,6 +351,29 @@ explicit operator adoption; its library file, which the app did place, is
 unaffected. Pre-existing rows migrate to NULL, and NULL must therefore be
 treated as "unknown → ask", never as "false → silently skip cleanup": the
 difference is visible in the UI, per north star 3.
+
+**The gate proves a torrent *instance*, not a hash.** `client_created=True` is
+evidence about the torrent that existed when `add_prepared` returned — and a
+torrent is not its info-hash. An operator can delete our torrent and later
+re-add the same release from another location; the historical `Download` row
+survives with its flag intact, and report-issue would then remove **the
+operator's replacement, with data**, on evidence that no longer refers to
+anything. Two rules close it:
+
+- **Proven absence invalidates the flag.** When reconciliation observes the
+  hash absent in the client (the existing `ClientMissing` signal), the gate is
+  cleared — it no longer describes any live torrent.
+- **Instance identity is recorded and compared.** Activation persists the
+  client's own creation timestamp for the torrent (qBittorrent's `added_on`,
+  reported alongside the `category` field this ADR already adds to
+  `DownloadStatus`), and destructive removal re-proves it matches before acting.
+  A re-added torrent carries a new `added_on`, so it fails the comparison even
+  when the hash and the flag both look right.
+
+The first rule alone is insufficient — a delete-and-re-add that completes
+between two polls is never observed as absent — which is why the instance
+marker, not the absence sweep, is the actual proof. The absence rule remains as
+defence in depth and as the cheaper signal.
 This is the named residual: the app may end up *tracking* a torrent an operator
 had already added for the same release, which is benign and already true today;
 it will not *destroy* one.
@@ -349,7 +391,7 @@ New table `download_add_intents`:
 | `source_ref` | the replayable source, **encrypted at rest**; credential-bearing indexer URLs are never persisted verbatim |
 | `save_path`, `category` | the directed path (issues #133/#157) and the submitted category (the fixed `plex-manager-intent`) |
 | `client_created` | nullable bool — `AddResult.created` as reported by `add_prepared`, written post-add. The proof that authorizes remove-with-data (see *Ownership model*); NULL means "unknown, operator-gated" |
-| `submitting_since` | nullable timestamp — the **submission lease**. Stamped in the same pre-add commit, cleared when `add_prepared` resolves. A live lease forbids the absent-transition from deleting the row (see *The submission lease*) |
+| `submitting_since` | nullable timestamp — the **submission lease**. Stamped in the same pre-add commit; cleared on a proven outcome, **held under an extended expiry on an ambiguous one**. A live lease forbids the absent-transition from deleting the row (see *The submission lease*) |
 | `media_request_id` | FK → `media_requests`, `ON DELETE SET NULL` |
 | `observed_request_status`, `observed_season_status` | the premise the grab decision observed — the CAS operands at activation, exactly as `grab()` uses them today |
 | `release_json` | the `ScoredRelease` fields needed to rebuild scopes and claims — **the release's** `target_seasons`/`covered_seasons`, not the request's stored episode filters (see lesson L10) |
@@ -411,7 +453,14 @@ needs_attention  --a NEW intent resolves the same hash, AND the park's
                                                     [superseded: row deleted,
                                                      torrent adopted by the new
                                                      intent]
-needs_attention  --operator adopt / discard-->      [row deleted]
+needs_attention  --operator adopt-->                [row deleted, torrent
+                                                    tracked]
+needs_attention  --operator discard, claims NOT retained-->
+                                                    [row deleted]
+needs_attention  --operator discard, claims RETAINED-->
+                                                    [refused until the operator
+                                                     picks remove / adopt /
+                                                     prove-absent]
 ```
 
 `activated` is not a resting state: activation is one transaction that creates
@@ -420,6 +469,26 @@ attaches `download_scopes` for `target` scopes, writes the `grabbed`
 `download_history` event, and deletes the intent. Because the claim rows are
 *swapped* rather than released and retaken, C1 holds structurally: there is no
 instant at which the footprint is unclaimed.
+
+**Activation must converge on an existing same-hash `Download`, never retry
+into it.** The intent and `downloads` are separate tables with no constraint
+between them (R1 unifies the *claim* namespace, not the row namespace), so a
+second intent can activate — creating a `Download` for the same hash — in the
+window between this grab's early known-hash check and its own intent commit.
+Nothing collides at that point; the two records simply coexist. Activation then
+tries to `create()` a `Download` whose `torrent_hash` is globally unique, fails,
+and — if it treats that as a transient conflict — retries forever, re-failing
+every cycle on a row that will never go away.
+
+So activation's first step is a **re-read of `downloads` by hash**, and its
+outcome is a convergence decision, not a retry: adopt the existing row if it
+serves this intent's request/scope (attaching scopes and swapping claim owners
+onto it), or release this intent and let the existing row stand if it does not.
+This is the same shape `grab_service._resolve_same_hash_owner` already
+implements for the download-vs-download case, and it should reuse that helper's
+logic rather than grow a parallel one. A uniqueness violation on `torrent_hash`
+during activation is therefore always a **bug or a lost race to be converged**,
+never a condition to retry unchanged.
 
 **The client recategorize is deliberately NOT in that transaction.** Setting the
 torrent's category is an irreversible external side effect, and putting it
@@ -473,9 +542,8 @@ cannot close this: the race is against an external await that no committed state
 describes.
 
 So the pre-add commit — the one that already writes the intent and its claims —
-additionally stamps `submitting_since`, and it is cleared when `add_prepared`
-resolves either way. **No absent-transition may delete or release an intent
-while its lease is live**; the cancel path leaves the row in
+additionally stamps `submitting_since`. **No absent-transition may delete or
+release an intent while its lease is live**; the cancel path leaves the row in
 `cancel_requested` and retries on a later cycle, when the submitter will have
 recorded its outcome. The lease carries a timeout because a crashed submitter
 would otherwise pin the intent forever — and expiry is safe precisely because a
@@ -483,6 +551,29 @@ crashed process has no in-flight call: after the timeout the probe-based logic
 is sound again. The timeout must exceed the adapter's own add timeout, and its
 expiry is a surfaced event, not a silent reclaim (north star 3). This costs no
 extra commit; it adds one column to a write that already happens.
+
+**When the lease clears depends on which kind of outcome `add_prepared`
+returned** — "resolves either way" is too coarse, and it reintroduces the race
+for the case that matters most. The port's failure taxonomy (Part 2, obligation
+5) already separates *proven rejection* from *ambiguous*, and the lease must
+honour that split:
+
+| `add_prepared` outcome | Lease |
+|---|---|
+| Proven success (a hash came back) | Cleared; activation proceeds |
+| **Proven rejection** (a response shape that conclusively proves the client did not accept) | Cleared immediately — nothing was submitted |
+| **Ambiguous** (proxy 502/504, 5xx after mutation, unparsable) | **Held**, under an extended expiry |
+
+The ambiguous row is the point. An interposed proxy can return 504 while the
+upstream `POST /torrents/add` is still in flight, and the torrent may appear
+*after* the call returned. Clearing the lease there would let an immediate
+probe — which correctly reports the hash absent, because it has not landed
+yet — free the intent moments before the torrent materialises: the original
+orphan, reached by a narrower door. So an ambiguous outcome keeps the lease and
+extends it, trading a bounded delay in cancellation for the guarantee that no
+absent-transition can outrun a submission that is still settling. The extended
+window must exceed the plausible upstream-settling time, and, as above, its
+expiry is surfaced rather than silent.
 
 **Superseding a parked intent (the re-park loop).** A parked intent releases its
 ownership tokens (L3) but its client torrent may still exist under our intent
@@ -492,8 +583,20 @@ category. A later grab of the same release resolves the *same* hash, and
 rule the new intent probes, finds a torrent it did not create, parks — and the
 cycle repeats forever. The rule: **an identical hash is identical content**, so
 when a new intent resolves a hash already held by a parked intent's torrent, the
-new intent **supersedes** the parked row — the parked row is deleted and its
-torrent is adopted by the successor, which proceeds to activation normally.
+new intent **supersedes** the parked row — its torrent is adopted by the
+successor, which proceeds to activation normally.
+
+**Supersession transfers claims; it must not delete-then-reacquire.** A parked
+intent that retained its claims (the liveness rule above) still owns them under
+`uq_download_coverage_claims_active`, so a successor cannot acquire its own —
+and deleting the parked row first would `ON DELETE CASCADE` those claims out of
+existence, momentarily unclaiming the footprint of a torrent that is still
+downloading. Both orderings are wrong. Supersession is therefore a single
+transaction that **owner-swaps every retained claim from the parked intent to
+the successor** and then deletes the now-claimless parked row — the identical
+move activation makes when swapping `intent_id` to `download_id`, applied one
+step earlier. C1 holds for the same structural reason: the claim row never stops
+existing, it only changes owner.
 Because `client_created` is false or NULL on that path, the successor may track
 and import the torrent but may not remove it with data without operator
 adoption (see *Ownership model*), and that restriction now travels onto the
@@ -530,11 +633,32 @@ both:
 
 | Park cause | Supersedable? (round-3 rule) | Claims on park |
 |---|---|---|
-| `duplicate_add` — our own duplicate-add no-op | **Yes** | Released (inert) |
-| `premise_conflict` — request/season moved on mid-flight | Yes, once the premise resolves | **Retained** while an owned torrent is live |
+| `duplicate_add` — our own duplicate-add no-op | **Yes** | Per the liveness rule below |
+| `premise_conflict` — request/season moved on mid-flight | Yes, once the premise resolves | Per the liveness rule below |
 | `hash_mismatch` / `resubmit_cap` — we created torrents we cannot address | No | **Retained** |
-| `foreign_category` — the hash belongs to someone else | No (a provenance refusal) | Released — nothing of ours is live |
+| `foreign_category` — the hash is under a category that is not ours | No (a provenance refusal) | Per the liveness rule below — **not** automatically released |
 | `source_unresolvable` — never submitted | Yes, once a source resolves | Released (inert) |
+
+**The liveness axis keys on evidence of an app-created torrent, never on the
+category.** An earlier draft released claims for every `foreign_category` park
+on the reasoning that "the hash belongs to someone else". That is wrong
+whenever `client_created` is true: `add_prepared` positively reported creating
+this torrent, and a category is mutable, so an *externally relabelled*
+app-created torrent lands in the `foreign_category` branch while still being a
+live mutation this app performed. Releasing its coverage would reopen the very
+#477 gap this design closes. The rule is therefore evaluated per row, not per
+cause:
+
+> **Retain claims whenever the intent carries evidence of a live app-created
+> torrent** — `client_created` is true, or it is NULL *and* the client has not
+> proven the hash absent. Release only when creation is positively disproven
+> (`client_created` false) or absence is proven.
+
+`foreign_category` still governs the *provenance* decision — the app does not
+adopt, recategorize, or destroy — but provenance and liveness are independent
+questions, and only the second one decides claims. `source_unresolvable` is the
+one cause that is inert by construction: it parks before any submission, so
+there is nothing live to protect.
 
 Retention is **conditional and terminating**, which is what reconciles it with
 L3: a retained claim is held only until its torrent is removed, adopted, or
@@ -544,6 +668,17 @@ exit. What must never happen is the other failure: releasing tokens for a
 torrent that is still moving bytes. Where the two rules would conflict, **the
 liveness axis wins**, because an invisible live torrent is the more dangerous
 state.
+
+**Operator discard is qualified by the same axis.** A bare "discard" on a park
+that retains its claims would delete the row and cascade the claims away —
+exactly the unclaimed-live-torrent state the retention exists to prevent, only
+reached by a button instead of a bug. So discard is offered unconditionally only
+for inert parks. For a claim-retaining park the UI does not offer a bare
+discard: it requires the operator to first resolve the torrent — **remove** it
+(subject to the destructive gate), **adopt** it into a request, or **prove it
+absent** (a probe confirming the client no longer holds it) — after which the
+park is inert and discard proceeds. This keeps north star 1 satisfied (there is
+always a button) without letting the button reintroduce the defect.
 
 In every case the `torrent_hash` ceases to *reserve* the hash against a future
 grab (see *Hash uniqueness*), and the row is retained with its reason and
@@ -964,7 +1099,10 @@ review deliberately rather than continuously.*
   already-shipped, well-tested paths, and it is the part of this design most
   likely to surprise: a rollback that reintroduces unconditional removal, or a
   migration that defaults existing rows to `false` instead of NULL, silently
-  changes what those buttons do. NULL means *ask*, never *skip*.
+  changes what those buttons do. The gate is **staged by value** — `false`
+  enforced from I2, NULL warn-only until I3's confirmation path exists — so
+  landing I2 alone never strands an operator without a way to cancel or report
+  an existing download.
 - **Category tampering is an accepted, named residual.** Because a category is
   mutable, a relabelled-out torrent is invisible to the filtered sweep and a
   relabelled-in torrent is refused rather than adopted. The tiered ownership
@@ -1011,7 +1149,16 @@ review deliberately rather than continuously.*
   which must not delete the intent while the lease is live** (and must proceed
   once it expires); a retained-claim park keeping its coverage until its torrent
   is removed, adopted, or proven absent; and `pending_recategorize` surviving a
-  crash and being retried to a confirmed category.
+  crash and being retried to a confirmed category. Added by the final review
+  round: an externally relabelled `client_created=True` torrent **retaining**
+  its claims through a `foreign_category` park; a delete-and-re-add of the same
+  hash failing the instance-marker comparison before a destructive removal;
+  activation converging on a same-hash `Download` created by another intent
+  rather than retrying `create()`; supersession **transferring** retained claims
+  in one transaction rather than cascading them away; discard refused on a
+  claim-retaining park until the operator resolves the torrent; an ambiguous
+  `add_prepared` outcome **holding** the lease against an immediate
+  absent-probe; and the staged gate leaving NULL rows removable during I2.
 
 ## Implementation scope
 
@@ -1029,15 +1176,19 @@ review deliberately rather than continuously.*
   side and a movie eviction predicate that consults them.
 - **I2 (port split + client-facing recovery): Large.** The port contract change
   and its adapter work (including the v2-magnet route, persisting
-  `client_created`, and adding `category` to `DownloadStatus`), intent recovery
-  with per-item isolation and backoff, the park-liveness taxonomy, the
+  `client_created`, and adding `category` + `added_on` to `DownloadStatus`),
+  intent recovery with per-item isolation and backoff, the park-liveness
+  taxonomy, same-hash activation convergence, claim transfer on supersession,
+  the staged (warn-only-on-NULL) destructive gate, the
   hash becoming `NOT NULL`, the single retirement point, the parked-intent
   supersession rule, and the cancel↔recovery serialization. This is where every
   #538 P1 lived; it deserves its own review window against a frozen commit.
 - **I3 (correction surface): Medium.** The two exact-match sweeps and their
   cadence, the on-demand deep scan, the observation table, the adopt/remove
-  verbs with their tiered ownership proofs, the OpenAPI/client regeneration, and
-  the frontend surface.
+  verbs with their tiered ownership proofs, **the confirmation path that
+  promotes the NULL gate from warn-only to enforced**, the resolve-before-discard
+  flow for claim-retaining parks, the OpenAPI/client regeneration, and the
+  frontend surface.
 
 **Recommendation:** accept this ADR as `Proposed`, land **I1** (+ **I1b**) first
 as a self-contained fix for #477, and let it soak on `:edge` before committing
@@ -1074,6 +1225,22 @@ revision or its PRs), because they do not change the option choice:
    generation marker.
 8. **Whether `client_only_torrents` observations are also the storage for I2's
    `needs_attention` surface**, or a separate list with a shared component.
+9. **The two lease durations.** The ordinary `submitting_since` timeout must
+   exceed the adapter's add timeout; the *extended* expiry after an ambiguous
+   outcome must exceed the plausible upstream-settling time of an interposed
+   proxy, which the app cannot measure. Both are safety-vs-latency trades on
+   cancellation responsiveness, and both should be configurable rather than
+   guessed once. Whether the ambiguous case warrants a distinct state
+   (`submitting_ambiguous`) or just a longer expiry on the same column is an
+   implementation choice; the constraint is that an ambiguous outcome must never
+   clear the lease immediately.
+10. **Instance-marker portability.** `added_on` is the qBittorrent-specific
+   spelling of "this torrent instance". The *requirement* is fixed — a
+   destructive removal must re-prove instance identity, not just hash identity —
+   but a future download-client adapter may expose no equivalent. What such an
+   adapter does (degrade to operator-gated removal, or synthesize a marker at
+   add time) is left open, and is the kind of thing ADR-0006's port contract
+   should state explicitly when a second adapter actually arrives.
 
 ## Alternatives considered
 
