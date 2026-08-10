@@ -41,7 +41,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import String, case, func, or_, select, type_coerce, update
 
 from plex_manager.adapters.plex.oauth import (
     CODE_TOKEN_INVALID,
@@ -70,6 +70,7 @@ __all__ = [
     "check_share",
     "count_due_share_checks",
     "list_due_share_checks",
+    "record_failed_attempt",
     "sweep_shares",
 ]
 
@@ -530,6 +531,52 @@ async def count_due_share_checks(
     return (await session.execute(stmt)).scalar_one()
 
 
+def _stored_token_ciphertext() -> ColumnElement[str]:
+    """``users.encrypted_plex_token`` as the RAW ciphertext actually on disk.
+
+    ``EncryptedStr`` encrypts on bind and decrypts on result, and Fernet is
+    non-deterministic (fresh IV + timestamp per call), so encrypting the same
+    plaintext twice yields different ciphertext. That makes the obvious
+    ``WHERE encrypted_plex_token = :plaintext`` guard impossible: the bound value
+    would be a brand-new ciphertext that can never equal the stored one.
+    ``type_coerce`` to plain ``String`` opts out of BOTH halves of that
+    processing, so the column reads as the stored ciphertext and compares against
+    a ciphertext we captured earlier -- a byte-for-byte "is this still the exact
+    row I read?" test, which is what the guard actually needs.
+
+    Conservative by construction: a re-sign-in that stores the SAME plaintext
+    still writes different ciphertext, so the guard treats it as changed and
+    declines to revoke. Erring toward keeping a session for one more interval is
+    the right direction (ADR-0005), and the next sweep re-evaluates.
+    """
+    return type_coerce(User.encrypted_plex_token, String)
+
+
+async def record_failed_attempt(session: AsyncSession, user_id: int, *, now: datetime) -> None:
+    """Record that a revalidation was ATTEMPTED for this user and did not land.
+
+    The same two columns an ``UNKNOWN`` verdict writes, for the case that never
+    produced a verdict at all: an unexpected exception out of
+    :func:`check_share`. Without this the crashing user's ``share_check_failed_at``
+    never moves, so :func:`_last_attempt_at` keeps them at the front of the due
+    queue and the same failing cohort is re-selected every tick forever --
+    exactly the starvation the last-attempt ordering exists to prevent, reached
+    through the defensive branch instead of the UNKNOWN one (Codex round 2 on
+    PR #557).
+
+    An in-place ``UPDATE`` (not a loaded instance) so it needs no prior read and
+    cannot clobber a concurrent write to any other column. Does not commit.
+    """
+    await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            share_check_failures=User.share_check_failures + 1,
+            share_check_failed_at=now,
+        )
+    )
+
+
 def _clear_entitlements(user: User) -> None:
     """Drop a captured section snapshot that a confirmed revoke has invalidated.
 
@@ -595,32 +642,59 @@ async def apply_share_verdict(
     ``expected_token``). Two things make that guard actually hold against a
     sign-in landing mid-apply (Codex review of PR #557):
 
-    1. The token is re-read with a fresh in-transaction ``SELECT`` rather than
-       trusted from the ``user`` instance loaded before this tick's network call,
-       and NOTHING is awaited between that read and the revocation below -- so no
-       other task can interleave, and under READ COMMITTED the read observes a
-       sign-in that has already committed.
-    2. The revocation is bounded to sessions that existed AT that read
-       (``created_at_or_before``). A session minted after it belongs to the fresh
-       sign-in and must survive. This is the belt to (1)'s braces and is what
-       covers the PostgreSQL MVCC posture, where a concurrent sign-in can commit
-       between our statements and be invisible to a snapshot taken earlier.
+    1. The token condition rides the revocation UPDATE ITSELF, as a correlated
+       ``EXISTS`` over ``users`` comparing the stored ciphertext byte-for-byte to
+       what this guard read (``only_if_user_matches``; see
+       :func:`_stored_token_ciphertext` for why the comparison is on ciphertext
+       rather than plaintext). One conditioned statement cannot be overtaken the
+       way a read-then-write can: under READ COMMITTED the UPDATE re-evaluates its
+       predicates against the latest committed row after any lock wait, so a
+       sign-in that committed a new token makes it match ZERO rows on every
+       supported backend. It also moots any autoflush interleaving for the
+       token-changed case. The Python-side comparison below stays as the fast,
+       honest early exit -- it is no longer what makes the guard safe.
+    2. The revocation is additionally bounded to sessions that existed at the
+       guard instant (``created_at_or_before``), which covers the case (1) cannot:
+       a sign-in that reuses the SAME token still mints a new session, and that
+       session must survive.
 
-    Residual, stated rather than hidden: the bound compares a Python-side instant
-    against ``AuthSession.created_at``, which is a server-side default
-    (``func.now()``). Under clock skew between app and database the bound could
-    spare a session it was meant to cut, which the next sweep after the
-    revalidation interval re-evaluates -- the same worst case the interval
-    already defines. The bound errs toward keeping a session rather than cutting
-    a legitimate new one, which is the direction ADR-0005 asks for.
+    **PostgreSQL posture.** Two residuals, neither reachable on the only
+    supported topology (SQLite, single-writer, which serializes these statements
+    outright):
+
+    * ``AuthSession.created_at`` defaults to ``func.now()``, which on PostgreSQL
+      is TRANSACTION-START time. A same-token sign-in whose transaction began
+      before ``guard_moment`` but committed after it therefore stamps a
+      ``created_at`` inside the bound and can still be cut. The direction is
+      toward cutting a fresh session rather than sparing a revoked one; it is
+      bounded (one session) and self-healing (the user signs in again, and a
+      genuinely-revoked user cannot complete sign-in because
+      ``auth._post_init_access`` re-checks the share on every sign-in). Closing it
+      fully would need real serialization, which is not worth engineering for a
+      backend this app does not yet run on.
+    * Symmetrically, app-vs-database clock skew could put a legitimately-old
+      session outside the bound and spare it; the next sweep after the
+      revalidation interval re-evaluates, the same worst case the interval
+      already defines.
     """
     # Deliberately the FIRST await of this branch and the last one before the
     # revoke: see the docstring. ``guard_moment`` is captured before the read so
-    # the bound can never exclude a session that existed when we looked.
+    # the bound can never exclude a session that existed when we looked, and the
+    # ciphertext is captured alongside the plaintext so the UPDATE below can
+    # re-assert "still the same row" atomically.
     guard_moment = datetime.now(UTC)
-    stored_token = (
-        await session.execute(select(User.encrypted_plex_token).where(User.id == user.id))
-    ).scalar_one_or_none()
+    guard_row = (
+        await session.execute(
+            # The ciphertext column is LABELLED: without it both selected
+            # expressions key to ``users.encrypted_plex_token`` and the row
+            # cannot be resolved.
+            select(
+                User.encrypted_plex_token,
+                _stored_token_ciphertext().label("token_ciphertext"),
+            ).where(User.id == user.id)
+        )
+    ).one_or_none()
+    stored_token, stored_ciphertext = guard_row if guard_row is not None else (None, None)
     if stored_token != expected_token:
         _logger.info(
             "share revalidation skipped for user_id=%s: the stored Plex token changed "
@@ -693,11 +767,15 @@ async def apply_share_verdict(
         )
         revoked = 0
     else:
-        # Bounded to what existed at ``guard_moment`` -- nothing has been awaited
-        # since that read, so a session newer than it can only be a sign-in this
-        # verdict knows nothing about.
+        # ONE conditioned statement (see the docstring): the token equality is
+        # re-asserted by the UPDATE itself against the latest committed row, and
+        # the revocation is bounded to sessions that existed at ``guard_moment``.
         revoked = await session_lifecycle.revoke_user_sessions(
-            session, user.id, now=now, created_at_or_before=guard_moment
+            session,
+            user.id,
+            now=now,
+            created_at_or_before=guard_moment,
+            only_if_user_matches=_stored_token_ciphertext() == stored_ciphertext,
         )
     await audit_service.record(
         session,
@@ -837,13 +915,31 @@ async def sweep_shares(
     for user_id, token in candidates:
         try:
             snapshot = await check_share(plex_tv, machine_identifier, token=token)
-        except Exception as exc:  # pragma: no cover - defensive; check_share maps its own errors
+        except Exception as exc:
             last_error = type(exc).__name__
             _logger.warning(
                 "share revalidation errored for user_id=%s (%s); leaving access unchanged",
                 safe_int(user_id),
                 type(exc).__name__,
             )
+            # Persist the failed ATTEMPT, exactly as the UNKNOWN verdict does.
+            # Without it this user's ``share_check_failed_at`` never moves, so
+            # ``_last_attempt_at`` keeps them at the head of the due queue and a
+            # crashing cohort re-consumes the whole budget every tick forever --
+            # the same starvation the ordering fix closed, reached through this
+            # branch instead (Codex round 2 on PR #557). Its own short
+            # transaction, and itself guarded: a bookkeeping failure must not end
+            # the sweep for everyone behind this user.
+            try:
+                async with sessionmaker() as session:
+                    await record_failed_attempt(session, user_id, now=datetime.now(UTC))
+                    await session.commit()
+            except Exception:
+                _logger.exception(
+                    "share revalidation could not record the failed attempt for user_id=%s; "
+                    "they may be re-selected next tick",
+                    safe_int(user_id),
+                )
             continue
         if snapshot.verdict is ShareVerdict.SHARE_REVOKED and not await _anchor_confirmed():
             # Act on NOTHING: no stamp, no revoke, no audit row. Leaving

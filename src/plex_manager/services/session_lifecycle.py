@@ -31,11 +31,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, and_, delete, func, or_, update
+from sqlalchemy import CursorResult, and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from plex_manager.models import AuthSession
+from plex_manager.models import AuthSession, User
 
 __all__ = [
     "SESSION_IDLE_WINDOW",
@@ -147,6 +147,7 @@ async def revoke_user_sessions(
     *,
     now: datetime | None = None,
     created_at_or_before: datetime | None = None,
+    only_if_user_matches: ColumnElement[bool] | None = None,
 ) -> int:
     """Stamp ``revoked_at`` on every ACTIVE session for ``user_id``; return count.
 
@@ -165,6 +166,27 @@ async def revoke_user_sessions(
     sign-in completing in between has its brand-new session cut on the strength
     of a verdict that predates it. See
     ``plex_access_service.apply_share_verdict`` for the one caller that needs it.
+
+    **PostgreSQL posture** for that bound: ``AuthSession.created_at`` is a
+    server-side ``func.now()`` default, which on PostgreSQL is TRANSACTION-START
+    time, so a session whose transaction opened before the caller's instant but
+    committed after it still stamps a ``created_at`` inside the bound and is
+    cut. Unreachable on SQLite (single-writer, which serializes these outright),
+    bounded to one session, and self-healing -- the user simply signs in again.
+    Documented rather than engineered around; see the caller's docstring.
+
+    ``only_if_user_matches`` is an extra predicate on the OWNING ``users`` row,
+    applied as a correlated ``EXISTS`` on the UPDATE itself so the whole
+    revocation is ONE conditioned statement rather than a read followed by a
+    write. An automated caller whose decision depends on some property of the
+    user (for the share sweep: "the stored Plex token is still the one this
+    verdict was computed from") passes it here instead of checking in Python,
+    because a separate read cannot be atomic with the write: under READ
+    COMMITTED the UPDATE re-evaluates its predicates against the latest committed
+    row after any lock wait, so a sign-in that committed a new token in between
+    makes the statement match zero rows. This module stays ignorant of what the
+    predicate means -- and, deliberately, of encryption: the caller owns how its
+    column compares.
     """
     stamp = now if now is not None else datetime.now(UTC)
     stmt = update(AuthSession).where(
@@ -172,6 +194,8 @@ async def revoke_user_sessions(
     )
     if created_at_or_before is not None:
         stmt = stmt.where(AuthSession.created_at <= created_at_or_before)
+    if only_if_user_matches is not None:
+        stmt = stmt.where(select(User.id).where(User.id == user_id, only_if_user_matches).exists())
     result = cast(
         CursorResult[Any],
         await session.execute(stmt.values(revoked_at=stamp)),
