@@ -204,6 +204,17 @@ async def revoke_user_sessions(
     into an action it never performed. ``only_if_user_matches`` is honoured
     either way -- if the guard rejects the UPDATE it matches zero rows, and the
     active count is reported as 0 rather than as what would have been cut.
+
+    **PostgreSQL posture** for the count: it is a separate SELECT immediately
+    before the conditioned UPDATE, so under a concurrent writer a live session
+    counted here can be revoked (or log out) before the UPDATE runs, and the
+    returned number would then overstate what this call actually cut. Unreachable
+    on SQLite (single-writer serializes the two statements outright), bounded to
+    one sweep tick's report, and self-healing at the next tick. Same class as
+    the transaction-time ``created_at`` residual documented above and tracked
+    with the PostgreSQL-gate blockers (issue #558): closing it means deriving
+    liveness from the UPDATE's own ``RETURNING`` rows, which belongs with the
+    first PostgreSQL-supporting release, not SQLite-era maintenance.
     """
     stamp = now if now is not None else datetime.now(UTC)
     active_count: int | None = None
