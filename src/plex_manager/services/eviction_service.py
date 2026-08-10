@@ -435,6 +435,34 @@ _TRANSFER_ACTIVE_DOWNLOAD_STATES: frozenset[str] = frozenset(
 )
 
 
+class _PressureLeaseDefeated(Exception):
+    """The sweep's root-scoped pressure-exclusion lease was DEFEATED at the
+    delete boundary by a correction starting under the same root (issue #526).
+
+    Raised from :func:`_evict_one`'s ``before_delete`` hook, which the purge
+    primitive runs after the delete-worker permit is held and immediately before
+    the destructive worker starts. The primitive propagates a hook failure
+    unchanged and starts no delete, so the caller catching this has a hard
+    guarantee that nothing left disk and the claimed row can simply be restored.
+
+    This is the BARRIER half of the lease. The sweep also consults the lease
+    before drawing each victim, but that check has the same await-window hole
+    every snapshot-style recheck has (candidate assembly, the Plex watch-state
+    re-read, the purge primitive's own preflight probes and its unbounded wait
+    for one of four delete permits all sit between it and the first unlinked
+    byte). Re-reading the latch HERE is what makes "no eviction delete starts
+    after a correction claimed a path under this root" true rather than likely.
+
+    ``reason`` is the STATIC literal the defeating verb supplied to
+    :func:`~plex_manager.services.purge_service.revoke_pressure_exclusions` --
+    never a request-derived string, so it is safe to log directly (AGENTS.md).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _RecoveryPurgeRevoked(Exception):
     """A marker-owned recovery purge was revoked AT the delete boundary.
 
@@ -2521,6 +2549,7 @@ async def _evict_one(
     pending: _Pending,
     grace_cutoff: datetime,
     note_unmeasured_free: Callable[[], None] | None = None,
+    pressure_lease: purge_service.PressureExclusionLease | None = None,
 ) -> EvictionOutcome | None:
     """Claim (status CAS) + delete + log ONE selected candidate, in that order
     (#67): the atomic claim runs BEFORE the delete, so nothing is deleted until
@@ -2708,6 +2737,18 @@ async def _evict_one(
     delete that already relieved the pressure cannot make it keep deleting watched
     titles against a snapshot taken before that destruction. ``None`` (the default)
     for callers with no pressure ledger to keep.
+
+    ``pressure_lease`` is the pressure-triggered sweep's root-scoped exclusion
+    (issue #526), threaded down so its defeat latch can be re-read at the DELETE
+    BOUNDARY -- inside the purge primitive's ``before_delete`` hook, under the held
+    delete permit, after every probe and every permit wait this function's earlier
+    checks predate. A lease defeated by then means a correction claimed a path under
+    this root while this eviction was in flight, so the free-space reading that
+    authorized it is no longer true: the delete is revoked before it starts and the
+    claimed row is restored to ``available``, exactly as for a refused delete.
+    ``None`` for callers with no pressure arithmetic to protect -- crash recovery
+    (which converges an already-started delete, see the recovery policy comment) and
+    proactive sweeps (no pressure gate, hence no reading to invalidate).
     """
     library_path = candidate.library_path
     if library_path is None:
@@ -2963,6 +3004,18 @@ async def _evict_one(
 
     async def _mark_delete_started() -> None:
         nonlocal delete_marker_committed
+        # THE PRESSURE-EXCLUSION BARRIER (issue #526), read FIRST -- before the
+        # marker is armed, so a defeated lease leaves the row byte-for-byte as the
+        # claim left it and the restore below has nothing to compensate. Everything
+        # that authorized this delete (the root's free-space probe, candidate
+        # ranking, the claim CAS) predates the primitive's two preflight probes and
+        # its UNBOUNDED wait for one of four delete permits; a correction claiming a
+        # path under this root anywhere in that stretch invalidates the reading, and
+        # this latch is the last cancellable point at which the sweep can still act
+        # on that. After it returns, only a synchronous thread start separates this
+        # from the first unlinked byte.
+        if pressure_lease is not None and pressure_lease.revoked_reason is not None:
+            raise _PressureLeaseDefeated(pressure_lease.revoked_reason)
         await _arm_partial_delete(session, pending, library_path)
         await session.commit()
         delete_marker_committed = True
@@ -2982,6 +3035,27 @@ async def _evict_one(
             hold_purge_registration=True,
             before_delete=_mark_delete_started,
         )
+    except _PressureLeaseDefeated as defeated:
+        # A correction claimed a path under this root while this eviction was in
+        # flight. The boundary hook raised BEFORE arming the marker and the primitive
+        # started no delete, so the tree is provably intact and nothing needs
+        # compensating -- release the claim the ordinary way a refused delete does,
+        # so the row is never stranded ``evicted`` over a live file, and let the next
+        # sweep re-decide it against the post-correction disk reading.
+        await _restore_after_failed_delete(session, pending)
+        _logger.info(
+            "eviction of %r%s revoked at the delete boundary: %s; restored to "
+            "'available' (nothing deleted), and the next sweep re-reads pressure "
+            "after the correction settles",
+            safe_text(candidate.title),
+            season_note,
+            defeated.reason,
+            extra={
+                "request_id": safe_int(pending.media_request_id),
+                "tmdb_id": safe_int(pending.tmdb_id),
+            },
+        )
+        return None
     except purge_service.DeleteWorkerStartError:
         # No delete ran and none ever will for this attempt, so the marker armed a
         # moment ago is now a false statement about an intact tree. Compensate it
@@ -3348,6 +3422,7 @@ async def run_eviction_sweep(
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
     qbt: DownloadClientPort | None = None,
+    on_stood_down: Callable[[str], None] | None = None,
 ) -> list[EvictionOutcome]:
     """One sweep pass for ONE configured root/media-kind.
 
@@ -3400,6 +3475,30 @@ async def run_eviction_sweep(
     instead of racing crash-recovery against a delete that is still physically
     running.
 
+    SERIALIZED against OPERATOR CORRECTIONS (issue #526): a pressure-triggered
+    sweep also holds a root-scoped PRESSURE-EXCLUSION LEASE
+    (:func:`~plex_manager.services.purge_service.acquire_pressure_exclusion`) for
+    its whole run, taken below before the first disk probe. Denied one — a
+    correction purge already owns a path under this root — it runs crash recovery
+    and then defers, because that correction's own delete may satisfy the root
+    by itself. A correction STARTING later DEFEATS the lease (it never queues
+    behind a sweep) and this sweep stands down: no further eviction delete is
+    started under the root, checked both before each victim is drawn and, as the
+    real barrier, at the purge primitive's delete boundary. A proactive sweep
+    takes no lease — it has no pressure reading a correction could invalidate.
+    See ``_run_sweep``'s lease comment for the full invariant and the exactly two
+    things it deliberately does NOT cover: a delete worker already started (it
+    cannot be recalled), and crash recovery, which runs before the stand-down and
+    ignores the lease on purpose so gutted media always converges.
+
+    ``on_stood_down`` is invoked AT MOST ONCE, with the STATIC reason, when this
+    sweep declines or stops for that lease. A sweep that stands down returns the
+    same empty/partial ``[]`` a below-threshold tick does, so a caller that only
+    reads the return value cannot tell "nothing was eligible" from "an operator
+    correction owns this root" -- which is exactly the difference the person who
+    pressed ``POST /ops/evict`` needs to see (``EvictResponse.stood_down``). The
+    periodic tick has the telemetry log and passes ``None``.
+
     CAVEAT (issue #421 / #431): the ``_ACTIVE_PURGE_PATHS`` purge-vs-placement
     race this latch is often discussed alongside is now CLOSED even at process
     shutdown — :func:`~plex_manager.services.purge_service.purge_library_path`
@@ -3431,6 +3530,26 @@ async def run_eviction_sweep(
         )
         return []
     _sweep_latch["busy"] = True
+    # THE ROOT-SCOPED PRESSURE-EXCLUSION LEASE (issue #526), taken here -- before
+    # the body's very first disk probe -- so that no reading this sweep ever
+    # reasons about predates the reservation. A correction claiming a path under
+    # this root from now on DEFEATS the lease instead of racing it, and the body
+    # stands down before starting any further delete; see ``_run_sweep``'s lease
+    # comment for the invariant, its bounds, and the one irreducible sliver.
+    #
+    # Denial (``None`` for a non-proactive sweep) is NOT handled here: the body
+    # still runs crash recovery first, which must converge at any pressure and
+    # regardless of who else is correcting. No ``await`` separates the latch, the
+    # scope and the acquisition, so the whole step is atomic on this loop.
+    scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
+    pressure_lease = (
+        None
+        if proactive
+        else purge_service.acquire_pressure_exclusion(
+            label=root_path,
+            owns_path=lambda active_path: _owned_by_root(active_path, root_path, scope),
+        )
+    )
     try:
         return await _run_sweep(
             session=session,
@@ -3444,8 +3563,15 @@ async def run_eviction_sweep(
             proactive=proactive,
             all_roots=all_roots,
             qbt=qbt,
+            pressure_lease=pressure_lease,
+            on_stood_down=on_stood_down,
         )
     finally:
+        # Released on EVERY exit, including a cancellation still unwinding through
+        # a shielded delete settlement -- a leaked lease would silently absorb
+        # every later correction's revocation for the life of the process.
+        if pressure_lease is not None:
+            purge_service.release_pressure_exclusion(pressure_lease)
         _sweep_latch["busy"] = False
 
 
@@ -3575,9 +3701,17 @@ async def _run_sweep(
     proactive: bool = False,
     all_roots: Sequence[str] | None = None,
     qbt: DownloadClientPort | None = None,
+    pressure_lease: purge_service.PressureExclusionLease | None = None,
+    on_stood_down: Callable[[str], None] | None = None,
 ) -> list[EvictionOutcome]:
     """The sweep body, entered only under :func:`run_eviction_sweep`'s
-    serialization latch — see the public docstring.
+    serialization latch and holding whatever pressure-exclusion lease that caller
+    managed to take — see the public docstring.
+
+    ``pressure_lease`` is ``None`` in exactly two cases the body distinguishes by
+    ``proactive``: a proactive sweep never takes one (nothing to exclude), while a
+    pressure-triggered sweep with ``None`` was DENIED one — a correction already
+    owns a path under this root — and stands down after crash recovery below.
 
     Every return path below logs an honest, always-on TELEMETRY line (issue
     #353's perf-confirmation half; an exception escaping this body -- e.g.
@@ -3613,7 +3747,6 @@ async def _run_sweep(
     # candidate for this (parent) root's pressure. Computed BEFORE the pressure
     # pre-check because the crash-recovery pass below needs it too.
     scope: Sequence[str] = all_roots if all_roots is not None else (root_path,)
-    disk_used_pct = used_percent(disk)
     grace_cutoff = datetime.now(UTC) - timedelta(days=grace_days)
 
     # Crash recovery FIRST, and deliberately BEFORE the pressure pre-check: a
@@ -3643,45 +3776,103 @@ async def _run_sweep(
     ):
         disk = await _reprobe_disk(root_path, fallback=disk)
 
-    # A multi-step operator correction can be between its DB publish and physical
-    # purge while recovery runs. Its delete may satisfy this root's pressure, so a
-    # non-proactive sweep must not select other victims from the snapshot taken
-    # before that purge. The next periodic/manual sweep re-reads pressure after the
-    # correction releases its claim.
+    # THE PRESSURE-EXCLUSION LEASE (issue #526). A multi-step operator correction can
+    # be anywhere between its DB publish and its physical purge, and its delete may
+    # satisfy this root's pressure all by itself -- so a pressure-triggered sweep must
+    # not select victims against a free-space reading a correction is about to
+    # invalidate.
+    #
+    # This REPLACES the pre-#526 guard, which read ``active_purge_paths()`` once here
+    # and proceeded. That was a check, not a barrier: a correction starting one await
+    # later -- during candidate assembly's Plex crawl, during an ``os.walk``, during a
+    # victim's delete -- was simply invisible, and no amount of re-checking closes it
+    # (every draft leaves the next await window open). A lease does, because it is a
+    # RESERVATION with a defeat channel:
+    #
+    #   * ACQUIRING it fails outright when a correction already owns a path under this
+    #     root -- the same defer as before, but now a state, not a sampled fact.
+    #   * A correction starting LATER calls ``revoke_pressure_exclusions`` in the same
+    #     await-free step as its ``begin_purge``, defeating this lease. It never waits
+    #     for the sweep (an operator pressing a button must not queue behind a Plex
+    #     crawl and several rmtrees); the sweep stands down instead, at its next
+    #     destructive decision point.
+    #   * The lease is held from before the root's disk probe (taken in
+    #     ``run_eviction_sweep``, so even THIS sweep's first reading is covered)
+    #     across candidate assembly, every claim, and every delete -- and re-read at
+    #     the DELETE BOUNDARY itself, inside the purge primitive's ``before_delete``
+    #     hook under the held delete permit (see ``_evict_one``). That last read is
+    #     what makes the invariant true rather than likely.
+    #
+    # INVARIANT (the guarantee that replaces the old residual): once a correction has
+    # claimed a path under this root, this sweep starts NO further RETENTION eviction
+    # delete under it. Stated in full, because a guarantee that hides its exceptions is
+    # no better than the residual it replaced -- exactly TWO destructive things can
+    # still happen under this root after that moment, and neither is a selection race:
+    #
+    #   1. A delete worker that had ALREADY been started. Past the boundary hook there
+    #      is no cancellation point before the first unlinked byte, and
+    #      ``purge_service`` deliberately shields such a delete through physical
+    #      settlement (issue #128). That victim was independently eligible (watched,
+    #      past grace, un-pinned, un-watchlisted) and is never the correction's own
+    #      path: an irreducible physical-completion sliver.
+    #   2. A CRASH-RECOVERY purge from step 0.5 above. Recovery runs BEFORE the
+    #      stand-down adjudication below and does not consult the lease at all, so
+    #      ``_resume_one_claimed`` / ``_recover_rearmed_season_claimed`` can start a
+    #      fresh ``rmtree`` over a marker-armed tree while a correction holds a claim
+    #      elsewhere under this root. That is the #515 recovery policy working as
+    #      designed, not a hole: the armed marker means a delete of exactly that path
+    #      ALREADY began and nothing proved the tree survived it, so the media is
+    #      unwatchable either way and only convergence is honest -- gating it on
+    #      another operator's correction would strand gutted media forever and, for
+    #      TV, permanently block the replacement import at its deterministic
+    #      destination. It is never the correction's OWN path (the per-path
+    #      ``begin_purge`` in ``_recover_rearmed_season`` / ``_resume_one`` defers
+    #      that), and never a tree anything could still play.
     #
     # Two deliberate bounds, both pinned by tests:
     #   * ROOT-SCOPED. ``_ACTIVE_PURGE_PATHS`` is process-global; ownership is
     #     decided the same way candidate assembly decides it, so a correction on the
     #     anime root cannot stall reclamation on a genuinely full tv root -- pressure
     #     nothing in flight is going to relieve.
-    #   * NON-PROACTIVE ONLY. The whole reason to defer is stale pressure ARITHMETIC.
-    #     A proactive sweep has no pressure gate and no target to overshoot, so there
-    #     is no snapshot to go stale and nothing here to suppress. The correction's
-    #     OWN path is still protected in both modes, by the per-path defer in
-    #     ``_recover_rearmed_season`` / ``_resume_one``, which runs above this.
+    #   * NON-PROACTIVE ONLY. The whole reason to exclude is stale pressure
+    #     ARITHMETIC. A proactive sweep has no pressure gate and no target to
+    #     overshoot, so there is no reading to go stale and nothing here to suppress:
+    #     it clears every eligible candidate on principle, and a correction cannot
+    #     make any of them ineligible. The correction's OWN path is still protected in
+    #     both modes, by the per-path defer in ``_recover_rearmed_season`` /
+    #     ``_resume_one``, which runs above this.
     #
-    # HONEST RESIDUAL (issue #526): this is a check, not a barrier. It sees only
-    # corrections that had already claimed their path by the time the sweep reached
-    # this line. A correction that starts AFTER it -- while candidate assembly is
-    # awaiting Plex, or while an earlier victim's delete runs -- is invisible to this
-    # sweep, which then evicts from a snapshot the correction is about to change.
-    # Those victims were each independently eligible (watched, past grace, un-pinned),
-    # so the cost is bounded to over-reclaiming, never to touching the correction's
-    # own path; it is NOT the same thing as serializing corrections against sweeps,
-    # and nothing here should be read as claiming that.
-    if not proactive and any(
-        _owned_by_root(active_path, root_path, scope)
-        for active_path in purge_service.active_purge_paths()
-    ):
-        _telemetry_logger.info(
-            "eviction sweep deferred for %s root %s: an operator correction purge "
-            "is active under this root; pressure will be re-read after it settles "
-            "(%.3fs)",
-            media_type,
-            safe_text(root_path),
-            time.monotonic() - sweep_started,
+    # The DENIAL is adjudicated HERE rather than at the acquisition site so that
+    # crash recovery above still runs on a tick a correction denied: a stranded
+    # ``evicted`` row over a live file, or remnants blocking a replacement import,
+    # must converge at ANY pressure and regardless of who else is correcting. Only
+    # the pressure-driven half of the sweep stands down.
+    #
+    # BOTH failure modes are adjudicated here, because both mean the same thing --
+    # a correction owns this root's free space right now -- and both must stop the
+    # sweep BEFORE it pays for candidate assembly (a Plex crawl plus an ``os.walk``
+    # per row) it is only going to discard at the first victim:
+    #   * DENIED: a correction already held a claim when the lease was requested.
+    #   * DEFEATED during crash recovery above: a correction started inside that
+    #     pass's awaits, which is precisely the start race this lease exists for.
+    if not proactive:
+        stand_down: str | None = (
+            "an operator correction purge was already active under this root"
+            if pressure_lease is None
+            else pressure_lease.revoked_reason
         )
-        return []
+        if stand_down is not None:
+            _telemetry_logger.info(
+                "eviction sweep deferred for %s root %s: %s; pressure will be "
+                "re-read after it settles (%.3fs)",
+                media_type,
+                safe_text(root_path),
+                stand_down,
+                time.monotonic() - sweep_started,
+            )
+            if on_stood_down is not None:
+                on_stood_down(stand_down)
+            return []
 
     disk_used_pct = used_percent(disk)
     if not proactive and disk_used_pct < threshold_pct:
@@ -3761,9 +3952,54 @@ async def _run_sweep(
     # nothing, deleting watched titles after the target was already reached.
     pressure_stale = False
 
+    lease_defeat_recorded = False
+
     def _note_unmeasured_free() -> None:
         nonlocal pressure_stale
         pressure_stale = True
+
+    def _lease_defeated() -> bool:
+        """Whether a correction has defeated this sweep's lease (issue #526),
+        RECORDING that fact exactly once on the way.
+
+        Consulted before drawing EACH victim, in both loops below: once a
+        correction has claimed a path under this root, the disk reading these
+        loops are deleting against is stale in the direction that keeps deleting,
+        so every remaining victim is destruction the operator may not need to
+        lose. Stopping is not a silent skip -- the stand-down is logged AND handed
+        to ``on_stood_down`` (so the operator who pressed the button sees it, not
+        just the log), the outcomes already achieved are still returned and
+        published, and the next periodic tick re-reads pressure once the
+        correction settles.
+
+        The ``lease_defeat_recorded`` latch is what makes it safe to call from
+        both loops and once more after them: the second loop must not repeat the
+        line, and the trailing call exists only to catch the defeat that lands
+        during the LAST victim's delete boundary -- which ends both loops by
+        exhaustion, never through a check here.
+
+        This is the CHEAP half of the barrier. It cannot cover a correction that
+        starts after it, which is why ``_evict_one`` re-reads the same latch at
+        the delete boundary itself.
+        """
+        nonlocal lease_defeat_recorded
+        if pressure_lease is None or pressure_lease.revoked_reason is None:
+            return False
+        if not lease_defeat_recorded:
+            lease_defeat_recorded = True
+            _telemetry_logger.info(
+                "eviction sweep standing down for %s root %s after %d eviction(s): "
+                "%s, so this sweep's free-space reading no longer holds; the next "
+                "sweep re-reads pressure once the correction settles (%.3fs)",
+                media_type,
+                safe_text(root_path),
+                len(outcomes),
+                pressure_lease.revoked_reason,
+                time.monotonic() - sweep_started,
+            )
+            if on_stood_down is not None:
+                on_stood_down(pressure_lease.revoked_reason)
+        return True
 
     async def _attempt(candidate: EvictionCandidate) -> None:
         nonlocal freed_bytes_total
@@ -3776,6 +4012,7 @@ async def _run_sweep(
                 pending=pending_by_id[id(candidate)],
                 grace_cutoff=grace_cutoff,
                 note_unmeasured_free=_note_unmeasured_free,
+                pressure_lease=pressure_lease,
             )
         except Exception:
             # Mirrors import_service.run_import_cycle / run_availability_cycle:
@@ -3810,6 +4047,12 @@ async def _run_sweep(
         return True
 
     for candidate in selected:
+        # STAND DOWN if a correction defeated this root's exclusion lease (issue
+        # #526) -- checked FIRST, before any re-baselining, because a defeated
+        # lease means the whole pressure question is being re-answered by someone
+        # else's delete and no further victim here is justified.
+        if _lease_defeated():
+            break
         # RE-BASELINE MID-PREFIX (Codex round-4 P1). ``selected`` is the domain's
         # target-seeking prefix, sized from ESTIMATED reclaimable bytes, and the
         # whole prefix is normally deleted. But a partial delete frees real bytes
@@ -3838,6 +4081,11 @@ async def _run_sweep(
     # very first check below already finds `projected <= target_pct`.
     if extra_pool and disk.total_bytes > 0:
         for candidate in extra_pool:
+            # STAND DOWN on a defeated exclusion lease (issue #526), first here as
+            # in the prefix loop above: drawing EXTRA victims is exactly the
+            # behaviour a correction's own delete may be making unnecessary.
+            if _lease_defeated():
+                break
             # RE-BASELINE (issue #482 review): an unmeasured destructive delete
             # landed, so the snapshot + running-total arithmetic below is no
             # longer an honest picture of the disk. Re-stat it and restart the
@@ -3849,6 +4097,15 @@ async def _run_sweep(
             if pressure_relieved(disk_used_pct, freed_bytes_total, disk.total_bytes, target_pct):
                 break
             await _attempt(candidate)
+
+    # LAST-VICTIM EDGE: a defeat landing at the FINAL candidate's delete boundary
+    # ends both loops by EXHAUSTION, never through a check above -- and with an
+    # empty ``extra_pool`` the second loop never runs at all. The stand-down would
+    # then exist only in that one candidate's own revoked-at-the-boundary line,
+    # while the summary below said "0 evicted" as though nothing had been eligible.
+    # Record it here so the telemetry and ``on_stood_down`` are honest on every
+    # path; the latch makes this a no-op whenever a loop check already recorded it.
+    _lease_defeated()
 
     _telemetry_logger.info(
         "eviction sweep telemetry: %s root %s took %.3fs -- %d candidate(s) "

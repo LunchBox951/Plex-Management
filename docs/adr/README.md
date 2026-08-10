@@ -27,6 +27,7 @@ once accepted — to change a decision, add a new ADR that supersedes the old on
 | [0019](0019-realtime-sse-invalidations-over-polling-floor.md) | Realtime admin SSE invalidations over a permanent polling floor | Accepted |
 | [0020](0020-episode-level-fallback-whole-season.md) | Episode-level fallback for whole-season TV requests | Accepted |
 | [0021](0021-trusted-host-setup-hardening.md) | Trusted-Host validation on the setup flow | Accepted |
+| [0021](0021-plex-watchlist-request-automation.md) | Plex watchlist request automation | Accepted |
 | [0022](0022-claim-before-purge-correction-order.md) | report-issue claims the active slot before the irreversible purge (supersedes ADR-0014's ordering) | Accepted |
 | [0023](0023-database-rollback-and-pre-migration-backup.md) | Database rollback policy and automatic pre-migration backup | Accepted |
 | [0024](0024-first-party-container-auto-updater.md) | First-party container updater with app-owned policy | Accepted |

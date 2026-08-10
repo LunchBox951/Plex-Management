@@ -39,6 +39,7 @@ the bad release — a correction verb calls :func:`remove_torrent` AND
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import os
@@ -60,9 +61,11 @@ if TYPE_CHECKING:
     from plex_manager.ports.library import LibraryPort
 
 __all__ = [
+    "PressureExclusionLease",
     "PurgeOutcome",
     "PurgeResult",
     "abandon_active_settlements",
+    "acquire_pressure_exclusion",
     "active_purge_paths",
     "active_settlement_tasks",
     "begin_placement",
@@ -71,7 +74,9 @@ __all__ = [
     "end_purge",
     "purge_in_progress",
     "purge_library_path",
+    "release_pressure_exclusion",
     "remove_torrent",
+    "revoke_pressure_exclusions",
     "run_abandonable_probe",
     "trigger_library_scan",
 ]
@@ -419,6 +424,156 @@ def active_purge_paths() -> tuple[str, ...]:
     registry directly.
     """
     return tuple(_ACTIVE_PURGE_PATHS)
+
+
+# --------------------------------------------------------------------------- #
+# Root-scoped PRESSURE-EXCLUSION LEASES (issue #526).
+#
+# The purge-claim registry above serializes actors by PATH. That is exactly the
+# wrong shape for the disk-pressure eviction sweep, whose destructive decision is
+# not about one path at all: it probes a ROOT's free space, ranks every candidate
+# under that root, and then deletes victims until the reading it took is
+# satisfied. A correction purge that starts anywhere under the same root can
+# satisfy that reading all by itself, so the sweep's victims stop being necessary
+# -- yet no path ever conflicts, and nothing in the path registry can say so.
+#
+# The pre-#526 guard was a one-time READ of ``active_purge_paths()`` at the top of
+# the sweep. A read is not a reservation: a correction beginning after it -- while
+# candidate assembly awaits Plex, or while an earlier victim's delete runs -- was
+# invisible, and the sweep went on selecting victims against a disk snapshot the
+# correction was about to invalidate. Every snapshot-style recheck has the same
+# hole one await later; closing the family needs a reservation held ACROSS the
+# probe, the claim and the destructive purge.
+#
+# So a lease, with two halves:
+#
+# * ACQUIRE (:func:`acquire_pressure_exclusion`) refuses outright when a purge
+#   claim the lease would cover is ALREADY registered -- the honest "a correction
+#   owns this root right now" answer, delivered before any probe is paid for.
+#   Check-and-register contains no ``await``, so it is atomic on the single event
+#   loop exactly like :func:`begin_purge`.
+# * REVOKE (:func:`revoke_pressure_exclusions`) is how a correction STARTING
+#   later coordinates: it DEFEATS every lease covering its path instead of
+#   queueing behind it. Corrections are operator-facing and must never wait on a
+#   whole sweep (north star 1), and the sweep's work is retried on the next tick
+#   anyway -- so the correction wins by construction and the lease holder learns
+#   about it. A revoked lease is a LATCH, never un-set, so a holder that checks it
+#   at any later point still sees the defeat.
+#
+# Revocation is a signal, not an interrupt: the holder must read
+# ``lease.revoked_reason`` at the points where it is about to do something
+# destructive. The eviction sweep reads it before drawing each victim AND, as the
+# real barrier, inside the purge primitive's ``before_delete`` hook -- after the
+# delete permit is held, with nothing but a synchronous thread start left. TWO
+# kinds of bytes can still leave under a defeated lease, and both are deliberate:
+#
+# * a delete worker that had ALREADY been started -- past the boundary hook there
+#   is no cancellation point before the first unlinked byte;
+# * a CRASH-RECOVERY purge, which does not consult the lease at all: it FINISHES
+#   deletes that already started rather than deciding fresh ones, and gating that
+#   on someone else's correction would strand gutted media forever.
+#
+# Both are stated in full, with their bounds, on ``eviction_service._run_sweep``
+# rather than papered over.
+#
+# Ownership is a caller-supplied PREDICATE, not a path prefix: "which root owns
+# this breadcrumb" is a nested-root, deepest-match question that
+# ``eviction_service._owned_by_root`` already answers for candidate assembly, and
+# duplicating it here would let the two drift. This module stays root-agnostic and
+# simply asks the lease.
+#
+# In-process, like every other serialization primitive here and like
+# ``eviction_service._sweep_latch``: both parties are coroutines on this one event
+# loop, over single-writer SQLite (ADR-0007), and the coordination has to be
+# await-free-atomic -- which a database round-trip cannot be. A persisted lease
+# would add crash-expiry semantics without adding a guarantee. Stated rather than
+# assumed silently; a multi-process deployment would need a different mechanism
+# here, exactly as it would for ``_ACTIVE_PURGE_PATHS``.
+
+
+@dataclass(eq=False)
+class PressureExclusionLease:
+    """One held root-scoped exclusion — see the block comment above.
+
+    Created only by :func:`acquire_pressure_exclusion` and released only by
+    :func:`release_pressure_exclusion`; the holder treats it as an opaque token
+    plus the ``revoked_reason`` latch it must consult before destroying anything.
+
+    ``label`` is a STATIC, operator-facing description of the leased scope (the
+    sweep passes its configured root path) used only in this module's log line.
+    ``revoked_reason`` is likewise a static literal supplied by the defeating
+    caller, never a request-derived string, so both are safe to interpolate into
+    a log message (AGENTS.md's logging rule).
+    """
+
+    label: str
+    owns_path: Callable[[str], bool]
+    revoked_reason: str | None = None
+
+
+_PRESSURE_EXCLUSION_LEASES: list[PressureExclusionLease] = []
+
+
+def acquire_pressure_exclusion(
+    *, label: str, owns_path: Callable[[str], bool]
+) -> PressureExclusionLease | None:
+    """Reserve a root-scoped pressure exclusion, or ``None`` if a purge owns it.
+
+    ``None`` means at least one path this lease would cover is ALREADY under a
+    purge claim: the caller must stand down (visibly — the eviction sweep logs a
+    deferral and returns no outcomes) rather than probe and select victims behind
+    a correction that is about to change the very disk reading it would use.
+
+    The conflict scan and the registration contain no suspension point, so they
+    are one atomic operation with respect to other tasks on this loop. A winning
+    caller MUST pair this with :func:`release_pressure_exclusion` in a ``finally``
+    — a leaked lease would keep absorbing every later correction's revocation for
+    the life of the process.
+    """
+    if any(owns_path(path) for path in _ACTIVE_PURGE_PATHS):
+        return None
+    lease = PressureExclusionLease(label=label, owns_path=owns_path)
+    _PRESSURE_EXCLUSION_LEASES.append(lease)
+    return lease
+
+
+def release_pressure_exclusion(lease: PressureExclusionLease) -> None:
+    """Release a :func:`acquire_pressure_exclusion` reservation (idempotent)."""
+    with contextlib.suppress(ValueError):
+        _PRESSURE_EXCLUSION_LEASES.remove(lease)
+
+
+def revoke_pressure_exclusions(library_path: str, *, reason: str) -> tuple[str, ...]:
+    """DEFEAT every held lease covering ``library_path``; return their labels.
+
+    The coordination point a correction calls as it claims its path, in the SAME
+    await-free step as :func:`begin_purge` so no task can observe the claim
+    without the defeat (or the reverse). The correction never waits: it wins, and
+    the lease holder stands down at its next destructive decision point.
+
+    ``reason`` is a STATIC literal describing the defeating verb (the holder logs
+    it verbatim, so it must never be a request-derived string). Revocation is a
+    latch: a lease already revoked keeps its FIRST reason, which is the one that
+    actually ended the holder's authority.
+    """
+    revoked = [
+        lease
+        for lease in _PRESSURE_EXCLUSION_LEASES
+        if lease.revoked_reason is None and lease.owns_path(library_path)
+    ]
+    for lease in revoked:
+        lease.revoked_reason = reason
+    if revoked:
+        # Honesty over silence: a defeated sweep is a real coordination event, not
+        # an implementation detail -- without this the only trace would be the
+        # holder's own stand-down line, which says nothing about who defeated it.
+        _logger.info(
+            "revoked %d pressure-exclusion lease(s) (%s) because %s",
+            len(revoked),
+            ", ".join(safe_text(lease.label) for lease in revoked),
+            reason,
+        )
+    return tuple(lease.label for lease in revoked)
 
 
 class PurgeOutcome(StrEnum):

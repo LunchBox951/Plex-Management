@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plex_manager.adapters.plex.library import PlexLibraryError
 from plex_manager.models import MediaRequest, MediaType, RequestStatus, SeasonRequest
 from plex_manager.ports.library import WatchState
-from plex_manager.services import eviction_service
+from plex_manager.services import eviction_service, purge_service
 from plex_manager.services.purge_service import PurgeOutcome, PurgeResult
 from plex_manager.web.deps import SettingsStore
 from plex_manager.web.events import get_event_hub
@@ -519,3 +519,54 @@ async def test_evict_reports_and_publishes_a_partial_delete(
     assert row is not None
     assert row.status is RequestStatus.evicted
     assert row.library_path == str(movie_file)  # the retry handle survives
+
+
+async def test_evict_reports_a_root_that_stood_down_for_an_operator_correction(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    tmp_path: Path,
+) -> None:
+    """Issue #526: an operator correction owning the root's free space makes the
+    sweep DECLINE, and that has to reach the person who pressed the button.
+
+    Standing down returns the same empty ``evicted`` a below-threshold tick does,
+    so without ``stood_down`` the operator sees "nothing to free" while their own
+    report-issue is mid-purge -- a healthy, pressured root reported as if nothing
+    were eligible. That is the silence north star #3 forbids, and it is a
+    different answer from ``errors`` (nothing failed here)."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    movie_file = tmp_path / "Stale Movie.mkv"
+    movie_file.write_bytes(b"0" * 1024)
+    correction_file = tmp_path / "Correction In Progress.mkv"
+    correction_file.write_bytes(b"0" * 1024)
+    request_id = await _seed(sessionmaker_, movies_root=str(tmp_path), library_path=str(movie_file))
+
+    library = FakeLibrary(
+        watch_states={(_TMDB_ID, "movie", None): WatchState(watched=True, last_viewed_at=_STALE)}
+    )
+    override_adapters(app, library=library)
+
+    assert purge_service.begin_purge(str(correction_file))
+    try:
+        response = await client.post("/api/v1/ops/evict", headers=_HEADERS)
+    finally:
+        purge_service.end_purge(str(correction_file))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["evicted"] == []
+    assert body["errors"] == [], "declining is not a failure"
+    assert body["stood_down"] == [
+        {
+            "root": "movies_root",
+            "reason": "an operator correction purge was already active under this root",
+        }
+    ]
+    # The otherwise-eligible title really was spared, not merely unreported.
+    assert movie_file.exists()
+    async with sessionmaker_() as session:
+        row = await session.get(MediaRequest, request_id)
+    assert row is not None
+    assert row.status is RequestStatus.available
