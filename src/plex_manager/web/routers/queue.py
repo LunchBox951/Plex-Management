@@ -249,11 +249,11 @@ async def grab_endpoint(
     if request.media_type == "tv":
         if body.season is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="tv_grab_requires_season"
             )
     elif body.season is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="movie_grab_rejects_season"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="movie_grab_rejects_season"
         )
 
     # TV terminal gate (issue #287): the up-front guard above is MOVIE-ONLY on
@@ -388,7 +388,7 @@ async def grab_endpoint(
         # run_preview even runs, but the service-level invariant holds
         # regardless of caller (never a season=None tv download persisted).
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="tv_grab_requires_season"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="tv_grab_requires_season"
         ) from exc
     except RequestNotActiveError as exc:
         # A stale terminal request id was grabbed while a newer active request owns

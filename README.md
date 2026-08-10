@@ -9,18 +9,17 @@ single app — with two differences that define the project:
    CAM/TS/telecast junk is *rejected outright* instead of slipping into your
    library.
 
-> **Status:** v1 beta, feature-complete. The full request → watchable → correct
-> loop is built and tested for movies, TV, and anime — search, grab, reconcile,
-> import, Plex scan, Plex availability dedupe, disk-pressure eviction,
-> operability (health/logs/retention/eviction), auto-grab, and in-app correction
-> surfaces. The 7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with
-> fixes landing continuously into `:edge` through the soak; after a renewed
-> soak of the post-fix build, 1.0.0 was promoted to `:stable` on Aug 9, 2026.
-> Browser Plex sign-in/session auth is built; the
-> bundled first-party container updater is available as an opt-in Compose
-> profile.
+> **Status:** 1.0.0 released — promoted to `:stable` on Aug 9, 2026. The full
+> request → watchable → correct loop is built and tested for movies, TV, and
+> anime — search, grab, reconcile, import, Plex scan, Plex availability dedupe,
+> disk-pressure eviction, operability (health/logs/retention/eviction),
+> auto-grab, and in-app correction surfaces. The promotion followed the 7-day
+> live canary run (Jul 25 - Aug 1, 2026) and a renewed soak of the post-fix
+> build; `:edge` remains the canary channel for ongoing work. Browser Plex
+> sign-in/session auth is built; the bundled first-party container updater is
+> available as an opt-in Compose profile.
 
-## What works now (beta)
+## What works now
 
 - **First-run setup wizard** (`/api/v1/setup/*`): validate and store
   Plex/Prowlarr/qBittorrent/TMDB credentials — encrypted at rest, never logged.

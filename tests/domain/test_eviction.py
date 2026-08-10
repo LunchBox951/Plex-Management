@@ -42,7 +42,7 @@ def _candidate(
     in_flight: bool = False,
     watchlisted: bool = False,
     library_path: str | None = "/media/movies/Some Movie (2020)",
-    size_percent: float = 5.0,
+    size_percent: float | None = 5.0,
 ) -> EvictionCandidate:
     return EvictionCandidate(
         request_id=request_id,
@@ -299,6 +299,22 @@ def test_zero_size_percent_candidates_are_still_all_picked_when_needed() -> None
     # pass over a finite ranked list, never an infinite wait for "enough" size.
     a = _candidate(request_id=1, last_viewed_at=_STALE - timedelta(days=30), size_percent=0.0)
     b = _candidate(request_id=2, last_viewed_at=_STALE - timedelta(days=20), size_percent=0.0)
+
+    result = select_evictions(
+        [b, a], used_pct=95.0, threshold_pct=90.0, target_pct=80.0, grace_cutoff=_GRACE_CUTOFF
+    )
+    assert result == [a, b]
+
+
+def test_unmeasured_size_percent_none_is_handled_like_a_measured_zero() -> None:
+    """Issue #353: ``size_percent=None`` (the walk-skip sentinel a service-layer
+    caller may leave on an otherwise-eligible, hand-built candidate) must not
+    crash the projection arithmetic -- it contributes ``0`` toward the target,
+    exactly like a measured ``0.0`` always has, and every candidate is still
+    picked in order. Eligibility never depends on size, so this module cannot
+    assume every candidate it ranks was actually walked by its caller."""
+    a = _candidate(request_id=1, last_viewed_at=_STALE - timedelta(days=30), size_percent=None)
+    b = _candidate(request_id=2, last_viewed_at=_STALE - timedelta(days=20), size_percent=None)
 
     result = select_evictions(
         [b, a], used_pct=95.0, threshold_pct=90.0, target_pct=80.0, grace_cutoff=_GRACE_CUTOFF

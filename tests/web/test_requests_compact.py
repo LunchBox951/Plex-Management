@@ -284,9 +284,8 @@ async def test_live_state_endpoint_scope_and_shape(
     await _add_request(sessionmaker_, tmdb_id=200, status=RequestStatus.available)  # not theirs
 
     # Empty keys -> empty map, no error.
-    response = await client.post(
-        "/api/v1/requests/live-state", json={"keys": []}, cookies=cookies, headers=headers
-    )
+    client.cookies.update(cookies)
+    response = await client.post("/api/v1/requests/live-state", json={"keys": []}, headers=headers)
     assert response.status_code == 200
     assert response.json() == {"states": {}}
 
@@ -299,7 +298,6 @@ async def test_live_state_endpoint_scope_and_shape(
                 {"media_type": "movie", "tmdb_id": 300},  # no history at all
             ]
         },
-        cookies=cookies,
         headers=headers,
     )
     assert response.status_code == 200
@@ -312,7 +310,9 @@ async def test_live_state_endpoint_scope_and_shape(
         "has_coexisting_available": False,
     }
 
-    # Admin/API-key: unscoped, sees both.
+    # Admin/API-key: unscoped, sees both. The shared user's cookie is dropped so
+    # this is a pure api-key call rather than key-beats-cookie precedence.
+    client.cookies.clear()
     response = await client.post(
         "/api/v1/requests/live-state",
         json={
@@ -364,10 +364,10 @@ async def test_by_title_returns_all_rows_scoped(
         await session.commit()
     await _add_request(sessionmaker_, tmdb_id=999, status=RequestStatus.available)  # other title
 
+    client.cookies.update(cookies)
     response = await client.get(
         "/api/v1/requests/by-title",
         params={"tmdb_id": 500, "media_type": "movie"},
-        cookies=cookies,
         headers=headers,
     )
     assert response.status_code == 200
@@ -376,7 +376,8 @@ async def test_by_title_returns_all_rows_scoped(
     assert body["next_cursor"] is None
     assert all(r["can_withdraw"] is True for r in body["requests"])
 
-    # Unknown title: empty list, never a 404.
+    # Unknown title: empty list, never a 404 (pure api-key call, no cookie).
+    client.cookies.clear()
     response = await client.get(
         "/api/v1/requests/by-title",
         params={"tmdb_id": 12345, "media_type": "movie"},
@@ -446,7 +447,8 @@ async def test_legacy_can_withdraw_byte_identical_after_among_swap(
         await session.commit()
         solo_id, shared_id, foreign_id = solo.id, shared.id, foreign.id
 
-    response = await client.get("/api/v1/requests", cookies=cookies, headers=headers)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/requests", headers=headers)
     assert response.status_code == 200
     by_id = {r["id"]: r for r in response.json()["requests"]}
     if as_admin:

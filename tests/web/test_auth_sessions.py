@@ -107,7 +107,8 @@ async def test_list_sessions_returns_active_users(
     admin_id, admin_cookies, _ = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
     other_id, _, _ = await _mint_session(app, plex_id=200, tag="oth", is_admin=False)
 
-    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    client.cookies.update(admin_cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 200
     by_id = {u["user_id"]: u for u in response.json()["users"]}
     assert set(by_id) == {admin_id, other_id}
@@ -123,7 +124,8 @@ async def test_list_sessions_requires_admin(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     _, cookies, _ = await _mint_session(app, plex_id=201, tag="nonadm", is_admin=False)
-    response = await client.get("/api/v1/auth/sessions", cookies=cookies)
+    client.cookies.update(cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 403
     assert response.json()["detail"] == "admin_required"
 
@@ -139,7 +141,8 @@ async def test_list_sessions_excludes_idle_and_revoked(
     # A revoked session.
     await _mint_session(app, plex_id=400, tag="rev", is_admin=False, revoked_at=datetime.now(UTC))
 
-    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    client.cookies.update(admin_cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 200
     assert [u["user_id"] for u in response.json()["users"]] == [admin_id]
 
@@ -167,7 +170,8 @@ async def test_list_sessions_excludes_absolute_expiry(
         expires_at=datetime.now(UTC) - timedelta(seconds=1),
     )
 
-    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    client.cookies.update(admin_cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 200
     assert [u["user_id"] for u in response.json()["users"]] == [admin_id]
 
@@ -183,7 +187,8 @@ async def test_list_sessions_includes_recovery_group(
     # A revoked recovery session must NOT be counted.
     await _mint_recovery_session(app, tag="dead", revoked_at=datetime.now(UTC))
 
-    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    client.cookies.update(admin_cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 200
     recovery = response.json()["recovery"]
     assert recovery is not None
@@ -197,7 +202,8 @@ async def test_list_sessions_recovery_null_when_none(
     """No active recovery session means a null group, not a zero-count object."""
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, _ = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
-    response = await client.get("/api/v1/auth/sessions", cookies=admin_cookies)
+    client.cookies.update(admin_cookies)
+    response = await client.get("/api/v1/auth/sessions")
     assert response.status_code == 200
     assert response.json()["recovery"] is None
 
@@ -212,17 +218,19 @@ async def test_revoke_kills_target_users_session(
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
     target_id, target_cookies, _ = await _mint_session(app, plex_id=200, tag="tgt", is_admin=False)
 
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": target_id},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
     assert revoke.json()["revoked"] == 1
 
     # The target's cookie no longer authenticates.
-    me = await client.get("/api/v1/auth/me", cookies=target_cookies)
+    client.cookies.clear()
+    client.cookies.update(target_cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is False
 
 
@@ -233,16 +241,16 @@ async def test_admin_can_revoke_own_sessions(
     admin_id, admin_cookies, admin_csrf = await _mint_session(
         app, plex_id=100, tag="adm", is_admin=True
     )
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": admin_id},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
     assert revoke.json()["revoked"] == 1
     # No hidden lockout: the admin's own session is simply signed out.
-    me = await client.get("/api/v1/auth/me", cookies=admin_cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is False
 
 
@@ -251,10 +259,10 @@ async def test_revoke_unknown_user_is_zero(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": 999999},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
@@ -264,10 +272,10 @@ async def test_revoke_unknown_user_is_zero(
 async def test_revoke_requires_admin(client: httpx.AsyncClient, app: FastAPI, seed: SeedFn) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     _, cookies, csrf = await _mint_session(app, plex_id=201, tag="nonadm", is_admin=False)
+    client.cookies.update(cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": 201},
-        cookies=cookies,
         headers=csrf,
     )
     assert revoke.status_code == 403
@@ -280,10 +288,11 @@ async def test_revoke_without_csrf_is_rejected(
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, _ = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
     target_id, _, _ = await _mint_session(app, plex_id=200, tag="tgt", is_admin=False)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": target_id},
-        cookies=admin_cookies,  # no X-CSRF-Token header
+        # no X-CSRF-Token header
     )
     assert revoke.status_code == 403
     assert revoke.json()["detail"] == "csrf_token_required"
@@ -298,20 +307,24 @@ async def test_revoke_recovery_kills_recovery_session(
     user_id, user_cookies, _ = await _mint_session(app, plex_id=200, tag="usr", is_admin=False)
     recovery_cookies = await _mint_recovery_session(app, tag="rec")
 
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"kind": "recovery"},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
     assert revoke.json()["revoked"] == 1
 
     # The recovery cookie no longer authenticates.
-    rec_me = await client.get("/api/v1/auth/me", cookies=recovery_cookies)
+    client.cookies.clear()
+    client.cookies.update(recovery_cookies)
+    rec_me = await client.get("/api/v1/auth/me")
     assert rec_me.json()["authenticated"] is False
     # A plain Plex-user session is untouched.
-    user_me = await client.get("/api/v1/auth/me", cookies=user_cookies)
+    client.cookies.clear()
+    client.cookies.update(user_cookies)
+    user_me = await client.get("/api/v1/auth/me")
     assert user_me.json()["authenticated"] is True
     assert user_id  # (bind for clarity)
 
@@ -321,10 +334,10 @@ async def test_revoke_recovery_with_no_active_is_zero(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"kind": "recovery"},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
@@ -337,10 +350,10 @@ async def test_revoke_user_kind_requires_user_id(
     """A ``user`` revoke with no ``user_id`` is a 422 validation error."""
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"kind": "user"},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 422
@@ -352,10 +365,10 @@ async def test_revoke_recovery_kind_rejects_user_id(
     """A ``recovery`` revoke must not carry a ``user_id``."""
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"kind": "recovery", "user_id": 5},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 422
@@ -368,15 +381,17 @@ async def test_revoke_defaults_to_user_kind(
     await seed(initialized=True, app_api_key=_API_KEY)
     _, admin_cookies, admin_csrf = await _mint_session(app, plex_id=100, tag="adm", is_admin=True)
     target_id, target_cookies, _ = await _mint_session(app, plex_id=200, tag="tgt", is_admin=False)
+    client.cookies.update(admin_cookies)
     revoke = await client.post(
         "/api/v1/auth/sessions/revoke",
         json={"user_id": target_id},
-        cookies=admin_cookies,
         headers=admin_csrf,
     )
     assert revoke.status_code == 200
     assert revoke.json()["revoked"] == 1
-    me = await client.get("/api/v1/auth/me", cookies=target_cookies)
+    client.cookies.clear()
+    client.cookies.update(target_cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is False
 
 
@@ -391,7 +406,8 @@ async def test_idle_session_is_rejected(
     _, cookies, _ = await _mint_session(
         app, plex_id=500, tag="idle", is_admin=True, last_seen_at=idle_seen
     )
-    me = await client.get("/api/v1/auth/me", cookies=cookies)
+    client.cookies.update(cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is False
 
 
@@ -404,7 +420,8 @@ async def test_active_request_slides_last_seen_forward(
         app, plex_id=600, tag="slide", is_admin=True, last_seen_at=stale
     )
 
-    me = await client.get("/api/v1/auth/me", cookies=cookies)
+    client.cookies.update(cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is True
 
     async with app.state.sessionmaker() as session:
@@ -426,7 +443,8 @@ async def test_recent_activity_does_not_rewrite_last_seen(
         app, plex_id=700, tag="fresh", is_admin=True, last_seen_at=recent
     )
 
-    me = await client.get("/api/v1/auth/me", cookies=cookies)
+    client.cookies.update(cookies)
+    me = await client.get("/api/v1/auth/me")
     assert me.json()["authenticated"] is True
 
     async with app.state.sessionmaker() as session:

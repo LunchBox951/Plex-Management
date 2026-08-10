@@ -44,7 +44,7 @@ jobs:
       - name: Type check (pyright --strict)
         run: pyright
       - name: Tests
-        run: pytest
+        run: make test-ci
 
   # Also run the test suite on the version the container image ships (3.14), so
   # runtime or dependency behaviour that only differs on the newer interpreter is
@@ -62,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -c requirements/runtime-constraints.txt -e ".[dev]"
       - name: Tests
-        run: pytest
+        run: make test-ci
 
   # Frontend gates (ADR-0009). The typed client is generated from the exported
   # OpenAPI doc, so the drift check fails the build if the committed client no
