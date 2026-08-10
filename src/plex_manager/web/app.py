@@ -1343,7 +1343,7 @@ async def _share_sweep_once(app: FastAPI) -> int:
         # untrue for a stale token (plex.tv rejected the credential before it
         # could say anything about the share). Same split as the AuditLog rows.
         #
-        # KNOWN GAP (tracked follow-up to #556): this close reason cannot
+        # KNOWN GAP (tracked in issue #569): this close reason cannot
         # currently REACH the user it describes. ``/api/v1/events`` is admin-only
         # and this sweep never signs an admin out (ADR-0005 exemption in
         # ``apply_share_verdict``), so a swept user never had a stream to close;
