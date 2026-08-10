@@ -739,6 +739,25 @@ function ShareSweepPanel({ sweep }: { sweep: HealthResponse['share_sweep'] }) {
             </dd>
           </>
         ) : null}
+        {/* Captures the live anchor check refused. Shown with the same weight as
+            the deferred sign-outs above and for the same reason: the anchor is
+            what makes a stamped snapshot trustworthy, so a tick that could not
+            confirm it did not do its job — even when every verdict happened to
+            be AUTHORIZED and nothing needed deferring. The panel's state label
+            says which answer it was. */}
+        {sweep.capture_anchor_blocked > 0 ? (
+          <>
+            <dt className="min-w-0 text-faint">Entitlement reads held</dt>
+            <dd
+              className={cn(
+                'min-w-0 text-right font-semibold tabular-nums [overflow-wrap:anywhere]',
+                anchorChanged ? 'text-error' : 'text-searching',
+              )}
+            >
+              {sweep.capture_anchor_blocked}
+            </dd>
+          </>
+        ) : null}
         {/* Capture switched OFF for the whole install (typically an upgrade that
             never re-saved its Plex settings, so there is no verified server
             anchor to stamp a snapshot with). Without this row the panel shows a

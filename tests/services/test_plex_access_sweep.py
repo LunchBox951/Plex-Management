@@ -1239,7 +1239,7 @@ async def _configure_anchor(sessionmaker: SessionMaker, machine_id: str = _MACHI
 def _capture_context(
     *,
     section_keys: tuple[str, ...] = ("1",),
-    owner_sections: int | None = 2,
+    service_sections: int | None = 2,
     fail: bool = False,
     calls: list[str] | None = None,
 ) -> plex_access_service.EntitlementCaptureContext:
@@ -1262,12 +1262,12 @@ def _capture_context(
         transport = httpx.MockTransport(handler)
         return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
 
-    async def _owner_section_count() -> int | None:
-        return owner_sections
+    async def _service_section_count() -> int | None:
+        return service_sections
 
     return plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
 
@@ -1414,7 +1414,7 @@ async def test_sweep_resolves_the_owner_baseline_at_most_once_per_tick(
         await _add_user(sessionmaker_, username=f"viewer{index}", token=f"token-{index}")
     baseline_calls = 0
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         nonlocal baseline_calls
         baseline_calls += 1
         return 2
@@ -1425,7 +1425,7 @@ async def test_sweep_resolves_the_owner_baseline_at_most_once_per_tick(
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
     result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
@@ -1439,14 +1439,14 @@ async def test_sweep_skips_the_baseline_entirely_when_nothing_is_captured(
     await _add_user(sessionmaker_)
     baseline_calls = 0
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         nonlocal baseline_calls
         baseline_calls += 1
         return 2
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=lambda _token: None,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
     # No library to capture with: not a failure, and no baseline worth reading.
@@ -1479,12 +1479,12 @@ async def test_a_raising_library_factory_only_degrades_capture(
     def _explode(_token: str) -> PlexLibrary:
         raise RuntimeError("composition root blew up")
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         return 2
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_explode,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
     result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
@@ -1497,6 +1497,63 @@ async def test_a_raising_library_factory_only_degrades_capture(
     user = await _load(sessionmaker_, user_id)
     assert user.share_state == "authorized"
     assert user.entitled_section_keys is None
+
+
+@pytest.mark.parametrize(
+    ("anchor", "expected_state"),
+    [
+        pytest.param(AnchorCheck.MISMATCHED, "anchor_mismatch", id="mismatched"),
+        pytest.param(AnchorCheck.UNCONFIRMED, "anchor_unconfirmed", id="unconfirmed"),
+    ],
+)
+async def test_an_anchor_that_blocks_only_capture_still_reports_its_state(
+    sessionmaker_: SessionMaker, anchor: AnchorCheck, expected_state: str
+) -> None:
+    """Everyone is AUTHORIZED, so no share-loss verdict needs deferring -- but the
+    anchor check still refuses every capture (Codex review of PR-3).
+
+    Before, ``anchor_deferred`` stayed 0 and the tick reported a clean ``ok``
+    while capture was blocked for the entire fleet. The commonest shape of this
+    is a live ``/identity`` outage with plex.tv still answering, which is an
+    actionable condition, not a silent one.
+    """
+    await _configure_anchor(sessionmaker_)
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_,
+        [_server_resource(_MACHINE_ID)],
+        anchor=anchor,
+        capture=_capture_context(),
+    )
+
+    assert result.authorized == 1
+    assert result.anchor_deferred == 0  # nobody was about to be signed out
+    assert result.captured == 0
+    assert result.capture_skipped == 1
+    assert result.capture_anchor_blocked == 1
+    assert result.anchor_state is anchor
+
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == expected_state
+    assert status.last_ok_at is None
+    assert status.capture_anchor_blocked == 1
+
+
+async def test_a_confirmed_anchor_never_flags_capture_as_blocked(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The counterpart: the ordinary healthy tick keeps reporting ``ok``."""
+    await _configure_anchor(sessionmaker_)
+    await _add_user(sessionmaker_)
+    result = await _sweep(
+        sessionmaker_, [_server_resource(_MACHINE_ID)], capture=_capture_context()
+    )
+    assert result.captured == 1
+    assert result.capture_anchor_blocked == 0
+    status = plex_access_service.ShareSweepStatus()
+    status.mark_completed(result)
+    assert status.state == "ok"
 
 
 async def test_an_unreachable_server_breaks_the_capture_circuit_for_the_tick(
@@ -1518,12 +1575,12 @@ async def test_an_unreachable_server_breaks_the_capture_circuit_for_the_tick(
         transport = httpx.MockTransport(handler)
         return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         return None
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
     result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
@@ -1574,12 +1631,12 @@ async def test_a_refused_token_does_not_break_the_circuit_for_everyone_else(
         transport = httpx.MockTransport(handler)
         return PlexLibrary(httpx.AsyncClient(transport=transport), "http://plex.local:32400", token)
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         return 1
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
     result = await _sweep(sessionmaker_, [_server_resource(_MACHINE_ID)], capture=context)
@@ -1695,12 +1752,12 @@ async def test_a_rotated_token_mid_sweep_discards_that_users_capture(
             token,
         )
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         return 1
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
 
@@ -1772,12 +1829,12 @@ async def test_a_rotation_between_verdict_and_capture_write_is_refused(
             token,
         )
 
-    async def _owner_section_count() -> int | None:
+    async def _service_section_count() -> int | None:
         return 1
 
     context = plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=_ANCHOR_KEY,
     )
 

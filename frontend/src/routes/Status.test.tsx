@@ -96,6 +96,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
       captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
       signed_out: 0,
       sessions_revoked: 0,
@@ -994,6 +995,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
@@ -1159,6 +1161,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
@@ -1220,6 +1223,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
           signed_out: 3,
           sessions_revoked: 5,
@@ -1253,6 +1257,59 @@ describe('Status', () => {
     expect(sweep.queryByText('Entitlement capture')).not.toBeInTheDocument()
   })
 
+  it('shows entitlement reads held when only capture hit the stale anchor', () => {
+    // Every verdict came back AUTHORIZED, so no sign-out needed deferring — but
+    // the live /identity check still refused every capture. That used to render
+    // as a clean 'running clean' tick with nothing to see.
+    ;(useOpsHealth as unknown as Mock).mockReturnValue({
+      data: health({
+        share_sweep: {
+          state: 'anchor_unconfirmed',
+          last_run_at: '2026-01-02T00:00:00Z',
+          last_ok_at: '2026-01-01T00:00:00Z',
+          last_error_type: null,
+          last_error_at: null,
+          checked: 2,
+          authorized: 2,
+          share_revoked: 0,
+          token_stale: 0,
+          unknown: 0,
+          unverifiable: 0,
+          skipped: 0,
+          admins_exempted: 0,
+          captured: 0,
+          capture_failed: 0,
+          capture_skipped: 2,
+          capture_anchor_blocked: 2,
+          capture_unavailable: null,
+          anchor_deferred: 0,
+          signed_out: 0,
+          sessions_revoked: 0,
+          due_remaining: 2,
+        },
+      }),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useOpsDisk as unknown as Mock).mockReturnValue({
+      data: disk(),
+      isLoading: false,
+      isError: false,
+    })
+    ;(useEvict as unknown as Mock).mockReturnValue({ mutateAsync: vi.fn(), isPending: false })
+
+    render(<Status />, { wrapper: Wrapper })
+
+    const panel = screen.getByRole('heading', { name: 'Plex share re-check' }).closest('article')
+    const sweep = within(panel as HTMLElement)
+    expect(sweep.getByText('anchor unconfirmed')).toBeInTheDocument()
+    const held = sweep.getByText('Entitlement reads held').nextElementSibling
+    expect(held).toHaveTextContent('2')
+    expect(held).toHaveClass('font-semibold', 'text-searching')
+    // Capture is not switched off install-wide — that is a different signal.
+    expect(sweep.queryByText('Entitlement capture')).not.toBeInTheDocument()
+  })
+
   it('names the remedy when entitlement capture is switched off install-wide', () => {
     // An upgraded install with no verified plex_machine_identifier captures
     // nothing, forever. Every capture counter reads zero on an otherwise clean
@@ -1277,6 +1334,7 @@ describe('Status', () => {
           captured: 0,
           capture_failed: 0,
           capture_skipped: 3,
+          capture_anchor_blocked: 0,
           capture_unavailable: 'no_server_anchor',
           anchor_deferred: 0,
           signed_out: 0,
@@ -1329,6 +1387,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 6,
           signed_out: 0,
           sessions_revoked: 0,
@@ -1381,6 +1440,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 2,
           signed_out: 0,
           sessions_revoked: 0,
@@ -1434,6 +1494,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
           signed_out: 0,
           sessions_revoked: 0,
@@ -1480,6 +1541,7 @@ describe('Status', () => {
           captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
           signed_out: 1,
           sessions_revoked: 1,

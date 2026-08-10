@@ -1931,6 +1931,11 @@ class ShareSweepStatusItem(BaseModel):
     unreachable and the tick stopped trying, or capture is switched off for this
     install (``capture_unavailable``). Distinct from ``capture_failed`` so a dead
     server's real cost to the tick is visible."""
+    capture_anchor_blocked: int = 0
+    """Captures refused because the tick could not confirm the configured
+    server's identity live. Read with ``state``: it is what makes the sweep
+    report ``anchor_mismatch``/``anchor_unconfirmed`` on a tick where every
+    verdict was AUTHORIZED and no sign-out needed deferring."""
     capture_unavailable: Literal["not_configured", "no_server_anchor"] | None = None
     """Why capture is switched off, or ``null`` when it is running. Without it an
     upgraded install with no verified ``plex_machine_identifier`` would report an

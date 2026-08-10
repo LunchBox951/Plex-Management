@@ -28,6 +28,7 @@ from plex_manager.adapters.plex.library import PlexLibrary, reset_caches
 from plex_manager.models import Setting, User
 from plex_manager.services.plex_access_service import (
     EntitlementCapture,
+    _clear_entitlements,  # pyright: ignore[reportPrivateUsage]
     capture_entitlements,
     read_token_ciphertext,
     store_entitlements,
@@ -198,10 +199,10 @@ async def test_capture_never_raises_when_the_server_is_unreachable() -> None:
 @pytest.mark.parametrize(
     ("token", "owner_count", "expected_scope", "expected_sections"),
     [
-        pytest.param(_SHARED_TOKEN, 3, "filtered", 1, id="shared_user_is_filtered"),
-        pytest.param(_OWNER_TOKEN, 3, "full", 3, id="owner_sees_everything"),
+        pytest.param(_SHARED_TOKEN, 3, "narrower_than_service", 1, id="shared_user_is_filtered"),
+        pytest.param(_OWNER_TOKEN, 3, "same_as_service", 3, id="owner_sees_everything"),
         pytest.param(_SHARED_TOKEN, None, "baseline_unknown", 1, id="no_baseline_to_compare"),
-        pytest.param(_OWNER_TOKEN, 1, "wider_than_owner", 3, id="baseline_is_not_what_we_think"),
+        pytest.param(_OWNER_TOKEN, 1, "wider_than_service", 3, id="baseline_is_not_what_we_think"),
     ],
 )
 async def test_capture_telemetry_names_the_scope_and_counts(
@@ -212,20 +213,25 @@ async def test_capture_telemetry_names_the_scope_and_counts(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The line that answers "is section filtering actually happening?" without
-    a terminal -- counts and a one-word scope only."""
+    a terminal -- counts and a one-word scope only.
+
+    The scope words name the SERVICE token, not "the owner": nothing proves the
+    stored ``plex_token`` belongs to the server owner (Codex review of PR-3), so
+    the ``baseline_is_not_what_we_think`` case below is exactly what a restricted
+    service credential looks like in the log."""
     with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
         await capture_entitlements(
             _library(_per_token_handler, token),
             machine_identifier=_MACHINE_ID,
             user_id=7,
-            owner_section_count=_baseline(owner_count),
+            service_section_count=_baseline(owner_count),
         )
     line = next(
         r.getMessage() for r in caplog.records if "entitlement capture user_id" in r.getMessage()
     )
     assert f"sections={expected_sections}" in line
     assert f"scope={expected_scope}" in line
-    assert f"owner_sections={owner_count if owner_count is not None else 'unknown'}" in line
+    assert f"service_sections={owner_count if owner_count is not None else 'unknown'}" in line
     # Never the secrets or the shape of the operator's disk.
     assert token not in line
     assert "Movies" not in line
@@ -384,6 +390,98 @@ async def test_a_later_capture_replaces_an_earlier_one(sessionmaker_: SessionMak
             await session.commit()
     user = await _load(sessionmaker_, user_id)
     assert user.entitled_section_keys == ["2"]
+
+
+async def test_an_older_capture_cannot_overwrite_a_newer_one_on_the_same_token(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """The same-credential ordering hole (Codex review of PR-3).
+
+    The anchor and ciphertext guards both hold when two captures share a
+    credential and a server -- the ordinary case, since re-signing in usually
+    returns the SAME Plex token. So the sweep could read a user's sections, be
+    overtaken by a sign-in capture that read LATER and wrote FIRST, and then
+    land its older section set on top. ``captured_at`` is what breaks the tie.
+    """
+    await _configure_anchor(sessionmaker_, _MACHINE_ID)
+    user_id = await _add_user(sessionmaker_)
+    read_first = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
+    read_second = read_first + timedelta(seconds=30)
+
+    # The NEWER capture writes first, exactly as the overtaking sign-in would.
+    async with sessionmaker_() as session:
+        assert await store_entitlements(
+            session,
+            user_id,
+            EntitlementCapture(
+                section_keys=("1", "3"),
+                machine_identifier=_MACHINE_ID,
+                captured_at=read_second,
+            ),
+            anchor_setting_key=_ANCHOR_KEY,
+            expected_token_ciphertext=None,
+        )
+        await session.commit()
+
+    # ... and the older, slower one lands afterwards with the same credential.
+    async with sessionmaker_() as session:
+        stored = await store_entitlements(
+            session,
+            user_id,
+            EntitlementCapture(
+                section_keys=("9",),
+                machine_identifier=_MACHINE_ID,
+                captured_at=read_first,
+            ),
+            anchor_setting_key=_ANCHOR_KEY,
+            expected_token_ciphertext=None,
+        )
+        await session.commit()
+
+    assert stored is False
+    user = await _load(sessionmaker_, user_id)
+    assert user.entitled_section_keys == ["1", "3"]
+    # SQLite hands back a naive datetime; the instant is what matters here.
+    stamped = user.entitlements_captured_at
+    assert stamped is not None
+    assert stamped.replace(tzinfo=UTC) == read_second
+
+
+async def test_a_recapture_after_a_revoke_is_never_blocked_by_the_cleared_row(
+    sessionmaker_: SessionMaker,
+) -> None:
+    """A confirmed revoke clears all three columns together. If it left
+    ``entitlements_captured_at`` behind, that stale stamp would look newer than
+    the user's next real capture and silently refuse it forever."""
+    await _configure_anchor(sessionmaker_, _MACHINE_ID)
+    user_id = await _add_user(sessionmaker_)
+    async with sessionmaker_() as session:
+        assert await store_entitlements(
+            session,
+            user_id,
+            EntitlementCapture(section_keys=("1",), machine_identifier=_MACHINE_ID),
+            anchor_setting_key=_ANCHOR_KEY,
+            expected_token_ciphertext=None,
+        )
+        await session.commit()
+
+    async with sessionmaker_() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        _clear_entitlements(user)
+        await session.commit()
+    assert (await _load(sessionmaker_, user_id)).entitlements_captured_at is None
+
+    async with sessionmaker_() as session:
+        assert await store_entitlements(
+            session,
+            user_id,
+            EntitlementCapture(section_keys=("2",), machine_identifier=_MACHINE_ID),
+            anchor_setting_key=_ANCHOR_KEY,
+            expected_token_ciphertext=None,
+        )
+        await session.commit()
+    assert (await _load(sessionmaker_, user_id)).entitled_section_keys == ["2"]
 
 
 async def test_capture_and_store_round_trip_from_a_real_adapter(
@@ -558,7 +656,7 @@ async def test_the_owner_baseline_is_only_resolved_after_a_successful_read() -> 
         _library(unreachable, _SHARED_TOKEN),
         machine_identifier=_MACHINE_ID,
         user_id=7,
-        owner_section_count=_baseline_resolver,
+        service_section_count=_baseline_resolver,
     )
     assert failed is None
     assert baseline_calls == 0
@@ -567,7 +665,7 @@ async def test_the_owner_baseline_is_only_resolved_after_a_successful_read() -> 
         _library(_per_token_handler, _SHARED_TOKEN),
         machine_identifier=_MACHINE_ID,
         user_id=7,
-        owner_section_count=_baseline_resolver,
+        service_section_count=_baseline_resolver,
     )
     assert ok is not None
     assert baseline_calls == 1

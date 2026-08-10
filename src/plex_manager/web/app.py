@@ -1123,10 +1123,11 @@ def _entitlement_capture_context(
     to learn that capture has been off since the upgrade.
 
     The per-user client is built with the USER's token deliberately: capturing
-    with the owner token would return the owner's view for everybody, which is
-    precisely the thing this PR exists to distinguish. ``PlexLibrary`` keys its
-    sections cache by ``base_url`` + a HASH of the token, so one user's filtered
-    view can never be served to (or poisoned by) another's.
+    with the install's service token would return that credential's view for
+    everybody, which is precisely the thing this PR exists to distinguish.
+    ``PlexLibrary`` keys its sections cache by ``base_url`` + a HASH of the
+    token, so one user's filtered view can never be served to (or poisoned by)
+    another's.
 
     ``cached_anchor`` is the STORED ``plex_machine_identifier``, and capture is
     declined outright without it. On an upgraded install the sweep can still
@@ -1160,20 +1161,31 @@ def _entitlement_capture_context(
             )
             return None
 
-    async def _owner_section_count() -> int | None:
-        """How many sections the OWNER token sees -- the filtering baseline."""
+    async def _service_section_count() -> int | None:
+        """How many sections the install's stored SERVICE token sees.
+
+        Deliberately not called "the owner's view": nothing on the write paths
+        for ``plex_token`` proves it belongs to the server owner. Setup and the
+        settings repoint both assert that the SERVER ACCEPTS this token, and
+        the ownership rung they run is against the CALLING admin's own plex.tv
+        account -- not against the credential being stored (Codex review of
+        PR-3). An operator who pasted a restricted account's token gets a
+        baseline that is itself filtered, so the scope words this feeds
+        (``narrower_than_service`` / ``same_as_service`` /
+        ``wider_than_service``) claim only what was actually measured.
+        """
         if not service_token:
             return None
         library = _library_for_token(service_token)
         if library is None:
             return None
         # Uncached for the same reason the per-user read is: a stale baseline
-        # would silently mislabel a genuinely filtered view as ``full``.
+        # would silently mislabel a genuinely filtered view as unfiltered.
         return len(await library.list_sections(use_cache=False))
 
     return plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,
-        owner_section_count=_owner_section_count,
+        service_section_count=_service_section_count,
         anchor_setting_key=PLEX_MACHINE_ID_SETTING,
     )
 

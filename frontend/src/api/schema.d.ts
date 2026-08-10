@@ -3201,6 +3201,11 @@ export interface components {
              */
             authorized: number;
             /**
+             * Capture Anchor Blocked
+             * @default 0
+             */
+            capture_anchor_blocked: number;
+            /**
              * Capture Failed
              * @default 0
              */

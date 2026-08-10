@@ -3603,6 +3603,11 @@
             "title": "Authorized",
             "type": "integer"
           },
+          "capture_anchor_blocked": {
+            "default": 0,
+            "title": "Capture Anchor Blocked",
+            "type": "integer"
+          },
           "capture_failed": {
             "default": 0,
             "title": "Capture Failed",

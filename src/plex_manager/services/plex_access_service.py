@@ -317,6 +317,13 @@ class ShareSweepResult:
     """Set when the tick had NO capture context, which is why every one of its
     AUTHORIZED users landed in ``capture_skipped``. ``None`` means capture was
     wired up (whether or not it captured anything)."""
+    capture_anchor_blocked: int = 0
+    """Captures the live anchor check refused (a subset of ``capture_skipped``).
+    Carried separately because it is the ONLY evidence that the anchor blocked
+    this tick when no share-loss verdict happened to need confirming -- without
+    it, an all-AUTHORIZED tick whose ``/identity`` probe failed would report a
+    clean ``ok`` with capture silently switched off (see
+    :meth:`ShareSweepStatus.mark_completed`)."""
     anchor_state: AnchorCheck | None = None
     """WHICH anchor answer caused ``anchor_deferred``, or ``None`` if the anchor
     was never consulted. Carried separately from the count because "the server
@@ -420,6 +427,11 @@ class ShareSweepStatus:
     indistinguishable from "capture ran and there was nothing to do". The count
     alone cannot say WHY, and the remedy (finish setup, or re-save the Plex
     settings so the verified anchor is recorded) is not guessable from it."""
+    capture_anchor_blocked: int = field(default=0)
+    """Captures the tick's live anchor check refused. Read together with
+    ``state``, which says WHY (``anchor_mismatch`` / ``anchor_unconfirmed``) --
+    this count is what makes the sweep report that state at all on a tick where
+    every verdict was AUTHORIZED and nothing needed deferring."""
     signed_out: int = field(default=0)
     """Users this tick actually signed out. NOT ``share_revoked + token_stale``:
     an admin-exempted share loss counts toward those verdict tallies but nobody
@@ -438,6 +450,7 @@ class ShareSweepStatus:
         self.unknown = self.unverifiable = self.sessions_revoked = self.due_remaining = 0
         self.skipped = self.admins_exempted = self.anchor_deferred = self.signed_out = 0
         self.captured = self.capture_failed = self.capture_skipped = 0
+        self.capture_anchor_blocked = 0
         self.capture_unavailable = None
 
     def mark_started(self) -> None:
@@ -476,7 +489,15 @@ class ShareSweepStatus:
         # do: the sweep ran but could not answer for someone, so it has NOT
         # succeeded and must not advance ``last_ok_at``. Confirmed revocations
         # and stale tokens do NOT degrade it -- those are the sweep working.
-        if result.anchor_deferred:
+        #
+        # ``capture_anchor_blocked`` counts here for the same reason
+        # ``anchor_deferred`` does: the anchor is what makes a stamped snapshot
+        # trustworthy, so a tick that could not confirm it did not do its job
+        # even if every verdict happened to be AUTHORIZED and nothing needed
+        # deferring. Without this the commonest shape of that fault (a live
+        # ``/identity`` outage while plex.tv still answers) reported a clean
+        # ``ok`` -- with capture blocked for everybody (Codex review of PR-3).
+        if result.anchor_deferred or result.capture_anchor_blocked:
             self.state = (
                 "anchor_mismatch"
                 if result.anchor_state is AnchorCheck.MISMATCHED
@@ -500,6 +521,7 @@ class ShareSweepStatus:
         self.captured = result.captured
         self.capture_failed = result.capture_failed
         self.capture_skipped = result.capture_skipped
+        self.capture_anchor_blocked = result.capture_anchor_blocked
         self.capture_unavailable = result.capture_unavailable
         self.signed_out = len(result.signed_out_user_ids)
         self.sessions_revoked = result.sessions_revoked
@@ -702,10 +724,18 @@ class EntitlementCapture:
     ``User.entitled_section_keys``). ``machine_identifier`` is the anchor the
     capture ran against, so a later reader can tell a snapshot taken against
     today's server from one left behind by a repoint.
+
+    ``captured_at`` is stamped when the section READ completed, never when the
+    write happens, and it is what orders two overlapping captures of the same
+    user: see :func:`store_entitlements`. The only producer in the app
+    (:func:`_attempt_capture`) always passes it explicitly; the default exists
+    so a hand-built capture means "as of now" rather than silently comparing
+    against an unset value.
     """
 
     section_keys: tuple[str, ...]
     machine_identifier: str
+    captured_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True)
@@ -719,33 +749,45 @@ class EntitlementCaptureContext:
     * ``library_for_token`` -- a :class:`LibraryPort` bound to the configured
       server with one user's token, or ``None`` when Plex is not configured
       enough to try.
-    * ``owner_section_count`` -- how many sections the OWNER (service) token
-      sees, awaited AT MOST ONCE per sweep and only if something was actually
-      captured. It is the baseline that turns a raw count into the answer this
-      whole staged PR exists to observe on the canary: is a shared user's view
-      actually FILTERED, or does their token see the entire library?
+    * ``service_section_count`` -- how many sections the install's stored SERVICE
+      token sees, awaited AT MOST ONCE per sweep and only if something was
+      actually captured. It is the baseline that turns a raw count into the
+      answer this whole staged PR exists to observe on the canary: is a shared
+      user's view actually NARROWER than the install's own, or does their token
+      see everything the install does?
     """
 
     library_for_token: Callable[[str], LibraryPort | None]
-    owner_section_count: Callable[[], Awaitable[int | None]]
+    service_section_count: Callable[[], Awaitable[int | None]]
     anchor_setting_key: str
     """The settings key holding the configured server's machine identifier, so
     :func:`store_entitlements` can re-read the anchor inside its own write. The
     service deliberately does not know the key's name -- that is web config."""
 
 
-def _capture_scope(section_count: int, owner_section_count: int | None) -> str:
-    """The one-word telemetry verdict for "is filtering actually happening?"."""
-    if owner_section_count is None:
+def _capture_scope(section_count: int, service_section_count: int | None) -> str:
+    """The one-word telemetry verdict for "is filtering actually happening?".
+
+    Phrased against the SERVICE token, never "the owner", because nothing
+    proves the stored ``plex_token`` belongs to the server owner: the settings
+    and setup ladders assert that the server ACCEPTS that token, while the
+    ownership check they run is against the CALLING admin's own plex.tv
+    account, not against the credential being stored (Codex review of PR-3).
+    An operator who pasted a restricted account's token would otherwise have
+    every capture labeled ``full`` against a baseline that is itself filtered.
+    The comparison is still the useful canary signal -- it just claims only
+    what it measured.
+    """
+    if service_section_count is None:
         return "baseline_unknown"
-    if section_count < owner_section_count:
-        return "filtered"
-    if section_count > owner_section_count:
-        # Not expected: a shared user seeing MORE than the owner token would
-        # mean the baseline is not what we think it is. Named rather than
-        # rounded into "full" so the canary surfaces it instead of hiding it.
-        return "wider_than_owner"
-    return "full"
+    if section_count < service_section_count:
+        return "narrower_than_service"
+    if section_count > service_section_count:
+        # A user seeing MORE than the service token does. Named rather than
+        # rounded into "same_as_service" so the canary surfaces it -- most
+        # likely the stored token is itself a restricted account's.
+        return "wider_than_service"
+    return "same_as_service"
 
 
 @dataclass(frozen=True)
@@ -768,11 +810,11 @@ async def _attempt_capture(
     *,
     machine_identifier: str,
     user_id: int,
-    owner_section_count: Callable[[], Awaitable[int | None]] | None = None,
+    service_section_count: Callable[[], Awaitable[int | None]] | None = None,
 ) -> _CaptureAttempt:
-    """Read one token's sections. ``owner_section_count`` is resolved ONLY after
-    a successful read, so a dead server costs one timeout rather than two and
-    never delays the tick behind a baseline nobody will compare against."""
+    """Read one token's sections. ``service_section_count`` is resolved ONLY
+    after a successful read, so a dead server costs one timeout rather than two
+    and never delays the tick behind a baseline nobody will compare against."""
     try:
         # Never cached: an entitlement snapshot is point-in-time AUTHORIZATION
         # data, and a cached success would both stamp a stale section set and
@@ -797,12 +839,17 @@ async def _attempt_capture(
         )
         return _CaptureAttempt(capture=None, server_unavailable=True)
     section_keys = tuple(section.key for section in sections)
+    # The read is DONE: this is the instant the snapshot describes, and the
+    # ordering key for two captures racing on one user. Taken before the
+    # baseline call below so a slow baseline cannot make this capture look
+    # newer than it is.
+    captured_at = datetime.now(UTC)
     # Resolved only now, on the success path: the baseline is telemetry, and
     # spending a call on it before knowing whether the server answers at all
     # would double a black-holed host's cost to the tick.
-    baseline = await owner_section_count() if owner_section_count is not None else None
+    baseline = await service_section_count() if service_section_count is not None else None
     _logger.info(
-        "entitlement capture user_id=%s sections=%s owner_sections=%s scope=%s",
+        "entitlement capture user_id=%s sections=%s service_sections=%s scope=%s",
         safe_int(user_id),
         safe_int(len(section_keys)),
         safe_int(baseline) if baseline is not None else "unknown",
@@ -810,7 +857,9 @@ async def _attempt_capture(
     )
     return _CaptureAttempt(
         capture=EntitlementCapture(
-            section_keys=section_keys, machine_identifier=machine_identifier
+            section_keys=section_keys,
+            machine_identifier=machine_identifier,
+            captured_at=captured_at,
         ),
         server_unavailable=False,
     )
@@ -821,7 +870,7 @@ async def capture_entitlements(
     *,
     machine_identifier: str,
     user_id: int,
-    owner_section_count: Callable[[], Awaitable[int | None]] | None = None,
+    service_section_count: Callable[[], Awaitable[int | None]] | None = None,
 ) -> EntitlementCapture | None:
     """Read the library sections ``library``'s token can see. Never raises.
 
@@ -846,7 +895,7 @@ async def capture_entitlements(
         library,
         machine_identifier=machine_identifier,
         user_id=user_id,
-        owner_section_count=owner_section_count,
+        service_section_count=service_section_count,
     )
     return attempt.capture
 
@@ -891,6 +940,16 @@ async def store_entitlements(
       credential's view. Conditioning on the ciphertext the capture was taken
       with means a rotated credential makes the stale write match zero rows and
       the newer capture stands.
+    * **The age.** The two guards above cannot order two captures that share a
+      credential AND an anchor -- the common case, since a re-sign-in usually
+      returns the SAME Plex token. The sweep can read a user's sections, be
+      overtaken by a sign-in capture that reads later and writes first, and then
+      land its OLDER section set on top; both predicates hold either way, so the
+      last WRITE won even though it was the first READ (Codex review of PR-3).
+      The write therefore also refuses a capture that is not at least as recent
+      as the stored one, using :attr:`EntitlementCapture.captured_at` -- stamped
+      when the READ finished. A ``NULL`` stored value (a snapshot from before
+      the column existed) is older than anything, so it never blocks a capture.
 
     **Caller contract, and it holds globally: every caller must present the
     ciphertext of the exact credential that PRODUCED the snapshot, captured at
@@ -914,6 +973,10 @@ async def store_entitlements(
             Setting.value == capture.machine_identifier,
         )
     )
+    not_superseded = or_(
+        User.entitlements_captured_at.is_(None),
+        User.entitlements_captured_at <= capture.captured_at,
+    )
     result = cast(
         CursorResult[Any],
         await session.execute(
@@ -922,21 +985,23 @@ async def store_entitlements(
                 User.id == user_id,
                 anchor_still_configured,
                 _stored_token_ciphertext() == expected_token_ciphertext,
+                not_superseded,
             )
             .values(
                 entitled_section_keys=list(capture.section_keys),
                 entitlements_machine_id=capture.machine_identifier,
+                entitlements_captured_at=capture.captured_at,
             )
         ),
     )
     if result.rowcount:
         return True
     _logger.info(
-        "entitlement capture for user_id=%s was not stored: either the configured Plex "
-        "server or this account's stored token changed since the capture was taken "
-        "(a repoint, a cleared anchor, or a fresher sign-in). Discarding it rather than "
-        "stamping a snapshot that describes the wrong server or an older credential; the "
-        "next sweep re-captures.",
+        "entitlement capture for user_id=%s was not stored: the configured Plex server "
+        "changed, this account's stored token changed, or a NEWER capture already landed "
+        "while this one was in flight. Discarding it rather than stamping a snapshot that "
+        "describes the wrong server, an older credential, or an older moment; the next "
+        "sweep re-captures.",
         safe_int(user_id),
     )
     return False
@@ -949,9 +1014,14 @@ def _clear_entitlements(user: User) -> None:
     entitled to nothing"): a revoked share tells us nothing about which sections
     the account could see, so recording an authoritative empty capture would be a
     lie the #484 enforcement sites would later act on.
+
+    All three columns clear together: leaving ``entitlements_captured_at`` set
+    would make this cleared row look NEWER than an in-flight capture and block
+    the recapture that follows the user's next sign-in.
     """
     user.entitled_section_keys = None
     user.entitlements_machine_id = None
+    user.entitlements_captured_at = None
 
 
 async def apply_share_verdict(
@@ -1281,34 +1351,35 @@ async def sweep_shares(
     capture_failed = 0
     capture_skipped = 0
     capture_circuit_open = False
-    owner_sections: int | None = None
-    owner_sections_resolved = False
+    capture_anchor_blocked = 0
+    service_sections: int | None = None
+    service_sections_resolved = False
 
-    async def _owner_section_count() -> int | None:
-        """The owner-token section count, resolved AT MOST ONCE per tick.
+    async def _service_section_count() -> int | None:
+        """The service-token section count, resolved AT MOST ONCE per tick.
 
         Lazy on purpose: a tick that captures nothing must not spend a call on a
-        baseline nobody will compare against. ``owner_sections_resolved`` (not a
-        ``None`` check) memoizes it, because ``None`` -- "the baseline itself
+        baseline nobody will compare against. ``service_sections_resolved`` (not
+        a ``None`` check) memoizes it, because ``None`` -- "the baseline itself
         could not be read" -- is a legitimate resolved answer that must not be
         retried per user.
         """
-        nonlocal owner_sections, owner_sections_resolved
-        if not owner_sections_resolved:
-            owner_sections_resolved = True
+        nonlocal service_sections, service_sections_resolved
+        if not service_sections_resolved:
+            service_sections_resolved = True
             if capture_context is not None:
                 try:
-                    owner_sections = await capture_context.owner_section_count()
+                    service_sections = await capture_context.service_section_count()
                 except Exception as exc:
                     # The baseline is telemetry, never a gate: losing it degrades
                     # the log line to ``scope=baseline_unknown`` and nothing else.
                     _logger.warning(
-                        "entitlement capture could not read the owner-token section baseline "
-                        "(%s); captures this tick report an unknown scope",
+                        "entitlement capture could not read the service-token section "
+                        "baseline (%s); captures this tick report an unknown scope",
                         type(exc).__name__,
                     )
-                    owner_sections = None
-        return owner_sections
+                    service_sections = None
+        return service_sections
 
     async def _capture_for(candidate: DueShareCandidate) -> None:
         """Capture and persist one AUTHORIZED user's sections. Never raises.
@@ -1323,7 +1394,8 @@ async def sweep_shares(
         the verdict and now, and the resulting old-token snapshot would sail
         through the write guard that exists to reject exactly that.
         """
-        nonlocal captured, capture_failed, capture_skipped, capture_circuit_open
+        nonlocal captured, capture_failed, capture_skipped
+        nonlocal capture_anchor_blocked, capture_circuit_open
         user_id = candidate.user_id
         token = candidate.token
         if token is None:
@@ -1366,13 +1438,19 @@ async def sweep_shares(
         # ``/identity`` confirmation, so it costs nothing extra on a tick that
         # already had to confirm for a revocation.
         if not await _anchor_confirmed():
+            # The tick knowingly captured nothing for this user. ``anchor`` now
+            # holds WHICH answer blocked it, and ``mark_completed`` reports that
+            # state even when no share-loss verdict was deferred -- otherwise an
+            # all-AUTHORIZED tick whose anchor could not be confirmed would read
+            # as a clean ``ok`` while capture was fully blocked.
             capture_skipped += 1
+            capture_anchor_blocked += 1
             return
         attempt = await _attempt_capture(
             library,
             machine_identifier=machine_identifier,
             user_id=user_id,
-            owner_section_count=_owner_section_count,
+            service_section_count=_service_section_count,
         )
         if attempt.server_unavailable:
             # Trip the breaker: a black-holed server costs one full timeout per
@@ -1572,6 +1650,7 @@ async def sweep_shares(
         capture_failed=capture_failed,
         capture_skipped=capture_skipped,
         capture_unavailable=capture_unavailable,
+        capture_anchor_blocked=capture_anchor_blocked,
         sessions_revoked=sessions_revoked,
         due_remaining=due_remaining,
         signed_out_user_ids=tuple(signed_out),

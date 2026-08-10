@@ -181,6 +181,7 @@ function healthResponse(
       captured: 0,
       capture_failed: 0,
       capture_skipped: 0,
+      capture_anchor_blocked: 0,
       anchor_deferred: 0,
       signed_out: 0,
       sessions_revoked: 0,
