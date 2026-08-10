@@ -6,16 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_No released versions yet — no Git tags or GitHub releases exist. Package
-metadata is set to `1.0.0` ahead of the promotion (see
-`src/plex_manager/__init__.py`); this section is cut to `## [1.0.0]` as the
-remaining release-checklist curation step, which must land on `main` before
-the `:edge` build selected for promotion (promotion itself only re-tags that
-already-built image — see CONTRIBUTING.md's release checklist). The request →
-watchable → correct loop for movies, TV, and anime is feature-complete; the
-7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with fixes landing
-continuously into `:edge` through the soak, and 1.0.0 stable promotion is
-scheduled for Aug 7, 2026 (see the "Version 1.0" milestone)._
+_Package metadata is `1.0.0` (see `src/plex_manager/__init__.py`). The
+canary-proven `edge-c1bf4eb` image was promoted to `:stable` / `1.0.0` on
+Aug 9, 2026 by re-tag (no rebuild — see CONTRIBUTING.md's release checklist
+and ADR-0004); this section is cut to `## [1.0.0]` in the promotion-day
+cleanup that follows the re-tag. The request → watchable → correct loop for
+movies, TV, and anime is feature-complete; the 7-day live canary run
+(Jul 25 - Aug 1, 2026) completed, fixes from it landed in `:edge` on Aug 2,
+and the renewed soak of the promoted build ran clean from Aug 3 (see the
+"Version 1.0" milestone)._
 
 ### Added
 - Typed React/Vite single-page app, contract-bound to the published OpenAPI

@@ -13,7 +13,7 @@ has an ADR under [`docs/adr/`](docs/adr/).
 
 Status: v1 beta, feature-complete — the request → watchable → correct loop for
 movies, TV, and anime is built and tested. The 7-day live canary run (Jul 25 -
-Aug 1, 2026) is complete; 1.0.0 stable promotion is scheduled for Aug 7, 2026.
+Aug 1, 2026) is complete; 1.0.0 was promoted to `:stable` on Aug 9, 2026.
 v1.x feature work is still gated on explicit tasking.
 
 ## North stars (don't violate these)

@@ -14,9 +14,9 @@ single app — with two differences that define the project:
 > import, Plex scan, Plex availability dedupe, disk-pressure eviction,
 > operability (health/logs/retention/eviction), auto-grab, and in-app correction
 > surfaces. The 7-day live canary run (Jul 25 - Aug 1, 2026) is complete, with
-> fixes landing continuously into `:edge` through the soak; a short
-> release-blocker buffer is underway ahead of the 1.0.0 stable promotion,
-> scheduled for Aug 7, 2026. Browser Plex sign-in/session auth is built; the
+> fixes landing continuously into `:edge` through the soak; after a renewed
+> soak of the post-fix build, 1.0.0 was promoted to `:stable` on Aug 9, 2026.
+> Browser Plex sign-in/session auth is built; the
 > bundled first-party container updater is available as an opt-in Compose
 > profile.
 
