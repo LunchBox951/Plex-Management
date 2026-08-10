@@ -137,6 +137,11 @@ merge — only when actually preparing a promotion):
 
 1. Curate `CHANGELOG.md`: move `[Unreleased]` to a new `## [x.y.z] - <date>`
    section, then restore an empty `## [Unreleased]` above it for the next cycle.
+   Unlike steps 2–3 this step is not machine-enforced, and it may be deferred
+   to promotion-day cleanup after the re-tag when the promoted bytes must be
+   exactly the soaked canary build — the 1.0.0 runbook did exactly that (see
+   the `## [1.0.0]` intro in `CHANGELOG.md`); the trade-off is that the cut is
+   not baked into the promoted image.
 2. Bump the single version source: `src/plex_manager/__init__.py`'s
    `__version__` to `x.y.z`. This is the one place hatch (`pyproject.toml`),
    OpenAPI (`info.version`), and `events.current_build_id()`'s fallback all
