@@ -346,12 +346,15 @@ async def _reuse_terminal_row(
     # torrent whose data is mid-deletion. Checked here so BOTH reuse call sites (the
     # post-add ``existing`` branch and the post-add UNIQUE-conflict branch) are covered
     # in one place; a synchronous read of the in-process registry, no await between it
-    # and the CAS below. Both call sites reach here AFTER ``qbt.add`` (the known-hash
-    # precheck refuses before adding), so a torrent THIS grab genuinely created for a
-    # hash qBittorrent had dropped mid-removal (``actually_added``) would be left
-    # seeding untracked once we refuse — remove it (WITH data, since it is ours and
-    # orphaned) before raising. A pre-existing torrent (``actually_added=False``) is
-    # left in place by ``_remove_torrent_if_added``: it predates this grab.
+    # and the CAS below. Both call sites reach here after the client boundary (the
+    # known-hash precheck refuses before adding), so a torrent THIS grab genuinely
+    # created for a hash qBittorrent had dropped mid-removal (``actually_added``) would
+    # be left seeding untracked once we refuse — remove it (WITH data, since it is ours
+    # and orphaned) before raising. A pre-existing torrent (``actually_added=False``) is
+    # left in place by ``_remove_torrent_if_added``: it predates this grab. That gate is
+    # what keeps this honest when an attachment-loss restart reached the boundary and
+    # deliberately made NO add (:func:`_restart_after_attachment_loss`): it can only
+    # report ``actually_added=False``, so nothing here is ours to remove.
     if queue_service.removal_in_flight(download_id):
         await _remove_torrent_if_added(
             qbt,
@@ -396,6 +399,45 @@ async def _reuse_terminal_row(
     return record, True
 
 
+async def _scope_still_grabbable(
+    session: AsyncSession, *, request_id: int, season: int | None
+) -> bool:
+    """Re-read :func:`grab`'s up-front request/season gate against CURRENT state.
+
+    The gate at the top of :func:`grab` observed the request and season BEFORE the
+    attachment race; the terminalization that won that race may itself have been a
+    cancel (season/request ``cancelled``) or an eviction fold that settled the scope.
+    Re-asking exactly the gate's questions — and only the ones it answers with a flat
+    refusal — is what lets :func:`_restart_after_attachment_loss` decline to hand the
+    release back to the client for content nobody is waiting for any more.
+
+    Deliberately NOT re-applied here: the caller's ``expected_season_status`` premise
+    and the post-add CAS. A season legitimately CHANGED status (that is the race), so
+    comparing against the decision-time snapshot again would refuse every restart; the
+    post-add CAS below still settles the honest winner.
+    """
+    request = await SqlRequestRepository(session).get(request_id)
+    if request is None:  # pragma: no cover - the request was read moments ago
+        return False
+    if request.media_type != "tv":  # pragma: no cover - only TV scopes attach/restart
+        # Domain-boundary backstop, mirroring the up-front gate: branch on the
+        # request's ACTUAL media type rather than on the caller's arguments. Every
+        # restart call site sits inside a ``season is not None`` TV branch, so this
+        # is unreachable today and stays only so the gate cannot silently mis-answer
+        # for a movie if a future caller reaches it.
+        return request.status not in TERMINAL_REQUEST_STATUS_VALUES
+    if season is None:  # pragma: no cover - a tv grab without a season already raised
+        return False
+    season_rows = await SqlSeasonRequestRepository(session).list_for_request(request_id)
+    season_row = next((s for s in season_rows if s.season_number == season), None)
+    status = season_row.status if season_row is not None else RequestStatus.pending.value
+    if status in {RequestStatus.cancelled.value, RequestStatus.waiting_for_air_date.value}:
+        return False
+    return not tv_grab_blocked_by_terminal_parent(
+        parent_status=request.status, observed_season_status=status
+    )
+
+
 async def _restart_after_attachment_loss(
     session: AsyncSession,
     *,
@@ -404,26 +446,52 @@ async def _restart_after_attachment_loss(
     save_path: str,
     category: str,
     torrent_hash: str,
+    download_id: int,
     tmdb_id: int | None,
     media_type: str | None,
+    season: int | None,
     qbt: DownloadClientPort,
     actually_added: bool,
     request_id: int | None,
 ) -> bool:
     """Restart client-add policy after terminalization wins an attachment race.
 
-    A normal grab decision already filtered the blocklist, but that snapshot may
-    predate an operator ``mark_failed`` which removes the torrent, blocklists the
-    release, and terminalizes the active row while this call tries to attach a TV
-    scope. Roll back the lost attachment transaction and recheck the fresh
-    blocklist before handing the release to the client again. A blocked stale
-    decision is refused so callers leave the re-armed scope for a fresh search.
+    A normal grab decision already filtered the blocklist and the request/season
+    gate, but that snapshot may predate the very write that won this race — an
+    operator ``mark_failed`` which removes the torrent, blocklists the release and
+    terminalizes the active row, or a cancel which removes the torrent and settles
+    the scope. Roll back the lost attachment transaction and RE-PROVE every guard
+    the ordinary pre-add path proves, in the same order, before handing the release
+    back to the client:
 
-    If the release remains eligible, repeat ``qbt.add`` before terminal reuse. This
-    matters when the winning terminalization removed the first add's torrent: the
-    repeated add restores a real client torrent, while qBittorrent treats an
-    already-present hash as an idempotent no-op. Return whether either add created
-    the torrent so any later lost race still performs orphan cleanup.
+    * the fresh blocklist (an operator correction must not be undone),
+    * the CURRENT request/season eligibility (:func:`_scope_still_grabbable`),
+    * the removal claim (#206) for the row a terminal reuse would resurrect —
+      ``_reuse_terminal_row`` deliberately refuses that row while a removal is in
+      flight, so re-adding its torrent during the same window would recreate what
+      the operator's delete is removing and leave it seeding untracked once the
+      reuse refuses.
+
+    Every refusal cleans up a torrent THIS call is still known to own
+    (``actually_added``) before raising, exactly like the reuse guard does.
+
+    OWNERSHIP IS RE-PROVEN, NEVER CARRIED. The incoming ``actually_added`` came from
+    an add that happened BEFORE the terminalization; if that terminalization removed
+    the torrent, the old ``created=True`` no longer describes whatever object now
+    answers to this hash — another grab may have recreated it, and carrying the claim
+    would let a later conflict/CAS loss delete that grab's torrent AND its data. So
+    the returned claim is only what THIS call can prove right now:
+
+    * the torrent is still present (``get_status``) — nothing to restore, so no add
+      is repeated (a repeat could only recreate an object mid-removal) and the claim
+      is dropped to ``False``: a torrent the client already holds is not ours to
+      destroy, exactly the rule :func:`_remove_torrent_if_added` states for
+      ``created=False``. A torrent this call created and can no longer claim stays
+      in the client, tracked by the same hash's (terminal) download row and visible
+      to the operator — an honest, recoverable leak rather than a destructive delete
+      of somebody else's data.
+    * the torrent is gone — the removal is proven, so the old claim is void; re-add
+      to restore a real client torrent and return exactly that add's ``created``.
     """
     await session.rollback()
     if await SqlBlocklistRepository(session).is_blocklisted(
@@ -445,7 +513,47 @@ async def _restart_after_attachment_loss(
             raise LookupError(f"blocklisted release {torrent_hash} has no request owner")
         raise RequestNotActiveError(request_id)
 
+    if request_id is not None and not await _scope_still_grabbable(
+        session, request_id=request_id, season=season
+    ):
+        await session.rollback()
+        await _remove_torrent_if_added(
+            qbt,
+            torrent_hash,
+            actually_added=actually_added,
+            request_id=request_id,
+            reason="the request or season settled while attaching its TV scope",
+        )
+        raise RequestNotActiveError(request_id)
+
     await session.rollback()
+    # Synchronous registry read with no await between it and the client calls below,
+    # mirroring ``_reuse_terminal_row``'s #206 guard on the SAME row: that guard would
+    # refuse this reuse anyway, so re-adding first would only resurrect a torrent the
+    # operator's delete is removing.
+    if queue_service.removal_in_flight(download_id):
+        await _remove_torrent_if_added(
+            qbt,
+            torrent_hash,
+            actually_added=actually_added,
+            request_id=request_id,
+            reason="the terminal row's torrent is being removed",
+        )
+        raise TorrentRemovalInFlightError(torrent_hash, download_id)
+
+    if await qbt.get_status(torrent_hash) is not None:
+        if actually_added:
+            _logger.info(
+                "dropping this grab's creator claim after terminalization won the TV "
+                "scope attachment: the torrent is still present, so it is no longer "
+                "provably the object this call added and must not be deleted later",
+                extra={
+                    "request_id": safe_int(request_id) if request_id is not None else None,
+                    "torrent_hash": safe_text(torrent_hash),
+                },
+            )
+        return False
+
     restarted = await qbt.add(source, save_path, category)
     restarted_hash = restarted.torrent_hash.lower() or torrent_hash
     if restarted_hash != torrent_hash:  # pragma: no cover - a source's hash is stable
@@ -457,7 +565,7 @@ async def _restart_after_attachment_loss(
             reason="the attachment-loss retry resolved to a different torrent",
         )
         raise GrabError(scored.candidate.title)
-    return actually_added or restarted.created
+    return restarted.created
 
 
 async def _remove_torrent_if_added(
@@ -1122,11 +1230,11 @@ async def grab(
 
     target_seasons = _planned_target_seasons(scored, season)
     active_guard_seasons = _active_guard_seasons(scored, season, target_seasons)
-    # ``None`` means the ordinary first client add has not run yet. A known-hash
-    # attachment may terminalize before that add; in that case the attachment-loss
-    # restart performs the policy recheck + add itself, and stores whether it created
-    # the torrent so the ordinary add below is not repeated.
-    actually_added_after_pre_add_attachment_loss: bool | None = None
+    # The terminalized row a PRE-ADD attachment loss must restart against, or ``None``
+    # when no such loss happened. A known-hash attachment can terminalize before the
+    # ordinary first client add; the attachment-loss restart then performs the policy
+    # recheck + add itself, replacing that ordinary add.
+    pre_add_attachment_loss_download_id: int | None = None
 
     # Pre-check on the candidate's own hash (when the indexer supplied one) so a
     # known duplicate never even hits the client.
@@ -1169,21 +1277,13 @@ async def grab(
                 if attached is not None:
                     return attached
                 # Attachment lost to terminalization before the ordinary client add.
-                # Revalidate the current blocklist and add the torrent before the
-                # terminal-row reuse path below can resurrect the row.
-                actually_added_after_pre_add_attachment_loss = await _restart_after_attachment_loss(
-                    session,
-                    scored=scored,
-                    source=source,
-                    save_path=save_path,
-                    category=category,
-                    torrent_hash=known_hash,
-                    tmdb_id=tmdb_id,
-                    media_type=request_media_type,
-                    qbt=qbt,
-                    actually_added=False,
-                    request_id=request_id,
-                )
+                # Only REMEMBER it here: the parallel-grab guard below is written to
+                # run before anything reaches the client and raises without cleanup,
+                # so restarting (and possibly re-creating the torrent) at this point
+                # would let that guard strand it seeding untracked. The restart runs
+                # immediately after that guard instead — still before any terminal-row
+                # reuse can resurrect the row.
+                pre_add_attachment_loss_download_id = pre.id
             else:
                 return pre
 
@@ -1215,7 +1315,7 @@ async def grab(
         if active is not None:
             raise AlreadyDownloadingError(request_id)
 
-    if actually_added_after_pre_add_attachment_loss is None:
+    if pre_add_attachment_loss_download_id is None:
         add_result = await qbt.add(source, save_path, category)
         torrent_hash = add_result.torrent_hash.lower() or (known_hash or "")
         # Whether THIS call genuinely created the torrent. False = the client
@@ -1226,12 +1326,27 @@ async def grab(
         # whatever row tracked it. See _remove_torrent_if_added.
         actually_added = add_result.created
     else:
-        # The known-hash attachment terminalized and
-        # ``_restart_after_attachment_loss`` already repeated the full decision at
-        # the client boundary. Continue from that same known hash without adding a
-        # third time.
+        # The known-hash attachment terminalized before the ordinary add. Every guard
+        # that would have run before that add has now run (the parallel-grab guard
+        # above included), so the restart repeats the whole decision at the client
+        # boundary — blocklist, request/season eligibility, removal claim, then the
+        # add — and continues from the same known hash.
         torrent_hash = known_hash or ""  # known by construction on this path
-        actually_added = actually_added_after_pre_add_attachment_loss
+        actually_added = await _restart_after_attachment_loss(
+            session,
+            scored=scored,
+            source=source,
+            save_path=save_path,
+            category=category,
+            torrent_hash=torrent_hash,
+            download_id=pre_add_attachment_loss_download_id,
+            tmdb_id=tmdb_id,
+            media_type=request_media_type,
+            season=season,
+            qbt=qbt,
+            actually_added=False,
+            request_id=request_id,
+        )
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -1240,7 +1355,7 @@ async def grab(
         # tracking an unmatchable row.
         raise GrabError(candidate.title)
 
-    post_add_attachment_lost = False
+    post_add_attachment_loss_download_id: int | None = None
     existing = await download_repo.get_by_hash(torrent_hash)
     if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
         if request_id is not None and existing.media_request_id != request_id:
@@ -1265,11 +1380,11 @@ async def grab(
             )
             if attached is not None:
                 return attached
-            post_add_attachment_lost = True
+            post_add_attachment_loss_download_id = existing.id
         else:
             return existing
 
-    if post_add_attachment_lost:
+    if post_add_attachment_loss_download_id is not None:
         # The first post-add attachment attempt lost to terminalization. Re-run
         # policy + client add before the very first terminal reuse CAS; delaying
         # this until a CAS loss would still let that first CAS resurrect an
@@ -1281,8 +1396,10 @@ async def grab(
             save_path=save_path,
             category=category,
             torrent_hash=torrent_hash,
+            download_id=post_add_attachment_loss_download_id,
             tmdb_id=tmdb_id,
             media_type=request_media_type,
+            season=season,
             qbt=qbt,
             actually_added=actually_added,
             request_id=request_id,
@@ -1364,8 +1481,10 @@ async def grab(
                             save_path=save_path,
                             category=category,
                             torrent_hash=torrent_hash,
+                            download_id=record.id,
                             tmdb_id=tmdb_id,
                             media_type=request_media_type,
+                            season=season,
                             qbt=qbt,
                             actually_added=actually_added,
                             request_id=request_id,
@@ -1476,8 +1595,10 @@ async def grab(
                         save_path=save_path,
                         category=category,
                         torrent_hash=torrent_hash,
+                        download_id=winner.id,
                         tmdb_id=tmdb_id,
                         media_type=request_media_type,
+                        season=season,
                         qbt=qbt,
                         actually_added=actually_added,
                         request_id=request_id,
@@ -1564,8 +1685,10 @@ async def grab(
                             save_path=save_path,
                             category=category,
                             torrent_hash=torrent_hash,
+                            download_id=record.id,
                             tmdb_id=tmdb_id,
                             media_type=request_media_type,
+                            season=season,
                             qbt=qbt,
                             actually_added=actually_added,
                             request_id=request_id,

@@ -25,7 +25,7 @@ from plex_manager.models import (
     RequestStatus,
     SeasonRequest,
 )
-from plex_manager.ports.download_client import AddResult
+from plex_manager.ports.download_client import AddResult, DownloadStatus
 from plex_manager.ports.repositories import DownloadRecord, DownloadScopeRecord
 from plex_manager.repositories.downloads import SqlDownloadRepository
 from plex_manager.services import grab_service, queue_service
@@ -3231,6 +3231,410 @@ async def test_grab_create_race_second_reuse_conflict_cleans_orphan(
         assert winner is not None
         assert winner.status == "downloading"
         assert winner.torrent_hash == winning_hash
+        assert history == []
+    finally:
+        await engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Codex round-3 findings (PR #532, #472): ``_restart_after_attachment_loss`` must
+# re-prove EVERY guard the ordinary pre-add path proves before it hands the
+# release back to the client, and must never carry the first add's creator claim
+# across a removal/replacement of the torrent.
+# --------------------------------------------------------------------------- #
+
+
+async def test_grab_pre_add_attachment_loss_refuses_parallel_grab_before_any_add(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1: the PRE-ADD restart must run AFTER the parallel-grab guard.
+
+    A known-hash attachment loses to terminalization BEFORE the ordinary client add,
+    and auto-grab commits a different release for the re-armed season during that
+    loss. The parallel-grab guard is written to run before anything reaches the
+    client, so it raises WITHOUT orphan cleanup -- restarting (and re-creating the
+    torrent) ahead of it would leave that torrent seeding untracked. Nothing may be
+    handed to qBittorrent at all.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "pre_add_attach_loss_parallel.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        async with sm() as session:
+            seeded = Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+            )
+            session.add(seeded)
+            await session.commit()
+            download_id = seeded.id
+
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+        winning_hash = "b" * 40
+        parallel_id: int | None = None
+
+        async def terminalize_and_claim_before_attachment_lock(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal parallel_id
+            if parallel_id is None:
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "failed"
+                    parallel = Download(
+                        torrent_hash=winning_hash,
+                        status="downloading",
+                        media_request_id=request_id,
+                        tmdb_id=900,
+                        season=2,
+                    )
+                    other.add(parallel)
+                    await other.commit()
+                    parallel_id = parallel.id
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            terminalize_and_claim_before_attachment_lock,
+        )
+
+        qbt = FakeQbittorrent()
+        with pytest.raises(AlreadyDownloadingError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_tv(_HASH, "Some.Show.S02.1080p.WEB-DL.x264-GROUP").model_copy(
+                        update={"target_seasons": (2,)}
+                    ),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        assert parallel_id is not None
+        # The known hash let the guard fire before the client boundary, exactly as it
+        # did before the restart existed: nothing added, so nothing to orphan.
+        assert qbt.added == []
+        assert qbt.removed == []
+        async with sm() as session:
+            row = await session.get(Download, download_id)
+            winner = await session.get(Download, parallel_id)
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert row is not None
+        assert row.status == "failed"
+        assert winner is not None
+        assert winner.status == "downloading"
+        assert history == []
+    finally:
+        await engine.dispose()
+
+
+async def test_grab_attachment_loss_restart_refused_while_removal_in_flight(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 3: the restart must recheck the #206 removal claim before re-adding.
+
+    The attachment loses to a terminalization whose torrent delete is still in
+    flight. ``_reuse_terminal_row`` deliberately refuses that same row during this
+    window, so re-adding first would recreate the very torrent the operator's delete
+    is removing and leave it seeding untracked once the reuse refuses. The restart
+    must refuse instead -- cleaning up the torrent this call created, and adding
+    nothing further.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "attach_loss_removal_in_flight.db")
+    claimed_id: int | None = None
+    try:
+        request_id = await _make_tv_request(sm)
+        async with sm() as session:
+            seeded = Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+            )
+            session.add(seeded)
+            await session.commit()
+            download_id = seeded.id
+
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+
+        async def terminalize_and_claim_removal(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal claimed_id
+            if claimed_id is None:
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "failed"
+                    await other.commit()
+                claimed_id = row_id
+                queue_service.register_removal_in_flight(row_id)
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            terminalize_and_claim_removal,
+        )
+
+        qbt = FakeQbittorrent()
+        with pytest.raises(TorrentRemovalInFlightError) as excinfo:
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless(
+                        "magnet:?xt=urn:btih:" + _HASH,
+                        "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                    ).model_copy(update={"target_seasons": (2,)}),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+        assert excinfo.value.download_id == download_id
+
+        # Exactly ONE add (the ordinary hashless one); the restart never recreated the
+        # torrent the operator's delete is removing, and cleaned up the one it owned.
+        assert len(qbt.added) == 1
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            row = await session.get(Download, download_id)
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert row is not None
+        assert row.status == "failed"  # not resurrected
+        assert history == []
+    finally:
+        if claimed_id is not None:
+            queue_service.release_removal_in_flight(claimed_id)
+        await engine.dispose()
+
+
+async def test_grab_attachment_loss_restart_refused_when_season_cancelled(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 3 (eligibility half): a scope cancelled mid-attach refuses the restart.
+
+    The terminalization that wins the attachment race is the operator's cancel, so the
+    season this grab was decided for is no longer due. The restart must re-ask the
+    up-front request/season gate and refuse rather than hand the release back to the
+    client for content the user explicitly stopped.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "attach_loss_season_cancelled.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        async with sm() as session:
+            seeded = Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+            )
+            session.add(seeded)
+            await session.commit()
+            download_id = seeded.id
+
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+        cancelled = False
+
+        async def terminalize_and_cancel_season(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal cancelled
+            if not cancelled:
+                cancelled = True
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "failed"
+                    season_two = (
+                        await other.execute(
+                            select(SeasonRequest).where(
+                                SeasonRequest.media_request_id == request_id,
+                                SeasonRequest.season_number == 2,
+                            )
+                        )
+                    ).scalar_one()
+                    season_two.status = RequestStatus.cancelled
+                    await other.commit()
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            terminalize_and_cancel_season,
+        )
+
+        qbt = FakeQbittorrent()
+        with pytest.raises(RequestNotActiveError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless(
+                        "magnet:?xt=urn:btih:" + _HASH,
+                        "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                    ).model_copy(update={"target_seasons": (2,)}),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        assert cancelled
+        assert len(qbt.added) == 1  # the restart added nothing for a cancelled season
+        assert qbt.removed == [(_HASH, True)]
+        async with sm() as session:
+            row = await session.get(Download, download_id)
+            season_two = (
+                await session.execute(
+                    select(SeasonRequest).where(
+                        SeasonRequest.media_request_id == request_id,
+                        SeasonRequest.season_number == 2,
+                    )
+                )
+            ).scalar_one()
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert row is not None
+        assert row.status == "failed"  # not resurrected
+        assert season_two.status == RequestStatus.cancelled  # the cancel stands
+        assert history == []
+    finally:
+        await engine.dispose()
+
+
+class _ReplacedTorrentQbittorrent(FakeQbittorrent):
+    """A client whose torrent for ``_HASH`` is removed by the terminalization that
+    wins the attachment race and IMMEDIATELY RECREATED by another grab.
+
+    From the restart's point of view the hash is present again (``get_status``) and a
+    repeat ``add`` reports it already present (``created=False``) -- so this call can
+    prove only that SOMEBODY owns the current object, never that it does.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replaced = False
+
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        if self.replaced and info_hash.lower() == _HASH:
+            return DownloadStatus(
+                info_hash=_HASH,
+                name="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                raw_state="downloading",
+            )
+        return await super().get_status(info_hash)
+
+    async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+        if self.replaced:
+            self.pre_existing = {_HASH}
+        return await super().add(magnet_or_url, save_path, category)
+
+
+async def test_grab_attachment_loss_restart_never_deletes_a_replacement_torrent(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2 (destructive): the restart must not carry a stale creator claim.
+
+    The first add genuinely created the torrent, but the terminalization that won the
+    attachment race removed it and ANOTHER grab recreated the same hash. The old add's
+    ``created=True`` no longer describes the current client object, so carrying it
+    across the restart would let the parallel-grab guard below delete that other
+    grab's torrent AND its data. Ownership is re-proven at the client instead: a hash
+    the client already holds is never this call's to destroy.
+    """
+    sm, engine = await _file_backed_sessionmaker(tmp_path, "attach_loss_replaced_torrent.db")
+    try:
+        request_id = await _make_tv_request(sm)
+        async with sm() as session:
+            seeded = Download(
+                torrent_hash=_HASH,
+                status="downloading",
+                media_request_id=request_id,
+                tmdb_id=900,
+                season=2,
+                release_title="Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+            )
+            session.add(seeded)
+            await session.commit()
+            download_id = seeded.id
+
+        qbt = _ReplacedTorrentQbittorrent()
+        real_lock = grab_service.SqlDownloadRepository.lock_if_active
+        winning_hash = "b" * 40
+        parallel_id: int | None = None
+
+        async def terminalize_replace_and_claim(
+            self: grab_service.SqlDownloadRepository, row_id: int
+        ) -> bool:
+            nonlocal parallel_id
+            if parallel_id is None:
+                async with sm() as other:
+                    row = await other.get(Download, row_id)
+                    assert row is not None
+                    row.status = "failed"
+                    parallel = Download(
+                        torrent_hash=winning_hash,
+                        status="downloading",
+                        media_request_id=request_id,
+                        tmdb_id=900,
+                        season=2,
+                    )
+                    other.add(parallel)
+                    await other.commit()
+                    parallel_id = parallel.id
+                # The terminalization removed this grab's torrent; another grab has
+                # already recreated the same hash for itself.
+                qbt.replaced = True
+            return await real_lock(self, row_id)
+
+        monkeypatch.setattr(
+            grab_service.SqlDownloadRepository,
+            "lock_if_active",
+            terminalize_replace_and_claim,
+        )
+
+        with pytest.raises(AlreadyDownloadingError):
+            async with sm() as session:
+                await grab_service.grab(
+                    qbt,
+                    session,
+                    scored=_scored_hashless(
+                        "magnet:?xt=urn:btih:" + _HASH,
+                        "Some.Show.S02.1080p.WEB-DL.x264-GROUP",
+                    ).model_copy(update={"target_seasons": (2,)}),
+                    request_id=request_id,
+                    tmdb_id=900,
+                    season=2,
+                )
+
+        assert parallel_id is not None
+        # The replacement is present, so there is nothing to restore and no claim to
+        # make: above all no delete of the other grab's torrent (and its data), and no
+        # repeat add either.
+        assert qbt.removed == []
+        assert len(qbt.added) == 1
+        async with sm() as session:
+            row = await session.get(Download, download_id)
+            winner = await session.get(Download, parallel_id)
+            history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert row is not None
+        assert row.status == "failed"
+        assert winner is not None
+        assert winner.status == "downloading"
         assert history == []
     finally:
         await engine.dispose()
