@@ -1,0 +1,7 @@
+# Known-benign findings, one fingerprint per line
+# (commit:file:rule:line — see https://github.com/gitleaks/gitleaks#gitleaksignore).
+#
+# Key-rotation race test fixture, not a credential. Flagged by the
+# generic-api-key detector after a gitleaks update; the weekly full-history
+# scan started failing on it 2026-08-17 with no repo change.
+e1084e71339bf2a1d98282806859e191e0dfc4c5:tests/web/test_settings.py:generic-api-key:1504
