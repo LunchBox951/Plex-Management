@@ -10,9 +10,12 @@ from typing import Any, cast
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-WOLFI_BASE = (
-    "cgr.dev/chainguard/wolfi-base:latest@"
-    "sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e"
+# The wolfi-base digest itself lives in the Dockerfile (its FROM lines are the
+# single source of truth). The contract asserts the pin *format* and that the
+# builder and runtime stages share one digest, so a Dependabot digest bump
+# stays a one-file change that passes CI on its own.
+WOLFI_BASE_FROM = re.compile(
+    r"^FROM (cgr\.dev/chainguard/wolfi-base:latest@sha256:[0-9a-f]{64}) AS \S+$"
 )
 PYTHON_PACKAGE = "python-3.14=3.14.6-r4"
 PIP_PACKAGE = "py3.14-pip=26.1.2-r1"
@@ -131,7 +134,9 @@ def test_dockerfile_pins_wolfi_and_exact_apk_packages() -> None:
     from_lines = [line for line in instructions if line.startswith("FROM ")]
     run_lines = [line for line in instructions if line.startswith("RUN ")]
 
-    assert sum(line.startswith(f"FROM {WOLFI_BASE} ") for line in from_lines) == 2
+    wolfi_refs = [match.group(1) for line in from_lines if (match := WOLFI_BASE_FROM.match(line))]
+    assert len(wolfi_refs) == 2, "builder and runtime must both build FROM digest-pinned wolfi-base"
+    assert len(set(wolfi_refs)) == 1, "builder and runtime must share the same wolfi-base digest"
     assert sum(PYTHON_PACKAGE in line for line in run_lines) == 2
     assert sum(PIP_PACKAGE in line for line in run_lines) == 1
     assert sum(FFMPEG_PACKAGE in line for line in run_lines) == 1
