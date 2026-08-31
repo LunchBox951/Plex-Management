@@ -14,7 +14,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- builder: install the app into an isolated venv ----
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e AS builder
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:57108e597a8cf3bd376b810f1c3539c21942daefa242cb9dddaae30f8aac735d AS builder
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 
@@ -39,7 +39,7 @@ COPY --from=web /src/plex_manager/web/static ./src/plex_manager/web/static
 RUN pip install -c requirements/runtime-constraints.txt ".[postgres]"
 
 # ---- runtime: Wolfi/glibc image with just the venv + migration assets ----
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:003627df3c1e1bba0c4116afcddb314aca9594ee2328c7e876a8081a6c988b2e AS runtime
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:57108e597a8cf3bd376b810f1c3539c21942daefa242cb9dddaae30f8aac735d AS runtime
 ARG PLEX_MANAGER_BUILD_ID=0.0.0
 # The app's config default is loopback (safe for bare-metal first runs); inside
 # the container the ONLY way in is the published port, so bind all interfaces
