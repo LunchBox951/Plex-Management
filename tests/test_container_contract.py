@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WOLFI_BASE_FROM = re.compile(
     r"^FROM (cgr\.dev/chainguard/wolfi-base:latest@sha256:[0-9a-f]{64}) AS \S+$"
 )
-PYTHON_PACKAGE = "python-3.14=3.14.6-r4"
+PYTHON_PACKAGE = "python-3.14=3.14.7-r4"
 PIP_PACKAGE = "py3.14-pip=26.1.2-r1"
 PIP_VERSION = "26.1.2"
 FFMPEG_PACKAGE = "ffmpeg-8.1=8.1.2-r2"
