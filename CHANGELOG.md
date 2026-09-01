@@ -83,6 +83,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer starve the rest of the sweep's backlog (#559).
 
 ### Security
+- Bumped the container's `python-3.14` APK pin from 3.14.6-r4 to 3.14.7-r4,
+  resolving CVE-2025-15366 (medium, `imaplib`) and CVE-2026-6879 (low, XML
+  parsing) reported by Trivy against the `:edge` image. The app imports
+  neither `imaplib` nor any `xml` module, so this is a supply-chain hygiene
+  bump rather than an exploitable path here. Ships with the next promotion
+  (#587, #562).
 - Bumped `cryptography` to 50.0.0, resolving GHSA-g6cj-pr64-35w5 (a
   Bleichenbacher timing oracle in PKCS#7 decryption affecting
   `cryptography` `>=44,<50`). Only Fernet is used in this codebase
