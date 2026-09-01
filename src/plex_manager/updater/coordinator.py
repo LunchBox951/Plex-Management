@@ -101,6 +101,12 @@ _KNOWN_MEDIA_TYPES: Final[frozenset[str]] = frozenset(
 #: hash length.
 _FINGERPRINT_HEX_CHARS: Final = 12
 
+#: Largest response body this client will hand to ``response.json()`` (issue
+#: #573). The coordinator's real payloads are a few hundred bytes at most, so
+#: anything larger is not a contract body; decoding it would only buy a
+#: second full-size allocation inside the long-running updater sidecar.
+_MAX_JSON_BODY_BYTES: Final = 16 * 1024
+
 
 class CoordinatorError(RuntimeError):
     """The coordinator was unavailable or returned an invalid contract."""
@@ -127,6 +133,8 @@ class LeaseStatus:
 
 
 def _object(response: httpx.Response) -> dict[str, object]:
+    if len(response.content) > _MAX_JSON_BODY_BYTES:
+        raise CoordinatorError("coordinator_invalid_response")
     try:
         value: object = response.json()
     # httpx.Response.json() delegates to the stdlib json module: a malformed
@@ -173,7 +181,14 @@ def _extract_safe_detail_code(response: httpx.Response) -> str | None:
     then it falls to the opaque branch like anything else unrecognized.
     ``message`` remains unread: free-text prose has no finite vocabulary the
     way a code does.
+
+    A body over :data:`_MAX_JSON_BODY_BYTES` is ``None`` without being
+    decoded at all (issue #573): the envelope is tiny, and ``response.json()``
+    on an oversized body would allocate a second full copy inside the
+    long-running sidecar before the caller ever raises.
     """
+    if len(response.content) > _MAX_JSON_BODY_BYTES:
+        return None
     try:
         parsed: object = response.json()
     # See _object's identical comment: json.JSONDecodeError (a ValueError
@@ -274,9 +289,11 @@ class CoordinatorClient:
         finite, actually-possible codes these six endpoints can send -- is
         ever echoed: nothing outside that enumeration reaches the log by
         name, regardless of shape or charset. ``message`` free text is never
-        logged at all. Any other body (the actual 2026-07-28 canary
-        recurrence was app-origin JSON with a known ``detail``, so this is
-        the exceptional path) logs status, an allowlisted media type
+        logged at all. Any other body -- not JSON, not a dict, no known
+        ``detail``, or oversized (issue #573: over
+        :data:`_MAX_JSON_BODY_BYTES`, never decoded) -- logs status (the
+        actual 2026-07-28 canary recurrence was app-origin JSON with a known
+        ``detail``, so this is the exceptional path), an allowlisted media type
         (:func:`_safe_media_type` -- a ``Content-Type`` parameter, or an
         out-of-allowlist subtype, could otherwise smuggle a secret), byte
         length, and an IRREVERSIBLE fingerprint instead: still enough to
