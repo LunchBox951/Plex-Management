@@ -53,6 +53,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#561).
 
 ### Fixed
+- Entitlement capture: the pre-init (first-owner claim) sign-in now reads its
+  token ciphertext inside the transaction that wrote it, before the session
+  commit, matching the token-rotation path. Read after the commit and without
+  `secret_rotation_lock`, a concurrent same-claimant sign-in with a different
+  token could rotate in that gap and let the old-token capture pass the write
+  guard under the new credential's ciphertext. Also pins the composed sweep
+  path (a stored capture and a sign-out in one tick) at the app layer (#572).
 - Eviction: operator corrections and pressure sweeps are now serialized by a
   per-root pressure-exclusion lease — a correction beginning inside a sweep's
   await windows defeats the sweep (corrections never wait), enforced down to

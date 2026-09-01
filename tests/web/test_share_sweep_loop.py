@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -25,6 +25,7 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 
+from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import AuditLog, AuthSession, User
 from plex_manager.services import plex_access_service
 from plex_manager.web import app as app_module
@@ -40,6 +41,15 @@ _MACHINE_ID = "configured-server-machine-id"
 _MAX_DRAINED_FRAMES = 100
 
 
+@pytest.fixture(autouse=True)
+def _clear_library_caches() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """A successful capture warms ``PlexLibrary``'s process-wide sections cache;
+    never let one test's server answer leak into another's."""
+    reset_caches()
+    yield
+    reset_caches()
+
+
 def _server_resource(machine_id: str) -> dict[str, object]:
     return {
         "name": "Living Room",
@@ -50,30 +60,66 @@ def _server_resource(machine_id: str) -> dict[str, object]:
     }
 
 
+def _sections(*keys: str) -> dict[str, object]:
+    """A ``/library/sections`` body the capture can parse."""
+    return {
+        "MediaContainer": {
+            "size": len(keys),
+            "Directory": [
+                {
+                    "key": key,
+                    "title": f"S{key}",
+                    "type": "movie",
+                    "Location": [{"id": 1, "path": "/x"}],
+                }
+                for key in keys
+            ],
+        }
+    }
+
+
 def _plex_tv_transport(
-    payload: list[dict[str, object]] | int,
+    payload: list[dict[str, object]] | int | Mapping[str, list[dict[str, object]]],
     *,
     live_identity: str | None = _MACHINE_ID,
+    sections: dict[str, object] | None = None,
 ) -> httpx.MockTransport:
     """plex.tv ``/resources`` plus the configured server's ``/identity`` probe.
+
+    ``payload`` is plex.tv's answer for every token (a list), a status code that
+    rejects every token (an int), or a mapping from ``X-Plex-Token`` to that
+    token's own answer, so one sweep can hold users with DIFFERENT verdicts.
 
     ``live_identity`` is what the CONFIGURED SERVER reports when the sweep
     re-confirms its anchor before acting on a share loss: the same id means the
     anchor holds, a different one means the server was rebuilt/re-claimed, and
     ``None`` makes the probe fail outright.
+
+    ``sections`` is the server's ``/library/sections`` body for any token; left
+    ``None`` the server answers with a non-JSON body, so a capture that runs
+    fails and no test that never asked for sections captures by accident.
     """
+
+    def resources_for(request: httpx.Request) -> httpx.Response:
+        if isinstance(payload, int):
+            return httpx.Response(payload, json={})
+        if isinstance(payload, Mapping):
+            token = request.headers.get("X-Plex-Token")
+            assert token is not None and token in payload, "unexpected token at plex.tv"
+            return httpx.Response(200, json=payload[token])
+        return httpx.Response(200, json=payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/resources":
-            if isinstance(payload, int):
-                return httpx.Response(payload, json={})
-            return httpx.Response(200, json=payload)
+            return resources_for(request)
         if request.url.path == "/identity":
             if live_identity is None:
                 raise httpx.ConnectError("plex server unreachable", request=request)
             return httpx.Response(
                 200, json={"MediaContainer": {"machineIdentifier": live_identity}}
             )
+        if request.url.path == "/library/sections" and sections is not None:
+            return httpx.Response(200, json=sections)
         return httpx.Response(200, text="ok")
 
     return httpx.MockTransport(handler)
@@ -84,14 +130,16 @@ async def _use_transport(app: FastAPI, transport: httpx.MockTransport) -> None:
     app.state.http_client = httpx.AsyncClient(transport=transport)
 
 
-async def _signed_in_user(app: FastAPI, *, username: str = "viewer", permissions: int = 0) -> int:
+async def _signed_in_user(
+    app: FastAPI,
+    *,
+    username: str = "viewer",
+    permissions: int = 0,
+    token: str = "user-token",  # noqa: S107
+) -> int:
     now = datetime.now(UTC)
     async with app.state.sessionmaker() as session:
-        user = User(
-            username=username,
-            encrypted_plex_token="user-token",  # noqa: S106
-            permissions=permissions,
-        )
+        user = User(username=username, encrypted_plex_token=token, permissions=permissions)
         session.add(user)
         await session.flush()
         session.add(
@@ -541,3 +589,59 @@ async def test_capture_is_declined_without_an_operator_verified_anchor(
         assert user.entitled_section_keys is None
         # The anchor was NOT silently backfilled from the unauthenticated probe.
         assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) is None
+
+
+async def test_one_tick_captures_the_authorized_user_and_signs_out_the_revoked_one(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """The composed success path (#572): a tick that BOTH stores a capture and
+    signs someone out, through the real ``_entitlement_capture_context`` wiring.
+
+    Every other test here pins one half in isolation, and none asserted a
+    ``captured`` count above zero at this layer -- so the wiring that #484 PR-4/5
+    will gate on had no test proving it ever produced a stored snapshot. This
+    one holds a user whose share is live next to one whose share is gone, and
+    checks each got exactly their own outcome.
+    """
+    await seed(initialized=True)
+    await _configure_server(app)
+    kept_id = await _signed_in_user(app, username="kept", token="kept-token")  # noqa: S106
+    revoked_id = await _signed_in_user(app, username="revoked", token="revoked-token")  # noqa: S106
+    await _use_transport(
+        app,
+        _plex_tv_transport(
+            {
+                "kept-token": [_server_resource(_MACHINE_ID)],
+                "revoked-token": [_server_resource("some-other-server")],
+            },
+            sections=_sections("1", "3"),
+        ),
+    )
+
+    assert await _tick(app) == 2
+
+    status = app.state.share_sweep_status
+    assert status.state == "ok"
+    assert status.authorized == 1
+    assert status.share_revoked == 1
+    assert status.signed_out == 1
+    assert status.sessions_revoked == 1
+    assert status.captured == 1
+    assert status.capture_failed == 0
+    assert status.capture_skipped == 0
+    assert status.capture_anchor_blocked == 0
+    assert status.capture_unavailable is None
+
+    assert await _live_sessions(app, kept_id) == 1
+    assert await _live_sessions(app, revoked_id) == 0
+    async with app.state.sessionmaker() as session:
+        kept = await session.get(User, kept_id)
+        assert kept is not None
+        assert kept.share_state == "authorized"
+        assert kept.entitled_section_keys == ["1", "3"]
+        assert kept.entitlements_machine_id == _MACHINE_ID
+        revoked = await session.get(User, revoked_id)
+        assert revoked is not None
+        assert revoked.share_state == "share_revoked"
+        # A capture is a snapshot of ACCESS; a user with none has nothing to capture.
+        assert revoked.entitled_section_keys is None
