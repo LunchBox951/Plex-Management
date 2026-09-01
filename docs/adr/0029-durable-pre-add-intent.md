@@ -37,7 +37,9 @@
   (merged — the delete-authorized vs. delete-started marker boundary, the direct
   analogue of this design one layer down) and
   [issue #526](https://github.com/LunchBox951/Plex-Management/issues/526)
-  (open — the per-root pressure-exclusion lease; ordering discussed below).
+  (closed by [PR #568](https://github.com/LunchBox951/Plex-Management/pull/568),
+  commit `881b8cbe` — the per-root pressure-exclusion lease; the landed
+  ordering is recorded below).
 
 ## Context
 
@@ -156,7 +158,7 @@ implementation detail.
 - **C7 — Coexistence, not replacement.** `download_coverage_claims`,
   `uq_downloads_active_request`, `uq_download_scopes_active_scope`, ADR-0022's
   claim-before-purge ordering, PR #524's delete-authorized/delete-started
-  boundary, and (when it lands) #526's per-root pressure lease all keep their
+  boundary, and #568's per-root pressure-exclusion lease (#526) all keep their
   current semantics.
 - **C8 — Single-writer SQLite.** Correctness arguments may lean on ADR-0007's
   serialization the way ADR-0022 does, and must say so where they do.
@@ -367,11 +369,17 @@ anything. Two rules close it:
   client's own creation timestamp for the torrent (qBittorrent's `added_on`,
   reported alongside the `category` field this ADR already adds to
   `DownloadStatus`), and destructive removal re-proves it matches before acting.
-  A re-added torrent carries a new `added_on`, so it fails the comparison even
-  when the hash and the flag both look right. **This applies to every
-  destructive removal, without exception** — report-issue, eviction cleanup, and
-  the `cancel_requested` recovery path alike. The cancel path is not a special
-  case that may remove on `client_created` alone: it removes with data, so it
+  A torrent re-added in a later second carries a new `added_on`, so it fails
+  the comparison even when the hash and the flag both look right. The marker is
+  coarse, though: qBittorrent reports `added_on` in Unix-epoch **seconds**
+  (`adapters/qbittorrent/adapter.py:105-115`), so a delete-and-re-add that
+  completes within the same second is indistinguishable by `added_on` alone.
+  That collision is Open Question 17: the comparison may only *authorize*
+  removal when the marker can distinguish instances, and must degrade to an
+  operator-gated removal when it cannot. **This applies to every destructive
+  removal, without exception** — report-issue, eviction cleanup, and the
+  `cancel_requested` recovery path alike. The cancel path is not a special case
+  that may remove on `client_created` alone: it removes with data, so it
   re-proves instance identity first.
 
 The first rule alone is insufficient — a delete-and-re-add that completes
@@ -408,10 +416,16 @@ ride-alongs):
 
 | Column | Notes |
 |---|---|
+| `id` | PK |
 | `intent_id` | FK, `ON DELETE CASCADE` |
-| `media_request_id`, `season_number` | scope identity; `NOT NULL` so NULLs cannot bypass uniqueness |
+| `media_request_id`, `season_number` | scope identity; `NOT NULL` so NULLs cannot bypass the unique key below |
 | `role` | `target` (will be imported) vs. `covered` (ride-along) — the same distinction `download_scopes` and `download_coverage_claims` already draw |
 | `episodes_json` | episode filter, `target` rows only |
+
+Unique key `(intent_id, media_request_id, season_number)`: one row per season
+per intent. A retried intent construction or a supersession that re-attaches
+scopes must therefore upsert rather than append, so activation never receives
+duplicate `target`/`covered` rows for one season.
 
 Changes to `download_coverage_claims` (R1):
 
@@ -893,13 +907,42 @@ every `needs_attention` residue from Part 1 terminates at a button.
   marker-gated recovery re-checks "active download/coverage" before force-purging
   an intact tree; that recheck must be widened to intent-owned claims, or #524's
   preserved-eligibility guarantee silently excludes in-flight grabs.
-- **Issue #526 (open).** If the per-root pressure-exclusion lease lands first,
-  the intent claim must be acquired *inside* that serialization for the TV
-  eviction path, not alongside it — otherwise the sweep's fresh disk probe and
-  an activation can still interleave. If this ADR lands first, #526's lease must
-  treat a live intent as active-download-equivalent when it samples claims.
-  Either order works; **the order must be chosen deliberately rather than
-  discovered.** Neither blocks the other.
+- **Issue #526 (closed by PR #568, commit `881b8cbe`).** The per-root
+  pressure-exclusion lease landed before this ADR, so the ordering is no longer
+  a choice: a pressure-triggered `run_eviction_sweep` now acquires a
+  root-scoped lease before its first disk probe and holds it across recovery,
+  candidate assembly, every claim, and every delete. **For the TV eviction
+  path, I1 acquires the intent claim *inside* that serialization, not
+  alongside it** — otherwise the sweep's fresh disk probe and a pre-add commit
+  can still interleave, the same snapshot-then-await shape #568 closed for
+  correction purges. The sweep's per-candidate claim check
+  (`_coverage_claim_active`) runs under the lease; once I1 widens it to
+  intent-owned claims, a live intent is active-download-equivalent to a running
+  sweep without a second rule. The lease itself samples nothing about claims.
+  It has two halves, and both matter here: **acquire**
+  (`acquire_pressure_exclusion`) refuses a sweep that is about to start when a
+  purge path is already registered under the root, and **revoke**
+  (`revoke_pressure_exclusions`) is a latch that defeats every lease already
+  held over a path, which the running sweep re-reads before each victim and at
+  its `before_delete` boundary. Leases do not exclude one another, and
+  registration alone does nothing to a sweep that already holds its lease, so
+  covering one half covers only one ordering. A correction covers both in one
+  await-free step (`begin_purge` then `revoke_pressure_exclusions`,
+  `correction_service.report_issue`). The pre-add
+  commit must do the equivalent: either register *and* revoke as a correction
+  does (which stands a running sweep down on every pre-add, a cost I1 must
+  weigh), or extend the lease so that *lease* acquisition is refused at sweep
+  start while a pre-add claim is in flight *and* claim acquisition refuses or
+  waits while a lease is held. Which of those I1 chooses is an implementation
+  choice; the obligation is that the sweep's per-candidate claim check and the
+  pre-add commit never interleave in either order. One TV eviction mode sits
+  outside that serialization entirely: a **proactive** sweep (the opt-in
+  `eviction_proactive_enabled` setting) takes no lease, because it has no
+  pressure reading a correction could invalidate, yet it still runs the same
+  per-candidate claim check and delete with suspension points between them.
+  Neither option above touches it, so #568 settles the ordering for
+  pressure-triggered sweeps only; the proactive gap is the part of Open
+  Question 6 that remains open.
 
 ### Crash-recovery matrix
 
@@ -913,7 +956,7 @@ every `needs_attention` residue from Part 1 terminates at a button.
 | **After the activation commit, before the best-effort recategorize** | `Download` + claims + history + `pending_recategorize` | torrent still under `plex-manager-intent` | the row is tracked and reconciles normally; the reconcile loop retries the recategorize **because `pending_recategorize` is set** — without that durable flag nothing would ever notice, since `DownloadStatus` carries no category and the sweep excludes tracked hashes. This row exists *because* the recategorize was moved out of the transaction | claim owned by the download |
 | After the activation commit and the recategorize | `Download` + claims + history | torrent under `plex-manager` | ordinary tracked reconciliation | claim owned by the download |
 | Hash mismatch (client resolved a different hash than `prepare_add` derived) | `prepared` + claims | a torrent under our intent category with an unexpected hash | The probe asks about *our* hash, so this is **indistinguishable from "never added"** and the intent re-submits. The re-submit cap bounds the leak and then parks `needs_attention`; the I3 sweep is what actually surfaces the leaked torrents. **Never** a silent adopt | **claimed throughout** — this park class **retains** its claims, because the leaked torrents may still be downloading (see the park taxonomy) |
-| Any of the above on a release rolled back to N-1 | `prepared` rows present, unactivatable | as above | N-1 cannot activate. See the honest residual under *Consequences* | see residual |
+| Any of the above on a release rolled back to N-1 | `prepared` rows present, unactivatable | as above | N-1 cannot activate. See the honest residual under *Consequences* and Open Question 18 | see residual |
 
 ### Staging
 
@@ -1139,8 +1182,13 @@ review deliberately rather than continuously.*
   behavior. Nothing is corrupted, but the protection silently lapses. Rolling
   back from I2 additionally leaves `prepared` intents that the older code will
   never activate and whose client torrents it cannot see — which is exactly the
-  #481 state, restored. **The rollback story must be documented as part of each
-  increment's release note, not assumed from the expand-only rule.**
+  #481 state, restored. That lapse is *not* acceptable under ADR-0024 for a
+  release published to an updater-consumed moving tag: N-1 must keep providing
+  its supported behavior against the migrated database, and the guard *is*
+  supported behavior. Release-note disclosure does not satisfy the rule.
+  **Open Question 18 records the resulting constraint and is I1's release
+  gate**: the migration may not reach an updater-consumed tag until an
+  N-1-compatible guard or an expand/contract sequence exists.
 - **The testing burden is the crash matrix.** Every row above is a required
   regression test, plus: the cancel↔recovery race in both directions (L9); the
   parked-intent-is-inert property across *every* guard (L3); the
@@ -1162,7 +1210,10 @@ review deliberately rather than continuously.*
   crash and being retried to a confirmed category. Added by the final review
   round: an externally relabelled `client_created=True` torrent **retaining**
   its claims through a `foreign_category` park; a delete-and-re-add of the same
-  hash failing the instance-marker comparison before a destructive removal;
+  hash in a later second failing the instance-marker comparison before a
+  destructive removal, and a same-second re-add never being removed on the
+  marker alone (Open Question 17 decides whether it fails a stronger marker or
+  degrades to the operator-gated path);
   activation converging on a same-hash `Download` created by another intent
   rather than retrying `create()`; supersession **transferring** retained claims
   in one transaction rather than cascading them away; discard refused on a
@@ -1178,7 +1229,8 @@ review deliberately rather than continuously.*
   site, `exclude_intent_id` at all eight `_active_conflict_for_targets` call
   sites, the submission lease, `pending_recategorize` and its retry, the
   stale-claim reaper, and the guard tests. No port change, no frontend.
-  Independently shippable and soakable. Sized above the first
+  Independently shippable and soakable, subject to Open Question 18 before
+  the migration reaches an updater-consumed tag. Sized above the first
   estimate deliberately: the self-exclusion threading is mechanical but
   unforgiving, and the owner swap is real logic on the hottest error-handling
   path in the file.
@@ -1229,8 +1281,13 @@ revision or its PRs), because they do not change the option choice:
    the indexer-supplied `infoHash`.
 5. **Backoff schedule shape** for `needs_attention` / `next_attempt_at`, and
    whether it reuses the auto-grab cooldown machinery.
-6. **Ordering against #526's per-root lease** — either order works, but the
-   choice must be made before either lands.
+6. **Ordering against #526's per-root lease** — *resolved for
+   pressure-triggered sweeps by PR #568 (commit `881b8cbe`)*: the lease landed
+   first, so I1 acquires the intent claim inside the per-root serialization for
+   the TV eviction path (see *Interaction with the existing claim machinery*).
+   *Still open:* a proactive sweep takes no lease, so I1 must either bring
+   proactive sweeps under the lease or key the pre-add exclusion on something
+   a proactive sweep does consult. Which is I1's to decide.
 7. **I1's stale-claim reaper predicate** — age-based, or tied to a process-start
    generation marker.
 8. **Whether `client_only_torrents` observations are also the storage for I2's
@@ -1254,15 +1311,17 @@ revision or its PRs), because they do not change the option choice:
 
 ### Open questions raised in review
 
-This ADR went through seven substantive review rounds, and each new mechanism
-kept surfacing further edge cases. That is not a sign the design is wrong; it is
-a measurement of how large the surface is — which is itself an argument for the
-release-separated staging, since each increment gets its own implementation
-review against real code rather than against a document. The following
-constraints were raised late and are recorded here as obligations on the
-implementing changes rather than resolved with more speculative machinery. Each
-states what must be true; where the direction is obvious it is named in one
-sentence.
+This ADR went through seven substantive review rounds before it merged as
+Proposed, and an eighth after the merge (recorded as questions 17–18 plus the
+text corrections for #568, `added_on`, and the intent-scope key). Each new
+mechanism kept surfacing further edge cases. That is not a sign the design is
+wrong; it is a measurement of how large the surface is — which is itself an
+argument for the release-separated staging, since each increment gets its own
+implementation review against real code rather than against a document. The
+following constraints were raised late and are recorded here as obligations on
+the implementing changes rather than resolved with more speculative machinery.
+Each states what must be true; where the direction is obvious it is named in
+one sentence.
 
 11. **I1's stale-claim reaper cannot distinguish crash-after-add from
     crash-before-submission.** In I1 the intent has no hash, so nothing lets the
@@ -1318,6 +1377,40 @@ sentence.
     reconciling with obligation 4's non-empty-hash requirement — most likely by
     distinguishing a *provisional* hash used for submission from a *confirmed*
     hash written back once the client reports it.
+17. **`added_on` cannot distinguish instances within one second.** The
+    instance marker in the *Ownership model* is qBittorrent's `added_on`, which
+    the adapter documents as Unix-epoch seconds. A delete-and-re-add completing
+    within the same second yields an identical marker, so the comparison would
+    accept the replacement as the original app-created instance and authorize
+    remove-with-data against it. **Constraint:** the instance check may
+    authorize a destructive removal only when the persisted marker can actually
+    distinguish the present instance from the one activation observed; where it
+    cannot, the removal must be operator-gated, never silent. *Direction:* a
+    stronger marker (further client-reported instance evidence persisted at
+    activation, or one the app stamps on the torrent at add time and verifies
+    before removal), or an explicit degrade to the operator-gated path when the
+    only available marker is second-resolution. This is the resolution half of
+    question 10's portability concern; the two should be settled together.
+18. **The N-1 rollback residual violates ADR-0024 on updater-consumed tags.**
+    *Consequences* records that after a rollback from I1, claim rows whose
+    `download_id` is NULL are invisible to the older inner-join guard, so N-1
+    can admit a replacement grab or evict against coverage that is in fact
+    claimed. [ADR-0024](0024-first-party-container-auto-updater.md) requires
+    that N-1 "still be able to start and provide its supported behavior
+    against the resulting database" for every release eligible for automatic
+    update; the coverage guard is supported behavior, and a release note does
+    not restore it. **Constraint (I1's release gate):** I1's migration, and
+    I2's after it, may not ship to an updater-consumed moving tag until either
+    an N-1-compatible guard exists or the change is sequenced as
+    expand/contract across releases. *Direction:* ship the expand migration
+    together with the intent-aware guard predicate one release *ahead* of the
+    release that first writes intent-owned claims, so the rollback target
+    already reads them. ADR-0024's own fallback — stay off moving tags and ship
+    with documented pinned/manual upgrade instructions — also satisfies the
+    rule, but `:edge` is itself a moving tag the canary fleet auto-pulls, so
+    that fallback forfeits the soak the staging plan depends on. Which route
+    the maintainer takes is a release decision, not a design one, and belongs
+    in the acceptance revision.
 
 ## Alternatives considered
 
