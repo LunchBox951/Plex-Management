@@ -39,6 +39,8 @@
   [issue #526](https://github.com/LunchBox951/Plex-Management/issues/526)
   (open — the per-root pressure-exclusion lease; ordering discussed below).
 
+> **Revision proposed:** [ADR-0030](0030-pre-add-intent-review-and-rollout.md) records the post-merge review findings and proposes to supersede this record's instance-identity rule, intent-scope key, eviction ordering, rollback treatment, and release sequence. Read those parts with ADR-0030; this record preserves the original proposal. Both records remain Proposed.
+
 ## Context
 
 ### The window
