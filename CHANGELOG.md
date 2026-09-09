@@ -59,6 +59,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `vite`, and `vitest` dev dependencies (#581).
 
 ### Fixed
+- Entitlement capture: the pre-init (first-owner claim) sign-in now reads its
+  token ciphertext inside the transaction that wrote it, before the session
+  commit, matching the token-rotation path. Read after the commit and without
+  `secret_rotation_lock`, a concurrent same-claimant sign-in with a different
+  token could rotate in that gap and let the old-token capture pass the write
+  guard under the new credential's ciphertext. Also pins the composed sweep
+  path (a stored capture and a sign-out in one tick) at the app layer (#572).
 - Eviction: operator corrections and pressure sweeps are now serialized by a
   per-root pressure-exclusion lease — a correction beginning inside a sweep's
   await windows defeats the sweep (corrections never wait), enforced down to
@@ -95,6 +102,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer starve the rest of the sweep's backlog (#559).
 
 ### Security
+- Bumped the container's `python-3.14` APK pin from 3.14.6-r4 to 3.14.7-r4,
+  resolving CVE-2025-15366 (medium, `imaplib`) and CVE-2026-6879 (low, XML
+  parsing) reported by Trivy against the `:edge` image. The app imports
+  neither `imaplib` nor any `xml` module, so this is a supply-chain hygiene
+  bump rather than an exploitable path here. Ships with the next promotion
+  (#587, #562).
 - Bumped `cryptography` to 50.0.0, resolving GHSA-g6cj-pr64-35w5 (a
   Bleichenbacher timing oracle in PKCS#7 decryption affecting
   `cryptography` `>=44,<50`). Only Fernet is used in this codebase
