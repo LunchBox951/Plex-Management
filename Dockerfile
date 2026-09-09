@@ -19,7 +19,7 @@ ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 
 RUN apk add --no-cache \
-        python-3.14=3.14.6-r4 \
+        python-3.14=3.14.7-r4 \
         py3.14-pip=26.1.2-r1 \
     && python3.14 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
@@ -66,7 +66,7 @@ WORKDIR /app
 # Validate downloaded candidates by their actual media container/streams before
 # they can enter a Plex library. The versioned ffmpeg package supplies ffprobe.
 RUN apk add --no-cache \
-        python-3.14=3.14.6-r4 \
+        python-3.14=3.14.7-r4 \
         ffmpeg-8.1=8.1.2-r2 \
         tzdata=2026c-r0 \
     && mkdir -p /app/data \
