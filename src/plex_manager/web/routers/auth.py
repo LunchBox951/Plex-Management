@@ -392,12 +392,21 @@ async def plex_sign_in_endpoint(
             _apply_signin_fields(
                 user, account, permissions=staged_permissions, token=body.auth_token
             )
-            await _issue_browser_session(session, response, request=request, user_id=user.id)
-            # After the issuance commit: the row now holds THIS sign-in's token,
-            # and pre-init concurrency is already serialized by the claim CAS.
+            # Flush the token write and read its ciphertext INSIDE this
+            # transaction, before the issuance commit -- the same shape as the
+            # rotation branch above. The claim CAS serializes only the CLAIM:
+            # a second sign-in by the same claimant resumes rather than being
+            # refused, and with no lock held here one carrying a DIFFERENT
+            # token can commit its rotation between this mint's commit and a
+            # post-commit read. Read there, the detached capture (taken with
+            # THIS token) would carry the newer credential's ciphertext past
+            # ``store_entitlements``' guard and stamp the old token's view as
+            # the new one's (#572).
+            await session.flush()
             signed_in_token_ciphertext = await plex_access_service.read_token_ciphertext(
                 session, user.id
             )
+            await _issue_browser_session(session, response, request=request, user_id=user.id)
             _close_demoted_streams()
             break
 
