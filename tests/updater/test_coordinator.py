@@ -8,7 +8,11 @@ import json
 import httpx
 import pytest
 
-from plex_manager.updater.coordinator import CoordinatorClient, CoordinatorError
+from plex_manager.updater.coordinator import (
+    _MAX_JSON_BODY_BYTES,  # pyright: ignore[reportPrivateUsage]
+    CoordinatorClient,
+    CoordinatorError,
+)
 
 _TOKEN = "coordinator-test-token-0123456789"  # noqa: S105 - synthetic test credential
 _LEASE_TOKEN = "lease-token-1234567890"  # noqa: S105 - synthetic test credential
@@ -471,6 +475,115 @@ async def test_non_2xx_deeply_nested_json_body_still_classifies_and_logs(
     assert "(opaque body)" in messages[0]
     assert "status=500" in messages[0]
     assert f"content_length={len(nested_body)}" in messages[0]
+
+
+def _padded_envelope(total_bytes: int) -> bytes:
+    """A syntactically valid app envelope padded with an ignored key so the
+    encoded body is exactly ``total_bytes`` long."""
+    prefix = b'{"detail": "updater_coordinator_unavailable", "pad": "'
+    suffix = b'"}'
+    padding = total_bytes - len(prefix) - len(suffix)
+    assert padding >= 0
+    body = prefix + (b"x" * padding) + suffix
+    assert len(body) == total_bytes
+    return body
+
+
+def _forbid_json_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _never(*args: object, **kwargs: object) -> object:
+        pytest.fail("response.json() must not run on an oversized body")
+
+    monkeypatch.setattr(httpx.Response, "json", _never)
+
+
+async def test_non_2xx_oversized_valid_envelope_is_opaque_without_decoding(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #573: a non-2xx body larger than ``_MAX_JSON_BODY_BYTES`` must
+    take the opaque branch without ever being handed to ``response.json()``,
+    even when it is a well-formed envelope with a known ``detail`` -- the
+    real envelope is tiny, and decoding an oversized one would allocate a
+    second full copy inside the long-running sidecar."""
+    body = _padded_envelope(_MAX_JSON_BODY_BYTES + 1)
+    _forbid_json_decoding(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=body, headers={"content-type": "application/json"})
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError) as exc_info:
+            await client.eligibility()
+
+    assert exc_info.value.code == "coordinator_unavailable"
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "(opaque body)" in messages[0]
+    assert "detail=" not in messages[0]
+    assert "status=503" in messages[0]
+    assert f"content_length={len(body)}" in messages[0]
+
+
+async def test_non_2xx_envelope_at_exact_cap_still_logs_detail_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """issue #573 boundary: a body of exactly ``_MAX_JSON_BODY_BYTES`` is
+    still decoded, so a known ``detail`` at the cap logs by name."""
+    body = _padded_envelope(_MAX_JSON_BODY_BYTES)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=body, headers={"content-type": "application/json"})
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with caplog.at_level("WARNING"), pytest.raises(CoordinatorError) as exc_info:
+            await client.eligibility()
+
+    assert exc_info.value.code == "coordinator_unavailable"
+    messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "(app envelope)" in messages[0]
+    assert "detail=updater_coordinator_unavailable" in messages[0]
+
+
+async def test_2xx_oversized_body_is_invalid_response_without_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #573: the same cap guards the 2xx contract path. An oversized
+    success body is rejected as ``coordinator_invalid_response`` (the
+    classification ``_optional_string`` already uses for an over-length
+    field) before ``response.json()`` runs."""
+    body = (
+        b'{"action": "none", "action_generation": 1, "pad": "'
+        + (b"x" * _MAX_JSON_BODY_BYTES)
+        + b'"}'
+    )
+    _forbid_json_decoding(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    async with httpx.AsyncClient(
+        base_url="http://coordinator/api/v1/internal/updates/",
+        transport=httpx.MockTransport(handler),
+    ) as http:
+        client = CoordinatorClient(
+            "http://coordinator/api/v1/internal/updates", _TOKEN, timeout=1, client=http
+        )
+        with pytest.raises(CoordinatorError) as exc_info:
+            await client.eligibility()
+
+    assert exc_info.value.code == "coordinator_invalid_response"
 
 
 async def test_non_2xx_non_app_shape_body_never_logs_body_text(

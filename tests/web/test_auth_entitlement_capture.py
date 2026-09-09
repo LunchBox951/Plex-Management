@@ -16,12 +16,13 @@ token really does come back section-filtered.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 
 import httpx
 import pytest
-from fastapi import FastAPI
-from sqlalchemy import select
+from fastapi import FastAPI, Request, Response
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import reset_caches
@@ -72,6 +73,11 @@ def _shared_server() -> dict[str, object]:
     }
 
 
+def _owned_server() -> dict[str, object]:
+    """The same server, OWNED: what the pre-init first-owner claim requires."""
+    return {**_shared_server(), "owned": True}
+
+
 def _sections(*keys: str) -> dict[str, object]:
     return {
         "MediaContainer": {
@@ -95,14 +101,18 @@ def _transport(
     section_keys: tuple[str, ...] = ("1", "3"),
     seen: list[str] | None = None,
     live_identity: str = _MACHINE_ID,
+    resources: list[dict[str, object]] | None = None,
 ) -> httpx.MockTransport:
     """plex.tv's v2 endpoints plus the configured server's ``/identity`` and
     ``/library/sections``.
 
     ``live_identity`` is what the server at ``plex_url`` claims to be when the
     detached capture confirms the anchor before stamping -- the same id means the
-    anchor holds; a different one means the host was replaced.
+    anchor holds; a different one means the host was replaced. ``resources`` is
+    plex.tv's ``/resources`` answer (default: the server, shared).
     """
+    if resources is None:
+        resources = [_shared_server()]
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -111,7 +121,7 @@ def _transport(
         if request.url.host == "plex.tv" and path == "/api/v2/user":
             return httpx.Response(200, json=_USER)
         if request.url.host == "plex.tv" and path == "/api/v2/resources":
-            return httpx.Response(200, json=[_shared_server()])
+            return httpx.Response(200, json=resources)
         if path == "/identity":
             return httpx.Response(
                 200, json={"MediaContainer": {"machineIdentifier": live_identity}}
@@ -515,6 +525,59 @@ async def test_an_older_overlapping_capture_cannot_overwrite_a_newer_one(
 
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys == ["1", "3"]
+
+
+async def test_a_pre_init_capture_carries_the_ciphertext_its_own_sign_in_wrote(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #572 residual 2: the pre-init claim path mints without
+    ``secret_rotation_lock``, so nothing stops a concurrent sign-in by the SAME
+    claimant (the claim CAS resumes it rather than refusing it) from rotating the
+    stored token between this sign-in's commit and a post-commit ciphertext read.
+    Read there, the detached capture -- taken with the OLD token -- would carry
+    the NEW credential's ciphertext, pass the write guard, and stamp the old
+    token's view as the new credential's snapshot.
+
+    The rotation is injected at the only place it can land: right after the
+    issuance commit, before control returns to the sign-in. The capture must
+    then be REFUSED, exactly as the rotation branch's in-transaction read
+    guarantees post-init.
+    """
+    await seed(initialized=False)
+    await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    await _use_transport(app, _transport(resources=[_owned_server()]))
+    rotated_token = "rotated-by-a-concurrent-sign-in"  # noqa: S105 - fake token
+
+    issue_browser_session = auth_module._issue_browser_session  # pyright: ignore[reportPrivateUsage]
+
+    async def issue_then_rotate(
+        session: AsyncSession, response: Response, *, request: Request, user_id: int | None
+    ) -> None:
+        await issue_browser_session(session, response, request=request, user_id=user_id)
+        async with sessionmaker_() as other:
+            await other.execute(
+                update(User).where(User.id == user_id).values(encrypted_plex_token=rotated_token)
+            )
+            await other.commit()
+
+    monkeypatch.setattr(auth_module, "_issue_browser_session", issue_then_rotate)
+
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
+        response = await _sign_in_and_settle(app, client)
+
+    assert response.status_code == 200
+    assert response.json()["user"]["is_admin"] is True
+    user = await _signed_in_user(sessionmaker_)
+    assert user.encrypted_plex_token == rotated_token
+    # The old-token capture was discarded, not stamped under the new credential.
+    assert user.entitled_section_keys is None
+    assert user.entitlements_machine_id is None
+    assert any("was not stored" in record.getMessage() for record in caplog.records)
 
 
 async def test_a_malformed_section_response_never_blanks_a_snapshot(
