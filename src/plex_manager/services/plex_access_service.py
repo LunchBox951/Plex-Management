@@ -42,7 +42,9 @@ anything on it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -85,6 +87,7 @@ __all__ = [
     "capture_entitlements",
     "check_share",
     "count_due_share_checks",
+    "entitlement_capture_lock",
     "list_due_share_checks",
     "record_failed_attempt",
     "store_entitlements",
@@ -714,6 +717,24 @@ async def record_failed_attempt(session: AsyncSession, user_id: int, *, now: dat
 # --------------------------------------------------------------------------- #
 # Section-entitlement capture (issue #484 PR-3) -- capture only, no enforcement
 # --------------------------------------------------------------------------- #
+_capture_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def entitlement_capture_lock(user_id: int) -> asyncio.Lock:
+    """Serialise a user's section read through persistence in this process.
+
+    Both capture sites hold this across the network read and the write-session
+    context, including commit/cleanup. A timestamp taken after a response arrives
+    cannot order overlapping reads whose responses were delivered out of order.
+    Waiters retain the same lock; idle users leave no permanent registry entry.
+    """
+    lock = _capture_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _capture_locks[user_id] = lock
+    return lock
+
+
 @dataclass(frozen=True)
 class EntitlementCapture:
     """One point-in-time read of which library sections a token can actually see.
@@ -725,9 +746,10 @@ class EntitlementCapture:
     capture ran against, so a later reader can tell a snapshot taken against
     today's server from one left behind by a repoint.
 
-    ``captured_at`` is stamped when the section READ completed, never when the
-    write happens, and it is what orders two overlapping captures of the same
-    user: see :func:`store_entitlements`. The only producer in the app
+    ``captured_at`` is stamped when the section read completed and supplies an
+    additional write guard in :func:`store_entitlements`. Both app callers hold
+    :func:`entitlement_capture_lock` through the read and commit: response
+    arrival timestamps alone cannot order overlapping reads. The producer
     (:func:`_attempt_capture`) always passes it explicitly; the default exists
     so a hand-built capture means "as of now" rather than silently comparing
     against an unset value.
@@ -839,10 +861,8 @@ async def _attempt_capture(
         )
         return _CaptureAttempt(capture=None, server_unavailable=True)
     section_keys = tuple(section.key for section in sections)
-    # The read is DONE: this is the instant the snapshot describes, and the
-    # ordering key for two captures racing on one user. Taken before the
-    # baseline call below so a slow baseline cannot make this capture look
-    # newer than it is.
+    # Record read completion before telemetry adds latency. Callers serialise
+    # read through commit; this timestamp alone cannot order delayed responses.
     captured_at = datetime.now(UTC)
     # Resolved only now, on the success path: the baseline is telemetry, and
     # spending a call on it before knowing whether the server answers at all
@@ -923,7 +943,7 @@ async def store_entitlements(
     """Persist a capture, but only while it still describes the CONFIGURED server
     AND was taken with the credential still on file. Does not commit.
 
-    Two conditions ride the UPDATE itself, so both are evaluated against the
+    Three conditions ride the UPDATE itself, so all are evaluated against the
     latest committed state rather than against locals that were read before a
     network call:
 
@@ -1326,10 +1346,10 @@ async def sweep_shares(
     :func:`apply_share_verdict` re-checks the token it was selected with.
 
     ``confirm_anchor`` re-reads the configured server's ``machineIdentifier``
-    live. It is awaited AT MOST ONCE per tick, lazily -- only when the tick is
-    about to act on its first :attr:`ShareVerdict.SHARE_REVOKED`, so a sweep that
-    finds everyone still entitled costs no extra probe -- and its answer gates
-    every share-loss verdict in that tick. Anything but
+    live. It is resolved lazily before the first capture or share-loss verdict,
+    and refreshed after each successful section read. Its latest answer gates
+    subsequent share-loss verdicts and captures. A negative result stays latched
+    for the rest of the tick to bound failed probes. Anything but
     :attr:`AnchorCheck.CONFIRMED` means the anchor those verdicts were computed
     against cannot be trusted (a rebuilt or re-claimed server hands out a new
     identifier, which makes plex.tv truthfully report EVERY user as revoked), so
@@ -1353,12 +1373,12 @@ async def sweep_shares(
 
     ``capture`` opts this sweep into section-entitlement capture (#484 PR-3).
     Capture runs ONLY for an ``AUTHORIZED`` verdict that was actually applied and
-    only once the tick's live anchor check has CONFIRMED the configured server,
-    so it costs one extra call to the Plex SERVER for users already confirmed
-    entitled and none at all for the revoked, stale, unknown or unverifiable --
-    and it rides the existing per-tick budget rather than widening it. It cannot
-    change a verdict, a revocation, or the tick's state: a failed capture is
-    counted and logged, and leaves the previous snapshot untouched. Omitted
+    only once the live anchor check has confirmed the configured server. Each
+    captured user costs a section read and a fresh identity probe before storage,
+    within the existing per-tick user budget. Capture cannot change an applied
+    verdict or revocation. Failures leave the previous snapshot untouched and
+    are counted and logged; identity failures also surface in the tick's health
+    state and gate later work against that anchor. Omitted
     (``None``) the sweep behaves exactly as it did before capture existed.
 
     ``capture`` may instead be a :data:`CaptureUnavailableReason` -- the
@@ -1484,14 +1504,9 @@ async def sweep_shares(
             # Plex is not configured enough to reach the server with a user
             # token. Not a capture FAILURE -- there was nothing to attempt.
             return
-        # A capture is only meaningful STAMPED, and a stamp is only trustworthy
-        # if the server answering right now is the one the anchor names. Without
-        # this, a replacement server at the SAME ``plex_url`` would have its
-        # sections written under the OLD cached identifier -- and the settings
-        # -row guard in ``store_entitlements`` would accept it, because that row
-        # still holds the old id. Reuses the sweep's own per-tick live
-        # ``/identity`` confirmation, so it costs nothing extra on a tick that
-        # already had to confirm for a revocation.
+        # Refuse a known-bad anchor before spending a section read. A previous
+        # positive probe is only an early gate: refresh it after THIS read before
+        # allowing persistence, even when the configured settings never changed.
         if not await _anchor_confirmed():
             # The tick knowingly captured nothing for this user. ``anchor`` now
             # holds WHICH answer blocked it, and ``mark_completed`` reports that
@@ -1501,55 +1516,67 @@ async def sweep_shares(
             capture_skipped += 1
             capture_anchor_blocked += 1
             return
-        attempt = await _attempt_capture(
-            library,
-            machine_identifier=machine_identifier,
-            user_id=user_id,
-            service_section_count=_service_section_count,
-        )
-        if attempt.server_unavailable:
-            # Trip the breaker: a black-holed server costs one full timeout per
-            # AUTHORIZED user, which at a full budget is minutes of tick wall
-            # time spent learning nothing. Verdict work is unaffected -- it talks
-            # to plex.tv, not to this server.
-            capture_circuit_open = True
-            _logger.warning(
-                "entitlement capture is skipped for the rest of this tick: the Plex server "
-                "did not answer. Verdicts are unaffected. Skipped users are NOT retried "
-                "immediately -- they are recaptured at their next due window (bounded by "
-                "share_revalidation_interval_hours) or at their next sign-in, whichever "
-                "comes first. Nothing reads these columns yet (#484 PR-3 is capture-only)."
+        async with entitlement_capture_lock(user_id):
+            attempt = await _attempt_capture(
+                library,
+                machine_identifier=machine_identifier,
+                user_id=user_id,
+                service_section_count=_service_section_count,
             )
-        if attempt.capture is None:
-            capture_failed += 1
-            return
-        try:
-            async with sessionmaker() as session:
-                stored = await store_entitlements(
-                    session,
-                    user_id,
-                    attempt.capture,
-                    anchor_setting_key=capture_context.anchor_setting_key,
-                    expected_token_ciphertext=candidate.token_ciphertext,
+            if attempt.server_unavailable:
+                # Trip the breaker: a black-holed server costs one full timeout per
+                # AUTHORIZED user, which at a full budget is minutes of tick wall
+                # time spent learning nothing. Verdict work is unaffected -- it talks
+                # to plex.tv, not to this server.
+                capture_circuit_open = True
+                _logger.warning(
+                    "entitlement capture is skipped for the rest of this tick: the Plex server "
+                    "did not answer. Verdicts are unaffected. Skipped users are NOT retried "
+                    "immediately -- they are recaptured at their next due window (bounded by "
+                    "share_revalidation_interval_hours) or at their next sign-in, whichever "
+                    "comes first. Nothing reads these columns yet (#484 PR-3 is capture-only)."
                 )
-                await session.commit()
-        except Exception:
-            capture_failed += 1
-            _logger.exception(
-                "entitlement capture for user_id=%s could not be persisted; the previous "
-                "snapshot is unchanged",
-                safe_int(user_id),
-            )
-            return
-        if stored:
-            captured += 1
-        else:
-            capture_failed += 1
+            if attempt.capture is None:
+                capture_failed += 1
+                return
+            if not await _anchor_confirmed(refresh=True):
+                capture_skipped += 1
+                capture_anchor_blocked += 1
+                return
+            try:
+                async with sessionmaker() as session:
+                    stored = await store_entitlements(
+                        session,
+                        user_id,
+                        attempt.capture,
+                        anchor_setting_key=capture_context.anchor_setting_key,
+                        expected_token_ciphertext=candidate.token_ciphertext,
+                    )
+                    await session.commit()
+            except Exception:
+                capture_failed += 1
+                _logger.exception(
+                    "entitlement capture for user_id=%s could not be persisted; the previous "
+                    "snapshot is unchanged",
+                    safe_int(user_id),
+                )
+                return
+            if stored:
+                captured += 1
+            else:
+                capture_failed += 1
 
-    async def _anchor_confirmed() -> bool:
-        """Resolve (once per tick) whether the server anchor still holds."""
+    async def _anchor_confirmed(*, refresh: bool = False) -> bool:
+        """Refresh positive evidence per capture; a failure blocks the tick.
+
+        A negative result stays latched so a broken server costs one failing
+        probe rather than one timeout for every remaining user. Captures refresh
+        after their section read, including time spent waiting for another
+        capture of the same user. Separate responses are not atomic identity
+        proof; server replacement is an owner-controlled workflow (#597).
+        """
         nonlocal anchor, last_error
-        if anchor is None:
+        if anchor is None or (refresh and anchor is AnchorCheck.CONFIRMED):
             if confirm_anchor is None:
                 anchor = AnchorCheck.UNCONFIRMED
             else:
