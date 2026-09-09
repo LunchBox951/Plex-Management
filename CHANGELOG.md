@@ -59,6 +59,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `vite`, and `vitest` dev dependencies (#581).
 
 ### Fixed
+- Entitlement captures now serialise each user's library read through its database commit across sign-in and background sweeps. A fresh server-identity check after each read rejects replacement-server or unverified results while retaining the previous snapshot. Sign-in remains responsive; owner-controlled server replacement is separate work (#572, #597).
 - Entitlement capture: the pre-init (first-owner claim) sign-in now reads its
   token ciphertext inside the transaction that wrote it, before the session
   commit, matching the token-rotation path. Read after the commit and without

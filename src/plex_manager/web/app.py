@@ -198,8 +198,8 @@ def _warn_if_multi_process() -> None:
         _logger.warning(
             "multi-worker configuration detected (%s): this app assumes a "
             "SINGLE process. Its in-process removal, purge-path, "
-            "pressure-exclusion-lease and settings-rotation guards "
-            "(queue_service, purge_service, web.routers.settings) do not "
+            "pressure-exclusion-lease, entitlement-capture and settings-rotation guards "
+            "(queue_service, purge_service, plex_access_service, web.routers.settings) do not "
             "coordinate across worker processes or container replicas, so "
             "running more than one silently reopens the same-hash download "
             "races those guards exist to close -- and lets a disk-pressure "

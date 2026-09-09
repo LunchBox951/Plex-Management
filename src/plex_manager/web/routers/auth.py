@@ -960,12 +960,14 @@ async def _capture_entitlements_after_sign_in(
     ``app._entitlement_capture_context`` for why a background probe must not
     backfill it).
 
-    The cached anchor is then CONFIRMED against a live ``/identity`` before
-    anything is stamped. A replacement server at the same ``plex_url`` answers
+    The cached anchor is confirmed against a live ``/identity`` before the
+    section read and again afterward, while holding this user's capture lock
+    through persistence. A replacement server at the same ``plex_url`` answers
     happily and would otherwise have ITS sections written under the OLD
     identifier -- which the settings-row guard in ``store_entitlements`` cannot
-    catch, since that row still holds the old id. The extra probe is free here
-    precisely because this runs off the request path.
+    catch, since that row still holds the old id. Both probes stay off the
+    sign-in request path. Separate responses cannot prove atomic server identity;
+    replacement adoption is the owner-controlled workflow tracked in #597.
     """
     try:
         async with app.state.sessionmaker() as session:
@@ -987,22 +989,32 @@ async def _capture_entitlements_after_sign_in(
                 safe_int(user_id),
             )
             return
-        library = PlexLibrary(app.state.http_client, plex_url, token)
-        capture = await plex_access_service.capture_entitlements(
-            library, machine_identifier=machine_identifier, user_id=user_id
-        )
-        if capture is None:
-            return
-        async with app.state.sessionmaker() as session:
-            stored = await plex_access_service.store_entitlements(
-                session,
-                user_id,
-                capture,
-                anchor_setting_key=PLEX_MACHINE_ID_SETTING,
-                expected_token_ciphertext=expected_token_ciphertext,
+        async with plex_access_service.entitlement_capture_lock(user_id):
+            library = PlexLibrary(app.state.http_client, plex_url, token)
+            capture = await plex_access_service.capture_entitlements(
+                library, machine_identifier=machine_identifier, user_id=user_id
             )
-            if stored:
-                await session.commit()
+            if capture is None:
+                return
+            live_identifier = await plex_tv.fetch_server_identity(plex_url, token)
+            if live_identifier != machine_identifier:
+                _logger.warning(
+                    "entitlement capture at sign-in discarded for user_id=%s: "
+                    "the Plex server identity changed during the section read; "
+                    "the previous snapshot and configured identity are unchanged",
+                    safe_int(user_id),
+                )
+                return
+            async with app.state.sessionmaker() as session:
+                stored = await plex_access_service.store_entitlements(
+                    session,
+                    user_id,
+                    capture,
+                    anchor_setting_key=PLEX_MACHINE_ID_SETTING,
+                    expected_token_ciphertext=expected_token_ciphertext,
+                )
+                if stored:
+                    await session.commit()
     except Exception:
         # Deliberately broad and deliberately swallowed: this is enrichment
         # hanging off an already-committed sign-in. Logged with a traceback so it

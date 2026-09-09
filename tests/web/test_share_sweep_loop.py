@@ -645,3 +645,64 @@ async def test_one_tick_captures_the_authorized_user_and_signs_out_the_revoked_o
         assert revoked.share_state == "share_revoked"
         # A capture is a snapshot of ACCESS; a user with none has nothing to capture.
         assert revoked.entitled_section_keys is None
+
+
+@pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
+async def test_sweep_rejects_a_server_change_after_a_later_users_section_read(
+    app: FastAPI, seed: SeedFn, identity_failure: str
+) -> None:
+    await seed(initialized=True)
+    await _configure_server(app)
+    user_ids = [
+        await _signed_in_user(app, username=f"viewer-{index}", token=f"viewer-token-{index}")
+        for index in range(3)
+    ]
+    previous_time = datetime.now(UTC) - timedelta(days=1)
+    async with app.state.sessionmaker() as session:
+        for user_id in user_ids:
+            user = await session.get(User, user_id)
+            assert user is not None
+            user.entitled_section_keys = ["old"]
+            user.entitlements_machine_id = _MACHINE_ID
+            user.entitlements_captured_at = previous_time
+        await session.commit()
+
+    second_read_finished = False
+    transport = _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal second_read_finished
+        if request.url.path == "/identity" and second_read_finished:
+            if identity_failure == "timeout":
+                raise httpx.ReadTimeout("identity unavailable", request=request)
+            return httpx.Response(
+                200, json={"MediaContainer": {"machineIdentifier": "replacement-server"}}
+            )
+        if (
+            request.url.path == "/library/sections"
+            and request.headers.get("X-Plex-Token") == "viewer-token-1"
+        ):
+            second_read_finished = True
+            return httpx.Response(200, json=_sections("9"))
+        return await transport.handle_async_request(request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    assert await _tick(app) == 3
+    status = app.state.share_sweep_status
+    assert status.authorized == 3
+    assert status.captured == 1
+    assert status.capture_skipped == 2
+    assert status.capture_anchor_blocked == 2
+    assert status.signed_out == 0
+    assert status.state == (
+        "anchor_mismatch" if identity_failure == "replacement" else "anchor_unconfirmed"
+    )
+    async with app.state.sessionmaker() as session:
+        for index, user_id in enumerate(user_ids):
+            user = await session.get(User, user_id)
+            assert user is not None
+            assert user.entitled_section_keys == (["1"] if index == 0 else ["old"])
+            assert user.entitlements_machine_id == _MACHINE_ID
+            if index:
+                assert user.entitlements_captured_at == previous_time.replace(tzinfo=None)
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) == _MACHINE_ID

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import User
+from plex_manager.web import app as app_module
 from plex_manager.web.background import detached_tasks
 from plex_manager.web.deps import PLEX_MACHINE_ID_SETTING, SettingsStore
 from plex_manager.web.routers import auth as auth_module
@@ -39,6 +40,7 @@ SessionMaker = async_sessionmaker[AsyncSession]
 
 _API_KEY = "s3cr3t-app-key"
 _TOKEN = "browser-obtained-plex-token"  # noqa: S105 - fake token for MockTransport
+_SERVICE_TOKEN = "service-token"  # noqa: S105 - fake token for MockTransport
 _MACHINE_ID = "abc123machine"
 _PLEX_URL = "http://plex.local:32400"
 
@@ -208,6 +210,65 @@ async def test_sign_in_captures_an_honest_empty_entitlement(
     assert user.entitlements_machine_id == _MACHINE_ID
 
 
+async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    await _use_transport(app, _transport())
+    assert (await _sign_in_and_settle(app, client)).status_code == 200
+    async with sessionmaker_() as session:
+        await SettingsStore(session).set("plex_token", _SERVICE_TOKEN)
+        await session.commit()
+
+    sweep_read_started = asyncio.Event()
+    release_sweep_read = asyncio.Event()
+    sign_in_identity_checked = asyncio.Event()
+    user_reads = 0
+    snapshot_before_second_read: list[str] | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal user_reads, snapshot_before_second_read
+        path = request.url.path
+        token = request.headers.get("X-Plex-Token")
+        if path == "/api/v2/user":
+            return httpx.Response(200, json=_USER)
+        if path == "/api/v2/resources":
+            return httpx.Response(200, json=[_shared_server()])
+        if path == "/identity":
+            if token == _TOKEN and sweep_read_started.is_set():
+                sign_in_identity_checked.set()
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        assert path == "/library/sections"
+        if token == _SERVICE_TOKEN:
+            return httpx.Response(200, json=_sections("1", "3", "9"))
+        user_reads += 1
+        if user_reads == 1:
+            sweep_read_started.set()
+            await release_sweep_read.wait()
+            return httpx.Response(200, json=_sections("9"))
+        snapshot_before_second_read = (await _signed_in_user(sessionmaker_)).entitled_section_keys
+        return httpx.Response(200, json=_sections("1"))
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    sweep = asyncio.create_task(app_module._share_sweep_once(app))  # pyright: ignore[reportPrivateUsage]
+    try:
+        async with asyncio.timeout(10):
+            await sweep_read_started.wait()
+            # The browser gets its session while its background capture waits.
+            assert (await _sign_in(client)).status_code == 200
+            await sign_in_identity_checked.wait()
+            assert user_reads == 1
+            release_sweep_read.set()
+            await sweep
+            await asyncio.gather(*detached_tasks(app))
+        assert snapshot_before_second_read == ["9"]
+        assert (await _signed_in_user(sessionmaker_)).entitled_section_keys == ["1"]
+    finally:
+        release_sweep_read.set()
+        await asyncio.gather(sweep, *detached_tasks(app), return_exceptions=True)
+
+
 # --------------------------------------------------------------------------- #
 # Never a gate
 # --------------------------------------------------------------------------- #
@@ -310,6 +371,7 @@ async def test_no_cached_anchor_means_no_capture_and_no_server_call(
     assert "/library/sections" not in seen
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys is None
+    assert user.entitlements_machine_id is None
     assert user.entitlements_machine_id is None
 
 
@@ -444,7 +506,48 @@ async def test_a_replacement_server_at_the_same_url_is_never_stamped(
     assert "/library/sections" not in seen
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys is None
-    assert user.entitlements_machine_id is None
+
+
+@pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
+async def test_sign_in_discards_sections_when_identity_changes_or_fails_after_the_read(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
+    identity_failure: str,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    await _use_transport(app, _transport())
+    assert (await _sign_in_and_settle(app, client)).status_code == 200
+    previous = await _signed_in_user(sessionmaker_)
+    sections_read = False
+    transport = _transport(section_keys=("9",))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sections_read
+        if request.url.path == "/identity" and sections_read:
+            if identity_failure == "timeout":
+                raise httpx.ReadTimeout("identity unavailable", request=request)
+            return httpx.Response(
+                200, json={"MediaContainer": {"machineIdentifier": "replacement-server"}}
+            )
+        response = await transport.handle_async_request(request)
+        if request.url.path == "/library/sections":
+            sections_read = True
+        return response
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    with caplog.at_level(logging.WARNING):
+        assert (await _sign_in_and_settle(app, client)).status_code == 200
+    user = await _signed_in_user(sessionmaker_)
+    assert user.entitled_section_keys == previous.entitled_section_keys
+    assert user.entitlements_captured_at == previous.entitlements_captured_at
+    assert user.entitlements_machine_id == _MACHINE_ID
+    async with sessionmaker_() as session:
+        assert await SettingsStore(session).get(PLEX_MACHINE_ID_SETTING) == _MACHINE_ID
+    assert any("entitlement capture" in record.message for record in caplog.records)
 
 
 async def test_the_anchor_is_confirmed_before_any_capture_is_stamped(
@@ -466,9 +569,13 @@ async def test_the_anchor_is_confirmed_before_any_capture_is_stamped(
 # The detached capture carries ITS OWN credential (Codex round 3 on PR #560)
 # --------------------------------------------------------------------------- #
 async def test_an_older_overlapping_capture_cannot_overwrite_a_newer_one(
-    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Two sign-ins overlap and the OLDER capture task stores LAST.
+    """A token rotation overtakes a section read, but its capture waits its turn.
 
     The older task captured with the older token. If it re-read the ciphertext at
     store time it would pick up the NEWER sign-in's value, pass the write guard,
@@ -476,8 +583,9 @@ async def test_an_older_overlapping_capture_cannot_overwrite_a_newer_one(
     ciphertext is captured at sign-in commit time and carried INTO the task, so
     the older one no longer matches and writes nothing.
 
-    The ordering is pinned, not hoped for: the first task is held inside its
-    section read until the second has fully stored.
+    The first capture is held inside its section read until the second sign-in
+    has rotated the credential. The old capture must still be refused, even
+    though serialisation now prevents the newer capture from writing first.
     """
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
@@ -494,7 +602,7 @@ async def test_an_older_overlapping_capture_cannot_overwrite_a_newer_one(
             return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
         token = request.headers.get("X-Plex-Token")
         if token == _TOKEN:
-            # The OLDER capture: hold it mid-read until the newer one has landed.
+            # Hold the old read until a newer sign-in has rotated its credential.
             older_reached.set()
             await release_older.wait()
             return httpx.Response(200, json=_sections("9"))
@@ -508,20 +616,21 @@ async def test_an_older_overlapping_capture_cannot_overwrite_a_newer_one(
     async with asyncio.timeout(10):
         await older_reached.wait()
 
-    # A SECOND sign-in rotates the stored token and stores ITS view first.
+    # Sign-in rotates the token while its detached capture waits for the old read.
     auth_module.reset_sign_in_throttle()
     newer = await client.post("/api/v1/auth/plex", json={"auth_token": "rotated-token"})
     assert newer.status_code == 200
     newer_tasks = tuple(t for t in detached_tasks(app) if t not in older_tasks)
-    await asyncio.gather(*newer_tasks, return_exceptions=True)
 
     user = await _signed_in_user(sessionmaker_)
-    assert user.entitled_section_keys == ["1", "3"]
+    assert user.entitled_section_keys is None
     assert user.encrypted_plex_token == "rotated-token"  # noqa: S105
 
-    # Now let the OLDER task finish and store. It must change nothing.
-    release_older.set()
-    await asyncio.gather(*older_tasks, return_exceptions=True)
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
+        release_older.set()
+        async with asyncio.timeout(10):
+            await asyncio.gather(*older_tasks, *newer_tasks)
+    assert any("was not stored" in record.message for record in caplog.records)
 
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys == ["1", "3"]
@@ -611,3 +720,81 @@ async def test_a_malformed_section_response_never_blanks_a_snapshot(
     # The prior snapshot survives -- it was NOT blanked to [].
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys == ["1", "3"]
+
+
+@pytest.mark.parametrize("cancel_holder", [True, False], ids=["holder", "waiter"])
+async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    cancel_holder: bool,
+) -> None:
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    first_read_started = asyncio.Event()
+    release_first_read = asyncio.Event()
+    waiter_ready = asyncio.Event()
+    first_read = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal first_read
+        token = request.headers.get("X-Plex-Token")
+        if request.url.path == "/api/v2/user":
+            account = _USER if token == _TOKEN else {**_USER, "id": 100, "username": "other"}
+            return httpx.Response(200, json=account)
+        if request.url.path == "/api/v2/resources":
+            return httpx.Response(200, json=[_shared_server()])
+        if request.url.path == "/identity":
+            if token == _TOKEN and first_read_started.is_set():
+                waiter_ready.set()
+            return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
+        assert request.url.path == "/library/sections"
+        if token == _TOKEN and first_read:
+            first_read = False
+            first_read_started.set()
+            await release_first_read.wait()
+            return httpx.Response(200, json=_sections("9"))
+        return httpx.Response(200, json=_sections("1"))
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    tasks: set[asyncio.Task[None]] = set()
+    try:
+        async with asyncio.timeout(10):
+            assert (await _sign_in(client)).status_code == 200
+            holders = set(detached_tasks(app))
+            tasks.update(holders)
+            await first_read_started.wait()
+
+            # An unrelated user's capture completes while this user's read waits.
+            other = await client.post("/api/v1/auth/plex", json={"auth_token": "other-user-token"})
+            assert other.status_code == 200
+            other_tasks = set(detached_tasks(app)) - holders
+            tasks.update(other_tasks)
+            await asyncio.gather(*other_tasks)
+            async with sessionmaker_() as session:
+                other_user = (
+                    await session.execute(select(User).where(User.plex_id == 100))
+                ).scalar_one()
+                assert other_user.entitled_section_keys == ["1"]
+
+            assert (await _sign_in(client)).status_code == 200
+            waiters = set(detached_tasks(app)) - holders
+            tasks.update(waiters)
+            await waiter_ready.wait()
+            cancelled = holders if cancel_holder else waiters
+            assert len(cancelled) == 1
+            for task in cancelled:
+                task.cancel()
+            outcomes = await asyncio.gather(*cancelled, return_exceptions=True)
+            assert all(isinstance(outcome, asyncio.CancelledError) for outcome in outcomes)
+            release_first_read.set()
+            await asyncio.gather(*(waiters if cancel_holder else holders))
+            if not cancel_holder:
+                assert (await _sign_in_and_settle(app, client)).status_code == 200
+            assert (await _signed_in_user(sessionmaker_)).entitled_section_keys == ["1"]
+    finally:
+        release_first_read.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
