@@ -5,7 +5,7 @@ SQLAlchemy==2.0.52
 aiosqlite==0.22.1
 alembic==1.19.1
 annotated-types==0.8.0
-anyio==4.14.2
+anyio==4.15.0
 asyncpg==0.31.0
 certifi==2026.7.22
 cffi==2.1.1
@@ -24,7 +24,7 @@ idna==3.19
 psycopg2-binary==2.9.12
 pycparser==3.0
 pydantic-settings==2.15.0
-pydantic==2.13.4
+pydantic==2.13.5
 python-dotenv==1.2.3
 rebulk==6.0.1
 starlette==1.6.0
