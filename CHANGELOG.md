@@ -51,6 +51,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `@types/react-dom`, `@vitejs/plugin-react`, `jsdom`, `vite` (#545), then
   `@testing-library/user-event`, `globals`, `typescript-eslint`, `vite`
   (#561).
+- `python-deps` group bump: uvicorn, pydantic-settings, sqlalchemy, alembic,
+  cryptography (50.0.1), ruff, httpx2/httpcore2, click, starlette,
+  websockets, and other transitive pins (#582).
+- `frontend-deps` group bump: `@tanstack/react-query` plus the
+  `@testing-library/*`, `@vitejs/plugin-react`, `eslint`, `typescript-eslint`,
+  `vite`, and `vitest` dev dependencies (#581).
 
 ### Fixed
 - Eviction: operator corrections and pressure sweeps are now serialized by a
@@ -58,7 +64,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   await windows defeats the sweep (corrections never wait), enforced down to
   the delete boundary before the durable marker arms; denied or defeated
   manual sweeps are visible in `POST /api/v1/ops/evict` and on the Status
-  page (#526, #568).
+  page (#526, #568). The delete-boundary hook now re-reads the lease a
+  second time after the partial-delete marker is armed and committed, so a
+  correction that revokes the lease during those awaits still defeats the
+  sweep (the defeat log line names which phase fired); a revocation landing
+  after that final read means the delete worker is already running, which
+  is the documented physical-completion exclusion, not a closable window
+  (#570, #575).
 - Updater: non-2xx coordinator responses (other than the separately-handled
   409 conflict path) now log the request path, status, and either the exact
   app error code (allowlisted) or an opaque-body summary (allowlisted media
@@ -90,7 +102,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than an exploitable path here. **Not
   included in the released `1.0.0` image** — the promoted `:stable` build is
   bit-identical to the canary-proven `edge-c1bf4eb` image, which predates
-  this bump (#548).
+  this bump (#548; raised to 50.0.1 in #582).
+- Bumped the `wolfi-base` container base image digest (`003627d` →
+  `57108e5`), clearing the openssl (CVE-2026-14456, CVE-2026-54876) and
+  busybox (CVE-2026-38752 through CVE-2026-38755) Trivy alerts against the
+  published image. The python CVE-2025-15366 / CVE-2026-6879 alerts stay
+  open until wolfi ships python 3.14.7. The container contract test now
+  derives the digest from the Dockerfile instead of a hardcoded constant, so
+  Dependabot digest bumps no longer need a companion commit to go green
+  (#583, #576).
 - Bumped the transitive `js-yaml` dev dependency to 4.3.1, resolving a
   quadratic-CPU DoS in `!!omap` resolution (GHSA-5p4m-2wfm-xmqj) (#547).
 
