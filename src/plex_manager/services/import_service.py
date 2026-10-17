@@ -57,6 +57,7 @@ from plex_manager.domain.naming import (
     plex_tv_episode_relative_path,
     plex_tv_season_relative_dir,
 )
+from plex_manager.domain.payload_validation import inspect_payload
 from plex_manager.domain.plex_video import plex_video_extension
 from plex_manager.domain.quality import Quality
 from plex_manager.domain.source_mapping import resolve_quality
@@ -531,6 +532,32 @@ class _VideoVerificationError(RuntimeError):
     """A surfaced, retryable reason no candidate can enter a Plex library."""
 
 
+class _NoVideoFilesError(_VideoVerificationError):
+    """The completed payload has no structurally verified video candidates.
+
+    ``probed`` records whether ffprobe judged candidates. Without that, the disk
+    scan found none, which proves nothing about the release on its own.
+    """
+
+    def __init__(self, message: str, *, probed: bool) -> None:
+        super().__init__(message)
+        self.probed = probed
+
+
+async def _no_video_is_confirmed(
+    qbt: DownloadClientPort, torrent_hash: str, exc: _NoVideoFilesError
+) -> bool:
+    """Whether the release itself, not this host, lacks a video to import.
+
+    An empty scan of a readable directory can follow a manual deletion or a mount
+    race, so it only counts when the client's own manifest has no video either.
+    """
+    if exc.probed:
+        return True
+    files = await qbt.list_files(torrent_hash)
+    return bool(files) and not inspect_payload([f.name for f in files]).video_indices
+
+
 class _VideoVerificationUnavailableError(_VideoVerificationError):
     """Verification could not establish whether any candidate was acceptable."""
 
@@ -566,6 +593,15 @@ async def _stop_or_join_probe_task(
         _ = await task
 
 
+async def _inspect_sources(fs: FileSystemPort, content: str) -> list[tuple[str, int, str]]:
+    try:
+        return await asyncio.to_thread(_resolve_sources, fs, content)
+    except OSError as exc:
+        raise _VideoVerificationUnavailableError(
+            f"video inspection unavailable: {safe_text(str(exc))}"
+        ) from exc
+
+
 async def _verified_plex_video_sources(
     media_probe: MediaProbePort,
     sources: list[tuple[str, int, str]],
@@ -593,8 +629,8 @@ async def _verified_plex_video_sources(
     next reconcile cycle re-probes the entire batch from scratch.
     """
     if not sources:
-        raise _VideoVerificationError(
-            "no Plex-supported video file found in the completed download"
+        raise _NoVideoFilesError(
+            "no Plex-supported video file found in the completed download", probed=False
         )
 
     accepted: list[tuple[str, int, str]] = []
@@ -671,9 +707,10 @@ async def _verified_plex_video_sources(
             raise _VideoVerificationUnavailableError(
                 f"video verification unavailable: {unavailable_detail}"
             )
-        raise _VideoVerificationError(
+        raise _NoVideoFilesError(
             "no verified Plex-compatible video file found in the completed download "
-            f"({rejected} candidate(s) rejected)"
+            f"({rejected} candidate(s) rejected)",
+            probed=True,
         )
     if rejected:
         _logger.warning(
@@ -1172,6 +1209,8 @@ async def _import_download_locked(
     season = row.season
     episodes = row.episodes_json
     entered_importing = row.status == DownloadState.Importing.value
+    if row.payload_pending:
+        return await download_repo.get_by_hash(torrent_hash)
     if row.status not in _RESUMABLE:
         return await download_repo.get_by_hash(torrent_hash)  # already done / not importable
     if row.media_request_id is None:
@@ -1339,8 +1378,8 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
+        sources = await _inspect_sources(fs, content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -1359,6 +1398,22 @@ async def _import_download_locked(
             str(exc),
             request_id=request.id,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                request_id=request.id,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
@@ -1796,8 +1851,8 @@ async def _import_tv_targets_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
     try:
+        sources = await _inspect_sources(fs, visible_content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -1818,6 +1873,23 @@ async def _import_tv_targets_locked(
             request_id=request.id,
             seasons=target_seasons,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                request_id=request.id,
+                seasons=target_seasons,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
@@ -2251,8 +2323,8 @@ async def _import_tv_locked(
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
+        sources = await _inspect_sources(fs, content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -2273,6 +2345,23 @@ async def _import_tv_locked(
             request_id=request.id,
             season=season,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+            await _block(
+                session,
+                download_repo,
+                download_id,
+                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                request_id=request.id,
+                season=season,
+            )
+            return await download_repo.get_by_hash(torrent_hash)
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(

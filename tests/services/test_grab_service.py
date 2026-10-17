@@ -5314,3 +5314,41 @@ async def test_reuse_refused_while_removal_in_flight_via_unique_conflict(
     assert row is not None
     assert row.status == "failed"  # still terminal, not resurrected
     assert row.media_request_id == old_id  # NOT repointed to the new request
+
+
+@pytest.mark.parametrize("created", [True, False])
+@pytest.mark.parametrize("reuse", [False, True])
+async def test_grab_persists_validation_hold_before_reconcile(
+    sessionmaker_: SessionMaker, reuse: bool, created: bool
+) -> None:
+    # A pre-existing torrent (qBittorrent 409) never received the stop-at-metadata
+    # hold, so it must not inherit an intent to be started after validation.
+    class HeldClient(FakeQbittorrent):
+        async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+            result = await super().add(magnet_or_url, save_path, category)
+            return result.model_copy(update={"payload_pending": True, "created": created})
+
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        if reuse:
+            session.add(Download(torrent_hash=_HASH, status="failed", media_request_id=request_id))
+        await session.commit()
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            HeldClient(),
+            session,
+            scored=_scored(_HASH),
+            request_id=request_id,
+            tmdb_id=300,
+        )
+    async with sessionmaker_() as session:
+        row = (
+            await session.execute(select(Download).where(Download.torrent_hash == _HASH))
+        ).scalar_one()
+        assert row.payload_pending
+        assert row.payload_resume is created

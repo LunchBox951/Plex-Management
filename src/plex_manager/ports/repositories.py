@@ -159,6 +159,9 @@ class DownloadRecord(BaseModel):
     episodes: list[int] | None = None
     media_type: str | None = None
     failed_reason: str | None = None
+    payload_pending: bool = False
+    payload_resume: bool = False
+    payload_rejection: str | None = None
     # Consecutive resumed-import probe-outage retries (``downloads.retry_count``,
     # issue #180) -- see ``services.import_service._refresh_resumed_import_after_probe_outage``
     # and ``_PROBE_OUTAGE_MAX_RETRIES``. Reset to 0 on terminal-row reuse.
