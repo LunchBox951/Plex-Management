@@ -1540,11 +1540,6 @@ async def reconcile_and_list(
         if row.payload_rejection and row.status != DownloadState.FailedPending.value:
             await reject_payload(session, qbt, row, row.payload_rejection)
             held_ids.add(row.id)
-        elif row.status == DownloadState.ImportBlocked.value and (
-            row.failed_reason or ""
-        ).startswith("no verified Plex-compatible video file found in the completed download"):
-            await reject_payload(session, qbt, row, row.failed_reason or "no video file")
-            held_ids.add(row.id)
         elif (
             row.payload_pending
             and row.torrent_hash.lower() in present_hashes
@@ -1566,6 +1561,25 @@ async def reconcile_and_list(
                 and raw_states.get(row.torrent_hash.lower()) in {"metaDL", "forcedMetaDL"}
             ):
                 held_stall_rows.append(row)
+        elif (
+            row.payload_pending
+            and row.torrent_hash.lower() not in present_hashes
+            and row.status
+            in {
+                DownloadState.ImportPending.value,
+                DownloadState.ImportBlocked.value,
+                DownloadState.Importing.value,
+            }
+        ):
+            # A completed payload whose torrent left the client has nothing left to
+            # download, so holding it would only make import retries silent no-ops.
+            # Import still verifies the bytes.
+            if await download_repo.update_status_if_in(
+                row.id, row.status, frozenset({row.status}), payload_pending=False
+            ):
+                await session.commit()
+            else:
+                await session.rollback()
     if held_ids:
         if changes is not None:
             changes.queue = changes.requests = changes.blocklist = True

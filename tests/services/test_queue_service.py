@@ -4024,43 +4024,26 @@ async def test_only_validated_video_selection_can_release_hold(
             assert "selection unavailable" in (row.failed_reason or "")
 
 
-async def test_legacy_no_video_block_rearms_season_and_remains_visible(
-    sessionmaker_: SessionMaker,
-) -> None:
-    _request_id, season_id = await _seed_tv_request_with_download(
-        sessionmaker_, season=1, first_seen_at=datetime.now(UTC)
-    )
-    async with sessionmaker_() as session:
-        row = (await session.execute(select(Download))).scalar_one()
-        row.status = "import_blocked"
-        row.failed_reason = (
-            "no verified Plex-compatible video file found in the completed download "
-            "(1 candidate(s) rejected)"
-        )
-        await session.commit()
-    qbt = FakeQbittorrent()
-    async with sessionmaker_() as session:
-        await queue_service.reconcile_and_list(qbt, session)
-    async with sessionmaker_() as session:
-        season = await session.get(SeasonRequest, season_id)
-        assert season is not None and season.status == "searching"
-        queue = await queue_service.list_queue(session)
-        assert len(queue) == 1
-        assert queue[0].status == "failed"
-        assert "no verified Plex-compatible video" in (queue[0].failed_reason or "")
+_LEGACY_NO_VIDEO_REASONS = [
+    "no Plex-supported video file found in the completed download",
+    "no verified Plex-compatible video file found in the completed download "
+    "(1 candidate(s) rejected)",
+]
 
 
+@pytest.mark.parametrize("reason", _LEGACY_NO_VIDEO_REASONS)
 @pytest.mark.parametrize("names", [["Show.S01/Show.S01E01.mkv"], ["Show.S01/readme.txt"]])
-async def test_legacy_unscanned_no_video_block_is_decided_by_the_manifest(
-    sessionmaker_: SessionMaker, names: list[str]
+async def test_legacy_no_video_block_is_decided_by_the_manifest(
+    sessionmaker_: SessionMaker, names: list[str], reason: str
 ) -> None:
     from plex_manager.ports.download_client import DownloadedFile
 
-    # The pre-#609 scan swallowed directory errors, so this reason alone can mean
-    # an unreadable path rather than a no-video payload.
-    reason = "no Plex-supported video file found in the completed download"
+    # Before #609 an unreadable scan or probe produced these same reasons, so the
+    # stored reason alone never justifies deleting and blocklisting the payload.
     has_video = names[0].endswith(".mkv")
-    await _seed_tv_request_with_download(sessionmaker_, season=1, first_seen_at=datetime.now(UTC))
+    _request_id, season_id = await _seed_tv_request_with_download(
+        sessionmaker_, season=1, first_seen_at=datetime.now(UTC)
+    )
     async with sessionmaker_() as session:
         row = (await session.execute(select(Download))).scalar_one()
         row.status = "import_blocked"
@@ -4080,7 +4063,10 @@ async def test_legacy_unscanned_no_video_block_is_decided_by_the_manifest(
         await queue_service.reconcile_and_list(qbt, session)
     async with sessionmaker_() as session:
         row = (await session.execute(select(Download))).scalar_one()
+        season = await session.get(SeasonRequest, season_id)
         blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        queue = await queue_service.list_queue(session)
+    assert season is not None
     if has_video:
         assert row.status == "import_blocked"
         assert row.failed_reason == reason
@@ -4089,8 +4075,33 @@ async def test_legacy_unscanned_no_video_block_is_decided_by_the_manifest(
         assert not qbt.removed
     else:
         assert row.status == "failed"
+        assert season.status == "searching"
         assert len(blocklist) == 1
         assert qbt.removed == [(_HASH, True)]
+        assert len(queue) == 1 and queue[0].status == "failed"
+
+
+@pytest.mark.parametrize("reason", _LEGACY_NO_VIDEO_REASONS)
+async def test_legacy_no_video_block_without_its_torrent_stays_retryable(
+    sessionmaker_: SessionMaker, reason: str
+) -> None:
+    await _seed_tv_request_with_download(sessionmaker_, season=1, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.status = "import_blocked"
+        row.failed_reason = reason
+        row.payload_pending = True
+        await session.commit()
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.status == "import_blocked"
+        assert row.failed_reason == reason
+        assert not row.payload_pending  # an operator retry reaches the importer
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+    assert not qbt.removed
 
 
 async def test_legacy_seeding_torrent_resumes_after_validation(
