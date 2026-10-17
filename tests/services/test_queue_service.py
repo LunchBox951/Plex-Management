@@ -3976,6 +3976,29 @@ async def test_queued_held_magnet_is_not_stopped_before_metadata(
         assert request is not None and request.status is RequestStatus.searching
 
 
+@pytest.mark.parametrize("raw_state", ["error", "missingFiles"])
+async def test_held_payload_client_failure_keeps_reconcile_recovery(
+    sessionmaker_: SessionMaker, raw_state: str
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state)]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        request = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"
+        assert raw_state in (row.failed_reason or "")
+        assert request is not None and request.status == RequestStatus.searching
+
+
 async def test_held_payload_metadata_stall_still_self_heals(
     sessionmaker_: SessionMaker,
 ) -> None:

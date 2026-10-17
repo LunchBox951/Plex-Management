@@ -1548,6 +1548,9 @@ async def reconcile_and_list(
         elif (
             row.payload_pending
             and row.torrent_hash.lower() in present_hashes
+            # A client-reported failure keeps its existing reconcile recovery;
+            # qBittorrent reports it ahead of any stop, so validation would wait forever.
+            and raw_states.get(row.torrent_hash.lower()) not in {"error", "missingFiles"}
             and row.status
             in {
                 DownloadState.Downloading.value,
