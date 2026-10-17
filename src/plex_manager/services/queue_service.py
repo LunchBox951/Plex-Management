@@ -1408,6 +1408,11 @@ async def _validate_held_payload(
             return
         if status is None or status.raw_state in {"metaDL", "forcedMetaDL", "stoppedMetaDL"}:
             return
+        if not await qbt.list_files(row.torrent_hash):
+            # No manifest means no metadata yet, e.g. a magnet queued behind the
+            # client's active-download limit. Stopping it would keep metadata from
+            # ever arriving; it reaches metaDL and the stall deadline once it starts.
+            return
         resume = row.payload_resume
         if not resume and status.raw_state in {
             "downloading",

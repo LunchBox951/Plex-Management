@@ -3936,6 +3936,46 @@ async def test_held_payload_with_unknown_metadata_does_not_fail_or_start(
     assert not qbt.removed
 
 
+async def test_queued_held_magnet_is_not_stopped_before_metadata(
+    sessionmaker_: SessionMaker,
+) -> None:
+    class Client(FakeQbittorrent):
+        pauses = 0
+
+        async def pause(self, info_hash: str) -> None:
+            self.pauses += 1
+
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="metadata_fetching",
+        added_at=datetime.now(UTC) - timedelta(minutes=46),
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = Client(statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="queuedDL")])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.pauses == 0
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None and row.payload_pending
+        assert "waiting for complete metadata" in (row.failed_reason or "")
+
+    # Once the client starts it, the metadata-stall deadline applies as usual.
+    qbt.statuses = [DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        assert row is not None and row.status == "failed"
+        assert request is not None and request.status is RequestStatus.searching
+
+
 async def test_held_payload_metadata_stall_still_self_heals(
     sessionmaker_: SessionMaker,
 ) -> None:
