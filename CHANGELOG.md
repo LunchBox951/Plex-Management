@@ -43,8 +43,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   script or installer, or no eligible video, is removed, blocklisted and
   re-searched with a visible reason; healthy releases download their video
   files only. Requires qBittorrent 5.0 or newer (WebAPI 2.11.0); older clients
-  refuse new grabs rather than download unchecked. Ships migration `609a01`
-  and ADR-0031 (#609).
+  fail setup validation and refuse new grabs rather than download unchecked.
+  Ships migration `609a01` and ADR-0031 (#609).
 - CI: parallelized the Python quality-gate test run, and eliminated pytest
   warnings under Python 3.12 and 3.14 (#543, #544).
 - Repo docs: archived the completed v1 planning docs under `docs/archive/`,

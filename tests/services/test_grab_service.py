@@ -5316,14 +5316,17 @@ async def test_reuse_refused_while_removal_in_flight_via_unique_conflict(
     assert row.media_request_id == old_id  # NOT repointed to the new request
 
 
+@pytest.mark.parametrize("created", [True, False])
 @pytest.mark.parametrize("reuse", [False, True])
 async def test_grab_persists_validation_hold_before_reconcile(
-    sessionmaker_: SessionMaker, reuse: bool
+    sessionmaker_: SessionMaker, reuse: bool, created: bool
 ) -> None:
+    # A pre-existing torrent (qBittorrent 409) never received the stop-at-metadata
+    # hold, so it must not inherit an intent to be started after validation.
     class HeldClient(FakeQbittorrent):
         async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
             result = await super().add(magnet_or_url, save_path, category)
-            return result.model_copy(update={"payload_pending": True})
+            return result.model_copy(update={"payload_pending": True, "created": created})
 
     async with sessionmaker_() as session:
         request = MediaRequest(
@@ -5347,4 +5350,5 @@ async def test_grab_persists_validation_hold_before_reconcile(
         row = (
             await session.execute(select(Download).where(Download.torrent_hash == _HASH))
         ).scalar_one()
-        assert row.payload_pending and row.payload_resume
+        assert row.payload_pending
+        assert row.payload_resume is created

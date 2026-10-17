@@ -17,8 +17,11 @@ def upgrade() -> None:
     op.add_column("downloads", sa.Column("payload_pending", sa.Boolean(), nullable=False, server_default=sa.false()))
     op.add_column("downloads", sa.Column("payload_rejection", sa.String(), nullable=True))
     op.add_column("downloads", sa.Column("payload_resume", sa.Boolean(), nullable=False, server_default=sa.false()))
+    # An importing row with a download_path breadcrumb may already have placed its
+    # library file; crash recovery owns it, and a rejection would orphan that file.
     op.execute("UPDATE downloads SET payload_pending = true WHERE status IN "
-               "('downloading', 'metadata_fetching', 'client_missing', 'import_pending', 'import_blocked', 'importing')")
+               "('downloading', 'metadata_fetching', 'client_missing', 'import_pending', 'import_blocked') "
+               "OR (status = 'importing' AND download_path IS NULL)")
 
 
 def downgrade() -> None:

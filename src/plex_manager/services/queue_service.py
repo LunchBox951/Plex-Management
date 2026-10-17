@@ -1337,6 +1337,9 @@ async def reject_payload(
         await session.rollback()
 
 
+_UNINSPECTED_NOT_BLOCKLISTED = "; payload never inspected, release not blocklisted"
+
+
 _LEGACY_METADATA_RESTART = (
     "payload validation pending: restarting legacy metadata with a download hold"
 )
@@ -1390,6 +1393,10 @@ async def _restart_legacy_metadata(
         await session.rollback()
 
 
+async def _held_row_changed(repo: SqlDownloadRepository, row: DownloadRecord) -> bool:
+    return await repo.get_by_hash(row.torrent_hash, populate_existing=True) != row
+
+
 async def _validate_held_payload(
     session: AsyncSession, qbt: DownloadClientPort, row: DownloadRecord
 ) -> None:
@@ -1406,12 +1413,24 @@ async def _validate_held_payload(
             reason = _LEGACY_METADATA_RESTART
             await _restart_legacy_metadata(session, qbt, row)
             return
-        if status is None or status.raw_state in {"metaDL", "forcedMetaDL", "stoppedMetaDL"}:
+        if status is None or status.raw_state in {
+            "metaDL",
+            "forcedMetaDL",
+            # Transient client work hides whether the torrent was running; judge it
+            # once it settles rather than guessing its resume intent.
+            "checkingResumeData",
+            "moving",
+        }:
             return
         if not await qbt.list_files(row.torrent_hash):
             # No manifest means no metadata yet, e.g. a magnet queued behind the
             # client's active-download limit. Stopping it would keep metadata from
             # ever arriving; it reaches metaDL and the stall deadline once it starts.
+            if status.raw_state in {"stoppedDL", "pausedDL", "stoppedMetaDL"}:
+                # A stopped magnet never fetches metadata, so nothing would ever
+                # validate or fail it. Restart it like a legacy metadata fetch.
+                reason = _LEGACY_METADATA_RESTART
+                await _restart_legacy_metadata(session, qbt, row)
             return
         resume = row.payload_resume
         if not resume and status.raw_state in {
@@ -1462,20 +1481,27 @@ async def _validate_held_payload(
             return
         if resume:
             await qbt.resume(row.torrent_hash)
-        await repo.update_status_if_in(
+        downloading = row.status in {
+            DownloadState.Downloading.value,
+            DownloadState.MetadataFetching.value,
+            DownloadState.ClientMissing.value,
+        }
+        won = await repo.update_status_if_in(
             row.id,
-            DownloadState.Downloading.value
-            if row.status
-            in {
-                DownloadState.Downloading.value,
-                DownloadState.MetadataFetching.value,
-                DownloadState.ClientMissing.value,
-            }
-            else row.status,
+            DownloadState.Downloading.value if downloading else row.status,
             frozenset({row.status}),
             payload_pending=False,
             clear_failed_reason=(row.failed_reason or "").startswith("payload validation pending:"),
+            # A recovered client_missing row gets a fresh grace window, as in reconcile.
+            clear_first_seen_at=downloading,
         )
+        if not won:
+            await session.rollback()
+            if resume:
+                # Another writer (e.g. an operator mark-failed) took the row while the
+                # resume was in flight; do not leave its torrent running behind it.
+                await qbt.pause(row.torrent_hash)
+            return
         await session.commit()
         return
     except (QbittorrentError, NotImplementedError) as exc:
@@ -1539,12 +1565,16 @@ async def reconcile_and_list(
     # A hold never pauses a magnet that is still fetching metadata, so those rows
     # keep the issue #165 metadata-stall deadline instead of waiting forever.
     held_stall_rows: list[DownloadRecord] = []
+    # Most held rows wait unchanged for many cycles; only a persisted change may
+    # invalidate the web caches.
+    held_changed = False
     for row in rows:
         if _is_operator_claimed(row.id):
             continue
         if row.payload_rejection and row.status != DownloadState.FailedPending.value:
             await reject_payload(session, qbt, row, row.payload_rejection)
             held_ids.add(row.id)
+            held_changed |= await _held_row_changed(download_repo, row)
         elif (
             row.payload_pending
             and row.torrent_hash.lower() in present_hashes
@@ -1563,6 +1593,7 @@ async def reconcile_and_list(
         ):
             await _validate_held_payload(session, qbt, row)
             held_ids.add(row.id)
+            held_changed |= await _held_row_changed(download_repo, row)
             if (
                 row.payload_resume
                 and not (row.failed_reason or "").startswith(_LEGACY_METADATA_RESTART)
@@ -1586,12 +1617,12 @@ async def reconcile_and_list(
                 row.id, row.status, frozenset({row.status}), payload_pending=False
             ):
                 await session.commit()
+                held_changed = True
             else:
                 await session.rollback()
-    if held_ids:
-        if changes is not None:
-            changes.queue = changes.requests = changes.blocklist = True
-        rows = [row for row in rows if row.id not in held_ids]
+    if held_changed and changes is not None:
+        changes.queue = changes.requests = changes.blocklist = True
+    rows = [row for row in rows if row.id not in held_ids]
 
     transitions = reconcile(rows, statuses, now=now)
     snapshot = {status.info_hash.lower(): status for status in statuses}
@@ -1785,8 +1816,12 @@ async def reconcile_and_list(
             if detail is not None and detail.source is FailureDetailSource.log
             else event.reason
         )
+        uninspected = event_row.payload_pending and event_row.torrent_hash.lower() not in snapshot
+        if uninspected:
+            # Durable in the stamped reason so a residual heal keeps the verdict.
+            reason += _UNINSPECTED_NOT_BLOCKLISTED
         blocklist = (
-            not (event_row.payload_pending and event_row.torrent_hash.lower() not in snapshot)
+            not uninspected
             and classify_failure_detail(classify_text) is not FailureClass.environmental
         )
         reconcile_completions.append(
@@ -1845,7 +1880,10 @@ async def reconcile_and_list(
             # still skips the blocklist instead of falling back to the poison
             # default. A plain/None reason classifies as release-fault (today's
             # default), so genuinely reconcile-derived strands are unchanged.
-            blocklist = classify_failure_detail(row.failed_reason) is not FailureClass.environmental
+            blocklist = (
+                _UNINSPECTED_NOT_BLOCKLISTED not in (row.failed_reason or "")
+                and classify_failure_detail(row.failed_reason) is not FailureClass.environmental
+            )
         completions.append(
             _FailureCompletion(
                 download_id=row.id,

@@ -606,7 +606,9 @@ class SqlDownloadRepository:
                     & (Download.failed_at >= datetime.now(UTC) - timedelta(days=1)),
                 )
             )
-            .order_by(Download.id)
+            # Retained rejections first: a client matching the last row for a
+            # request/season then sees an active replacement, never the old failure.
+            .order_by((Download.status == "failed").desc(), Download.id)
         )
         rows = (await self._session.execute(stmt)).all()
         scopes = await self._scopes_by_download([download.id for download, _title, _poster in rows])
@@ -634,6 +636,7 @@ class SqlDownloadRepository:
         release_title: str | None = None,
         timeout_at: datetime | None = None,
         payload_pending: bool = False,
+        payload_resume: bool = False,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -648,7 +651,7 @@ class SqlDownloadRepository:
             release_title=release_title,
             timeout_at=timeout_at,
             payload_pending=payload_pending,
-            payload_resume=payload_pending,
+            payload_resume=payload_resume,
         )
         self._session.add(row)
         await self._session.flush()

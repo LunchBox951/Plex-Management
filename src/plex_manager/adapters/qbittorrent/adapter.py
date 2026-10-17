@@ -81,6 +81,7 @@ __all__ = [
     "QbittorrentClient",
     "QbittorrentError",
     "QbittorrentSourceError",
+    "QbittorrentVersionError",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -165,6 +166,10 @@ class QbittorrentAuthError(QbittorrentError):
     A surfaced error — never a silent failure. The message never includes the
     password or session id.
     """
+
+
+class QbittorrentVersionError(QbittorrentError):
+    """qBittorrent is reachable but older than payload validation requires (5.0)."""
 
 
 class QbittorrentSourceError(QbittorrentError):
@@ -1493,15 +1498,7 @@ class QbittorrentClient:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
 
-        version_response = await self._request("GET", "/app/webapiVersion")
-        self._raise_for_status(version_response)
-        version = version_response.text.strip()
-        if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(
-            int(part) for part in version.split(".")
-        ) < (2, 11, 0):
-            raise QbittorrentError(
-                "payload validation requires qBittorrent 5.0 or newer; download not added"
-            )
+        await self.require_payload_validation_support()
         form: dict[str, str] = {
             "savepath": save_path,
             "category": category,
@@ -1538,6 +1535,21 @@ class QbittorrentClient:
         # effort: the caller can reconcile by category on the next poll.
         _logger.warning("added torrent but could not derive its info-hash locally")
         return AddResult(torrent_hash="", created=created)
+
+    async def require_payload_validation_support(self) -> None:
+        """Raise :class:`QbittorrentVersionError` below WebAPI 2.11.0 (qBittorrent 5.0).
+
+        Payload validation needs the add-time ``MetadataReceived`` stop condition.
+        """
+        response = await self._request("GET", "/app/webapiVersion")
+        self._raise_for_status(response)
+        version = response.text.strip()
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(
+            int(part) for part in version.split(".")
+        ) < (2, 11, 0):
+            raise QbittorrentVersionError(
+                "payload validation requires qBittorrent 5.0 or newer; download not added"
+            )
 
     # ---- status --------------------------------------------------------- #
     async def get_status(self, info_hash: str) -> DownloadStatus | None:

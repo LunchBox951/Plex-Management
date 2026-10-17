@@ -7,6 +7,7 @@ from plex_manager.adapters.qbittorrent.adapter import (
     QbittorrentClient,
     QbittorrentError,
     QbittorrentSourceError,
+    QbittorrentVersionError,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "QbittorrentClient",
     "QbittorrentError",
     "QbittorrentSourceError",
+    "QbittorrentVersionError",
 ]

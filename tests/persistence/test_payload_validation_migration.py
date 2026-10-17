@@ -32,14 +32,19 @@ def test_upgrade_enrols_unfinished_downloads_only(
                 db.execute(
                     "INSERT INTO downloads (torrent_hash, status) VALUES (?, ?)", (status, status)
                 )
+            # A crash-resumable import that may already have placed its library file.
+            db.execute(
+                "INSERT INTO downloads (torrent_hash, status, download_path) VALUES (?, ?, ?)",
+                ("placed", "importing", "/library/Movie (2020)/Movie.mkv"),
+            )
         command.upgrade(Config("alembic.ini"), "head")
         with sqlite3.connect(path) as db:
             rows = db.execute(
-                "SELECT status, payload_pending, payload_resume FROM downloads"
+                "SELECT torrent_hash, payload_pending, payload_resume FROM downloads"
             ).fetchall()
         assert all(
-            pending == (status not in {"failed", "imported"}) and resume == 0
-            for status, pending, resume in rows
+            pending == (name not in {"failed", "imported", "placed"}) and resume == 0
+            for name, pending, resume in rows
         )
     finally:
         get_settings.cache_clear()

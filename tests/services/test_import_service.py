@@ -1086,8 +1086,11 @@ async def test_import_with_no_video_file_is_failed_and_blocklisted(
         download_status=initial_state,
     )
 
+    # The client's own manifest confirms the release has no video.
+    manifest = [DownloadedFile(name="junk/readme.txt", size_bytes=len("no video here"))]
+
     record = await _import(
-        sessionmaker_, download_id, movies_root, _qbt(content_dir), FakeLibrary()
+        sessionmaker_, download_id, movies_root, _qbt(content_dir, files=manifest), FakeLibrary()
     )
 
     assert record is not None
@@ -1098,6 +1101,37 @@ async def test_import_with_no_video_file_is_failed_and_blocklisted(
     async with sessionmaker_() as session:
         blocklisted = (await session.execute(select(Blocklist))).scalars().all()
         assert len(blocklisted) == 1
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [[], [DownloadedFile(name="junk/Movie.2020.1080p.mkv", size_bytes=1)]],
+    ids=["no-manifest", "manifest-lists-video"],
+)
+async def test_empty_disk_scan_without_a_manifest_verdict_stays_retryable(
+    tmp_path: Path, sessionmaker_: SessionMaker, manifest: list[DownloadedFile]
+) -> None:
+    # A readable but emptied directory (manual deletion, mount race) says nothing
+    # about the release; deleting and blocklisting it would punish a good release.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    content_dir = tmp_path / "downloads" / "junk"
+    content_dir.mkdir(parents=True)
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+
+    record = await _import(
+        sessionmaker_, download_id, movies_root, _qbt(content_dir, files=manifest), FakeLibrary()
+    )
+
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    assert "check volume mounts" in (record.failed_reason or "")
+    async with sessionmaker_() as session:
+        assert not (await session.execute(select(Blocklist))).scalars().all()
 
 
 async def test_import_ignores_non_video_siblings_and_associates_only_verified_video(

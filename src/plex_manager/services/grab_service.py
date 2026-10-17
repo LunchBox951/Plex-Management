@@ -282,6 +282,7 @@ async def _reuse_terminal_row(
     qbt: DownloadClientPort,
     actually_added: bool,
     payload_pending: bool = False,
+    payload_resume: bool = False,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -389,7 +390,7 @@ async def _reuse_terminal_row(
         timeout_at=now + METADATA_STALL_WINDOW,
         retry_count=0,
         payload_pending=payload_pending,
-        payload_resume=payload_pending,
+        payload_resume=payload_resume,
         clear_payload_rejection=True,
     )
     if not claimed:
@@ -1321,6 +1322,10 @@ async def grab(
     # back a live library file via hardlink), and the DB rollback preserves
     # whatever row tracked it. See _remove_torrent_if_added.
     actually_added = add_result.created
+    # Only a torrent this add created carries the stop-at-metadata hold, so only it
+    # may be started after validation. A pre-existing one is judged like a legacy
+    # row: its live client state decides whether it was running.
+    payload_resume = add_result.payload_pending and add_result.created
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
         # opaque URL) and the indexer supplied none either. Tracking by the indexer
@@ -1408,6 +1413,7 @@ async def grab(
                     qbt=qbt,
                     actually_added=actually_added,
                     payload_pending=add_result.payload_pending,
+                    payload_resume=payload_resume,
                 )
                 if claimed_reuse:
                     break
@@ -1491,6 +1497,7 @@ async def grab(
                 release_title=candidate.title,
                 timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
                 payload_pending=add_result.payload_pending,
+                payload_resume=payload_resume,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release
