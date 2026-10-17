@@ -1493,7 +1493,21 @@ class QbittorrentClient:
             urls_value = magnet_or_url
             info_hash = _info_hash_from_magnet(magnet_or_url)
 
-        form: dict[str, str] = {"savepath": save_path, "category": category}
+        version_response = await self._request("GET", "/app/webapiVersion")
+        self._raise_for_status(version_response)
+        version = version_response.text.strip()
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(
+            int(part) for part in version.split(".")
+        ) < (2, 11, 0):
+            raise QbittorrentError(
+                "payload validation requires qBittorrent 5.0 or newer; download not added"
+            )
+        form: dict[str, str] = {
+            "savepath": save_path,
+            "category": category,
+            "stopCondition": "MetadataReceived",
+            "stopped": "false",
+        }
         if save_path:
             # A directed save path only takes effect when this torrent is NOT
             # auto-managed -- otherwise a global AutoTMM install silently
@@ -1519,7 +1533,7 @@ class QbittorrentClient:
         created = response.status_code != _HTTP_CONFLICT
 
         if info_hash is not None:
-            return AddResult(torrent_hash=info_hash.lower(), created=created)
+            return AddResult(torrent_hash=info_hash.lower(), created=created, payload_pending=True)
         # No locally-derivable hash (rare: opaque .torrent URL qBit fetched). Best
         # effort: the caller can reconcile by category on the next poll.
         _logger.warning("added torrent but could not derive its info-hash locally")
@@ -1647,11 +1661,53 @@ class QbittorrentClient:
         out: list[DownloadedFile] = []
         for row in _as_list(_decode_json(response, "/torrents/files")):
             entry = _as_dict(row)
+            if not entry or not isinstance(entry.get("name"), str) or not entry.get("name"):
+                raise QbittorrentError("payload manifest contains an invalid file entry")
             if entry:
+                file_index = entry.get("index")
+                file_priority = entry.get("priority")
                 out.append(
-                    DownloadedFile(name=_s(entry.get("name")), size_bytes=_i(entry.get("size")))
+                    DownloadedFile(
+                        name=_s(entry.get("name")),
+                        size_bytes=_i(entry.get("size")),
+                        index=file_index if type(file_index) is int else None,
+                        priority=file_priority if type(file_priority) is int else None,
+                    )
                 )
         return out
+
+    async def select_files(
+        self, info_hash: str, indices: Sequence[int], expected_files: Sequence[DownloadedFile]
+    ) -> None:
+        files = await self.list_files(info_hash)
+        if files != list(expected_files):
+            raise QbittorrentError("payload manifest changed; download remains held")
+        all_ids = [file.index for file in files]
+        if not files or any(index is None for index in all_ids) or len(set(all_ids)) != len(files):
+            raise QbittorrentError("payload file IDs unavailable; download remains held")
+        selected = set(indices)
+        if not selected or not selected.issubset(set(all_ids)):
+            raise QbittorrentError(
+                "payload selection does not match manifest; download remains held"
+            )
+        for wanted, priority in ((False, 0), (True, 1)):
+            ids = [str(index) for index in all_ids if (index in selected) == wanted]
+            if ids:
+                response = await self._request(
+                    "POST",
+                    "/torrents/filePrio",
+                    data={
+                        "hash": info_hash.lower(),
+                        "id": "|".join(ids),
+                        "priority": str(priority),
+                    },
+                )
+                self._raise_for_status(response)
+        confirmed = await self.list_files(info_hash)
+        if [(f.index, f.name, f.size_bytes) for f in confirmed] != [
+            (f.index, f.name, f.size_bytes) for f in files
+        ] or any(f.priority != (1 if f.index in selected else 0) for f in confirmed):
+            raise QbittorrentError("payload selection not confirmed; download remains held")
 
     async def get_default_save_path(self) -> str | None:
         """Return the client's GLOBAL default save path via ``GET /app/preferences``.

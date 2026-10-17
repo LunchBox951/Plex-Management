@@ -531,6 +531,10 @@ class _VideoVerificationError(RuntimeError):
     """A surfaced, retryable reason no candidate can enter a Plex library."""
 
 
+class _NoVideoFilesError(_VideoVerificationError):
+    """The completed payload has no structurally verified video candidates."""
+
+
 class _VideoVerificationUnavailableError(_VideoVerificationError):
     """Verification could not establish whether any candidate was acceptable."""
 
@@ -566,6 +570,15 @@ async def _stop_or_join_probe_task(
         _ = await task
 
 
+async def _inspect_sources(fs: FileSystemPort, content: str) -> list[tuple[str, int, str]]:
+    try:
+        return await asyncio.to_thread(_resolve_sources, fs, content)
+    except OSError as exc:
+        raise _VideoVerificationUnavailableError(
+            f"video inspection unavailable: {safe_text(str(exc))}"
+        ) from exc
+
+
 async def _verified_plex_video_sources(
     media_probe: MediaProbePort,
     sources: list[tuple[str, int, str]],
@@ -593,9 +606,7 @@ async def _verified_plex_video_sources(
     next reconcile cycle re-probes the entire batch from scratch.
     """
     if not sources:
-        raise _VideoVerificationError(
-            "no Plex-supported video file found in the completed download"
-        )
+        raise _NoVideoFilesError("no Plex-supported video file found in the completed download")
 
     accepted: list[tuple[str, int, str]] = []
     rejected = 0
@@ -671,7 +682,7 @@ async def _verified_plex_video_sources(
             raise _VideoVerificationUnavailableError(
                 f"video verification unavailable: {unavailable_detail}"
             )
-        raise _VideoVerificationError(
+        raise _NoVideoFilesError(
             "no verified Plex-compatible video file found in the completed download "
             f"({rejected} candidate(s) rejected)"
         )
@@ -1172,6 +1183,8 @@ async def _import_download_locked(
     season = row.season
     episodes = row.episodes_json
     entered_importing = row.status == DownloadState.Importing.value
+    if row.payload_pending:
+        return await download_repo.get_by_hash(torrent_hash)
     if row.status not in _RESUMABLE:
         return await download_repo.get_by_hash(torrent_hash)  # already done / not importable
     if row.media_request_id is None:
@@ -1339,8 +1352,8 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
+        sources = await _inspect_sources(fs, content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -1359,6 +1372,13 @@ async def _import_download_locked(
             str(exc),
             request_id=request.id,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
@@ -1796,8 +1816,8 @@ async def _import_tv_targets_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, visible_content)
     try:
+        sources = await _inspect_sources(fs, visible_content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -1818,6 +1838,13 @@ async def _import_tv_targets_locked(
             request_id=request.id,
             seasons=target_seasons,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(
@@ -2251,8 +2278,8 @@ async def _import_tv_locked(
         return await download_repo.get_by_hash(torrent_hash)
     content = visible_content
 
-    sources = await asyncio.to_thread(_resolve_sources, fs, content)
     try:
+        sources = await _inspect_sources(fs, content)
         sources = await _verified_plex_video_sources(media_probe, sources)
     except _VideoVerificationUnavailableError as exc:
         if entered_importing:
@@ -2273,6 +2300,13 @@ async def _import_tv_locked(
             request_id=request.id,
             season=season,
         )
+        return await download_repo.get_by_hash(torrent_hash)
+    except _NoVideoFilesError as exc:
+        from plex_manager.services.queue_service import reject_payload
+
+        record = await download_repo.get_by_hash(torrent_hash)
+        if record is not None and record.status in _RESUMABLE:
+            await reject_payload(session, qbt, record, str(exc))
         return await download_repo.get_by_hash(torrent_hash)
     except _VideoVerificationError as exc:
         await _block(

@@ -1069,8 +1069,11 @@ async def test_mark_failed_recovers_a_blocked_import(sessionmaker_: SessionMaker
         assert len(blocklisted) == 1  # the bad release was blocklisted
 
 
-async def test_import_with_no_video_file_is_blocked(
-    tmp_path: Path, sessionmaker_: SessionMaker
+@pytest.mark.parametrize(
+    "initial_state", [DownloadState.ImportPending.value, DownloadState.Importing.value]
+)
+async def test_import_with_no_video_file_is_failed_and_blocklisted(
+    tmp_path: Path, sessionmaker_: SessionMaker, initial_state: str
 ) -> None:
     movies_root = tmp_path / "library"
     movies_root.mkdir()
@@ -1080,7 +1083,7 @@ async def test_import_with_no_video_file_is_blocked(
     download_id, _ = await _seed(
         sessionmaker_,
         request_status=RequestStatus.downloading,
-        download_status=DownloadState.ImportPending.value,
+        download_status=initial_state,
     )
 
     record = await _import(
@@ -1088,9 +1091,13 @@ async def test_import_with_no_video_file_is_blocked(
     )
 
     assert record is not None
-    assert record.status == DownloadState.ImportBlocked.value
+    assert record.status == DownloadState.Failed.value
     assert record.failed_reason is not None
     assert "no Plex-supported video file" in record.failed_reason
+
+    async with sessionmaker_() as session:
+        blocklisted = (await session.execute(select(Blocklist))).scalars().all()
+        assert len(blocklisted) == 1
 
 
 async def test_import_ignores_non_video_siblings_and_associates_only_verified_video(
@@ -1144,7 +1151,7 @@ async def test_import_rejects_renamed_non_video_before_library_association(
         media_probe=probe,
     )
 
-    assert record is not None and record.status == DownloadState.ImportBlocked.value
+    assert record is not None and record.status == DownloadState.Failed.value
     assert record.failed_reason is not None
     assert "no verified Plex-compatible video file" in record.failed_reason
     assert library.scanned == []
@@ -6660,3 +6667,34 @@ async def test_heal_is_bounded_per_cycle(sessionmaker_: SessionMaker) -> None:
     processed = sum(1 for s in statuses if s == RequestStatus.pending)
     assert processed == limit
     assert statuses.count(RequestStatus.available) == extra
+
+
+@pytest.mark.parametrize("operation", ["scandir", "getsize"])
+@pytest.mark.parametrize("initial_state", ["import_pending", "importing"])
+async def test_import_scan_error_never_rejects_payload(
+    tmp_path: Path, sessionmaker_: SessionMaker, operation: str, initial_state: str
+) -> None:
+    from unittest.mock import patch
+
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    content = tmp_path / "downloads" / "release"
+    _make_video(content / "The.Matrix.1999.1080p.WEB-DL.mkv")
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=initial_state,
+    )
+    qbt = _qbt(content)
+    target = "os.scandir" if operation == "scandir" else "os.path.getsize"
+    with patch(target, side_effect=PermissionError("unreadable download")):
+        record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+    assert record is not None
+    assert record.status in {"import_blocked", "importing"}
+    if initial_state == "import_pending":
+        assert "inspection unavailable" in (record.failed_reason or "")
+    else:
+        assert record.status == "importing"
+    assert not qbt.removed
+    async with sessionmaker_() as session:
+        assert not (await session.execute(select(Blocklist))).scalars().all()

@@ -281,6 +281,7 @@ async def _reuse_terminal_row(
     release_title: str | None,
     qbt: DownloadClientPort,
     actually_added: bool,
+    payload_pending: bool = False,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -387,6 +388,9 @@ async def _reuse_terminal_row(
         added_at=now,
         timeout_at=now + METADATA_STALL_WINDOW,
         retry_count=0,
+        payload_pending=payload_pending,
+        payload_resume=payload_pending,
+        clear_payload_rejection=True,
     )
     if not claimed:
         await session.rollback()
@@ -1403,6 +1407,7 @@ async def grab(
                     release_title=candidate.title,
                     qbt=qbt,
                     actually_added=actually_added,
+                    payload_pending=add_result.payload_pending,
                 )
                 if claimed_reuse:
                     break
@@ -1485,6 +1490,7 @@ async def grab(
                 media_type=request_media_type,
                 release_title=candidate.title,
                 timeout_at=datetime.now(UTC) + METADATA_STALL_WINDOW,
+                payload_pending=add_result.payload_pending,
             )
         except IntegrityError:
             # A concurrent grab won the race. It either grabbed the SAME release

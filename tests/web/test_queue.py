@@ -727,6 +727,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
         media_type: str | None = None,
         release_title: str | None = None,
         timeout_at: datetime | None = None,
+        payload_pending: bool = False,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -761,6 +762,7 @@ async def test_grab_recovers_from_concurrent_insert_conflict(
             media_type=media_type,
             release_title=release_title,
             timeout_at=timeout_at,
+            payload_pending=payload_pending,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
@@ -1584,6 +1586,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
         media_type: str | None = None,
         release_title: str | None = None,
         timeout_at: datetime | None = None,
+        payload_pending: bool = False,
     ) -> DownloadRecord:
         if calls["n"] == 0:
             calls["n"] = 1
@@ -1618,6 +1621,7 @@ async def test_grab_loser_orphaned_torrent_is_removed_from_client(
             media_type=media_type,
             release_title=release_title,
             timeout_at=timeout_at,
+            payload_pending=payload_pending,
         )
 
     monkeypatch.setattr(SqlDownloadRepository, "create", conflicting_create)
