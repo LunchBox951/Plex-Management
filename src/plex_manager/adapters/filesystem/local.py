@@ -34,7 +34,11 @@ from collections.abc import Generator, Iterable, Iterator
 from pathlib import Path
 from typing import IO, NoReturn
 
-from plex_manager.domain.plex_video import is_plex_disc_structure_path, plex_video_extension
+from plex_manager.domain.plex_video import (
+    PLEX_EXTRAS_DIR_NAMES,
+    is_plex_disc_structure_path,
+    plex_video_extension,
+)
 from plex_manager.ports.filesystem import FilePublication, PublishedFileIdentity
 
 __all__ = ["LocalFileSystem", "LocalFileSystemError", "PartialDeleteError"]
@@ -61,12 +65,6 @@ _XATTR_ATTRIBUTE_TOLERATED_ERRNOS: frozenset[int] = frozenset(
 #: this is the same 1 MiB chunk the import pipeline used before the comparison moved
 #: behind the publish walk's descriptor.
 _DIGEST_CHUNK_BYTES = 1024 * 1024
-
-#: Lowercased directory names whose contents are bonus material, not the main
-#: feature — skipped entirely when picking the largest video.
-_EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
-    {"featurettes", "extras", "trailers", "behind the scenes", "deleted scenes"}
-)
 
 
 class LocalFileSystemError(RuntimeError):
@@ -1026,7 +1024,7 @@ def _iter_video_files(root: str, *, strict: bool = False) -> Iterator[tuple[str,
         dirnames[:] = [
             name
             for name in dirnames
-            if name.casefold() not in _EXTRAS_DIR_NAMES
+            if name.casefold() not in PLEX_EXTRAS_DIR_NAMES
             and not is_plex_disc_structure_path(name)
             and "sample" not in name.casefold()
         ]

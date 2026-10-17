@@ -1415,6 +1415,11 @@ async def _validate_held_payload(
             "stalledDL",
             "queuedDL",
             "checkingDL",
+            "uploading",
+            "forcedUP",
+            "stalledUP",
+            "queuedUP",
+            "checkingUP",
         }:
             # Save the legacy torrent's running intent before stopping it; a restart
             # must not turn our validation pause into a permanent operator pause.
@@ -1524,7 +1529,11 @@ async def reconcile_and_list(
     now = _utcnow()
 
     present_hashes = {status.info_hash.lower() for status in statuses}
+    raw_states = {status.info_hash.lower(): status.raw_state for status in statuses}
     held_ids: set[int] = set()
+    # A hold never pauses a magnet that is still fetching metadata, so those rows
+    # keep the issue #165 metadata-stall deadline instead of waiting forever.
+    held_stall_rows: list[DownloadRecord] = []
     for row in rows:
         if _is_operator_claimed(row.id):
             continue
@@ -1533,12 +1542,7 @@ async def reconcile_and_list(
             held_ids.add(row.id)
         elif row.status == DownloadState.ImportBlocked.value and (
             row.failed_reason or ""
-        ).startswith(
-            (
-                "no Plex-supported video file found in the completed download",
-                "no verified Plex-compatible video file found in the completed download",
-            )
-        ):
+        ).startswith("no verified Plex-compatible video file found in the completed download"):
             await reject_payload(session, qbt, row, row.failed_reason or "no video file")
             held_ids.add(row.id)
         elif (
@@ -1556,6 +1560,12 @@ async def reconcile_and_list(
         ):
             await _validate_held_payload(session, qbt, row)
             held_ids.add(row.id)
+            if (
+                row.payload_resume
+                and not (row.failed_reason or "").startswith(_LEGACY_METADATA_RESTART)
+                and raw_states.get(row.torrent_hash.lower()) in {"metaDL", "forcedMetaDL"}
+            ):
+                held_stall_rows.append(row)
     if held_ids:
         if changes is not None:
             changes.queue = changes.requests = changes.blocklist = True
@@ -1679,8 +1689,9 @@ async def reconcile_and_list(
     # fresh. A row an operator ``mark_failed`` currently owns is likewise skipped
     # (the pre-stamp invisibility fast-path, module docstring) -- the operator's
     # own call, not this heal, is what completes it.
-    rows_by_id = {row.id: row for row in rows}
-    for detection in detect_stalls(rows, statuses, now=now):
+    stall_rows = [*rows, *held_stall_rows]
+    rows_by_id = {row.id: row for row in stall_rows}
+    for detection in detect_stalls(stall_rows, statuses, now=now):
         if detection.download_id in transitions_by_id or _is_operator_claimed(
             detection.download_id
         ):
