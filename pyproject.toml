@@ -56,8 +56,8 @@ dev = [
     # the pre-commit hook in sync; ``pyright`` is NOT a pre-commit hook (it
     # runs via ``make type`` / ``make check`` and CI only), so this pin only
     # keeps local and CI agreeing on it.
-    "ruff==0.16.6",
-    "pyright==1.1.411",
+    "ruff==0.17.1",
+    "pyright==1.1.414",
     "pytest>=8.2",
     "pytest-cov>=5.0",
     "pytest-xdist==3.8.0",
