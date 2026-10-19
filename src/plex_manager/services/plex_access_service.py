@@ -1378,7 +1378,9 @@ async def sweep_shares(
     within the existing per-tick user budget. Capture cannot change an applied
     verdict or revocation. Failures leave the previous snapshot untouched and
     are counted and logged; identity failures also surface in the tick's health
-    state and gate later work against that anchor. Omitted
+    state and gate later work against that anchor. A user whose capture lock is
+    already held (a sign-in capture in flight) is counted in ``capture_skipped``
+    without waiting. Omitted
     (``None``) the sweep behaves exactly as it did before capture existed.
 
     ``capture`` may instead be a :data:`CaptureUnavailableReason` -- the
@@ -1516,7 +1518,20 @@ async def sweep_shares(
             capture_skipped += 1
             capture_anchor_blocked += 1
             return
-        async with entitlement_capture_lock(user_id):
+        capture_lock = entitlement_capture_lock(user_id)
+        # No await between this check and ``async with``: on one event loop the
+        # lock cannot be taken in between. A sign-in capture already holds this
+        # user's freshest evidence, so the sweep skips instead of stalling the
+        # tick behind that capture's network read.
+        if capture_lock.locked():
+            capture_skipped += 1
+            _logger.info(
+                "entitlement capture for user_id=%s skipped this tick: another capture "
+                "for this user is in progress",
+                safe_int(user_id),
+            )
+            return
+        async with capture_lock:
             attempt = await _attempt_capture(
                 library,
                 machine_identifier=machine_identifier,
