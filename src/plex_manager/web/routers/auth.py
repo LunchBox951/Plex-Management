@@ -960,14 +960,16 @@ async def _capture_entitlements_after_sign_in(
     ``app._entitlement_capture_context`` for why a background probe must not
     backfill it).
 
-    The cached anchor is confirmed against a live ``/identity`` before the
-    section read and again afterward, while holding this user's capture lock
-    through persistence. A replacement server at the same ``plex_url`` answers
+    The section read is followed by a live ``/identity`` probe while this user's
+    capture lock is held through persistence; only a match with the cached
+    anchor is stored. A replacement server at the same ``plex_url`` answers
     happily and would otherwise have ITS sections written under the OLD
     identifier -- which the settings-row guard in ``store_entitlements`` cannot
-    catch, since that row still holds the old id. Both probes stay off the
-    sign-in request path. Separate responses cannot prove atomic server identity;
-    replacement adoption is the owner-controlled workflow tracked in #597.
+    catch, since that row still holds the old id. A pre-read probe would add a
+    call without closing that window, so the post-read probe is the only check.
+    It stays off the sign-in request path. Separate responses cannot prove
+    atomic server identity; replacement adoption is the owner-controlled
+    workflow tracked in #597.
     """
     try:
         async with app.state.sessionmaker() as session:
@@ -980,15 +982,6 @@ async def _capture_entitlements_after_sign_in(
         # is held across them. Each write below opens its own.
         client_identifier = await _client_identifier_for_capture(app)
         plex_tv = PlexTvClient(app.state.http_client, client_identifier=client_identifier)
-        live_identifier = await plex_tv.fetch_server_identity(plex_url, token)
-        if live_identifier != machine_identifier:
-            _logger.warning(
-                "entitlement capture at sign-in skipped for user_id=%s: the server at the "
-                "configured URL reports a different machine identifier than the stored "
-                "one, so its sections must not be stamped with the stored anchor",
-                safe_int(user_id),
-            )
-            return
         async with plex_access_service.entitlement_capture_lock(user_id):
             library = PlexLibrary(app.state.http_client, plex_url, token)
             capture = await plex_access_service.capture_entitlements(
@@ -999,9 +992,9 @@ async def _capture_entitlements_after_sign_in(
             live_identifier = await plex_tv.fetch_server_identity(plex_url, token)
             if live_identifier != machine_identifier:
                 _logger.warning(
-                    "entitlement capture at sign-in discarded for user_id=%s: "
-                    "the Plex server identity changed during the section read; "
-                    "the previous snapshot and configured identity are unchanged",
+                    "entitlement capture at sign-in discarded for user_id=%s: the server at "
+                    "the configured URL did not confirm the stored machine identifier after "
+                    "the section read; the previous snapshot is unchanged",
                     safe_int(user_id),
                 )
                 return

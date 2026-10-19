@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from plex_manager.adapters.plex.library import reset_caches
 from plex_manager.models import User
+from plex_manager.services import plex_access_service
 from plex_manager.web import app as app_module
 from plex_manager.web.background import detached_tasks
 from plex_manager.web.deps import PLEX_MACHINE_ID_SETTING, SettingsStore
@@ -109,7 +110,7 @@ def _transport(
     ``/library/sections``.
 
     ``live_identity`` is what the server at ``plex_url`` claims to be when the
-    detached capture confirms the anchor before stamping -- the same id means the
+    detached capture confirms the anchor after its section read -- the same id means the
     anchor holds; a different one means the host was replaced. ``resources`` is
     plex.tv's ``/resources`` answer (default: the server, shared).
     """
@@ -177,6 +178,29 @@ async def _sign_in_and_settle(app: FastAPI, client: httpx.AsyncClient) -> httpx.
     return response
 
 
+def _record_capture_lock_requests(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record each user id whose capture lock is requested, in call order.
+
+    Both capture sites enter the lock immediately after requesting it, so once a
+    request is recorded and the test yields, a contended requester is already
+    queued on the lock.
+    """
+    requests: list[int] = []
+    real_lock = plex_access_service.entitlement_capture_lock
+
+    def recording_lock(user_id: int) -> asyncio.Lock:
+        requests.append(user_id)
+        return real_lock(user_id)
+
+    monkeypatch.setattr(plex_access_service, "entitlement_capture_lock", recording_lock)
+    return requests
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    while not condition():
+        await asyncio.sleep(0)
+
+
 # --------------------------------------------------------------------------- #
 # The happy path
 # --------------------------------------------------------------------------- #
@@ -211,7 +235,11 @@ async def test_sign_in_captures_an_honest_empty_entitlement(
 
 
 async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
-    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    seed: SeedFn,
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
@@ -221,9 +249,10 @@ async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
         await SettingsStore(session).set("plex_token", _SERVICE_TOKEN)
         await session.commit()
 
+    user_id = (await _signed_in_user(sessionmaker_)).id
+    lock_requests = _record_capture_lock_requests(monkeypatch)
     sweep_read_started = asyncio.Event()
     release_sweep_read = asyncio.Event()
-    sign_in_identity_checked = asyncio.Event()
     user_reads = 0
     snapshot_before_second_read: list[str] | None = None
 
@@ -236,8 +265,6 @@ async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
         if path == "/api/v2/resources":
             return httpx.Response(200, json=[_shared_server()])
         if path == "/identity":
-            if token == _TOKEN and sweep_read_started.is_set():
-                sign_in_identity_checked.set()
             return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
         assert path == "/library/sections"
         if token == _SERVICE_TOKEN:
@@ -257,7 +284,8 @@ async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
             await sweep_read_started.wait()
             # The browser gets its session while its background capture waits.
             assert (await _sign_in(client)).status_code == 200
-            await sign_in_identity_checked.wait()
+            await _until(lambda: lock_requests.count(user_id) == 2)
+            await asyncio.sleep(0)
             assert user_reads == 1
             release_sweep_read.set()
             await sweep
@@ -371,7 +399,6 @@ async def test_no_cached_anchor_means_no_capture_and_no_server_call(
     assert "/library/sections" not in seen
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys is None
-    assert user.entitlements_machine_id is None
     assert user.entitlements_machine_id is None
 
 
@@ -493,7 +520,8 @@ async def test_a_replacement_server_at_the_same_url_is_never_stamped(
     """The hole the settings-row guard cannot see: a DIFFERENT Plex server now
     answers at the same ``plex_url``. Its sections would be written under the old
     cached identifier -- and the row still holds that id, so the guard accepts it.
-    The live /identity confirm is what catches it."""
+    The post-read /identity confirm is what catches it: the sections are read
+    but never stored."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
     seen: list[str] = []
@@ -501,11 +529,10 @@ async def test_a_replacement_server_at_the_same_url_is_never_stamped(
 
     assert (await _sign_in_and_settle(app, client)).status_code == 200
 
-    # Confirmed first, and the section read never happened.
-    assert "/identity" in seen
-    assert "/library/sections" not in seen
+    assert seen.index("/library/sections") < seen.index("/identity")
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys is None
+    assert user.entitlements_machine_id is None
 
 
 @pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
@@ -550,9 +577,11 @@ async def test_sign_in_discards_sections_when_identity_changes_or_fails_after_th
     assert any("entitlement capture" in record.message for record in caplog.records)
 
 
-async def test_the_anchor_is_confirmed_before_any_capture_is_stamped(
+async def test_the_anchor_is_confirmed_after_the_read_before_any_capture_is_stamped(
     client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
 ) -> None:
+    """One probe, after the section read: a pre-read probe cannot vouch for the
+    server that answered the read."""
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
     seen: list[str] = []
@@ -560,7 +589,8 @@ async def test_the_anchor_is_confirmed_before_any_capture_is_stamped(
 
     assert (await _sign_in_and_settle(app, client)).status_code == 200
 
-    assert seen.index("/identity") < seen.index("/library/sections")
+    assert seen.count("/identity") == 1
+    assert seen.index("/library/sections") < seen.index("/identity")
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys == ["1", "3"]
 
@@ -728,13 +758,14 @@ async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
     app: FastAPI,
     seed: SeedFn,
     sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
     cancel_holder: bool,
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    lock_requests = _record_capture_lock_requests(monkeypatch)
     first_read_started = asyncio.Event()
     release_first_read = asyncio.Event()
-    waiter_ready = asyncio.Event()
     first_read = True
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -746,8 +777,6 @@ async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
         if request.url.path == "/api/v2/resources":
             return httpx.Response(200, json=[_shared_server()])
         if request.url.path == "/identity":
-            if token == _TOKEN and first_read_started.is_set():
-                waiter_ready.set()
             return httpx.Response(200, json={"MediaContainer": {"machineIdentifier": _MACHINE_ID}})
         assert request.url.path == "/library/sections"
         if token == _TOKEN and first_read:
@@ -781,7 +810,9 @@ async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
             assert (await _sign_in(client)).status_code == 200
             waiters = set(detached_tasks(app)) - holders
             tasks.update(waiters)
-            await waiter_ready.wait()
+            user_id = (await _signed_in_user(sessionmaker_)).id
+            await _until(lambda: lock_requests.count(user_id) == 2)
+            await asyncio.sleep(0)
             cancelled = holders if cancel_holder else waiters
             assert len(cancelled) == 1
             for task in cancelled:
