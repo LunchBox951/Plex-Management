@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 
 __all__ = [
+    "PLEX_EXTRAS_DIR_NAMES",
     "PLEX_VIDEO_EXTENSIONS",
     "PLEX_VIDEO_FORMATS",
     "expected_probe_formats",
@@ -34,6 +35,12 @@ _FLV_FORMATS = frozenset({"flv"})
 _OGG_FORMATS = frozenset({"ogg"})
 _NO_FORMATS: frozenset[str] = frozenset()
 _DISC_STRUCTURE_DIR_NAMES = frozenset({"bdmv", "video_ts"})
+
+#: Lowercased directory names whose contents are bonus material, not the main
+#: feature -- never import (or payload-gate) candidates.
+PLEX_EXTRAS_DIR_NAMES: frozenset[str] = frozenset(
+    {"featurettes", "extras", "trailers", "behind the scenes", "deleted scenes"}
+)
 
 # Keep this mapping explicit.  Adding a suffix is a Plex-library policy change,
 # not a generic "ffprobe can decode it" decision.  In particular, DVD ``.vob``

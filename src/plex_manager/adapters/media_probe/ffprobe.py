@@ -210,6 +210,13 @@ class FfprobeMediaProbe:
         if completed.returncode < 0:
             raise MediaProbeUnavailableError("ffprobe terminated without a media verdict")
         if completed.returncode != 0:
+            # ffprobe also exits non-zero when it cannot open the file; an unreadable
+            # candidate is an outage, never a verdict on its content.
+            try:
+                with open(path, "rb") as candidate:
+                    candidate.read(1)
+            except OSError as exc:
+                raise MediaProbeUnavailableError("candidate media file is unreadable") from exc
             raise MediaProbeError("ffprobe rejected the candidate media file")
 
         payload = _response(completed.stdout)

@@ -38,6 +38,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   design).
 
 ### Changed
+- Downloads: new grabs are held at metadata, and the full file list is
+  checked before any payload downloads. A release containing an executable,
+  script or installer, or no eligible video, is removed, blocklisted and
+  re-searched with a visible reason; healthy releases download their video
+  files only. Requires qBittorrent 5.0 or newer (WebAPI 2.11.0); older clients
+  fail setup validation and refuse new grabs rather than download unchecked.
+  Ships migration `609a01` and ADR-0031 (#609).
 - CI: parallelized the Python quality-gate test run, and eliminated pytest
   warnings under Python 3.12 and 3.14 (#543, #544).
 - Repo docs: archived the completed v1 planning docs under `docs/archive/`,

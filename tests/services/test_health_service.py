@@ -134,6 +134,8 @@ async def test_all_subsystems_ok_when_upstreams_answer_well() -> None:
             return httpx.Response(200, json={"version": "1.0"})
         if path == "/api/v2/auth/login":
             return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if path == "/api/v2/torrents/info":
             return httpx.Response(200, json=[])
         if path == "/api/v2/app/preferences":
@@ -182,6 +184,8 @@ async def test_qbittorrent_note_surfaces_an_invisible_default_save_path(
         path = request.url.path
         if path == "/api/v2/auth/login":
             return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if path == "/api/v2/torrents/info":
             return httpx.Response(200, json=[])
         if path == "/api/v2/app/preferences":
@@ -457,6 +461,8 @@ async def test_check_subsystems_runs_the_four_probes_concurrently() -> None:
             return httpx.Response(200, json={"version": "1.0"})
         if path == "/api/v2/auth/login":
             return httpx.Response(200, text="Ok.")
+        if path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if path == "/api/v2/torrents/info":
             return httpx.Response(200, json=[])
         if path == "/api/v2/app/preferences":
@@ -483,13 +489,14 @@ async def test_check_subsystems_runs_the_four_probes_concurrently() -> None:
     # Order is preserved regardless of concurrency.
     assert [r.name for r in results] == ["plex", "prowlarr", "qbittorrent", "tmdb"]
     assert {r.status for r in results} == {"ok"}
-    # Sequential would take ~6 * delay_seconds (~1.2s: plex + prowlarr + tmdb at
-    # one round trip each, qBittorrent at three -- login, connectivity, and the
-    # download-path visibility probe, issues #133/#157); concurrent stays close
-    # to the SLOWEST single subsystem's own chain (qBittorrent's three). The
-    # threshold is comfortably below the sequential sum but above that slowest
-    # chain, so it fails loudly if a future change re-serializes the probes.
-    assert elapsed < delay_seconds * 4
+    # Sequential would take ~7 * delay_seconds (~1.4s: plex + prowlarr + tmdb at
+    # one round trip each, qBittorrent at four -- login, connectivity, the
+    # version gate, and the download-path visibility probe, issues #133/#157);
+    # concurrent stays close to the SLOWEST single subsystem's own chain
+    # (qBittorrent's four). The threshold is comfortably below the sequential sum
+    # but above that slowest chain, so it fails loudly if a future change
+    # re-serializes the probes.
+    assert elapsed < delay_seconds * 5.5
 
 
 # --------------------------------------------------------------------------- #

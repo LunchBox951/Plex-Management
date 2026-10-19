@@ -3877,3 +3877,574 @@ async def test_cancel_racing_reconcile_phase_b_refcounts_shared_guard(
     assert download is not None and download.status == "failed"
     assert download.failed_reason == "cancelled by operator"
     assert request is not None and request.status is RequestStatus.cancelled
+
+
+@pytest.mark.parametrize("names", [["movie.mkv", "setup.EXE"], ["readme.txt"]])
+async def test_held_payload_rejection_rearms_request(
+    sessionmaker_: SessionMaker, names: list[str]
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="stoppedDL")],
+        files={
+            _HASH: [
+                DownloadedFile(name=name, size_bytes=100, index=i, priority=1)
+                for i, name in enumerate(names)
+            ]
+        },
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        request = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"
+        assert row.payload_rejection == row.failed_reason
+        assert request is not None and request.status == RequestStatus.searching
+        assert len((await session.execute(select(Blocklist))).scalars().all()) == 1
+        history = (await session.execute(select(DownloadHistory))).scalars().all()
+        assert any("automatic payload rejection" in (entry.message or "") for entry in history)
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def test_held_payload_with_unknown_metadata_does_not_fail_or_start(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.payload_pending
+        assert "waiting for complete metadata" in (row.failed_reason or "")
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+    assert not qbt.removed
+
+
+async def test_queued_held_magnet_is_not_stopped_before_metadata(
+    sessionmaker_: SessionMaker,
+) -> None:
+    class Client(FakeQbittorrent):
+        pauses = 0
+
+        async def pause(self, info_hash: str) -> None:
+            self.pauses += 1
+
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="metadata_fetching",
+        added_at=datetime.now(UTC) - timedelta(minutes=46),
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = Client(statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="queuedDL")])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.pauses == 0
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None and row.payload_pending
+        assert "waiting for complete metadata" in (row.failed_reason or "")
+
+    # Once the client starts it, the metadata-stall deadline applies as usual.
+    qbt.statuses = [DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        assert row is not None and row.status == "failed"
+        assert request is not None and request.status is RequestStatus.searching
+
+
+@pytest.mark.parametrize("raw_state", ["error", "missingFiles"])
+async def test_held_payload_client_failure_keeps_reconcile_recovery(
+    sessionmaker_: SessionMaker, raw_state: str
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state)]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        request = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"
+        assert raw_state in (row.failed_reason or "")
+        assert request is not None and request.status == RequestStatus.searching
+
+
+async def test_held_payload_metadata_stall_still_self_heals(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id, download_id = await _seed_movie_request_and_download(
+        sessionmaker_,
+        download_status="metadata_fetching",
+        added_at=datetime.now(UTC) - timedelta(minutes=46),
+    )
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        assert row is not None
+        row.payload_pending = True
+        row.payload_resume = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = await session.get(Download, download_id)
+        request = await session.get(MediaRequest, request_id)
+        assert row is not None and row.status == "failed"
+        assert request is not None and request.status is RequestStatus.searching
+        assert len((await session.execute(select(Blocklist))).scalars().all()) == 1
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def _hold_only_row(sm: SessionMaker, *, resume: bool) -> None:
+    async with sm() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = resume
+        await session.commit()
+
+
+@pytest.mark.parametrize("raw_state", ["checkingResumeData", "moving"])
+async def test_held_payload_waits_out_transient_client_work(
+    sessionmaker_: SessionMaker, raw_state: str
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # These states hide whether a legacy torrent was running, so stopping it now
+    # could turn a validation pause into a permanent one.
+    class Client(FakeQbittorrent):
+        pauses = 0
+
+        async def pause(self, info_hash: str) -> None:
+            self.pauses += 1
+
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=False)
+    qbt = Client(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state)],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.pauses == 0
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.payload_pending and not row.payload_resume
+
+
+@pytest.mark.parametrize("raw_state", ["stoppedDL", "stoppedMetaDL"])
+async def test_stopped_held_magnet_without_metadata_is_restarted(
+    sessionmaker_: SessionMaker, raw_state: str
+) -> None:
+    # A stopped magnet never fetches metadata, so it would otherwise wait forever.
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=True)
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state=raw_state)]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        request = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"
+        assert request is not None and request.status == RequestStatus.searching
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+    assert qbt.removed == [(_HASH, True)]
+
+
+async def test_validation_resume_is_undone_when_the_row_changes_hands(
+    sessionmaker_: SessionMaker,
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    class Client(FakeQbittorrent):
+        resumed = False
+        paused_after_resume = False
+
+        async def pause(self, info_hash: str) -> None:
+            self.paused_after_resume = self.resumed
+
+        async def resume(self, info_hash: str) -> None:
+            self.resumed = True
+            # An operator mark-failed lands while the resume is in flight.
+            async with sessionmaker_() as other:
+                row = (await other.execute(select(Download))).scalar_one()
+                row.status = "failed_pending"
+                await other.commit()
+
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=True)
+    qbt = Client(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="stoppedDL")],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.resumed and qbt.paused_after_resume
+
+
+async def test_waiting_held_payload_does_not_invalidate_caches_every_cycle(
+    sessionmaker_: SessionMaker,
+) -> None:
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    await _hold_only_row(sessionmaker_, resume=True)
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="metaDL")]
+    )
+    first = queue_service.ReconcileChanges()
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session, changes=first)
+    assert first.queue  # the waiting reason was written
+    second = queue_service.ReconcileChanges()
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session, changes=second)
+    assert not (second.queue or second.requests or second.blocklist)
+
+
+async def test_uninspected_missing_residual_heals_without_blocklisting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # The no-blocklist verdict for a never-inspected payload must be durable before
+    # removal, so a crash before completion cannot heal it as a release fault.
+    class Client(FakeQbittorrent):
+        stamped: str | None = None
+
+        async def remove(self, info_hash: str, *, delete_files: bool) -> None:
+            async with sessionmaker_() as other:
+                row = (await other.execute(select(Download))).scalar_one()
+                self.stamped = row.failed_reason
+            await super().remove(info_hash, delete_files=delete_files)
+
+    await _seed_request_with_download(
+        sessionmaker_, first_seen_at=datetime.now(UTC) - timedelta(minutes=11)
+    )
+    await _hold_only_row(sessionmaker_, resume=True)
+    qbt = Client(statuses=[])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.stamped is not None
+
+    # Replay the crash: the row is left failed_pending with only that stamp.
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.status = "failed_pending"
+        row.failed_reason = qbt.stamped
+        request = await session.get(MediaRequest, row.media_request_id)
+        assert request is not None
+        request.status = RequestStatus.downloading
+        await session.commit()
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(FakeQbittorrent(statuses=[]), session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.status == "failed"
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+
+
+async def test_queue_lists_a_retained_rejection_before_its_active_replacement(
+    sessionmaker_: SessionMaker,
+) -> None:
+    # The UI picks the last row per request, so the active replacement must win
+    # even when it reuses an older (lower-id) download row.
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=603,
+            media_type=MediaType.movie,
+            title="Some Movie",
+            status=RequestStatus.downloading,
+        )
+        session.add(request)
+        await session.flush()
+        session.add(
+            Download(torrent_hash="a" * 40, status="downloading", media_request_id=request.id)
+        )
+        await session.flush()
+        session.add(
+            Download(
+                torrent_hash="b" * 40,
+                status="failed",
+                media_request_id=request.id,
+                payload_rejection="release payload contains executable: setup.exe",
+                failed_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    async with sessionmaker_() as session:
+        rows = await SqlDownloadRepository(session).list_active_for_queue()
+    assert [row.status for row in rows] == ["failed", "downloading"]
+
+
+@pytest.mark.parametrize("selection_fails", [False, True])
+@pytest.mark.parametrize("mode", ["new", "legacy_running", "legacy_paused"])
+@pytest.mark.parametrize("reappearing", [False, True])
+async def test_only_validated_video_selection_can_release_hold(
+    sessionmaker_: SessionMaker, selection_fails: bool, mode: str, reappearing: bool
+) -> None:
+    from plex_manager.adapters.qbittorrent import QbittorrentError
+    from plex_manager.ports.download_client import DownloadedFile
+
+    class Client(FakeQbittorrent):
+        resumed = False
+
+        async def select_files(
+            self, info_hash: str, indices: Sequence[int], expected_files: Sequence[DownloadedFile]
+        ) -> None:
+            if selection_fails:
+                raise QbittorrentError("selection unavailable")
+            await super().select_files(info_hash, indices, expected_files)
+
+        async def pause(self, info_hash: str) -> None:
+            self.statuses = [s.model_copy(update={"raw_state": "stoppedDL"}) for s in self.statuses]
+
+        async def resume(self, info_hash: str) -> None:
+            assert [f.priority for f in self.files[info_hash]] == [1, 0]
+            self.resumed = True
+
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        row.payload_resume = mode == "new"
+        if reappearing:
+            row.status = "client_missing"
+        await session.commit()
+    qbt = Client(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="downloading" if mode == "legacy_running" else "stoppedDL",
+            )
+        ],
+        files={
+            _HASH: [
+                DownloadedFile(name="movie.mkv", size_bytes=100, index=4, priority=1),
+                DownloadedFile(name="readme.txt", size_bytes=10, index=9, priority=1),
+            ]
+        },
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.resumed == (mode != "legacy_paused" and not selection_fails)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.payload_pending is selection_fails
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+        if selection_fails:
+            assert "selection unavailable" in (row.failed_reason or "")
+        elif reappearing:
+            # A recovered client_missing row gets a fresh missing-grace window.
+            assert row.first_seen_at is None
+
+
+_LEGACY_NO_VIDEO_REASONS = [
+    "no Plex-supported video file found in the completed download",
+    (
+        "no verified Plex-compatible video file found in the completed download "
+        "(1 candidate(s) rejected)"
+    ),
+]
+
+
+@pytest.mark.parametrize("reason", _LEGACY_NO_VIDEO_REASONS)
+@pytest.mark.parametrize("names", [["Show.S01/Show.S01E01.mkv"], ["Show.S01/readme.txt"]])
+async def test_legacy_no_video_block_is_decided_by_the_manifest(
+    sessionmaker_: SessionMaker, names: list[str], reason: str
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    # Before #609 an unreadable scan or probe produced these same reasons, so the
+    # stored reason alone never justifies deleting and blocklisting the payload.
+    has_video = names[0].endswith(".mkv")
+    _request_id, season_id = await _seed_tv_request_with_download(
+        sessionmaker_, season=1, first_seen_at=datetime.now(UTC)
+    )
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.status = "import_blocked"
+        row.failed_reason = reason
+        row.payload_pending = True
+        await session.commit()
+    qbt = FakeQbittorrent(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="stoppedUP")],
+        files={
+            _HASH: [
+                DownloadedFile(name=name, size_bytes=100, index=i, priority=1)
+                for i, name in enumerate(names)
+            ]
+        },
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        season = await session.get(SeasonRequest, season_id)
+        blocklist = (await session.execute(select(Blocklist))).scalars().all()
+        queue = await queue_service.list_queue(session)
+    assert season is not None
+    if has_video:
+        assert row.status == "import_blocked"
+        assert row.failed_reason == reason
+        assert not row.payload_pending
+        assert not blocklist
+        assert not qbt.removed
+    else:
+        assert row.status == "failed"
+        assert season.status == "searching"
+        assert len(blocklist) == 1
+        assert qbt.removed == [(_HASH, True)]
+        assert len(queue) == 1 and queue[0].status == "failed"
+
+
+@pytest.mark.parametrize("reason", _LEGACY_NO_VIDEO_REASONS)
+async def test_legacy_no_video_block_without_its_torrent_stays_retryable(
+    sessionmaker_: SessionMaker, reason: str
+) -> None:
+    await _seed_tv_request_with_download(sessionmaker_, season=1, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.status = "import_blocked"
+        row.failed_reason = reason
+        row.payload_pending = True
+        await session.commit()
+    qbt = FakeQbittorrent()
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.status == "import_blocked"
+        assert row.failed_reason == reason
+        assert not row.payload_pending  # an operator retry reaches the importer
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+    assert not qbt.removed
+
+
+async def test_legacy_seeding_torrent_resumes_after_validation(
+    sessionmaker_: SessionMaker,
+) -> None:
+    from plex_manager.ports.download_client import DownloadedFile
+
+    class Client(FakeQbittorrent):
+        resumed = False
+
+        async def pause(self, info_hash: str) -> None:
+            self.statuses = [s.model_copy(update={"raw_state": "stoppedUP"}) for s in self.statuses]
+
+        async def resume(self, info_hash: str) -> None:
+            self.resumed = True
+
+    await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.status = "import_pending"
+        row.payload_pending = True
+        await session.commit()
+    qbt = Client(
+        statuses=[DownloadStatus(info_hash=_HASH, name=_TITLE, raw_state="uploading")],
+        files={_HASH: [DownloadedFile(name="movie.mkv", size_bytes=100, index=0, priority=1)]},
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.resumed
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        assert not row.payload_pending
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_legacy_metadata_restarts_under_hold_without_blocklisting(
+    sessionmaker_: SessionMaker, interrupted: bool
+) -> None:
+    class Client(FakeQbittorrent):
+        paused = False
+
+        async def pause(self, info_hash: str) -> None:
+            self.paused = True
+
+        async def resume(self, info_hash: str) -> None:
+            pytest.fail("legacy metadata must not resume without an add-time hold")
+
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.payload_pending = True
+        if interrupted:
+            row.failed_reason = (
+                "payload validation pending: restarting legacy metadata with a download hold"
+            )
+        await session.commit()
+    qbt = Client(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH,
+                name=_TITLE,
+                raw_state="stoppedMetaDL" if interrupted else "metaDL",
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+    assert qbt.paused
+    assert qbt.removed == [(_HASH, True)]
+    async with sessionmaker_() as session:
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.searching
+
+
+async def test_pending_missing_torrent_recovers_without_blocklisting(
+    sessionmaker_: SessionMaker,
+) -> None:
+    request_id = await _seed_request_with_download(sessionmaker_, first_seen_at=datetime.now(UTC))
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        row.first_seen_at = None
+        row.payload_pending = True
+        await session.commit()
+    qbt = FakeQbittorrent(statuses=[])
+    async with sessionmaker_() as session:
+        await queue_service.reconcile_and_list(qbt, session)
+        row = (await session.execute(select(Download))).scalar_one()
+        assert row.status == "client_missing"
+        assert row.payload_pending
+        row.first_seen_at = datetime.now(UTC) - timedelta(days=1)
+        await session.commit()
+        await queue_service.reconcile_and_list(qbt, session)
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+        request = await session.get(MediaRequest, request_id)
+        assert row.status == "failed"
+        assert request is not None and request.status == RequestStatus.searching
+        assert not (await session.execute(select(Blocklist))).scalars().all()
