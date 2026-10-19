@@ -961,15 +961,15 @@ async def _capture_entitlements_after_sign_in(
     backfill it).
 
     The section read is followed by a live ``/identity`` probe while this user's
-    capture lock is held through persistence; only a match with the cached
-    anchor is stored. A replacement server at the same ``plex_url`` answers
-    happily and would otherwise have ITS sections written under the OLD
-    identifier -- which the settings-row guard in ``store_entitlements`` cannot
-    catch, since that row still holds the old id. A pre-read probe would add a
-    call without closing that window, so the post-read probe is the only check.
-    It stays off the sign-in request path. Separate responses cannot prove
-    atomic server identity; replacement adoption is the owner-controlled
-    workflow tracked in #597.
+    capture slot is held through persistence; only a match with the cached
+    anchor is reported in telemetry and stored. A replacement server at the
+    same ``plex_url`` answers happily and would otherwise have ITS sections
+    written under the OLD identifier -- which the settings-row guard in
+    ``store_entitlements`` cannot catch, since that row still holds the old id.
+    A pre-read probe would add a call without closing that window, so the
+    post-read probe is the only check. It stays off the sign-in request path.
+    Separate responses cannot prove atomic server identity; replacement
+    adoption is the owner-controlled workflow tracked in #597.
     """
     try:
         async with app.state.sessionmaker() as session:
@@ -982,7 +982,7 @@ async def _capture_entitlements_after_sign_in(
         # is held across them. Each write below opens its own.
         client_identifier = await _client_identifier_for_capture(app)
         plex_tv = PlexTvClient(app.state.http_client, client_identifier=client_identifier)
-        async with plex_access_service.entitlement_capture_lock(user_id):
+        async with plex_access_service.entitlement_capture_slot(user_id):
             library = PlexLibrary(app.state.http_client, plex_url, token)
             capture = await plex_access_service.capture_entitlements(
                 library, machine_identifier=machine_identifier, user_id=user_id
@@ -998,6 +998,7 @@ async def _capture_entitlements_after_sign_in(
                     safe_int(user_id),
                 )
                 return
+            await plex_access_service.report_entitlement_capture(capture, user_id=user_id)
             async with app.state.sessionmaker() as session:
                 stored = await plex_access_service.store_entitlements(
                     session,

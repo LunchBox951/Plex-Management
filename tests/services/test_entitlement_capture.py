@@ -14,6 +14,7 @@ leaves the previous snapshot exactly as it was).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -30,8 +31,11 @@ from plex_manager.services.plex_access_service import (
     EntitlementCapture,
     _clear_entitlements,  # pyright: ignore[reportPrivateUsage]
     capture_entitlements,
+    entitlement_capture_slot,
     read_token_ciphertext,
+    report_entitlement_capture,
     store_entitlements,
+    try_entitlement_capture_slot,
 )
 
 SessionMaker = async_sessionmaker[AsyncSession]
@@ -220,11 +224,12 @@ async def test_capture_telemetry_names_the_scope_and_counts(
     the ``baseline_is_not_what_we_think`` case below is exactly what a restricted
     service credential looks like in the log."""
     with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
-        await capture_entitlements(
-            _library(_per_token_handler, token),
-            machine_identifier=_MACHINE_ID,
-            user_id=7,
-            service_section_count=_baseline(owner_count),
+        capture = await capture_entitlements(
+            _library(_per_token_handler, token), machine_identifier=_MACHINE_ID, user_id=7
+        )
+        assert capture is not None
+        await report_entitlement_capture(
+            capture, user_id=7, service_section_count=_baseline(owner_count)
         )
     line = next(
         r.getMessage() for r in caplog.records if "entitlement capture user_id" in r.getMessage()
@@ -638,10 +643,12 @@ async def test_entitlement_reads_never_come_from_the_section_cache() -> None:
     assert calls == 2
 
 
-async def test_the_owner_baseline_is_only_resolved_after_a_successful_read() -> None:
-    """A black-holed host must cost ONE timeout, not two: the baseline is
-    telemetry, so spending a call on it before knowing the server answers at all
-    would double the cost of the very failure the circuit breaker exists for."""
+async def test_a_read_emits_no_scope_sample_and_never_resolves_the_baseline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The read is unverified until its caller confirms the server identity, so
+    it must not emit the canary sample or spend a call on the baseline. Both
+    belong to the report, which callers make only after that check passes."""
     baseline_calls = 0
 
     async def _baseline_resolver() -> int | None:
@@ -649,23 +656,62 @@ async def test_the_owner_baseline_is_only_resolved_after_a_successful_read() -> 
         baseline_calls += 1
         return 3
 
-    def unreachable(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("black hole", request=request)
+    with caplog.at_level(logging.INFO, logger="plex_manager.services.plex_access_service"):
+        capture = await capture_entitlements(
+            _library(_per_token_handler, _SHARED_TOKEN), machine_identifier=_MACHINE_ID, user_id=7
+        )
+        assert capture is not None
+        assert "scope=" not in caplog.text
+        assert baseline_calls == 0
 
-    failed = await capture_entitlements(
-        _library(unreachable, _SHARED_TOKEN),
-        machine_identifier=_MACHINE_ID,
-        user_id=7,
-        service_section_count=_baseline_resolver,
-    )
-    assert failed is None
-    assert baseline_calls == 0
-
-    ok = await capture_entitlements(
-        _library(_per_token_handler, _SHARED_TOKEN),
-        machine_identifier=_MACHINE_ID,
-        user_id=7,
-        service_section_count=_baseline_resolver,
-    )
-    assert ok is not None
+        await report_entitlement_capture(
+            capture, user_id=7, service_section_count=_baseline_resolver
+        )
+    assert "scope=narrower_than_service" in caplog.text
     assert baseline_calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# The per-user capture slot
+# --------------------------------------------------------------------------- #
+async def test_the_sweep_slot_treats_a_handoff_to_a_queued_waiter_as_contention() -> None:
+    """A released lock is briefly unlocked while it is handed to a queued
+    sign-in waiter. The sweep's non-blocking take must still see contention
+    there; queueing would stall the tick behind that sign-in's read."""
+    waiter_entered = asyncio.Event()
+    release_waiter = asyncio.Event()
+
+    async def sign_in_capture() -> None:
+        async with entitlement_capture_slot(7):
+            waiter_entered.set()
+            await release_waiter.wait()
+
+    async with entitlement_capture_slot(7):
+        waiter = asyncio.create_task(sign_in_capture())
+        await asyncio.sleep(0)
+        assert not waiter_entered.is_set()
+    # Released with the waiter woken but not yet running: the handoff window.
+    # A blocking take would queue behind the waiter, which never releases.
+    async with asyncio.timeout(1), try_entitlement_capture_slot(7) as acquired:
+        assert not acquired
+
+    await waiter_entered.wait()
+    release_waiter.set()
+    await waiter
+    async with try_entitlement_capture_slot(7) as acquired:
+        assert acquired
+
+
+async def test_a_cancelled_waiter_frees_the_slot() -> None:
+    async def sign_in_capture() -> None:
+        async with entitlement_capture_slot(7):
+            pass
+
+    async with entitlement_capture_slot(7):
+        waiter = asyncio.create_task(sign_in_capture())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    async with try_entitlement_capture_slot(7) as acquired:
+        assert acquired

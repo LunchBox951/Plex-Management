@@ -45,7 +45,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -87,11 +88,13 @@ __all__ = [
     "capture_entitlements",
     "check_share",
     "count_due_share_checks",
-    "entitlement_capture_lock",
+    "entitlement_capture_slot",
     "list_due_share_checks",
     "record_failed_attempt",
+    "report_entitlement_capture",
     "store_entitlements",
     "sweep_shares",
+    "try_entitlement_capture_slot",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -717,22 +720,70 @@ async def record_failed_attempt(session: AsyncSession, user_id: int, *, now: dat
 # --------------------------------------------------------------------------- #
 # Section-entitlement capture (issue #484 PR-3) -- capture only, no enforcement
 # --------------------------------------------------------------------------- #
-_capture_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+class _CaptureSlot:
+    """One user's capture lock plus a count of every task holding or awaiting it.
+
+    ``asyncio.Lock.locked()`` is briefly false while a released lock is handed
+    to a queued waiter, so it cannot tell a non-blocking caller that the lock is
+    contended. ``occupants`` can: it is raised before a task awaits the lock and
+    lowered in ``finally``, so it covers holders, queued waiters, and the
+    handoff between them, and a cancelled waiter still lowers it.
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.occupants = 0
 
 
-def entitlement_capture_lock(user_id: int) -> asyncio.Lock:
+_capture_slots: weakref.WeakValueDictionary[int, _CaptureSlot] = weakref.WeakValueDictionary()
+
+
+def _capture_slot(user_id: int) -> _CaptureSlot:
+    slot = _capture_slots.get(user_id)
+    if slot is None:
+        slot = _CaptureSlot()
+        _capture_slots[user_id] = slot
+    return slot
+
+
+@asynccontextmanager
+async def entitlement_capture_slot(user_id: int) -> AsyncGenerator[None]:
     """Serialise a user's section read through persistence in this process.
 
-    Both capture sites hold this across the network read and the write-session
-    context, including commit/cleanup. A timestamp taken after a response arrives
-    cannot order overlapping reads whose responses were delivered out of order.
-    Waiters retain the same lock; idle users leave no permanent registry entry.
+    Both capture sites hold the slot across the network read, the post-read
+    identity check, and the write-session context, including commit/cleanup. A
+    timestamp taken after a response arrives cannot order overlapping reads
+    whose responses were delivered out of order. This form waits its turn
+    (sign-in); the sweep uses :func:`try_entitlement_capture_slot` instead.
+    Idle users leave no permanent registry entry.
     """
-    lock = _capture_locks.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _capture_locks[user_id] = lock
-    return lock
+    slot = _capture_slot(user_id)
+    slot.occupants += 1
+    try:
+        async with slot.lock:
+            yield
+    finally:
+        slot.occupants -= 1
+
+
+@asynccontextmanager
+async def try_entitlement_capture_slot(user_id: int) -> AsyncGenerator[bool]:
+    """Take the user's capture slot only if nobody holds or awaits it.
+
+    Yields ``False`` without waiting when the slot is occupied. When it yields
+    ``True`` the slot is held: with no occupant the lock is free and has no
+    queued waiter, so acquiring it completes without suspending.
+    """
+    slot = _capture_slot(user_id)
+    if slot.occupants:
+        yield False
+        return
+    slot.occupants += 1
+    try:
+        async with slot.lock:
+            yield True
+    finally:
+        slot.occupants -= 1
 
 
 @dataclass(frozen=True)
@@ -748,7 +799,8 @@ class EntitlementCapture:
 
     ``captured_at`` is stamped when the section read completed and supplies an
     additional write guard in :func:`store_entitlements`. Both app callers hold
-    :func:`entitlement_capture_lock` through the read and commit: response
+    the user's capture slot (:func:`entitlement_capture_slot`) through the read
+    and commit: response
     arrival timestamps alone cannot order overlapping reads. The producer
     (:func:`_attempt_capture`) always passes it explicitly; the default exists
     so a hand-built capture means "as of now" rather than silently comparing
@@ -832,11 +884,10 @@ async def _attempt_capture(
     *,
     machine_identifier: str,
     user_id: int,
-    service_section_count: Callable[[], Awaitable[int | None]] | None = None,
 ) -> _CaptureAttempt:
-    """Read one token's sections. ``service_section_count`` is resolved ONLY
-    after a successful read, so a dead server costs one timeout rather than two
-    and never delays the tick behind a baseline nobody will compare against."""
+    """Read one token's sections. Emits no success telemetry: callers report a
+    capture with :func:`report_entitlement_capture` only once its server
+    identity is confirmed."""
     try:
         # Never cached: an entitlement snapshot is point-in-time AUTHORIZATION
         # data, and a cached success would both stamp a stale section set and
@@ -861,20 +912,10 @@ async def _attempt_capture(
         )
         return _CaptureAttempt(capture=None, server_unavailable=True)
     section_keys = tuple(section.key for section in sections)
-    # Record read completion before telemetry adds latency. Callers serialise
-    # read through commit; this timestamp alone cannot order delayed responses.
+    # Record read completion before the identity probe adds latency. Callers
+    # serialise read through commit; this timestamp alone cannot order delayed
+    # responses.
     captured_at = datetime.now(UTC)
-    # Resolved only now, on the success path: the baseline is telemetry, and
-    # spending a call on it before knowing whether the server answers at all
-    # would double a black-holed host's cost to the tick.
-    baseline = await service_section_count() if service_section_count is not None else None
-    _logger.info(
-        "entitlement capture user_id=%s sections=%s service_sections=%s scope=%s",
-        safe_int(user_id),
-        safe_int(len(section_keys)),
-        safe_int(baseline) if baseline is not None else "unknown",
-        safe_text(_capture_scope(len(section_keys), baseline)),
-    )
     return _CaptureAttempt(
         capture=EntitlementCapture(
             section_keys=section_keys,
@@ -890,7 +931,6 @@ async def capture_entitlements(
     *,
     machine_identifier: str,
     user_id: int,
-    service_section_count: Callable[[], Awaitable[int | None]] | None = None,
 ) -> EntitlementCapture | None:
     """Read the library sections ``library``'s token can see. Never raises.
 
@@ -899,13 +939,8 @@ async def capture_entitlements(
     own and carry on unchanged when it returns ``None`` -- a failed capture
     leaves the previous snapshot exactly as it was, because nothing is written.
 
-    This is the one unverified premise of the #484 design, deliberately staged
-    ahead of any enforcement so it can be OBSERVED on the canary first: that a
-    shared user's token authenticates against the configured ``plex_url``
-    (possibly a LAN address the account has never used) and comes back
-    SECTION-FILTERED rather than with the whole library. The telemetry line
-    emitted here is what answers that from the log store -- counts and a one-word
-    scope only, never section titles, keys, paths or tokens.
+    The result is unverified: the caller confirms the server identity after the
+    read and only then reports it with :func:`report_entitlement_capture`.
 
     The sweep uses :func:`_attempt_capture` directly because it also needs to
     know WHY a capture failed (to break its circuit on an unreachable server);
@@ -915,9 +950,38 @@ async def capture_entitlements(
         library,
         machine_identifier=machine_identifier,
         user_id=user_id,
-        service_section_count=service_section_count,
     )
     return attempt.capture
+
+
+async def report_entitlement_capture(
+    capture: EntitlementCapture,
+    *,
+    user_id: int,
+    service_section_count: Callable[[], Awaitable[int | None]] | None = None,
+) -> None:
+    """Emit the canary telemetry line for a capture whose server is confirmed.
+
+    This is the one unverified premise of the #484 design, deliberately staged
+    ahead of any enforcement so it can be OBSERVED on the canary first: that a
+    shared user's token authenticates against the configured ``plex_url``
+    (possibly a LAN address the account has never used) and comes back
+    SECTION-FILTERED rather than with the whole library. This line answers that
+    from the log store -- counts and a one-word scope only, never section
+    titles, keys, paths or tokens. Callers emit it only after the post-read
+    identity check passes, so a replacement or unverified server never
+    contributes a sample. ``service_section_count`` is resolved here, so a
+    rejected or failed read never spends a call on the baseline.
+    """
+    baseline = await service_section_count() if service_section_count is not None else None
+    section_count = len(capture.section_keys)
+    _logger.info(
+        "entitlement capture user_id=%s sections=%s service_sections=%s scope=%s",
+        safe_int(user_id),
+        safe_int(section_count),
+        safe_int(baseline) if baseline is not None else "unknown",
+        safe_text(_capture_scope(section_count, baseline)),
+    )
 
 
 async def read_token_ciphertext(session: AsyncSession, user_id: int) -> str | None:
@@ -1378,9 +1442,9 @@ async def sweep_shares(
     within the existing per-tick user budget. Capture cannot change an applied
     verdict or revocation. Failures leave the previous snapshot untouched and
     are counted and logged; identity failures also surface in the tick's health
-    state and gate later work against that anchor. A user whose capture lock is
-    already held (a sign-in capture in flight) is counted in ``capture_skipped``
-    without waiting. Omitted
+    state and gate later work against that anchor. A user whose capture slot is
+    occupied (a sign-in capture holding or awaiting it) is counted in
+    ``capture_skipped`` without waiting or probing the anchor. Omitted
     (``None``) the sweep behaves exactly as it did before capture existed.
 
     ``capture`` may instead be a :data:`CaptureUnavailableReason` -- the
@@ -1506,6 +1570,32 @@ async def sweep_shares(
             # Plex is not configured enough to reach the server with a user
             # token. Not a capture FAILURE -- there was nothing to attempt.
             return
+        # Take the slot before any identity probe: a user whose sign-in capture
+        # is in flight costs the tick nothing, and cannot latch a failed probe
+        # that would defer later share-loss verdicts. A sign-in capture already
+        # carries this user's freshest evidence, so the sweep skips rather than
+        # stalling the tick behind that capture's network read.
+        async with try_entitlement_capture_slot(user_id) as acquired:
+            if not acquired:
+                capture_skipped += 1
+                _logger.info(
+                    "entitlement capture for user_id=%s skipped this tick: another capture "
+                    "for this user is in progress",
+                    safe_int(user_id),
+                )
+                return
+            await _capture_in_slot(candidate, library, capture_context)
+
+    async def _capture_in_slot(
+        candidate: DueShareCandidate, library: LibraryPort, context: EntitlementCaptureContext
+    ) -> None:
+        """Read, verify, report and persist one user's capture. Never raises.
+
+        The caller holds the user's capture slot for the whole call.
+        """
+        nonlocal captured, capture_failed, capture_skipped
+        nonlocal capture_anchor_blocked, capture_circuit_open
+        user_id = candidate.user_id
         # Refuse a known-bad anchor before spending a section read. A previous
         # positive probe is only an early gate: refresh it after THIS read before
         # allowing persistence, even when the configured settings never changed.
@@ -1518,68 +1608,56 @@ async def sweep_shares(
             capture_skipped += 1
             capture_anchor_blocked += 1
             return
-        capture_lock = entitlement_capture_lock(user_id)
-        # No await between this check and ``async with``: on one event loop the
-        # lock cannot be taken in between. A sign-in capture already holds this
-        # user's freshest evidence, so the sweep skips instead of stalling the
-        # tick behind that capture's network read.
-        if capture_lock.locked():
+        attempt = await _attempt_capture(
+            library,
+            machine_identifier=machine_identifier,
+            user_id=user_id,
+        )
+        if attempt.server_unavailable:
+            # Trip the breaker: a black-holed server costs one full timeout per
+            # AUTHORIZED user, which at a full budget is minutes of tick wall
+            # time spent learning nothing. Verdict work is unaffected -- it talks
+            # to plex.tv, not to this server.
+            capture_circuit_open = True
+            _logger.warning(
+                "entitlement capture is skipped for the rest of this tick: the Plex server "
+                "did not answer. Verdicts are unaffected. Skipped users are NOT retried "
+                "immediately -- they are recaptured at their next due window (bounded by "
+                "share_revalidation_interval_hours) or at their next sign-in, whichever "
+                "comes first. Nothing reads these columns yet (#484 PR-3 is capture-only)."
+            )
+        if attempt.capture is None:
+            capture_failed += 1
+            return
+        if not await _anchor_confirmed(refresh=True):
             capture_skipped += 1
-            _logger.info(
-                "entitlement capture for user_id=%s skipped this tick: another capture "
-                "for this user is in progress",
+            capture_anchor_blocked += 1
+            return
+        await report_entitlement_capture(
+            attempt.capture, user_id=user_id, service_section_count=_service_section_count
+        )
+        try:
+            async with sessionmaker() as session:
+                stored = await store_entitlements(
+                    session,
+                    user_id,
+                    attempt.capture,
+                    anchor_setting_key=context.anchor_setting_key,
+                    expected_token_ciphertext=candidate.token_ciphertext,
+                )
+                await session.commit()
+        except Exception:
+            capture_failed += 1
+            _logger.exception(
+                "entitlement capture for user_id=%s could not be persisted; the previous "
+                "snapshot is unchanged",
                 safe_int(user_id),
             )
             return
-        async with capture_lock:
-            attempt = await _attempt_capture(
-                library,
-                machine_identifier=machine_identifier,
-                user_id=user_id,
-                service_section_count=_service_section_count,
-            )
-            if attempt.server_unavailable:
-                # Trip the breaker: a black-holed server costs one full timeout per
-                # AUTHORIZED user, which at a full budget is minutes of tick wall
-                # time spent learning nothing. Verdict work is unaffected -- it talks
-                # to plex.tv, not to this server.
-                capture_circuit_open = True
-                _logger.warning(
-                    "entitlement capture is skipped for the rest of this tick: the Plex server "
-                    "did not answer. Verdicts are unaffected. Skipped users are NOT retried "
-                    "immediately -- they are recaptured at their next due window (bounded by "
-                    "share_revalidation_interval_hours) or at their next sign-in, whichever "
-                    "comes first. Nothing reads these columns yet (#484 PR-3 is capture-only)."
-                )
-            if attempt.capture is None:
-                capture_failed += 1
-                return
-            if not await _anchor_confirmed(refresh=True):
-                capture_skipped += 1
-                capture_anchor_blocked += 1
-                return
-            try:
-                async with sessionmaker() as session:
-                    stored = await store_entitlements(
-                        session,
-                        user_id,
-                        attempt.capture,
-                        anchor_setting_key=capture_context.anchor_setting_key,
-                        expected_token_ciphertext=candidate.token_ciphertext,
-                    )
-                    await session.commit()
-            except Exception:
-                capture_failed += 1
-                _logger.exception(
-                    "entitlement capture for user_id=%s could not be persisted; the previous "
-                    "snapshot is unchanged",
-                    safe_int(user_id),
-                )
-                return
-            if stored:
-                captured += 1
-            else:
-                capture_failed += 1
+        if stored:
+            captured += 1
+        else:
+            capture_failed += 1
 
     async def _anchor_confirmed(*, refresh: bool = False) -> bool:
         """Refresh positive evidence per capture; a failure blocks the tick.

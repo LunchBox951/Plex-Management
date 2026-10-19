@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterator
+from contextlib import AbstractAsyncContextManager
 
 import httpx
 import pytest
@@ -178,21 +179,20 @@ async def _sign_in_and_settle(app: FastAPI, client: httpx.AsyncClient) -> httpx.
     return response
 
 
-def _record_capture_lock_requests(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Record each user id whose capture lock is requested, in call order.
+def _record_capture_slot_requests(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record each user id whose waiting capture slot is requested, in call order.
 
-    Both capture sites enter the lock immediately after requesting it, so once a
-    request is recorded and the test yields, a contended requester is already
-    queued on the lock.
+    Sign-in enters the slot immediately after requesting it, so once a request
+    is recorded and the test yields, a contended requester is already queued.
     """
     requests: list[int] = []
-    real_lock = plex_access_service.entitlement_capture_lock
+    real_slot = plex_access_service.entitlement_capture_slot
 
-    def recording_lock(user_id: int) -> asyncio.Lock:
+    def recording_slot(user_id: int) -> AbstractAsyncContextManager[None]:
         requests.append(user_id)
-        return real_lock(user_id)
+        return real_slot(user_id)
 
-    monkeypatch.setattr(plex_access_service, "entitlement_capture_lock", recording_lock)
+    monkeypatch.setattr(plex_access_service, "entitlement_capture_slot", recording_slot)
     return requests
 
 
@@ -250,7 +250,7 @@ async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
         await session.commit()
 
     user_id = (await _signed_in_user(sessionmaker_)).id
-    lock_requests = _record_capture_lock_requests(monkeypatch)
+    slot_requests = _record_capture_slot_requests(monkeypatch)
     sweep_read_started = asyncio.Event()
     release_sweep_read = asyncio.Event()
     user_reads = 0
@@ -284,7 +284,7 @@ async def test_sign_in_capture_waits_for_the_same_users_sweep_to_commit(
             await sweep_read_started.wait()
             # The browser gets its session while its background capture waits.
             assert (await _sign_in(client)).status_code == 200
-            await _until(lambda: lock_requests.count(user_id) == 2)
+            await _until(lambda: slot_requests.count(user_id) == 1)
             await asyncio.sleep(0)
             assert user_reads == 1
             release_sweep_read.set()
@@ -566,8 +566,11 @@ async def test_sign_in_discards_sections_when_identity_changes_or_fails_after_th
         return response
 
     await _use_transport(app, httpx.MockTransport(handler))
-    with caplog.at_level(logging.WARNING):
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
         assert (await _sign_in_and_settle(app, client)).status_code == 200
+    # The unverified read is not a canary sample.
+    assert "scope=" not in caplog.text
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys == previous.entitled_section_keys
     assert user.entitlements_captured_at == previous.entitlements_captured_at
@@ -763,7 +766,7 @@ async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
 ) -> None:
     await seed(initialized=True, app_api_key=_API_KEY)
     await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
-    lock_requests = _record_capture_lock_requests(monkeypatch)
+    slot_requests = _record_capture_slot_requests(monkeypatch)
     first_read_started = asyncio.Event()
     release_first_read = asyncio.Event()
     first_read = True
@@ -811,7 +814,7 @@ async def test_cancelled_capture_does_not_block_later_captures_or_other_users(
             waiters = set(detached_tasks(app)) - holders
             tasks.update(waiters)
             user_id = (await _signed_in_user(sessionmaker_)).id
-            await _until(lambda: lock_requests.count(user_id) == 2)
+            await _until(lambda: slot_requests.count(user_id) == 2)
             await asyncio.sleep(0)
             cancelled = holders if cancel_holder else waiters
             assert len(cancelled) == 1

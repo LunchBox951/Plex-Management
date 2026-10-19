@@ -649,7 +649,7 @@ async def test_one_tick_captures_the_authorized_user_and_signs_out_the_revoked_o
 
 @pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])
 async def test_sweep_rejects_a_server_change_after_a_later_users_section_read(
-    app: FastAPI, seed: SeedFn, identity_failure: str
+    app: FastAPI, seed: SeedFn, identity_failure: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     await seed(initialized=True)
     await _configure_server(app)
@@ -687,7 +687,10 @@ async def test_sweep_rejects_a_server_change_after_a_later_users_section_read(
         return await transport.handle_async_request(request)
 
     await _use_transport(app, httpx.MockTransport(handler))
-    assert await _tick(app) == 3
+    with caplog.at_level(logging.INFO):
+        assert await _tick(app) == 3
+    # Only the verified capture is a canary sample; the rejected read is not.
+    assert caplog.text.count("scope=") == 1
     status = app.state.share_sweep_status
     assert status.authorized == 3
     assert status.captured == 1
@@ -775,7 +778,7 @@ async def test_sweep_skips_a_user_whose_sign_in_capture_holds_the_lock(
         app, _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
     )
 
-    async with asyncio.timeout(10), plex_access_service.entitlement_capture_lock(held_id):
+    async with asyncio.timeout(10), plex_access_service.entitlement_capture_slot(held_id):
         assert await _tick(app) == 3
 
     status = app.state.share_sweep_status
@@ -789,3 +792,32 @@ async def test_sweep_skips_a_user_whose_sign_in_capture_holds_the_lock(
             user = await session.get(User, user_id)
             assert user is not None
             assert user.entitled_section_keys == (None if user_id == held_id else ["1"])
+
+
+async def test_an_occupied_capture_slot_is_skipped_before_any_identity_probe(
+    app: FastAPI, seed: SeedFn
+) -> None:
+    """A skipped user must not pay for an identity probe, nor latch a failed one
+    that would mark the tick's anchor as unconfirmed."""
+    await seed(initialized=True)
+    await _configure_server(app)
+    held_id = await _signed_in_user(app)
+    identity_probes = 0
+    transport = _plex_tv_transport([_server_resource(_MACHINE_ID)], sections=_sections("1"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_probes
+        if request.url.path == "/identity":
+            identity_probes += 1
+            raise httpx.ReadTimeout("identity unavailable", request=request)
+        return await transport.handle_async_request(request)
+
+    await _use_transport(app, httpx.MockTransport(handler))
+    async with asyncio.timeout(10), plex_access_service.entitlement_capture_slot(held_id):
+        assert await _tick(app) == 1
+
+    assert identity_probes == 0
+    status = app.state.share_sweep_status
+    assert status.state == "ok"
+    assert status.capture_skipped == 1
+    assert status.capture_anchor_blocked == 0
