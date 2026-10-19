@@ -697,7 +697,7 @@ async def test_the_sweep_slot_treats_a_handoff_to_a_queued_waiter_as_contention(
 
     await waiter_entered.wait()
     release_waiter.set()
-    await waiter
+    await asyncio.gather(waiter)
     async with try_entitlement_capture_slot(7) as acquired:
         assert acquired
 
@@ -711,7 +711,7 @@ async def test_a_cancelled_waiter_frees_the_slot() -> None:
         waiter = asyncio.create_task(sign_in_capture())
         await asyncio.sleep(0)
         waiter.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiter
+        (outcome,) = await asyncio.gather(waiter, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
     async with try_entitlement_capture_slot(7) as acquired:
         assert acquired

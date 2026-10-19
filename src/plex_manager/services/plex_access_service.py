@@ -800,8 +800,8 @@ class EntitlementCapture:
     ``captured_at`` is stamped when the section read completed and supplies an
     additional write guard in :func:`store_entitlements`. Both app callers hold
     the user's capture slot (:func:`entitlement_capture_slot`) through the read
-    and commit: response
-    arrival timestamps alone cannot order overlapping reads. The producer
+    and commit: response arrival timestamps alone cannot order overlapping
+    reads. The producer
     (:func:`_attempt_capture`) always passes it explicitly; the default exists
     so a hand-built capture means "as of now" rather than silently comparing
     against an unset value.
@@ -1664,8 +1664,7 @@ async def sweep_shares(
 
         A negative result stays latched so a broken server costs one failing
         probe rather than one timeout for every remaining user. Captures refresh
-        after their section read, including time spent waiting for another
-        capture of the same user. Separate responses are not atomic identity
+        after their section read. Separate responses are not atomic identity
         proof; server replacement is an owner-controlled workflow (#597).
         """
         nonlocal anchor, last_error
