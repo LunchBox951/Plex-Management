@@ -299,9 +299,9 @@ async def _reuse_terminal_row(
     release_title: str | None,
     qbt: DownloadClientPort,
     actually_added: bool,
-    payload_pending: bool = False,
-    payload_resume: bool = False,
-    payload_force_start: bool = False,
+    payload_pending: bool,
+    payload_resume: bool,
+    payload_force_start: bool,
 ) -> tuple[DownloadRecord, bool]:
     """Drive a terminal (Failed/Imported) row back to Downloading and re-own it.
 
@@ -1622,6 +1622,9 @@ async def grab(
                         release_title=candidate.title,
                         qbt=qbt,
                         actually_added=actually_added,
+                        payload_pending=add_result.payload_pending,
+                        payload_resume=payload_resume,
+                        payload_force_start=payload_force_start,
                     )
                 except IntegrityError:
                     # This retry runs inside the create-conflict handler, so a new
