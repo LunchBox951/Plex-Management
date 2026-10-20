@@ -26,7 +26,7 @@ from fastapi import FastAPI, Request, Response
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from plex_manager.adapters.plex.library import reset_caches
+from plex_manager.adapters.plex.library import PlexLibrary, reset_caches
 from plex_manager.models import User
 from plex_manager.services import plex_access_service
 from plex_manager.web import app as app_module
@@ -533,6 +533,25 @@ async def test_a_replacement_server_at_the_same_url_is_never_stamped(
     user = await _signed_in_user(sessionmaker_)
     assert user.entitled_section_keys is None
     assert user.entitlements_machine_id is None
+
+
+async def test_a_rejected_capture_read_never_reaches_the_section_cache(
+    client: httpx.AsyncClient, app: FastAPI, seed: SeedFn, sessionmaker_: SessionMaker
+) -> None:
+    """The discarded read must not warm the process-wide section cache either.
+    When the signing-in token is also the service token, a later library
+    operation would otherwise be served the replacement server's sections."""
+    await seed(initialized=True, app_api_key=_API_KEY)
+    await _configure(sessionmaker_, url=_PLEX_URL, machine_id=_MACHINE_ID)
+    seen: list[str] = []
+    await _use_transport(app, _transport(seen=seen, live_identity="a-completely-different-server"))
+
+    assert (await _sign_in_and_settle(app, client)).status_code == 200
+    assert seen.count("/library/sections") == 1
+
+    # A cache-reading operation with the same token must go back to the server.
+    await PlexLibrary(app.state.http_client, _PLEX_URL, _TOKEN).list_sections()
+    assert seen.count("/library/sections") == 2
 
 
 @pytest.mark.parametrize("identity_failure", ["replacement", "timeout"])

@@ -887,12 +887,15 @@ async def _attempt_capture(
 ) -> _CaptureAttempt:
     """Read one token's sections. Emits no success telemetry: callers report a
     capture with :func:`report_entitlement_capture` only once its server
-    identity is confirmed."""
+    identity is confirmed and the capture is stored."""
     try:
         # Never cached: an entitlement snapshot is point-in-time AUTHORIZATION
         # data, and a cached success would both stamp a stale section set and
         # mask an unreachable server -- mis-counting it as ``captured``.
-        sections = await library.list_sections(use_cache=False)
+        # Nor stored: the identity of the server that answered is unverified
+        # until the caller's post-read probe, so this response must never be
+        # served to a later library operation.
+        sections = await library.list_sections(use_cache=False, write_cache=False)
     except PlexAuthError:
         # This user's token is not accepted by the server -- an ordinary,
         # expected canary outcome for the premise under test, and specific to
@@ -940,7 +943,8 @@ async def capture_entitlements(
     leaves the previous snapshot exactly as it was, because nothing is written.
 
     The result is unverified: the caller confirms the server identity after the
-    read and only then reports it with :func:`report_entitlement_capture`.
+    read, stores it, and only then reports it with
+    :func:`report_entitlement_capture`.
 
     The sweep uses :func:`_attempt_capture` directly because it also needs to
     know WHY a capture failed (to break its circuit on an unreachable server);
@@ -968,10 +972,11 @@ async def report_entitlement_capture(
     (possibly a LAN address the account has never used) and comes back
     SECTION-FILTERED rather than with the whole library. This line answers that
     from the log store -- counts and a one-word scope only, never section
-    titles, keys, paths or tokens. Callers emit it only after the post-read
-    identity check passes, so a replacement or unverified server never
-    contributes a sample. ``service_section_count`` is resolved here, so a
-    rejected or failed read never spends a call on the baseline.
+    titles, keys, paths or tokens. Callers emit it only once the capture passed
+    the post-read identity check and was stored, so a replacement server, an
+    unverified server, or a rejected write never contributes a sample.
+    ``service_section_count`` is resolved here, so a rejected or failed read
+    never spends a call on the baseline.
     """
     baseline = await service_section_count() if service_section_count is not None else None
     section_count = len(capture.section_keys)
@@ -1589,7 +1594,7 @@ async def sweep_shares(
     async def _capture_in_slot(
         candidate: DueShareCandidate, library: LibraryPort, context: EntitlementCaptureContext
     ) -> None:
-        """Read, verify, report and persist one user's capture. Never raises.
+        """Read, verify, persist and report one user's capture. Never raises.
 
         The caller holds the user's capture slot for the whole call.
         """
@@ -1633,9 +1638,6 @@ async def sweep_shares(
             capture_skipped += 1
             capture_anchor_blocked += 1
             return
-        await report_entitlement_capture(
-            attempt.capture, user_id=user_id, service_section_count=_service_section_count
-        )
         try:
             async with sessionmaker() as session:
                 stored = await store_entitlements(
@@ -1654,10 +1656,13 @@ async def sweep_shares(
                 safe_int(user_id),
             )
             return
-        if stored:
-            captured += 1
-        else:
+        if not stored:
             capture_failed += 1
+            return
+        captured += 1
+        await report_entitlement_capture(
+            attempt.capture, user_id=user_id, service_section_count=_service_section_count
+        )
 
     async def _anchor_confirmed(*, refresh: bool = False) -> bool:
         """Refresh positive evidence per capture; a failure blocks the tick.

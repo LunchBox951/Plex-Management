@@ -962,7 +962,8 @@ async def _capture_entitlements_after_sign_in(
 
     The section read is followed by a live ``/identity`` probe while this user's
     capture slot is held through persistence; only a match with the cached
-    anchor is reported in telemetry and stored. A replacement server at the
+    anchor is stored, and only a stored capture is reported in telemetry. The
+    read never warms the shared section cache. A replacement server at the
     same ``plex_url`` answers happily and would otherwise have ITS sections
     written under the OLD identifier -- which the settings-row guard in
     ``store_entitlements`` cannot catch, since that row still holds the old id.
@@ -998,7 +999,6 @@ async def _capture_entitlements_after_sign_in(
                     safe_int(user_id),
                 )
                 return
-            await plex_access_service.report_entitlement_capture(capture, user_id=user_id)
             async with app.state.sessionmaker() as session:
                 stored = await plex_access_service.store_entitlements(
                     session,
@@ -1009,6 +1009,8 @@ async def _capture_entitlements_after_sign_in(
                 )
                 if stored:
                     await session.commit()
+            if stored:
+                await plex_access_service.report_entitlement_capture(capture, user_id=user_id)
     except Exception:
         # Deliberately broad and deliberately swallowed: this is enrichment
         # hanging off an already-committed sign-in. Logged with a traceback so it

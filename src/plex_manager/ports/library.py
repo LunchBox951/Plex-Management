@@ -306,7 +306,9 @@ class LibraryPort(Protocol):
         """
         raise NotImplementedError
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
         """Return the configured library sections.
 
         ``use_cache=False`` forces a fresh read of the server, bypassing the
@@ -314,7 +316,13 @@ class LibraryPort(Protocol):
         is user-visible (the Settings library picker, the setup wizard's "Test
         connection", the health dashboard's live probe), never for the warmed
         fast paths (``is_available``, ``trigger_scan``, ``watch_state``) that
-        rely on this staying cheap.
+        rely on this staying cheap. A fresh read still refreshes that snapshot
+        so those fast paths stay warm.
+
+        ``write_cache=False`` leaves the snapshot untouched: for reads whose
+        answer is not yet trusted, such as an entitlement capture that must
+        confirm the server's identity after the read. Such a response must not
+        be served to later operations.
         """
         raise NotImplementedError
 
