@@ -299,7 +299,9 @@ class _LibraryMissingTriggerScan(LibraryPort):
     ) -> frozenset[tuple[int, Literal["movie", "tv"]]]:
         return frozenset()
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
         return []
 
     async def watch_state(
