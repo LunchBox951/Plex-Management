@@ -34,6 +34,22 @@ DANGEROUS_EXTENSIONS = frozenset(
 )
 
 
+HELD_METADATA_STATES = frozenset({"metaDL", "forcedMetaDL"})
+
+
+def is_unstarted_held_torrent(raw_state: str, progress: float, *, has_manifest: bool) -> bool:
+    """Whether a torrent still has the shape of this app's own never-started held add.
+
+    Adds stop once metadata arrives, so such a torrent is either still fetching
+    metadata or stopped at zero progress with a readable manifest. This is the one
+    definition of a held torrent the app may take ownership of and start after
+    validation; anything else keeps its live state.
+    """
+    if raw_state in HELD_METADATA_STATES:
+        return True
+    return raw_state in {"stoppedDL", "pausedDL"} and progress == 0 and has_manifest
+
+
 @dataclass(frozen=True)
 class PayloadInspection:
     video_indices: tuple[int, ...] = ()

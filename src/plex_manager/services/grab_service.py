@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy.exc import IntegrityError
 
+from plex_manager.domain.payload_validation import is_unstarted_held_torrent
 from plex_manager.domain.reconciler import METADATA_STALL_WINDOW
 from plex_manager.domain.state_machine import TERMINAL_STATES, DownloadState
 from plex_manager.logsafe import safe_int, safe_text
@@ -263,6 +264,14 @@ class TorrentRemovalInFlightError(Exception):
         self.torrent_hash = torrent_hash
         self.download_id = download_id
         super().__init__(f"torrent {torrent_hash} (download {download_id}) is being removed; retry")
+
+
+async def _is_untracked_held_orphan(qbt: DownloadClientPort, torrent_hash: str) -> bool:
+    status = await qbt.get_status(torrent_hash)
+    if status is None:
+        return False
+    has_manifest = bool(await qbt.list_files(torrent_hash))
+    return is_unstarted_held_torrent(status.raw_state, status.progress, has_manifest=has_manifest)
 
 
 async def _reuse_terminal_row(
@@ -1323,9 +1332,9 @@ async def grab(
     # back a live library file via hardlink), and the DB rollback preserves
     # whatever row tracked it. See _remove_torrent_if_added.
     actually_added = add_result.created
-    # Only a torrent this add created carries the stop-at-metadata hold, so only it
-    # may be started after validation. A pre-existing one is judged like a legacy
-    # row: its live client state decides whether it was running.
+    # A torrent this add created carries the stop-at-metadata hold, so it is started
+    # after validation. A pre-existing one is judged like a legacy row, by its live
+    # client state, unless it is an untracked held orphan (see below).
     payload_resume = add_result.payload_pending and add_result.created
     if not torrent_hash:
         # The client accepted it but no real info-hash could be derived (rare
@@ -1336,7 +1345,8 @@ async def grab(
         raise GrabError(candidate.title)
 
     existing = await download_repo.get_by_hash(torrent_hash)
-    if existing is not None and existing.status not in _TERMINAL_STATUS_VALUES:
+    tracked = existing is not None and existing.status not in _TERMINAL_STATUS_VALUES
+    if existing is not None and tracked:
         if request_id is not None and existing.media_request_id != request_id:
             raise TorrentAlreadyTrackedError(torrent_hash, existing.media_request_id)
         # Same scope-match guard as the known-hash precheck, for the case the indexer
@@ -1394,6 +1404,12 @@ async def grab(
                 reason="losing a parallel grab for a planned TV scope",
             )
             raise AlreadyDownloadingError(request_id)
+
+    if add_result.payload_pending and not payload_resume and not tracked:
+        # No active row tracks this hash, so a never-started held torrent is this
+        # app's own add from a grab that crashed before its row committed (#481).
+        # This grab exists to download it; record the intent validation then honours.
+        payload_resume = await _is_untracked_held_orphan(qbt, torrent_hash)
 
     if existing is not None:
         try:
