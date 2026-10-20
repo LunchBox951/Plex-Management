@@ -14,6 +14,7 @@ import { useImageFallback } from '../lib/useImageFallback'
 import { requestStatus, type StatusPresentation } from '../lib/status'
 import { Button } from './ui/Button'
 import { buttonClasses } from './ui/button-variants'
+import { TvRequestPicker } from './TvRequestPicker'
 import { StatusBadge } from './ui/StatusBadge'
 import { useToast } from './ui/toast'
 
@@ -76,6 +77,7 @@ export function Spotlight({
 }: SpotlightProps) {
   const { toast } = useToast()
   const createRequest = useCreateRequest()
+  const [tvPickerItem, setTvPickerItem] = useState<DiscoverResult | null>(null)
   const reducedMotion = usePrefersReducedMotion()
   const keys = useMemo(() => items.map(itemKey), [items])
   const keysSignature = keys.join('|')
@@ -190,6 +192,7 @@ export function Spotlight({
     documentHidden ||
     localRequestPending ||
     createRequest.isPending ||
+    tvPickerItem !== null ||
     reducedMotion
 
   // A timeout is scheduled afresh after every slide/pause/manual-dot change.
@@ -243,10 +246,17 @@ export function Spotlight({
       return
     }
 
-    // A season-less TV POST means whole aired series. When freshness/history
-    // makes that unsafe, the same visible CTA opens Details for season choice.
+    // When freshness/history makes a quick request unsafe, the same visible CTA
+    // opens Details instead.
     if (!canQuickRequest(activeItem)) {
       onOpen(activeItem)
+      return
+    }
+
+    // TV: what part of a show to ask for is never guessed (Interactions: Request
+    // on a TV title opens the TV request sheet, which sends the request itself).
+    if (activeItem.media_type === 'tv') {
+      setTvPickerItem(activeItem)
       return
     }
 
@@ -349,6 +359,27 @@ export function Spotlight({
         >
           {manualPaused ? 'Play' : 'Pause'}
         </button>
+      ) : null}
+      {tvPickerItem ? (
+        <TvRequestPicker
+          open
+          onOpenChange={(open) => {
+            if (!open) setTvPickerItem(null)
+          }}
+          tmdbId={tvPickerItem.tmdb_id}
+          title={tvPickerItem.title}
+          onRequested={(created) => {
+            const key = itemKey(tvPickerItem)
+            setImmediateStates((current) => ({
+              ...current,
+              [key]: {
+                presentation: requestStatus(created.status),
+                requestRevision: latestSettledRevision.current,
+              },
+            }))
+            setTvPickerItem(null)
+          }}
+        />
       ) : null}
     </section>
   )

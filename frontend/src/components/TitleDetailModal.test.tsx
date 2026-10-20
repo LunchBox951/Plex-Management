@@ -29,6 +29,7 @@ import type {
   SearchPreviewResponse,
 } from '../api/types'
 import { TitleDetailModal } from './TitleDetailModal'
+import type { TvRequestPickerProps } from './TvRequestPicker'
 
 const layoutEffectPin = vi.hoisted(() => ({
   deferLatestTitleKeyEffect: false,
@@ -126,6 +127,39 @@ beforeEach(() => {
 })
 
 vi.mock('./ui/toast', () => ({ useToast: () => ({ toast: toastState.toast }) }))
+
+// The TV request sheet has its own suite (TvRequestPicker.test.tsx). Here it is a
+// stand-in that, like the real sheet, sends the create through the SAME mocked
+// `useCreateRequest`, closes, and hands the created row back via `onRequested`
+// -- so these tests pin the modal's side of the hand-off (open it, adopt the
+// row, preview the resolved season) without the sheet's season/episode fetches.
+vi.mock('./TvRequestPicker', async () => {
+  const hooks = await import('../api/hooks')
+  function TvRequestPicker(props: TvRequestPickerProps) {
+    const create = hooks.useCreateRequest()
+    if (!props.open) return null
+    const send = async (extra: { seasons?: number[] }) => {
+      const body = { tmdb_id: props.tmdbId, media_type: 'tv' as const, ...extra }
+      const created = await create.mutateAsync(body)
+      props.onOpenChange(false)
+      props.onRequested?.(created, body)
+    }
+    return (
+      <div
+        data-testid="tv-request-picker"
+        data-existing-request-id={props.existingRequest?.id ?? ''}
+      >
+        <button type="button" onClick={() => void send({})}>
+          Picker: every season
+        </button>
+        <button type="button" onClick={() => void send({ seasons: [2] })}>
+          Picker: season 2
+        </button>
+      </div>
+    )
+  }
+  return { TvRequestPicker }
+})
 
 vi.mock('./ui/Dialog', () => ({
   Dialog: ({
@@ -379,6 +413,124 @@ describe('TitleDetailModal TV request actions', () => {
     expect(screen.getByRole('button', { name: /^\+ request$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /search releases/i })).toBeInTheDocument()
   })
+
+  it('opens the TV request sheet from + Request instead of creating a request directly', () => {
+    const createRequestMock = idle()
+    ;(useCreateRequest as unknown as Mock).mockReturnValue(createRequestMock)
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, media_type: 'tv', title: 'Test Show' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    // The old inline TV controls are gone; the sheet owns what to request.
+    expect(screen.queryByRole('checkbox', { name: /whole series/i })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/season to search/i)).not.toBeInTheDocument()
+    expect(screen.queryByTestId('tv-request-picker')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+
+    expect(screen.getByTestId('tv-request-picker')).toBeInTheDocument()
+    expect(createRequestMock.mutateAsync).not.toHaveBeenCalled()
+  })
+
+  it('offers "Request more" on an existing TV request and opens the sheet with that request', () => {
+    const request: RequestResponse = {
+      id: 31,
+      tmdb_id: 42,
+      media_type: 'tv',
+      title: 'Test Show',
+      status: 'downloading',
+      is_anime: false,
+      keep_forever: false,
+      can_mutate: true,
+      is_owner: true,
+      can_withdraw: false,
+      has_other_participants: false,
+      seasons: [{ season_number: 1, status: 'downloading' }],
+      requested_seasons: [1],
+      tv_request_mode: 'explicit_seasons',
+    }
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
+      authoritative: true,
+      data: { requests: [request] },
+    })
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, media_type: 'tv', title: 'Test Show' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: /^\+ request$/i })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Request more' }))
+    expect(screen.getByTestId('tv-request-picker')).toHaveAttribute(
+      'data-existing-request-id',
+      '31',
+    )
+  })
+
+  it('hides "Request more" from a subscriber who cannot grow the request', () => {
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
+      authoritative: true,
+      data: {
+        requests: [
+          {
+            id: 32,
+            tmdb_id: 42,
+            media_type: 'tv',
+            title: 'Test Show',
+            status: 'downloading',
+            is_anime: false,
+            keep_forever: false,
+            can_mutate: false,
+            is_owner: false,
+            can_withdraw: true,
+            has_other_participants: true,
+            seasons: [{ season_number: 1, status: 'downloading' }],
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+    render(
+      <TitleDetailModal
+        title={{ ...TITLE, media_type: 'tv', title: 'Test Show' }}
+        open
+        onOpenChange={() => {}}
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Request more' })).not.toBeInTheDocument()
+  })
+
+  it('never offers "Request more" for a movie', () => {
+    ;(useTitleRequests as unknown as Mock).mockReturnValue({
+      authoritative: true,
+      data: {
+        requests: [
+          {
+            id: 33,
+            tmdb_id: 42,
+            media_type: 'movie',
+            title: 'Test Movie',
+            status: 'downloading',
+            is_anime: false,
+            keep_forever: false,
+            can_mutate: true,
+            is_owner: true,
+            can_withdraw: false,
+            has_other_participants: false,
+          } satisfies RequestResponse,
+        ],
+      },
+    })
+    render(<TitleDetailModal title={TITLE} open onOpenChange={() => {}} />)
+
+    expect(screen.queryByRole('button', { name: 'Request more' })).not.toBeInTheDocument()
+  })
 })
 
 describe('TitleDetailModal report-a-problem gating (G6)', () => {
@@ -586,10 +738,9 @@ describe('TitleDetailModal — tv season selector', () => {
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
 
-    // Uncheck "whole series" and pick season 2 before requesting.
-    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
-    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
+    // + Request opens the TV request sheet; season 2 is chosen there.
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Picker: season 2' }))
 
     await waitFor(() =>
       expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
@@ -657,9 +808,8 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
-    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
-    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Picker: season 2' }))
 
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
@@ -720,9 +870,8 @@ describe('TitleDetailModal — tv season selector', () => {
     ;(useQueue as unknown as Mock).mockReturnValue({ data: { queue: [] } })
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
-    fireEvent.click(screen.getByRole('checkbox', { name: /whole series/i }))
-    fireEvent.change(screen.getByLabelText(/season to search/i), { target: { value: '2' } })
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Picker: season 2' }))
 
     const grab = await screen.findByRole('button', { name: /grab/i })
     expect(grab).toBeEnabled()
@@ -770,8 +919,8 @@ describe('TitleDetailModal — tv season selector', () => {
   })
 
   it('previews and arms Grab against the season the create RESOLVED to, not the click-time default (whole-series request, season 1 already in the library)', async () => {
-    // "Whole series" stays checked (the default) — no season exists to pick before
-    // the request is created, so the click-time default is season 1. The create
+    // "Every season" is chosen in the TV request sheet — no season exists to pick
+    // before the request is created, so the click-time default is season 1. The create
     // comes back tracking season 1 as already available (terminal) and season 2 as
     // the real actionable one — exactly the shape that exposed the bug.
     const created: RequestResponse = {
@@ -826,6 +975,7 @@ describe('TitleDetailModal — tv season selector', () => {
 
     render(<TitleDetailModal title={TV_TITLE} open onOpenChange={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: /^\+ request$/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Picker: every season' }))
 
     await waitFor(() =>
       expect(createRequestMock.mutateAsync).toHaveBeenCalledWith({
@@ -3003,7 +3153,8 @@ describe('TitleDetailModal — four-zone presentation (issue #197)', () => {
       badge: 'Waiting for air date',
       sentence:
         "This season hasn't aired yet. It will be searched automatically after its air date.",
-      actions: ['Cancel request'],
+      // TV only: "Request more" (secondary) opens the TV request sheet over this request.
+      actions: ['Cancel request', 'Request more'],
       primary: null,
     },
     {
@@ -3673,9 +3824,10 @@ describe('TitleDetailModal — request actions suppressed while /requests/by-tit
     render(<TitleDetailModal title={TV} open onOpenChange={() => {}} boundRequestId={81} />)
 
     expect(screen.queryByRole('button', { name: /\+ request/i })).not.toBeInTheDocument()
-    // The pre-request "Whole series" checkbox (state.kind === 'none' only) must
-    // not render either -- it belongs to the confirmed-no-request flow.
-    expect(screen.queryByLabelText('Whole series')).not.toBeInTheDocument()
+    // Nor may "Request more" (which opens the TV request sheet) -- whether a
+    // request exists is exactly what is still unknown here.
+    expect(screen.queryByRole('button', { name: 'Request more' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('tv-request-picker')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /checking/i })).toBeDisabled()
   })
 

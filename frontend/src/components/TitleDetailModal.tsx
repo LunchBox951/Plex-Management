@@ -35,6 +35,7 @@ import { ProgressBar } from './ui/ProgressBar'
 import { CenteredSpinner } from './ui/feedback'
 import { useToast } from './ui/toast'
 import { useTitleReleasePreview } from './useTitleReleasePreview'
+import { TvRequestPicker } from './TvRequestPicker'
 
 export interface TitleDetailModalAction {
   kind: 're-search'
@@ -573,9 +574,10 @@ export function TitleDetailModal({
       setCreatedCanMutate(false)
     }
   }, [boundRequestId])
-  // tv only, read at Request time: track the whole aired series (default) or just
-  // the one season named below. Irrelevant once a request exists.
-  const [wholeSeries, setWholeSeries] = useState(true)
+  // tv only: the TV request sheet (TvRequestPicker). It owns the choice of what
+  // to request (latest season / new episodes / episodes / seasons / every
+  // season) — the first Request and "Request more" both open it.
+  const [tvPickerOpen, setTvPickerOpen] = useState(false)
   // tv only: the season the operator explicitly picked (to search/grab/view).
   // `null` until they touch the control — `currentSeason` below resolves the
   // real default (the first actionable tracked season, else 1).
@@ -653,7 +655,7 @@ export function TitleDetailModal({
     setCreatedGrabbable(false)
     setCreatedSeasons(null)
     setCreatedCanMutate(false)
-    setWholeSeries(true)
+    setTvPickerOpen(false)
     setActiveSeason(null)
     setGrabbingGuid(null)
     setReportFor(null)
@@ -900,30 +902,19 @@ export function TitleDetailModal({
     void runPreview(action.requestId, action.season)
   }, [action, isAdmin, open, runPreview])
 
-  const onRequest = useCallback(async () => {
-    if (!title) return
-    const startedKey = `${title.media_type}:${title.tmdb_id}`
-    const titleName = title.title
-    try {
-      const body: CreateRequestBody = { tmdb_id: title.tmdb_id, media_type: title.media_type }
-      // tv only: naming a single season narrows CreateRequestBody.seasons; leaving
-      // "whole series" checked (the default) omits it entirely, which the backend
-      // reads as "track every aired season" (request_service._season_numbers).
-      // Movies never set this field — identical payload to before.
-      //
-      // A title that ALREADY has tracked seasons hides the "whole series" checkbox
-      // (the season PICKER drives selection instead), so `wholeSeries` is stale-true
-      // there: a "Request again" for a failed S2 must scope to the SELECTED season,
-      // not silently re-request the whole show. Only the pre-request flow (no tracked
-      // seasons yet, checkbox visible) honours `wholeSeries`.
-      if (title.media_type === 'tv') {
-        const hasTrackedSeasons = (effectiveSeasons?.length ?? 0) > 0
-        if (hasTrackedSeasons || !wholeSeries) {
-          body.seasons = [currentSeason ?? 1]
-        }
-      }
-      const created = await createRequest.mutateAsync(body)
-      if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
+  // Adopt a just-created (or dedup-resolved) request row: bind the modal to it,
+  // arm Grab off its own status, and — for an admin — preview releases for the
+  // season it resolved to. Shared by `onRequest` ("+ Request" for a movie,
+  // "Request again") and the TV request sheet's `onRequested`. The caller has
+  // already checked that `created` still belongs to the open title.
+  // `seasonPick` is the season the operator just chose (the sheet's single
+  // picked season), standing in for `activeSeason`, which that render predates.
+  const adoptCreatedRequest = useCallback(
+    async (
+      created: RequestResponse,
+      mediaType: DiscoverResult['media_type'],
+      seasonPick: number | null = activeSeason,
+    ) => {
       setRequestId(created.id)
       // issue #272: this exact click just produced (or dedup-resolved to) the row
       // the modal must now track — rebind `liveRequest`'s pin to it so a
@@ -942,14 +933,13 @@ export function TitleDetailModal({
       // preview S1's releases under an S2 selector — exactly the bug this guards.
       // Always `null` for a movie, byte-identical to the `currentSeason` it replaces.
       const resolvedSeason =
-        title.media_type === 'tv' ? resolveSeason(created.seasons ?? null, activeSeason) : null
+        mediaType === 'tv' ? resolveSeason(created.seasons ?? null, seasonPick) : null
       // A terminal create (Plex already has the title, or a reused completed/failed
       // request) must not arm Grab — gate on the returned status, not just the id.
       // For tv this is the SELECTED (resolved) season's own status (`created.seasons`
       // is now populated), never the show-level rollup.
       const grabbable = isSeasonGrabbable(created, resolvedSeason)
       setCreatedGrabbable(grabbable)
-      toast({ title: `Requested ${titleName}`, intent: 'success' })
       // Search-preview is admin-only server-side: a shared user's request ends
       // here (the auto-grab worker takes it from request to download unattended).
       if (grabbable && isAdmin) {
@@ -957,11 +947,52 @@ export function TitleDetailModal({
       } else {
         clearPreview()
       }
+    },
+    [activeSeason, isAdmin, runPreview, clearPreview],
+  )
+
+  const onRequest = useCallback(async () => {
+    if (!title) return
+    const startedKey = `${title.media_type}:${title.tmdb_id}`
+    const titleName = title.title
+    try {
+      const body: CreateRequestBody = { tmdb_id: title.tmdb_id, media_type: title.media_type }
+      // tv only: a first TV request goes through the TV request sheet instead
+      // (`onTvRequested`), so a tv title reaches here only via "Request again"
+      // on a settled row. With tracked seasons that re-request is scoped to the
+      // SELECTED season — a "Request again" for a failed S2 must never silently
+      // re-request the whole show. With nothing tracked it omits `seasons`,
+      // which the backend reads as "track every aired season"
+      // (request_service._season_numbers). Movies never set this field.
+      if (title.media_type === 'tv' && (effectiveSeasons?.length ?? 0) > 0) {
+        body.seasons = [currentSeason ?? 1]
+      }
+      const created = await createRequest.mutateAsync(body)
+      if (latestTitleKey.current !== startedKey) return // don't apply A's request to title B
+      toast({ title: `Requested ${titleName}`, intent: 'success' })
+      await adoptCreatedRequest(created, title.media_type)
     } catch (error) {
       if (latestTitleKey.current !== startedKey) return
       toast({ title: 'Request failed', description: asApiError(error).message, intent: 'error' })
     }
-  }, [title, createRequest, toast, runPreview, wholeSeries, currentSeason, activeSeason, effectiveSeasons, isAdmin, clearPreview])
+  }, [title, createRequest, toast, currentSeason, effectiveSeasons, adoptCreatedRequest])
+
+  // The TV request sheet already created the request and showed its own toast;
+  // the modal only adopts the row. Ignored when the modal has since moved on to
+  // a different title (TMDB movie/tv ids collide, so compare media_type too).
+  // When exactly one season was asked for (Choose seasons, or episodes from one
+  // season) the season selector, preview and Grab follow THAT season — the
+  // successor of the old inline "Season" field.
+  const onTvRequested = useCallback(
+    (created: RequestResponse, body: CreateRequestBody) => {
+      if (latestTitleKey.current !== `tv:${String(created.tmdb_id)}`) return
+      const picked = body.seasons ?? Object.keys(body.episodes ?? {}).map(Number)
+      const seasonPick = picked.length === 1 ? (picked[0] ?? null) : null
+      if (seasonPick !== null) setActiveSeason(seasonPick)
+      void adoptCreatedRequest(created, 'tv', seasonPick ?? activeSeason)
+    },
+    [adoptCreatedRequest, activeSeason],
+  )
 
   // Re-acquire (issue #131), movie-only: force-create a fresh grabbable request
   // even though Plex still reports the title present (its file was deleted or
@@ -1168,9 +1199,9 @@ export function TitleDetailModal({
   // per-season presence is surfaced through its own tracked seasons instead.
   const presenceOnly = title.media_type === 'movie' && title.library_state === 'available'
 
-  // tv only: before any request exists, let the operator name a single season (and
-  // whether to track just it or the whole series); once seasons are tracked,
-  // enumerate them in a picker that also drives which one is searched/grabbed/shown.
+  // tv only: once seasons are tracked, enumerate them in a picker that drives which
+  // one is searched/grabbed/shown. Choosing WHAT to request (before any request
+  // exists, or "Request more" after) is the TV request sheet's job instead.
   const seasonSelector: ReactNode =
     title.media_type !== 'tv' ? null : effectiveSeasons && effectiveSeasons.length > 0 ? (
       <div className="flex min-w-0 items-center gap-2 max-sm:w-full">
@@ -1196,31 +1227,6 @@ export function TitleDetailModal({
             </option>
           ))}
         </select>
-      </div>
-    ) : state.kind === 'none' ? (
-      <div className="flex flex-wrap items-center gap-4 max-sm:w-full">
-        <label className="flex items-center gap-2 text-xs text-muted">
-          <input
-            type="checkbox"
-            className="size-4 accent-gold outline-none focus-visible:ring-2 focus-visible:ring-gold/60"
-            checked={wholeSeries}
-            onChange={(e) => setWholeSeries(e.target.checked)}
-          />
-          Whole series
-        </label>
-        <label className="flex items-center gap-2 text-xs text-muted">
-          Season
-          <input
-            type="number"
-            min={1}
-            aria-label="Season to search"
-            className="h-8 w-16 rounded-lg bg-bg px-2 text-xs text-ink ring-1 ring-inset ring-white/10 outline-none focus-visible:ring-2 focus-visible:ring-gold/50"
-            value={currentSeason ?? 1}
-            onChange={(e) =>
-              setActiveSeason(Math.max(1, Number.parseInt(e.target.value, 10) || 1))
-            }
-          />
-        </label>
       </div>
     ) : null
 
@@ -1386,6 +1392,25 @@ export function TitleDetailModal({
   // sr-only accessible description all read from the same copy).
   const withdrawCopy = withdrawFor ? withdrawDialogCopy(withdrawFor) : null
 
+  // "Request more" (tv): opens the TV request sheet over an EXISTING request,
+  // showing what it already covers; the backend merges new picks into the same
+  // row. Offered to whoever may mutate the row (its creator, or an admin) — a
+  // plain subscriber's create dedups onto the shared row WITHOUT growing the
+  // owner's intent, so the button would silently do nothing for them. Hidden
+  // while the state is unresolved ('checking') or unrecognized ('unknown',
+  // fail closed like every other action there).
+  const requestMoreButton =
+    title.media_type === 'tv' &&
+    effectiveRequestId !== null &&
+    canMutateRequest &&
+    state.kind !== 'checking' &&
+    state.kind !== 'none' &&
+    state.kind !== 'unknown' ? (
+      <Button variant="secondary" onClick={() => setTvPickerOpen(true)}>
+        Request more
+      </Button>
+    ) : null
+
   const reSearchNowButton = isAdmin ? (
     <Button
       onClick={() => void runPreview(effectiveRequestId)}
@@ -1433,6 +1458,9 @@ export function TitleDetailModal({
               honest verb here is Re-acquire (force-create). */}
           {presenceOnly ? (
             reacquirePrimary
+          ) : title.media_type === 'tv' ? (
+            // TV: Request opens the TV request sheet; the sheet sends the request.
+            <Button onClick={() => setTvPickerOpen(true)}>+ Request</Button>
           ) : (
             <Button onClick={() => void onRequest()} loading={createRequest.isPending}>
               + Request
@@ -1714,13 +1742,16 @@ export function TitleDetailModal({
           ) : null}
         </section>
 
-        {actionZone || (canMutateRequest && pinRequestId != null && state.kind === 'available') ? (
+        {actionZone ||
+        requestMoreButton ||
+        (canMutateRequest && pinRequestId != null && state.kind === 'available') ? (
           <section aria-labelledby="title-actions-heading" className="mt-5">
             <h3 id="title-actions-heading" className="sr-only">
               Actions
             </h3>
             <div className="flex flex-wrap items-center gap-2.5">
               {actionZone}
+              {requestMoreButton}
               {/* Keep-forever is available only for a known, watchable pin target.
                   Creators and admins may pin; subscribers keep a read-only view. */}
               {canMutateRequest && pinRequestId != null && state.kind === 'available' ? (
@@ -1950,6 +1981,17 @@ export function TitleDetailModal({
             </div>
           )}
         </Dialog>
+      ) : null}
+
+      {title.media_type === 'tv' ? (
+        <TvRequestPicker
+          open={tvPickerOpen}
+          onOpenChange={setTvPickerOpen}
+          tmdbId={title.tmdb_id}
+          title={title.title}
+          existingRequest={liveRequest}
+          onRequested={onTvRequested}
+        />
       ) : null}
 
       {/* Re-acquire confirm (issue #131): the only guard against the accepted

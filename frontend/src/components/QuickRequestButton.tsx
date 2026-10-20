@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useCreateRequest } from '../api/hooks'
 import type { CreateRequestBody, DiscoverResult } from '../api/types'
 import { cn } from '../lib/cn'
 import type { ApiError } from '../lib/errors'
+import { TvRequestPicker } from './TvRequestPicker'
 import { useToast } from './ui/toast'
 
 interface QuickRequestButtonProps {
@@ -35,17 +36,15 @@ function asApiError(error: unknown): ApiError {
  * unaffected by pointer-events, so the tab-order guarantee above holds.
  *
  * Reuses the SAME `useCreateRequest()` mutation `TitleDetailModal` uses; there
- * is only one create-request code path. For a tv title this always omits
- * `seasons`, which the backend reads as "track every aired season" (matches
- * the modal's own default) — targeting a single season from the tile would
- * need the season picker, so that stays a one-click-away modal action.
- * BECAUSE of that whole-series default, the caller's gate (Discover's
- * `quickRequestable`) renders this for a tv title only when the compact
- * live-state poll (issue #370 phase 2) reports `has_history: false` for it —
- * a true first-time request. A
- * tv title with a settled season-scoped row (failed/cancelled/evicted season)
- * re-derives `state === null` too, but a seasons-less POST there would EXPAND
- * the tracked set to the whole aired series, where the modal's "Request again"
+ * is only one create-request code path. A movie is requested at once. A tv
+ * title instead opens the TV request sheet (`TvRequestPicker`, Interactions:
+ * "Gold + on a poster — TV: opens the TV request sheet"), which sends the
+ * request itself — what part of a show to ask for is never guessed from a tile.
+ * The caller's gate (Discover's `quickRequestable`) still renders this for a
+ * tv title only when the compact live-state poll (issue #370 phase 2) reports
+ * `has_history: false` for it — a true first-time request. A tv title with a
+ * settled season-scoped row (failed/cancelled/evicted season) re-derives
+ * `state === null` too, but its retry is the modal's "Request again", which
  * deliberately narrows to the selected season — so every tv retry/re-request
  * stays a modal action.
  *
@@ -63,6 +62,10 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
   // /requests poll settling the tile's real badge (the invalidation this
   // mutation already fires — see useCreateRequest — refetches it shortly).
   const [justRequested, setJustRequested] = useState(false)
+  // tv only: the TV request sheet, and the card trigger to hand focus back to
+  // once the sheet's request succeeds (resolved at click time, like `onRequest`).
+  const [tvPickerOpen, setTvPickerOpen] = useState(false)
+  const returnFocusTo = useRef<HTMLElement | null>(null)
 
   if (justRequested) return null
 
@@ -85,7 +88,7 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
     }
   }
 
-  return (
+  const button = (
     <button
       type="button"
       // Every tile's action reads "Request" — give assistive tech the title so a
@@ -99,6 +102,11 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
         // async mutation unmounts this button) so `onRequest` can restore focus.
         const card = e.currentTarget.closest<HTMLElement>('[data-poster-card]')
         const trigger = card?.querySelector<HTMLElement>('[data-poster-card-trigger]') ?? null
+        if (item.media_type === 'tv') {
+          returnFocusTo.current = trigger
+          setTvPickerOpen(true)
+          return
+        }
         void onRequest(trigger)
       }}
       className={cn(
@@ -128,5 +136,28 @@ export function QuickRequestButton({ item }: QuickRequestButtonProps) {
         </svg>
       )}
     </button>
+  )
+
+  if (item.media_type !== 'tv') return button
+
+  return (
+    <>
+      {button}
+      <TvRequestPicker
+        open={tvPickerOpen}
+        onOpenChange={setTvPickerOpen}
+        tmdbId={item.tmdb_id}
+        title={item.title}
+        onRequested={() => {
+          // The sheet already toasted. Same hand-off as the movie path: this
+          // button is about to unmount, so return focus to the card trigger --
+          // deferred a tick so it lands AFTER the closing sheet restores focus
+          // to this (unmounting) button.
+          const trigger = returnFocusTo.current
+          setJustRequested(true)
+          window.setTimeout(() => trigger?.focus(), 0)
+        }}
+      />
+    </>
   )
 }
