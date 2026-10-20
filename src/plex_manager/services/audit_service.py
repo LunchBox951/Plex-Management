@@ -19,6 +19,11 @@ as the answer path. The read is deliberately NOT a generic log browser: it
 selects exactly the automatic-sign-out action family this module names, so the
 audit table's other rows (and any future ones) do not silently become a web
 resource nobody vetted.
+
+Issue #633 adds the one deliberate exception to that family: a same-server Plex
+relocation (:data:`PLEX_SERVER_RELOCATED_ACTION`). It is the save that USED to
+sign everyone out, so the same Settings list is where an operator looks for it;
+its row says that no one was signed out and why.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from plex_manager.models import AuditLog
 from plex_manager.services.session_lifecycle import ensure_utc
@@ -37,12 +42,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AUTOMATIC_SIGN_OUT_ACTION_TYPES",
+    "PLEX_SERVER_ENTITY_TYPE",
+    "PLEX_SERVER_RELOCATED_ACTION",
     "PLEX_SIGN_IN_EXPIRED_ACTION",
     "SHARE_REVOKED_ACTION",
     "USER_ENTITY_TYPE",
     "SignOutAuditRecord",
     "admin_exempt_action",
     "list_automatic_sign_outs",
+    "plex_server_fingerprint",
     "record",
 ]
 
@@ -58,6 +66,28 @@ SHARE_REVOKED_ACTION: Final = "user.share_revoked"
 #: plex.tv rejected the stored credential, so the share could not be checked at
 #: all. Access was NOT established to be gone -- different words, on purpose.
 PLEX_SIGN_IN_EXPIRED_ACTION: Final = "user.plex_sign_in_expired"
+
+#: ``entity_type`` of a row about the configured Plex server itself. Such a row
+#: has no ``entity_id``: the server is named in the payload by display name and
+#: :func:`plex_server_fingerprint`.
+PLEX_SERVER_ENTITY_TYPE: Final = "plex_server"
+
+#: A verified Plex URL or token change that reached the SAME server identity.
+#: Sessions stay valid, so the row records ``sessions_revoked: 0`` (#633).
+PLEX_SERVER_RELOCATED_ACTION: Final = "plex.server_relocated"
+
+_PLEX_SERVER_FINGERPRINT_LENGTH: Final = 8
+
+
+def plex_server_fingerprint(machine_identifier: str) -> str:
+    """Return the short form of a server identity used in audit rows.
+
+    A prefix rather than a hash, so the operator can match it against the
+    ``machineIdentifier`` Plex itself displays. The identifier is not a secret
+    (Plex serves it on the unauthenticated ``/identity`` endpoint).
+    """
+    return machine_identifier[:_PLEX_SERVER_FINGERPRINT_LENGTH]
+
 
 #: Suffix marking a verdict that was RECORDED for an owner/admin but deliberately
 #: not acted on (ADR-0005 never-locked-out; see ``plex_access_service``).
@@ -189,9 +219,10 @@ async def list_automatic_sign_outs(
 ) -> list[SignOutAuditRecord]:
     """Return the most recent automatic sign-out audit rows, newest first.
 
-    Scoped to :data:`AUTOMATIC_SIGN_OUT_ACTION_TYPES` on purpose: this is the
-    answer to "why was I signed out?", not a general audit browser. ``limit`` is
-    the caller's already-validated bound.
+    Scoped to :data:`AUTOMATIC_SIGN_OUT_ACTION_TYPES` plus
+    :data:`PLEX_SERVER_RELOCATED_ACTION` on purpose: this is the answer to "why
+    was I signed out (or not)?", not a general audit browser. ``limit`` is the
+    caller's already-validated bound.
 
     ``username`` comes ONLY from the name stamped into the row when it was
     written; a row without one reports ``None``, never a name recovered by
@@ -209,8 +240,16 @@ async def list_automatic_sign_outs(
         await session.execute(
             select(AuditLog)
             .where(
-                AuditLog.entity_type == USER_ENTITY_TYPE,
-                AuditLog.action_type.in_(AUTOMATIC_SIGN_OUT_ACTION_TYPES),
+                or_(
+                    and_(
+                        AuditLog.entity_type == USER_ENTITY_TYPE,
+                        AuditLog.action_type.in_(AUTOMATIC_SIGN_OUT_ACTION_TYPES),
+                    ),
+                    and_(
+                        AuditLog.entity_type == PLEX_SERVER_ENTITY_TYPE,
+                        AuditLog.action_type == PLEX_SERVER_RELOCATED_ACTION,
+                    ),
+                )
             )
             # ``created_at`` is a server default with second-ish resolution, so
             # ``id`` breaks ties: two sign-outs inside the same tick must still

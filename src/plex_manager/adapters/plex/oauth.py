@@ -297,6 +297,33 @@ class PlexTvClient:
             )
         return identity
 
+    async def fetch_server_name(self, base_url: str, service_token: str) -> str | None:
+        """Return the server's ``friendlyName`` from its authenticated root.
+
+        ``/identity`` carries no display name, so this reads ``GET /``. Callers
+        must already have verified ``base_url`` and ``service_token`` with the
+        identity ladder; this only labels a server, never authenticates one.
+        ``None`` means the server answered without a name.
+        """
+        try:
+            service_url = ServiceUrl.parse(base_url)
+            url = service_url.endpoint("/")
+        except InvalidServiceUrl as exc:
+            raise PlexVerifyError(
+                _CODE_SERVER_UNREACHABLE,
+                "Plex server URL is invalid",
+            ) from exc
+        _require_header_safe_token(service_token, service_url.host)
+        payload = await self._request_json(
+            "GET",
+            url,
+            headers=self._token_headers(service_token),
+            unreachable_code=_CODE_SERVER_UNREACHABLE,
+            bad_response_code=_CODE_IDENTITY_FAILED,
+            invalid_token_code=CODE_TOKEN_INVALID,
+        )
+        return _get_str(_media_container(payload), "friendlyName")
+
     async def _request_json(
         self,
         method: str,

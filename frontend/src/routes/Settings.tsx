@@ -786,12 +786,26 @@ function SessionsSection() {
  * holds it now is exactly the misattribution the backend refuses to do.
  */
 function signOutSubject(entry: AutomaticSignOut): string {
+  if (isServerRelocation(entry)) return 'Plex server'
   if (entry.username !== null) return entry.username
   return entry.user_id === null ? 'Unknown account' : `Unknown account (id ${entry.user_id})`
 }
 
-/** How the two automatic sign-out causes read to an operator. */
+/**
+ * A Plex URL or token save that verified the same server (issue #633). It
+ * shares this list because it is the save that used to sign everyone out; the
+ * row says why it did not. The backend's description names the server and the
+ * changed settings, never their values.
+ */
+function isServerRelocation(entry: AutomaticSignOut): boolean {
+  return entry.action_type === 'plex.server_relocated'
+}
+
+/** How each recorded cause reads to an operator. */
 function signOutCause(entry: AutomaticSignOut): { label: string; detail: string } {
+  if (isServerRelocation(entry)) {
+    return { label: 'Plex server moved', detail: entry.description ?? '' }
+  }
   if (entry.action_type.startsWith('user.plex_sign_in_expired')) {
     return {
       label: 'Plex sign-in expired',
@@ -806,7 +820,7 @@ function signOutCause(entry: AutomaticSignOut): { label: string; detail: string 
       detail: 'Plex confirmed this account no longer has access to the server.',
     }
   }
-  // Unreachable while the backend only writes the two families above, but a new
+  // Unreachable while the backend only writes the families above, but a new
   // one must show up honestly rather than being silently mislabeled as a share
   // removal.
   return { label: entry.action_type, detail: '' }
@@ -832,8 +846,9 @@ function AutomaticSignOutsSection() {
       <h2 className="font-display text-sm font-semibold text-ink">Automatic sign-outs</h2>
       <p className="mt-1 text-xs text-faint">
         Sign-outs decided by the periodic Plex share re-check — not every automatic one: a session
-        that expires or idles out ends on its own and is not recorded here. This is the durable
-        record — unlike the Logs page, it is not trimmed by log retention.
+        that expires or idles out ends on its own and is not recorded here. A Plex address or token
+        change that reached the same server is listed too, since it keeps everyone signed in. This
+        is the durable record — unlike the Logs page, it is not trimmed by log retention.
       </p>
 
       <div className="mt-4">
@@ -879,7 +894,9 @@ function AutomaticSignOutsSection() {
                   </div>
                   <div className="text-xs text-faint">
                     {formatLastSeen(entry.occurred_at)} ·{' '}
-                    {entry.admin_exempt
+                    {isServerRelocation(entry)
+                      ? 'same server, so no one was signed out'
+                      : entry.admin_exempt
                       ? 'sessions left alone so an administrator can never be locked out — revoke by hand above if the removal is genuine'
                       : `${entry.sessions_revoked} ${
                           entry.sessions_revoked === 1 ? 'session' : 'sessions'
