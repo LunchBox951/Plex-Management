@@ -150,6 +150,8 @@ async def test_add_with_directed_save_path_disables_autotmm() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
             calls.append(dict(httpx.QueryParams(request.content.decode())))
             return httpx.Response(200, text="Ok.")
@@ -161,6 +163,8 @@ async def test_add_with_directed_save_path_disables_autotmm() -> None:
             "savepath": "/downloads/movies",
             "category": "plex-manager",
             "autoTMM": "false",
+            "stopCondition": "MetadataReceived",
+            "stopped": "false",
             "urls": MAGNET,
         }
     ]
@@ -174,13 +178,23 @@ async def test_add_with_no_save_path_omits_autotmm() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add" and request.method == "POST":
             calls.append(dict(httpx.QueryParams(request.content.decode())))
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404, text="unhandled")
 
     await _client(handler).add(MAGNET, "", "plex-manager")
-    assert calls == [{"savepath": "", "category": "plex-manager", "urls": MAGNET}]
+    assert calls == [
+        {
+            "savepath": "",
+            "category": "plex-manager",
+            "urls": MAGNET,
+            "stopCondition": "MetadataReceived",
+            "stopped": "false",
+        }
+    ]
     assert "autoTMM" not in calls[0]
 
 
@@ -500,6 +514,8 @@ async def test_add_torrent_file_url_computes_bencode_hash() -> None:
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -518,6 +534,8 @@ async def test_add_torrent_file_hashes_top_level_info_dict() -> None:
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(200, content=_NESTED_INFO_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -535,6 +553,8 @@ async def test_add_http_redirect_to_magnet_is_followed() -> None:
             return _login_response()
         if str(request.url) == REDIRECT_URL:
             return httpx.Response(302, headers={"Location": REDIRECT_MAGNET})
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -557,6 +577,8 @@ async def test_add_opaque_http_url_is_rejected_before_client_add() -> None:
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -579,6 +601,8 @@ async def test_add_uppercase_http_url_uses_resolver_before_client_add() -> None:
             return _login_response()
         if str(request.url) == upper_url:
             return httpx.Response(200, content=b"not a torrent")
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -611,6 +635,8 @@ async def test_add_oversized_declared_content_length_raises_source_error() -> No
                 content=b"d",
                 headers={"Content-Length": str(oversized_len)},
             )
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -637,6 +663,8 @@ async def test_add_oversized_streamed_body_raises_source_error() -> None:
             response = httpx.Response(200, content=b"d" + b"x" * _MAX_TORRENT_BYTES)
             response.headers.pop("Content-Length", None)
             return response
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -654,6 +682,8 @@ async def test_add_loopback_http_url_is_rejected_before_fetch() -> None:
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -671,6 +701,8 @@ async def test_add_cgnat_http_url_is_rejected_before_fetch() -> None:
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -688,6 +720,8 @@ async def test_add_nat64_loopback_http_url_is_rejected_before_fetch() -> None:
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -707,6 +741,8 @@ async def test_add_http_url_with_invalid_port_is_rejected_before_fetch() -> None
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -734,6 +770,8 @@ async def test_add_unresolvable_http_host_is_rejected_before_fetch(
             return _login_response()
         if str(request.url) == url:
             return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -768,6 +806,8 @@ async def test_add_torrent_from_configured_prowlarr_private_origin_is_allowed() 
             return _login_response()
         if str(request.url) == PROWLARR_DOWNLOAD_URL:
             return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -788,6 +828,8 @@ async def test_other_private_hosts_stay_vetoed_despite_trusted_prowlarr() -> Non
         seen.append(str(request.url))
         if request.url.path == "/api/v2/auth/login":
             return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -818,6 +860,8 @@ async def test_redirect_off_trusted_prowlarr_to_private_host_is_vetoed() -> None
             return _login_response()
         if str(request.url) == PROWLARR_DOWNLOAD_URL:
             return httpx.Response(302, headers={"Location": "http://10.0.0.7/file.torrent"})
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -848,6 +892,8 @@ async def test_add_malformed_redirect_location_raises_source_error() -> None:
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(302, headers={"Location": "http://[::1"})
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -918,6 +964,8 @@ async def test_add_torrent_from_configured_prowlarr_prefixed_origin_is_allowed()
             return _login_response()
         if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
             return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -1002,6 +1050,8 @@ async def test_redirect_off_prefix_same_origin_is_vetoed() -> None:
             return _login_response()
         if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
             return httpx.Response(302, headers={"Location": "http://127.0.0.1:9696/admin"})
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -1090,6 +1140,8 @@ async def test_trusted_source_fetch_forwards_no_stored_credential_headers() -> N
         if str(request.url) == PROWLARR_PREFIXED_DOWNLOAD_URL:
             seen_headers["source"] = request.headers
             return httpx.Response(200, content=_TORRENT_BYTES)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -1937,6 +1989,8 @@ async def test_add_torrent_file_without_info_dict_is_rejected_before_client_add(
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(200, content=b"d3:foo3:bare")
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -1973,6 +2027,8 @@ async def test_add_torrent_with_non_dict_info_value_is_rejected_before_client_ad
             return _login_response()
         if str(request.url) == DOWNLOAD_URL:
             return httpx.Response(200, content=body)
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         if request.url.path == "/api/v2/torrents/add":
             return httpx.Response(200, text="Ok.")
         return httpx.Response(404)
@@ -2639,3 +2695,54 @@ async def test_live_smoke_statuses() -> None:  # pragma: no cover - live only
         client = QbittorrentClient(http, base_url, username, password)
         statuses = await client.get_all_statuses()
         assert isinstance(statuses, list)
+
+
+@pytest.mark.parametrize("version", ["2.8.14", "", "unexpected", "2.11.0junk"])
+async def test_add_refuses_unverified_hold_capability(version: str) -> None:
+    added = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal added
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text=version)
+        if request.url.path == "/api/v2/torrents/add":
+            added = True
+            return httpx.Response(200, text="Ok.")
+        return httpx.Response(404)
+
+    with pytest.raises(QbittorrentError, match="download not added"):
+        await _client(handler).add(MAGNET, "/downloads", "plex-manager")
+    assert not added
+
+
+@pytest.mark.parametrize("confirm", [True, False])
+async def test_select_files_requires_confirmed_video_only_priorities(confirm: bool) -> None:
+    files = [
+        {"name": "movie.mkv", "size": 100, "index": 7, "priority": 1},
+        {"name": "readme.txt", "size": 10, "index": 9, "priority": 1},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return _login_response()
+        if request.url.path == "/api/v2/torrents/files":
+            return httpx.Response(200, json=files)
+        if request.url.path == "/api/v2/torrents/filePrio":
+            fields = dict(httpx.QueryParams(request.content.decode()))
+            if confirm:
+                for file in files:
+                    if str(file["index"]) in fields["id"].split("|"):
+                        file["priority"] = int(fields["priority"])
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    client = _client(handler)
+    manifest = await client.list_files(MAGNET_HASH)
+    if confirm:
+        await client.select_files(MAGNET_HASH, [7], manifest)
+        assert [file["priority"] for file in files] == [1, 0]
+    else:
+        with pytest.raises(QbittorrentError, match="not confirmed"):
+            await client.select_files(MAGNET_HASH, [7], manifest)

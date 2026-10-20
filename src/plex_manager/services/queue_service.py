@@ -233,8 +233,10 @@ from typing import TYPE_CHECKING, Final
 from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 
+from plex_manager.adapters.qbittorrent import QbittorrentError
 from plex_manager.domain.events import DownloadFailed
 from plex_manager.domain.failure_classification import FailureClass, classify_failure_detail
+from plex_manager.domain.payload_validation import inspect_payload
 from plex_manager.domain.reconciler import (
     StallDetection,
     StateTransition,
@@ -249,7 +251,7 @@ from plex_manager.domain.state_machine import (
     DownloadState,
     is_legal_transition,
 )
-from plex_manager.logsafe import safe_int
+from plex_manager.logsafe import safe_int, safe_text
 from plex_manager.models import (
     BlocklistReason,
     Download,
@@ -1022,7 +1024,7 @@ async def _handle_failed(
         record.id,
         DownloadState.Failed.value,
         frozenset({DownloadState.FailedPending.value}),
-        failed_reason=event.reason,
+        failed_reason=record.payload_rejection or event.reason,
         require_failed_reason=completion.observed_failed_reason,
     )
     if not won:
@@ -1285,6 +1287,245 @@ async def list_queue(session: AsyncSession) -> list[QueueRecord]:
     return await SqlDownloadRepository(session).list_active_for_queue()
 
 
+async def reject_payload(
+    session: AsyncSession, qbt: DownloadClientPort, row: DownloadRecord, reason: str
+) -> None:
+    """Persist the content verdict before entering the existing failure lifecycle."""
+    if _is_operator_claimed(row.id):
+        return
+    repo = SqlDownloadRepository(session)
+    if not row.payload_rejection or row.status == DownloadState.Importing.value:
+        won = await repo.update_status_if_in(
+            row.id,
+            DownloadState.ImportBlocked.value
+            if row.status == DownloadState.Importing.value
+            else row.status,
+            frozenset({row.status}),
+            payload_rejection=reason,
+            failed_reason=reason,
+        )
+        if not won:
+            await session.rollback()
+            return
+        session.add(
+            DownloadHistory(
+                tmdb_id=row.tmdb_id,
+                torrent_hash=row.torrent_hash,
+                event_type=DownloadHistoryEvent.failed,
+                source_title=row.release_title,
+                message=f"automatic payload rejection: {reason}",
+            )
+        )
+        await session.commit()
+    try:
+        await mark_failed(
+            session,
+            qbt,
+            download_id=row.id,
+            blocklist=True,
+            remove_torrent=True,
+            allow_claim_supersede=False,
+            allow_adopt_existing_marker=False,
+        )
+    except (
+        InvalidStateTransitionError,
+        RemovalInProgressError,
+        OperatorClaimActiveError,
+        FailedPendingAdoptionRefusedError,
+        LookupError,
+    ):
+        await session.rollback()
+
+
+_UNINSPECTED_NOT_BLOCKLISTED = "; payload never inspected, release not blocklisted"
+
+
+_LEGACY_METADATA_RESTART = (
+    "payload validation pending: restarting legacy metadata with a download hold"
+)
+
+
+async def _restart_legacy_metadata(
+    session: AsyncSession, qbt: DownloadClientPort, row: DownloadRecord
+) -> None:
+    repo = SqlDownloadRepository(session)
+    if not (row.failed_reason or "").startswith(_LEGACY_METADATA_RESTART):
+        won = await repo.update_status_if_in(
+            row.id,
+            row.status,
+            frozenset({row.status}),
+            failed_reason=_LEGACY_METADATA_RESTART,
+        )
+        if not won:
+            await session.rollback()
+            return
+        session.add(
+            DownloadHistory(
+                tmdb_id=row.tmdb_id,
+                torrent_hash=row.torrent_hash,
+                event_type=DownloadHistoryEvent.failed,
+                source_title=row.release_title,
+                message="restarting legacy metadata acquisition with pre-download validation; "
+                "release is not blocklisted",
+            )
+        )
+        await session.commit()
+    await qbt.pause(row.torrent_hash)
+    if _is_operator_claimed(row.id):
+        return
+    try:
+        await mark_failed(
+            session,
+            qbt,
+            download_id=row.id,
+            blocklist=False,
+            remove_torrent=True,
+            allow_claim_supersede=False,
+            allow_adopt_existing_marker=False,
+        )
+    except (
+        InvalidStateTransitionError,
+        RemovalInProgressError,
+        OperatorClaimActiveError,
+        FailedPendingAdoptionRefusedError,
+        LookupError,
+    ):
+        await session.rollback()
+
+
+async def _held_row_changed(repo: SqlDownloadRepository, row: DownloadRecord) -> bool:
+    return await repo.get_by_hash(row.torrent_hash, populate_existing=True) != row
+
+
+async def _validate_held_payload(
+    session: AsyncSession, qbt: DownloadClientPort, row: DownloadRecord
+) -> None:
+    repo = SqlDownloadRepository(session)
+    reason = "payload validation pending: waiting for complete metadata"
+    try:
+        status = await qbt.get_status(row.torrent_hash)
+        restarting = (row.failed_reason or "").startswith(_LEGACY_METADATA_RESTART)
+        if restarting or (
+            status is not None
+            and status.raw_state in {"metaDL", "forcedMetaDL"}
+            and not row.payload_resume
+        ):
+            reason = _LEGACY_METADATA_RESTART
+            await _restart_legacy_metadata(session, qbt, row)
+            return
+        if status is None or status.raw_state in {
+            "metaDL",
+            "forcedMetaDL",
+            # Transient client work hides whether the torrent was running; judge it
+            # once it settles rather than guessing its resume intent.
+            "checkingResumeData",
+            "moving",
+        }:
+            return
+        if not await qbt.list_files(row.torrent_hash):
+            # No manifest means no metadata yet, e.g. a magnet queued behind the
+            # client's active-download limit. Stopping it would keep metadata from
+            # ever arriving; it reaches metaDL and the stall deadline once it starts.
+            if status.raw_state in {"stoppedDL", "pausedDL", "stoppedMetaDL"}:
+                # A stopped magnet never fetches metadata, so nothing would ever
+                # validate or fail it. Restart it like a legacy metadata fetch.
+                reason = _LEGACY_METADATA_RESTART
+                await _restart_legacy_metadata(session, qbt, row)
+            return
+        resume = row.payload_resume
+        if not resume and status.raw_state in {
+            "downloading",
+            "forcedDL",
+            "stalledDL",
+            "queuedDL",
+            "checkingDL",
+            "uploading",
+            "forcedUP",
+            "stalledUP",
+            "queuedUP",
+            "checkingUP",
+        }:
+            # Save the legacy torrent's running intent before stopping it; a restart
+            # must not turn our validation pause into a permanent operator pause.
+            won = await repo.update_status_if_in(
+                row.id,
+                row.status,
+                frozenset({row.status}),
+                payload_resume=True,
+            )
+            if not won:
+                await session.rollback()
+                return
+            await session.commit()
+            resume = True
+        await qbt.pause(row.torrent_hash)
+        status = await qbt.get_status(row.torrent_hash)
+        if status is None or status.raw_state not in {
+            "stoppedDL",
+            "pausedDL",
+            "stoppedUP",
+            "pausedUP",
+        }:
+            return
+        files = await qbt.list_files(row.torrent_hash)
+        if not files or any(not f.name or f.index is None or f.priority is None for f in files):
+            return
+        verdict = inspect_payload([file.name for file in files])
+        if verdict.reason is not None:
+            await reject_payload(session, qbt, row, verdict.reason)
+            return
+        indices = [files[i].index for i in verdict.video_indices]
+        await qbt.select_files(row.torrent_hash, [i for i in indices if i is not None], files)
+        fresh = await repo.get_by_hash(row.torrent_hash, populate_existing=True)
+        if fresh is None or fresh.status != row.status or _is_operator_claimed(row.id):
+            return
+        if resume:
+            await qbt.resume(row.torrent_hash)
+        downloading = row.status in {
+            DownloadState.Downloading.value,
+            DownloadState.MetadataFetching.value,
+            DownloadState.ClientMissing.value,
+        }
+        won = await repo.update_status_if_in(
+            row.id,
+            DownloadState.Downloading.value if downloading else row.status,
+            frozenset({row.status}),
+            payload_pending=False,
+            clear_failed_reason=(row.failed_reason or "").startswith("payload validation pending:"),
+            # A recovered client_missing row gets a fresh grace window, as in reconcile.
+            clear_first_seen_at=downloading,
+        )
+        if not won:
+            await session.rollback()
+            if resume:
+                # Another writer (e.g. an operator mark-failed) took the row while the
+                # resume was in flight; do not leave its torrent running behind it.
+                await qbt.pause(row.torrent_hash)
+            return
+        await session.commit()
+        return
+    except (QbittorrentError, NotImplementedError) as exc:
+        reason = f"{reason}: {safe_text(str(exc))}"
+    finally:
+        # An unresolved hold is visible even when metadata has not arrived yet.
+        fresh = await repo.get_by_hash(row.torrent_hash, populate_existing=True)
+        if (
+            fresh is not None
+            and fresh.payload_pending
+            and not fresh.payload_rejection
+            and fresh.status == row.status
+            and (row.status != DownloadState.ImportBlocked.value or not row.failed_reason)
+            and not _is_operator_claimed(row.id)
+        ):
+            await repo.update_status_if_in(
+                row.id,
+                row.status,
+                frozenset({row.status}),
+                failed_reason=reason,
+            )
+            await session.commit()
+
+
 async def reconcile_and_list(
     qbt: DownloadClientPort,
     session: AsyncSession,
@@ -1317,6 +1558,71 @@ async def reconcile_and_list(
         return rows
     statuses = await qbt.get_statuses_for_hashes([row.torrent_hash for row in rows])
     now = _utcnow()
+
+    present_hashes = {status.info_hash.lower() for status in statuses}
+    raw_states = {status.info_hash.lower(): status.raw_state for status in statuses}
+    held_ids: set[int] = set()
+    # A hold never pauses a magnet that is still fetching metadata, so those rows
+    # keep the issue #165 metadata-stall deadline instead of waiting forever.
+    held_stall_rows: list[DownloadRecord] = []
+    # Most held rows wait unchanged for many cycles; only a persisted change may
+    # invalidate the web caches.
+    held_changed = False
+    for row in rows:
+        if _is_operator_claimed(row.id):
+            continue
+        if row.payload_rejection and row.status != DownloadState.FailedPending.value:
+            await reject_payload(session, qbt, row, row.payload_rejection)
+            held_ids.add(row.id)
+            held_changed |= await _held_row_changed(download_repo, row)
+        elif (
+            row.payload_pending
+            and row.torrent_hash.lower() in present_hashes
+            # A client-reported failure keeps its existing reconcile recovery;
+            # qBittorrent reports it ahead of any stop, so validation would wait forever.
+            and raw_states.get(row.torrent_hash.lower()) not in {"error", "missingFiles"}
+            and row.status
+            in {
+                DownloadState.Downloading.value,
+                DownloadState.MetadataFetching.value,
+                DownloadState.ImportPending.value,
+                DownloadState.ImportBlocked.value,
+                DownloadState.Importing.value,
+                DownloadState.ClientMissing.value,
+            }
+        ):
+            await _validate_held_payload(session, qbt, row)
+            held_ids.add(row.id)
+            held_changed |= await _held_row_changed(download_repo, row)
+            if (
+                row.payload_resume
+                and not (row.failed_reason or "").startswith(_LEGACY_METADATA_RESTART)
+                and raw_states.get(row.torrent_hash.lower()) in {"metaDL", "forcedMetaDL"}
+            ):
+                held_stall_rows.append(row)
+        elif (
+            row.payload_pending
+            and row.torrent_hash.lower() not in present_hashes
+            and row.status
+            in {
+                DownloadState.ImportPending.value,
+                DownloadState.ImportBlocked.value,
+                DownloadState.Importing.value,
+            }
+        ):
+            # A completed payload whose torrent left the client has nothing left to
+            # download, so holding it would only make import retries silent no-ops.
+            # Import still verifies the bytes.
+            if await download_repo.update_status_if_in(
+                row.id, row.status, frozenset({row.status}), payload_pending=False
+            ):
+                await session.commit()
+                held_changed = True
+            else:
+                await session.rollback()
+    if held_changed and changes is not None:
+        changes.queue = changes.requests = changes.blocklist = True
+    rows = [row for row in rows if row.id not in held_ids]
 
     transitions = reconcile(rows, statuses, now=now)
     snapshot = {status.info_hash.lower(): status for status in statuses}
@@ -1436,8 +1742,9 @@ async def reconcile_and_list(
     # fresh. A row an operator ``mark_failed`` currently owns is likewise skipped
     # (the pre-stamp invisibility fast-path, module docstring) -- the operator's
     # own call, not this heal, is what completes it.
-    rows_by_id = {row.id: row for row in rows}
-    for detection in detect_stalls(rows, statuses, now=now):
+    stall_rows = [*rows, *held_stall_rows]
+    rows_by_id = {row.id: row for row in stall_rows}
+    for detection in detect_stalls(stall_rows, statuses, now=now):
         if detection.download_id in transitions_by_id or _is_operator_claimed(
             detection.download_id
         ):
@@ -1509,7 +1816,14 @@ async def reconcile_and_list(
             if detail is not None and detail.source is FailureDetailSource.log
             else event.reason
         )
-        blocklist = classify_failure_detail(classify_text) is not FailureClass.environmental
+        uninspected = event_row.payload_pending and event_row.torrent_hash.lower() not in snapshot
+        if uninspected:
+            # Durable in the stamped reason so a residual heal keeps the verdict.
+            reason += _UNINSPECTED_NOT_BLOCKLISTED
+        blocklist = (
+            not uninspected
+            and classify_failure_detail(classify_text) is not FailureClass.environmental
+        )
         reconcile_completions.append(
             _FailureCompletion(
                 download_id=event_row.id,
@@ -1566,7 +1880,10 @@ async def reconcile_and_list(
             # still skips the blocklist instead of falling back to the poison
             # default. A plain/None reason classifies as release-fault (today's
             # default), so genuinely reconcile-derived strands are unchanged.
-            blocklist = classify_failure_detail(row.failed_reason) is not FailureClass.environmental
+            blocklist = (
+                _UNINSPECTED_NOT_BLOCKLISTED not in (row.failed_reason or "")
+                and classify_failure_detail(row.failed_reason) is not FailureClass.environmental
+            )
         completions.append(
             _FailureCompletion(
                 download_id=row.id,
@@ -1981,6 +2298,7 @@ async def mark_failed(
     if row is None:
         raise LookupError(f"download {download_id} does not exist")
 
+    final_reason = row.payload_rejection or _OPERATOR_FAIL_FINAL_REASON
     current = DownloadState(row.status)
     if current.value in _TERMINAL_STATUS_VALUES:
         raise InvalidStateTransitionError(current.value, DownloadState.Failed.value)
@@ -2192,7 +2510,7 @@ async def mark_failed(
                     download_id,
                     DownloadState.Failed.value,
                     frozenset({DownloadState.FailedPending.value}),
-                    failed_reason=_OPERATOR_FAIL_FINAL_REASON,
+                    failed_reason=final_reason,
                     require_failed_reason=marker,
                 )
                 if not won:

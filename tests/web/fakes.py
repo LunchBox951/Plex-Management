@@ -377,6 +377,14 @@ class FakeQbittorrent:
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         return list(self.files.get(info_hash.lower(), []))
 
+    async def select_files(
+        self, info_hash: str, indices: Sequence[int], expected_files: Sequence[DownloadedFile]
+    ) -> None:
+        self.files[info_hash] = [
+            f.model_copy(update={"priority": 1 if f.index in indices else 0})
+            for f in self.files.get(info_hash, [])
+        ]
+
     async def get_default_save_path(self) -> str | None:
         return self.default_save_path
 
@@ -623,8 +631,10 @@ class FakeLibrary:
         self.scanned.append(path)
         self.scan_calls.append((path, media_type))
 
-    async def list_sections(self, *, use_cache: bool = True) -> list[LibrarySection]:
-        del use_cache  # the fake has no cache to bypass
+    async def list_sections(
+        self, *, use_cache: bool = True, write_cache: bool = True
+    ) -> list[LibrarySection]:
+        del use_cache, write_cache  # the fake has no cache to bypass
         return list(self.sections)
 
     async def watch_state(

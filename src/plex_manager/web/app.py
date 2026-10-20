@@ -198,8 +198,8 @@ def _warn_if_multi_process() -> None:
         _logger.warning(
             "multi-worker configuration detected (%s): this app assumes a "
             "SINGLE process. Its in-process removal, purge-path, "
-            "pressure-exclusion-lease and settings-rotation guards "
-            "(queue_service, purge_service, web.routers.settings) do not "
+            "pressure-exclusion-lease, entitlement-capture and settings-rotation guards "
+            "(queue_service, purge_service, plex_access_service, web.routers.settings) do not "
             "coordinate across worker processes or container replicas, so "
             "running more than one silently reopens the same-hash download "
             "races those guards exist to close -- and lets a disk-pressure "
@@ -1207,8 +1207,9 @@ def _entitlement_capture_context(
         if library is None:
             return None
         # Uncached for the same reason the per-user read is: a stale baseline
-        # would silently mislabel a genuinely filtered view as unfiltered.
-        return len(await library.list_sections(use_cache=False))
+        # would silently mislabel a genuinely filtered view as unfiltered. Not
+        # stored either: this telemetry read is not identity-verified itself.
+        return len(await library.list_sections(use_cache=False, write_cache=False))
 
     return plex_access_service.EntitlementCaptureContext(
         library_for_token=_library_for_token,

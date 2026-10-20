@@ -46,6 +46,7 @@ class AddResult(BaseModel):
 
     torrent_hash: str
     created: bool
+    payload_pending: bool = False
 
 
 class DownloadStatus(BaseModel):
@@ -123,6 +124,8 @@ class DownloadedFile(BaseModel):
 
     name: str
     size_bytes: int
+    index: int | None = None
+    priority: int | None = None
 
 
 @runtime_checkable
@@ -235,6 +238,12 @@ class DownloadClientPort(Protocol):
     async def list_files(self, info_hash: str) -> list[DownloadedFile]:
         """Return the torrent's files (relative path + size) so the importer can
         locate the completed video file."""
+        raise NotImplementedError
+
+    async def select_files(
+        self, info_hash: str, indices: Sequence[int], expected_files: Sequence[DownloadedFile]
+    ) -> None:
+        """Select exactly these manifest file IDs; all others must be skipped."""
         raise NotImplementedError
 
     async def get_default_save_path(self) -> str | None:

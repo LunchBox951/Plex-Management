@@ -264,13 +264,24 @@ def test_probe_rejects_unsupported_suffix_before_subprocess(
 
 
 def test_nonzero_ffprobe_exit_is_deterministic_media_error(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_run(monkeypatch, _completed({}, returncode=1))
+    broken = tmp_path / "broken.mkv"
+    broken.write_bytes(b"not a container")
+
+    with pytest.raises(MediaProbeError, match="rejected") as raised:
+        FfprobeMediaProbe().probe(broken)
+    assert not isinstance(raised.value, MediaProbeUnavailableError)
+
+
+def test_nonzero_ffprobe_exit_on_unreadable_candidate_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _stub_run(monkeypatch, _completed({}, returncode=1))
 
-    with pytest.raises(MediaProbeError, match="rejected") as raised:
-        FfprobeMediaProbe().probe(Path("broken.mkv"))
-    assert not isinstance(raised.value, MediaProbeUnavailableError)
+    with pytest.raises(MediaProbeUnavailableError, match="unreadable"):
+        FfprobeMediaProbe().probe(tmp_path / "vanished.mkv")
 
 
 def test_signal_terminated_ffprobe_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:

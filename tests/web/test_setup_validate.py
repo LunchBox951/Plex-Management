@@ -692,6 +692,8 @@ async def test_validate_qbittorrent_ok(
             return httpx.Response(200, text="Ok.")
         if request.url.path == "/api/v2/app/preferences":
             return httpx.Response(200, json={"save_path": str(tmp_path)})
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         assert request.url.path == "/api/v2/torrents/info"
         return httpx.Response(200, json=[])
 
@@ -732,6 +734,8 @@ async def test_validate_qbittorrent_notes_an_invisible_default_save_path(
             return httpx.Response(
                 200, json={"save_path": "/definitely-not-a-real-host-path/Downloads"}
             )
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         assert request.url.path == "/api/v2/torrents/info"
         return httpx.Response(200, json=[])
 
@@ -758,6 +762,8 @@ async def test_validate_qbittorrent_swallows_a_preferences_probe_failure(
             return httpx.Response(200, text="Ok.")
         if request.url.path == "/api/v2/app/preferences":
             return httpx.Response(500, text="boom")
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.11.0")
         assert request.url.path == "/api/v2/torrents/info"
         return httpx.Response(200, json=[])
 
@@ -770,6 +776,28 @@ async def test_validate_qbittorrent_swallows_a_preferences_probe_failure(
     body = response.json()
     assert body["ok"] is True
     assert body["download_path_note"] is None
+
+
+async def test_validate_qbittorrent_rejects_a_client_older_than_5_0(
+    admin_client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2/auth/login":
+            return httpx.Response(200, text="Ok.")
+        if request.url.path == "/api/v2/app/webapiVersion":
+            return httpx.Response(200, text="2.9.3")
+        assert request.url.path == "/api/v2/torrents/info"
+        return httpx.Response(200, json=[])
+
+    await _use_transport(app, handler)
+    response = await admin_client.post(
+        "/api/v1/setup/validate/qbittorrent",
+        json={"url": "http://qb.local", "username": "admin", "password": "pw"},
+        headers=_CSRF_HEADERS,
+    )
+    body = response.json()
+    assert body["ok"] is False
+    assert body["message"] == "Plex Manager requires qBittorrent 5.0 or newer."
 
 
 async def test_validate_qbittorrent_bad_creds(

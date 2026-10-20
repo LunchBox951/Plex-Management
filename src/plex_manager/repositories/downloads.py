@@ -9,7 +9,7 @@ string literals; it mirrors P4's terminal ``DownloadState`` members.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import CursorResult, delete, exists, or_, select, update
@@ -119,6 +119,9 @@ def _to_record(row: Download, scopes: list[DownloadScopeRecord] | None = None) -
         episodes=row.episodes_json,
         media_type=row.media_type.value if row.media_type is not None else None,
         failed_reason=row.failed_reason,
+        payload_pending=row.payload_pending,
+        payload_resume=row.payload_resume,
+        payload_rejection=row.payload_rejection,
         retry_count=row.retry_count,
         first_seen_at=_as_utc(row.first_seen_at),
         added_at=_as_utc(row.added_at),
@@ -581,7 +584,7 @@ class SqlDownloadRepository:
         return [_to_record(row, scopes.get(row.id, [])) for row in rows]
 
     async def list_active_for_queue(self) -> list[QueueRecord]:
-        """Active (non-terminal) downloads enriched for the human-legible queue.
+        """Active downloads and the last day of payload rejections for the queue.
 
         Queue-specific (issue #134): LEFT OUTER JOINs ``MediaRequest`` to pull in
         ``title``/``poster_url`` without a per-row re-fetch. OUTER (not INNER)
@@ -595,8 +598,17 @@ class SqlDownloadRepository:
         stmt = (
             select(Download, MediaRequest.title, MediaRequest.poster_url)
             .outerjoin(MediaRequest, Download.media_request_id == MediaRequest.id)
-            .where(Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES))
-            .order_by(Download.id)
+            .where(
+                or_(
+                    Download.status.notin_(_TERMINAL_DOWNLOAD_STATUSES),
+                    (Download.status == "failed")
+                    & Download.payload_rejection.is_not(None)
+                    & (Download.failed_at >= datetime.now(UTC) - timedelta(days=1)),
+                )
+            )
+            # Retained rejections first: a client matching the last row for a
+            # request/season then sees an active replacement, never the old failure.
+            .order_by((Download.status == "failed").desc(), Download.id)
         )
         rows = (await self._session.execute(stmt)).all()
         scopes = await self._scopes_by_download([download.id for download, _title, _poster in rows])
@@ -623,6 +635,8 @@ class SqlDownloadRepository:
         media_type: str | None = None,
         release_title: str | None = None,
         timeout_at: datetime | None = None,
+        payload_pending: bool = False,
+        payload_resume: bool = False,
     ) -> DownloadRecord:
         row = Download(
             torrent_hash=torrent_hash,
@@ -636,6 +650,8 @@ class SqlDownloadRepository:
             media_type=MediaType(media_type) if media_type is not None else None,
             release_title=release_title,
             timeout_at=timeout_at,
+            payload_pending=payload_pending,
+            payload_resume=payload_resume,
         )
         self._session.add(row)
         await self._session.flush()
@@ -1147,6 +1163,10 @@ class SqlDownloadRepository:
         timeout_at: datetime | None = None,
         clear_timeout_at: bool = False,
         retry_count: int | None = None,
+        payload_pending: bool | None = None,
+        payload_resume: bool | None = None,
+        payload_rejection: str | None = None,
+        clear_payload_rejection: bool = False,
         require_failed_reason: str | _NoReasonPredicate | None = NO_REASON_PREDICATE,
         require_no_unimported_scope_outside: frozenset[int] | None = None,
     ) -> bool:
@@ -1226,6 +1246,15 @@ class SqlDownloadRepository:
             values["download_path"] = None
         elif download_path is not None:
             values["download_path"] = download_path
+        if payload_resume is not None:
+            values["payload_resume"] = payload_resume
+        if payload_pending is not None:
+            values["payload_pending"] = payload_pending
+        if clear_payload_rejection:
+            values["payload_rejection"] = None
+        elif payload_rejection is not None:
+            values["payload_rejection"] = payload_rejection
+            values["failed_at"] = datetime.now(UTC)
         if clear_failed_reason:
             values["failed_reason"] = None
         elif failed_reason is not None:
