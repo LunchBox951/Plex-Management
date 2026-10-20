@@ -41,6 +41,10 @@ _SHOW_ENTRIES: Final = (
     "stream_disposition=attached_pic:packet=stream_index"
 )
 _UNKNOWN_CODEC_NAMES: Final = frozenset({"", "unknown", "none", "n/a"})
+# ffprobe itself exits only 0 or 1.  126 and 127 come from the dynamic loader
+# (missing library, failed symbol lookup) or a wrapper script, so they mean the
+# binary could not run and never carry a verdict on the candidate.
+_EXEC_FAILURE_EXIT_CODES: Final = frozenset({126, 127})
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -209,6 +213,8 @@ class FfprobeMediaProbe:
 
         if completed.returncode < 0:
             raise MediaProbeUnavailableError("ffprobe terminated without a media verdict")
+        if completed.returncode in _EXEC_FAILURE_EXIT_CODES:
+            raise MediaProbeUnavailableError(f"ffprobe could not run (exit {completed.returncode})")
         if completed.returncode != 0:
             # ffprobe also exits non-zero when it cannot open the file; an unreadable
             # candidate is an outage, never a verdict on its content.
