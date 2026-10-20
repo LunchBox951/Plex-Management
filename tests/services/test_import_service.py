@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import (
 from plex_manager.adapters.filesystem.local import LocalFileSystem, LocalFileSystemError
 from plex_manager.adapters.parser.guessit_adapter import GuessitParser
 from plex_manager.adapters.plex.library import PlexLibraryError
+from plex_manager.adapters.qbittorrent.adapter import QbittorrentError
 from plex_manager.db import Base, enable_sqlite_fk_enforcement
 from plex_manager.domain.quality import WEBDL1080P, QualitySource
 from plex_manager.domain.quality_profile import default_profile
@@ -1132,6 +1133,128 @@ async def test_empty_disk_scan_without_a_manifest_verdict_stays_retryable(
     assert "check volume mounts" in (record.failed_reason or "")
     async with sessionmaker_() as session:
         assert not (await session.execute(select(Blocklist))).scalars().all()
+
+
+class _TorrentGoneQbittorrent(FakeQbittorrent):
+    """A client with no record of the torrent, whose manifest lookup 404s."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.list_files_calls = 0
+
+    async def list_files(self, info_hash: str) -> list[DownloadedFile]:
+        self.list_files_calls += 1
+        raise QbittorrentError("torrent not found")
+
+
+class _ClientOutageQbittorrent(FakeQbittorrent):
+    async def get_status(self, info_hash: str) -> DownloadStatus | None:
+        raise QbittorrentError("qBittorrent is unreachable")
+
+
+async def _resume_importing_from(
+    sessionmaker_: SessionMaker, download_id: int, breadcrumb: Path
+) -> None:
+    """Turn a seeded row into a crash-resumed import with a placement breadcrumb."""
+    breadcrumb.mkdir(parents=True)
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        download.status = DownloadState.Importing.value
+        download.download_path = str(breadcrumb)
+        await session.commit()
+
+
+async def _assert_retryable_torrent_gone_block(
+    sessionmaker_: SessionMaker,
+    record: DownloadRecord | None,
+    qbt: _TorrentGoneQbittorrent,
+) -> None:
+    assert record is not None
+    assert record.status == DownloadState.ImportBlocked.value
+    reason = record.failed_reason or ""
+    assert "no Plex-supported video file" in reason
+    assert "no longer in qBittorrent" in reason
+    assert not reason.startswith(import_service.PATH_NOT_VISIBLE_REASON_PREFIX)
+    assert qbt.list_files_calls == 0
+    assert qbt.removed == []
+    async with sessionmaker_() as session:
+        assert not (await session.execute(select(Blocklist))).scalars().all()
+
+
+async def test_resumed_movie_import_with_torrent_gone_and_no_video_blocks_visibly(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    # Issue #619: without a torrent there is no manifest to consult, so the
+    # empty scan must surface as a retryable block rather than retry silently.
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    download_id, request_id = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    await _resume_importing_from(sessionmaker_, download_id, tmp_path / "downloads" / "gone")
+    qbt = _TorrentGoneQbittorrent()
+
+    record = await _import(sessionmaker_, download_id, movies_root, qbt, FakeLibrary())
+
+    await _assert_retryable_torrent_gone_block(sessionmaker_, record, qbt)
+    async with sessionmaker_() as session:
+        request = await session.get(MediaRequest, request_id)
+        assert request is not None and request.status == RequestStatus.import_blocked
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["season", "targets"])
+async def test_resumed_tv_import_with_torrent_gone_and_no_video_blocks_visibly(
+    tmp_path: Path, sessionmaker_: SessionMaker, scoped: bool
+) -> None:
+    tv_root = tmp_path / "tv"
+    tv_root.mkdir()
+    if scoped:
+        download_id, request_id = await _seed_tv_pack_with_s1_scope(sessionmaker_)
+    else:
+        download_id, request_id, _ = await _seed_tv(sessionmaker_, season=1)
+    await _resume_importing_from(sessionmaker_, download_id, tmp_path / "downloads" / "gone")
+    qbt = _TorrentGoneQbittorrent()
+
+    record = await _import_tv(sessionmaker_, download_id, tv_root, qbt, FakeLibrary())
+
+    await _assert_retryable_torrent_gone_block(sessionmaker_, record, qbt)
+    async with sessionmaker_() as session:
+        season = (
+            await session.execute(
+                select(SeasonRequest).where(
+                    SeasonRequest.media_request_id == request_id,
+                    SeasonRequest.season_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert season.status.value == RequestStatus.import_blocked.value
+
+
+async def test_resumed_import_during_client_outage_retries_without_blocking(
+    tmp_path: Path, sessionmaker_: SessionMaker
+) -> None:
+    movies_root = tmp_path / "library"
+    movies_root.mkdir()
+    download_id, _ = await _seed(
+        sessionmaker_,
+        request_status=RequestStatus.downloading,
+        download_status=DownloadState.ImportPending.value,
+    )
+    await _resume_importing_from(sessionmaker_, download_id, tmp_path / "downloads" / "gone")
+
+    with pytest.raises(QbittorrentError):
+        await _import(
+            sessionmaker_, download_id, movies_root, _ClientOutageQbittorrent(), FakeLibrary()
+        )
+
+    async with sessionmaker_() as session:
+        download = await session.get(Download, download_id)
+        assert download is not None
+        assert download.status == DownloadState.Importing.value
+        assert download.failed_reason is None
 
 
 async def test_import_ignores_non_video_siblings_and_associates_only_verified_video(

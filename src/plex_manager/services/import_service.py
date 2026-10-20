@@ -544,18 +544,31 @@ class _NoVideoFilesError(_VideoVerificationError):
         self.probed = probed
 
 
-async def _no_video_is_confirmed(
-    qbt: DownloadClientPort, torrent_hash: str, exc: _NoVideoFilesError
-) -> bool:
-    """Whether the release itself, not this host, lacks a video to import.
+async def _unconfirmed_no_video_reason(
+    qbt: DownloadClientPort,
+    torrent_hash: str,
+    status: DownloadStatus | None,
+    exc: _NoVideoFilesError,
+) -> str | None:
+    """The retryable block reason when the release is not proven to lack video.
 
-    An empty scan of a readable directory can follow a manual deletion or a mount
-    race, so it only counts when the client's own manifest has no video either.
+    Returns ``None`` when the release itself, not this host, lacks a video to
+    import. An empty scan of a readable directory can follow a manual deletion or
+    a mount race, so it only counts when the client's own manifest has no video
+    either. A torrent already gone from the client (``status`` is ``None``) has no
+    manifest to consult, so the release cannot be judged and the row blocks.
     """
     if exc.probed:
-        return True
+        return None
+    if status is None:
+        return (
+            f"{exc}; the torrent is no longer in qBittorrent, so the release cannot be "
+            "checked (restore the files and retry, or mark failed to search again)"
+        )
     files = await qbt.list_files(torrent_hash)
-    return bool(files) and not inspect_payload([f.name for f in files]).video_indices
+    if files and not inspect_payload([f.name for f in files]).video_indices:
+        return None
+    return f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)"
 
 
 class _VideoVerificationUnavailableError(_VideoVerificationError):
@@ -1400,12 +1413,13 @@ async def _import_download_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     except _NoVideoFilesError as exc:
-        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+        unconfirmed_reason = await _unconfirmed_no_video_reason(qbt, torrent_hash, status, exc)
+        if unconfirmed_reason is not None:
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                unconfirmed_reason,
                 request_id=request.id,
             )
             return await download_repo.get_by_hash(torrent_hash)
@@ -1875,12 +1889,13 @@ async def _import_tv_targets_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     except _NoVideoFilesError as exc:
-        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+        unconfirmed_reason = await _unconfirmed_no_video_reason(qbt, torrent_hash, status, exc)
+        if unconfirmed_reason is not None:
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                unconfirmed_reason,
                 request_id=request.id,
                 seasons=target_seasons,
             )
@@ -2347,12 +2362,13 @@ async def _import_tv_locked(
         )
         return await download_repo.get_by_hash(torrent_hash)
     except _NoVideoFilesError as exc:
-        if not await _no_video_is_confirmed(qbt, torrent_hash, exc):
+        unconfirmed_reason = await _unconfirmed_no_video_reason(qbt, torrent_hash, status, exc)
+        if unconfirmed_reason is not None:
             await _block(
                 session,
                 download_repo,
                 download_id,
-                f"{exc}; qBittorrent does not confirm the release lacks one (check volume mounts)",
+                unconfirmed_reason,
                 request_id=request.id,
                 season=season,
             )
