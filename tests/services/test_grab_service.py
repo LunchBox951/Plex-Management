@@ -5480,3 +5480,64 @@ async def test_regrabbed_force_started_orphan_keeps_force_start(
         await queue_service.reconcile_and_list(qbt, session)
     assert qbt.force_started == [_HASH]
     assert qbt.resumed == 0
+
+
+@pytest.mark.parametrize(
+    ("created", "force_start"),
+    [
+        # This grab's own held add.
+        (True, False),
+        # A force-started held orphan from a grab that crashed before its row committed.
+        (False, True),
+    ],
+)
+async def test_create_conflict_reuse_keeps_payload_hold(
+    sessionmaker_: SessionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+    created: bool,
+    force_start: bool,
+) -> None:
+    # A terminal row for the same hash commits between this grab's hash lookup and
+    # its insert, so the grab reuses that row from the create-conflict handler.
+    class HeldClient(_HeldOrphanClient):
+        async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
+            result = await super().add(magnet_or_url, save_path, category)
+            return result.model_copy(update={"created": created})
+
+    qbt = HeldClient(
+        statuses=[
+            DownloadStatus(
+                info_hash=_HASH, name="C", raw_state="forcedMetaDL", force_start=force_start
+            )
+        ]
+    )
+    async with sessionmaker_() as session:
+        request = MediaRequest(
+            tmdb_id=300, media_type=MediaType.movie, title="C", status=RequestStatus.searching
+        )
+        session.add(request)
+        await session.commit()
+        request_id = request.id
+
+    real_create = grab_service.SqlDownloadRepository.create
+
+    async def racing_create(
+        self: grab_service.SqlDownloadRepository, **kwargs: Any
+    ) -> DownloadRecord:
+        async with sessionmaker_() as other:
+            other.add(Download(torrent_hash=_HASH, status="failed", media_request_id=request_id))
+            await other.commit()
+        return await real_create(self, **kwargs)
+
+    monkeypatch.setattr(grab_service.SqlDownloadRepository, "create", racing_create)
+
+    async with sessionmaker_() as session:
+        await grab_service.grab(
+            qbt, session, scored=_scored(_HASH), request_id=request_id, tmdb_id=300
+        )
+    async with sessionmaker_() as session:
+        row = (await session.execute(select(Download))).scalar_one()
+    assert row.status == "downloading"
+    assert row.payload_pending
+    assert row.payload_resume
+    assert row.payload_force_start is force_start
