@@ -45,6 +45,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   files only. Requires qBittorrent 5.0 or newer (WebAPI 2.11.0); older clients
   fail setup validation and refuse new grabs rather than download unchecked.
   Ships migration `609a01` and ADR-0031 (#609).
+- Version: `__version__`, the OpenAPI `info.version` and the frontend package version are now 1.1.0, so every `:edge` build carries the `org.opencontainers.image.version` label `1.1.0` that the promote gate checks (#586, #562).
+- Docs: proposed ADR-0029 (durable pre-add intent for grab-window integrity) and ADR-0030, which records ADR-0029's review gaps and stages the rollout behind an I0 compatibility release. Neither is accepted, and no behaviour changes (#565, #571, #588).
 - CI: parallelized the Python quality-gate test run, and eliminated pytest
   warnings under Python 3.12 and 3.14 (#543, #544).
 - Repo docs: archived the completed v1 planning docs under `docs/archive/`,
@@ -64,6 +66,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `frontend-deps` group bump: `@tanstack/react-query` plus the
   `@testing-library/*`, `@vitejs/plugin-react`, `eslint`, `typescript-eslint`,
   `vite`, and `vitest` dev dependencies (#581).
+- `python-deps` group bumps: pydantic, ruff and anyio (#592), then fastapi 0.143.3, uvicorn 0.54.0, pydantic 2.14.1, pydantic-settings 2.16.0, SQLAlchemy 2.0.55, alembic 1.20.0, cryptography 50.0.2, httpx2/httpcore2 2.13.1, starlette 1.8.0, ruff 0.17.1, pyright 1.1.414 and other transitive pins (#656). Dependabot now skips SQLAlchemy minor updates until the 2.1 migration in #615; 2.0.x patch releases still arrive (#616).
+- `frontend-deps` group bumps: `react-router`, `eslint`, `typescript-eslint`, `globals` and `vitest` 5 (#593), then `react`/`react-dom` 19.3, `react-router` 8.4, `@radix-ui/react-dialog`, `@radix-ui/react-toast`, `@tanstack/react-query`, `vite` 8.3 and other dev dependencies (#611, #655). Transitive frontend lockfile bumps: `browserslist` 4.28.9 (#594), `js-yaml` 4.3.2 (#596), `undici` 8.11.2 (#606) and `brace-expansion` 2.1.7 (#610).
 
 ### Fixed
 - Changing the Plex URL or token in Settings no longer signs everyone out when the change reaches the same server. The save still runs the full verification (including token re-entry for a new address), and a matching `machineIdentifier` now commits in place: sessions stay valid and the watchlist worker is not woken to clear snapshots. Each such save writes one audit record, without the URL or token, that names the server and appears in Settings → Automatic sign-outs. A change that reaches a different server, or one made before a server identity was recorded, still signs everyone out (#633).
@@ -92,6 +96,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after that final read means the delete worker is already running, which
   is the documented physical-completion exclusion, not a closable window
   (#570, #575).
+- Updater: the sidecar no longer JSON-decodes a coordinator response body larger than 16 KiB. An oversized error body is logged through the existing opaque summary as `coordinator_unavailable`, and an oversized success body fails as `coordinator_invalid_response` (#573, #585).
 - Updater: non-2xx coordinator responses (other than the separately-handled
   409 conflict path) now log the request path, status, and either the exact
   app error code (allowlisted) or an opaque-body summary (allowlisted media
@@ -116,6 +121,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer starve the rest of the sweep's backlog (#559).
 
 ### Security
+- Bumped Mako to 1.4.2 (#614) and then 1.4.3 (#656), resolving GHSA-5639-2j2p-m4mx (medium: a drive-letter URI could bypass `TemplateLookup`'s directory-traversal check on Windows). Mako is used only by Alembic's revision template and the container runs Linux, so this is a supply-chain hygiene bump rather than an exploitable path here.
+- Bumped the `wolfi-base` container base image digest `57108e5` → `918a593` (#590) → `9a8d954` (#599) → `c2a4815` (#621).
 - Bumped the container's `python-3.14` APK pin from 3.14.6-r4 to 3.14.7-r4,
   resolving CVE-2025-15366 (medium, `imaplib`) and CVE-2026-6879 (low, XML
   parsing) reported by Trivy against the `:edge` image. The app imports
