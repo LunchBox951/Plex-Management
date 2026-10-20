@@ -1,7 +1,7 @@
 import { cn } from '../../lib/cn'
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
-export type ButtonSize = 'sm' | 'md'
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'destructive'
+export type ButtonSize = 'sm' | 'md' | 'lg'
 
 const VARIANTS: Record<ButtonVariant, string> = {
   primary: 'bg-gold text-gold-ink hover:bg-gold-hover focus-visible:ring-gold/60',
@@ -10,11 +10,14 @@ const VARIANTS: Record<ButtonVariant, string> = {
   ghost: 'bg-transparent text-muted hover:text-ink hover:bg-white/6 focus-visible:ring-white/20',
   danger:
     'bg-error/15 text-error hover:bg-error/25 ring-1 ring-inset ring-error/30 focus-visible:ring-error/50',
+  // The confirm button of a ConfirmDialog: solid, named by what it does.
+  destructive: 'bg-error text-gold-ink hover:bg-error/90 focus-visible:ring-error/60',
 }
 
 const SIZES: Record<ButtonSize, string> = {
   sm: 'h-8 px-3 text-[13px]',
   md: 'h-10 px-4 text-sm',
+  lg: 'h-12 px-5 text-[15px]',
 }
 
 /** Shared class string so a styled <Link> (LinkButton) matches <Button> exactly. */

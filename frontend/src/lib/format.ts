@@ -19,3 +19,18 @@ export function formatTimestamp(value: string | null | undefined): string {
   if (!value) return 'never'
   return new Date(value).toLocaleString()
 }
+
+/** An ISO timestamp -> a short relative age: `"now"`, `"5m"`, `"3h"`, `"2d"`, then
+ * a short date. `now` is injectable for tests. */
+export function formatRelative(value: string, now: number = Date.now()): string {
+  const then = new Date(value).getTime()
+  if (!Number.isFinite(then)) return ''
+  const minutes = Math.floor((now - then) / 60_000)
+  if (minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  const days = Math.floor(hours / 24)
+  if (days < 7) return `${days}d`
+  return new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}

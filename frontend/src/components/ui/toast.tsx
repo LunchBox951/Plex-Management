@@ -4,17 +4,25 @@ import { cn } from '../../lib/cn'
 
 export type ToastIntent = 'info' | 'success' | 'warning' | 'error'
 
+/** One follow-up a toast can offer: Undo, Open it. Clicking it closes the toast. */
+interface ToastAction {
+  label: string
+  onClick: () => void
+}
+
 interface ToastItem {
   id: number
   title: string
   description?: string
   intent: ToastIntent
+  action?: ToastAction
 }
 
 interface ToastInput {
   title: string
   description?: string
   intent?: ToastIntent
+  action?: ToastAction
 }
 
 interface ToastContextValue {
@@ -53,6 +61,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         {items.map((item) => (
           <RadixToast.Root
             key={item.id}
+            // A toast that offers Undo stays a little longer so it can be used.
+            {...(item.action ? { duration: 6500 } : {})}
             onOpenChange={(open) => {
               if (!open) remove(item.id)
             }}
@@ -72,6 +82,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 </RadixToast.Description>
               ) : null}
             </div>
+            {item.action ? (
+              <RadixToast.Action
+                altText={item.action.label}
+                onClick={item.action.onClick}
+                className="ml-auto shrink-0 self-center rounded-md px-2 py-1 text-[13px] font-semibold text-gold outline-none hover:bg-gold/10 focus-visible:ring-2 focus-visible:ring-gold/60"
+              >
+                {item.action.label}
+              </RadixToast.Action>
+            ) : null}
           </RadixToast.Root>
         ))}
         <RadixToast.Viewport className="fixed right-0 bottom-0 z-[60] m-4 flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2 outline-none" />

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, formatTimestamp } from './format'
+import { formatBytes, formatRelative, formatTimestamp } from './format'
 
 describe('formatBytes', () => {
   it('renders bytes below 1024 with no decimal', () => {
@@ -28,5 +28,21 @@ describe('formatTimestamp', () => {
     const rendered = formatTimestamp('2026-01-01T00:00:00Z')
     expect(rendered).not.toBe('never')
     expect(rendered.length).toBeGreaterThan(0)
+  })
+})
+
+describe('formatRelative', () => {
+  const now = Date.parse('2026-10-20T12:00:00Z')
+
+  it('reads recent times as short relative ages', () => {
+    expect(formatRelative('2026-10-20T11:59:40Z', now)).toBe('now')
+    expect(formatRelative('2026-10-20T11:55:00Z', now)).toBe('5m')
+    expect(formatRelative('2026-10-20T09:00:00Z', now)).toBe('3h')
+    expect(formatRelative('2026-10-18T12:00:00Z', now)).toBe('2d')
+  })
+
+  it('falls back to a short date after a week, and to nothing for garbage', () => {
+    expect(formatRelative('2026-10-01T12:00:00Z', now)).not.toMatch(/^\d+[mhd]$/)
+    expect(formatRelative('not a date', now)).toBe('')
   })
 })

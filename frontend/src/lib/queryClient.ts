@@ -75,6 +75,8 @@ export const queryKeys = {
   requestsByTitle: (mediaType: string, tmdbId: number) =>
     ['requests', 'by-title', mediaType, tmdbId] as const,
   queue: ['queue'] as const,
+  // UI overhaul: the notification inbox (501 until the backend lands).
+  notifications: ['notifications'] as const,
   blocklist: (tmdbId?: number) => ['blocklist', tmdbId ?? 'all'] as const,
   qualityProfile: ['quality-profile'] as const,
   discover: (query: string, year?: number) => ['discover', query, year ?? null] as const,
