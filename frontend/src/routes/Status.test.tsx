@@ -799,7 +799,7 @@ describe('Status', () => {
     expect(screen.getByText('No such file or directory')).toBeInTheDocument()
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
     const link = screen.getByRole('link', { name: /fix in settings/i })
-    expect(link).toHaveAttribute('href', '/settings')
+    expect(link).toHaveAttribute('href', '/manage/settings')
   })
 
   it('"Free space now" triggers the evict mutation and reports an honest outcome', async () => {

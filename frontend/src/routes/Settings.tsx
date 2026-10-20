@@ -1837,7 +1837,7 @@ export function Settings() {
             Ordered qualities with a hard cutoff. Read-only in v1.
           </p>
           <div className="mt-4">
-            <LinkButton variant="secondary" size="sm" to="/quality">
+            <LinkButton variant="secondary" size="sm" to="/manage/quality">
               View profile
             </LinkButton>
           </div>
@@ -1849,7 +1849,7 @@ export function Settings() {
             Review releases that Plex Manager must not grab again.
           </p>
           <div className="mt-4">
-            <LinkButton variant="secondary" size="sm" to="/blocklist">
+            <LinkButton variant="secondary" size="sm" to="/manage/blocklist">
               Manage blocklist
             </LinkButton>
           </div>

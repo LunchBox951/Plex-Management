@@ -12,8 +12,15 @@ import { useDiscoverTilePresentation } from './useDiscoverTilePresentation'
 const SEARCH_DEBOUNCE_MS = 300
 
 interface SearchOverlayProps {
+  /**
+   * Controlled open state. Lets the shell open search from elsewhere (the phone
+   * tab bar). Omit to let the overlay manage its own state.
+   */
+  open?: boolean
   /** Lets the shell pause background motion while this full-screen dialog is open. */
   onOpenChange?: (open: boolean) => void
+  /** `field`: the header search field opens it. `none`: opened only via `open`. */
+  trigger?: 'field' | 'none'
 }
 
 function useDebounced<T>(value: T, delayMs: number): [T, (nextValue: T) => void] {
@@ -27,24 +34,6 @@ function useDebounced<T>(value: T, delayMs: number): [T, (nextValue: T) => void]
   return [debounced, setDebounced]
 }
 
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false
-  return (
-    target.isContentEditable ||
-    target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])') !==
-      null
-  )
-}
-
-function anotherDialogIsOpen(): boolean {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>('[role="dialog"], [role="alertdialog"]'),
-  ).some(
-    (dialog) =>
-      dialog.getAttribute('data-state') !== 'closed' &&
-      dialog.getAttribute('aria-hidden') !== 'true',
-  )
-}
 
 function popularTitles(home: ReturnType<typeof useDiscoverHome>['data']): DiscoverResult[] {
   const seen = new Set<string>()
@@ -64,8 +53,17 @@ function popularTitles(home: ReturnType<typeof useDiscoverHome>['data']): Discov
 }
 
 /** Global, accessible TMDB search mounted in the authenticated app header. */
-export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
-  const [open, setOpen] = useState(false)
+export function SearchOverlay({
+  open: controlledOpen,
+  onOpenChange,
+  trigger = 'field',
+}: SearchOverlayProps = {}) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false)
+  const open = controlledOpen ?? uncontrolledOpen
+  const setOpen = (nextOpen: boolean) => {
+    if (controlledOpen === undefined) setUncontrolledOpen(nextOpen)
+    else onOpenChange?.(nextOpen)
+  }
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<DiscoverResult | null>(null)
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -111,30 +109,6 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
     [onOpenChange],
   )
 
-  useEffect(() => {
-    const openWithSlash = (event: KeyboardEvent) => {
-      if (
-        event.key !== '/' ||
-        event.defaultPrevented ||
-        event.repeat ||
-        event.altKey ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.shiftKey ||
-        isEditableTarget(event.target) ||
-        isEditableTarget(document.activeElement) ||
-        anotherDialogIsOpen()
-      ) {
-        return
-      }
-
-      event.preventDefault()
-      setOpen(true)
-    }
-
-    document.addEventListener('keydown', openWithSlash)
-    return () => document.removeEventListener('keydown', openWithSlash)
-  }, [])
 
   const onSearchOpenChange = (nextOpen: boolean) => {
     setOpen(nextOpen)
@@ -198,23 +172,22 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
 
   return (
     <RadixDialog.Root open={open} onOpenChange={onSearchOpenChange}>
-      <RadixDialog.Trigger asChild>
-        <button
-          ref={triggerRef}
-          type="button"
-          aria-label="Search TMDB to request"
-          aria-haspopup="dialog"
-          className="flex size-10 shrink-0 items-center justify-center gap-2 rounded-full bg-white/6 text-faint ring-1 ring-inset ring-white/10 transition-colors hover:bg-white/10 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60 lg:h-9 lg:w-[13.25rem] lg:justify-start lg:px-3"
-        >
-          <SearchIcon className="size-4 shrink-0" />
-          <span className="hidden min-w-0 flex-1 truncate text-left text-[13px] font-medium lg:block">
-            Search TMDB to request…
-          </span>
-          <kbd className="hidden shrink-0 rounded-md bg-black/25 px-1.5 py-0.5 font-mono text-[10px] text-faint ring-1 ring-inset ring-white/10 lg:inline-flex">
-            /
-          </kbd>
-        </button>
-      </RadixDialog.Trigger>
+      {trigger === 'field' ? (
+        <RadixDialog.Trigger asChild>
+          <button
+            ref={triggerRef}
+            type="button"
+            aria-label="Search movies and shows"
+            aria-haspopup="dialog"
+            className="flex h-9 w-[15rem] shrink-0 items-center gap-2 rounded-full bg-white/6 px-3 text-faint ring-1 ring-inset ring-white/8 transition-colors hover:bg-white/10 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold/60 xl:w-[16.5rem]"
+          >
+            <SearchIcon className="size-4 shrink-0" />
+            <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">
+              Search movies and shows
+            </span>
+          </button>
+        </RadixDialog.Trigger>
+      ) : null}
 
       <RadixDialog.Portal>
         <RadixDialog.Overlay className="fixed inset-0 z-50 bg-black/85" />
@@ -230,7 +203,7 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
             triggerRef.current?.focus()
           }}
         >
-          <RadixDialog.Title className="sr-only">Search TMDB</RadixDialog.Title>
+          <RadixDialog.Title className="sr-only">Search movies and shows</RadixDialog.Title>
           <RadixDialog.Description className="sr-only">
             Search for a movie or TV show to view details and request it.
           </RadixDialog.Description>
@@ -244,15 +217,12 @@ export function SearchOverlay({ onOpenChange }: SearchOverlayProps = {}) {
                   type="search"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  aria-label="Search TMDB"
-                  placeholder="Search TMDB to request…"
+                  aria-label="Search movies and shows"
+                  placeholder="Search movies and shows"
                   autoComplete="off"
                   className="h-14 w-full rounded-2xl bg-surface pr-4 pl-12 text-lg text-ink ring-1 ring-inset ring-white/10 outline-none placeholder:text-faint focus-visible:ring-2 focus-visible:ring-gold/50 sm:h-16 sm:pr-5 sm:pl-14 sm:text-[26px]"
                 />
               </div>
-              <kbd className="hidden font-mono text-[11px] tracking-wide text-faint sm:block">
-                ESC
-              </kbd>
               <RadixDialog.Close asChild>
                 <button
                   type="button"

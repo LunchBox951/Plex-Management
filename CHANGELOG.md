@@ -7,6 +7,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- UI overhaul, first draft (ADR-0032): a new header with Home / Movies / TV /
+  My requests and a Manage mode for admins (tabs instead of a header link
+  row), a phone bottom tab bar, Home with "Ready to watch" and "On the way",
+  My requests grouped by state with a "Let the admin know" problem card,
+  Manage › Requests (filters, per-row action menu, bulk actions, side-effect
+  confirmations) and Needs attention, a notification bell and page, a TV
+  request sheet (latest season, new episodes, chosen episodes or seasons, every
+  season) and the two-ticket logo. Planned endpoints ship as 501
+  `not_implemented` stubs with their final contracts: notifications,
+  `POST /requests/{id}/notify-admin`, `POST /queue/{id}/force-import`, and the
+  `tv_mode` request field. New read-only `GET /discover/tv/{id}/seasons` and
+  `GET /discover/tv/{id}/seasons/{n}` feed the TV request sheet. The search
+  `/` keyboard shortcut is removed.
 - Capture-only section entitlements (PR-3 of the auth-revalidation design):
   the share sweep and a detached post-sign-in step now record each shared
   user's Plex section entitlements (no enforcement yet — that is PR-5), with

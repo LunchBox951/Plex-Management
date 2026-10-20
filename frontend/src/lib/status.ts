@@ -144,6 +144,23 @@ export function isInFlightRequestStatus(status: string): boolean {
 }
 
 /**
+ * The `RequestStatus` values that are stuck and waiting on an admin decision —
+ * the Manage pill's red count and the Needs attention tab (UI overhaul).
+ * `no_acceptable_release` (re-searches on a schedule but usually needs a person
+ * to pick a release or relax the profile) and `import_blocked` (waits for retry,
+ * Import anyway, or Mark as bad). Terminal `failed` is deliberately NOT counted:
+ * it never clears by itself, so counting it would keep the pill lit forever.
+ */
+export const NEEDS_ATTENTION_REQUEST_STATUSES: ReadonlySet<string> = new Set([
+  'no_acceptable_release',
+  'import_blocked',
+])
+
+export function needsAttention(status: string): boolean {
+  return NEEDS_ATTENTION_REQUEST_STATUSES.has(status)
+}
+
+/**
  * The download states Mark failed / Blocklist & fail -- and the title modal's
  * in-flight "report a problem", which drives the very same `mark_failed`
  * mutation on a queue download -- can act on without a 409: every state that

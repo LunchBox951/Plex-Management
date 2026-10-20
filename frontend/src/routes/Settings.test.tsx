@@ -389,10 +389,10 @@ describe('Settings — admin grammar and saved service health', () => {
     expect(screen.getByRole('checkbox', { name: /^Enable automatic eviction/i })).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /^Proactive eviction/i })).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /^Enable auto-grab/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'View profile' })).toHaveAttribute('href', '/quality')
+    expect(screen.getByRole('link', { name: 'View profile' })).toHaveAttribute('href', '/manage/quality')
     expect(screen.getByRole('link', { name: 'Manage blocklist' })).toHaveAttribute(
       'href',
-      '/blocklist',
+      '/manage/blocklist',
     )
   })
 })
