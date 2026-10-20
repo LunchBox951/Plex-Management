@@ -332,6 +332,8 @@ class FakeQbittorrent:
         # call was scoped to -- lets a test assert reconcile requested exactly
         # its tracked hashes (issue #216), never the whole inventory.
         self.status_queries: list[list[str]] = []
+        # Lowercased hashes passed to ``force_start``.
+        self.force_started: list[str] = []
 
     async def add(self, magnet_or_url: str, save_path: str, category: str) -> AddResult:
         if magnet_or_url in self.source_errors:
@@ -364,6 +366,9 @@ class FakeQbittorrent:
 
     async def resume(self, info_hash: str) -> None:
         return None
+
+    async def force_start(self, info_hash: str) -> None:
+        self.force_started.append(info_hash.lower())
 
     async def remove(self, info_hash: str, *, delete_files: bool) -> None:
         self.removed.append((info_hash.lower(), delete_files))

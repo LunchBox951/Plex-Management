@@ -1416,10 +1416,12 @@ async def _validate_held_payload(
         if status is None or status.raw_state in {
             "metaDL",
             "forcedMetaDL",
-            # Transient client work hides whether the torrent was running; judge it
-            # once it settles rather than guessing its resume intent.
+            # Transient or ambiguous client states hide whether the torrent was
+            # running; judge it once it settles rather than guessing its resume intent.
             "checkingResumeData",
             "moving",
+            "allocating",
+            "unknown",
         }:
             return
         if not await qbt.list_files(row.torrent_hash):
@@ -1433,31 +1435,39 @@ async def _validate_held_payload(
                 await _restart_legacy_metadata(session, qbt, row)
             return
         resume = row.payload_resume
-        if not resume and status.raw_state in {
-            "downloading",
-            "forcedDL",
-            "stalledDL",
-            "queuedDL",
-            "checkingDL",
-            "uploading",
-            "forcedUP",
-            "stalledUP",
-            "queuedUP",
-            "checkingUP",
-        }:
+        force_start = row.payload_force_start
+        if not resume and (
+            status.force_start
+            or status.raw_state
+            in {
+                "downloading",
+                "forcedDL",
+                "stalledDL",
+                "queuedDL",
+                "checkingDL",
+                "uploading",
+                "forcedUP",
+                "stalledUP",
+                "queuedUP",
+                "checkingUP",
+            }
+        ):
             # Save the legacy torrent's running intent before stopping it; a restart
             # must not turn our validation pause into a permanent operator pause.
+            # Stopping clears the client's force-start flag, so record it now too.
             won = await repo.update_status_if_in(
                 row.id,
                 row.status,
                 frozenset({row.status}),
                 payload_resume=True,
+                payload_force_start=status.force_start,
             )
             if not won:
                 await session.rollback()
                 return
             await session.commit()
             resume = True
+            force_start = status.force_start
         await qbt.pause(row.torrent_hash)
         status = await qbt.get_status(row.torrent_hash)
         if status is None or status.raw_state not in {
@@ -1479,7 +1489,10 @@ async def _validate_held_payload(
         fresh = await repo.get_by_hash(row.torrent_hash, populate_existing=True)
         if fresh is None or fresh.status != row.status or _is_operator_claimed(row.id):
             return
-        if resume:
+        if resume and force_start:
+            # setForceStart also starts the stopped torrent, so no separate start.
+            await qbt.force_start(row.torrent_hash)
+        elif resume:
             await qbt.resume(row.torrent_hash)
         downloading = row.status in {
             DownloadState.Downloading.value,

@@ -53,7 +53,9 @@ class DownloadStatus(BaseModel):
     """A point-in-time snapshot of one torrent in the download client.
 
     ``raw_state`` is the client's own state string (e.g. ``downloading``,
-    ``stoppedUP``); the reconciler maps it to a domain ``DownloadState``. The
+    ``stoppedUP``); the reconciler maps it to a domain ``DownloadState``.
+    ``force_start`` is the client's own force-start flag, read directly because a
+    forced torrent can report states such as ``checkingDL``. The
     ``ratio_limit`` / ``*_limit_minutes`` defaults of ``-2`` mean "use the
     client global" (qBittorrent convention); ``-1`` means unlimited.
     """
@@ -72,6 +74,7 @@ class DownloadStatus(BaseModel):
     seeding_time_limit_minutes: int = -2
     inactive_seeding_time_limit_minutes: int = -2
     last_activity_unix: int = 0
+    force_start: bool = False
 
 
 class FailureDetailSource(StrEnum):
@@ -201,6 +204,15 @@ class DownloadClientPort(Protocol):
         Raises ``NotImplementedError`` by default (issue #204): same rationale
         as :meth:`pause` -- a silent no-op default would let a caller believe a
         torrent was resumed when nothing happened.
+        """
+        raise NotImplementedError
+
+    async def force_start(self, info_hash: str) -> None:
+        """Start the torrent ``info_hash`` in forced mode, bypassing queue limits.
+
+        This both starts a stopped torrent and sets force-start, so callers must not
+        follow it with :meth:`resume`, which would restart it as a normal start.
+        Raises ``NotImplementedError`` by default for the same reason as :meth:`resume`.
         """
         raise NotImplementedError
 
