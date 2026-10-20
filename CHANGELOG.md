@@ -66,6 +66,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `vite`, and `vitest` dev dependencies (#581).
 
 ### Fixed
+- Media probe: an ffprobe that cannot run (exit 126 or 127, such as a missing shared library) now leaves the download `import_blocked` with a retryable "verification unavailable" reason instead of rejecting, blocklisting and re-searching every completed release (#618).
 - Import: a crash-resumed import whose torrent has left qBittorrent and whose download holds no video now moves to a visible, retryable `import_blocked` that names the missing torrent, instead of retrying silently every cycle. Retry Import and Mark Failed recover it; nothing is blocklisted or removed automatically (#619).
 - Entitlement captures now serialise each user's library read through its database commit across sign-in and background sweeps; a sweep skips a user whose sign-in capture is already in flight instead of waiting or probing the server. A fresh server-identity check after each read rejects replacement-server or unverified results while retaining the previous snapshot, never warms the shared library-section cache with an unverified read, and only verified, stored captures emit the canary scope telemetry. Sign-in remains responsive; owner-controlled server replacement is separate work (#572, #597).
 - Entitlement capture: the pre-init (first-owner claim) sign-in now reads its
